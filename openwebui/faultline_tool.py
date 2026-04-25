@@ -13,20 +13,31 @@ Returns a human-readable string describing the validation outcome.
 
 import json
 import os
+from typing import Optional
 
 import httpx
 
-FAULTLINE_URL = os.getenv("FAULTLINE_URL", "http://faultline:8000")
+
+class Valves:
+    """Configuration valves for FaultLine integration."""
+
+    FAULTLINE_URL: str = os.getenv("FAULTLINE_URL", "http://faultline:8001")
+    FAULTLINE_TIMEOUT: int = 20
+    DEFAULT_SOURCE: str = "openwebui"
+    ENABLE_DEBUG: bool = False
 
 
 class Tools:
     """OpenWebUI Tools class for FaultLine WGM integration."""
 
-    @staticmethod
+    def __init__(self):
+        self.valves = Valves()
+
     async def store_fact(
+        self,
         text: str,
-        edges: list[dict] | None = None,
-        source: str = "openwebui",
+        edges: Optional[list[dict]] = None,
+        source: Optional[str] = None,
     ) -> str:
         """
         Store a validated fact via the FaultLine WGM pipeline.
@@ -36,23 +47,46 @@ class Tools:
             edges:  Optional list of explicit edges to validate and commit.
                     Each edge is {"subject": str, "object": str, "rel_type": str}.
                     If omitted, entities are extracted but nothing is committed.
-            source: Provenance label recorded in the fact store.
+            source: Provenance label recorded in the fact store (defaults to valve config).
 
         Returns:
             A short status string the model can relay to the user.
         """
+        source = source or self.valves.DEFAULT_SOURCE
         payload = {"text": text, "source": source}
         if edges:
             payload["edges"] = edges
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(f"{FAULTLINE_URL}/ingest", json=payload)
+        if self.valves.ENABLE_DEBUG:
+            print(f"[FaultLine Debug] POST {self.valves.FAULTLINE_URL}/ingest")
+            print(f"[FaultLine Debug] Payload: {json.dumps(payload, indent=2)}")
 
-        response.raise_for_status()
-        data = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                response = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/ingest", json=payload
+                )
+            response.raise_for_status()
+        except httpx.ConnectError as e:
+            return (
+                f"[FaultLine] Connection failed to {self.valves.FAULTLINE_URL}. "
+                f"Error: {str(e)}"
+            )
+        except httpx.TimeoutException:
+            return (
+                f"[FaultLine] Timeout connecting to {self.valves.FAULTLINE_URL}. "
+                f"Increase FAULTLINE_TIMEOUT if needed."
+            )
+        except Exception as e:
+            return f"[FaultLine] Request failed: {str(e)}"
 
-        status = data["status"]
-        committed = data["committed"]
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return f"[FaultLine] Invalid JSON response: {response.text[:200]}"
+
+        status = data.get("status", "unknown")
+        committed = data.get("committed", 0)
         entity_names = [e["entity"] for e in data.get("entities", [])]
 
         if status == "extracted":

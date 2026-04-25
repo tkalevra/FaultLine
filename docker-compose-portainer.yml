@@ -28,7 +28,7 @@ services:
     container_name: faultline
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_test
       QWEN_API_URL: ${QWEN_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
