@@ -3,12 +3,15 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
 RUN pip install --upgrade pip
 
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --prefix=/install ".[api]"
+RUN pip install --no-cache-dir ".[api]"
 
-# Pre-download the GliNER model into the image so startup is instant
+# Pre-download the GliNER model while gliner is on PATH via the venv
 RUN python -c "from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner_medium-v2.1')"
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
@@ -20,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=builder /install /usr/local
+COPY --from=builder /venv /venv
 # Copy cached HuggingFace model weights
 COPY --from=builder /root/.cache /root/.cache
 
@@ -30,6 +33,7 @@ COPY docker-entrypoint.sh ./
 
 RUN chmod +x docker-entrypoint.sh
 
+ENV PATH="/venv/bin:$PATH"
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
