@@ -19,53 +19,57 @@ import httpx
 FAULTLINE_URL = os.getenv("FAULTLINE_URL", "http://faultline:8000")
 
 
-async def store_fact(
-    text: str,
-    edges: list[dict] | None = None,
-    source: str = "openwebui",
-) -> str:
-    """
-    Store a validated fact via the FaultLine WGM pipeline.
+class Tools:
+    """OpenWebUI Tools class for FaultLine WGM integration."""
 
-    Args:
-        text:   The sentence or passage containing the fact.
-        edges:  Optional list of explicit edges to validate and commit.
-                Each edge is {"subject": str, "object": str, "rel_type": str}.
-                If omitted, entities are extracted but nothing is committed.
-        source: Provenance label recorded in the fact store.
+    @staticmethod
+    async def store_fact(
+        text: str,
+        edges: list[dict] | None = None,
+        source: str = "openwebui",
+    ) -> str:
+        """
+        Store a validated fact via the FaultLine WGM pipeline.
 
-    Returns:
-        A short status string the model can relay to the user.
-    """
-    payload = {"text": text, "source": source}
-    if edges:
-        payload["edges"] = edges
+        Args:
+            text:   The sentence or passage containing the fact.
+            edges:  Optional list of explicit edges to validate and commit.
+                    Each edge is {"subject": str, "object": str, "rel_type": str}.
+                    If omitted, entities are extracted but nothing is committed.
+            source: Provenance label recorded in the fact store.
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(f"{FAULTLINE_URL}/ingest", json=payload)
+        Returns:
+            A short status string the model can relay to the user.
+        """
+        payload = {"text": text, "source": source}
+        if edges:
+            payload["edges"] = edges
 
-    response.raise_for_status()
-    data = response.json()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(f"{FAULTLINE_URL}/ingest", json=payload)
 
-    status = data["status"]
-    committed = data["committed"]
-    entity_names = [e["entity"] for e in data.get("entities", [])]
+        response.raise_for_status()
+        data = response.json()
 
-    if status == "extracted":
-        return (
-            f"[FaultLine] Extracted {len(entity_names)} entities "
-            f"({', '.join(entity_names)}). No edges committed."
-        )
-    if status == "valid":
-        return f"[FaultLine] Committed {committed} fact(s). Entities: {', '.join(entity_names)}."
-    if status == "novel":
-        return (
-            f"[FaultLine] Edge type not in ontology — queued for review. "
-            f"Committed {committed} valid fact(s)."
-        )
-    if status == "conflict":
-        return (
-            f"[FaultLine] Conflict detected — contradicting edge exists. "
-            f"Committed {committed} non-conflicting fact(s)."
-        )
-    return f"[FaultLine] status={status} committed={committed}"
+        status = data["status"]
+        committed = data["committed"]
+        entity_names = [e["entity"] for e in data.get("entities", [])]
+
+        if status == "extracted":
+            return (
+                f"[FaultLine] Extracted {len(entity_names)} entities "
+                f"({', '.join(entity_names)}). No edges committed."
+            )
+        if status == "valid":
+            return f"[FaultLine] Committed {committed} fact(s). Entities: {', '.join(entity_names)}."
+        if status == "novel":
+            return (
+                f"[FaultLine] Edge type not in ontology — queued for review. "
+                f"Committed {committed} valid fact(s)."
+            )
+        if status == "conflict":
+            return (
+                f"[FaultLine] Conflict detected — contradicting edge exists. "
+                f"Committed {committed} non-conflicting fact(s)."
+            )
+        return f"[FaultLine] status={status} committed={committed}"

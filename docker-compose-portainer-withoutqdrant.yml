@@ -1,13 +1,21 @@
 version: "3.8"
 
-# FaultLine WGM — Portainer Stack
+# FaultLine WGM — Portainer Stack (WITHOUT Qdrant)
+#
+# This compose file assumes you already have Qdrant running in a separate stack.
+# It will connect to your existing Qdrant instance via the shared network.
 #
 # IMPORTANT: This compose file references a PRE-BUILT Docker image.
 # Before deploying this stack in Portainer, build the image on your Docker host:
 #
 #   cd /path/to/FaultLine
 #   docker build -t faultline-wgm:latest .
-#   docker tag faultline-wgm:latest faultline-wgm:latest  # Ensure tag exists
+#
+# PREREQUISITES:
+#   ✓ Qdrant already running (e.g., in rag-ai-qdrant stack)
+#   ✓ Qdrant network name: rag-ai-qdrant_default
+#   ✓ Qdrant hostname: qdrant
+#   ✓ Qdrant port: 6333
 #
 # DEPLOYMENT OPTIONS:
 #   Option 1: Web Editor (Portainer UI)
@@ -15,7 +23,7 @@ version: "3.8"
 #
 #   Option 2: Git Repository (recommended for version control)
 #     → Stacks → Add Stack → Git Repository
-#     → Repository URL, Branch, Compose path: docker-compose-portainer.yml
+#     → Repository URL, Branch, Compose path: docker-compose-portainer-withoutqdrant.yml
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
 #   QWEN_API_URL       - LLM endpoint, e.g. http://192.168.1.x:11434/v1/chat/completions
@@ -44,8 +52,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
     logging:
       driver: json-file
       options:
@@ -53,6 +59,7 @@ services:
         max-file: "3"
     networks:
       - faultline-net
+      - rag-ai-qdrant_default
 
   postgres:
     image: postgres:16-alpine
@@ -77,33 +84,9 @@ services:
     networks:
       - faultline-net
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: faultline-qdrant
-    restart: unless-stopped
-    ports:
-      - "6334:6333"
-    volumes:
-      - qdrant-data:/qdrant/storage
-    healthcheck:
-      test: ["CMD-SHELL",
-             "wget -qO- http://localhost:6333/healthz | grep -q '\"status\":\"ok\"' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    networks:
-      - faultline-net
-
 volumes:
   pg-data:
     name: faultline-pg-data
-  qdrant-data:
-    name: faultline-qdrant-data
 
 networks:
   faultline-net:
@@ -111,3 +94,8 @@ networks:
     driver: bridge
     driver_opts:
       com.docker.network.driver.mtu: 1500
+
+  # Reference to existing Qdrant network
+  rag-ai-qdrant_default:
+    external: true
+    name: rag-ai-qdrant_default
