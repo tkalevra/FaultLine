@@ -1,0 +1,26 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[test,api]"
+
+      - name: Run tests
+        run: |
+          pytest tests/ \
+            --ignore=tests/evaluation \
+            --ignore=tests/feature_extraction \
+            --ignore=tests/model_inference \
+            --ignore=tests/preprocessing \
+            -v

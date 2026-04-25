@@ -1,6 +1,6 @@
 # FaultLine WGM — Next Steps
 
-**Status as of 2026-04-25** | All 38 unit + integration tests passing.
+**Status as of 2026-04-25** | All 38 unit + integration tests passing. Initial commit pushed to GitHub (private).
 
 ---
 
@@ -22,79 +22,149 @@
 | 6 | `pyproject.toml` full dependencies + pytest config | ✅ Done |
 | 6 | `.env.example` | ✅ Done |
 | 7 | `tests/test_pipeline.py` end-to-end integration test | ✅ Done |
+| 8 | `ABOUT.md`, `LICENSE` (Apache 2.0), `.gitignore` | ✅ Done |
+| 9 | Private GitHub repo `tkalevra/FaultLine` created and pushed | ✅ Done |
 
 ---
 
-## Remaining Work
+## Phase 2 — Docker + OpenWebUI Integration
 
-### 1. Stub modules in `tests/evaluation`, `tests/feature_extraction`, etc.
+**Goal**: Expose the WGM pipeline as a containerised HTTP service and wire it into
+OpenWebUI as a Tool function, using a dedicated test Qdrant collection so no
+production data is touched during development.
 
-The following test files were migrated from `src/tests/` but reference modules that don't
-exist yet in this project (`evaluation`, `feature_extraction`, `model_inference`,
-`preprocessing`). They are skipped from the default test run.
+### Step 1 — FastAPI service layer
+
+**New files**: `src/api/main.py`, `src/api/models.py`
+
+Expose the 5-stage pipeline behind a single endpoint:
 
 ```
-tests/evaluation/test_evaluate.py       → needs src/evaluation/__init__.py
-tests/feature_extraction/test_feature_extract.py → needs src/feature_extraction/__init__.py
-tests/model_inference/test_inference.py → needs src/model_inference/__init__.py
-tests/preprocessing/test_preprocess.py  → needs src/preprocessing/__init__.py
+POST /ingest          { "text": str, "source": str }
+  → extract_entities
+  → build_audit_context
+  → resolve_entities (classify)
+  → validate_edge (WGM gate)
+  → commit (Fact Store)
+  ← { "status": "valid"|"novel"|"conflict", "committed": int, "facts": [...] }
+
+GET  /health          → { "ok": true }
 ```
 
-These are out-of-scope for the current WGM gate milestone. Decide whether to keep,
-implement, or remove them before running `pytest tests/` without `--ignore` flags.
+- Use `fastapi` + `uvicorn`
+- All pipeline dependencies injected at startup (GliNER model, DB pool, oracle URL)
+- Pydantic request/response models in `models.py`
+- Tests in `tests/api/test_ingest.py` using `httpx.AsyncClient` + `TestClient`
 
-### 2. GliNER Real Model Integration
+### Step 2 — PostgreSQL migration
 
-`src/gli_ner/extractor.py` always requires a model to be injected. For production use,
-add a factory that loads the real GliNER model from HuggingFace:
+**New file**: `migrations/001_create_facts.sql`
+
+```sql
+CREATE TABLE IF NOT EXISTS facts (
+    id          SERIAL PRIMARY KEY,
+    subject_id  TEXT NOT NULL,
+    object_id   TEXT NOT NULL,
+    rel_type    TEXT NOT NULL,
+    provenance  TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_pair
+    ON facts (subject_id, object_id);
+```
+
+Run at container startup via entrypoint script.
+
+### Step 3 — GliNER real model factory
+
+**File**: `src/gli_ner/extractor.py`
+
+Add a startup factory so the container loads the real model once:
 
 ```python
-# Option: add to src/gli_ner/extractor.py
 def load_default_model():
     from gliner import GLiNER
     return GLiNER.from_pretrained("urchade/gliner_medium-v2.1")
 ```
 
-Note: The original code used `import gliener` (typo); the real package is `gliner`
-and its class is `GLiNER`, not `GliNERModel`.
+The API layer calls this once on startup and injects the instance into `ExtractionService`.
+Unit tests continue to inject mocks — no change needed there.
 
-### 3. WGM Ontology Configuration
+### Step 4 — Dockerfile
 
-`SEED_ONTOLOGY` in `src/wgm/gate.py` is hardcoded. For production, load it from:
-- A config file (YAML/JSON), or
-- A PostgreSQL `ontology_types` table at startup.
+**New file**: `Dockerfile`
 
-### 4. Schema Oracle Endpoint Configuration
+Multi-stage build:
+- Stage 1 (`builder`): install deps into a venv
+- Stage 2 (`runtime`): slim Python 3.11 image, copy venv + src, expose port 8000
 
-`invoke_oracle` reads `QWEN_API_URL` from env (defaults to `localhost:11434`).
-Ensure this is set in deployment config and `.env` for local dev.
-
-### 5. Structured Logging
-
-`structlog` is installed but not wired into any component. Add structured log calls at
-key pipeline boundaries (extraction, classification, validation, commit) to support
-observability in production.
-
-### 6. PostgreSQL Schema Migration
-
-No SQL migration files exist. Create:
-```sql
--- migrations/001_create_facts.sql
-CREATE TABLE IF NOT EXISTS facts (
-    id SERIAL PRIMARY KEY,
-    subject_id TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    rel_type TEXT NOT NULL,
-    provenance TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+```
+ENTRYPOINT: run migrations → start uvicorn src.api.main:app
 ```
 
-### 7. CI/CD
+### Step 5 — Docker Compose (test stack)
 
-No `.github/workflows/` or equivalent. Add a minimal GitHub Actions workflow:
+**New file**: `docker-compose.yml`
+
+Three services, all on an isolated `faultline-test` network:
+
+| Service | Image | Purpose |
+|---------|-------|---------|
+| `faultline` | local build | FastAPI WGM service |
+| `postgres` | postgres:16-alpine | Fact store (test DB) |
+| `qdrant` | qdrant/qdrant | Test-only vector store (separate from production) |
+
+Named volumes: `pg-test-data`, `qdrant-test-data` — easy to nuke with `docker compose down -v`.
+
+Env vars passed through from `.env`:
+```
+QWEN_API_URL, POSTGRES_DSN, QDRANT_URL, QDRANT_COLLECTION=faultline-test
+```
+
+### Step 6 — OpenWebUI Tool function
+
+**New file**: `openwebui/faultline_tool.py`
+
+A single Python file dropped into OpenWebUI's Tools directory. OpenWebUI calls it when
+the model decides to store a memory/fact.
+
+```python
+"""
+Tool name:   FaultLine WGM
+Description: Store validated facts through the FaultLine WGM pipeline.
+"""
+import httpx
+
+async def store_fact(text: str, source: str = "openwebui") -> str:
+    """Store a fact via FaultLine. Returns validation status."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "http://faultline:8000/ingest",
+            json={"text": text, "source": source},
+            timeout=15.0,
+        )
+    r.raise_for_status()
+    data = r.json()
+    return f"[FaultLine] status={data['status']} committed={data['committed']}"
+```
+
+The tool is **additive** — OpenWebUI's existing memory agent is untouched. The model
+calls `store_fact` explicitly when it wants a fact validated and persisted.
+
+### Step 7 — Structured logging
+
+Wire `structlog` into key pipeline boundaries in `src/api/main.py`:
+- Request received (text length, source)
+- Extraction complete (entity count)
+- Validation result (status per edge)
+- Commit complete (row count)
+
+### Step 8 — CI/CD
+
+**New file**: `.github/workflows/test.yml`
+
 ```yaml
-# .github/workflows/test.yml
 on: [push, pull_request]
 jobs:
   test:
@@ -105,8 +175,19 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -e ".[test]"
       - run: pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction
-               --ignore=tests/model_inference --ignore=tests/preprocessing
+                           --ignore=tests/model_inference --ignore=tests/preprocessing
 ```
+
+---
+
+## Backlog (post Phase 2)
+
+| Item | Notes |
+|------|-------|
+| WGM ontology from config file / DB table | `SEED_ONTOLOGY` is hardcoded in `gate.py` |
+| Qdrant re-embedder service | Re-embed `facts` table into `qdrant-test` collection after each commit |
+| OpenWebUI memory agent modification | Deeper integration once Tool path is validated |
+| Stub modules (`evaluation`, `feature_extraction`, etc.) | Out-of-scope artifacts; implement or remove |
 
 ---
 
