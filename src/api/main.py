@@ -5,12 +5,12 @@ import psycopg2
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
 
-from context_packager import build_audit_context
-from fact_store.store import FactStoreManager
-from gli_ner import extract_entities
-from gli_ner.extractor import load_default_model
-from schema_oracle import resolve_entities
-from wgm.gate import WGMValidationGate
+from src.context_packager import build_audit_context
+from src.fact_store.store import FactStoreManager
+from src.gli_ner import extract_entities
+from src.gli_ner.extractor import load_default_model
+from src.schema_oracle import resolve_entities
+from src.wgm.gate import WGMValidationGate
 
 from .models import EntityResult, FactResult, IngestRequest, IngestResponse
 
