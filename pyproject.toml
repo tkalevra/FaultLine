@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultline-wgm"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = [
+    "gliner",
+    "psycopg2-binary",
+    "httpx",
+    "structlog",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-mock",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
