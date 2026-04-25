@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faultline-wgm"
-version = "0.0.1"
+version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "gliner",
@@ -14,9 +14,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
+]
 test = [
     "pytest>=7.0",
     "pytest-mock",
+    "requests",
+    "fastapi>=0.110",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
 ]
 
 [tool.pytest.ini_options]
