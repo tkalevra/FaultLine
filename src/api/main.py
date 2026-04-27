@@ -182,7 +182,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # and the re-embedder payload permanently.
             # ================================================================
             if rows_to_commit:
-                if log.isEnabledFor(structlog.DEBUG):
+                if os.getenv("ENABLE_DEBUG", "false").lower() == "true":
                     for sub, obj, rel, _ in rows_to_commit:
                         log.debug("ingest.committing", subject=sub, object=obj, rel_type=rel)
                 committed = manager.commit(rows_to_commit)
