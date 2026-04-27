@@ -25,7 +25,6 @@ class WGMValidationGate:
         Returns {"status": "valid"} otherwise.
         """
         rt = rel_type.lower().strip()
-        if rt not in SEED_ONTOLOGY: return {"status": "novel"}
         if rt not in SEED_ONTOLOGY:
             return {"status": "novel"}
 
@@ -33,16 +32,8 @@ class WGMValidationGate:
             # Check for existing relations in the same direction
             cur.execute("SELECT rel_type FROM facts WHERE subject_id = %s AND object_id = %s", (subject_id, object_id))
             rows = cur.fetchall()
-            existing_rels = {r[0].lower() for r in cur.fetchall()}
+            existing_rels = {r[0].lower() for r in rows}
             
-            # Check for reverse relations (conflict detection)
-            cur.execute("SELECT 1 FROM facts WHERE subject_id = %s AND object_id = %s AND rel_type = %s", (object_id, subject_id, rt))
-            if cur.fetchone() and rt not in ["spouse", "sibling_of", "also_known_as"]:
-            if existing_rels and rt not in existing_rels:
-                return {"status": "conflict"}
-
-        existing_rels = {r[0].lower() for r in rows}
-        if existing_rels and rt not in existing_rels: return {"status": "conflict"}
             # Check for reverse relations (conflict detection for directed edges)
             # Symmetric relations and aliases are exempt from reverse-direction conflict checks
             if rt not in ["spouse", "sibling_of", "also_known_as", "related_to"]:
