@@ -12,53 +12,59 @@ from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestRe
 
 log = structlog.get_logger()
 
-# Mapping Natural Language prompts to DB Slugs
-ENTITY_PROMPTS = {
-    "a human being": "Person",
-    "a company or organization": "Organization",
-    "a physical location": "Location"
+# GLiNER2 schema — dict form: {label: description}
+# label   = the key GLiNER2 uses in returned results; must be lowercase_with_underscores
+#            for relations so they match WGM gate slugs directly (no lookup needed)
+# description = natural language guidance that improves model accuracy
+ENTITY_SCHEMA = {
+    "person":       "a person or individual",
+    "organization": "a company, business, or organization",
+    "location":     "a city, country, or geographic location",
 }
 
-RELATION_PROMPTS = {
-    "is the parent of": "parent_of",
-    "is the child of": "child_of",
-    "is the spouse of": "spouse",
-    "is also known as": "also_known_as",
-    "goes by the nickname": "also_known_as",
-    "prefers to be called": "also_known_as",
-    "works for": "works_for"
+# Maps GLiNER2 entity label → DB slug (title-cased for resolve_entities)
+ENTITY_LABEL_TO_DB = {
+    "person":       "Person",
+    "organization": "Organization",
+    "location":     "Location",
 }
 
-DIRECTED_RELATIONSHIPS = frozenset({"parent_of", "child_of", "works_for", "part_of"})
+# Relation labels ARE the DB slugs — no secondary mapping needed
+RELATION_SCHEMA = {
+    "parent_of":    "is the parent, father, or mother of",
+    "child_of":     "is the child, son, or daughter of",
+    "spouse":       "is married to or is the spouse of",
+    "sibling_of":   "is the sibling, brother, or sister of",
+    "also_known_as":"is also known as, goes by, or has the nickname",
+    "works_for":    "works for or is employed by",
+}
 
 def extract_entities_and_relations(text: str, model) -> tuple[list[dict], list[EdgeInput]]:
     if model is None: return [], []
     try:
         schema = (model.create_schema()
-            .entities(list(ENTITY_PROMPTS.keys()))
-            .relations(list(RELATION_PROMPTS.keys()))
+            .entities(ENTITY_SCHEMA)
+            .relations(RELATION_SCHEMA)
         )
         results = model.extract(text, schema)
-        
+
         entities = []
-        for prompt, db_label in ENTITY_PROMPTS.items():
-            for e in results.get(prompt, []):
+        for label, db_label in ENTITY_LABEL_TO_DB.items():
+            for e in results.get(label, []):
                 val = e["text"] if isinstance(e, dict) else str(e)
                 entities.append({"entity": val.lower().strip(), "label": db_label})
 
         relation_edges = []
-        rel_results = results.get("relation_extraction", {})
-        for prompt_rel, pairs in rel_results.items():
-            db_rel = RELATION_PROMPTS.get(prompt_rel, "related_to")
+        def get_text(o): return o.get("text", "") if isinstance(o, dict) else str(o)
+        for rel_label, pairs in results.get("relation_extraction", {}).items():
+            if rel_label not in RELATION_SCHEMA:
+                continue
             for pair in pairs:
                 if isinstance(pair, (tuple, list)): h, t = pair[0], pair[1]
                 else: h, t = pair.get("head"), pair.get("tail")
-                
-                def get_t(o): return o.get("text", "") if isinstance(o, dict) else str(o)
-                sub, obj = get_t(h).lower().strip(), get_t(t).lower().strip()
-                
+                sub, obj = get_text(h).lower().strip(), get_text(t).lower().strip()
                 if sub and obj and sub != obj:
-                    relation_edges.append(EdgeInput(subject=sub, object=obj, rel_type=db_rel))
+                    relation_edges.append(EdgeInput(subject=sub, object=obj, rel_type=rel_label))
         return entities, relation_edges
     except Exception as e:
         log.error("ingest.gliner2_failed", error=str(e))
@@ -120,11 +126,18 @@ def query(request: QueryRequest):
     user_id = request.user_id or "anonymous"
     collection = derive_collection(user_id)
 
+    # Use a short embed timeout so the filter's request doesn't time out waiting for us.
+    # fallback=False: if nomic is unavailable, return empty rather than searching with a
+    # hash vector that cannot match the nomic-embedded stored facts.
+    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
+    if vector is None:
+        log.warning("query.embed_unavailable — skipping Qdrant search")
+        return {"status": "ok", "facts": []}
+
     try:
-        vector = embed_text(request.text, qwen_api_url)
         resp = httpx.post(
             f"{qdrant_url}/collections/{collection}/points/search",
-            json={"vector": vector, "limit": 10, "with_payload": True, "score_threshold": 0.5},
+            json={"vector": vector, "limit": 10, "with_payload": True, "score_threshold": 0.3},
             timeout=10.0,
         )
         if resp.status_code == 404:
@@ -143,6 +156,7 @@ def query(request: QueryRequest):
             for h in resp.json().get("result", [])
             if h.get("payload")
         ]
+        log.info("query.ok", collection=collection, hits=len(facts))
         return {"status": "ok", "facts": facts}
     except Exception as e:
         log.error("query.failed", error=str(e))
