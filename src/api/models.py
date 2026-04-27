@@ -14,11 +14,13 @@ class IngestRequest(BaseModel):
     source: str = "api"
     edges: list[EdgeInput] | None = None
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
+    user_id: Optional[str] = "anonymous"
 
 
 class QueryRequest(BaseModel):
     text: str
     source: Optional[str] = "openwebui"
+    user_id: Optional[str] = "anonymous"
 
 
 class EntityResult(BaseModel):

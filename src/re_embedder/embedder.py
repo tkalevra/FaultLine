@@ -16,9 +16,6 @@ import psycopg2
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
-# Cache of known-good Qdrant collections to avoid redundant checks
-_known_collections: set = set()
-
 
 def derive_collection(user_id: str) -> str:
     """Derive Qdrant collection name from user_id."""
@@ -103,24 +100,19 @@ def hash_vector(text: str, size: int = 768) -> list[float]:
     return vector
 
 
-def ensure_collection_exists(collection: str, qdrant_url: str) -> None:
+def ensure_collection(collection: str, qdrant_url: str) -> bool:
     """
     Check if Qdrant collection exists, create if not.
-    Uses local cache to avoid redundant checks.
+    Returns True if collection exists or was created, False on failure.
     """
-    if collection in _known_collections:
-        return
-
     try:
-        # Check if collection exists
         response = httpx.get(
             f"{qdrant_url}/collections/{collection}",
             timeout=10.0
         )
 
         if response.status_code == 200:
-            _known_collections.add(collection)
-            return
+            return True
 
         if response.status_code == 404:
             # Create collection
@@ -134,16 +126,20 @@ def ensure_collection_exists(collection: str, qdrant_url: str) -> None:
                 },
                 timeout=10.0
             )
-            create_response.raise_for_status()
-            _known_collections.add(collection)
-            log.info(f"re_embedder.collection_created collection={collection}")
-            return
 
-        raise Exception(f"Unexpected status checking collection: {response.status_code}")
+            if create_response.status_code == 200:
+                log.info(f"re_embedder.collection_created collection={collection}")
+                return True
+            else:
+                log.error(f"re_embedder.collection_create_failed collection={collection} status={create_response.status_code}")
+                return False
+
+        log.error(f"re_embedder.collection_check_unexpected collection={collection} status={response.status_code}")
+        return False
 
     except Exception as e:
-        log.error(f"re_embedder.collection_error collection={collection}: {e}")
-        raise
+        log.error(f"re_embedder.collection_check_failed collection={collection} error={e}")
+        return False
 
 
 def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url: str) -> bool:
@@ -226,7 +222,9 @@ def main():
                         collection = derive_collection(row["user_id"])
 
                         # Ensure collection exists
-                        ensure_collection_exists(collection, qdrant_url)
+                        if not ensure_collection(collection, qdrant_url):
+                            log.error(f"re_embedder.collection_unavailable fact_id={row['id']} collection={collection}")
+                            continue
 
                         # Upsert to Qdrant
                         if upsert_to_qdrant(row, vector, collection, qdrant_url):
