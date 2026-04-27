@@ -22,11 +22,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS lowercase_facts_before_insert ON facts;
 CREATE TRIGGER lowercase_facts_before_insert
 BEFORE INSERT ON facts
 FOR EACH ROW
 EXECUTE FUNCTION lowercase_facts_columns();
 
+DROP TRIGGER IF EXISTS lowercase_facts_before_update ON facts;
 CREATE TRIGGER lowercase_facts_before_update
 BEFORE UPDATE ON facts
 FOR EACH ROW
