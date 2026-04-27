@@ -1,9 +1,11 @@
 import os
 from contextlib import asynccontextmanager
+import httpx
 import psycopg2
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
 from src.fact_store.store import FactStoreManager
+from src.re_embedder.embedder import derive_collection, embed_text
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate
 from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest
@@ -113,10 +115,35 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
 
 @app.post("/query")
 def query(request: QueryRequest):
-    db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qwen_api_url = os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+    user_id = request.user_id or "anonymous"
+    collection = derive_collection(user_id)
+
     try:
-        tokens = request.text.lower().split()
-        with db.cursor() as cur:
-            cur.execute("SELECT subject_id, object_id, rel_type, provenance FROM facts WHERE user_id = %s AND (subject_id = ANY(%s) OR object_id = ANY(%s)) LIMIT 20", (request.user_id or "anonymous", tokens, tokens))
-            return {"status": "ok", "facts": [{"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3]} for r in cur.fetchall()]}
-    finally: db.close()
+        vector = embed_text(request.text, qwen_api_url)
+        resp = httpx.post(
+            f"{qdrant_url}/collections/{collection}/points/search",
+            json={"vector": vector, "limit": 10, "with_payload": True, "score_threshold": 0.5},
+            timeout=10.0,
+        )
+        if resp.status_code == 404:
+            return {"status": "ok", "facts": []}
+        if resp.status_code != 200:
+            log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
+            return {"status": "ok", "facts": []}
+
+        facts = [
+            {
+                "subject": h["payload"].get("subject"),
+                "object": h["payload"].get("object"),
+                "rel_type": h["payload"].get("rel_type"),
+                "provenance": h["payload"].get("provenance"),
+            }
+            for h in resp.json().get("result", [])
+            if h.get("payload")
+        ]
+        return {"status": "ok", "facts": facts}
+    except Exception as e:
+        log.error("query.failed", error=str(e))
+        return {"status": "ok", "facts": []}
