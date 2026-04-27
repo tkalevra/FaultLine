@@ -27,7 +27,7 @@ OpenWebUI (outlet filter)
 
 The `/query` endpoint embeds the request text using the same `nomic-embed-text-v1.5` model as the re-embedder, then does a Qdrant cosine nearest-neighbour search against the user's collection (`score_threshold: 0.5`). Facts are returned from the Qdrant payload — PostgreSQL is not consulted during retrieval.
 
-The outlet filter queries on the **user's** last message (the question), not the assistant's response.
+The outlet queries Qdrant for facts relevant to the **user's** question and appends them as a memory block below the assistant's response. The user's message is the retrieval signal — not the assistant's response.
 
 ## Key Files
 
