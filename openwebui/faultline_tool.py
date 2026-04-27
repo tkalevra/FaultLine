@@ -24,7 +24,7 @@ class Filter:
 
     class Valves(BaseModel):
         FAULTLINE_URL: str = "http://192.168.40.10:8001"
-        FAULTLINE_TIMEOUT: int = 20
+        FAULTLINE_TIMEOUT: int = 30
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
         ENABLED: bool = True

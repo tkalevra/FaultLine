@@ -3,7 +3,13 @@
     "allow": [
       "Bash(python -m pytest tests/ -v --tb=short --ignore=tests/evaluation --ignore=tests/feature_extraction --ignore=tests/model_inference --ignore=tests/preprocessing)",
       "Bash(pip install *)",
-      "Bash(gh auth *)"
+      "Bash(gh auth *)",
+      "WebFetch(domain:pypi.org)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:towardsdatascience.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

@@ -50,34 +50,37 @@ def fetch_unsynced(db_conn) -> list[dict]:
     ]
 
 
-def embed_text(text: str, qwen_api_url: str) -> list[float]:
+def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bool = True) -> list[float] | None:
     """
-    Embed text using Qwen API embeddings endpoint.
-    Falls back to deterministic hash vector on failure.
+    Embed text using the nomic-embed-text model via the Ollama/Qwen API.
+
+    fallback=True  (default, used by re_embedder): returns a hash vector on failure so
+                   the re_embedder loop keeps running.
+    fallback=False (used by /query):               returns None on failure so the caller
+                   can skip the Qdrant search rather than searching with a meaningless vector.
     """
     embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
 
     try:
         response = httpx.post(
             embed_url,
-            json={
-                "model": "text-embedding-nomic-embed-text-v1.5",
-                "input": text
-            },
-            timeout=30.0
+            json={"model": "text-embedding-nomic-embed-text-v1.5", "input": text},
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
 
-        # Extract embedding from response
         if "data" in data and len(data["data"]) > 0:
             return data["data"][0]["embedding"]
 
         raise ValueError("Invalid embedding response format")
 
     except Exception as e:
-        log.warning(f"re_embedder.embed_failed text_preview={text[:50]} falling back to hash vector: {e}")
-        return hash_vector(text)
+        if fallback:
+            log.warning(f"re_embedder.embed_failed text_preview={text[:50]} falling back to hash vector: {e}")
+            return hash_vector(text)
+        log.error(f"re_embedder.embed_failed text_preview={text[:50]} no fallback: {e}")
+        return None
 
 
 def hash_vector(text: str, size: int = 768) -> list[float]:
