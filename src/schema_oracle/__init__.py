@@ -1,4 +1,3 @@
-from .oracle import classify, resolve_entities, EntityRegistry, ClassificationService, invoke_oracle, parse_oracle_response
+from .oracle import resolve_entities, EntityRegistry
 
-__all__ = ["classify", "resolve_entities", "EntityRegistry", "ClassificationService", 
-           "invoke_oracle", "parse_oracle_response"]
+__all__ = ["resolve_entities", "EntityRegistry"]
