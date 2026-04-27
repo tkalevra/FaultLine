@@ -6,7 +6,7 @@ Description: Validate and persist facts through the FaultLine WGM pipeline.
 
 Usage (model-facing):
   store_fact(text="Alice works for Acme Corp.",
-             edges=[{"subject": "Alice", "object": "Acme Corp", "rel_type": "WORKS_FOR"}])
+             edges=[{"subject": "alice", "object": "acme corp", "rel_type": "works_for"}])
 
 Returns a human-readable string describing the validation outcome.
 """
@@ -42,20 +42,51 @@ class Tools:
         """
         Store a validated fact via the FaultLine WGM pipeline.
 
+        IMPORTANT: You MUST provide edges. This tool does nothing useful without them.
+        Always include at least one edge describing the relationship found in the text.
+
         Args:
             text:   The sentence or passage containing the fact.
-            edges:  Optional list of explicit edges to validate and commit.
+            edges:  Required in practice. A list of explicit edges to validate and commit.
                     Each edge is {"subject": str, "object": str, "rel_type": str}.
-                    If omitted, entities are extracted but nothing is committed.
+                    subject is the entity ORIGINATING the relationship.
+                    object  is the entity RECEIVING the relationship.
+                    All values must be lowercase.
             source: Provenance label recorded in the fact store (defaults to valve config).
+
+        Available rel_types (use exactly as written, lowercase):
+            parent_of   subject=parent      object=child
+            child_of    subject=child       object=parent
+            works_for   subject=employee    object=employer
+            created_by  subject=creation    object=creator
+            kills       subject=agent       object=target
+            part_of     subject=component   object=whole
+            is_a        subject=subtype     object=supertype
+
+        Directionality examples:
+            "Tom is Jenny's father"         → subject=tom,   object=jenny,  rel_type=parent_of
+            "Jenny is Tom's daughter"       → subject=jenny, object=tom,    rel_type=child_of
+            "Alice works for Acme Corp"     → subject=alice, object=acme corp, rel_type=works_for
+            "Bob created the algorithm"     → subject=algorithm, object=bob, rel_type=created_by
 
         Returns:
             A short status string the model can relay to the user.
         """
         source = source or self.valves.DEFAULT_SOURCE
-        payload = {"text": text, "source": source}
-        if edges:
-            payload["edges"] = edges
+
+        if not edges:
+            return (
+                "[FaultLine] No edges provided — nothing to commit. "
+                "You must supply edges with subject, object, and rel_type. "
+                f"Available rel_types: parent_of, child_of, works_for, "
+                f"created_by, kills, part_of, is_a"
+            )
+
+        payload = {
+            "text": text,
+            "source": source,
+            "edges": edges,
+        }
 
         if self.valves.ENABLE_DEBUG:
             print(f"[FaultLine Debug] POST {self.valves.FAULTLINE_URL}/ingest")

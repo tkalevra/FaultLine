@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -12,6 +14,11 @@ class IngestRequest(BaseModel):
     source: str = "api"
     edges: list[EdgeInput] | None = None
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
+
+
+class QueryRequest(BaseModel):
+    text: str
+    source: Optional[str] = "openwebui"
 
 
 class EntityResult(BaseModel):
