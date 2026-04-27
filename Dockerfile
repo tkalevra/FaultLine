@@ -11,8 +11,8 @@ RUN pip install --upgrade pip
 COPY pyproject.toml .
 RUN pip install --no-cache-dir ".[api]"
 
-# Pre-download the GliNER model while gliner is on PATH via the venv
-RUN python -c "from gliner import GLiNER; GLiNER.from_pretrained('urchade/gliner_medium-v2.1')"
+# Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
+RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
