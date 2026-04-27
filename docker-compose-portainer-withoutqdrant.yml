@@ -42,6 +42,7 @@ services:
       QWEN_API_URL: ${QWEN_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
+      REEMBED_INTERVAL: 5
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
