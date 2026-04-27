@@ -23,21 +23,11 @@ OpenWebUI (outlet filter)
               └─▶ Appends memory block to assistant message (if facts found)
 ```
 
-## Known Bug: Query Returns No Results
+## Query / Retrieval Path
 
-**Symptom:** Asking the AI about stored entities yields no memory block / no call to Qdrant.
+The `/query` endpoint embeds the request text using the same `nomic-embed-text-v1.5` model as the re-embedder, then does a Qdrant cosine nearest-neighbour search against the user's collection (`score_threshold: 0.5`). Facts are returned from the Qdrant payload — PostgreSQL is not consulted during retrieval.
 
-**Root causes (in `src/api/main.py` `/query` endpoint, lines 114–122):**
-
-1. **Qdrant is never queried.** The `/query` endpoint does a raw SQL keyword match against PostgreSQL. Qdrant contains embeddings but has no retrieval path — it is write-only.
-
-2. **Naive token split misses multi-word entities.** The query splits `request.text` on spaces and checks `subject_id = ANY(tokens)`. A stored fact for `"alice johnson"` will never match a token `"alice"` because the stored value is `"alice johnson"` (space-joined), not split by word.
-
-3. **Outlet queries the assistant's response, not the user's message.** In `openwebui/faultline_tool.py` `outlet()`, `text = self._last_message(messages, "assistant")`. If the model's response doesn't happen to include entity names verbatim, no facts are retrieved. The user's question is a better retrieval signal.
-
-**Fix direction:**
-- Replace token-split SQL with a full-text or ILIKE search, or implement a `/query` path that embeds the query text and does a Qdrant nearest-neighbor lookup.
-- In the outlet, use the **user's** last message as the query text, not the assistant's response.
+The outlet filter queries on the **user's** last message (the question), not the assistant's response.
 
 ## Key Files
 

@@ -137,7 +137,7 @@ class Filter:
             return body
 
         try:
-            text = self._last_message(body.get("messages", []), "assistant")
+            text = self._last_message(body.get("messages", []), "user")
             if not text:
                 return body
 
