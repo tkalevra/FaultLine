@@ -2,15 +2,23 @@
 
 CREATE TABLE IF NOT EXISTS facts (
     id          SERIAL PRIMARY KEY,
+    user_id     TEXT        NOT NULL DEFAULT 'anonymous',
     subject_id  TEXT        NOT NULL,
     object_id   TEXT        NOT NULL,
     rel_type    TEXT        NOT NULL,
     provenance  TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, subject_id, object_id, rel_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_pair
     ON facts (subject_id, object_id);
+
+CREATE INDEX IF NOT EXISTS idx_facts_user_subject
+    ON facts (user_id, subject_id);
+
+CREATE INDEX IF NOT EXISTS idx_facts_user_object
+    ON facts (user_id, object_id);
 
 CREATE OR REPLACE FUNCTION lowercase_facts_columns()
 RETURNS TRIGGER AS $$
@@ -22,6 +30,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Safe migration: only create triggers if they don't exist (drop and recreate)
 DROP TRIGGER IF EXISTS lowercase_facts_before_insert ON facts;
 CREATE TRIGGER lowercase_facts_before_insert
 BEFORE INSERT ON facts
