@@ -17,7 +17,8 @@ class FactStoreManager:
                 for sub, obj, rel, prov in connections:
                     cur.execute(
                         "INSERT INTO facts (subject_id, object_id, rel_type, provenance)"
-                        " VALUES (%s, %s, %s, %s)",
+                        " VALUES (%s, %s, %s, %s)"
+                        " ON CONFLICT (user_id, subject_id, object_id, rel_type) DO NOTHING",
                         (sub, obj, rel, prov),
                     )
                     count += 1
