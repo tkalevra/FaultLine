@@ -7,7 +7,7 @@ until pg_isready -d "$POSTGRES_DSN" -q; do
 done
 
 echo "[entrypoint] Running migrations..."
-psql "$POSTGRES_DSN" -f /app/migrations/001_create_facts.sql
+psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/001_create_facts.sql
 
 echo "[entrypoint] Starting re_embedder service (background)..."
 python -m src.re_embedder.embedder &
