@@ -62,7 +62,7 @@ async def rewrite_to_triples(text: str, valves) -> list[dict]:
                         {"role": "user", "content": text},
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 150,
+                    "max_tokens": 400,
                     "thinking": {"type": "disabled"},
                 },
             )
@@ -159,7 +159,7 @@ class Filter:
         ingest, then query FaultLine for relevant memories and inject them into
         the user message before the model sees it.
         """
-        if not self.valves.ENABLED or not self.valves.INGEST_ENABLED:
+        if not self.valves.ENABLED:
             return body
 
         try:
@@ -171,64 +171,72 @@ class Filter:
 
             text_lower = text.lower()
             words = text_lower.split()
-            if len(words) < 5 or not (
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] inlet text='{text[:80]}' words={len(words)} keyword_match={bool(set(words) & _INGEST_KEYWORDS or 'also known' in text_lower)}")
+
+            keyword_match = len(words) >= 5 and bool(
                 set(words) & _INGEST_KEYWORDS or "also known" in text_lower
-            ):
+            )
+            will_ingest = self.valves.INGEST_ENABLED and keyword_match
+            will_query = self.valves.QUERY_ENABLED
+
+            if not will_ingest and not will_query:
                 return body
 
-            raw_triples = await rewrite_to_triples(text, self.valves)
-            confident = [e for e in raw_triples if not e.get("low_confidence", False)]
-            edges = [
-                {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
-                for e in confident
-                if e.get("subject") and e.get("object") and e.get("rel_type")
-            ]
-
-            if edges:
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
-                asyncio.create_task(
-                    self._fire_ingest(
-                        text,
-                        self.valves.DEFAULT_SOURCE,
-                        user_id,
-                        edges=edges,
+            if will_ingest:
+                raw_triples = await rewrite_to_triples(text, self.valves)
+                confident = [e for e in raw_triples if not e.get("low_confidence", False)]
+                edges = [
+                    {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
+                    for e in confident
+                    if e.get("subject") and e.get("object") and e.get("rel_type")
+                ]
+                if edges:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
+                    asyncio.create_task(
+                        self._fire_ingest(
+                            text,
+                            self.valves.DEFAULT_SOURCE,
+                            user_id,
+                            edges=edges,
+                        )
                     )
-                )
 
-            try:
-                async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                    resp = await client.post(
-                        f"{self.valves.FAULTLINE_URL}/query",
-                        json={"text": text, "user_id": user_id, "top_k": 5},
-                    )
-                if resp.status_code == 200:
-                    facts = resp.json().get("facts", [])
-                    if facts:
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] inlet injecting {len(facts)} facts into user message")
-                        identity = next(
-                            (f.get("object") for f in facts
-                             if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
-                            None,
+            if will_query:
+                try:
+                    async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                        resp = await client.post(
+                            f"{self.valves.FAULTLINE_URL}/query",
+                            json={"text": text, "user_id": user_id, "top_k": 5},
                         )
-                        identity_line = (
-                            f"You are {identity} in these facts.\n"
-                            if identity
-                            else "Note: you are the user these facts refer to.\n"
-                        )
-                        fact_lines = "\n".join(
-                            f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
-                            for f in facts
-                        )
-                        memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}{fact_lines}"
-                        messages = body.get("messages", [])
-                        for i in reversed(range(len(messages))):
-                            if messages[i].get("role") == "user":
-                                messages[i]["content"] = messages[i]["content"] + memory_block
-                                break
-            except Exception:
-                pass
+                    if resp.status_code == 200:
+                        facts = resp.json().get("facts", [])
+                        if facts:
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] inlet injecting {len(facts)} facts into user message")
+                            identity = next(
+                                (f.get("object") for f in facts
+                                 if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
+                                None,
+                            )
+                            identity_line = (
+                                f"You are {identity} in these facts.\n"
+                                if identity
+                                else "Note: you are the user these facts refer to.\n"
+                            )
+                            fact_lines = "\n".join(
+                                f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
+                                for f in facts
+                            )
+                            memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}{fact_lines}"
+                            messages = body.get("messages", [])
+                            for i in reversed(range(len(messages))):
+                                if messages[i].get("role") == "user":
+                                    messages[i]["content"] = messages[i]["content"] + memory_block
+                                    break
+                except Exception:
+                    pass
 
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
