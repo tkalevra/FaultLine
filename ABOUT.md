@@ -1,57 +1,75 @@
 # FaultLine
 
-**WGM Validation Gate** for [faultline-rag](https://github.com/tkalevra/faultline-rag) — a strict
-TDD-based pipeline for deterministic entity extraction, schema classification, edge validation,
-and PostgreSQL persistence.
+**Write-validated knowledge graph** pipeline that intercepts OpenWebUI conversations, extracts named entities and relationships, validates them against an ontology, and persists them to PostgreSQL. Qdrant is a derived vector index — facts flow Postgres → Qdrant via the re-embedder and are queried for memory recall.
 
 ## Architecture
 
 ```
-text
-  └─▶ GliNER (CPU)          entity extraction, deterministic
-         └─▶ Context Packager    bundles entities + source span
-                └─▶ Schema Oracle (Qwen2.5 Coder)   classification-only, no generation
-                       └─▶ WGM Validation Gate       novel / conflict / valid state machine
-                              └─▶ PostgreSQL Fact Store   strict write policy
+OpenWebUI inlet
+  ├─▶ Qwen triple rewrite        structured edge extraction from text
+  │     └─▶ POST /ingest (async)
+  │           └─▶ GLiNER2 extract_json   typed schema edge extraction
+  │                 └─▶ WGMValidationGate   ontology + conflict check
+  │                       └─▶ FactStoreManager.commit()   INSERT INTO facts
+  │                             └─▶ re_embedder (background)   → Qdrant upsert
+  │
+  └─▶ POST /query (sync)
+        └─▶ embed text → Qdrant cosine search
+              └─▶ inject memory block into user message
 ```
 
-Qdrant remains a read-only derived view, updated only by a separate Re-embedder service.
+Facts are validated against a Wikidata-aligned ontology (RDF/SKOS/OWL semantics) and stored with unique constraint `(user_id, subject_id, object_id, rel_type)`.
 
 ## Components
 
 | Module | Path | Role |
 |--------|------|------|
-| GliNER Extractor | `src/gli_ner/` | CPU-based NER, returns `{entity, label}` pairs |
-| Context Packager | `src/context_packager/` | Wraps entities + source span into audit dict |
-| Schema Oracle | `src/schema_oracle/` | Qwen2.5 Coder via httpx, classification-only |
-| WGM Gate | `src/wgm/` | Ontology novelty + DB conflict detection |
-| Fact Store | `src/fact_store/` | Single-transaction INSERT with rollback |
+| FastAPI App | `src/api/main.py` | `/ingest` and `/query` endpoints, GLiNER2 lifecycle |
+| Schema Oracle | `src/schema_oracle/` | Entity registry & canonical ID assignment |
+| WGM Gate | `src/wgm/gate.py` | Ontology check + conflict detection state machine |
+| Fact Store | `src/fact_store/store.py` | Single-transaction INSERT with ON CONFLICT DO NOTHING |
+| Re-embedder | `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts to Qdrant |
+| OpenWebUI Filter | `openwebui/faultline_tool.py` | Inlet: Qwen rewrite → ingest + query/inject; Outlet: pass-through |
+| OpenWebUI Function | `openwebui/faultline_function.py` | Explicit `store_fact()` tool call with Qwen rewrite |
 
 ## Quick Start
 
 ```bash
+# Install with test extras
 pip install -e ".[test]"
+
+# Run stable tests (excludes eval/feature/inference/preprocessing stubs)
 pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
               --ignore=tests/model_inference --ignore=tests/preprocessing
+
+# Start API server (requires .env)
+uvicorn src.api.main:app --host 0.0.0.0 --port 8001 --reload
+
+# Run full stack with Docker
+docker compose up --build
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set:
+Copy `.env.example` to `.env`:
 
 ```
-QWEN_API_URL=http://localhost:11434/v1/chat/completions
 POSTGRES_DSN=postgresql://user:pass@localhost:5432/faultline
+QWEN_API_URL=http://localhost:11434/v1/chat/completions
+QDRANT_URL=http://qdrant:6333
+QDRANT_COLLECTION=faultline-test
+REEMBED_INTERVAL=10
 ```
 
 ## Tech Stack
 
-- Python 3.11
-- [gliner](https://github.com/urchade/GLiNER) — entity extraction
-- [httpx](https://www.python-httpx.org/) — async-ready HTTP client for Qwen2.5
-- [psycopg2-binary](https://pypi.org/project/psycopg2-binary/) — PostgreSQL driver
-- [structlog](https://www.structlog.org/) — structured logging
-- [pytest](https://pytest.org/) + [pytest-mock](https://github.com/pytest-dev/pytest-mock)
+- Python 3.11+
+- [FastAPI](https://fastapi.tiangolo.com/) — async HTTP API
+- [GLiNER2](https://github.com/urchade/gliner) — typed schema entity extraction
+- [psycopg](https://www.psycopg.org/) — async PostgreSQL driver
+- [qdrant-client](https://github.com/qdrant/qdrant-client) — vector search
+- [Pydantic](https://docs.pydantic.dev/) — request/response models
+- [pytest](https://pytest.org/) + [pytest-asyncio](https://pytest-asyncio.readthedocs.io/) — testing
 
 ## License
 

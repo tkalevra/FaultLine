@@ -40,12 +40,42 @@ OUTPUT FORMAT — exactly this, nothing else:
 [{"subject":"...","object":"...","rel_type":"also_known_as","low_confidence":false,"is_preferred_label":true}]"""
 
 
-_INGEST_KEYWORDS = {
-    "is", "are", "was", "were", "has", "have", "like", "likes", "loves",
-    "enjoys", "hates", "knows", "works", "married", "son", "daughter",
-    "wife", "husband", "parent", "child", "sibling", "brother", "sister",
-    "nickname", "called",
-}
+async def _should_ingest(text: str, valves) -> bool:
+    """Ask Qwen if this message contains a factual assertion worth storing."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.post(
+                valves.QWEN_URL,
+                json={
+                    "model": valves.QWEN_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a fact detection classifier. "
+                                "Respond with only the single word 'yes' or 'no'. "
+                                "No punctuation, no explanation."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Does this message contain a factual assertion "
+                                f"about a person, place, animal, object, or "
+                                f"relationship that is worth storing as a "
+                                f"long-term memory?\n\n\"{text}\""
+                            )
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 5,
+                    "thinking": {"type": "disabled"}
+                }
+            )
+        result = r.json()["choices"][0]["message"]["content"].strip().lower()
+        return result.startswith("yes")
+    except Exception:
+        return True
 
 
 async def rewrite_to_triples(text: str, valves) -> list[dict]:
@@ -173,13 +203,15 @@ class Filter:
 
             text_lower = text.lower()
             words = text_lower.split()
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] inlet text='{text[:80]}' words={len(words)} keyword_match={bool(set(words) & _INGEST_KEYWORDS or 'also known' in text_lower)}")
 
-            keyword_match = len(words) >= 5 and bool(
-                set(words) & _INGEST_KEYWORDS or "also known" in text_lower
-            )
-            will_ingest = self.valves.INGEST_ENABLED and keyword_match
+            should_ingest = False
+            if len(words) >= 5:
+                should_ingest = await _should_ingest(text, self.valves)
+
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] inlet text='{text[:80]}' words={len(words)} should_ingest={should_ingest}")
+
+            will_ingest = self.valves.INGEST_ENABLED and should_ingest
             will_query = self.valves.QUERY_ENABLED
 
             if not will_ingest and not will_query:
