@@ -32,3 +32,11 @@ class FactStoreManager:
         except psycopg2.Error:
             self.db_conn.rollback()
             raise
+
+    def mark_contradicted(self, old_id: int, new_id: int) -> None:
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE facts SET contradicted_by = %s WHERE id = %s",
+                (new_id, old_id),
+            )
+        self.db_conn.commit()
