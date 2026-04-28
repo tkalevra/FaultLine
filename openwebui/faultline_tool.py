@@ -8,10 +8,70 @@ requirements: httpx
 
 import asyncio
 import json
+import os
 from typing import Optional
 
 import httpx
 from pydantic import BaseModel
+
+
+_TRIPLE_SYSTEM_PROMPT = """\
+You are a relationship fact extractor. Output ONLY a raw JSON array, nothing else.
+No thinking, no explanation, no markdown, no code fences, no preamble.
+
+STRICT RULES:
+1. Only extract relationships explicitly stated in the text.
+2. Entities must be proper names only. No pronouns, no "the user", no generics.
+3. All subject and object values must be lowercase.
+4. rel_type must be EXACTLY one of: parent_of, child_of, spouse, sibling_of, also_known_as, works_for
+5. also_known_as means nickname or alias ONLY — e.g. "Cyrus also known as Cy" → {"subject":"cyrus","object":"cy","rel_type":"also_known_as"}
+6. parent_of means a parent-child relationship — e.g. "Christopher has a son Cyrus" → {"subject":"christopher","object":"cyrus","rel_type":"parent_of"}
+7. spouse means married or partnered — e.g. "Christopher's spouse is Marla" → {"subject":"christopher","object":"marla","rel_type":"spouse"}
+8. Never use also_known_as for a parent-child or spouse relationship.
+9. If unsure, set "low_confidence": true. Never silently drop a relation.
+10. If the input contains a first-person statement identifying the speaker's name (e.g. "My name is X", "I am X", "I'm X"), emit exactly one triple: {"subject":"user","object":"<name>","rel_type":"also_known_as","low_confidence":false}
+
+OUTPUT FORMAT — exactly this, nothing else:
+[{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]"""
+
+
+async def rewrite_to_triples(text: str, valves) -> list[dict]:
+    """
+    Send text to the Qwen model and parse the returned JSON triple array.
+    Returns [] on any failure so the caller can handle the empty-edge case.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
+            response = await client.post(
+                valves.QWEN_URL,
+                json={
+                    "model": valves.QWEN_MODEL,
+                    "messages": [
+                        {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "repeat_penalty": 1.0,
+                    "max_tokens": 500,
+                    "thinking": {"type": "disabled"},
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"].strip()
+            triples = json.loads(content)
+            if not isinstance(triples, list):
+                return []
+            return triples
+    except httpx.HTTPStatusError as e:
+        if valves.ENABLE_DEBUG:
+            print(f"[FaultLine] rewrite_to_triples HTTP error: {e.response.status_code}")
+            print(f"[FaultLine] rewrite_to_triples response body: {e.response.text}")
+        return []
+    except Exception as e:
+        if valves.ENABLE_DEBUG:
+            print(f"[FaultLine] rewrite_to_triples failed: {e}")
+        return []
 
 
 class Filter:
@@ -25,6 +85,9 @@ class Filter:
     class Valves(BaseModel):
         FAULTLINE_URL: str = "http://192.168.40.10:8001"
         FAULTLINE_TIMEOUT: int = 30
+        QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
+        QWEN_MODEL: str = "qwen/qwen3.5-9b@q4_k_m"
+        QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
         ENABLED: bool = True
@@ -83,26 +146,74 @@ class Filter:
         __user__: Optional[dict] = None,
     ) -> dict:
         """
-        Fire-and-forget ingest of the user's message into the WGM pipeline.
-        Does not block the conversation flow.
+        Rewrite the user's message to structured triples via Qwen, fire-and-forget
+        ingest, then query FaultLine for relevant memories and inject them into
+        the user message before the model sees it.
         """
         if not self.valves.ENABLED or not self.valves.INGEST_ENABLED:
             return body
 
         try:
             text = self._last_message(body.get("messages", []), "user")
-            if text:
+            if not text:
+                return body
+
+            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+
+            raw_triples = await rewrite_to_triples(text, self.valves)
+            confident = [e for e in raw_triples if not e.get("low_confidence", False)]
+            edges = [
+                {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
+                for e in confident
+                if e.get("subject") and e.get("object") and e.get("rel_type")
+            ]
+
+            if edges:
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] inlet firing ingest: {text[:80]}")
-                user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+                    print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
                 asyncio.create_task(
                     self._fire_ingest(
                         text,
                         self.valves.DEFAULT_SOURCE,
                         user_id,
-                        edges=None,
+                        edges=edges,
                     )
                 )
+
+            try:
+                async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                    resp = await client.post(
+                        f"{self.valves.FAULTLINE_URL}/query",
+                        json={"text": text, "user_id": user_id},
+                    )
+                if resp.status_code == 200:
+                    facts = resp.json().get("facts", [])
+                    if facts:
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] inlet injecting {len(facts)} facts into user message")
+                        identity = next(
+                            (f.get("object") for f in facts
+                             if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
+                            None,
+                        )
+                        identity_line = (
+                            f"You are {identity} in these facts.\n"
+                            if identity
+                            else "Note: you are the user these facts refer to.\n"
+                        )
+                        fact_lines = "\n".join(
+                            f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
+                            for f in facts
+                        )
+                        memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}{fact_lines}"
+                        messages = body.get("messages", [])
+                        for i in reversed(range(len(messages))):
+                            if messages[i].get("role") == "user":
+                                messages[i]["content"] = messages[i]["content"] + memory_block
+                                break
+            except Exception:
+                pass
+
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] inlet error: {e}")
@@ -114,64 +225,4 @@ class Filter:
         body: dict,
         __user__: Optional[dict] = None,
     ) -> dict:
-        """
-        Query Qdrant for facts relevant to the user's message and append them
-        as a memory block below the assistant's response.
-        """
-        if not self.valves.ENABLED or not self.valves.QUERY_ENABLED:
-            return body
-
-        try:
-            # Use the user's question as the retrieval query, not the assistant's response
-            text = self._last_message(body.get("messages", []), "user")
-            if not text:
-                return body
-
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] outlet querying: {text[:80]}")
-
-            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
-
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                response = await client.post(
-                    f"{self.valves.FAULTLINE_URL}/query",
-                    json={"text": text, "user_id": user_id},
-                )
-
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] outlet query status: {response.status_code}")
-
-            if response.status_code != 200:
-                return body
-
-            facts = response.json().get("facts", [])
-
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] outlet facts returned: {len(facts)}")
-
-            if not facts:
-                return body
-
-            fact_lines = "\n".join(
-                f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
-                for f in facts
-            )
-            memory_block = f"\n\n---\n🧠 **Memory context from FaultLine:**\n{fact_lines}"
-
-            messages = body.get("messages", [])
-            for i in reversed(range(len(messages))):
-                if messages[i].get("role") == "assistant":
-                    messages[i]["content"] = messages[i]["content"] + memory_block
-                    break
-
-        except httpx.ConnectError:
-            if self.valves.ENABLE_DEBUG:
-                print("[FaultLine Filter] outlet: FaultLine unreachable")
-        except httpx.TimeoutException:
-            if self.valves.ENABLE_DEBUG:
-                print("[FaultLine Filter] outlet: FaultLine timeout")
-        except Exception as e:
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] outlet error: {e}")
-
         return body

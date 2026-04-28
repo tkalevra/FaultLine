@@ -12,19 +12,22 @@ from pydantic import BaseModel
 
 
 _TRIPLE_SYSTEM_PROMPT = """\
-You are a fact extraction engine. Your only job is to convert natural language into structured relationship triples.
+You are a relationship fact extractor. Output ONLY a raw JSON array, nothing else.
+No thinking, no explanation, no markdown, no code fences, no preamble.
 
-RULES — follow every rule exactly, no exceptions:
-1. Output ONLY a JSON array. No preamble, no explanation, no markdown, no code fences.
-2. Every entity must be a real named entity (a proper noun). Never use pronouns (I, my, he, she, they, we), never use "the user", never use generic nouns.
+STRICT RULES:
+1. Only extract relationships explicitly stated in the text.
+2. Entities must be proper names only. No pronouns, no "the user", no generics.
 3. All subject and object values must be lowercase.
-4. rel_type must be one of exactly: parent_of, child_of, spouse, sibling_of, also_known_as, works_for
-5. For every nickname or alias mentioned, emit a separate also_known_as triple.
-6. If you cannot confidently extract a relation, still include it with "low_confidence": true. Never silently drop ambiguous relations.
-7. Do not infer relations that are not explicitly stated in the input.
+4. rel_type must be EXACTLY one of: parent_of, child_of, spouse, sibling_of, also_known_as, works_for
+5. also_known_as means nickname or alias ONLY — e.g. "Cyrus also known as Cy" → {"subject":"cyrus","object":"cy","rel_type":"also_known_as"}
+6. parent_of means a parent-child relationship — e.g. "Christopher has a son Cyrus" → {"subject":"christopher","object":"cyrus","rel_type":"parent_of"}
+7. spouse means married or partnered — e.g. "Christopher's spouse is Marla" → {"subject":"christopher","object":"marla","rel_type":"spouse"}
+8. Never use also_known_as for a parent-child or spouse relationship.
+9. If unsure, set "low_confidence": true. Never silently drop a relation.
 
-OUTPUT SCHEMA (each item):
-{"subject": string, "object": string, "rel_type": string, "low_confidence": boolean}"""
+OUTPUT FORMAT — exactly this, nothing else:
+[{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]"""
 
 
 async def rewrite_to_triples(text: str, valves) -> list[dict]:
@@ -37,12 +40,16 @@ async def rewrite_to_triples(text: str, valves) -> list[dict]:
             response = await client.post(
                 valves.QWEN_URL,
                 json={
+                    "model": valves.QWEN_MODEL,
                     "messages": [
                         {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
                         {"role": "user", "content": text},
                     ],
                     "temperature": 0.0,
+                    "top_p": 1.0,
+                    "repeat_penalty": 1.0,
                     "max_tokens": 500,
+                    "thinking": {"type": "disabled"},
                 },
             )
             response.raise_for_status()
@@ -66,6 +73,7 @@ class Function:
         FAULTLINE_URL: str = "http://faultline:8001"
         FAULTLINE_TIMEOUT: int = 20
         QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
+        QWEN_MODEL: str = "qwen/qwen3.5-9b@q4_k_m"
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
