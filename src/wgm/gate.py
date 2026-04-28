@@ -11,6 +11,9 @@ SEED_ONTOLOGY = {
     "sibling_of":     {"subject_role": "sibling",   "object_role": "sibling"},
     "also_known_as":  {"subject_role": "canonical", "object_role": "alias"},
     "related_to":     {"subject_role": "entity",    "object_role": "entity"},
+    "likes":          {"subject_role": "subject",   "object_role": "target"},
+    "dislikes":       {"subject_role": "subject",   "object_role": "target"},
+    "prefers":        {"subject_role": "subject",   "object_role": "target"},
 }
 
 class WGMValidationGate:
