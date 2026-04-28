@@ -33,10 +33,19 @@ class FactStoreManager:
             self.db_conn.rollback()
             raise
 
-    def mark_contradicted(self, old_id: int, new_id: int) -> None:
+    def mark_contradicted(self, old_id: int, new_id: int, penalty: float = 0.5) -> None:
+        """
+        Penalize old_id by reducing its confidence by penalty and linking it to new_id.
+        Uses GREATEST to floor confidence at 0.0. Penalty is stored for audit.
+        """
         with self.db_conn.cursor() as cur:
             cur.execute(
-                "UPDATE facts SET contradicted_by = %s WHERE id = %s",
-                (new_id, old_id),
+                "UPDATE facts SET"
+                "  confidence = GREATEST(confidence - %s, 0.0),"
+                "  contradicted_by = %s,"
+                "  contradiction_confidence_penalty = %s,"
+                "  updated_at = now()"
+                " WHERE id = %s",
+                (penalty, new_id, penalty, old_id),
             )
         self.db_conn.commit()

@@ -28,8 +28,8 @@ class WGMValidationGate:
         Returns {"status": "novel"} if rel_type not in ontology.
         Returns {"status": "valid"} when no contradiction exists.
         When user_id is supplied and a contradiction is detected (same user+subject+rel,
-        different object): inserts the new fact, marks the old one as contradicted, and
-        returns {"status": "conflict", "new_id": int, "old_id": int}.
+        different object): inserts the new fact, penalizes all superseded facts via
+        mark_contradicted, and returns a conflict dict with the penalty details.
         """
         rt = rel_type.lower().strip()
         if rt not in SEED_ONTOLOGY:
@@ -40,15 +40,14 @@ class WGMValidationGate:
 
         with self.db_conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM facts"
+                "SELECT id, confidence FROM facts"
                 " WHERE user_id = %s AND subject_id = %s AND rel_type = %s AND object_id != %s",
                 (user_id, subject_id, rt, object_id),
             )
-            old_row = cur.fetchone()
-            if old_row is None:
+            old_rows = cur.fetchall()
+            if not old_rows:
                 return {"status": "valid"}
 
-            old_id = old_row[0]
             cur.execute(
                 "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"
                 " VALUES (%s, %s, %s, %s, %s) RETURNING id",
@@ -57,5 +56,15 @@ class WGMValidationGate:
             new_id = cur.fetchone()[0]
 
         self.db_conn.commit()
-        FactStoreManager(self.db_conn).mark_contradicted(old_id, new_id)
-        return {"status": "conflict", "new_id": new_id, "old_id": old_id}
+
+        manager = FactStoreManager(self.db_conn)
+        for old_id, _ in old_rows:
+            manager.mark_contradicted(old_id, new_id, penalty=0.5)
+
+        first_old_id, first_old_confidence = old_rows[0]
+        return {
+            "status": "conflict",
+            "new_fact_id": new_id,
+            "superseded_fact_id": first_old_id,
+            "old_confidence_after_penalty": max(first_old_confidence - 0.5, 0.0),
+        }

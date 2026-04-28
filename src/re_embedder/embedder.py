@@ -29,7 +29,8 @@ def fetch_unsynced(db_conn) -> list[dict]:
     with db_conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, subject_id, object_id, rel_type, provenance, user_id
+            SELECT id, subject_id, object_id, rel_type, provenance, user_id,
+                   confidence, confirmed_count, last_seen_at, contradicted_by
             FROM facts
             WHERE qdrant_synced = false
             ORDER BY id ASC
@@ -44,7 +45,11 @@ def fetch_unsynced(db_conn) -> list[dict]:
             "object_id": row[2],
             "rel_type": row[3],
             "provenance": row[4],
-            "user_id": row[5] if len(row) > 5 and row[5] else "anonymous",
+            "user_id": row[5] if row[5] else "anonymous",
+            "confidence": row[6] if row[6] is not None else 1.0,
+            "confirmed_count": row[7] if row[7] is not None else 0,
+            "last_seen_at": row[8],
+            "contradicted_by": row[9],
         }
         for row in rows
     ]
@@ -165,6 +170,10 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                             "provenance": row["provenance"],
                             "user_id": row["user_id"],
                             "fact_id": int(row["id"]),
+                            "confidence": row.get("confidence", 1.0),
+                            "confirmed_count": row.get("confirmed_count", 0),
+                            "last_seen_at": row["last_seen_at"].isoformat() if row.get("last_seen_at") else None,
+                            "contradicted": row.get("contradicted_by") is not None,
                         }
                     }
                 ]
