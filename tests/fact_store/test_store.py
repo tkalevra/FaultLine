@@ -59,5 +59,42 @@ def test_mark_contradicted():
     cursor = mock_conn.cursor.return_value.__enter__.return_value
     sql, params = cursor.execute.call_args[0]
     assert "contradicted_by" in sql
-    assert params == (99, 42)
+    assert "GREATEST" in sql
+    assert params == (0.5, 99, 0.5, 42)
     mock_conn.commit.assert_called_once()
+
+
+def test_mark_contradicted_reduces_confidence(mock_db):
+    manager = FactStoreManager(mock_db)
+    manager.mark_contradicted(old_id=42, new_id=99, penalty=0.5)
+
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    sql, params = cursor.execute.call_args[0]
+    assert "GREATEST" in sql
+    assert "confidence" in sql
+    assert "contradicted_by" in sql
+    assert "contradiction_confidence_penalty" in sql
+    assert 0.5 in params
+    assert 99 in params
+    assert 42 in params
+    mock_db.commit.assert_called_once()
+
+
+def test_mark_contradicted_floors_at_zero(mock_db):
+    manager = FactStoreManager(mock_db)
+    manager.mark_contradicted(old_id=1, new_id=2, penalty=0.5)
+
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    sql, _ = cursor.execute.call_args[0]
+    assert "GREATEST" in sql
+    assert "0.0" in sql
+
+
+def test_mark_contradicted_twice(mock_db):
+    manager = FactStoreManager(mock_db)
+    manager.mark_contradicted(old_id=1, new_id=2, penalty=0.5)
+    manager.mark_contradicted(old_id=1, new_id=3, penalty=0.5)
+
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    assert cursor.execute.call_count == 2
+    assert mock_db.commit.call_count == 2

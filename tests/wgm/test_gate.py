@@ -64,24 +64,42 @@ def test_conflict_inserts_new_fact():
     """Conflicting edge (same user+subject+rel, different object) gets inserted, not dropped."""
     mock_conn = MagicMock()
     cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
-    cursor_mock.fetchone.side_effect = [(42,), (99,)]  # old_id=42, then new_id=99
+    cursor_mock.fetchall.return_value = [(42, 1.0)]  # old fact: id=42, confidence=1.0
+    cursor_mock.fetchone.return_value = (99,)  # new_id from RETURNING
 
     gate = WGMValidationGate(mock_conn)
-    result = gate.validate_edge("alice", "corp_b", "works_for",
+    result = gate.validate_edge("christopher", "christophe", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["status"] == "conflict"
-    assert result["old_id"] == 42
-    assert result["new_id"] == 99
     all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
     assert any("INSERT" in s for s in all_sql)
+
+
+def test_conflict_penalizes_old_fact():
+    """After conflict INSERT, old fact confidence drops by penalty and gets linked."""
+    mock_conn = MagicMock()
+    cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+    cursor_mock.fetchall.return_value = [(42, 1.0)]  # old: id=42, confidence=1.0
+    cursor_mock.fetchone.return_value = (99,)
+
+    gate = WGMValidationGate(mock_conn)
+    result = gate.validate_edge("christopher", "christophe", "also_known_as",
+                                user_id="user1", provenance="doc")
+
+    assert result["superseded_fact_id"] == 42
+    assert result["new_fact_id"] == 99
+    assert result["old_confidence_after_penalty"] == pytest.approx(0.5)
+    all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
+    assert any("GREATEST" in s for s in all_sql)
 
 
 def test_conflict_marks_old_superseded():
     """After a conflict INSERT, old fact's contradicted_by is updated to new fact id."""
     mock_conn = MagicMock()
     cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
-    cursor_mock.fetchone.side_effect = [(42,), (99,)]
+    cursor_mock.fetchall.return_value = [(42, 1.0)]
+    cursor_mock.fetchone.return_value = (99,)
 
     gate = WGMValidationGate(mock_conn)
     gate.validate_edge("alice", "corp_b", "works_for",
@@ -95,7 +113,7 @@ def test_valid_path_unaffected():
     """Valid edge with no prior conflict returns status=valid, no contradicted_by update."""
     mock_conn = MagicMock()
     cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
-    cursor_mock.fetchone.return_value = None  # no existing conflicting fact
+    cursor_mock.fetchall.return_value = []  # no existing conflicting fact
 
     gate = WGMValidationGate(mock_conn)
     result = gate.validate_edge("alice", "corp", "works_for", user_id="user1")
