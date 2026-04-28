@@ -28,12 +28,13 @@ def test_validate_conflict():
     """Known rel_type but a different rel already exists for same pair → conflict."""
     mock_conn = MagicMock()
     cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
-    cursor_mock.fetchall.return_value = [("IS_A",)]
+    cursor_mock.fetchall.return_value = [(42, 1.0)]  # Existing fact with id=42, confidence=1.0
+    cursor_mock.fetchone.return_value = (99,)  # New fact id from RETURNING
 
     gate = WGMValidationGate(mock_conn)
-    result = gate.validate_edge(1, 2, "KILLS")
+    result = gate.validate_edge(1, 2, "is_a", user_id="user1", provenance="doc")
 
-    assert result == {"status": "conflict"}
+    assert result["status"] == "conflict"
 
 
 def test_validate_valid_edge():
@@ -139,3 +140,125 @@ def test_occupation_in_ontology():
     """New rel_type 'occupation' is in the ontology."""
     from wgm.gate import SEED_ONTOLOGY
     assert "occupation" in SEED_ONTOLOGY
+
+
+def test_rel_type_registry_loads_from_db():
+    """RelTypeRegistry can load types from mock DB."""
+    from wgm.gate import RelTypeRegistry
+    from unittest.mock import MagicMock, patch
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = None
+    mock_cursor.fetchall.return_value = [("is_a",), ("works_for",), ("spouse",)]
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.__exit__.return_value = None
+    mock_conn.cursor.return_value = mock_cursor
+
+    with patch("wgm.gate.psycopg2.connect", return_value=mock_conn):
+        registry = RelTypeRegistry("fake_dsn")
+        types = registry.get_valid_types()
+
+    assert "is_a" in types
+    assert "works_for" in types
+    assert "spouse" in types
+
+
+def test_rel_type_registry_is_valid():
+    """RelTypeRegistry.is_valid checks membership correctly."""
+    from wgm.gate import RelTypeRegistry
+    from unittest.mock import MagicMock, patch
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = None
+    mock_cursor.fetchall.return_value = [("is_a",), ("works_for",)]
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.__exit__.return_value = None
+    mock_conn.cursor.return_value = mock_cursor
+
+    with patch("wgm.gate.psycopg2.connect", return_value=mock_conn):
+        registry = RelTypeRegistry("fake_dsn")
+        assert registry.is_valid("is_a") is True
+        assert registry.is_valid("unknown_type") is False
+
+
+def test_novel_type_approved_by_qwen():
+    """When Qwen approves a novel type with confidence >= 0.7, it gets inserted to rel_types."""
+    from wgm.gate import WGMValidationGate
+    from unittest.mock import MagicMock, patch
+
+    mock_db = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = None
+    mock_db.cursor.return_value = mock_cursor
+
+    qwen_response = MagicMock()
+    qwen_response.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"valid": true, "label": "influenced by", "wikidata_pid": "P1891", "confidence": 0.85, "reason": "Valid relationship"}'
+                }
+            }
+        ]
+    }
+    qwen_response.raise_for_status.return_value = None
+
+    with patch("wgm.gate.httpx.post", return_value=qwen_response):
+        with patch("wgm.gate.os.getenv", return_value="http://qwen:8000/v1/chat/completions"):
+            gate = WGMValidationGate(mock_db)
+            result = gate._try_approve_novel_type("influenced_by")
+
+    assert result is True
+    mock_db.cursor.assert_called()
+
+
+def test_novel_type_rejected_by_qwen():
+    """When Qwen rejects a novel type (confidence < 0.7), it gets inserted to pending_types."""
+    from wgm.gate import WGMValidationGate
+    from unittest.mock import MagicMock, patch
+
+    mock_db = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = None
+    mock_db.cursor.return_value = mock_cursor
+
+    qwen_response = MagicMock()
+    qwen_response.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"valid": false, "label": "unknown", "wikidata_pid": null, "confidence": 0.2, "reason": "Not a standard relationship"}'
+                }
+            }
+        ]
+    }
+    qwen_response.raise_for_status.return_value = None
+
+    with patch("wgm.gate.httpx.post", return_value=qwen_response):
+        with patch("wgm.gate.os.getenv", return_value="http://qwen:8000/v1/chat/completions"):
+            gate = WGMValidationGate(mock_db)
+            result = gate._try_approve_novel_type("nonsense_type")
+
+    assert result is False
+
+
+def test_novel_type_qwen_timeout():
+    """When Qwen times out, the edge does not get approved (graceful failure)."""
+    from wgm.gate import WGMValidationGate
+    from unittest.mock import MagicMock, patch
+    import httpx
+
+    mock_db = MagicMock()
+
+    with patch("wgm.gate.httpx.post", side_effect=httpx.TimeoutException("timeout")):
+        with patch("wgm.gate.os.getenv", return_value="http://qwen:8000/v1/chat/completions"):
+            gate = WGMValidationGate(mock_db)
+            result = gate._try_approve_novel_type("some_type")
+
+    assert result is False

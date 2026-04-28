@@ -95,3 +95,26 @@ def test_ingest_edges_no_dsn(client):
             "edges": [{"subject": "Alice", "object": "Acme Corp", "rel_type": "WORKS_FOR"}],
         })
     assert r.status_code == 503
+
+
+def test_bracket_constraint_built_from_db():
+    """_build_rel_type_constraint should load types from DB and create pipe-separated string."""
+    from api.main import _build_rel_type_constraint
+    from unittest.mock import MagicMock, patch
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = None
+    mock_cursor.fetchall.return_value = [("is_a",), ("works_for",), ("spouse",)]
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.__exit__.return_value = None
+    mock_conn.cursor.return_value = mock_cursor
+
+    with patch("api.main.psycopg2.connect", return_value=mock_conn):
+        constraint = _build_rel_type_constraint("fake_dsn")
+
+    assert "is_a" in constraint
+    assert "works_for" in constraint
+    assert "spouse" in constraint
+    assert "|" in constraint
