@@ -12,6 +12,14 @@ from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestRe
 
 log = structlog.get_logger()
 
+_PREFERENCE_SIGNALS = {
+    "goes by", "prefers to be called", "preferred name", "please call me",
+    "call me", "known as", "my name is"
+}
+
+def _detect_preference_signal(text: str) -> bool:
+    text_lower = text.lower()
+    return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
 
 _gliner2_model = None
 
@@ -81,12 +89,33 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
         try:
             gate, manager = WGMValidationGate(db), FactStoreManager(db)
             rows = []
+            has_preferred = _detect_preference_signal(req.text)
+
             for edge in edges:
                 if edge.subject == edge.object: continue
                 status = gate.validate_edge(edge.subject, edge.object, edge.rel_type)["status"]
                 facts.append(FactResult(subject=edge.subject, object=edge.object, rel_type=edge.rel_type, status=status))
-                if status == "valid": rows.append((req.user_id, edge.subject, edge.object, edge.rel_type, req.source))
-            if rows: committed = manager.commit(rows)
+                if status == "valid":
+                    is_preferred = (
+                        (edge.rel_type.lower() == "also_known_as" and
+                         (has_preferred or edge.is_preferred_label))
+                    )
+                    rows.append((req.user_id, edge.subject, edge.object, edge.rel_type, req.source, is_preferred))
+
+            if rows:
+                committed = manager.commit(rows)
+
+                with db.cursor() as cur:
+                    for row in rows:
+                        user_id, subject, obj, rel_type, source, is_preferred = row
+                        if rel_type.lower() == "also_known_as" and is_preferred:
+                            cur.execute(
+                                "UPDATE facts SET is_preferred_label = false"
+                                " WHERE user_id = %s AND subject_id = %s AND rel_type = 'also_known_as'"
+                                " AND object_id != %s",
+                                (user_id, subject, obj),
+                            )
+                    db.commit()
         finally: db.close()
 
     return IngestResponse(status="valid", committed=committed, 
@@ -106,7 +135,21 @@ def query(request: QueryRequest):
     vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
     if vector is None:
         log.warning("query.embed_unavailable — skipping Qdrant search")
-        return {"status": "ok", "facts": []}
+        return {"status": "ok", "facts": [], "preferred_names": {}}
+
+    preferred_names = {}
+    try:
+        db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT subject_id, object_id FROM facts"
+                " WHERE user_id = %s AND rel_type = 'also_known_as' AND is_preferred_label = true",
+                (user_id,),
+            )
+            preferred_names = {row[0]: row[1] for row in cur.fetchall()}
+        db.close()
+    except Exception as e:
+        log.warning("query.preferred_names_error", error=str(e))
 
     try:
         resp = httpx.post(
@@ -116,10 +159,10 @@ def query(request: QueryRequest):
         )
         if resp.status_code == 404:
             ensure_collection(collection, qdrant_url)
-            return {"status": "ok", "facts": []}
+            return {"status": "ok", "facts": [], "preferred_names": preferred_names}
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
-            return {"status": "ok", "facts": []}
+            return {"status": "ok", "facts": [], "preferred_names": preferred_names}
 
         facts = [
             {
@@ -132,7 +175,7 @@ def query(request: QueryRequest):
             if h.get("payload")
         ]
         log.info("query.ok", collection=collection, hits=len(facts))
-        return {"status": "ok", "facts": facts}
+        return {"status": "ok", "facts": facts, "preferred_names": preferred_names}
     except Exception as e:
         log.error("query.failed", error=str(e))
-        return {"status": "ok", "facts": []}
+        return {"status": "ok", "facts": [], "preferred_names": preferred_names}
