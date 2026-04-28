@@ -11,6 +11,52 @@ import httpx
 from pydantic import BaseModel
 
 
+_TRIPLE_SYSTEM_PROMPT = """\
+You are a fact extraction engine. Your only job is to convert natural language into structured relationship triples.
+
+RULES — follow every rule exactly, no exceptions:
+1. Output ONLY a JSON array. No preamble, no explanation, no markdown, no code fences.
+2. Every entity must be a real named entity (a proper noun). Never use pronouns (I, my, he, she, they, we), never use "the user", never use generic nouns.
+3. All subject and object values must be lowercase.
+4. rel_type must be one of exactly: parent_of, child_of, spouse, sibling_of, also_known_as, works_for
+5. For every nickname or alias mentioned, emit a separate also_known_as triple.
+6. If you cannot confidently extract a relation, still include it with "low_confidence": true. Never silently drop ambiguous relations.
+7. Do not infer relations that are not explicitly stated in the input.
+
+OUTPUT SCHEMA (each item):
+{"subject": string, "object": string, "rel_type": string, "low_confidence": boolean}"""
+
+
+async def rewrite_to_triples(text: str, valves) -> list[dict]:
+    """
+    Send text to the Qwen model and parse the returned JSON triple array.
+    Returns [] on any failure so the caller can handle the empty-edge case.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
+            response = await client.post(
+                valves.QWEN_URL,
+                json={
+                    "messages": [
+                        {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 500,
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"].strip()
+            triples = json.loads(content)
+            if not isinstance(triples, list):
+                return []
+            return triples
+    except Exception as e:
+        if valves.ENABLE_DEBUG:
+            print(f"[FaultLine] rewrite_to_triples failed: {e}")
+        return []
+
+
 class Function:
     """OpenWebUI v0.9.2 Function for FaultLine WGM tool."""
 
@@ -19,6 +65,8 @@ class Function:
 
         FAULTLINE_URL: str = "http://faultline:8001"
         FAULTLINE_TIMEOUT: int = 20
+        QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
+        QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
         ENABLED: bool = True
@@ -60,57 +108,55 @@ class Function:
         """
         Store a validated fact via the FaultLine WGM pipeline.
 
-        IMPORTANT: You MUST provide edges. This tool does nothing useful without them.
-        Always include at least one edge describing the relationship found in the text.
+        The model should call this with the sentence or passage containing the fact.
+        Edges are rewritten by Qwen before commit — explicit edges passed by the model
+        are overridden by the Qwen extraction.
 
         Args:
             text:   The sentence or passage containing the fact.
-            edges:  Required. A list of explicit edges to validate and commit.
-                    Each edge is {"subject": str, "object": str, "rel_type": str}.
-                    subject is the entity ORIGINATING the relationship.
-                    object  is the entity RECEIVING the relationship.
-                    All values must be lowercase.
+            edges:  Ignored — edges are derived from text via Qwen rewrite.
             source: Provenance label recorded in the fact store (defaults to valve config).
 
-        Available rel_types (use exactly as written, lowercase):
-            parent_of   subject=parent      object=child
-            child_of    subject=child       object=parent
-            works_for   subject=employee    object=employer
-            created_by  subject=creation    object=creator
-            kills       subject=agent       object=target
-            part_of     subject=component   object=whole
-            is_a        subject=subtype     object=supertype
-
-        Directionality examples:
-            "Tom is Jenny's father"       → subject=tom,       object=jenny,     rel_type=parent_of
-            "Jenny is Tom's daughter"     → subject=jenny,     object=tom,       rel_type=child_of
-            "Alice works for Acme Corp"   → subject=alice,     object=acme corp, rel_type=works_for
-            "Bob created the algorithm"   → subject=algorithm, object=bob,       rel_type=created_by
+        Available rel_types:
+            parent_of, child_of, spouse, sibling_of, also_known_as, works_for
         """
 
-        # Check ENABLED first — scope valve
         if not self.valves.ENABLED:
             return "[FaultLine] Tool is disabled."
+
+        await self._emit(__event_emitter__, "Extracting triples...")
+
+        # Rewrite text to clean triples via Qwen — overrides any model-supplied edges
+        raw_triples = await rewrite_to_triples(text, self.valves)
+
+        if self.valves.ENABLE_DEBUG:
+            print(f"[FaultLine] raw_triples: {json.dumps(raw_triples, indent=2)}")
+
+        # Strip low-confidence edges
+        confident = [e for e in raw_triples if not e.get("low_confidence", False)]
+
+        # Remove the low_confidence key — EdgeInput does not accept it
+        edges = [
+            {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
+            for e in confident
+            if e.get("subject") and e.get("object") and e.get("rel_type")
+        ]
 
         # Validate edges are present
         if not edges:
             await self._emit(
                 __event_emitter__,
-                "[FaultLine] No edges provided — nothing to commit. "
-                "Available rel_types: parent_of, child_of, works_for, "
-                "created_by, kills, part_of, is_a"
+                "[FaultLine] No confident triples extracted — nothing to commit."
             )
             return (
-                "[FaultLine] No edges provided — nothing to commit. "
-                "You must supply edges with subject, object, and rel_type. "
-                "Available rel_types: parent_of, child_of, works_for, "
-                "created_by, kills, part_of, is_a"
+                "[FaultLine] No confident triples extracted — nothing to commit. "
+                "Available rel_types: parent_of, child_of, spouse, sibling_of, "
+                "also_known_as, works_for"
             )
 
         # Normalize edges to lowercase
         normalized_edges = self._normalize_edges(edges)
 
-        # Check if any edges survived normalization
         if not normalized_edges:
             await self._emit(
                 __event_emitter__,
@@ -124,7 +170,6 @@ class Function:
 
         source = source or self.valves.DEFAULT_SOURCE
 
-        # Build payload
         payload = {
             "text": text,
             "source": source,
@@ -135,7 +180,6 @@ class Function:
             print(f"[FaultLine Debug] POST {self.valves.FAULTLINE_URL}/ingest")
             print(f"[FaultLine Debug] Payload: {json.dumps(payload, indent=2)}")
 
-        # Emit start status
         await self._emit(__event_emitter__, "Validating facts...")
 
         try:
@@ -194,7 +238,6 @@ class Function:
         else:
             result = f"[FaultLine] status={status} committed={committed}"
 
-        # Emit final status with done flag
         if __event_emitter__:
             await __event_emitter__(
                 {"type": "status", "data": {"description": result, "done": True}}
