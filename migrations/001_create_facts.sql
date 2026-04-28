@@ -21,7 +21,7 @@ CREATE INDEX IF NOT EXISTS idx_facts_user_object
     ON facts (user_id, object_id);
 
 -- Track which facts have been synced to Qdrant
-ALTER TABLE facts ADD COLUMN IF NOT EXISTS qdrant_synced BOOLEAN DEFAULT false;
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS qdrant_synced BOOLEAN NOT NULL DEFAULT false;
 
 CREATE INDEX IF NOT EXISTS idx_facts_unsynced
     ON facts (qdrant_synced, user_id)

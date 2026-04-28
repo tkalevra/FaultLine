@@ -215,21 +215,23 @@ def main():
                 if rows:
                     log.info(f"re_embedder.batch_start count={len(rows)}")
 
+                    # Ensure every collection needed by this batch exists before
+                    # processing any rows — a deleted collection is recovered within
+                    # one loop cycle rather than causing rows to be skipped.
+                    seen_collections: set[str] = set()
+                    for row in rows:
+                        col = derive_collection(row["user_id"])
+                        if col not in seen_collections:
+                            seen_collections.add(col)
+                            if not ensure_collection(col, qdrant_url):
+                                log.error(f"re_embedder.collection_unavailable collection={col}")
+
                 for row in rows:
                     try:
-                        # Embed the fact
                         text = f"{row['subject_id']} {row['rel_type']} {row['object_id']}"
                         vector = embed_text(text, qwen_api_url)
-
-                        # Determine collection
                         collection = derive_collection(row["user_id"])
 
-                        # Ensure collection exists
-                        if not ensure_collection(collection, qdrant_url):
-                            log.error(f"re_embedder.collection_unavailable fact_id={row['id']} collection={collection}")
-                            continue
-
-                        # Upsert to Qdrant
                         if upsert_to_qdrant(row, vector, collection, qdrant_url):
                             mark_synced(db, row["id"])
                             log.info(
