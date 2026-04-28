@@ -41,4 +41,62 @@ def resolve_entities(query_input, model=None, context=None):
         }
     }
 
-# (Other classification functions like classify() and invoke_oracle() can be added as needed)
+# Human-readable labels for relationship types
+LABEL_MAP = {
+    "is_a": "is a type of",
+    "part_of": "is a part of",
+    "created_by": "was created by",
+    "works_for": "works for",
+    "parent_of": "is the parent of",
+    "child_of": "is the child of",
+    "spouse": "is married to",
+    "sibling_of": "is a sibling of",
+    "also_known_as": "is also known as",
+    "related_to": "is related to",
+    "likes": "likes",
+    "dislikes": "dislikes",
+    "prefers": "prefers",
+    "owns": "owns",
+    "located_in": "is located in",
+    "educated_at": "was educated at",
+    "nationality": "has nationality",
+    "occupation": "has occupation",
+    "born_on": "was born on",
+    "age": "has age",
+    "knows": "knows",
+    "friend_of": "is friends with",
+    "met": "has met",
+    "lives_in": "lives in",
+    "born_in": "was born in",
+    "has_gender": "has gender",
+}
+
+# GLiNER2 label constraints for relationship extraction
+GLIREL_LABELS = {
+    "is_a": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "part_of": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["ORG", "LOC", "MISC"]},
+    "created_by": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG"]},
+    "works_for": {"allowed_head": ["PERSON"], "allowed_tail": ["ORG"]},
+    "parent_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "child_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "spouse": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "sibling_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "also_known_as": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "related_to": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "likes": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "dislikes": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "prefers": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "owns": {"allowed_head": ["PERSON", "ORG"], "allowed_tail": ["MISC", "ORG", "LOC"]},
+    "located_in": {"allowed_head": ["ORG", "LOC", "GPE"], "allowed_tail": ["LOC", "GPE"]},
+    "educated_at": {"allowed_head": ["PERSON"], "allowed_tail": ["ORG"]},
+    "nationality": {"allowed_head": ["PERSON"], "allowed_tail": ["GPE"]},
+    "occupation": {"allowed_head": ["PERSON"], "allowed_tail": ["MISC"]},
+    "born_on": {"allowed_head": ["PERSON"], "allowed_tail": ["DATE"]},
+    "age": {"allowed_head": ["PERSON"], "allowed_tail": ["MISC"]},
+    "knows": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "friend_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "met": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
+    "lives_in": {"allowed_head": ["PERSON"], "allowed_tail": ["LOC", "GPE"]},
+    "born_in": {"allowed_head": ["PERSON"], "allowed_tail": ["LOC", "GPE"]},
+    "has_gender": {"allowed_head": ["PERSON"], "allowed_tail": ["MISC"]},
+}

@@ -121,3 +121,21 @@ def test_valid_path_unaffected():
     assert result == {"status": "valid"}
     all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
     assert not any("contradicted_by" in s for s in all_sql)
+
+
+def test_owns_in_ontology():
+    """New rel_type 'owns' is in the ontology."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "owns" in SEED_ONTOLOGY
+
+
+def test_educated_at_in_ontology():
+    """New rel_type 'educated_at' is in the ontology."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "educated_at" in SEED_ONTOLOGY
+
+
+def test_occupation_in_ontology():
+    """New rel_type 'occupation' is in the ontology."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "occupation" in SEED_ONTOLOGY

@@ -89,10 +89,38 @@ Both the Filter and Function pass the OpenWebUI user UUID as `user_id` so facts 
 
 ## WGM Ontology
 
-Hard-coded in `src/wgm/gate.py` `SEED_ONTOLOGY`. Allowed `rel_type` values:
-`is_a`, `part_of`, `created_by`, `works_for`, `parent_of`, `child_of`, `spouse`, `sibling_of`, `also_known_as`, `related_to`, `likes`, `dislikes`, `prefers`
+Hard-coded in `src/wgm/gate.py` `SEED_ONTOLOGY`. Relationship types are aligned with Wikidata property semantics where applicable. Domain-specific types have no Wikidata equivalent and are retained for conversational memory use cases. PID directions marked (inv) indicate the stored direction is the inverse of the Wikidata property direction.
 
 Edges with `rel_type` not in the ontology return `status: "novel"` and are **not committed**.
+
+| rel_type       | Wikidata PID | Notes                        |
+|----------------|--------------|------------------------------|
+| is_a           | P31          | instance of                  |
+| part_of        | P361         |                              |
+| created_by     | P170 (inv)   |                              |
+| works_for      | P108 (inv)   |                              |
+| parent_of      | P40          | child in Wikidata            |
+| child_of       | P40 (inv)    |                              |
+| spouse         | P26          | symmetric                    |
+| sibling_of     | P3373        | symmetric                    |
+| also_known_as  | P742/P1449   | pseudonym/nickname           |
+| related_to     | P1659        | see also; loose mapping      |
+| likes          | —            | domain-specific              |
+| dislikes       | —            | domain-specific              |
+| prefers        | —            | domain-specific              |
+| owns           | P1830 (inv)  |                              |
+| located_in     | P131         |                              |
+| educated_at    | P69          |                              |
+| nationality    | P27          |                              |
+| occupation     | P106         |                              |
+| born_on        | P569         | value is date string         |
+| age            | —            | domain-specific              |
+| knows          | P1891        | influenced; loose mapping    |
+| friend_of      | —            | domain-specific              |
+| met            | —            | domain-specific              |
+| lives_in       | P551         | residence                    |
+| born_in        | P19          | place of birth               |
+| has_gender     | P21          |                              |
 
 ## Database Schema
 
