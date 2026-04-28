@@ -103,6 +103,7 @@ class Function:
         text: str,
         edges: Optional[list[dict]] = None,
         source: Optional[str] = None,
+        __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable] = None,
     ) -> str:
         """
@@ -169,11 +170,13 @@ class Function:
             )
 
         source = source or self.valves.DEFAULT_SOURCE
+        user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
         payload = {
             "text": text,
             "source": source,
             "edges": normalized_edges,
+            "user_id": user_id,
         }
 
         if self.valves.ENABLE_DEBUG:

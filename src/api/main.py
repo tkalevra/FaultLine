@@ -150,6 +150,7 @@ def query(request: QueryRequest):
             timeout=10.0,
         )
         if resp.status_code == 404:
+            ensure_collection(collection, qdrant_url)
             return {"status": "ok", "facts": []}
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
