@@ -1,0 +1,2 @@
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS
+  contradicted_by INT REFERENCES facts(id) ON DELETE SET NULL;

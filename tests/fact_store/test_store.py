@@ -49,3 +49,15 @@ def test_commit_rollback_on_error():
 
     mock_conn.rollback.assert_called_once()
     mock_conn.commit.assert_not_called()
+
+
+def test_mark_contradicted():
+    mock_conn = MagicMock()
+    manager = FactStoreManager(mock_conn)
+    manager.mark_contradicted(old_id=42, new_id=99)
+
+    cursor = mock_conn.cursor.return_value.__enter__.return_value
+    sql, params = cursor.execute.call_args[0]
+    assert "contradicted_by" in sql
+    assert params == (99, 42)
+    mock_conn.commit.assert_called_once()

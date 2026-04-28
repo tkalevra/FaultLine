@@ -1,4 +1,5 @@
 import psycopg2
+from fact_store.store import FactStoreManager
 
 SEED_ONTOLOGY = {
     "is_a":           {"subject_role": "subtype",   "object_role": "supertype"},
@@ -20,28 +21,41 @@ class WGMValidationGate:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def validate_edge(self, subject_id, object_id, rel_type: str) -> dict:
+    def validate_edge(self, subject_id, object_id, rel_type: str,
+                      user_id=None, provenance=None) -> dict:
         """
         Validate an incoming edge against the ontology and existing DB state.
         Returns {"status": "novel"} if rel_type not in ontology.
-        Returns {"status": "conflict"} if a contradicting rel_type exists for this pair.
-        Returns {"status": "valid"} otherwise.
+        Returns {"status": "valid"} when no contradiction exists.
+        When user_id is supplied and a contradiction is detected (same user+subject+rel,
+        different object): inserts the new fact, marks the old one as contradicted, and
+        returns {"status": "conflict", "new_id": int, "old_id": int}.
         """
         rt = rel_type.lower().strip()
         if rt not in SEED_ONTOLOGY:
             return {"status": "novel"}
 
-        with self.db_conn.cursor() as cur:
-            # Check for existing relations in the same direction
-            cur.execute("SELECT rel_type FROM facts WHERE subject_id = %s AND object_id = %s", (subject_id, object_id))
-            rows = cur.fetchall()
-            existing_rels = {r[0].lower() for r in rows}
-            
-            # Check for reverse relations (conflict detection for directed edges)
-            # Symmetric relations and aliases are exempt from reverse-direction conflict checks
-            if rt not in ["spouse", "sibling_of", "also_known_as", "related_to"]:
-                cur.execute("SELECT 1 FROM facts WHERE subject_id = %s AND object_id = %s AND rel_type = %s", (object_id, subject_id, rt))
-                if cur.fetchone():
-                    return {"status": "conflict"}
+        if user_id is None:
+            return {"status": "valid"}
 
-        return {"status": "valid"}
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM facts"
+                " WHERE user_id = %s AND subject_id = %s AND rel_type = %s AND object_id != %s",
+                (user_id, subject_id, rt, object_id),
+            )
+            old_row = cur.fetchone()
+            if old_row is None:
+                return {"status": "valid"}
+
+            old_id = old_row[0]
+            cur.execute(
+                "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"
+                " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (user_id, subject_id, object_id, rt, provenance or ""),
+            )
+            new_id = cur.fetchone()[0]
+
+        self.db_conn.commit()
+        FactStoreManager(self.db_conn).mark_contradicted(old_id, new_id)
+        return {"status": "conflict", "new_id": new_id, "old_id": old_id}

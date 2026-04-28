@@ -58,3 +58,48 @@ def test_validate_same_rel_existing():
     result = gate.validate_edge(1, 2, "IS_A")
 
     assert result == {"status": "valid"}
+
+
+def test_conflict_inserts_new_fact():
+    """Conflicting edge (same user+subject+rel, different object) gets inserted, not dropped."""
+    mock_conn = MagicMock()
+    cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+    cursor_mock.fetchone.side_effect = [(42,), (99,)]  # old_id=42, then new_id=99
+
+    gate = WGMValidationGate(mock_conn)
+    result = gate.validate_edge("alice", "corp_b", "works_for",
+                                user_id="user1", provenance="doc")
+
+    assert result["status"] == "conflict"
+    assert result["old_id"] == 42
+    assert result["new_id"] == 99
+    all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
+    assert any("INSERT" in s for s in all_sql)
+
+
+def test_conflict_marks_old_superseded():
+    """After a conflict INSERT, old fact's contradicted_by is updated to new fact id."""
+    mock_conn = MagicMock()
+    cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+    cursor_mock.fetchone.side_effect = [(42,), (99,)]
+
+    gate = WGMValidationGate(mock_conn)
+    gate.validate_edge("alice", "corp_b", "works_for",
+                       user_id="user1", provenance="doc")
+
+    all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
+    assert any("contradicted_by" in s for s in all_sql)
+
+
+def test_valid_path_unaffected():
+    """Valid edge with no prior conflict returns status=valid, no contradicted_by update."""
+    mock_conn = MagicMock()
+    cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+    cursor_mock.fetchone.return_value = None  # no existing conflicting fact
+
+    gate = WGMValidationGate(mock_conn)
+    result = gate.validate_edge("alice", "corp", "works_for", user_id="user1")
+
+    assert result == {"status": "valid"}
+    all_sql = [str(c) for c in cursor_mock.execute.call_args_list]
+    assert not any("contradicted_by" in s for s in all_sql)
