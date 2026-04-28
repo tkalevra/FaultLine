@@ -2,19 +2,32 @@ import psycopg2
 from src.fact_store.store import FactStoreManager
 
 SEED_ONTOLOGY = {
-    "is_a":           {"subject_role": "subtype",   "object_role": "supertype"},
-    "part_of":        {"subject_role": "component", "object_role": "whole"},
-    "created_by":     {"subject_role": "creation",  "object_role": "creator"},
-    "works_for":      {"subject_role": "employee",  "object_role": "employer"},
-    "parent_of":      {"subject_role": "parent",    "object_role": "child"},
-    "child_of":       {"subject_role": "child",     "object_role": "parent"},
-    "spouse":         {"subject_role": "partner",   "object_role": "partner"},
-    "sibling_of":     {"subject_role": "sibling",   "object_role": "sibling"},
-    "also_known_as":  {"subject_role": "canonical", "object_role": "alias"},
-    "related_to":     {"subject_role": "entity",    "object_role": "entity"},
-    "likes":          {"subject_role": "subject",   "object_role": "target"},
-    "dislikes":       {"subject_role": "subject",   "object_role": "target"},
-    "prefers":        {"subject_role": "subject",   "object_role": "target"},
+    "is_a":           {"subject_role": "subtype",   "object_role": "supertype"},  # Wikidata P31 (instance of)
+    "part_of":        {"subject_role": "component", "object_role": "whole"},      # Wikidata P361 (part of)
+    "created_by":     {"subject_role": "creation",  "object_role": "creator"},    # Wikidata P170 (creator, inv)
+    "works_for":      {"subject_role": "employee",  "object_role": "employer"},   # Wikidata P108 (employer, inv)
+    "parent_of":      {"subject_role": "parent",    "object_role": "child"},      # Wikidata P40 (child)
+    "child_of":       {"subject_role": "child",     "object_role": "parent"},     # Wikidata P40 (child, inv)
+    "spouse":         {"subject_role": "partner",   "object_role": "partner"},    # Wikidata P26 (spouse)
+    "sibling_of":     {"subject_role": "sibling",   "object_role": "sibling"},    # Wikidata P3373 (sibling)
+    "also_known_as":  {"subject_role": "canonical", "object_role": "alias"},      # Wikidata P742/P1449 (pseudonym/nickname)
+    "related_to":     {"subject_role": "entity",    "object_role": "entity"},     # Wikidata P1659 (see also) - loose mapping, domain-specific
+    "likes":          {"subject_role": "subject",   "object_role": "target"},     # domain-specific
+    "dislikes":       {"subject_role": "subject",   "object_role": "target"},     # domain-specific
+    "prefers":        {"subject_role": "subject",   "object_role": "target"},     # domain-specific
+    "owns":           {"subject_role": "owner",     "object_role": "property"},    # Wikidata P1830 (owner of, inv)
+    "located_in":     {"subject_role": "entity",    "object_role": "location"},    # Wikidata P131 (located in admin entity)
+    "educated_at":    {"subject_role": "student",   "object_role": "institution"}, # Wikidata P69 (educated at)
+    "nationality":    {"subject_role": "person",    "object_role": "country"},     # Wikidata P27 (country of citizenship)
+    "occupation":     {"subject_role": "person",    "object_role": "profession"},  # Wikidata P106 (occupation)
+    "born_on":        {"subject_role": "person",    "object_role": "date"},        # Wikidata P569 (date of birth)
+    "age":            {"subject_role": "person",    "object_role": "value"},       # domain-specific
+    "knows":          {"subject_role": "person",    "object_role": "person"},      # Wikidata P1891 (influenced) - loose, domain-specific
+    "friend_of":      {"subject_role": "person",    "object_role": "person"},      # domain-specific
+    "met":            {"subject_role": "person",    "object_role": "person"},      # domain-specific
+    "lives_in":       {"subject_role": "person",    "object_role": "location"},    # Wikidata P551 (residence)
+    "born_in":        {"subject_role": "person",    "object_role": "location"},    # Wikidata P19 (place of birth)
+    "has_gender":     {"subject_role": "person",    "object_role": "gender"},      # Wikidata P21 (sex or gender)
 }
 
 class WGMValidationGate:
