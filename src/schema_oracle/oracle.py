@@ -73,7 +73,7 @@ LABEL_MAP = {
 
 # GLiNER2 label constraints for relationship extraction
 GLIREL_LABELS = {
-    "is_a": {"allowed_head": ["PERSON", "ORG", "MISC", "LOC"], "allowed_tail": ["MISC", "ORG"]},
+    "is_a": {"allowed_head": ["PERSON", "ORG", "MISC", "LOC", "ANIMAL"], "allowed_tail": ["MISC", "ORG", "ANIMAL"]},
     "part_of": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["ORG", "LOC", "MISC"]},
     "created_by": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG"]},
     "works_for": {"allowed_head": ["PERSON"], "allowed_tail": ["ORG"]},
