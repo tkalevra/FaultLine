@@ -8,6 +8,8 @@ done
 
 echo "[entrypoint] Running migrations..."
 psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/001_create_facts.sql
+psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/002_add_fact_weights.sql
+psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/003_add_contradiction.sql
 
 echo "[entrypoint] Starting re_embedder service (background)..."
 python -m src.re_embedder.embedder &
