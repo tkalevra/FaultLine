@@ -9,7 +9,13 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:towardsdatascience.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip show *)",
+      "Bash(python3 -c \"import gliner2; print\\(dir\\(gliner2.GLiNER2\\)\\)\")",
+      "Bash(pip index *)",
+      "Bash(pip download *)",
+      "Read(//tmp/**)",
+      "Bash(unzip -q gliner2_pkg/gliner2-1.3.0-py3-none-any.whl -d gliner2_src)"
     ]
   }
 }
