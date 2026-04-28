@@ -57,7 +57,7 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
                     "rel_type::[parent_of|child_of|spouse|sibling_of|also_known_as|works_for]::str::The relationship type from subject to object.",
                 ]
             }
-            result = model.extract_json(req.text, schema)
+            result = model.extract_json(req.text, schema, labels=["PERSON", "ORG", "LOC", "MISC", "ANIMAL"])
             inferred_relations = [
                 EdgeInput(
                     subject=fact["subject"].lower().strip(),
