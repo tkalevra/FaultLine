@@ -27,28 +27,25 @@ CREATE INDEX IF NOT EXISTS idx_facts_unsynced
     ON facts (qdrant_synced, user_id)
     WHERE qdrant_synced = false;
 
-CREATE OR REPLACE FUNCTION lowercase_facts_columns()
+CREATE OR REPLACE FUNCTION lowercase_facts()
 RETURNS TRIGGER AS $$
 BEGIN
-    NEW.subject_id := lower(NEW.subject_id);
-    NEW.object_id := lower(NEW.object_id);
-    NEW.rel_type := lower(NEW.rel_type);
+    NEW.subject_id = LOWER(TRIM(NEW.subject_id));
+    NEW.object_id  = LOWER(TRIM(NEW.object_id));
+    NEW.rel_type   = LOWER(TRIM(NEW.rel_type));
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- Safe migration: only create triggers if they don't exist (drop and recreate)
 DROP TRIGGER IF EXISTS lowercase_facts_before_insert ON facts;
 CREATE TRIGGER lowercase_facts_before_insert
-BEFORE INSERT ON facts
-FOR EACH ROW
-EXECUTE FUNCTION lowercase_facts_columns();
+    BEFORE INSERT ON facts
+    FOR EACH ROW EXECUTE FUNCTION lowercase_facts();
 
 DROP TRIGGER IF EXISTS lowercase_facts_before_update ON facts;
 CREATE TRIGGER lowercase_facts_before_update
-BEFORE UPDATE ON facts
-FOR EACH ROW
-EXECUTE FUNCTION lowercase_facts_columns();
+    BEFORE UPDATE ON facts
+    FOR EACH ROW EXECUTE FUNCTION lowercase_facts();
 
 CREATE TABLE IF NOT EXISTS pending_types (
     id          SERIAL PRIMARY KEY,

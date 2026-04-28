@@ -208,6 +208,12 @@ def main():
 
     while True:
         try:
+            # At the top of every iteration, before any DB query, ensure the default
+            # collection exists. This recovers a deleted collection within one loop
+            # cycle regardless of whether there are any unsynced rows.
+            default_collection = os.getenv("QDRANT_COLLECTION", "faultline-test")
+            ensure_collection(default_collection, qdrant_url)
+
             db = psycopg2.connect(postgres_dsn)
             try:
                 rows = fetch_unsynced(db)
@@ -215,10 +221,9 @@ def main():
                 if rows:
                     log.info(f"re_embedder.batch_start count={len(rows)}")
 
-                    # Ensure every collection needed by this batch exists before
-                    # processing any rows — a deleted collection is recovered within
-                    # one loop cycle rather than causing rows to be skipped.
-                    seen_collections: set[str] = set()
+                    # Ensure every per-user collection needed by this batch exists
+                    # before processing any rows.
+                    seen_collections: set[str] = {default_collection}
                     for row in rows:
                         col = derive_collection(row["user_id"])
                         if col not in seen_collections:
