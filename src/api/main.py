@@ -5,7 +5,7 @@ import psycopg2
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
 from src.fact_store.store import FactStoreManager
-from src.re_embedder.embedder import derive_collection, embed_text
+from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate
 from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest
@@ -75,6 +75,15 @@ _gliner2_model = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _gliner2_model
+
+    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
+    log.info("startup.qdrant_collection_check", collection=default_collection)
+    if ensure_collection(default_collection, qdrant_url):
+        log.info("startup.qdrant_collection_ready", collection=default_collection)
+    else:
+        log.error("startup.qdrant_collection_failed", collection=default_collection)
+
     log.info("startup.gliner2_loading")
     try:
         from gliner2 import GLiNER2
