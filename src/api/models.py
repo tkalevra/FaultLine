@@ -7,6 +7,7 @@ class EdgeInput(BaseModel):
     subject: str
     object: str
     rel_type: str
+    is_preferred_label: bool = False
 
 
 class IngestRequest(BaseModel):

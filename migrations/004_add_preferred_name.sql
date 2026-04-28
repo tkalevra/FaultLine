@@ -1,0 +1,2 @@
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS
+  is_preferred_label BOOLEAN NOT NULL DEFAULT false;
