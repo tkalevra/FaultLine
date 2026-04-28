@@ -12,63 +12,6 @@ from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestRe
 
 log = structlog.get_logger()
 
-# GLiNER2 schema — dict form: {label: description}
-# label   = the key GLiNER2 uses in returned results; must be lowercase_with_underscores
-#            for relations so they match WGM gate slugs directly (no lookup needed)
-# description = natural language guidance that improves model accuracy
-ENTITY_SCHEMA = {
-    "person":       "a person or individual",
-    "organization": "a company, business, or organization",
-    "location":     "a city, country, or geographic location",
-}
-
-# Maps GLiNER2 entity label → DB slug (title-cased for resolve_entities)
-ENTITY_LABEL_TO_DB = {
-    "person":       "Person",
-    "organization": "Organization",
-    "location":     "Location",
-}
-
-# Relation labels ARE the DB slugs — no secondary mapping needed
-RELATION_SCHEMA = {
-    "parent_of":    "is the parent, father, or mother of",
-    "child_of":     "is the child, son, or daughter of",
-    "spouse":       "is married to or is the spouse of",
-    "sibling_of":   "is the sibling, brother, or sister of",
-    "also_known_as":"is also known as, goes by, or has the nickname",
-    "works_for":    "works for or is employed by",
-}
-
-def extract_entities_and_relations(text: str, model) -> tuple[list[dict], list[EdgeInput]]:
-    if model is None: return [], []
-    try:
-        schema = (model.create_schema()
-            .entities(ENTITY_SCHEMA)
-            .relations(RELATION_SCHEMA)
-        )
-        results = model.extract(text, schema)
-
-        entities = []
-        for label, db_label in ENTITY_LABEL_TO_DB.items():
-            for e in results.get(label, []):
-                val = e["text"] if isinstance(e, dict) else str(e)
-                entities.append({"entity": val.lower().strip(), "label": db_label})
-
-        relation_edges = []
-        def get_text(o): return o.get("text", "") if isinstance(o, dict) else str(o)
-        for rel_label, pairs in results.get("relation_extraction", {}).items():
-            if rel_label not in RELATION_SCHEMA:
-                continue
-            for pair in pairs:
-                if isinstance(pair, (tuple, list)): h, t = pair[0], pair[1]
-                else: h, t = pair.get("head"), pair.get("tail")
-                sub, obj = get_text(h).lower().strip(), get_text(t).lower().strip()
-                if sub and obj and sub != obj:
-                    relation_edges.append(EdgeInput(subject=sub, object=obj, rel_type=rel_label))
-        return entities, relation_edges
-    except Exception as e:
-        log.error("ingest.gliner2_failed", error=str(e))
-        return [], []
 
 _gliner2_model = None
 
@@ -104,8 +47,30 @@ def health():
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
-    entities, inferred_relations = extract_entities_and_relations(req.text, model)
-    resolution = resolve_entities({"entities": [{"entity": e["entity"], "type": e["label"]} for e in entities]}, 
+    inferred_relations = []
+    if model is not None:
+        try:
+            schema = {
+                "facts": [
+                    "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
+                    "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
+                    "rel_type::[parent_of|child_of|spouse|sibling_of|also_known_as|works_for]::str::The relationship type from subject to object.",
+                ]
+            }
+            result = model.extract_json(req.text, schema)
+            inferred_relations = [
+                EdgeInput(
+                    subject=fact["subject"].lower().strip(),
+                    object=fact["object"].lower().strip(),
+                    rel_type=fact["rel_type"].lower().strip()
+                )
+                for fact in result.get("facts", [])
+                if fact.get("subject") and fact.get("object") and fact.get("rel_type")
+            ]
+        except Exception as e:
+            log.error("ingest.gliner2_failed", error=str(e))
+
+    resolution = resolve_entities({"entities": []},
                                   context={"known_types": ["Person", "Organization", "Location"]})
     resolved = resolution["resolution"]["resolved"]
     
