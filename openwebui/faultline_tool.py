@@ -33,9 +33,11 @@ STRICT RULES:
 11. For preference statements ("X likes Y", "X loves Y", "X enjoys Y", "X is into Y", "X prefers Y"), emit: {"subject":"<person>","object":"<thing>","rel_type":"likes"}. For negative preferences ("X hates Y", "X dislikes Y", "X doesn't like Y"), use rel_type "dislikes".
 12. Pronoun resolution: if the input contains "she", "her", "he", "his", and a named person of that gender was mentioned earlier in the same input, replace the pronoun with that person's name when extracting triples. If ambiguous, set low_confidence: true.
 13. "my wife", "my husband", "my son", "my daughter", "my spouse" always refers to the person linked to "user" via the spouse/parent_of relation in prior context. Use their name if known from the same input, otherwise set low_confidence: true.
+14. PREFERRED NAME DETECTION: If the text contains preference signals ("goes by", "call me", "prefers to be called", "preferred name", "please call me", "my name is"), extract as also_known_as and add: "is_preferred_label": true. All other triples must either omit this field or set it to false.
 
 OUTPUT FORMAT — exactly this, nothing else:
-[{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]"""
+[{"subject":"...","object":"...","rel_type":"...","low_confidence":false}] or with preferred name:
+[{"subject":"...","object":"...","rel_type":"also_known_as","low_confidence":false,"is_preferred_label":true}]"""
 
 
 _INGEST_KEYWORDS = {
@@ -187,7 +189,12 @@ class Filter:
                 raw_triples = await rewrite_to_triples(text, self.valves)
                 confident = [e for e in raw_triples if not e.get("low_confidence", False)]
                 edges = [
-                    {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
+                    {
+                        "subject": e["subject"],
+                        "object": e["object"],
+                        "rel_type": e["rel_type"],
+                        "is_preferred_label": e.get("is_preferred_label", False),
+                    }
                     for e in confident
                     if e.get("subject") and e.get("object") and e.get("rel_type")
                 ]
@@ -212,9 +219,10 @@ class Filter:
                         )
                     if resp.status_code == 200:
                         facts = resp.json().get("facts", [])
-                        if facts:
+                        preferred_names = resp.json().get("preferred_names", {})
+                        if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] inlet injecting {len(facts)} facts into user message")
+                                print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
                             identity = next(
                                 (f.get("object") for f in facts
                                  if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
@@ -225,11 +233,22 @@ class Filter:
                                 if identity
                                 else "Note: you are the user these facts refer to.\n"
                             )
-                            fact_lines = "\n".join(
-                                f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
-                                for f in facts
-                            )
-                            memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}{fact_lines}"
+
+                            memory_lines = []
+                            if preferred_names:
+                                memory_lines.append("## Preferred Names (use these exclusively)")
+                                for subject, preferred_obj in preferred_names.items():
+                                    memory_lines.append(f"- {subject} → {preferred_obj}")
+                                memory_lines.append("")
+
+                            if facts:
+                                memory_lines.append("## Facts")
+                                for f in facts:
+                                    memory_lines.append(
+                                        f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
+                                    )
+
+                            memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}" + "\n".join(memory_lines)
                             messages = body.get("messages", [])
                             for i in reversed(range(len(messages))):
                                 if messages[i].get("role") == "user":

@@ -15,7 +15,9 @@
       "Bash(pip index *)",
       "Bash(pip download *)",
       "Read(//tmp/**)",
-      "Bash(unzip -q gliner2_pkg/gliner2-1.3.0-py3-none-any.whl -d gliner2_src)"
+      "Bash(unzip -q gliner2_pkg/gliner2-1.3.0-py3-none-any.whl -d gliner2_src)",
+      "Bash(git commit -m ' *)",
+      "Bash(python -m pytest tests/fact_store/test_commit.py -v)"
     ]
   }
 }

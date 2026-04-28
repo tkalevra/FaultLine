@@ -98,3 +98,36 @@ def test_mark_contradicted_twice(mock_db):
     cursor = mock_db.cursor.return_value.__enter__.return_value
     assert cursor.execute.call_count == 2
     assert mock_db.commit.call_count == 2
+
+
+def test_preferred_label_set_on_also_known_as():
+    """Commit fact with is_preferred_label=True should be stored correctly."""
+    mock_conn = MagicMock()
+    manager = FactStoreManager(mock_conn)
+
+    result = manager.commit([
+        ("user1", "marla", "mars", "also_known_as", "test", True)
+    ])
+
+    assert result == 1
+    cursor = mock_conn.cursor.return_value.__enter__.return_value
+    sql, params = cursor.execute.call_args[0]
+    assert "is_preferred_label" in sql
+    # is_preferred_label should be the 8th parameter in the VALUES tuple
+    assert params[7] is True
+    mock_conn.commit.assert_called_once()
+
+
+def test_also_known_as_accepts_is_preferred_label_field():
+    """EdgeInput with is_preferred_label field should be valid."""
+    from api.models import EdgeInput
+    edge = EdgeInput(
+        subject="marla",
+        object="mars",
+        rel_type="also_known_as",
+        is_preferred_label=True
+    )
+    assert edge.subject == "marla"
+    assert edge.object == "mars"
+    assert edge.rel_type == "also_known_as"
+    assert edge.is_preferred_label is True
