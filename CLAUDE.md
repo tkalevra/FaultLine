@@ -89,38 +89,58 @@ Both the Filter and Function pass the OpenWebUI user UUID as `user_id` so facts 
 
 ## WGM Ontology
 
-Hard-coded in `src/wgm/gate.py` `SEED_ONTOLOGY`. Relationship types are aligned with Wikidata property semantics where applicable. Domain-specific types have no Wikidata equivalent and are retained for conversational memory use cases. PID directions marked (inv) indicate the stored direction is the inverse of the Wikidata property direction.
+FaultLine's triple model `(subject_id, rel_type, object_id)` is semantically equivalent to RDF triples. Relationship types are aligned to **Wikidata property PIDs** as the primary reference standard. SKOS (Simple Knowledge Organization System) and OWL (Web Ontology Language) semantics inform naming and behavior where applicable, without adopting RDF URI syntax (which would be overkill for a personal memory system and would break GLiNER2 bracket constraints).
 
-Edges with `rel_type` not in the ontology return `status: "novel"` and are **not committed**.
+### Ontology Standards Alignment
 
-| rel_type       | Wikidata PID | Notes                        |
-|----------------|--------------|------------------------------|
-| is_a           | P31          | instance of                  |
-| part_of        | P361         |                              |
-| created_by     | P170 (inv)   |                              |
-| works_for      | P108 (inv)   |                              |
-| parent_of      | P40          | child in Wikidata            |
-| child_of       | P40 (inv)    |                              |
-| spouse         | P26          | symmetric                    |
-| sibling_of     | P3373        | symmetric                    |
-| also_known_as  | P742/P1449   | pseudonym/nickname           |
-| related_to     | P1659        | see also; loose mapping      |
-| likes          | —            | domain-specific              |
-| dislikes       | —            | domain-specific              |
-| prefers        | —            | domain-specific              |
-| owns           | P1830 (inv)  |                              |
-| located_in     | P131         |                              |
-| educated_at    | P69          |                              |
-| nationality    | P27          |                              |
-| occupation     | P106         |                              |
-| born_on        | P569         | value is date string         |
-| age            | —            | domain-specific              |
-| knows          | P1891        | influenced; loose mapping    |
-| friend_of      | —            | domain-specific              |
-| met            | —            | domain-specific              |
-| lives_in       | P551         | residence                    |
-| born_in        | P19          | place of birth               |
-| has_gender     | P21          |                              |
+**Semantic distinctions:**
+- **instance_of** (P31): A named entity belongs to a type class (e.g., "Fraggle instance_of dog"). NOT transitive for type inference.
+- **subclass_of** (P279): A type class is a subtype of another class (e.g., "dog subclass_of animal"). IS transitive.
+- **pref_name**: The canonical display name for an entity (SKOS prefLabel semantics). Enforced via `is_preferred_label` column.
+- **also_known_as**: Alternate name, alias, or nickname (SKOS altLabel semantics). Multiple may exist per entity.
+- **same_as**: Full identity equivalence between two entity references (OWL sameAs semantics). Symmetric.
+
+**Symmetric relationships** (storing A→B implies B→A; duplicates suppressed at write time):
+- spouse, sibling_of, same_as, friend_of, knows, met
+
+**Inverse relationships** (OWL inverseOf pairs):
+- parent_of ↔ child_of
+- All others are unidirectional or symmetric
+
+Edges with `rel_type` not in the ontology return `status: "novel"` and are **not committed** until approved by Qwen.
+
+| rel_type       | Wikidata PID | Inverse   | Symmetric | W3C Mapping      | Notes                           |
+|----------------|--------------|-----------|-----------|------------------|---------------------------------|
+| is_a           | P31/P279     | —         | No        | rdf:type (dep.)  | **deprecated**: use instance_of or subclass_of |
+| instance_of    | P31          | —         | No        | rdf:type         | entity → type (NOT transitive) |
+| subclass_of    | P279         | —         | No        | rdfs:subClassOf  | type → type (IS transitive)     |
+| part_of        | P361         | —         | No        | —                | component → whole               |
+| created_by     | P170 (inv)   | —         | No        | —                | creation → creator              |
+| works_for      | P108 (inv)   | —         | No        | —                | employee → employer             |
+| parent_of      | P40          | child_of  | No        | —                | parent → child                  |
+| child_of       | P40 (inv)    | parent_of | No        | —                | child → parent                  |
+| spouse         | P26          | spouse    | Yes       | —                | partner → partner (symmetric)   |
+| sibling_of     | P3373        | sibling_of| Yes       | —                | sibling → sibling (symmetric)   |
+| also_known_as  | P742/P1449   | —         | No        | skos:altLabel    | entity → alias (alternate name) |
+| pref_name      | —            | —         | No        | skos:prefLabel   | entity → name (preferred display) |
+| same_as        | Q39893449    | same_as   | Yes       | owl:sameAs       | entity → entity (identity, symmetric) |
+| related_to     | P1659        | —         | No        | skos:related     | loose semantic link             |
+| likes          | —            | —         | No        | —                | domain-specific (subject preference) |
+| dislikes       | —            | —         | No        | —                | domain-specific (subject preference) |
+| prefers        | —            | —         | No        | —                | domain-specific (subject preference) |
+| owns           | P1830 (inv)  | —         | No        | —                | owner → property                |
+| located_in     | P131         | —         | No        | —                | entity → location               |
+| educated_at    | P69          | —         | No        | —                | student → institution           |
+| nationality    | P27          | —         | No        | —                | person → country                |
+| occupation     | P106         | —         | No        | —                | person → profession             |
+| born_on        | P569         | —         | No        | —                | person → date (date of birth)   |
+| age            | —            | —         | No        | —                | domain-specific (person → value) |
+| knows          | P1891        | knows     | Yes       | —                | person → person (symmetric)     |
+| friend_of      | —            | friend_of | Yes       | —                | domain-specific (symmetric)     |
+| met            | —            | met       | Yes       | —                | domain-specific (symmetric)     |
+| lives_in       | P551         | —         | No        | —                | person → location (residence)   |
+| born_in        | P19          | —         | No        | —                | person → location (birthplace)  |
+| has_gender     | P21          | —         | No        | —                | person → gender                 |
 
 ## Database Schema
 

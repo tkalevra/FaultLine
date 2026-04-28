@@ -262,3 +262,73 @@ def test_novel_type_qwen_timeout():
             result = gate._try_approve_novel_type("some_type")
 
     assert result is False
+
+
+def test_symmetric_duplicate_suppressed():
+    """For symmetric rel_types, storing A→B prevents duplicate B→A insertion."""
+    from wgm.gate import WGMValidationGate
+    from unittest.mock import MagicMock
+
+    mock_db = MagicMock()
+    cursor_mock = mock_db.cursor.return_value.__enter__.return_value
+
+    # Check 1: exact duplicate (A→B) — not found
+    # Check 2: symmetric duplicate (B→A) — not found
+    # Check 3: conflicting facts with different object — not found
+    cursor_mock.fetchone.side_effect = [None, None]
+    cursor_mock.fetchall.return_value = []
+
+    gate = WGMValidationGate(mock_db)
+    result = gate.validate_edge("alice", "bob", "spouse", user_id="user1", provenance="doc")
+
+    # Should be valid (no duplicates, no conflicts)
+    assert result == {"status": "valid"}
+
+
+def test_symmetric_duplicate_detected():
+    """When B→A already exists and A→B is attempted for a symmetric type, return symmetric_duplicate."""
+    from wgm.gate import WGMValidationGate
+    from unittest.mock import MagicMock
+
+    mock_db = MagicMock()
+    cursor_mock = mock_db.cursor.return_value.__enter__.return_value
+
+    # Check 1: exact duplicate (A→B) — not found
+    # Check 2: symmetric duplicate (B→A) — found!
+    cursor_mock.fetchone.side_effect = [None, (42,)]
+
+    gate = WGMValidationGate(mock_db)
+    result = gate.validate_edge("alice", "bob", "spouse", user_id="user1", provenance="doc")
+
+    assert result["status"] == "valid"
+    assert result["note"] == "symmetric_duplicate"
+
+
+def test_instance_of_valid():
+    """instance_of (P31) is a valid rel_type."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "instance_of" in SEED_ONTOLOGY
+
+
+def test_subclass_of_valid():
+    """subclass_of (P279) is a valid rel_type."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "subclass_of" in SEED_ONTOLOGY
+
+
+def test_pref_name_valid():
+    """pref_name (skos:prefLabel) is a valid rel_type."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "pref_name" in SEED_ONTOLOGY
+
+
+def test_same_as_valid():
+    """same_as (owl:sameAs) is a valid rel_type."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "same_as" in SEED_ONTOLOGY
+
+
+def test_is_a_deprecated_but_valid():
+    """is_a is deprecated but remains valid for backward compatibility."""
+    from wgm.gate import SEED_ONTOLOGY
+    assert "is_a" in SEED_ONTOLOGY

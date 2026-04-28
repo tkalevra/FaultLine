@@ -90,7 +90,7 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
                 "facts": [
                     "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
                     "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
-                    f"rel_type::[{constraint}]::str::The relationship type from subject to object. Choose the most specific type that fits.",
+                    f"rel_type::[{constraint}]::str::The relationship type from subject to object. For 'X is a Y' where X is a named entity (person, place, thing), use instance_of. For 'X is a type of Y' where both are categories or classes, use subclass_of. Use pref_name for preferred display names, also_known_as for alternate names.",
                 ]
             }
             result = model.extract_json(req.text, schema)
