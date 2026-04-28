@@ -62,10 +62,10 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
                 "facts": [
                     "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
                     "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
-                    "rel_type::[parent_of|child_of|spouse|sibling_of|also_known_as|works_for]::str::The relationship type from subject to object.",
+                    "rel_type::[is_a|part_of|created_by|works_for|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|has_gender|lives_in|born_in|born_on|nationality|educated_at|occupation|owns|located_in|knows|friend_of|met|age|located_at]::str::The relationship type from subject to object. Choose the most specific type that fits.",
                 ]
             }
-            result = model.extract_json(req.text, schema, labels=["PERSON", "ORG", "LOC", "MISC", "ANIMAL"])
+            result = model.extract_json(req.text, schema)
             inferred_relations = [
                 EdgeInput(
                     subject=fact["subject"].lower().strip(),
