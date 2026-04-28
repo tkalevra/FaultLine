@@ -52,7 +52,7 @@ async def rewrite_to_triples(text: str, valves) -> list[dict]:
                     "temperature": 0.0,
                     "top_p": 1.0,
                     "repeat_penalty": 1.0,
-                    "max_tokens": 500,
+                    "max_tokens": 400,
                     "thinking": {"type": "disabled"},
                 },
             )
