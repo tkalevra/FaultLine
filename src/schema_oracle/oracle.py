@@ -73,7 +73,7 @@ LABEL_MAP = {
 
 # GLiNER2 label constraints for relationship extraction
 GLIREL_LABELS = {
-    "is_a": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "is_a": {"allowed_head": ["PERSON", "ORG", "MISC", "LOC"], "allowed_tail": ["MISC", "ORG"]},
     "part_of": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["ORG", "LOC", "MISC"]},
     "created_by": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG"]},
     "works_for": {"allowed_head": ["PERSON"], "allowed_tail": ["ORG"]},
@@ -81,7 +81,7 @@ GLIREL_LABELS = {
     "child_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
     "spouse": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
     "sibling_of": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON"]},
-    "also_known_as": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
+    "also_known_as": {"allowed_head": ["PERSON", "ORG", "LOC"], "allowed_tail": ["PERSON", "ORG", "LOC"]},
     "related_to": {"allowed_head": ["PERSON", "ORG", "LOC", "MISC"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
     "likes": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
     "dislikes": {"allowed_head": ["PERSON"], "allowed_tail": ["PERSON", "ORG", "LOC", "MISC"]},
