@@ -1,5 +1,5 @@
 import psycopg2
-from fact_store.store import FactStoreManager
+from src.fact_store.store import FactStoreManager
 
 SEED_ONTOLOGY = {
     "is_a":           {"subject_role": "subtype",   "object_role": "supertype"},
