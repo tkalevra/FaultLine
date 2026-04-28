@@ -39,34 +39,43 @@ class RelTypeRegistry:
 
 
 # DEPRECATED: Kept for test compatibility. RelTypeRegistry reads from Postgres at runtime.
+# Added W3C-aligned types (instance_of, subclass_of, pref_name, same_as)
+# See migrations/006_split_is_a.sql for standards alignment details.
 SEED_ONTOLOGY = {
-    "is_a":           {"subject_role": "subtype",   "object_role": "supertype"},  # Wikidata P31 (instance of)
-    "part_of":        {"subject_role": "component", "object_role": "whole"},      # Wikidata P361 (part of)
-    "created_by":     {"subject_role": "creation",  "object_role": "creator"},    # Wikidata P170 (creator, inv)
-    "works_for":      {"subject_role": "employee",  "object_role": "employer"},   # Wikidata P108 (employer, inv)
-    "parent_of":      {"subject_role": "parent",    "object_role": "child"},      # Wikidata P40 (child)
-    "child_of":       {"subject_role": "child",     "object_role": "parent"},     # Wikidata P40 (child, inv)
-    "spouse":         {"subject_role": "partner",   "object_role": "partner"},    # Wikidata P26 (spouse)
-    "sibling_of":     {"subject_role": "sibling",   "object_role": "sibling"},    # Wikidata P3373 (sibling)
-    "also_known_as":  {"subject_role": "canonical", "object_role": "alias"},      # Wikidata P742/P1449 (pseudonym/nickname)
-    "related_to":     {"subject_role": "entity",    "object_role": "entity"},     # Wikidata P1659 (see also) - loose mapping, domain-specific
-    "likes":          {"subject_role": "subject",   "object_role": "target"},     # domain-specific
-    "dislikes":       {"subject_role": "subject",   "object_role": "target"},     # domain-specific
-    "prefers":        {"subject_role": "subject",   "object_role": "target"},     # domain-specific
-    "owns":           {"subject_role": "owner",     "object_role": "property"},    # Wikidata P1830 (owner of, inv)
-    "located_in":     {"subject_role": "entity",    "object_role": "location"},    # Wikidata P131 (located in admin entity)
-    "educated_at":    {"subject_role": "student",   "object_role": "institution"}, # Wikidata P69 (educated at)
-    "nationality":    {"subject_role": "person",    "object_role": "country"},     # Wikidata P27 (country of citizenship)
-    "occupation":     {"subject_role": "person",    "object_role": "profession"},  # Wikidata P106 (occupation)
-    "born_on":        {"subject_role": "person",    "object_role": "date"},        # Wikidata P569 (date of birth)
-    "age":            {"subject_role": "person",    "object_role": "value"},       # domain-specific
-    "knows":          {"subject_role": "person",    "object_role": "person"},      # Wikidata P1891 (influenced) - loose, domain-specific
-    "friend_of":      {"subject_role": "person",    "object_role": "person"},      # domain-specific
-    "met":            {"subject_role": "person",    "object_role": "person"},      # domain-specific
-    "lives_in":       {"subject_role": "person",    "object_role": "location"},    # Wikidata P551 (residence)
-    "born_in":        {"subject_role": "person",    "object_role": "location"},    # Wikidata P19 (place of birth)
-    "has_gender":     {"subject_role": "person",    "object_role": "gender"},      # Wikidata P21 (sex or gender)
+    "is_a":           {"subject_role": "entity",     "object_role": "type"},       # P31/P279 (deprecated: use instance_of or subclass_of)
+    "instance_of":    {"subject_role": "entity",     "object_role": "type"},       # Wikidata P31 (instance of)
+    "subclass_of":    {"subject_role": "type",       "object_role": "type"},       # Wikidata P279 (subclass of)
+    "part_of":        {"subject_role": "component",  "object_role": "whole"},      # Wikidata P361 (part of)
+    "created_by":     {"subject_role": "creation",   "object_role": "creator"},    # Wikidata P170 (creator, inv)
+    "works_for":      {"subject_role": "employee",   "object_role": "employer"},   # Wikidata P108 (employer, inv)
+    "parent_of":      {"subject_role": "parent",     "object_role": "child"},      # Wikidata P40 (child)
+    "child_of":       {"subject_role": "child",      "object_role": "parent"},     # Wikidata P40 (child, inv)
+    "spouse":         {"subject_role": "partner",    "object_role": "partner"},    # Wikidata P26 (spouse, symmetric)
+    "sibling_of":     {"subject_role": "sibling",    "object_role": "sibling"},    # Wikidata P3373 (sibling, symmetric)
+    "also_known_as":  {"subject_role": "canonical",  "object_role": "alias"},      # Wikidata P742/P1449 (skos:altLabel)
+    "pref_name":      {"subject_role": "entity",     "object_role": "name"},       # preferred display name (skos:prefLabel)
+    "same_as":        {"subject_role": "entity",     "object_role": "entity"},     # owl:sameAs (symmetric, identity equiv)
+    "related_to":     {"subject_role": "entity",     "object_role": "entity"},     # Wikidata P1659 (see also)
+    "likes":          {"subject_role": "subject",    "object_role": "target"},     # domain-specific
+    "dislikes":       {"subject_role": "subject",    "object_role": "target"},     # domain-specific
+    "prefers":        {"subject_role": "subject",    "object_role": "target"},     # domain-specific
+    "owns":           {"subject_role": "owner",      "object_role": "property"},   # Wikidata P1830 (owner of, inv)
+    "located_in":     {"subject_role": "entity",     "object_role": "location"},   # Wikidata P131 (located in)
+    "educated_at":    {"subject_role": "student",    "object_role": "institution"},# Wikidata P69 (educated at)
+    "nationality":    {"subject_role": "person",     "object_role": "country"},    # Wikidata P27 (citizenship)
+    "occupation":     {"subject_role": "person",     "object_role": "profession"}, # Wikidata P106 (occupation)
+    "born_on":        {"subject_role": "person",     "object_role": "date"},       # Wikidata P569 (date of birth)
+    "age":            {"subject_role": "person",     "object_role": "value"},      # domain-specific
+    "knows":          {"subject_role": "person",     "object_role": "person"},     # Wikidata P1891 (influenced, symmetric)
+    "friend_of":      {"subject_role": "person",     "object_role": "person"},     # domain-specific (symmetric)
+    "met":            {"subject_role": "person",     "object_role": "person"},     # domain-specific (symmetric)
+    "lives_in":       {"subject_role": "person",     "object_role": "location"},   # Wikidata P551 (residence)
+    "born_in":        {"subject_role": "person",     "object_role": "location"},   # Wikidata P19 (place of birth)
+    "has_gender":     {"subject_role": "person",     "object_role": "gender"},     # Wikidata P21 (sex or gender)
 }
+
+# Symmetric relationships: storing A→B implies B→A
+_SYMMETRIC_TYPES = {"spouse", "sibling_of", "same_as", "friend_of", "knows", "met"}
 
 class WGMValidationGate:
     def __init__(self, db_conn, registry: RelTypeRegistry = None):
@@ -100,6 +109,26 @@ class WGMValidationGate:
 
         if user_id is None:
             return {"status": "valid"}
+
+        # Check for symmetric duplicates: if A→B exists and rel_type is symmetric,
+        # do not insert B→A again (it's implicitly the same fact in both directions)
+        if rt in _SYMMETRIC_TYPES:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM facts"
+                    " WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s",
+                    (user_id, subject_id, object_id, rt),
+                )
+                if cur.fetchone():
+                    return {"status": "valid", "note": "duplicate_exact"}
+
+                cur.execute(
+                    "SELECT id FROM facts"
+                    " WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s",
+                    (user_id, object_id, subject_id, rt),
+                )
+                if cur.fetchone():
+                    return {"status": "valid", "note": "symmetric_duplicate"}
 
         with self.db_conn.cursor() as cur:
             cur.execute(
