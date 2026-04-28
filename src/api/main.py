@@ -7,10 +7,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
-from src.wgm.gate import WGMValidationGate
+from src.wgm.gate import WGMValidationGate, RelTypeRegistry
 from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest
 
 log = structlog.get_logger()
+
+_gliner2_model = None
+_rel_type_registry: RelTypeRegistry = None
+_rel_type_constraint: str = ""
 
 _PREFERENCE_SIGNALS = {
     "goes by", "prefers to be called", "preferred name", "please call me",
@@ -21,11 +25,21 @@ def _detect_preference_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
 
-_gliner2_model = None
+def _build_rel_type_constraint(dsn: str) -> str:
+    """Load rel_types from DB and build pipe-separated bracket constraint."""
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT rel_type FROM rel_types ORDER BY rel_type")
+                types = [row[0] for row in cur.fetchall()]
+        return "|".join(types) if types else ""
+    except Exception as e:
+        log.warning("startup.constraint_builder_failed", error=str(e))
+        return ""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _gliner2_model
+    global _gliner2_model, _rel_type_registry, _rel_type_constraint
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
@@ -34,6 +48,18 @@ async def lifespan(app: FastAPI):
         log.info("startup.qdrant_collection_ready", collection=default_collection)
     else:
         log.error("startup.qdrant_collection_failed", collection=default_collection)
+
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        _rel_type_registry = RelTypeRegistry(dsn)
+        try:
+            _rel_type_registry.get_valid_types()
+            _rel_type_constraint = _build_rel_type_constraint(dsn)
+            log.info("startup.rel_type_registry_ready",
+                     count=len(_rel_type_registry._cache),
+                     constraint_len=len(_rel_type_constraint))
+        except Exception as e:
+            log.error("startup.rel_type_registry_failed", error=str(e))
 
     log.info("startup.gliner2_loading")
     try:
@@ -44,6 +70,7 @@ async def lifespan(app: FastAPI):
         log.error("startup.gliner2_failed", error=str(e))
     yield
     _gliner2_model = None
+    _rel_type_registry = None
 
 app = FastAPI(title="FaultLine WGM", lifespan=lifespan)
 
@@ -58,11 +85,12 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
     inferred_relations = []
     if model is not None:
         try:
+            constraint = _rel_type_constraint or "is_a|part_of|created_by|works_for|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|has_gender|lives_in|born_in|born_on|nationality|educated_at|occupation|owns|located_in|knows|friend_of|met|age|located_at"
             schema = {
                 "facts": [
                     "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
                     "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
-                    "rel_type::[is_a|part_of|created_by|works_for|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|has_gender|lives_in|born_in|born_on|nationality|educated_at|occupation|owns|located_in|knows|friend_of|met|age|located_at]::str::The relationship type from subject to object. Choose the most specific type that fits.",
+                    f"rel_type::[{constraint}]::str::The relationship type from subject to object. Choose the most specific type that fits.",
                 ]
             }
             result = model.extract_json(req.text, schema)
@@ -87,7 +115,7 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         try:
-            gate, manager = WGMValidationGate(db), FactStoreManager(db)
+            gate, manager = WGMValidationGate(db, _rel_type_registry), FactStoreManager(db)
             rows = []
             has_preferred = _detect_preference_signal(req.text)
 
