@@ -23,9 +23,9 @@ Output ONLY a raw JSON array. No markdown, no explanation, no code fences.
 RULES:
 
 ENTITY NAMING RULES (strictly enforced):
-- Never use first-person pronouns (I, me, my, we, our, myself) as subject or object values.
-- If the speaker refers to themselves using "I" or "me", and a named identity has been established in the conversation (e.g. "I am Thomas"), substitute that name as the entity.
-- If no named identity is established yet, skip the triple entirely. Do not emit a triple with subject="i" or subject="me".
+- NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called Mars", the subject is "marla" not "i".
+- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being described, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
 RELATIONSHIP RULES (strictly enforced):
