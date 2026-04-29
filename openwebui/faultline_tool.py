@@ -343,11 +343,32 @@ class Filter:
                                     by_rel[f.get("rel_type", "")].append(f)
 
                                 sentences = []
-                                children = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
-                                parents = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
-                                spouses = [f.get("object") for f in by_rel.get("spouse", []) if identity and (f.get("subject") == identity or f.get("object") == identity)]
-                                spouses += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") == identity and f.get("subject") not in spouses]
-                                siblings = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") == identity]
+                                # Build a nickname lookup from also_known_as facts: canonical → alias
+                                # e.g. charles → chuck means display as "Charles (Chuck)"
+                                nickname_map = {}
+                                for f in by_rel.get("also_known_as", []):
+                                    canonical = f.get("subject", "")
+                                    alias = f.get("object", "")
+                                    if canonical and alias and canonical != identity:
+                                        nickname_map[canonical] = alias
+
+                                def _display_name(name: str) -> str:
+                                    """Return 'Name (Nickname)' if a nickname exists, else just 'Name'."""
+                                    title = name.title()
+                                    if name in nickname_map:
+                                        return f"{title} ({nickname_map[name].title()})"
+                                    return title
+
+                                children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
+                                parents_raw = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
+                                spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and (f.get("subject") == identity or f.get("object") == identity)]
+                                spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") == identity and f.get("subject") not in spouses_raw]
+                                siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") == identity]
+
+                                children = [_display_name(c) for c in children_raw]
+                                parents = [_display_name(p) for p in parents_raw]
+                                spouses = [_display_name(s) for s in set(spouses_raw)]
+                                siblings = [_display_name(s) for s in siblings_raw]
 
                                 if children:
                                     sentences.append(f"You have {len(children)} {'child' if len(children) == 1 else 'children'}: {', '.join(children)}.")
@@ -359,7 +380,7 @@ class Filter:
                                     sentences.append(f"Your {'sibling is' if len(siblings) == 1 else 'siblings are'} {', '.join(siblings)}.")
 
                                 # Render remaining facts not already covered
-                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of"}
+                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as"}
                                 for f in facts:
                                     if f.get("rel_type") in covered_rels:
                                         continue
