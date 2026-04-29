@@ -11,7 +11,7 @@ class EntityRegistry:
         target_type = entity_type.lower().strip()
 
         # Strict Matching: Only merge if text is IDENTICAL.
-        # This prevents "Cy" merging into "Cyrus".
+        # This prevents "Theo" merging into "Theodore".
         for cid, data in self.registry.items():
             if data["name"].lower().strip() == target_name and data["type"].lower().strip() == target_type:
                 return {"canonical_id": cid, "is_duplicate": True}

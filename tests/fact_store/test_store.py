@@ -106,7 +106,7 @@ def test_preferred_label_set_on_also_known_as():
     manager = FactStoreManager(mock_conn)
 
     result = manager.commit([
-        ("test_user", "marla", "mars", "also_known_as", "test", True)
+        ("test_user", "eleanor", "ellie", "also_known_as", "test", True)
     ])
 
     assert result == 1
@@ -122,12 +122,12 @@ def test_also_known_as_accepts_is_preferred_label_field():
     """EdgeInput with is_preferred_label field should be valid."""
     from api.models import EdgeInput
     edge = EdgeInput(
-        subject="marla",
-        object="mars",
+        subject="eleanor",
+        object="ellie",
         rel_type="also_known_as",
         is_preferred_label=True
     )
-    assert edge.subject == "marla"
-    assert edge.object == "mars"
+    assert edge.subject == "eleanor"
+    assert edge.object == "ellie"
     assert edge.rel_type == "also_known_as"
     assert edge.is_preferred_label is True

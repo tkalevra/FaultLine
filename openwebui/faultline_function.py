@@ -20,9 +20,9 @@ STRICT RULES:
 2. Entities must be proper names only. No pronouns, no "the user", no generics.
 3. All subject and object values must be lowercase.
 4. rel_type must be EXACTLY one of: parent_of, child_of, spouse, sibling_of, also_known_as, works_for, likes, dislikes, prefers
-5. also_known_as means nickname or alias ONLY — e.g. "Cyrus also known as Cy" → {"subject":"cyrus","object":"cy","rel_type":"also_known_as"}
-6. parent_of means a parent-child relationship — e.g. "Christopher has a son Cyrus" → {"subject":"christopher","object":"cyrus","rel_type":"parent_of"}
-7. spouse means married or partnered — e.g. "Christopher's spouse is Marla" → {"subject":"christopher","object":"marla","rel_type":"spouse"}
+5. also_known_as means nickname or alias ONLY — e.g. "Theodore also known as Theo" → {"subject":"theodore","object":"theo","rel_type":"also_known_as"}
+6. parent_of means a parent-child relationship — e.g. "Arthur has a son Theodore" → {"subject":"arthur","object":"theodore","rel_type":"parent_of"}
+7. spouse means married or partnered — e.g. "Arthur's spouse is Eleanor" → {"subject":"arthur","object":"eleanor","rel_type":"spouse"}
 8. Never use also_known_as for a parent-child or spouse relationship.
 9. If unsure, set "low_confidence": true. Never silently drop a relation.
 10. If the input contains a first-person statement identifying the speaker's name (e.g. "My name is X", "I am X", "I'm X"), emit exactly one triple: {"subject":"user","object":"<name>","rel_type":"also_known_as","low_confidence":false}

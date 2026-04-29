@@ -155,12 +155,12 @@ def test_correction_hard_delete_migrates_facts():
 
         with TestClient(app) as c:
             r = c.post("/ingest", json={
-                "text": "oh his name is actually Fraggle",
+                "text": "oh his name is actually Biscuit",
                 "source": "test",
                 "user_id": "user1",
                 "edges": [{
-                    "subject": "fragglr",
-                    "object": "fraggle",
+                    "subject": "biskit",
+                    "object": "biscuit",
                     "rel_type": "also_known_as",
                     "is_correction": True,
                 }],
@@ -234,7 +234,7 @@ def test_correction_immutable_does_nothing():
                 "source": "test",
                 "user_id": "user1",
                 "edges": [{
-                    "subject": "christopher",
+                    "subject": "arthur",
                     "object": "toronto",
                     "rel_type": "born_in",
                     "is_correction": True,

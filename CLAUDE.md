@@ -94,7 +94,7 @@ FaultLine's triple model `(subject_id, rel_type, object_id)` is semantically equ
 ### Ontology Standards Alignment
 
 **Semantic distinctions:**
-- **instance_of** (P31): A named entity belongs to a type class (e.g., "Fraggle instance_of dog"). NOT transitive for type inference.
+- **instance_of** (P31): A named entity belongs to a type class (e.g., "Biscuit instance_of dog"). NOT transitive for type inference.
 - **subclass_of** (P279): A type class is a subtype of another class (e.g., "dog subclass_of animal"). IS transitive.
 - **pref_name**: The canonical display name for an entity (SKOS prefLabel semantics). Enforced via `is_preferred_label` column.
 - **also_known_as**: Alternate name, alias, or nickname (SKOS altLabel semantics). Multiple may exist per entity.

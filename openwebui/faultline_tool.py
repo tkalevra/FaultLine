@@ -41,9 +41,9 @@ RELATIONSHIP RULES (strictly enforced):
    Common types: is_a, has_pet, parent_of, child_of, spouse, sibling_of,
    also_known_as, works_for, likes, dislikes, prefers, lives_at, owns.
    You may use other snake_case types if none of the above fit.
-4. also_known_as = nickname or alias ONLY (e.g. "Cy" for "Cyrus").
+4. also_known_as = nickname or alias ONLY (e.g. "Theo" for "Theodore").
 5. is_a = type or category (e.g. "morkie is_a dog breed").
-6. has_pet = person owns an animal (e.g. "we have a dog named Fragglr").
+6. has_pet = person owns an animal (e.g. "we have a dog named Biskit").
 7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
    between the descriptor and the name.
 8. Pronoun resolution: replace he/she/it with the named entity if clear.
@@ -59,8 +59,8 @@ RELATIONSHIP RULES (strictly enforced):
     "not X, it's Y", "correct that to"), extract the correction as a new
     triple with the corrected value. Use prior context to resolve the
     subject. Mark corrected triples with "is_correction": true.
-    e.g. "oh his name is actually Fraggle" (context: dog named Fragglr) →
-    {"subject":"fragglr","object":"fraggle","rel_type":"also_known_as",
+    e.g. "oh his name is actually Biscuit" (context: dog named Biskit) →
+    {"subject":"biskit","object":"biscuit","rel_type":"also_known_as",
      "is_correction":true,"low_confidence":false}
 
 OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
