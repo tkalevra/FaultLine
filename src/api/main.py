@@ -83,6 +83,31 @@ def health():
         raise HTTPException(status_code=503, detail="Model loading")
     return {"status": "ok"}
 
+@app.post("/extract")
+def extract(req: IngestRequest, model=Depends(get_gliner_model)):
+    """
+    Run GLiNER2 entity extraction only. Returns typed entities for use
+    by the filter before calling Qwen for relationship classification.
+    """
+    if model is None:
+        return {"entities": []}
+    try:
+        constraint = _rel_type_constraint or "is_a|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|owns|knows|friend_of"
+        schema = {
+            "facts": [
+                "subject::str::The full proper name of the first entity. Never a pronoun.",
+                "object::str::The full proper name of the second entity. Never a pronoun.",
+                f"rel_type::[{constraint}]::str::The relationship type from subject to object.",
+                "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The entity type of the subject.",
+                "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The entity type of the object.",
+            ]
+        }
+        result = model.extract_json(req.text, schema)
+        return {"entities": result.get("facts", [])}
+    except Exception as e:
+        log.error("extract.gliner2_failed", error=str(e))
+        return {"entities": []}
+
 def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
                       rel_type: str, new_fact_id: int, correction_behavior: str) -> int:
     if correction_behavior == "hard_delete":
