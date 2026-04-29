@@ -5,6 +5,7 @@ import httpx
 import psycopg2
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
+from src.entity_registry.registry import EntityRegistry
 from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
@@ -304,120 +305,53 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     edges = list(edges_dict.values())
 
-    # Resolve "user" subject/object to known identity if established
-    # Look up the most recent also_known_as fact for this user_id
-    resolved_identity = None
-    _dsn = os.environ.get("POSTGRES_DSN")
-    try:
-        if not _dsn:
-            raise ValueError("No POSTGRES_DSN")
-        _db = psycopg2.connect(_dsn)
-        with _db.cursor() as _cur:
-            _cur.execute(
-                "SELECT object_id FROM facts "
-                "WHERE user_id = %s AND subject_id = 'user' AND rel_type = 'also_known_as' "
-                "ORDER BY id DESC LIMIT 1",
-                (req.user_id,),
-            )
-            _row = _cur.fetchone()
-            if _row:
-                resolved_identity = _row[0]
-        _db.close()
-    except Exception as _e:
-        log.warning("ingest.identity_resolution_failed", error=str(_e))
-
-    if resolved_identity:
-        resolved_edges = []
-        for edge in edges:
-            subj = resolved_identity if edge.subject == "user" else edge.subject
-            obj = resolved_identity if edge.object == "user" else edge.object
-            resolved_edges.append(EdgeInput(
-                subject=subj,
-                object=obj,
-                rel_type=edge.rel_type,
-                is_preferred_label=edge.is_preferred_label,
-                is_correction=edge.is_correction,
-            ))
-        edges = resolved_edges
-
-    # Build alias → canonical map from existing facts in DB
-    # Only resolve Person-type entities to prevent cross-type contamination
-    # e.g. don't resolve "sophia" (snake) even if it matches an alias
-    _PERSON_TYPES = {"person", "per", "human", "character"}
-
-    alias_to_canonical: dict[str, str] = {}
-    _dsn2 = os.environ.get("POSTGRES_DSN")
-    if _dsn2:
-        try:
-            _db2 = psycopg2.connect(_dsn2)
-            with _db2.cursor() as _cur2:
-                _cur2.execute(
-                    "SELECT subject_id, object_id FROM facts "
-                    "WHERE user_id = %s AND rel_type = 'also_known_as'",
-                    (req.user_id,),
-                )
-                for canonical, alias in _cur2.fetchall():
-                    alias_to_canonical[alias] = canonical
-            _db2.close()
-        except Exception as _e:
-            log.warning("ingest.alias_resolution_failed", error=str(_e))
-
-    def _is_person(name: str) -> bool:
-        """Return True if entity is known to be a Person type."""
-        entity_type = _entity_types.get(name, "")
-        # If we have explicit type info, use it
-        if entity_type:
-            return entity_type in _PERSON_TYPES
-        # If no type info, only resolve if it's a known alias
-        # (conservative: unknown type entities are not resolved)
-        return False
-
-    if alias_to_canonical:
-        resolved_alias_edges = []
-        for edge in edges:
-            # Only resolve subject/object if they are Person-type entities
-            subj = alias_to_canonical[edge.subject] if (
-                edge.subject in alias_to_canonical and _is_person(edge.subject)
-            ) else edge.subject
-            obj = alias_to_canonical[edge.object] if (
-                edge.object in alias_to_canonical and _is_person(edge.object)
-            ) else edge.object
-            # Skip self-referential edges created by alias resolution
-            if subj == obj:
-                log.debug("ingest.alias_self_ref_skipped", subject=subj, rel=edge.rel_type)
-                continue
-            # Skip also_known_as edges where both sides resolve to same canonical
-            if edge.rel_type == "also_known_as" and (
-                alias_to_canonical.get(edge.subject) == alias_to_canonical.get(edge.object)
-            ):
-                continue
-            resolved_alias_edges.append(EdgeInput(
-                subject=subj,
-                object=obj,
-                rel_type=edge.rel_type,
-                is_preferred_label=edge.is_preferred_label,
-                is_correction=edge.is_correction,
-            ))
-        edges = resolved_alias_edges
-
     facts, committed = [], 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         try:
             gate, manager = WGMValidationGate(db, _rel_type_registry), FactStoreManager(db)
+            registry = EntityRegistry(db)
             rows = []
             has_preferred = _detect_preference_signal(req.text)
+            preferred_objects = set()
 
             for edge in edges:
                 if edge.subject == edge.object: continue
-                status = gate.validate_edge(edge.subject, edge.object, edge.rel_type)["status"]
-                facts.append(FactResult(subject=edge.subject, object=edge.object, rel_type=edge.rel_type, status=status))
+
+                # Resolve all entity names to canonical form via registry
+                # This ensures aliases (mars, chris) never appear as subject/object in facts
+                canonical_subject = registry.resolve(req.user_id, edge.subject)
+                canonical_object = registry.resolve(req.user_id, edge.object)
+
+                # Register aliases from also_known_as and pref_name edges
+                if edge.rel_type.lower() in ("also_known_as", "pref_name"):
+                    is_pref = (
+                        edge.rel_type.lower() == "pref_name" or
+                        edge.is_preferred_label or
+                        edge.object.lower() in preferred_objects or
+                        (has_preferred and edge.rel_type.lower() in ("also_known_as", "pref_name"))
+                    )
+                    registry.register_alias(
+                        req.user_id,
+                        canonical_subject,
+                        edge.object.lower(),
+                        is_preferred=is_pref,
+                    )
+                    if is_pref and edge.rel_type.lower() == "pref_name":
+                        preferred_objects.add(edge.object.lower())
+
+                # Skip self-referential after resolution
+                if canonical_subject == canonical_object:
+                    continue
+
+                status = gate.validate_edge(canonical_subject, canonical_object, edge.rel_type)["status"]
+                facts.append(FactResult(subject=canonical_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
                 if status == "valid":
                     is_preferred = (
                         edge.rel_type.lower() in ("also_known_as", "pref_name") and
                         (has_preferred or edge.is_preferred_label)
                     )
-                    rows.append((req.user_id, edge.subject, edge.object, edge.rel_type, req.source, is_preferred))
+                    rows.append((req.user_id, canonical_subject, canonical_object, edge.rel_type, req.source, is_preferred))
 
             if rows:
                 committed = manager.commit(rows)
@@ -512,15 +446,17 @@ def query(request: QueryRequest):
         return {"status": "ok", "facts": [], "preferred_names": {}}
 
     preferred_names = {}
+    canonical_identity = None
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT subject_id, object_id FROM facts"
-                " WHERE user_id = %s AND rel_type = 'also_known_as' AND is_preferred_label = true",
-                (user_id,),
-            )
-            preferred_names = {row[0]: row[1] for row in cur.fetchall()}
+        registry = EntityRegistry(db)
+        canonical_identity = registry.get_canonical_for_user(user_id)
+        if canonical_identity:
+            preferred = registry.get_preferred_name(user_id, canonical_identity)
+            if preferred != canonical_identity:
+                preferred_names = {"user": preferred}
+            else:
+                preferred_names = {"user": canonical_identity}
         db.close()
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
@@ -541,37 +477,60 @@ def query(request: QueryRequest):
     direct_facts = []
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
         try:
+            # Use registry to get all aliases for this user
             _db_direct = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            with _db_direct.cursor() as _cur:
-                # Get known identity for this user
-                _cur.execute(
-                    "SELECT object_id FROM facts WHERE user_id = %s "
-                    "AND subject_id = 'user' AND rel_type = 'also_known_as' "
-                    "AND is_preferred_label = true LIMIT 1",
-                    (user_id,),
-                )
-                _identity_row = _cur.fetchone()
-                _identity = _identity_row[0] if _identity_row else None
+            _registry = EntityRegistry(_db_direct)
+            _identity = canonical_identity or _registry.get_canonical_for_user(user_id)
 
-                if _identity:
-                    # Fetch all facts where identity is subject or object
+            if _identity:
+                _user_aliases = set(_registry.get_all_aliases(user_id, _identity)) | {_identity}
+
+                # Also get aliases for spouse entities (2-hop)
+                _alias_list = list(_user_aliases)
+                _placeholders = ",".join(["%s"] * len(_alias_list))
+                with _db_direct.cursor() as _cur:
                     _cur.execute(
-                        "SELECT subject_id, object_id, rel_type, provenance FROM facts "
-                        "WHERE user_id = %s AND superseded_at IS NULL "
-                        "AND (subject_id = %s OR object_id = %s) "
-                        "AND rel_type != 'also_known_as' "
-                        "ORDER BY id",
-                        (user_id, _identity, _identity),
+                        f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                        f"WHERE user_id = %s AND superseded_at IS NULL "
+                        f"AND (subject_id IN ({_placeholders}) OR object_id IN ({_placeholders})) "
+                        f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
+                        f"ORDER BY id",
+                        [user_id] + _alias_list + _alias_list,
                     )
                     direct_facts = [
-                        {
-                            "subject": row[0],
-                            "object": row[1],
-                            "rel_type": row[2],
-                            "provenance": row[3],
-                        }
+                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3]}
                         for row in _cur.fetchall()
                     ]
+
+                    # 2-hop: fetch facts for directly related entities
+                    related = {
+                        f["object"] for f in direct_facts if f["subject"] in _user_aliases
+                    } | {
+                        f["subject"] for f in direct_facts if f["object"] in _user_aliases
+                    }
+                    related -= _user_aliases
+
+                    if related:
+                        _rel_list = list(related)
+                        _rel_ph = ",".join(["%s"] * len(_rel_list))
+                        _cur.execute(
+                            f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                            f"WHERE user_id = %s AND superseded_at IS NULL "
+                            f"AND (subject_id IN ({_rel_ph}) OR object_id IN ({_rel_ph})) "
+                            f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
+                            f"ORDER BY id",
+                            [user_id] + _rel_list + _rel_list,
+                        )
+                        seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+                        for row in _cur.fetchall():
+                            key = (row[0], row[1], row[2])
+                            if key not in seen:
+                                direct_facts.append({
+                                    "subject": row[0], "object": row[1],
+                                    "rel_type": row[2], "provenance": row[3]
+                                })
+                                seen.add(key)
+
             _db_direct.close()
             if direct_facts:
                 log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
