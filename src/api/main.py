@@ -18,8 +18,12 @@ _rel_type_registry: RelTypeRegistry = None
 _rel_type_constraint: str = ""
 
 _PREFERENCE_SIGNALS = {
-    "goes by", "prefers to be called", "preferred name", "please call me",
-    "call me", "known as", "my name is"
+    "goes by", "go by",
+    "prefers to be called", "prefer to be called",
+    "preferred name", "my preferred name",
+    "please call me", "call me",
+    "known as", "also known as",
+    "my name is", "i prefer", "i go by",
 }
 
 _IDENTITY_PATTERNS = [
