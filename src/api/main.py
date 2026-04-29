@@ -525,6 +525,60 @@ def query(request: QueryRequest):
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
 
+    # Graph traversal path: if query contains self-referential signals,
+    # fetch facts directly from Postgres anchored to the user's identity.
+    # This bypasses vector similarity which fails for structured relational queries.
+    _SELF_REF_SIGNALS = {
+        "my family", "my children", "my kids", "my wife", "my husband",
+        "my spouse", "my partner", "my parents", "my siblings", "my brother",
+        "my sister", "my son", "my daughter", "about me", "about myself",
+        "who am i", "who i am", "list my", "tell me about me",
+        "what do you know about me", "my pets", "my animals", "my home",
+        "where do i live", "my address", "my age", "my job", "my work",
+    }
+
+    query_lower = request.text.lower()
+    direct_facts = []
+    if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
+        try:
+            _db_direct = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            with _db_direct.cursor() as _cur:
+                # Get known identity for this user
+                _cur.execute(
+                    "SELECT object_id FROM facts WHERE user_id = %s "
+                    "AND subject_id = 'user' AND rel_type = 'also_known_as' "
+                    "AND is_preferred_label = true LIMIT 1",
+                    (user_id,),
+                )
+                _identity_row = _cur.fetchone()
+                _identity = _identity_row[0] if _identity_row else None
+
+                if _identity:
+                    # Fetch all facts where identity is subject or object
+                    _cur.execute(
+                        "SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                        "WHERE user_id = %s AND superseded_at IS NULL "
+                        "AND (subject_id = %s OR object_id = %s) "
+                        "AND rel_type != 'also_known_as' "
+                        "ORDER BY id",
+                        (user_id, _identity, _identity),
+                    )
+                    direct_facts = [
+                        {
+                            "subject": row[0],
+                            "object": row[1],
+                            "rel_type": row[2],
+                            "provenance": row[3],
+                        }
+                        for row in _cur.fetchall()
+                    ]
+            _db_direct.close()
+            if direct_facts:
+                log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
+                return {"status": "ok", "facts": direct_facts, "preferred_names": preferred_names}
+        except Exception as _e:
+            log.warning("query.graph_traversal_failed", error=str(_e))
+
     try:
         resp = httpx.post(
             f"{qdrant_url}/collections/{collection}/points/search",
