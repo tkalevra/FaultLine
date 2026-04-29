@@ -330,9 +330,10 @@ class Filter:
 
                             memory_lines = []
                             if preferred_names:
-                                memory_lines.append("## Preferred Names (use these exclusively)")
-                                for subject, preferred_obj in preferred_names.items():
-                                    memory_lines.append(f"- {subject} → {preferred_obj}")
+                                memory_lines.append("## Preferred Names (always use these, never the canonical form unless explicitly asked for a full or legal name)")
+                                for canonical, preferred in preferred_names.items():
+                                    if canonical != identity:
+                                        memory_lines.append(f"- Always call {canonical.title()} by '{preferred.title()}'. Only use '{canonical.title()}' if asked for their full or legal name.")
                                 memory_lines.append("")
 
                             if facts:
@@ -353,11 +354,10 @@ class Filter:
                                         nickname_map[canonical] = alias
 
                                 def _display_name(name: str) -> str:
-                                    """Return 'Name (Nickname)' if a nickname exists, else just 'Name'."""
-                                    title = name.title()
+                                    """Return preferred name if one exists, otherwise canonical name."""
                                     if name in nickname_map:
-                                        return f"{title} ({nickname_map[name].title()})"
-                                    return title
+                                        return nickname_map[name].title()
+                                    return name.title()
 
                                 children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
                                 parents_raw = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
