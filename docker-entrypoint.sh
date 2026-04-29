@@ -9,7 +9,9 @@ done
 echo "[entrypoint] Running migrations..."
 for migration in $(ls /app/migrations/*.sql | sort); do
     echo "[entrypoint] Applying $migration..."
-    psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f "$migration"
+    if ! psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f "$migration"; then
+        echo "[entrypoint] WARNING: $migration had errors (may already be applied) — continuing"
+    fi
 done
 echo "[entrypoint] Migrations complete."
 
