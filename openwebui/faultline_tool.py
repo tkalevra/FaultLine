@@ -47,44 +47,6 @@ OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false
 If nothing to extract: []"""
 
 
-async def _should_ingest(text: str, valves) -> bool:
-    if len(text.split()) < 5:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.post(
-                valves.QWEN_URL,
-                json={
-                    "model": valves.QWEN_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a memory-relevance classifier for a personal knowledge graph. "
-                                "Reply with only the single word yes or no. "
-                                "No punctuation, no explanation. "
-                                "When in doubt, reply yes."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Does this message contain a factual assertion, a correction to a prior "
-                                f"fact, or any statement about a person, animal, place, or object that "
-                                f"should be remembered? Reply with only: yes or no.\n\n\"{text}\""
-                            )
-                        }
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 5,
-                    "thinking": {"type": "disabled"},
-                },
-            )
-        return r.json()["choices"][0]["message"]["content"].strip().lower().startswith("yes")
-    except Exception:
-        return True
-
-
 async def rewrite_to_triples(text: str, valves, context: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
@@ -221,7 +183,7 @@ class Filter:
 
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
-            will_ingest = self.valves.INGEST_ENABLED and await _should_ingest(text, self.valves)
+            will_ingest = self.valves.INGEST_ENABLED and len(text.split()) >= 5
             will_query = self.valves.QUERY_ENABLED
 
             if self.valves.ENABLE_DEBUG:
@@ -281,27 +243,17 @@ class Filter:
 
                             memory_lines = []
                             if preferred_names:
-                                memory_lines.append(
-                                    "IMPORTANT: Use ONLY the following names. "
-                                    "Never use the alternate form in your response:"
-                                )
+                                memory_lines.append("## Preferred Names (use these exclusively)")
                                 for subject, preferred_obj in preferred_names.items():
-                                    memory_lines.append(
-                                        f"- Always refer to '{subject}' as '{preferred_obj}'"
-                                    )
+                                    memory_lines.append(f"- {subject} → {preferred_obj}")
                                 memory_lines.append("")
 
                             if facts:
                                 memory_lines.append("## Facts")
                                 for f in facts:
-                                    subj = f.get("subject", "")
-                                    rel = f.get("rel_type", "")
-                                    obj = f.get("object", "")
-                                    if rel == "also_known_as" and subj in preferred_names:
-                                        continue
-                                    display_subj = preferred_names.get(subj, subj)
-                                    display_obj = preferred_names.get(obj, obj)
-                                    memory_lines.append(f"- {display_subj} {rel} {display_obj}")
+                                    memory_lines.append(
+                                        f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
+                                    )
 
                             memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}" + "\n".join(memory_lines)
                             messages = body.get("messages", [])
