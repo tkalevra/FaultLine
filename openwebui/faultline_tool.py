@@ -330,20 +330,58 @@ class Filter:
                                 memory_lines.append("")
 
                             if facts:
-                                memory_lines.append("## Facts")
+                                # Group facts by rel_type for natural sentence construction
+                                from collections import defaultdict
+                                by_rel = defaultdict(list)
                                 for f in facts:
+                                    by_rel[f.get("rel_type", "")].append(f)
+
+                                sentences = []
+                                children = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
+                                parents = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
+                                spouses = [f.get("object") for f in by_rel.get("spouse", []) if identity and (f.get("subject") == identity or f.get("object") == identity)]
+                                spouses += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") == identity and f.get("subject") not in spouses]
+                                siblings = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") == identity]
+
+                                if children:
+                                    sentences.append(f"You have {len(children)} {'child' if len(children) == 1 else 'children'}: {', '.join(children)}.")
+                                if spouses:
+                                    sentences.append(f"You are married to {', '.join(set(spouses))}.")
+                                if parents:
+                                    sentences.append(f"Your {'parent is' if len(parents) == 1 else 'parents are'} {', '.join(parents)}.")
+                                if siblings:
+                                    sentences.append(f"Your {'sibling is' if len(siblings) == 1 else 'siblings are'} {', '.join(siblings)}.")
+
+                                # Render remaining facts not already covered
+                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of"}
+                                for f in facts:
+                                    if f.get("rel_type") in covered_rels:
+                                        continue
                                     subj = f.get("subject", "")
                                     obj = f.get("object", "")
-                                    rel = f.get("rel_type", "")
-                                    # Rewrite facts involving the known identity to be user-anchored
+                                    rel = f.get("rel_type", "").replace("_", " ")
                                     if identity and subj == identity:
-                                        memory_lines.append(f"- You ({identity}) {rel.replace('_', ' ')} {obj}")
+                                        sentences.append(f"You {rel} {obj}.")
                                     elif identity and obj == identity:
-                                        memory_lines.append(f"- {subj} {rel.replace('_', ' ')} you ({identity})")
+                                        sentences.append(f"{subj.title()} {rel} you.")
                                     else:
-                                        memory_lines.append(f"- {subj} {rel.replace('_', ' ')} {obj}")
+                                        sentences.append(f"{subj.title()} {rel} {obj}.")
 
-                            memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}" + "\n".join(memory_lines)
+                                if sentences:
+                                    memory_lines.append("## What I know about you")
+                                    for s in sentences:
+                                        memory_lines.append(f"- {s}")
+
+                            memory_block = (
+                                f"\n\n🧠 Memory context from FaultLine:\n"
+                                f"{identity_line}"
+                                f"IMPORTANT: These facts are about the person you are speaking with directly. "
+                                f"Do not invent parents, ancestors, or additional family members not listed here. "
+                                f"Do not reframe the user as a child or sibling. Only state what the facts explicitly say.\n"
+                                + "\n".join(memory_lines)
+                            )
+                            print(f"[FaultLine DEBUG] identity={identity}")
+                            print(f"[FaultLine DEBUG] memory_block=\n{memory_block}")
                             messages = body.get("messages", [])
                             for i in reversed(range(len(messages))):
                                 if messages[i].get("role") == "user":
