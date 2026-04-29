@@ -1,26 +1,41 @@
-name: Tests
+name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -e ".[test,api]"
+        run: pip install -e ".[test]"
 
       - name: Run tests
         run: |
-          pytest tests/ \
-            --ignore=tests/evaluation \
-            --ignore=tests/feature_extraction \
-            --ignore=tests/model_inference \
-            --ignore=tests/preprocessing \
-            -v
+          pytest \
+            tests/gli_ner/ \
+            tests/schema_oracle/ \
+            tests/wgm/ \
+            tests/fact_store/ \
+            tests/context_packager/ \
+            tests/api/ \
+            -q --tb=short
+        env:
+          POSTGRES_DSN: ""
+          QWEN_API_URL: ""
+          QDRANT_URL: ""
+          QDRANT_COLLECTION: "faultline-test"
