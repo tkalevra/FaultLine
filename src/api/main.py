@@ -122,17 +122,15 @@ def add_rel_type(req: RelTypeRequest):
     try:
         with psycopg2.connect(dsn) as db:
             with db.cursor() as cur:
-                # Refuse to overwrite wikidata or builtin sources
+                # Trust hierarchy: user > wikidata > engine > builtin
+                # Users can overwrite anything. Engine cannot overwrite user or wikidata.
                 cur.execute(
                     "SELECT source FROM rel_types WHERE rel_type = %s",
                     (req.rel_type.lower(),),
                 )
                 existing = cur.fetchone()
-                if existing and existing[0] in ("wikidata", "builtin"):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Cannot overwrite protected source '{existing[0]}' for rel_type '{req.rel_type}'"
-                    )
+                if existing and existing[0] == "user":
+                    pass  # user-asserted types can be updated by users
                 cur.execute(
                     "INSERT INTO rel_types"
                     " (rel_type, label, wikidata_pid, engine_generated, confidence, source,"
