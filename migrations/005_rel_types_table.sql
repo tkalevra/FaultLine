@@ -14,6 +14,7 @@ CREATE INDEX IF NOT EXISTS idx_rel_types_engine_generated
     ON rel_types (engine_generated);
 
 -- Add unique constraint to pending_types.rel_type for ON CONFLICT handling
+ALTER TABLE pending_types DROP CONSTRAINT IF EXISTS pending_types_rel_type_unique;
 ALTER TABLE pending_types ADD CONSTRAINT pending_types_rel_type_unique UNIQUE (rel_type);
 CREATE INDEX IF NOT EXISTS idx_pending_types_rel_type ON pending_types (rel_type);
 
