@@ -304,11 +304,7 @@ class Filter:
                         if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
-                            identity = preferred_names.get("user") or next(
-                                (f.get("object") for f in facts
-                                 if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
-                                None,
-                            )
+                            identity = preferred_names.get("user")
                             if identity:
                                 identity_line = (
                                     f"The user in this conversation is '{identity}'. "
