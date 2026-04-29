@@ -30,6 +30,14 @@ _IDENTITY_PATTERNS = [
     re.compile(r"\bpeople call me ([a-z]+)", re.IGNORECASE),
 ]
 
+_IDENTITY_STOPWORDS = {
+    "a", "an", "the", "not", "just", "also", "here", "happy", "glad", "sorry",
+    "married", "single", "divorced", "engaged", "here", "ready", "trying",
+    "going", "looking", "back", "home", "out", "in", "on", "at", "to",
+    "very", "really", "so", "too", "quite", "sure", "afraid", "aware",
+    "excited", "sorry", "glad", "grateful", "proud", "tired", "done",
+}
+
 def _detect_preference_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
@@ -40,8 +48,7 @@ def _extract_identity(text: str) -> str | None:
         m = pattern.search(text)
         if m:
             name = m.group(1).lower().strip()
-            # Exclude common false positives
-            if name not in {"a", "an", "the", "not", "just", "also", "here", "happy", "glad", "sorry"}:
+            if name not in _IDENTITY_STOPWORDS:
                 return name
     return None
 
@@ -234,6 +241,40 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
     edges = list(edges_dict.values())
+
+    # Resolve "user" subject/object to known identity if established
+    # Look up the most recent also_known_as fact for this user_id
+    resolved_identity = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as _cur:
+            _cur.execute(
+                "SELECT object_id FROM facts "
+                "WHERE user_id = %s AND subject_id = 'user' AND rel_type = 'also_known_as' "
+                "ORDER BY id DESC LIMIT 1",
+                (req.user_id,),
+            )
+            _row = _cur.fetchone()
+            if _row:
+                resolved_identity = _row[0]
+        _db.close()
+    except Exception as _e:
+        log.warning("ingest.identity_resolution_failed", error=str(_e))
+
+    if resolved_identity:
+        resolved_edges = []
+        for edge in edges:
+            subj = resolved_identity if edge.subject == "user" else edge.subject
+            obj = resolved_identity if edge.object == "user" else edge.object
+            resolved_edges.append(EdgeInput(
+                subject=subj,
+                object=obj,
+                rel_type=edge.rel_type,
+                is_preferred_label=edge.is_preferred_label,
+                is_correction=edge.is_correction,
+            ))
+        edges = resolved_edges
+
     facts, committed = [], 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
