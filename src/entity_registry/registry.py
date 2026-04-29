@@ -51,10 +51,10 @@ class EntityRegistry:
 
             # Unknown — register as new canonical entity
             cur.execute(
-                "INSERT INTO entities (id, user_id, name, entity_type) "
-                "VALUES (%s, %s, %s, 'unknown') "
-                "ON CONFLICT (id) DO NOTHING",
-                (name, user_id, name),
+                "INSERT INTO entities (id, user_id, entity_type) "
+                "VALUES (%s, %s, 'unknown') "
+                "ON CONFLICT (id, user_id) DO NOTHING",
+                (name, user_id),
             )
             self.db_conn.commit()
             log.info("entity_registry.registered", entity=name, user_id=user_id)
@@ -80,9 +80,9 @@ class EntityRegistry:
         with self.db_conn.cursor() as cur:
             # Ensure canonical entity exists
             cur.execute(
-                "INSERT INTO entities (id, user_id, name, entity_type) "
-                "VALUES (%s, %s, %s, 'unknown') ON CONFLICT (id) DO NOTHING",
-                (canonical, user_id, canonical),
+                "INSERT INTO entities (id, user_id, entity_type) "
+                "VALUES (%s, %s, 'unknown') ON CONFLICT (id, user_id) DO NOTHING",
+                (canonical, user_id),
             )
 
             if is_preferred:
