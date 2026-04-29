@@ -29,6 +29,12 @@ class EntityRegistry:
         if not name:
             raise ValueError("Entity name cannot be empty")
 
+        # Special case: resolve 'user' to canonical identity if known
+        if name == "user":
+            canonical = self.get_canonical_for_user(user_id)
+            if canonical:
+                return canonical
+
         with self.db_conn.cursor() as cur:
             # Check if it's a known alias
             cur.execute(
@@ -127,23 +133,36 @@ class EntityRegistry:
             return [row[0] for row in cur.fetchall()]
 
     def get_canonical_for_user(self, user_id: str) -> str | None:
-        """Return the canonical entity ID for the special 'user' subject."""
+        """
+        Return the canonical entity ID for this user.
+        Follows the chain: user → also_known_as → canonical_name
+        The canonical name is the one that has a preferred alias (e.g. christopher → chris).
+        Falls back to any also_known_as target if no preferred chain exists.
+        """
         with self.db_conn.cursor() as cur:
+            # Get all entities linked to 'user' via also_known_as
             cur.execute(
-                "SELECT entity_id FROM entity_aliases "
-                "WHERE user_id = %s AND alias = %s AND entity_id != 'user' "
-                "LIMIT 1",
-                (user_id, "user"),
-            )
-            row = cur.fetchone()
-            if row:
-                return row[0]
-            # Fall back to preferred alias of 'user' entity
-            cur.execute(
-                "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = 'user' AND is_preferred = true "
-                "LIMIT 1",
+                "SELECT object_id FROM facts "
+                "WHERE user_id = %s AND subject_id = 'user' "
+                "AND rel_type = 'also_known_as' "
+                "ORDER BY is_preferred_label DESC, id ASC",
                 (user_id,),
             )
-            row = cur.fetchone()
-            return row[0] if row else None
+            candidates = [row[0] for row in cur.fetchall()]
+
+            if not candidates:
+                return None
+
+            # Prefer the candidate that has a preferred alias in entity_aliases
+            for candidate in candidates:
+                cur.execute(
+                    "SELECT alias FROM entity_aliases "
+                    "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
+                    "LIMIT 1",
+                    (user_id, candidate),
+                )
+                if cur.fetchone():
+                    return candidate
+
+            # Fall back to first candidate
+            return candidates[0]
