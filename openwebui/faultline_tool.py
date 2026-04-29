@@ -20,6 +20,20 @@ You are a relationship fact extractor for a personal knowledge graph.
 Output ONLY a raw JSON array. No markdown, no explanation, no code fences.
 
 RULES:
+
+ENTITY NAMING RULES (strictly enforced):
+- Never use first-person pronouns (I, me, my, we, our, myself) as subject or object values.
+- If the speaker refers to themselves using "I" or "me", and a named identity has been established in the conversation (e.g. "I am Thomas"), substitute that name as the entity.
+- If no named identity is established yet, skip the triple entirely. Do not emit a triple with subject="i" or subject="me".
+- Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
+
+RELATIONSHIP RULES (strictly enforced):
+- "child_of" means the subject IS the child, the object IS the parent. Example: "henry child_of thomas" means henry is thomas's child.
+- "parent_of" means the subject IS the parent, the object IS the child. Example: "thomas parent_of henry" means thomas is henry's parent.
+- Never emit child_of or parent_of between two siblings. If two entities share the same parent, emit sibling_of between them instead.
+- For "X and Y are children of Z", emit three triples: Z parent_of X, Z parent_of Y, X sibling_of Y.
+- Directionality is absolute. When in doubt, prefer parent_of with the parent as subject.
+
 1. Extract ALL factual assertions — people, animals, objects, places, preferences.
 2. Entities must be specific names or nouns. Lowercase all values.
 3. rel_type must be snake_case. Use the most precise label that fits.
@@ -33,7 +47,12 @@ RULES:
    between the descriptor and the name.
 8. Pronoun resolution: replace he/she/it with the named entity if clear.
 9. If unsure, set "low_confidence": true. Never return empty if facts exist.
-10. First-person "my/our/we" refers to subject "user".
+10. First-person "my/our/we/I/me" refers to the named user entity if established,
+    otherwise use subject "user".
+11. If the message contains a self-identification pattern ("I am X", "I'm X",
+    "my name is X", "call me X"), emit an also_known_as triple:
+    {"subject":"user","object":"x","rel_type":"also_known_as","low_confidence":false}
+    where X is the proper name, lowercased.
 15. CORRECTION DETECTION: If the message indicates a prior fact was wrong
     ("actually", "his name is", "it's supposed to be", "I meant",
     "not X, it's Y", "correct that to"), extract the correction as a new
@@ -59,13 +78,23 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None) -> l
         if context:
             prior_turns = []
             for msg in context[-6:]:
-                if msg.get("role") in ("user", "assistant"):
-                    prior_turns.append({
-                        "role": msg["role"],
-                        "content": msg.get("content", "")[:200]
-                    })
-            if len(prior_turns) > 1:
-                messages.extend(prior_turns[:-1])
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and content:
+                    if isinstance(content, list):
+                        content = " ".join(
+                            p.get("text", "") for p in content if isinstance(p, dict)
+                        )
+                    if content.strip():
+                        prior_turns.append({"role": role, "content": content})
+            # Include all prior turns except the current message (last user turn)
+            # which is already appended as the final message separately
+            if prior_turns:
+                # Drop the last user turn from context since it's the current message
+                turns_to_add = prior_turns[:-1] if (
+                    prior_turns[-1]["role"] == "user"
+                ) else prior_turns
+                messages.extend(turns_to_add)
 
         messages.append({"role": "user", "content": text})
 
@@ -235,11 +264,30 @@ class Filter:
                                  if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
                                 None,
                             )
-                            identity_line = (
-                                f"You are {identity} in these facts.\n"
-                                if identity
-                                else "Note: you are the user these facts refer to.\n"
-                            )
+                            if identity:
+                                identity_line = (
+                                    f"The user in this conversation is '{identity}'. "
+                                    f"When facts reference '{identity}', that means YOU (the user). "
+                                    f"Do not describe '{identity}' as a third party.\n"
+                                )
+                            else:
+                                identity_line = "Note: you are the user these facts refer to.\n"
+
+                            # Inject identity anchor into system message for hard grounding
+                            if identity:
+                                system_anchor = (
+                                    f"[Memory] The user's name is {identity}. "
+                                    f"All facts referencing '{identity}' describe this user directly. "
+                                    f"Never refer to {identity} as a third party or someone else."
+                                )
+                                messages = body.get("messages", [])
+                                for i, msg in enumerate(messages):
+                                    if msg.get("role") == "system":
+                                        messages[i]["content"] = messages[i]["content"] + "\n\n" + system_anchor
+                                        break
+                                else:
+                                    # No system message exists — prepend one
+                                    messages.insert(0, {"role": "system", "content": system_anchor})
 
                             memory_lines = []
                             if preferred_names:
@@ -251,9 +299,16 @@ class Filter:
                             if facts:
                                 memory_lines.append("## Facts")
                                 for f in facts:
-                                    memory_lines.append(
-                                        f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
-                                    )
+                                    subj = f.get("subject", "")
+                                    obj = f.get("object", "")
+                                    rel = f.get("rel_type", "")
+                                    # Rewrite facts involving the known identity to be user-anchored
+                                    if identity and subj == identity:
+                                        memory_lines.append(f"- You ({identity}) {rel.replace('_', ' ')} {obj}")
+                                    elif identity and obj == identity:
+                                        memory_lines.append(f"- {subj} {rel.replace('_', ' ')} you ({identity})")
+                                    else:
+                                        memory_lines.append(f"- {subj} {rel.replace('_', ' ')} {obj}")
 
                             memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}" + "\n".join(memory_lines)
                             messages = body.get("messages", [])
