@@ -19,8 +19,8 @@ def test_commit_valid_entities():
     manager = FactStoreManager(mock_conn)
 
     result = manager.commit([
-        ("sub1", "obj1", "IS_A", "prov1"),
-        ("sub2", "obj2", "KILLS", "prov2"),
+        ("test_user", "sub1", "obj1", "IS_A", "prov1"),
+        ("test_user", "sub2", "obj2", "KILLS", "prov2"),
     ])
 
     assert result == 2
@@ -31,7 +31,7 @@ def test_commit_single_edge():
     mock_conn = MagicMock()
     manager = FactStoreManager(mock_conn)
 
-    result = manager.commit([("alice", "acme", "WORKS_FOR", "doc-1")])
+    result = manager.commit([("test_user", "alice", "acme", "WORKS_FOR", "doc-1")])
 
     assert result == 1
     mock_conn.commit.assert_called_once()
@@ -45,7 +45,7 @@ def test_commit_rollback_on_error():
     manager = FactStoreManager(mock_conn)
 
     with pytest.raises(psycopg2.Error):
-        manager.commit([("sub1", "obj1", "IS_A", "prov1")])
+        manager.commit([("test_user", "sub1", "obj1", "IS_A", "prov1")])
 
     mock_conn.rollback.assert_called_once()
     mock_conn.commit.assert_not_called()
@@ -106,7 +106,7 @@ def test_preferred_label_set_on_also_known_as():
     manager = FactStoreManager(mock_conn)
 
     result = manager.commit([
-        ("user1", "marla", "mars", "also_known_as", "test", True)
+        ("test_user", "marla", "mars", "also_known_as", "test", True)
     ])
 
     assert result == 1
