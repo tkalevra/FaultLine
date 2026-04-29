@@ -241,6 +241,17 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if fact.get("subject") and fact.get("object") and fact.get("rel_type")
             ]
 
+            # Build entity type map from GLiNER2 output for use in alias resolution
+            # Only Person-type entities should have alias resolution applied
+            _entity_types: dict[str, str] = {}
+            for fact in result.get("facts", []):
+                subj = fact.get("subject", "").lower().strip()
+                obj = fact.get("object", "").lower().strip()
+                if subj and fact.get("subject_type"):
+                    _entity_types[subj] = fact["subject_type"].lower()
+                if obj and fact.get("object_type"):
+                    _entity_types[obj] = fact["object_type"].lower()
+
             # Build a set of parent_of pairs from this batch for directionality validation
             batch_parent_of = {
                 (e.object, e.subject)  # (child, parent) — flipped for lookup
@@ -324,6 +335,66 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=edge.is_correction,
             ))
         edges = resolved_edges
+
+    # Build alias → canonical map from existing facts in DB
+    # Only resolve Person-type entities to prevent cross-type contamination
+    # e.g. don't resolve "sophia" (snake) even if it matches an alias
+    _PERSON_TYPES = {"person", "per", "human", "character"}
+
+    alias_to_canonical: dict[str, str] = {}
+    _dsn2 = os.environ.get("POSTGRES_DSN")
+    if _dsn2:
+        try:
+            _db2 = psycopg2.connect(_dsn2)
+            with _db2.cursor() as _cur2:
+                _cur2.execute(
+                    "SELECT subject_id, object_id FROM facts "
+                    "WHERE user_id = %s AND rel_type = 'also_known_as'",
+                    (req.user_id,),
+                )
+                for canonical, alias in _cur2.fetchall():
+                    alias_to_canonical[alias] = canonical
+            _db2.close()
+        except Exception as _e:
+            log.warning("ingest.alias_resolution_failed", error=str(_e))
+
+    def _is_person(name: str) -> bool:
+        """Return True if entity is known to be a Person type."""
+        entity_type = _entity_types.get(name, "")
+        # If we have explicit type info, use it
+        if entity_type:
+            return entity_type in _PERSON_TYPES
+        # If no type info, only resolve if it's a known alias
+        # (conservative: unknown type entities are not resolved)
+        return False
+
+    if alias_to_canonical:
+        resolved_alias_edges = []
+        for edge in edges:
+            # Only resolve subject/object if they are Person-type entities
+            subj = alias_to_canonical[edge.subject] if (
+                edge.subject in alias_to_canonical and _is_person(edge.subject)
+            ) else edge.subject
+            obj = alias_to_canonical[edge.object] if (
+                edge.object in alias_to_canonical and _is_person(edge.object)
+            ) else edge.object
+            # Skip self-referential edges created by alias resolution
+            if subj == obj:
+                log.debug("ingest.alias_self_ref_skipped", subject=subj, rel=edge.rel_type)
+                continue
+            # Skip also_known_as edges where both sides resolve to same canonical
+            if edge.rel_type == "also_known_as" and (
+                alias_to_canonical.get(edge.subject) == alias_to_canonical.get(edge.object)
+            ):
+                continue
+            resolved_alias_edges.append(EdgeInput(
+                subject=subj,
+                object=obj,
+                rel_type=edge.rel_type,
+                is_preferred_label=edge.is_preferred_label,
+                is_correction=edge.is_correction,
+            ))
+        edges = resolved_alias_edges
 
     facts, committed = [], 0
     if edges:
