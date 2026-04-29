@@ -80,6 +80,41 @@ def health():
         raise HTTPException(status_code=503, detail="Model loading")
     return {"status": "ok"}
 
+def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
+                      rel_type: str, new_fact_id: int, correction_behavior: str) -> int:
+    if correction_behavior == "hard_delete":
+        # DELETE stale alias facts BEFORE renaming subject (WHERE subject_id = old_value still matches)
+        cur.execute(
+            "DELETE FROM facts "
+            "WHERE user_id = %s AND subject_id = %s AND id != %s AND rel_type = 'also_known_as'",
+            (user_id, old_value, new_fact_id),
+        )
+        affected = cur.rowcount
+        cur.execute(
+            "UPDATE facts SET subject_id = %s, qdrant_synced = false "
+            "WHERE user_id = %s AND subject_id = %s AND id != %s",
+            (new_value, user_id, old_value, new_fact_id),
+        )
+        affected += cur.rowcount
+        cur.execute(
+            "UPDATE facts SET object_id = %s, qdrant_synced = false "
+            "WHERE user_id = %s AND object_id = %s",
+            (new_value, user_id, old_value),
+        )
+        affected += cur.rowcount
+        return affected
+    elif correction_behavior == "supersede":
+        cur.execute(
+            "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+            "WHERE user_id = %s AND subject_id = %s AND rel_type = %s "
+            "AND id != %s AND superseded_at IS NULL",
+            (user_id, old_value, rel_type, new_fact_id),
+        )
+        return cur.rowcount
+    else:  # immutable
+        return 0
+
+
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
     inferred_relations = []
@@ -109,8 +144,17 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
     resolution = resolve_entities({"entities": []},
                                   context={"known_types": ["Person", "Organization", "Location"]})
     resolved = resolution["resolution"]["resolved"]
-    
-    edges = req.edges or inferred_relations or []
+
+    edges_dict = {}
+    for edge in (inferred_relations or []):
+        key = (edge.subject, edge.object, edge.rel_type)
+        edges_dict[key] = edge
+
+    for edge in (req.edges or []):
+        key = (edge.subject, edge.object, edge.rel_type)
+        edges_dict[key] = edge
+
+    edges = list(edges_dict.values())
     facts, committed = [], 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
@@ -133,6 +177,11 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
             if rows:
                 committed = manager.commit(rows)
 
+                correction_keys = {
+                    (e.subject.lower(), e.object.lower(), e.rel_type.lower())
+                    for e in edges if e.is_correction
+                }
+
                 with db.cursor() as cur:
                     for row in rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row
@@ -143,6 +192,34 @@ def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
                                 " AND object_id != %s",
                                 (user_id, subject, obj),
                             )
+
+                    for row in rows:
+                        user_id, subject, obj, rel_type, source, is_preferred = row
+                        if (subject.lower(), obj.lower(), rel_type.lower()) not in correction_keys:
+                            continue
+                        cur.execute(
+                            "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                            " AND object_id = %s AND rel_type = %s",
+                            (user_id, subject.lower(), obj.lower(), rel_type.lower()),
+                        )
+                        result = cur.fetchone()
+                        if not result:
+                            continue
+                        new_fact_id = result[0]
+                        cur.execute(
+                            "SELECT correction_behavior FROM rel_types WHERE rel_type = %s",
+                            (rel_type.lower(),),
+                        )
+                        cb_row = cur.fetchone()
+                        behavior = cb_row[0] if cb_row else "supersede"
+                        _apply_correction(cur, user_id, subject.lower(), obj.lower(),
+                                          rel_type.lower(), new_fact_id, behavior)
+                        if rel_type.lower() == "also_known_as":
+                            cur.execute(
+                                "UPDATE facts SET is_preferred_label = true WHERE id = %s",
+                                (new_fact_id,),
+                            )
+
                     db.commit()
         finally: db.close()
 

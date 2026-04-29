@@ -25,14 +25,14 @@ def derive_collection(user_id: str) -> str:
 
 
 def fetch_unsynced(db_conn) -> list[dict]:
-    """Fetch all facts where qdrant_synced = false."""
+    """Fetch all non-superseded facts where qdrant_synced = false."""
     with db_conn.cursor() as cur:
         cur.execute(
             """
             SELECT id, subject_id, object_id, rel_type, provenance, user_id,
                    confidence, confirmed_count, last_seen_at, contradicted_by
             FROM facts
-            WHERE qdrant_synced = false
+            WHERE qdrant_synced = false AND (superseded_at IS NULL)
             ORDER BY id ASC
             """
         )
@@ -258,6 +258,37 @@ def main():
                     except Exception as e:
                         log.error(f"re_embedder.row_error fact_id={row['id']}: {e}")
                         continue
+
+                # Deletion pass — remove superseded facts from Qdrant
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, user_id FROM facts "
+                        "WHERE superseded_at IS NOT NULL AND qdrant_synced = false"
+                    )
+                    superseded = cur.fetchall()
+
+                for fact_id, uid in superseded:
+                    collection = derive_collection(uid)
+                    try:
+                        resp = httpx.delete(
+                            f"{qdrant_url}/collections/{collection}/points",
+                            json={"points": [fact_id]},
+                            timeout=10.0,
+                        )
+                        if resp.status_code in (200, 404):
+                            with db.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE facts SET qdrant_synced = true WHERE id = %s",
+                                    (fact_id,),
+                                )
+                            db.commit()
+                            log.info(
+                                "re_embedder.deleted",
+                                fact_id=fact_id,
+                                collection=collection,
+                            )
+                    except Exception as e:
+                        log.error(f"re_embedder.delete_failed fact_id={fact_id}: {e}")
 
             finally:
                 db.close()

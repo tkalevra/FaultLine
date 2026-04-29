@@ -8,6 +8,7 @@ class EdgeInput(BaseModel):
     object: str
     rel_type: str
     is_preferred_label: bool = False
+    is_correction: bool = False
 
 
 class IngestRequest(BaseModel):

@@ -16,32 +16,40 @@ from pydantic import BaseModel
 
 
 _TRIPLE_SYSTEM_PROMPT = """\
-You are a relationship fact extractor. Output ONLY a raw JSON array, nothing else.
-No thinking, no explanation, no markdown, no code fences, no preamble.
+You are a relationship fact extractor for a personal knowledge graph.
+Output ONLY a raw JSON array. No markdown, no explanation, no code fences.
 
-STRICT RULES:
-1. Only extract relationships explicitly stated in the text.
-2. Entities must be proper names only. No pronouns, no "the user", no generics.
-3. All subject and object values must be lowercase.
-4. rel_type must be EXACTLY one of: parent_of, child_of, spouse, sibling_of, also_known_as, works_for, likes, dislikes, prefers
-5. also_known_as means nickname or alias ONLY — e.g. "Cyrus also known as Cy" → {"subject":"cyrus","object":"cy","rel_type":"also_known_as"}
-6. parent_of means a parent-child relationship — e.g. "Christopher has a son Cyrus" → {"subject":"christopher","object":"cyrus","rel_type":"parent_of"}
-7. spouse means married or partnered — e.g. "Christopher's spouse is Marla" → {"subject":"christopher","object":"marla","rel_type":"spouse"}
-8. Never use also_known_as for a parent-child or spouse relationship.
-9. If unsure, set "low_confidence": true. Never silently drop a relation.
-10. If the input contains a first-person statement identifying the speaker's name (e.g. "My name is X", "I am X", "I'm X"), emit exactly one triple: {"subject":"user","object":"<name>","rel_type":"also_known_as","low_confidence":false}
-11. For preference statements ("X likes Y", "X loves Y", "X enjoys Y", "X is into Y", "X prefers Y"), emit: {"subject":"<person>","object":"<thing>","rel_type":"likes"}. For negative preferences ("X hates Y", "X dislikes Y", "X doesn't like Y"), use rel_type "dislikes".
-12. Pronoun resolution: if the input contains "she", "her", "he", "his", and a named person of that gender was mentioned earlier in the same input, replace the pronoun with that person's name when extracting triples. If ambiguous, set low_confidence: true.
-13. "my wife", "my husband", "my son", "my daughter", "my spouse" always refers to the person linked to "user" via the spouse/parent_of relation in prior context. Use their name if known from the same input, otherwise set low_confidence: true.
-14. PREFERRED NAME DETECTION: If the text contains preference signals ("goes by", "call me", "prefers to be called", "preferred name", "please call me", "my name is"), extract as also_known_as and add: "is_preferred_label": true. All other triples must either omit this field or set it to false.
+RULES:
+1. Extract ALL factual assertions — people, animals, objects, places, preferences.
+2. Entities must be specific names or nouns. Lowercase all values.
+3. rel_type must be snake_case. Use the most precise label that fits.
+   Common types: is_a, has_pet, parent_of, child_of, spouse, sibling_of,
+   also_known_as, works_for, likes, dislikes, prefers, lives_at, owns.
+   You may use other snake_case types if none of the above fit.
+4. also_known_as = nickname or alias ONLY (e.g. "Cy" for "Cyrus").
+5. is_a = type or category (e.g. "morkie is_a dog breed").
+6. has_pet = person owns an animal (e.g. "we have a dog named Fragglr").
+7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
+   between the descriptor and the name.
+8. Pronoun resolution: replace he/she/it with the named entity if clear.
+9. If unsure, set "low_confidence": true. Never return empty if facts exist.
+10. First-person "my/our/we" refers to subject "user".
+15. CORRECTION DETECTION: If the message indicates a prior fact was wrong
+    ("actually", "his name is", "it's supposed to be", "I meant",
+    "not X, it's Y", "correct that to"), extract the correction as a new
+    triple with the corrected value. Use prior context to resolve the
+    subject. Mark corrected triples with "is_correction": true.
+    e.g. "oh his name is actually Fraggle" (context: dog named Fragglr) →
+    {"subject":"fragglr","object":"fraggle","rel_type":"also_known_as",
+     "is_correction":true,"low_confidence":false}
 
-OUTPUT FORMAT — exactly this, nothing else:
-[{"subject":"...","object":"...","rel_type":"...","low_confidence":false}] or with preferred name:
-[{"subject":"...","object":"...","rel_type":"also_known_as","low_confidence":false,"is_preferred_label":true}]"""
+OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
+If nothing to extract: []"""
 
 
 async def _should_ingest(text: str, valves) -> bool:
-    """Ask Qwen if this message contains a factual assertion worth storing."""
+    if len(text.split()) < 5:
+        return False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.post(
@@ -52,47 +60,59 @@ async def _should_ingest(text: str, valves) -> bool:
                         {
                             "role": "system",
                             "content": (
-                                "You are a fact detection classifier. "
-                                "Respond with only the single word 'yes' or 'no'. "
-                                "No punctuation, no explanation."
+                                "You are a memory-relevance classifier for a personal knowledge graph. "
+                                "Reply with only the single word yes or no. "
+                                "No punctuation, no explanation. "
+                                "When in doubt, reply yes."
                             )
                         },
                         {
                             "role": "user",
                             "content": (
-                                f"Does this message contain a factual assertion "
-                                f"about a person, place, animal, object, or "
-                                f"relationship that is worth storing as a "
-                                f"long-term memory?\n\n\"{text}\""
+                                f"Does this message contain a factual assertion, a correction to a prior "
+                                f"fact, or any statement about a person, animal, place, or object that "
+                                f"should be remembered? Reply with only: yes or no.\n\n\"{text}\""
                             )
                         }
                     ],
                     "temperature": 0.0,
                     "max_tokens": 5,
-                    "thinking": {"type": "disabled"}
-                }
+                    "thinking": {"type": "disabled"},
+                },
             )
-        result = r.json()["choices"][0]["message"]["content"].strip().lower()
-        return result.startswith("yes")
+        return r.json()["choices"][0]["message"]["content"].strip().lower().startswith("yes")
     except Exception:
         return True
 
 
-async def rewrite_to_triples(text: str, valves) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, context: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
+    Context (prior messages) provides conversation history for resolution.
     Returns [] on any failure so the caller can handle the empty-edge case.
     """
     try:
+        messages = [{"role": "system", "content": _TRIPLE_SYSTEM_PROMPT}]
+
+        if context:
+            prior_turns = []
+            for msg in context[-6:]:
+                if msg.get("role") in ("user", "assistant"):
+                    prior_turns.append({
+                        "role": msg["role"],
+                        "content": msg.get("content", "")[:200]
+                    })
+            if len(prior_turns) > 1:
+                messages.extend(prior_turns[:-1])
+
+        messages.append({"role": "user", "content": text})
+
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
                 valves.QWEN_URL,
                 json={
                     "model": valves.QWEN_MODEL,
-                    "messages": [
-                        {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
+                    "messages": messages,
                     "temperature": 0.0,
                     "max_tokens": 400,
                     "thinking": {"type": "disabled"},
@@ -127,7 +147,7 @@ class Filter:
         FAULTLINE_URL: str = "http://192.168.40.10:8001"
         FAULTLINE_TIMEOUT: int = 30
         QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
-        QWEN_MODEL: str = "qwen/qwen3.5-9b@q4_k_m"
+        QWEN_MODEL: str = "qwen/qwen3.5-9b"
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
@@ -201,24 +221,17 @@ class Filter:
 
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
-            text_lower = text.lower()
-            words = text_lower.split()
-
-            should_ingest = False
-            if len(words) >= 5:
-                should_ingest = await _should_ingest(text, self.valves)
+            will_ingest = self.valves.INGEST_ENABLED and await _should_ingest(text, self.valves)
+            will_query = self.valves.QUERY_ENABLED
 
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] inlet text='{text[:80]}' words={len(words)} should_ingest={should_ingest}")
-
-            will_ingest = self.valves.INGEST_ENABLED and should_ingest
-            will_query = self.valves.QUERY_ENABLED
+                print(f"[FaultLine Filter] inlet text='{text[:80]}' will_ingest={will_ingest}")
 
             if not will_ingest and not will_query:
                 return body
 
             if will_ingest:
-                raw_triples = await rewrite_to_triples(text, self.valves)
+                raw_triples = await rewrite_to_triples(text, self.valves, context=body.get("messages", []))
                 confident = [e for e in raw_triples if not e.get("low_confidence", False)]
                 edges = [
                     {
@@ -226,21 +239,21 @@ class Filter:
                         "object": e["object"],
                         "rel_type": e["rel_type"],
                         "is_preferred_label": e.get("is_preferred_label", False),
+                        "is_correction": e.get("is_correction", False),
                     }
                     for e in confident
                     if e.get("subject") and e.get("object") and e.get("rel_type")
                 ]
-                if edges:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
-                    asyncio.create_task(
-                        self._fire_ingest(
-                            text,
-                            self.valves.DEFAULT_SOURCE,
-                            user_id,
-                            edges=edges,
-                        )
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
+                asyncio.create_task(
+                    self._fire_ingest(
+                        text,
+                        self.valves.DEFAULT_SOURCE,
+                        user_id,
+                        edges=edges,
                     )
+                )
 
             if will_query:
                 try:
@@ -255,7 +268,7 @@ class Filter:
                         if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
-                            identity = next(
+                            identity = preferred_names.get("user") or next(
                                 (f.get("object") for f in facts
                                  if f.get("subject") == "user" and f.get("rel_type") == "also_known_as"),
                                 None,
@@ -268,17 +281,27 @@ class Filter:
 
                             memory_lines = []
                             if preferred_names:
-                                memory_lines.append("## Preferred Names (use these exclusively)")
+                                memory_lines.append(
+                                    "IMPORTANT: Use ONLY the following names. "
+                                    "Never use the alternate form in your response:"
+                                )
                                 for subject, preferred_obj in preferred_names.items():
-                                    memory_lines.append(f"- {subject} → {preferred_obj}")
+                                    memory_lines.append(
+                                        f"- Always refer to '{subject}' as '{preferred_obj}'"
+                                    )
                                 memory_lines.append("")
 
                             if facts:
                                 memory_lines.append("## Facts")
                                 for f in facts:
-                                    memory_lines.append(
-                                        f"- {f.get('subject')} {f.get('rel_type')} {f.get('object')}"
-                                    )
+                                    subj = f.get("subject", "")
+                                    rel = f.get("rel_type", "")
+                                    obj = f.get("object", "")
+                                    if rel == "also_known_as" and subj in preferred_names:
+                                        continue
+                                    display_subj = preferred_names.get(subj, subj)
+                                    display_obj = preferred_names.get(obj, obj)
+                                    memory_lines.append(f"- {display_subj} {rel} {display_obj}")
 
                             memory_block = f"\n\n🧠 Memory context from FaultLine:\n{identity_line}" + "\n".join(memory_lines)
                             messages = body.get("messages", [])

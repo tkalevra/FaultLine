@@ -118,3 +118,118 @@ def test_bracket_constraint_built_from_db():
     assert "works_for" in constraint
     assert "spouse" in constraint
     assert "|" in constraint
+
+
+def test_correction_hard_delete_migrates_facts():
+    """hard_delete correction should migrate facts from old name to new name."""
+    mock_db = MagicMock()
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [
+        (42,),             # SELECT id FROM facts → new_fact_id
+        ("hard_delete",),  # SELECT correction_behavior
+    ]
+
+    with patch("api.main.psycopg2.connect", return_value=mock_db), \
+         patch.dict(os.environ, {"POSTGRES_DSN": "mock://dsn"}), \
+         patch("api.main._gliner2_model", None), \
+         patch("api.main._rel_type_registry", None), \
+         patch("api.main.WGMValidationGate") as MockGate, \
+         patch("api.main.FactStoreManager") as MockManager:
+
+        MockGate.return_value.validate_edge.return_value = {"status": "valid"}
+        MockManager.return_value.commit.return_value = 1
+
+        with TestClient(app) as c:
+            r = c.post("/ingest", json={
+                "text": "oh his name is actually Fraggle",
+                "source": "test",
+                "user_id": "user1",
+                "edges": [{
+                    "subject": "fragglr",
+                    "object": "fraggle",
+                    "rel_type": "also_known_as",
+                    "is_correction": True,
+                }],
+            })
+
+    assert r.status_code == 200
+    all_sql = [str(c) for c in cursor.execute.call_args_list]
+    assert any("DELETE" in sql for sql in all_sql), "DELETE should be called for hard_delete"
+    assert any("SET subject_id" in sql for sql in all_sql), "UPDATE subject_id should be called"
+    assert any("is_preferred_label = true" in sql for sql in all_sql), "is_preferred_label should be set"
+
+
+def test_correction_supersede_marks_old_fact():
+    """supersede correction should mark old fact as superseded, not delete."""
+    mock_db = MagicMock()
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [
+        (10,),             # SELECT id FROM facts → new_fact_id
+        ("supersede",),    # SELECT correction_behavior
+    ]
+
+    with patch("api.main.psycopg2.connect", return_value=mock_db), \
+         patch.dict(os.environ, {"POSTGRES_DSN": "mock://dsn"}), \
+         patch("api.main._gliner2_model", None), \
+         patch("api.main._rel_type_registry", None), \
+         patch("api.main.WGMValidationGate") as MockGate, \
+         patch("api.main.FactStoreManager") as MockManager:
+
+        MockGate.return_value.validate_edge.return_value = {"status": "valid"}
+        MockManager.return_value.commit.return_value = 1
+
+        with TestClient(app) as c:
+            r = c.post("/ingest", json={
+                "text": "I moved to 456 New Street",
+                "source": "test",
+                "user_id": "user1",
+                "edges": [{
+                    "subject": "user",
+                    "object": "456 new street",
+                    "rel_type": "lives_at",
+                    "is_correction": True,
+                }],
+            })
+
+    assert r.status_code == 200
+    all_sql = [str(c) for c in cursor.execute.call_args_list]
+    assert any("superseded_at" in sql for sql in all_sql), "superseded_at UPDATE should be called"
+    assert not any("DELETE" in sql for sql in all_sql), "DELETE should not be called for supersede"
+
+
+def test_correction_immutable_does_nothing():
+    """immutable correction should not modify any facts."""
+    mock_db = MagicMock()
+    cursor = mock_db.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [
+        (5,),              # SELECT id FROM facts → new_fact_id
+        ("immutable",),    # SELECT correction_behavior
+    ]
+
+    with patch("api.main.psycopg2.connect", return_value=mock_db), \
+         patch.dict(os.environ, {"POSTGRES_DSN": "mock://dsn"}), \
+         patch("api.main._gliner2_model", None), \
+         patch("api.main._rel_type_registry", None), \
+         patch("api.main.WGMValidationGate") as MockGate, \
+         patch("api.main.FactStoreManager") as MockManager:
+
+        MockGate.return_value.validate_edge.return_value = {"status": "valid"}
+        MockManager.return_value.commit.return_value = 1
+
+        with TestClient(app) as c:
+            r = c.post("/ingest", json={
+                "text": "I was actually born in Toronto",
+                "source": "test",
+                "user_id": "user1",
+                "edges": [{
+                    "subject": "christopher",
+                    "object": "toronto",
+                    "rel_type": "born_in",
+                    "is_correction": True,
+                }],
+            })
+
+    assert r.status_code == 200
+    all_sql = [str(c) for c in cursor.execute.call_args_list]
+    assert not any("DELETE" in sql for sql in all_sql), "DELETE should not be called for immutable"
+    assert not any("superseded_at" in sql for sql in all_sql), "superseded_at should not be called for immutable"
