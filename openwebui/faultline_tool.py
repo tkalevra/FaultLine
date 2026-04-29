@@ -9,6 +9,7 @@ requirements: httpx
 import asyncio
 import json
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -241,7 +242,12 @@ class Filter:
 
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
-            will_ingest = self.valves.INGEST_ENABLED and len(text.split()) >= 5
+            _IDENTITY_RE = re.compile(
+                r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
+            )
+            will_ingest = self.valves.INGEST_ENABLED and (
+                len(text.split()) >= 5 or bool(_IDENTITY_RE.search(text))
+            )
             will_query = self.valves.QUERY_ENABLED
 
             if self.valves.ENABLE_DEBUG:
@@ -380,8 +386,6 @@ class Filter:
                                 f"Do not reframe the user as a child or sibling. Only state what the facts explicitly say.\n"
                                 + "\n".join(memory_lines)
                             )
-                            print(f"[FaultLine DEBUG] identity={identity}")
-                            print(f"[FaultLine DEBUG] memory_block=\n{memory_block}")
                             messages = body.get("messages", [])
                             for i in reversed(range(len(messages))):
                                 if messages[i].get("role") == "user":

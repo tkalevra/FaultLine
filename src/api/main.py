@@ -177,7 +177,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 ]
             }
             result = model.extract_json(req.text, schema)
-            inferred_relations = [
+            raw_inferred = [
                 EdgeInput(
                     subject=fact["subject"].lower().strip(),
                     object=fact["object"].lower().strip(),
@@ -186,6 +186,24 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 for fact in result.get("facts", [])
                 if fact.get("subject") and fact.get("object") and fact.get("rel_type")
             ]
+
+            # Build a set of parent_of pairs from this batch for directionality validation
+            batch_parent_of = {
+                (e.object, e.subject)  # (child, parent) — flipped for lookup
+                for e in raw_inferred
+                if e.rel_type == "parent_of"
+            }
+
+            inferred_relations = []
+            for edge in raw_inferred:
+                if edge.rel_type == "child_of":
+                    # Only allow child_of(X, Y) if parent_of(Y, X) exists in this batch
+                    # i.e. (subject=X, object=Y) requires (X, Y) in batch_parent_of
+                    if (edge.subject, edge.object) not in batch_parent_of:
+                        log.warning("ingest.child_of_rejected_no_parent",
+                                    subject=edge.subject, object=edge.object)
+                        continue
+                inferred_relations.append(edge)
         except Exception as e:
             log.error("ingest.gliner2_failed", error=str(e))
 

@@ -26,7 +26,8 @@
       "Bash(python -m pytest tests/schema_oracle/test_oracle.py::test_entity_registry_init tests/schema_oracle/test_oracle.py::test_resolve_new_entity tests/schema_oracle/test_oracle.py::test_resolve_duplicate_entity tests/schema_oracle/test_oracle.py::test_resolve_entities -v)",
       "Bash(python -m pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction --ignore=tests/model_inference --ignore=tests/preprocessing -x)",
       "Bash(python -m pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction --ignore=tests/model_inference --ignore=tests/preprocessing -q)",
-      "Bash(python -m pytest tests/api/test_ingest.py::test_correction_hard_delete_migrates_facts tests/api/test_ingest.py::test_correction_supersede_marks_old_fact tests/api/test_ingest.py::test_correction_immutable_does_nothing tests/api/test_ingest.py::test_bracket_constraint_built_from_db -v)"
+      "Bash(python -m pytest tests/api/test_ingest.py::test_correction_hard_delete_migrates_facts tests/api/test_ingest.py::test_correction_supersede_marks_old_fact tests/api/test_ingest.py::test_correction_immutable_does_nothing tests/api/test_ingest.py::test_bracket_constraint_built_from_db -v)",
+      "Bash(docker exec *)"
     ]
   }
 }
