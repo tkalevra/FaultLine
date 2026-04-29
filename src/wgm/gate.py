@@ -175,7 +175,7 @@ class WGMValidationGate:
             response = httpx.post(
                 qwen_url,
                 json={
-                    "model": "qwen/qwen3.5-9b@q4_k_m",
+                    "model": "qwen/qwen3.5-9b",
                     "messages": [
                         {
                             "role": "system",

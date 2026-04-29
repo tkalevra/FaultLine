@@ -37,6 +37,9 @@ def _build_rel_type_constraint(dsn: str) -> str:
         log.warning("startup.constraint_builder_failed", error=str(e))
         return ""
 
+def get_gliner_model():
+    return _gliner2_model
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _gliner2_model, _rel_type_registry, _rel_type_constraint
@@ -116,7 +119,7 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest, model=Depends(lambda: _gliner2_model)):
+def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     inferred_relations = []
     if model is not None:
         try:
