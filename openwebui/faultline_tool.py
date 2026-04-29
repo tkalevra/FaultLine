@@ -370,6 +370,10 @@ class Filter:
                                         return nickname_map[name].title()
                                     return name.title()
 
+                                # TODO: enrich entity descriptions with entity_attributes
+                                # e.g. "Desmonde (Des), age 12" by joining entity_attributes on entity_id
+                                # Requires /query endpoint to return attributes in response
+
                                 children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
                                 parents_raw = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
                                 spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and (f.get("subject") == identity or f.get("object") == identity)]
