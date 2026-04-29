@@ -43,6 +43,32 @@ _IDENTITY_STOPWORDS = {
     "excited", "sorry", "glad", "grateful", "proud", "tired", "done",
 }
 
+_SCALAR_REL_TYPES = {
+    "age", "born_on", "born_in", "nationality",
+    "occupation", "has_gender", "height", "weight",
+}
+
+def _coerce_scalar(value: str) -> tuple:
+    """
+    Coerce a scalar value string to (value_text, value_int, value_float, value_date).
+    Returns appropriate typed value and None for others.
+    """
+    # Try integer
+    try:
+        return (None, int(value), None, None)
+    except ValueError:
+        pass
+    # Try float
+    try:
+        return (None, None, float(value), None)
+    except ValueError:
+        pass
+    # Try date (basic YYYY-MM-DD)
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', value):
+        return (None, None, None, value)
+    # Fall back to text
+    return (value, None, None, None)
+
 def _detect_preference_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
@@ -343,6 +369,38 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Skip self-referential after resolution
                 if canonical_subject == canonical_object:
                     continue
+
+                # Route scalar rel_types to entity_attributes instead of facts
+                if edge.rel_type.lower() in _SCALAR_REL_TYPES:
+                    val_text, val_int, val_float, val_date = _coerce_scalar(canonical_object)
+                    # Only store if value is meaningful (reject non-numeric age etc.)
+                    if edge.rel_type.lower() == "age" and val_int is None:
+                        log.warning("ingest.scalar_rejected_non_numeric",
+                                    entity=canonical_subject, value=canonical_object)
+                        continue
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "INSERT INTO entity_attributes"
+                                " (user_id, entity_id, attribute, value_text, value_int,"
+                                "  value_float, value_date, provenance)"
+                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                                " ON CONFLICT (user_id, entity_id, attribute)"
+                                " DO UPDATE SET"
+                                "   value_text = EXCLUDED.value_text,"
+                                "   value_int = EXCLUDED.value_int,"
+                                "   value_float = EXCLUDED.value_float,"
+                                "   value_date = EXCLUDED.value_date,"
+                                "   updated_at = now()",
+                                (req.user_id, canonical_subject, edge.rel_type.lower(),
+                                 val_text, val_int, val_float, val_date, req.source),
+                            )
+                        db.commit()
+                        log.info("ingest.scalar_stored", entity=canonical_subject,
+                                 attribute=edge.rel_type, value=canonical_object)
+                    except Exception as _e:
+                        log.warning("ingest.scalar_failed", error=str(_e))
+                    continue  # Don't process as a relationship fact
 
                 status = gate.validate_edge(canonical_subject, canonical_object, edge.rel_type)["status"]
                 facts.append(FactResult(subject=canonical_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
