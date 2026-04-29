@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 import httpx
 import psycopg2
@@ -21,9 +22,28 @@ _PREFERENCE_SIGNALS = {
     "call me", "known as", "my name is"
 }
 
+_IDENTITY_PATTERNS = [
+    re.compile(r"\bmy name is ([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bi am ([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bi'm ([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bcall me ([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bpeople call me ([a-z]+)", re.IGNORECASE),
+]
+
 def _detect_preference_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
+
+def _extract_identity(text: str) -> str | None:
+    """Return the user's stated name if a self-identification pattern is found."""
+    for pattern in _IDENTITY_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = m.group(1).lower().strip()
+            # Exclude common false positives
+            if name not in {"a", "an", "the", "not", "just", "also", "here", "happy", "glad", "sorry"}:
+                return name
+    return None
 
 def _build_rel_type_constraint(dsn: str) -> str:
     """Load rel_types from DB and build pipe-separated bracket constraint."""
@@ -181,6 +201,19 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     for edge in (req.edges or []):
         key = (edge.subject, edge.object, edge.rel_type)
         edges_dict[key] = edge
+
+    # Auto-synthesize also_known_as if user identifies themselves
+    detected_identity = _extract_identity(req.text)
+    if detected_identity:
+        identity_key = ("user", detected_identity, "also_known_as")
+        if identity_key not in edges_dict:
+            edges_dict[identity_key] = EdgeInput(
+                subject="user",
+                object=detected_identity,
+                rel_type="also_known_as",
+                is_preferred_label=True,
+                is_correction=False,
+            )
 
     edges = list(edges_dict.values())
     facts, committed = [], 0
