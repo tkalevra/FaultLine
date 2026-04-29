@@ -55,6 +55,15 @@ RELATIONSHIP RULES (strictly enforced):
     "my name is X", "call me X"), emit an also_known_as triple:
     {"subject":"user","object":"x","rel_type":"also_known_as","low_confidence":false}
     where X is the proper name, lowercased.
+    The subject is ALWAYS "user", the object is ALWAYS the name. Never reverse this.
+    NEVER emit {"subject":"name","object":"user"} — that direction is always wrong.
+12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
+    emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
+    NEVER use a nickname or name as the age value.
+    If the sentence contains both an age AND a nickname (e.g. "Desmonde age 12, goes by Des"),
+    emit TWO separate triples:
+    {"subject":"desmonde","object":"12","rel_type":"age"}
+    {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
 15. CORRECTION DETECTION: If the message indicates a prior fact was wrong
     ("actually", "his name is", "it's supposed to be", "I meant",
     "not X, it's Y", "correct that to"), extract the correction as a new
