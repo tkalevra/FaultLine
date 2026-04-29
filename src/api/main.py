@@ -414,8 +414,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 facts.append(FactResult(subject=edge.subject, object=edge.object, rel_type=edge.rel_type, status=status))
                 if status == "valid":
                     is_preferred = (
-                        (edge.rel_type.lower() == "also_known_as" and
-                         (has_preferred or edge.is_preferred_label))
+                        edge.rel_type.lower() in ("also_known_as", "pref_name") and
+                        (has_preferred or edge.is_preferred_label)
                     )
                     rows.append((req.user_id, edge.subject, edge.object, edge.rel_type, req.source, is_preferred))
 
@@ -427,6 +427,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     for e in edges if e.is_correction
                 }
 
+                # Build set of preferred objects from pref_name rows in this batch
+                # e.g. christopher → chris → pref_name means "chris" is preferred
+                batch_preferred_objects = {
+                    obj.lower() for _, subject, obj, rel_type, _, is_preferred in rows
+                    if rel_type.lower() == "pref_name" and is_preferred
+                }
+
                 with db.cursor() as cur:
                     for row in rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row
@@ -436,6 +443,23 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 " WHERE user_id = %s AND subject_id = %s AND rel_type = 'also_known_as'"
                                 " AND object_id != %s",
                                 (user_id, subject, obj),
+                            )
+
+                    # Propagate preferred label from pref_name to matching user → also_known_as rows
+                    if batch_preferred_objects:
+                        for preferred_obj in batch_preferred_objects:
+                            cur.execute(
+                                "UPDATE facts SET is_preferred_label = true"
+                                " WHERE user_id = %s AND subject_id = 'user'"
+                                " AND rel_type = 'also_known_as' AND object_id = %s",
+                                (req.user_id, preferred_obj),
+                            )
+                            # Clear other user → also_known_as preferred labels
+                            cur.execute(
+                                "UPDATE facts SET is_preferred_label = false"
+                                " WHERE user_id = %s AND subject_id = 'user'"
+                                " AND rel_type = 'also_known_as' AND object_id != %s",
+                                (req.user_id, preferred_obj),
                             )
 
                     for row in rows:
