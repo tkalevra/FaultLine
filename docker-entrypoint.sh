@@ -7,9 +7,11 @@ until pg_isready -d "$POSTGRES_DSN" -q; do
 done
 
 echo "[entrypoint] Running migrations..."
-psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/001_create_facts.sql
-psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/002_add_fact_weights.sql
-psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f /app/migrations/003_add_contradiction.sql
+for migration in $(ls /app/migrations/*.sql | sort); do
+    echo "[entrypoint] Applying $migration..."
+    psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f "$migration"
+done
+echo "[entrypoint] Migrations complete."
 
 echo "[entrypoint] Starting re_embedder service (background)..."
 python -m src.re_embedder.embedder &
