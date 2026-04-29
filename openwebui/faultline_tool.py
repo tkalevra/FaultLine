@@ -34,6 +34,7 @@ RELATIONSHIP RULES (strictly enforced):
 - Never emit child_of or parent_of between two siblings. If two entities share the same parent, emit sibling_of between them instead.
 - For "X and Y are children of Z", emit three triples: Z parent_of X, Z parent_of Y, X sibling_of Y.
 - Directionality is absolute. When in doubt, prefer parent_of with the parent as subject.
+- NEVER emit child_of where the subject is the person speaking or the established user identity. If the user says "I have children" or "we have children", emit parent_of with the user as subject, never child_of with the user as subject.
 
 1. Extract ALL factual assertions — people, animals, objects, places, preferences.
 2. Entities must be specific names or nouns. Lowercase all values.
@@ -257,9 +258,14 @@ class Filter:
                 return body
 
             if will_ingest:
-                typed_entities = await self._fetch_entities(text, user_id)
+                # Strip injected memory block before extraction so Qwen
+                # doesn't extract facts from our own injections
+                _MEMORY_MARKER = "\n\n🧠 Memory context from FaultLine:"
+                clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
+
+                typed_entities = await self._fetch_entities(clean_text, user_id)
                 raw_triples = await rewrite_to_triples(
-                    text, self.valves, context=body.get("messages", []),
+                    clean_text, self.valves, context=body.get("messages", []),
                     typed_entities=typed_entities if typed_entities else None
                 )
                 confident = [e for e in raw_triples if not e.get("low_confidence", False)]
@@ -278,7 +284,7 @@ class Filter:
                     print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
                 asyncio.create_task(
                     self._fire_ingest(
-                        text,
+                        clean_text,
                         self.valves.DEFAULT_SOURCE,
                         user_id,
                         edges=edges,
