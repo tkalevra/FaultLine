@@ -66,7 +66,7 @@ OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false
 If nothing to extract: []"""
 
 
-async def rewrite_to_triples(text: str, valves, context: list[dict] = None) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, context: list[dict] = None, typed_entities: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
@@ -96,7 +96,22 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None) -> l
                 ) else prior_turns
                 messages.extend(turns_to_add)
 
-        messages.append({"role": "user", "content": text})
+        user_content = text
+        if typed_entities:
+            entity_lines = "\n".join(
+                f"- {e.get('subject')} (type: {e.get('subject_type', 'unknown')})"
+                f" {e.get('rel_type')} {e.get('object')} (type: {e.get('object_type', 'unknown')})"
+                for e in typed_entities
+                if e.get("subject") and e.get("object")
+            )
+            user_content = (
+                f"{text}\n\n"
+                f"GLiNER2 has pre-classified these entities from the text:\n{entity_lines}\n"
+                f"Use these entity types to guide relationship selection. "
+                f"A Person cannot be owned. An Animal cannot be a spouse. "
+                f"Respect these types strictly."
+            )
+        messages.append({"role": "user", "content": user_content})
 
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
@@ -192,6 +207,20 @@ class Filter:
                 print(f"[FaultLine Filter] Ingest error: {e}")
             return {"status": "error", "detail": str(e)}
 
+    async def _fetch_entities(self, text: str, user_id: str) -> list[dict]:
+        """Call /extract to get GLiNER2-typed entities before Qwen runs."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/extract",
+                    json={"text": text, "source": "preflight", "user_id": user_id},
+                )
+            if resp.status_code == 200:
+                return resp.json().get("entities", [])
+        except Exception:
+            pass
+        return []
+
     async def inlet(
         self,
         body: dict,
@@ -222,7 +251,11 @@ class Filter:
                 return body
 
             if will_ingest:
-                raw_triples = await rewrite_to_triples(text, self.valves, context=body.get("messages", []))
+                typed_entities = await self._fetch_entities(text, user_id)
+                raw_triples = await rewrite_to_triples(
+                    text, self.valves, context=body.get("messages", []),
+                    typed_entities=typed_entities if typed_entities else None
+                )
                 confident = [e for e in raw_triples if not e.get("low_confidence", False)]
                 edges = [
                     {
