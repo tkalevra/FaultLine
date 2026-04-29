@@ -292,8 +292,11 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # Resolve "user" subject/object to known identity if established
     # Look up the most recent also_known_as fact for this user_id
     resolved_identity = None
+    _dsn = os.environ.get("POSTGRES_DSN")
     try:
-        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        if not _dsn:
+            raise ValueError("No POSTGRES_DSN")
+        _db = psycopg2.connect(_dsn)
         with _db.cursor() as _cur:
             _cur.execute(
                 "SELECT object_id FROM facts "
