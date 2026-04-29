@@ -43,3 +43,12 @@ class IngestResponse(BaseModel):
     committed: int
     entities: list[EntityResult]
     facts: list[FactResult]
+
+
+class RelTypeRequest(BaseModel):
+    rel_type: str
+    label: str
+    subject_role: str = "entity"
+    object_role: str = "entity"
+    correction_behavior: str = "supersede"
+    wikidata_pid: Optional[str] = None

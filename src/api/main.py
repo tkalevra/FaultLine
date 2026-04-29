@@ -9,7 +9,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest
+from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest
 
 log = structlog.get_logger()
 
@@ -109,6 +109,55 @@ def health():
     if _gliner2_model is None:
         raise HTTPException(status_code=503, detail="Model loading")
     return {"status": "ok"}
+
+@app.post("/ontology/rel_types")
+def add_rel_type(req: RelTypeRequest):
+    """
+    User-asserted rel_type registration. Source is always 'user'.
+    Wikidata and builtin types cannot be overwritten via this endpoint.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+    try:
+        with psycopg2.connect(dsn) as db:
+            with db.cursor() as cur:
+                # Refuse to overwrite wikidata or builtin sources
+                cur.execute(
+                    "SELECT source FROM rel_types WHERE rel_type = %s",
+                    (req.rel_type.lower(),),
+                )
+                existing = cur.fetchone()
+                if existing and existing[0] in ("wikidata", "builtin"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Cannot overwrite protected source '{existing[0]}' for rel_type '{req.rel_type}'"
+                    )
+                cur.execute(
+                    "INSERT INTO rel_types"
+                    " (rel_type, label, wikidata_pid, engine_generated, confidence, source,"
+                    "  correction_behavior)"
+                    " VALUES (%s, %s, %s, false, 1.0, 'user', %s)"
+                    " ON CONFLICT (rel_type) DO UPDATE SET"
+                    "   label = EXCLUDED.label,"
+                    "   source = 'user',"
+                    "   correction_behavior = EXCLUDED.correction_behavior",
+                    (
+                        req.rel_type.lower(),
+                        req.label,
+                        req.wikidata_pid,
+                        req.correction_behavior,
+                    ),
+                )
+                db.commit()
+        if _rel_type_registry:
+            _rel_type_registry._refresh()
+        return {"status": "ok", "rel_type": req.rel_type.lower(), "source": "user"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("ontology.add_rel_type_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract")
 def extract(req: IngestRequest, model=Depends(get_gliner_model)):
