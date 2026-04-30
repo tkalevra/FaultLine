@@ -592,7 +592,12 @@ def query(request: QueryRequest):
             _db_direct.close()
             if direct_facts:
                 log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
-                return {"status": "ok", "facts": direct_facts, "preferred_names": preferred_names}
+                return {
+                    "status": "ok",
+                    "facts": direct_facts,
+                    "preferred_names": preferred_names,
+                    "canonical_identity": _identity,
+                }
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
 
@@ -620,7 +625,17 @@ def query(request: QueryRequest):
             if h.get("payload")
         ]
         log.info("query.ok", collection=collection, hits=len(facts))
-        return {"status": "ok", "facts": facts, "preferred_names": preferred_names}
+        return {
+            "status": "ok",
+            "facts": facts,
+            "preferred_names": preferred_names,
+            "canonical_identity": canonical_identity,
+        }
     except Exception as e:
         log.error("query.failed", error=str(e))
-        return {"status": "ok", "facts": [], "preferred_names": preferred_names}
+        return {
+            "status": "ok",
+            "facts": [],
+            "preferred_names": preferred_names,
+            "canonical_identity": canonical_identity,
+        }

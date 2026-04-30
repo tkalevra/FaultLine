@@ -308,8 +308,10 @@ class Filter:
                             json={"text": text, "user_id": user_id, "top_k": 5},
                         )
                     if resp.status_code == 200:
-                        facts = resp.json().get("facts", [])
-                        preferred_names = resp.json().get("preferred_names", {})
+                        _resp_json = resp.json()
+                        facts = _resp_json.get("facts", [])
+                        preferred_names = _resp_json.get("preferred_names", {})
+                        canonical_identity = _resp_json.get("canonical_identity")
                         if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
@@ -317,22 +319,7 @@ class Filter:
                             # but facts use the canonical name (e.g. "christopher")
                             # We need both for matching
                             identity_display = preferred_names.get("user")
-                            # Find canonical by looking for facts where subject matches any form
-                            # The canonical is what actually appears in fact subjects
-                            identity_canonical = None
-                            if identity_display:
-                                # Check if display name appears in facts as subject
-                                display_subjects = {f.get("subject") for f in facts}
-                                if identity_display in display_subjects:
-                                    identity_canonical = identity_display
-                                else:
-                                    # Find canonical by checking also_known_as in facts
-                                    identity_canonical = next(
-                                        (f.get("subject") for f in facts
-                                         if f.get("object") == identity_display
-                                         and f.get("rel_type") in ("also_known_as", "pref_name")),
-                                        identity_display
-                                    )
+                            identity_canonical = canonical_identity or identity_display
                             identity = identity_canonical or identity_display
                             if identity:
                                 display = identity_display or identity
