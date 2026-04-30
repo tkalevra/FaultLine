@@ -40,7 +40,8 @@ RELATIONSHIP RULES (strictly enforced):
 2. Entities must be specific names or nouns. Lowercase all values.
 3. rel_type must be snake_case. Use the most precise label that fits.
    Common types: is_a, has_pet, parent_of, child_of, spouse, sibling_of,
-   also_known_as, works_for, likes, dislikes, prefers, lives_at, owns.
+   also_known_as, works_for, likes, dislikes, prefers, lives_at, owns,
+   age, height, weight.
    You may use other snake_case types if none of the above fit.
 4. also_known_as = nickname or alias ONLY (e.g. "Theo" for "Theodore").
 5. is_a = type or category (e.g. "morkie is_a dog breed").
@@ -64,6 +65,14 @@ RELATIONSHIP RULES (strictly enforced):
     emit TWO separate triples:
     {"subject":"desmonde","object":"12","rel_type":"age"}
     {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
+13. For height patterns ("X is 6ft tall", "X height 6’", "X stands 6 feet", "X is 6’ tall"):
+    emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
+    Normalize units to feet/inches format. Use ' for feet, \" for inches.
+    For self-statements ("I am 6’ tall", "I'm 6ft", "my height is 6 feet"), emit {"subject":"user","object":"6ft","rel_type":"height"}.
+14. For weight patterns ("X weighs 230lbs", "X weight 230 pounds", "X is 230lb"):
+    emit {"subject":"x","object":"230lb","rel_type":"weight"} where object is the weight in pounds (e.g. "230lb").
+    Normalize units to pounds.
+    For self-statements ("I weigh 230lbs", "I'm 230lb", "my weight is 230 pounds"), emit {"subject":"user","object":"230lb","rel_type":"weight"}.
 15. CORRECTION DETECTION: If the message indicates a prior fact was wrong
     ("actually", "his name is", "it's supposed to be", "I meant",
     "not X, it's Y", "correct that to"), extract the correction as a new
@@ -88,7 +97,7 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
 
         if context:
             prior_turns = []
-            for msg in context[-6:]:
+            for msg in context[-self.valves.MAX_CONTEXT_TURNS:]:
                 role = msg.get("role")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -171,6 +180,8 @@ class Filter:
         ENABLED: bool = True
         INGEST_ENABLED: bool = True
         QUERY_ENABLED: bool = True
+        MAX_MEMORY_SENTENCES: int = 10  # Limit memory block to prevent token bloat
+        MAX_CONTEXT_TURNS: int = 3  # Limit conversation context turns sent to Qwen
 
     def __init__(self):
         self.valves = self.Valves()
@@ -277,7 +288,11 @@ class Filter:
                     clean_text, self.valves, context=body.get("messages", []),
                     typed_entities=typed_entities if typed_entities else None
                 )
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] raw_triples: {raw_triples}")
                 confident = [e for e in raw_triples if not e.get("low_confidence", False)]
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] confident edges: {len(confident)}")
                 edges = [
                     {
                         "subject": e["subject"],
@@ -417,6 +432,16 @@ class Filter:
                                 if siblings:
                                     sentences.append(f"Your {'sibling is' if len(siblings) == 1 else 'siblings are'} {', '.join(siblings)}.")
 
+                                # Add user attributes
+                                if entity_attributes and identity in entity_attributes:
+                                    user_attrs = entity_attributes[identity]
+                                    if "height" in user_attrs:
+                                        sentences.append(f"You are {user_attrs['height']} tall.")
+                                    if "weight" in user_attrs:
+                                        sentences.append(f"You weigh {user_attrs['weight']}.")
+                                    if "age" in user_attrs:
+                                        sentences.append(f"You are {user_attrs['age']} years old.")
+
                                 # Render remaining facts not already covered
                                 covered_rels = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
                                 for f in facts:
@@ -468,8 +493,12 @@ class Filter:
 
                                 if sentences:
                                     memory_lines.append("## What I know about you")
-                                    for s in sentences:
+                                    # Limit to prevent token bloat
+                                    limited_sentences = sentences[:self.valves.MAX_MEMORY_SENTENCES]
+                                    for s in limited_sentences:
                                         memory_lines.append(f"- {s}")
+                                    if len(sentences) > self.valves.MAX_MEMORY_SENTENCES:
+                                        memory_lines.append(f"- ... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated to save context window)")
 
                             memory_block = (
                                 f"\n\n🧠 Memory context from FaultLine:\n"
