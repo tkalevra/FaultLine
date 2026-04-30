@@ -313,12 +313,33 @@ class Filter:
                         if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
-                            identity = preferred_names.get("user")
+                            # preferred_names["user"] is the display name (e.g. "chris")
+                            # but facts use the canonical name (e.g. "christopher")
+                            # We need both for matching
+                            identity_display = preferred_names.get("user")
+                            # Find canonical by looking for facts where subject matches any form
+                            # The canonical is what actually appears in fact subjects
+                            identity_canonical = None
+                            if identity_display:
+                                # Check if display name appears in facts as subject
+                                display_subjects = {f.get("subject") for f in facts}
+                                if identity_display in display_subjects:
+                                    identity_canonical = identity_display
+                                else:
+                                    # Find canonical by checking also_known_as in facts
+                                    identity_canonical = next(
+                                        (f.get("subject") for f in facts
+                                         if f.get("object") == identity_display
+                                         and f.get("rel_type") in ("also_known_as", "pref_name")),
+                                        identity_display
+                                    )
+                            identity = identity_canonical or identity_display
                             if identity:
+                                display = identity_display or identity
                                 identity_line = (
-                                    f"The user in this conversation is '{identity}'. "
-                                    f"When facts reference '{identity}', that means YOU (the user). "
-                                    f"Do not describe '{identity}' as a third party.\n"
+                                    f"The user in this conversation is '{display}'. "
+                                    f"When facts reference '{identity}' or '{display}', that means YOU (the user). "
+                                    f"Do not describe '{display}' as a third party.\n"
                                 )
                             else:
                                 identity_line = "Note: you are the user these facts refer to.\n"
@@ -326,9 +347,11 @@ class Filter:
                             # Inject identity anchor into system message for hard grounding
                             if identity:
                                 system_anchor = (
-                                    f"[Memory] The user's name is {identity}. "
-                                    f"All facts referencing '{identity}' describe this user directly. "
-                                    f"Never refer to {identity} as a third party or someone else."
+                                    f"You are speaking directly with {identity_display or identity}. "
+                                    f"Facts may refer to them as '{identity}' or '{identity_display}'. "
+                                    f"Both refer to the same person — the user in front of you. "
+                                    f"Address them as 'you', never as 'he', 'she', or 'they'. "
+                                    f"Do not invent relationships or family members beyond what the facts state."
                                 )
                                 messages = body.get("messages", [])
                                 for i, msg in enumerate(messages):
