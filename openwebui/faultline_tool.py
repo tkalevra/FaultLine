@@ -1,7 +1,7 @@
 """
 title: FaultLine WGM Filter
 author: tkalevra
-version: 1.2.0
+version: 1.3.0
 required_open_webui_version: 0.9.0
 requirements: httpx
 """
@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+from collections import defaultdict
 from typing import Optional
 
 import httpx
@@ -65,10 +66,10 @@ RELATIONSHIP RULES (strictly enforced):
     emit TWO separate triples:
     {"subject":"desmonde","object":"12","rel_type":"age"}
     {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
-13. For height patterns ("X is 6ft tall", "X height 6’", "X stands 6 feet", "X is 6’ tall"):
+13. For height patterns ("X is 6ft tall", "X height 6'", "X stands 6 feet", "X is 6' tall"):
     emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
     Normalize units to feet/inches format. Use ' for feet, \" for inches.
-    For self-statements ("I am 6’ tall", "I'm 6ft", "my height is 6 feet"), emit {"subject":"user","object":"6ft","rel_type":"height"}.
+    For self-statements ("I am 6' tall", "I'm 6ft", "my height is 6 feet"), emit {"subject":"user","object":"6ft","rel_type":"height"}.
 14. For weight patterns ("X weighs 230lbs", "X weight 230 pounds", "X is 230lb"):
     emit {"subject":"x","object":"230lb","rel_type":"weight"} where object is the weight in pounds (e.g. "230lb").
     Normalize units to pounds.
@@ -97,7 +98,7 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
 
         if context:
             prior_turns = []
-            for msg in context[-self.valves.MAX_CONTEXT_TURNS:]:
+            for msg in context[-valves.MAX_CONTEXT_TURNS:]:
                 role = msg.get("role")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -107,10 +108,7 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
                         )
                     if content.strip():
                         prior_turns.append({"role": role, "content": content})
-            # Include all prior turns except the current message (last user turn)
-            # which is already appended as the final message separately
             if prior_turns:
-                # Drop the last user turn from context since it's the current message
                 turns_to_add = prior_turns[:-1] if (
                     prior_turns[-1]["role"] == "user"
                 ) else prior_turns
@@ -165,8 +163,8 @@ class Filter:
     """
     OpenWebUI Filter for FaultLine WGM Integration.
 
-    inlet:  extract and commit facts from user messages (write path, fire-and-forget)
-    outlet: query Qdrant for relevant memories and append to response (read-only)
+    inlet:  extract and commit facts (fire-and-forget), query for memory and inject as system message
+    outlet: pass-through
     """
 
     class Valves(BaseModel):
@@ -180,8 +178,8 @@ class Filter:
         ENABLED: bool = True
         INGEST_ENABLED: bool = True
         QUERY_ENABLED: bool = True
-        MAX_MEMORY_SENTENCES: int = 10  # Limit memory block to prevent token bloat
-        MAX_CONTEXT_TURNS: int = 3  # Limit conversation context turns sent to Qwen
+        MAX_MEMORY_SENTENCES: int = 10
+        MAX_CONTEXT_TURNS: int = 3
 
     def __init__(self):
         self.valves = self.Valves()
@@ -189,7 +187,10 @@ class Filter:
     def _last_message(self, messages: list, role: str) -> Optional[str]:
         for m in reversed(messages):
             if m.get("role") == role:
-                return m.get("content", "")
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+                return c
         return None
 
     async def _fire_ingest(
@@ -218,19 +219,18 @@ class Filter:
                 return response.json()
         except httpx.ConnectError as e:
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] Connection error: {e}")
+                print(f"[FaultLine Filter] ingest connection error: {e}")
             return {"status": "error", "detail": "FaultLine unreachable"}
         except httpx.TimeoutException as e:
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] Timeout: {e}")
+                print(f"[FaultLine Filter] ingest timeout: {e}")
             return {"status": "error", "detail": "FaultLine timeout"}
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] Ingest error: {e}")
+                print(f"[FaultLine Filter] ingest error: {e}")
             return {"status": "error", "detail": str(e)}
 
     async def _fetch_entities(self, text: str, user_id: str) -> list[dict]:
-        """Call /extract to get GLiNER2-typed entities before Qwen runs."""
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
@@ -243,16 +243,125 @@ class Filter:
             pass
         return []
 
+    def _build_memory_block(
+        self,
+        facts: list[dict],
+        preferred_names: dict,
+        canonical_identity: Optional[str],
+        entity_attributes: dict,
+    ) -> str:
+        identity_display = preferred_names.get("user")
+        identity = canonical_identity or identity_display
+
+        lines = []
+
+        if identity:
+            display = identity_display or identity
+            lines.append(
+                f"The user is '{display}'. Facts referencing '{identity}' or '{display}' are about the user directly. "
+                f"Address the user as 'you', never as a third party."
+            )
+
+        if preferred_names:
+            for canonical, preferred in preferred_names.items():
+                if canonical != identity:
+                    lines.append(f"Always call {canonical.title()} by '{preferred.title()}'.")
+
+        if facts:
+            nickname_map = {}
+            by_rel = defaultdict(list)
+            for f in facts:
+                by_rel[f.get("rel_type", "")].append(f)
+                if f.get("rel_type") == "also_known_as":
+                    subj = f.get("subject", "")
+                    alias = f.get("object", "")
+                    if subj and alias and subj != identity:
+                        nickname_map[subj] = alias
+
+            def _dn(name: str) -> str:
+                return nickname_map.get(name, name).title()
+
+            sentences = []
+
+            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
+            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") == identity]
+            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") == identity and f.get("subject") not in spouses_raw]
+            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") == identity]
+
+            if children_raw:
+                descs = []
+                for c in children_raw:
+                    age = entity_attributes.get(c, {}).get("age")
+                    descs.append(f"{_dn(c)} (age {age})" if age else _dn(c))
+                sentences.append(f"You have {len(children_raw)} {'child' if len(children_raw) == 1 else 'children'}: {', '.join(descs)}.")
+            if spouses_raw:
+                sentences.append(f"You are married to {', '.join(_dn(s) for s in set(spouses_raw))}.")
+            if siblings_raw:
+                sentences.append(f"Your {'sibling is' if len(siblings_raw) == 1 else 'siblings are'} {', '.join(_dn(s) for s in siblings_raw)}.")
+
+            if entity_attributes and identity and identity in entity_attributes:
+                ua = entity_attributes[identity]
+                if "height" in ua:
+                    sentences.append(f"You are {ua['height']} tall.")
+                if "weight" in ua:
+                    sentences.append(f"You weigh {ua['weight']}.")
+                if "age" in ua:
+                    sentences.append(f"You are {ua['age']} years old.")
+
+            covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
+            for f in facts:
+                if f.get("rel_type") in covered:
+                    continue
+                subj = f.get("subject", "")
+                obj = f.get("object", "")
+                rel = f.get("rel_type", "").replace("_", " ")
+                if identity and subj == identity:
+                    if rel == "has pet":
+                        sentences.append(f"You have a pet named {_dn(obj)}.")
+                    elif rel == "owns":
+                        sentences.append(f"You own {_dn(obj)}.")
+                    elif rel == "likes":
+                        sentences.append(f"You like {obj}.")
+                    elif rel in ("lives at", "lives in"):
+                        sentences.append(f"You live at {obj}.")
+                    elif rel == "works for":
+                        sentences.append(f"You work for {obj.title()}.")
+                    elif rel == "address":
+                        sentences.append(f"Your address is {obj}.")
+                    else:
+                        sentences.append(f"You {rel} {_dn(obj)}.")
+                elif identity and obj == identity:
+                    sentences.append(f"{_dn(subj)} {rel} you.")
+                else:
+                    sentences.append(f"{_dn(subj)} {rel} {_dn(obj)}.")
+
+            if entity_attributes:
+                for entity, attrs in entity_attributes.items():
+                    if entity == identity:
+                        continue
+                    parts = []
+                    if "age" in attrs:
+                        parts.append(f"age {attrs['age']}")
+                    if parts:
+                        sentences.append(f"{_dn(entity)}: {', '.join(parts)}.")
+
+            limited = sentences[:self.valves.MAX_MEMORY_SENTENCES]
+            lines.extend(limited)
+            if len(sentences) > self.valves.MAX_MEMORY_SENTENCES:
+                lines.append(f"... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
+
+        return (
+            "🧠 Memory context (FaultLine):\n"
+            + "\n".join(f"- {l}" for l in lines)
+            + "\nOnly state what the facts above explicitly say. Do not invent additional details."
+        )
+
     async def inlet(
         self,
         body: dict,
         __user__: Optional[dict] = None,
     ) -> dict:
-        """
-        Rewrite the user's message to structured triples via Qwen, fire-and-forget
-        ingest, then query FaultLine for relevant memories and inject them into
-        the user message before the model sees it.
-        """
+        print(f"[FaultLine Filter] inlet CALLED enabled={self.valves.ENABLED} debug={self.valves.ENABLE_DEBUG}")
         if not self.valves.ENABLED:
             return body
 
@@ -262,6 +371,8 @@ class Filter:
                 return body
 
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
 
             _IDENTITY_RE = re.compile(
                 r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
@@ -271,28 +382,21 @@ class Filter:
             )
             will_query = self.valves.QUERY_ENABLED
 
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] inlet text='{text[:80]}' will_ingest={will_ingest}")
-
             if not will_ingest and not will_query:
                 return body
 
             if will_ingest:
-                # Strip injected memory block before extraction so Qwen
-                # doesn't extract facts from our own injections
-                _MEMORY_MARKER = "\n\n🧠 Memory context from FaultLine:"
+                _MEMORY_MARKER = "🧠 Memory context (FaultLine):"
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
                 typed_entities = await self._fetch_entities(clean_text, user_id)
                 raw_triples = await rewrite_to_triples(
                     clean_text, self.valves, context=body.get("messages", []),
-                    typed_entities=typed_entities if typed_entities else None
+                    typed_entities=typed_entities if typed_entities else None,
                 )
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] raw_triples: {raw_triples}")
-                confident = [e for e in raw_triples if not e.get("low_confidence", False)]
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] confident edges: {len(confident)}")
+                    print(f"[FaultLine Filter] raw_triples={raw_triples}")
+
                 edges = [
                     {
                         "subject": e["subject"],
@@ -301,229 +405,70 @@ class Filter:
                         "is_preferred_label": e.get("is_preferred_label", False),
                         "is_correction": e.get("is_correction", False),
                     }
-                    for e in confident
-                    if e.get("subject") and e.get("object") and e.get("rel_type")
+                    for e in raw_triples
+                    if not e.get("low_confidence", False)
+                    and e.get("subject") and e.get("object") and e.get("rel_type")
                 ]
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] inlet firing ingest: {text[:80]} edges={len(edges)}")
+                    print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
                 asyncio.create_task(
-                    self._fire_ingest(
-                        clean_text,
-                        self.valves.DEFAULT_SOURCE,
-                        user_id,
-                        edges=edges,
-                    )
+                    self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
                 )
 
             if will_query:
                 try:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
                     async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
                         resp = await client.post(
                             f"{self.valves.FAULTLINE_URL}/query",
                             json={"text": text, "user_id": user_id, "top_k": 5},
                         )
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query status={resp.status_code}")
+
                     if resp.status_code == 200:
-                        _resp_json = resp.json()
-                        facts = _resp_json.get("facts", [])
-                        preferred_names = _resp_json.get("preferred_names", {})
-                        canonical_identity = _resp_json.get("canonical_identity")
-                        entity_attributes = _resp_json.get("attributes", {})
-                        if facts or preferred_names:
-                            if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
-                            # preferred_names["user"] is the display name (e.g. "chris")
-                            # but facts use the canonical name (e.g. "christopher")
-                            # We need both for matching
-                            identity_display = preferred_names.get("user")
-                            identity_canonical = canonical_identity or identity_display
-                            identity = identity_canonical or identity_display
-                            if identity:
-                                display = identity_display or identity
-                                identity_line = (
-                                    f"The user in this conversation is '{display}'. "
-                                    f"When facts reference '{identity}' or '{display}', that means YOU (the user). "
-                                    f"Do not describe '{display}' as a third party.\n"
-                                )
-                            else:
-                                identity_line = "Note: you are the user these facts refer to.\n"
+                        data = resp.json()
+                        facts = data.get("facts", [])
+                        preferred_names = data.get("preferred_names", {})
+                        canonical_identity = data.get("canonical_identity")
+                        entity_attributes = data.get("attributes", {})
 
-                            # Inject identity anchor into system message for hard grounding
-                            if identity:
-                                system_anchor = (
-                                    f"You are speaking directly with {identity_display or identity}. "
-                                    f"Facts may refer to them as '{identity}' or '{identity_display}'. "
-                                    f"Both refer to the same person — the user in front of you. "
-                                    f"Address them as 'you', never as 'he', 'she', or 'they'. "
-                                    f"Do not invent relationships or family members beyond what the facts state."
-                                )
-                                messages = body.get("messages", [])
-                                for i, msg in enumerate(messages):
-                                    if msg.get("role") == "system":
-                                        messages[i]["content"] = messages[i]["content"] + "\n\n" + system_anchor
-                                        break
-                                else:
-                                    # No system message exists — prepend one
-                                    messages.insert(0, {"role": "system", "content": system_anchor})
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] facts={len(facts)} preferred_names={preferred_names} identity={canonical_identity}")
+                            for f in facts:
+                                print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
 
-                            memory_lines = []
-                            if preferred_names:
-                                memory_lines.append("## Preferred Names (always use these, never the canonical form unless explicitly asked for a full or legal name)")
-                                for canonical, preferred in preferred_names.items():
-                                    if canonical != identity:
-                                        memory_lines.append(f"- Always call {canonical.title()} by '{preferred.title()}'. Only use '{canonical.title()}' if asked for their full or legal name.")
-                                memory_lines.append("")
-
-                            if facts:
-                                # Group facts by rel_type for natural sentence construction
-                                from collections import defaultdict
-                                if self.valves.ENABLE_DEBUG:
-                                    print(f"[FaultLine DEBUG] facts count={len(facts)}")
-                                    for _f in facts:
-                                        print(f"[FaultLine DEBUG] fact: {_f.get('subject')} -> {_f.get('rel_type')} -> {_f.get('object')}")
-                                by_rel = defaultdict(list)
-                                for f in facts:
-                                    by_rel[f.get("rel_type", "")].append(f)
-
-                                sentences = []
-                                # Build a nickname lookup from also_known_as facts: canonical → alias
-                                # e.g. charles → chuck means display as "Charles (Chuck)"
-                                nickname_map = {}
-                                for f in by_rel.get("also_known_as", []):
-                                    canonical = f.get("subject", "")
-                                    alias = f.get("object", "")
-                                    if canonical and alias and canonical != identity:
-                                        nickname_map[canonical] = alias
-
-                                def _display_name(name: str) -> str:
-                                    """Return preferred name if one exists, otherwise canonical name."""
-                                    if name in nickname_map:
-                                        return nickname_map[name].title()
-                                    return name.title()
-
-                                # TODO: enrich entity descriptions with entity_attributes
-                                # e.g. "Desmonde (Des), age 12" by joining entity_attributes on entity_id
-                                # Requires /query endpoint to return attributes in response
-
-                                children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") == identity]
-                                parents_raw = [f.get("object") for f in by_rel.get("child_of", []) if identity and f.get("subject") == identity]
-                                spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and (f.get("subject") == identity or f.get("object") == identity)]
-                                spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") == identity and f.get("subject") not in spouses_raw]
-                                siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") == identity]
-
-                                children = [_display_name(c) for c in children_raw]
-                                parents = [_display_name(p) for p in parents_raw]
-                                spouses = [_display_name(s) for s in set(spouses_raw)]
-                                siblings = [_display_name(s) for s in siblings_raw]
-
-                                if children:
-                                    child_descriptions = []
-                                    for c in children_raw:
-                                        display = _display_name(c)
-                                        age = entity_attributes.get(c, {}).get("age")
-                                        if age:
-                                            child_descriptions.append(f"{display} (age {age})")
-                                        else:
-                                            child_descriptions.append(display)
-                                    sentences.append(f"You have {len(children)} {'child' if len(children) == 1 else 'children'}: {', '.join(child_descriptions)}.")
-                                if spouses:
-                                    sentences.append(f"You are married to {', '.join(set(spouses))}.")
-                                if parents:
-                                    sentences.append(f"Your {'parent is' if len(parents) == 1 else 'parents are'} {', '.join(parents)}.")
-                                if siblings:
-                                    sentences.append(f"Your {'sibling is' if len(siblings) == 1 else 'siblings are'} {', '.join(siblings)}.")
-
-                                # Add user attributes
-                                if entity_attributes and identity in entity_attributes:
-                                    user_attrs = entity_attributes[identity]
-                                    if "height" in user_attrs:
-                                        sentences.append(f"You are {user_attrs['height']} tall.")
-                                    if "weight" in user_attrs:
-                                        sentences.append(f"You weigh {user_attrs['weight']}.")
-                                    if "age" in user_attrs:
-                                        sentences.append(f"You are {user_attrs['age']} years old.")
-
-                                # Render remaining facts not already covered
-                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
-                                for f in facts:
-                                    if f.get("rel_type") in covered_rels:
-                                        continue
-                                    subj = f.get("subject", "")
-                                    obj = f.get("object", "")
-                                    rel = f.get("rel_type", "").replace("_", " ")
-                                    if identity and subj == identity:
-                                        if rel == "has_pet":
-                                            sentences.append(f"You have a pet named {_display_name(obj)}.")
-                                        elif rel == "owns":
-                                            sentences.append(f"You own {_display_name(obj)}.")
-                                        elif rel == "likes":
-                                            sentences.append(f"You like {obj}.")
-                                        elif rel in ("lives_at", "lives_in"):
-                                            sentences.append(f"You live at {obj}.")
-                                        elif rel == "works_for":
-                                            sentences.append(f"You work for {obj.title()}.")
-                                        elif rel == "ip_address":
-                                            sentences.append(f"Your IP address is {obj}.")
-                                        elif rel == "phone":
-                                            sentences.append(f"Your phone number is {obj}.")
-                                        elif rel == "address":
-                                            sentences.append(f"Your address is {obj}.")
-                                        else:
-                                            sentences.append(f"You {rel} {_display_name(obj)}.")
-                                    elif identity and obj == identity:
-                                        sentences.append(f"{_display_name(subj).title()} {rel} you.")
-                                    else:
-                                        sentences.append(
-                                            f"{_display_name(subj).title()} {rel} {_display_name(obj)}."
-                                        )
-
-                                # Append known attributes for related entities
-                                if entity_attributes:
-                                    for entity, attrs in entity_attributes.items():
-                                        if entity == identity:
-                                            continue  # user attributes handled above
-                                        attr_parts = []
-                                        if "age" in attrs:
-                                            attr_parts.append(f"age {attrs['age']}")
-                                        if "ip_address" in attrs:
-                                            attr_parts.append(f"IP {attrs['ip_address']}")
-                                        if attr_parts:
-                                            sentences.append(
-                                                f"{_display_name(entity).title()}: {', '.join(attr_parts)}."
-                                            )
-
-                                if sentences:
-                                    memory_lines.append("## What I know about you")
-                                    # Limit to prevent token bloat
-                                    limited_sentences = sentences[:self.valves.MAX_MEMORY_SENTENCES]
-                                    for s in limited_sentences:
-                                        memory_lines.append(f"- {s}")
-                                    if len(sentences) > self.valves.MAX_MEMORY_SENTENCES:
-                                        memory_lines.append(f"- ... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated to save context window)")
-
-                            memory_block = (
-                                f"\n\n🧠 Memory context from FaultLine:\n"
-                                f"{identity_line}"
-                                f"IMPORTANT: These facts are about the person you are speaking with directly. "
-                                f"Do not invent parents, ancestors, or additional family members not listed here. "
-                                f"Do not reframe the user as a child or sibling. Only state what the facts explicitly say.\n"
-                                + "\n".join(memory_lines)
+                        # Inject whenever we have anything useful — let the model decide relevance
+                        if facts or preferred_names or canonical_identity:
+                            memory_block = self._build_memory_block(
+                                facts, preferred_names, canonical_identity, entity_attributes
                             )
                             if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine DEBUG] identity_display={identity_display}")
-                                print(f"[FaultLine DEBUG] identity_canonical={identity_canonical}")
-                                print(f"[FaultLine DEBUG] identity={identity}")
-                                print(f"[FaultLine DEBUG] memory_block=\n{memory_block}")
-                            messages = body.get("messages", [])
-                            for i in reversed(range(len(messages))):
-                                if messages[i].get("role") == "user":
-                                    messages[i]["content"] = messages[i]["content"] + memory_block
-                                    break
-                except Exception:
-                    pass
+                                print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
+
+                            # Append as system message — safe documented pattern per OpenWebUI spec
+                            body["messages"].append({"role": "system", "content": memory_block})
+
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] INJECTED total_messages={len(body['messages'])}")
+                        else:
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] no facts to inject")
+
+                except httpx.ConnectError as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query connection error: {e}")
+                except httpx.TimeoutException as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query timeout: {e}")
+                except Exception as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query error: {type(e).__name__}: {e}")
 
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] inlet error: {e}")
+                print(f"[FaultLine Filter] inlet error: {type(e).__name__}: {e}")
 
         return body
 

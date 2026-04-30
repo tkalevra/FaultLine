@@ -35,9 +35,15 @@ If neither condition is met AND `QUERY_ENABLED` is false, the inlet returns imme
 
 ## Query / Retrieval Path
 
-The `/query` endpoint embeds the request text using `nomic-embed-text-v1.5` via Ollama/LM Studio, then does a Qdrant cosine nearest-neighbour search against the per-user collection (`score_threshold: 0.3`, `limit: 10`). Facts are returned from the Qdrant payload — PostgreSQL is not consulted during retrieval.
+`/query` runs three parallel sources and merges them before returning:
 
-Memory injection happens in the **inlet** (before the model sees the message), not the outlet. The injected block includes an identity header derived from `user also_known_as` facts, followed by matching fact triples.
+1. **Baseline facts** (PostgreSQL, always) — `lives_at`, `lives_in`, `address`, `age`, `height`, `weight`, `works_for`, `occupation`, `nationality`, `has_gender` anchored to the user's canonical identity. These are returned regardless of query text — vector similarity is too low to surface them for unrelated queries like "what's the weather tomorrow?".
+2. **Graph traversal** (PostgreSQL, signal-gated) — when the query contains self-referential signals ("my family", "where do i live", etc.), fetches all facts anchored to the user's identity + 2-hop related entities.
+3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5` embedding, cosine search, `score_threshold: 0.3`, `limit: 10`. Adds associative context not captured by the other two paths.
+
+The three result sets are merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict.
+
+Memory injection happens in the **inlet** (before the model sees the message). The filter appends a `{"role": "system", "content": memory_block}` to `body["messages"]` — this is the safe documented OpenWebUI pattern. Injecting as a system message avoids a known v0.9.x regression where user message content modifications can be overruled downstream in the filter chain.
 
 ## Key Files
 
