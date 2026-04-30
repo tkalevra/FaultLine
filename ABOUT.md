@@ -6,7 +6,8 @@
 
 ```
 OpenWebUI inlet filter (faultline_tool.py)
-  ├─▶ Qwen triple rewrite        structured edge extraction from text
+  ├─▶ POST /extract (preflight)   GLiNER2 entity typing (subject/object type context)
+  ├─▶ Qwen triple rewrite        entity-typed structured edge extraction from text
   │     └─▶ POST /ingest (fire-and-forget)
   │           └─▶ GLiNER2 extract_json   typed schema edge extraction
   │                 └─▶ WGMValidationGate   ontology + conflict check
@@ -27,7 +28,8 @@ Facts are validated against a Wikidata-aligned ontology (RDF/SKOS/OWL semantics)
 | Module | Path | Role |
 |--------|------|------|
 | FastAPI App | `src/api/main.py` | `/ingest` and `/query` endpoints, GLiNER2 lifecycle |
-| Schema Oracle | `src/schema_oracle/` | Entity registry & canonical ID assignment |
+| Schema Oracle | `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers and label maps |
+| Entity Registry | `src/entity_registry/registry.py` | DB-backed canonical ID assignment, alias tracking, preferred name resolution |
 | WGM Gate | `src/wgm/gate.py` | Ontology check + conflict detection state machine |
 | Fact Store | `src/fact_store/store.py` | Single-transaction INSERT with ON CONFLICT DO NOTHING |
 | Re-embedder | `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts to Qdrant |

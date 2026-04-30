@@ -10,7 +10,8 @@ FaultLine is a **write-validated knowledge graph** pipeline that intercepts Open
 
 ```
 OpenWebUI inlet filter
-  ├─▶ Qwen triple rewrite (LM Studio)   structured edge extraction from raw text
+  ├─▶ POST /extract (preflight)   GLiNER2 entity typing (subject/object type context)
+  ├─▶ Qwen triple rewrite   entity-typed structured edge extraction from text
   │     └─▶ POST /ingest (fire-and-forget)
   │           └─▶ GLiNER2 extract_json   typed schema edge extraction (fallback/override)
   │                 └─▶ WGMValidationGate   ontology + conflict check → status
@@ -18,8 +19,10 @@ OpenWebUI inlet filter
   │                             └─▶ re_embedder (background) → Qdrant upsert
   │
   └─▶ POST /query (synchronous, before model sees message)
-        └─▶ embed text → Qdrant cosine search (score_threshold: 0.3)
-              └─▶ inject memory block into user message
+        ├─▶ PostgreSQL baseline facts (always returned for known identity)
+        ├─▶ PostgreSQL graph traversal (self-referential signals, 2-hop)
+        └─▶ Qdrant cosine search (nomic-embed-text, score_threshold: 0.3)
+              └─▶ merged, deduplicated → injected as system message
 
 OpenWebUI outlet filter
   └─▶ pass-through (no-op)
@@ -38,7 +41,7 @@ Memory is injected whenever `/query` returns facts, a `canonical_identity`, or `
 
 `/query` runs three parallel sources and merges them before returning:
 
-1. **Baseline facts** (PostgreSQL, always) — `lives_at`, `lives_in`, `address`, `age`, `height`, `weight`, `works_for`, `occupation`, `nationality`, `has_gender` anchored to the user's canonical identity. These are returned regardless of query text — vector similarity is too low to surface them for unrelated queries like "what's the weather tomorrow?".
+1. **Baseline facts** (PostgreSQL, always) — `lives_at`, `lives_in`, `address`, `located_in`, `born_in`, `age`, `height`, `weight`, `works_for`, `occupation`, `nationality`, `has_gender` anchored to the user's canonical identity. These are returned regardless of query text — vector similarity is too low to surface them for unrelated queries like "what's the weather tomorrow?".
 2. **Graph traversal** (PostgreSQL, signal-gated) — when the query contains self-referential signals ("my family", "where do i live", etc.), fetches all facts anchored to the user's identity + 2-hop related entities.
 3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5` embedding, cosine search, `score_threshold: 0.3`, `limit: 10`. Adds associative context not captured by the other two paths.
 
@@ -54,7 +57,8 @@ Memory injection happens in the **inlet** (before the model sees the message). T
 | `src/api/models.py` | Pydantic request/response models |
 | `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection |
 | `src/fact_store/store.py` | `FactStoreManager.commit()` — single-transaction INSERT with ON CONFLICT DO NOTHING |
-| `src/schema_oracle/oracle.py` | `EntityRegistry`, `resolve_entities()` — canonical ID assignment |
+| `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers and label maps |
+| `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — canonical ID assignment, alias tracking, preferred name resolution |
 | `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts and upserts to per-user Qdrant collections |
 | `openwebui/faultline_tool.py` | OpenWebUI **Filter** — inlet: Qwen rewrite → ingest + memory query/inject; outlet: no-op |
 | `openwebui/faultline_function.py` | OpenWebUI **Function** (tool call) — explicit `store_fact()` with Qwen rewrite |
@@ -62,13 +66,26 @@ Memory injection happens in the **inlet** (before the model sees the message). T
 
 ## GLiNER2 Extraction
 
-`/ingest` uses `model.extract_json(text, schema)` with a typed JSON schema:
+Both `/ingest` and `/extract` use `model.extract_json(text, schema)`. The `rel_type` constraint is built dynamically from the `rel_types` DB table at startup via `_build_rel_type_constraint`; a comprehensive hardcoded fallback is used when the DB is unavailable.
+
+`/ingest` schema — 3 fields:
 ```python
 {
     "facts": [
-        "subject::str::The full proper name of the first entity...",
-        "object::str::The full proper name of the second entity...",
-        "rel_type::[parent_of|child_of|spouse|sibling_of|also_known_as|works_for]::str::...",
+        "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
+        "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
+        "rel_type::[<db-loaded constraint>]::str::The relationship type from subject to object.",
+    ]
+}
+```
+
+`/extract` (preflight) schema — 5 fields, adds entity type classification:
+```python
+{
+    "facts": [
+        "subject::str::...", "object::str::...", "rel_type::[...]::str::...",
+        "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::...",
+        "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::...",
     ]
 }
 ```
@@ -80,10 +97,11 @@ When `req.edges` are supplied (from the Qwen rewrite in the filter), they overri
 
 Both `faultline_tool.py` and `faultline_function.py` call an LM Studio endpoint before `/ingest` to convert natural language into structured JSON triples. Key constants at module level in both files:
 - `_TRIPLE_SYSTEM_PROMPT` — extraction rules and output schema
-- `_INGEST_KEYWORDS` — (tool only) word-level short-circuit set
 - `rewrite_to_triples(text, valves)` — async, returns `[]` on any failure
 
-Valves controlling Qwen: `QWEN_URL`, `QWEN_MODEL` (`qwen/qwen3.5-9b@q4_k_m`), `QWEN_TIMEOUT`.
+In the filter (`faultline_tool.py`), `rewrite_to_triples` also accepts `context` (prior conversation turns) and `typed_entities` (GLiNER2 pre-classifications from `/extract`) to guide Qwen's entity type reasoning.
+
+Valves controlling Qwen: `QWEN_URL`, `QWEN_MODEL` (default `qwen/qwen3.5-9b`), `QWEN_TIMEOUT`.
 Payload always includes `"thinking": {"type": "disabled"}` to suppress Qwen3 chain-of-thought.
 
 ## Qdrant Collection Naming
@@ -114,7 +132,7 @@ FaultLine's triple model `(subject_id, rel_type, object_id)` is semantically equ
 - parent_of ↔ child_of
 - All others are unidirectional or symmetric
 
-Edges with `rel_type` not in the ontology return `status: "novel"` and are **not committed** until approved by Qwen.
+Edges with `rel_type` not in the ontology trigger a Qwen approval call. If Qwen approves with confidence ≥ 0.7, the type is inserted into `rel_types` and the edge is committed immediately. Otherwise the type is queued in `pending_types` and the edge is dropped (`status: "novel"`).
 
 | rel_type       | Wikidata PID | Inverse   | Symmetric | W3C Mapping      | Notes                           |
 |----------------|--------------|-----------|-----------|------------------|---------------------------------|
@@ -151,9 +169,14 @@ Edges with `rel_type` not in the ontology return `status: "novel"` and are **not
 
 ## Database Schema
 
-Single table: `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced)`.  
-Unique constraint: `(user_id, subject_id, object_id, rel_type)`.  
-A DB trigger lowercases `subject_id`, `object_id`, and `rel_type` on every INSERT/UPDATE.
+Primary tables:
+- `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`.
+- `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts (`age`, `height`, `weight`, `born_on`, `born_in`, `nationality`, `occupation`, `has_gender`) routed here at ingest instead of `facts`.
+- `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry.
+- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior)` — live ontology, loaded at startup.
+- `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
+
+A DB trigger lowercases `subject_id`, `object_id`, and `rel_type` on every INSERT/UPDATE to `facts`.
 
 ## Running / Developing
 
@@ -194,7 +217,7 @@ Two separate artifacts in `openwebui/`:
 - **`faultline_tool.py`** — install as an OpenWebUI **Filter** (Admin → Functions → Filters). Inlet: keyword-gated Qwen rewrite → fire-and-forget `/ingest`, then synchronous `/query` → memory injected into user message before model sees it. Outlet: no-op pass-through.
 - **`faultline_function.py`** — install as an OpenWebUI **Function/Tool**. Model explicitly calls `store_fact(text, __user__)`. Qwen rewrites text to triples, strips low-confidence edges, POSTs to `/ingest` with `user_id`.
 
-Both default to `FAULTLINE_URL = "http://192.168.40.10:8001"` — verify this matches the running service port (internal container port is 8000; external is 8001).
+Defaults differ: Filter (`faultline_tool.py`) defaults to `"http://192.168.40.10:8001"`; Function (`faultline_function.py`) defaults to `"http://faultline:8001"` (Docker service DNS). Verify these match the running service port (internal container port is 8000; external is 8001).
 
 ## Do Not Develop Here
 

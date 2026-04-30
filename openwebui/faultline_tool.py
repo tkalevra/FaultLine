@@ -351,9 +351,11 @@ class Filter:
                 lines.append(f"... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
 
         return (
-            "🧠 Memory context (FaultLine):\n"
+            "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine). "
+            "These are THEIR facts about THEIR life — not things you know or remember yourself. "
+            "When referencing them, say 'according to your stored facts' or 'you've told me' — never 'I know' or 'I have stored'.\n"
             + "\n".join(f"- {l}" for l in lines)
-            + "\nOnly state what the facts above explicitly say. Do not invent additional details."
+            + "\nOnly reference what the facts above explicitly say. Do not invent additional details."
         )
 
     async def inlet(
@@ -386,7 +388,7 @@ class Filter:
                 return body
 
             if will_ingest:
-                _MEMORY_MARKER = "🧠 Memory context (FaultLine):"
+                _MEMORY_MARKER = "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine)."
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
                 typed_entities = await self._fetch_entities(clean_text, user_id)
