@@ -1,17 +1,5 @@
-DROP TABLE IF EXISTS entity_aliases;
-DROP TABLE IF EXISTS entities;
-
-CREATE TABLE entities (
-    id          TEXT NOT NULL,
-    user_id     TEXT NOT NULL,
-    entity_type TEXT NOT NULL DEFAULT 'unknown',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (id, user_id)
-);
-
-CREATE INDEX idx_entities_user ON entities (user_id);
-
-CREATE TABLE entity_aliases (
+-- Entity aliases table (idempotent)
+CREATE TABLE IF NOT EXISTS entity_aliases (
     id           SERIAL PRIMARY KEY,
     entity_id    TEXT NOT NULL,
     user_id      TEXT NOT NULL,
@@ -21,11 +9,12 @@ CREATE TABLE entity_aliases (
     UNIQUE (user_id, alias),
     FOREIGN KEY (entity_id, user_id) REFERENCES entities(id, user_id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_user ON entity_aliases (user_id);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity ON entity_aliases (entity_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_preferred
+    ON entity_aliases (user_id, entity_id) WHERE is_preferred = true;
 
-CREATE INDEX idx_entity_aliases_user ON entity_aliases (user_id);
-CREATE INDEX idx_entity_aliases_entity ON entity_aliases (entity_id, user_id);
-CREATE INDEX idx_entity_aliases_preferred ON entity_aliases (user_id, entity_id) WHERE is_preferred = true;
-
+-- Migrate existing also_known_as facts into entity_aliases
 INSERT INTO entities (id, user_id, entity_type)
 SELECT DISTINCT subject_id, user_id, 'unknown'
 FROM facts WHERE user_id IS NOT NULL
