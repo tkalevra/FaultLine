@@ -645,13 +645,8 @@ def query(request: QueryRequest):
             _db_direct.close()
             if direct_facts:
                 log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
-                return {
-                    "status": "ok",
-                    "facts": direct_facts,
-                    "preferred_names": preferred_names,
-                    "canonical_identity": _identity,
-                    "attributes": attributes,
-                }
+                # Don't return early — merge with Qdrant results below
+                # Postgres facts are authoritative; Qdrant adds associative context
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
 
@@ -668,7 +663,7 @@ def query(request: QueryRequest):
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
             return {"status": "ok", "facts": [], "preferred_names": preferred_names}
 
-        facts = [
+        qdrant_facts = [
             {
                 "subject": h["payload"].get("subject"),
                 "object": h["payload"].get("object"),
@@ -678,7 +673,19 @@ def query(request: QueryRequest):
             for h in resp.json().get("result", [])
             if h.get("payload")
         ]
-        log.info("query.ok", collection=collection, hits=len(facts))
+        log.info("query.ok", collection=collection, hits=len(qdrant_facts))
+
+        # Merge: Postgres facts are authoritative, Qdrant adds associative context
+        # Deduplicate on (subject, object, rel_type) — Postgres wins on conflict
+        pg_keys = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+        for f in qdrant_facts:
+            key = (f["subject"], f["object"], f["rel_type"])
+            if key not in pg_keys:
+                direct_facts.append(f)
+                pg_keys.add(key)
+
+        facts = direct_facts
+        log.info("query.merged", pg_hits=len(pg_keys), total=len(facts))
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
             _entity_ids = list({f["subject"] for f in facts} | {f["object"] for f in facts})

@@ -361,6 +361,10 @@ class Filter:
                             if facts:
                                 # Group facts by rel_type for natural sentence construction
                                 from collections import defaultdict
+                                if self.valves.ENABLE_DEBUG:
+                                    print(f"[FaultLine DEBUG] facts count={len(facts)}")
+                                    for _f in facts:
+                                        print(f"[FaultLine DEBUG] fact: {_f.get('subject')} -> {_f.get('rel_type')} -> {_f.get('object')}")
                                 by_rel = defaultdict(list)
                                 for f in facts:
                                     by_rel[f.get("rel_type", "")].append(f)
