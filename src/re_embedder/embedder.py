@@ -24,17 +24,19 @@ def derive_collection(user_id: str) -> str:
     return f"faultline-{user_id}"
 
 
-def fetch_unsynced(db_conn) -> list[dict]:
-    """Fetch all non-superseded facts where qdrant_synced = false."""
+def fetch_unsynced(db_conn, confidence_threshold: float = 0.0) -> list[dict]:
+    """Fetch all non-superseded facts where qdrant_synced = false and confidence >= threshold."""
     with db_conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT id, subject_id, object_id, rel_type, provenance, user_id,
                    confidence, confirmed_count, last_seen_at, contradicted_by
             FROM facts
             WHERE qdrant_synced = false AND (superseded_at IS NULL)
+            AND confidence >= %s
             ORDER BY id ASC
-            """
+            """,
+            (confidence_threshold,)
         )
         rows = cur.fetchall()
 
@@ -202,18 +204,38 @@ def mark_synced(db_conn, fact_id: int) -> None:
     db_conn.commit()
 
 
+def promote_facts(db_conn) -> None:
+    """Promote facts to long-term memory by increasing confidence for eligible facts."""
+    with db_conn.cursor() as cur:
+        # Increase confidence for facts that have been confirmed multiple times or are old
+        cur.execute(
+            """
+            UPDATE facts
+            SET confidence = LEAST(confidence + 0.1, 1.0)
+            WHERE superseded_at IS NULL
+            AND (confirmed_count >= 2 OR last_seen_at < now() - interval '7 days')
+            AND confidence < 1.0
+            """
+        )
+        promoted_count = cur.rowcount
+        if promoted_count > 0:
+            log.info(f"re_embedder.promoted {promoted_count} facts to long-term memory")
+    db_conn.commit()
+
+
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     qwen_api_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
     interval = int(os.getenv("REEMBED_INTERVAL", "10"))
+    confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
     if not postgres_dsn:
         log.error("POSTGRES_DSN not configured")
         return
 
-    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url}")
+    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold}")
 
     while True:
         try:
@@ -225,7 +247,7 @@ def main():
 
             db = psycopg2.connect(postgres_dsn)
             try:
-                rows = fetch_unsynced(db)
+                rows = fetch_unsynced(db, confidence_threshold)
 
                 if rows:
                     log.info(f"re_embedder.batch_start count={len(rows)}")
@@ -258,6 +280,9 @@ def main():
                     except Exception as e:
                         log.error(f"re_embedder.row_error fact_id={row['id']}: {e}")
                         continue
+
+                # Promotion step: move short-term to long-term
+                promote_facts(db)
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:
