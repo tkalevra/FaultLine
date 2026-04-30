@@ -139,6 +139,8 @@ class EntityRegistry:
         The canonical name is the one that has a preferred alias (e.g. christopher → chris).
         Falls back to any also_known_as target if no preferred chain exists.
         """
+        import structlog as _structlog
+        _log = _structlog.get_logger()
         with self.db_conn.cursor() as cur:
             # Get all entities linked to 'user' via also_known_as
             cur.execute(
@@ -149,6 +151,7 @@ class EntityRegistry:
                 (user_id,),
             )
             candidates = [row[0] for row in cur.fetchall()]
+            _log.info("registry.canonical_candidates", user_id=user_id, candidates=candidates)
 
             if not candidates:
                 return None
