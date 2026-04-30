@@ -27,11 +27,12 @@ OpenWebUI outlet filter
 
 ## Inlet Short-Circuit
 
-Before calling Qwen, the inlet checks:
-1. Word count ≥ 5
-2. Message contains at least one keyword from `_INGEST_KEYWORDS` (is, are, married, likes, etc.) or the phrase "also known"
+Before calling Qwen for ingest:
+1. Word count ≥ 5, OR message matches a self-identification pattern (`my name is`, `I am`, `call me`, etc.)
 
-If neither condition is met AND `QUERY_ENABLED` is false, the inlet returns immediately. If `QUERY_ENABLED` is true, the query step always runs regardless of keyword match.
+If neither condition is met, `will_ingest = False`. `will_query` is always `True` when `QUERY_ENABLED` is set. If both are False the inlet returns immediately with no work done.
+
+Memory is injected whenever `/query` returns facts, a `canonical_identity`, or `preferred_names` — there is no secondary relevance gate. The model decides what is relevant to the current message.
 
 ## Query / Retrieval Path
 

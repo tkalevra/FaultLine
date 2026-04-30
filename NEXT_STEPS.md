@@ -1,201 +1,135 @@
-# FaultLine WGM — Next Steps
+# FaultLine — Next Steps
 
-**Status as of 2026-04-25** | All 38 unit + integration tests passing. Initial commit pushed to GitHub (private).
-
----
-
-## Completed
-
-| # | Item | Status |
-|---|------|--------|
-| 0 | Delete `FaultLine/FaultLine/` nested duplicate files | ✅ Done |
-| 0 | Consolidate `src/tests/` → `tests/` | ✅ Done |
-| 0 | Remove duplicate code blocks from all src modules | ✅ Done |
-| 0 | Fix `conftest.py` location and `import pytest` | ✅ Done |
-| 1 | Align `extractor.py` ↔ `__init__.py` interface (`"label"` key) | ✅ Done |
-| 1 | Wire `extract_entities()` through `ExtractionService` | ✅ Done |
-| 2 | Implement `invoke_oracle` with httpx POST to Qwen2.5 | ✅ Done |
-| 2 | Implement `parse_oracle_response` | ✅ Done |
-| 3 | Create `src/wgm/gate.py` — `WGMValidationGate` state machine | ✅ Done |
-| 4 | Create `src/fact_store/store.py` — `FactStoreManager` transaction + rollback | ✅ Done |
-| 5 | Context Packager schema validation tests | ✅ Done |
-| 6 | `pyproject.toml` full dependencies + pytest config | ✅ Done |
-| 6 | `.env.example` | ✅ Done |
-| 7 | `tests/test_pipeline.py` end-to-end integration test | ✅ Done |
-| 8 | `ABOUT.md`, `LICENSE` (Apache 2.0), `.gitignore` | ✅ Done |
-| 9 | Private GitHub repo `tkalevra/FaultLine` created and pushed | ✅ Done |
+**Status as of 2026-04-30** | Filter v1.3.0. Dual-path query (PostgreSQL baseline + graph traversal + Qdrant). System message injection. All 38 unit + integration tests passing.
 
 ---
 
-## Phase 2 — Docker + OpenWebUI Integration
+## Current State
 
-**Goal**: Expose the WGM pipeline as a containerised HTTP service and wire it into
-OpenWebUI as a Tool function, using a dedicated test Qdrant collection so no
-production data is touched during development.
+| Capability | Status |
+|---|---|
+| Fact extraction (GLiNER2 + Qwen rewrite) | ✅ Operational |
+| PostgreSQL persistence with ontology validation | ✅ Operational |
+| Qdrant re-embedder (background sync) | ✅ Operational |
+| `/query` dual-path: baseline facts + graph traversal + Qdrant | ✅ Operational |
+| OpenWebUI filter — system message injection (no relevance gate) | ✅ Operational |
+| Per-user Qdrant collections | ✅ Operational |
+| Short-term → long-term memory promotion (confidence scoring) | ✅ Operational |
 
-### Step 1 — FastAPI service layer
+---
 
-**New files**: `src/api/main.py`, `src/api/models.py`
+## Priority 1 — Temporal Awareness
 
-Expose the 5-stage pipeline behind a single endpoint:
+Facts exist in time. Without date context the model can't reason about staleness, countdowns, or when something happened.
 
-```
-POST /ingest          { "text": str, "source": str }
-  → extract_entities
-  → build_audit_context
-  → resolve_entities (classify)
-  → validate_edge (WGM gate)
-  → commit (Fact Store)
-  ← { "status": "valid"|"novel"|"conflict", "committed": int, "facts": [...] }
+### 1a — Date storage on facts
 
-GET  /health          → { "ok": true }
-```
-
-- Use `fastapi` + `uvicorn`
-- All pipeline dependencies injected at startup (GliNER model, DB pool, oracle URL)
-- Pydantic request/response models in `models.py`
-- Tests in `tests/api/test_ingest.py` using `httpx.AsyncClient` + `TestClient`
-
-### Step 2 — PostgreSQL migration
-
-**New file**: `migrations/001_create_facts.sql`
+Add `valid_from` and `valid_until` columns to the `facts` table (nullable `TIMESTAMPTZ`). Migration needed.
 
 ```sql
-CREATE TABLE IF NOT EXISTS facts (
-    id          SERIAL PRIMARY KEY,
-    subject_id  TEXT NOT NULL,
-    object_id   TEXT NOT NULL,
-    rel_type    TEXT NOT NULL,
-    provenance  TEXT,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_facts_pair
-    ON facts (subject_id, object_id);
+ALTER TABLE facts ADD COLUMN valid_from  TIMESTAMPTZ DEFAULT NULL;
+ALTER TABLE facts ADD COLUMN valid_until TIMESTAMPTZ DEFAULT NULL;
 ```
 
-Run at container startup via entrypoint script.
+Qwen extraction prompt needs rules for temporal assertions:
+- "Chris's birthday is March 12" → `born_on` triple + `valid_from = null` (static, always true)
+- "Jordan is visiting next Thursday" → `lives_at / visiting` triple + `valid_until = <date>`
+- "The concert is May 5th" → event triple + `valid_from = 2026-05-05`
 
-### Step 3 — GliNER real model factory
+### 1b — Temporal classification in /ingest
 
-**File**: `src/gli_ner/extractor.py`
+When a fact is committed, classify it as one of:
+- **static** — true indefinitely (birthdate, name, relationship)
+- **dated** — has a known point-in-time (was born, met someone on date X)
+- **ephemeral** — time-bounded and expires (event, visit, appointment)
 
-Add a startup factory so the container loads the real model once:
+Store this as a `temporal_class` column: `('static', 'dated', 'ephemeral')`.
+
+### 1c — Countdown and elapsed rendering in the filter
+
+When the filter builds the memory block, inject time context for dated/ephemeral facts:
+
+```
+- Jordan is visiting on 2026-05-10 (10 days from now)
+- Chris's birthday was 2026-03-12 (49 days ago)
+- Concert on 2026-04-20 (10 days ago — likely past)
+```
+
+This requires the filter to know today's date (trivial) and compare it against `valid_from` / `valid_until`.
+
+---
+
+## Priority 2 — Memory Regression Gate (Staleness → Archive)
+
+Facts degrade. A `lives_at` from 3 years ago is weaker than one from last week. The system needs a principled way to:
+1. Reduce confidence on facts that haven't been reinforced
+2. Mark facts as **stale** before fully superseding them
+3. Archive (soft-delete from Qdrant, retain in PostgreSQL) facts that have fallen below a threshold
+
+### 2a — Staleness scoring in re_embedder
+
+The re_embedder already runs `promote_facts()` to increase confidence on confirmed facts. Add a symmetric `decay_facts()`:
 
 ```python
-def load_default_model():
-    from gliner import GLiNER
-    return GLiNER.from_pretrained("urchade/gliner_medium-v2.1")
-```
-
-The API layer calls this once on startup and injects the instance into `ExtractionService`.
-Unit tests continue to inject mocks — no change needed there.
-
-### Step 4 — Dockerfile
-
-**New file**: `Dockerfile`
-
-Multi-stage build:
-- Stage 1 (`builder`): install deps into a venv
-- Stage 2 (`runtime`): slim Python 3.11 image, copy venv + src, expose port 8000
-
-```
-ENTRYPOINT: run migrations → start uvicorn src.api.main:app
-```
-
-### Step 5 — Docker Compose (test stack)
-
-**New file**: `docker-compose.yml`
-
-Three services, all on an isolated `faultline-test` network:
-
-| Service | Image | Purpose |
-|---------|-------|---------|
-| `faultline` | local build | FastAPI WGM service |
-| `postgres` | postgres:16-alpine | Fact store (test DB) |
-| `qdrant` | qdrant/qdrant | Test-only vector store (separate from production) |
-
-Named volumes: `pg-test-data`, `qdrant-test-data` — easy to nuke with `docker compose down -v`.
-
-Env vars passed through from `.env`:
-```
-QWEN_API_URL, POSTGRES_DSN, QDRANT_URL, QDRANT_COLLECTION=faultline-test
-```
-
-### Step 6 — OpenWebUI Tool function
-
-**New file**: `openwebui/faultline_tool.py`
-
-A single Python file dropped into OpenWebUI's Tools directory. OpenWebUI calls it when
-the model decides to store a memory/fact.
-
-```python
-"""
-Tool name:   FaultLine WGM
-Description: Store validated facts through the FaultLine WGM pipeline.
-"""
-import httpx
-
-async def store_fact(text: str, source: str = "openwebui") -> str:
-    """Store a fact via FaultLine. Returns validation status."""
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "http://faultline:8000/ingest",
-            json={"text": text, "source": source},
-            timeout=15.0,
+def decay_facts(db_conn, decay_rate: float = 0.05) -> None:
+    """Reduce confidence on facts not seen or confirmed recently."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE facts
+            SET confidence = GREATEST(confidence - %s, 0.0)
+            WHERE superseded_at IS NULL
+            AND confirmed_count = 0
+            AND last_seen_at < now() - interval '30 days'
+            AND temporal_class != 'static'
+            AND confidence > 0.0
+            """,
+            (decay_rate,)
         )
-    r.raise_for_status()
-    data = r.json()
-    return f"[FaultLine] status={data['status']} committed={data['committed']}"
 ```
 
-The tool is **additive** — OpenWebUI's existing memory agent is untouched. The model
-calls `store_fact` explicitly when it wants a fact validated and persisted.
+Static facts (birthdate, name, relationships) are exempt from decay.
 
-### Step 7 — Structured logging
+### 2b — Archive threshold
 
-Wire `structlog` into key pipeline boundaries in `src/api/main.py`:
-- Request received (text length, source)
-- Extraction complete (entity count)
-- Validation result (status per edge)
-- Commit complete (row count)
+Facts that fall below a configurable `ARCHIVE_CONFIDENCE_THRESHOLD` (default: `0.2`) should be:
+1. Removed from Qdrant (so they stop surfacing in queries) — re_embedder deletion pass handles this via `superseded_at`
+2. Retained in PostgreSQL with `archived_at` timestamp for audit / recovery
 
-### Step 8 — CI/CD
+Add `archived_at TIMESTAMPTZ DEFAULT NULL` to the facts table. The re_embedder sets this when confidence drops below threshold.
 
-**New file**: `.github/workflows/test.yml`
+### 2c — Archive threshold as environment variable
 
-```yaml
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install -e ".[test]"
-      - run: pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction
-                           --ignore=tests/model_inference --ignore=tests/preprocessing
+```
+ARCHIVE_CONFIDENCE_THRESHOLD=0.2    # below this, remove from Qdrant, keep in PG
+DECAY_INTERVAL_DAYS=30              # days without reinforcement before decay starts
+DECAY_RATE=0.05                     # confidence reduction per decay cycle
 ```
 
 ---
 
-## Backlog (post Phase 2)
+## Priority 3 — Dual Search Path Verification
+
+The `/query` endpoint currently runs three sources and merges them:
+
+| Source | When | What |
+|---|---|---|
+| PostgreSQL baseline | Always (if canonical identity known) | `lives_at`, `age`, `height`, `weight`, `works_for`, etc. |
+| PostgreSQL graph traversal | When query matches self-ref signals | All facts anchored to identity + 2-hop related entities |
+| Qdrant vector search | Always | Cosine similarity ≥ 0.3, limit 10 |
+
+**Verification needed**: confirm that for a cold-start user (no graph traversal triggered, no Qdrant hits above threshold), the baseline path still returns location facts correctly. Test with "What's the weather tomorrow?" against a known `lives_at` fact.
+
+**Potential gap**: the `_SELF_REF_SIGNALS` set in `/query` is checked against `query_lower` (the full query text lowercased). Signals like "my home" and "where do i live" are present. Consider whether conversational fragments like "near me" or "around here" should trigger graph traversal.
+
+---
+
+## Backlog
 
 | Item | Notes |
-|------|-------|
-| WGM ontology from config file / DB table | `SEED_ONTOLOGY` is hardcoded in `gate.py` |
-| Qdrant re-embedder service | Re-embed `facts` table into `qdrant-test` collection after each commit |
-| OpenWebUI memory agent modification | Deeper integration once Tool path is validated |
-| Stub modules (`evaluation`, `feature_extraction`, etc.) | Out-of-scope artifacts; implement or remove |
-
----
-
-## Test Summary (current)
-
-```
-pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction
-              --ignore=tests/model_inference --ignore=tests/preprocessing
-
-38 passed in 0.21s
-```
+|---|---|
+| `faultline_function.py` parity | The explicit Tool function doesn't have the same baseline-fetch fix as the filter. Parity pass needed. |
+| Qdrant score threshold tuning | 0.3 may be too high for short or sparse queries. Consider adaptive threshold based on result count. |
+| Fact confidence UI | No way to see or manage individual fact confidence scores from OpenWebUI. |
+| Multi-user isolation audit | Per-user Qdrant collections are implemented; verify no cross-user fact leakage in the merge paths. |
+| Test coverage for `/query` baseline path | No unit tests for the new baseline fact fetch added in the dual-path refactor. |

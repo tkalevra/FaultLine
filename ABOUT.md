@@ -5,17 +5,19 @@
 ## Architecture
 
 ```
-OpenWebUI inlet
+OpenWebUI inlet filter (faultline_tool.py)
   ├─▶ Qwen triple rewrite        structured edge extraction from text
-  │     └─▶ POST /ingest (async)
+  │     └─▶ POST /ingest (fire-and-forget)
   │           └─▶ GLiNER2 extract_json   typed schema edge extraction
   │                 └─▶ WGMValidationGate   ontology + conflict check
   │                       └─▶ FactStoreManager.commit()   INSERT INTO facts
   │                             └─▶ re_embedder (background)   → Qdrant upsert
   │
-  └─▶ POST /query (sync)
-        └─▶ embed text → Qdrant cosine search
-              └─▶ inject memory block into user message
+  └─▶ POST /query (sync, before model sees message)
+        ├─▶ PostgreSQL — baseline personal facts (location, age, etc.) always returned
+        ├─▶ PostgreSQL — graph traversal for self-referential queries (2-hop)
+        └─▶ Qdrant — cosine similarity search (nomic-embed-text, score ≥ 0.3)
+              └─▶ merged result → injected as system message into body["messages"]
 ```
 
 Facts are validated against a Wikidata-aligned ontology (RDF/SKOS/OWL semantics) and stored with unique constraint `(user_id, subject_id, object_id, rel_type)`.
