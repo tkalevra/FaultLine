@@ -511,10 +511,9 @@ def query(request: QueryRequest):
         canonical_identity = registry.get_canonical_for_user(user_id)
         if canonical_identity:
             preferred = registry.get_preferred_name(user_id, canonical_identity)
-            if preferred != canonical_identity:
-                preferred_names = {"user": preferred}
-            else:
-                preferred_names = {"user": canonical_identity}
+            preferred_names = {"user": preferred}
+            log.info("query.identity_resolved",
+                     canonical=canonical_identity, preferred=preferred, user_id=user_id)
         db.close()
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
