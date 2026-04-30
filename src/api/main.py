@@ -508,6 +508,7 @@ def query(request: QueryRequest):
 
     preferred_names = {}
     canonical_identity = None
+    baseline_facts = []
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
@@ -517,6 +518,38 @@ def query(request: QueryRequest):
             preferred_names = {"user": preferred}
             log.info("query.identity_resolved",
                      canonical=canonical_identity, preferred=preferred, user_id=user_id)
+
+            # Always fetch baseline personal facts (location, attributes) anchored to
+            # the user's identity — these won't surface via vector similarity for
+            # unrelated queries like "what's the weather tomorrow?" but are always useful.
+            _BASELINE_RELS = (
+                "lives_at", "lives_in", "address", "located_in", "born_in",
+                "age", "height", "weight", "works_for", "occupation",
+                "nationality", "has_gender",
+            )
+            try:
+                all_aliases = set(registry.get_all_aliases(user_id, canonical_identity)) | {canonical_identity}
+            except Exception:
+                all_aliases = {canonical_identity}
+
+            alias_list = list(all_aliases)
+            placeholders = ",".join(["%s"] * len(alias_list))
+            rel_placeholders = ",".join(["%s"] * len(_BASELINE_RELS))
+            with db.cursor() as cur:
+                cur.execute(
+                    f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                    f"WHERE user_id = %s AND superseded_at IS NULL "
+                    f"AND rel_type IN ({rel_placeholders}) "
+                    f"AND (subject_id IN ({placeholders}) OR object_id IN ({placeholders})) "
+                    f"ORDER BY id",
+                    [user_id] + list(_BASELINE_RELS) + alias_list + alias_list,
+                )
+                baseline_facts = [
+                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3]}
+                    for r in cur.fetchall()
+                ]
+            if baseline_facts:
+                log.info("query.baseline_facts", count=len(baseline_facts), identity=canonical_identity)
         db.close()
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
@@ -684,8 +717,16 @@ def query(request: QueryRequest):
                 direct_facts.append(f)
                 pg_keys.add(key)
 
+        # Merge baseline personal facts (location, attributes) — always present for
+        # known identities regardless of whether Qdrant or graph traversal returned them.
+        for f in baseline_facts:
+            key = (f["subject"], f["object"], f["rel_type"])
+            if key not in pg_keys:
+                direct_facts.append(f)
+                pg_keys.add(key)
+
         facts = direct_facts
-        log.info("query.merged", pg_hits=len(pg_keys), total=len(facts))
+        log.info("query.merged", pg_hits=len(pg_keys), baseline=len(baseline_facts), total=len(facts))
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
             _entity_ids = list({f["subject"] for f in facts} | {f["object"] for f in facts})
