@@ -383,8 +383,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             _cur.execute(
                                 "INSERT INTO entity_attributes"
                                 " (user_id, entity_id, attribute, value_text, value_int,"
-                                "  value_float, value_date, provenance)"
-                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                                "  value_float, value_date, provenance, sensitivity)"
+                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
                                 " ON CONFLICT (user_id, entity_id, attribute)"
                                 " DO UPDATE SET"
                                 "   value_text = EXCLUDED.value_text,"
@@ -393,7 +393,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "   value_date = EXCLUDED.value_date,"
                                 "   updated_at = now()",
                                 (req.user_id, canonical_subject, edge.rel_type.lower(),
-                                 val_text, val_int, val_float, val_date, req.source),
+                                 val_text, val_int, val_float, val_date, req.source,
+                                 "private" if edge.rel_type.lower() in {
+                                     "phone", "address", "email", "lives_at", "lives_in", "ip_address"
+                                 } else "public"),
                             )
                         db.commit()
                         log.info("ingest.scalar_stored", entity=canonical_subject,
@@ -530,6 +533,55 @@ def query(request: QueryRequest):
         "where do i live", "my address", "my age", "my job", "my work",
     }
 
+    def _fetch_attributes(
+        db_conn,
+        user_id: str,
+        entity_ids: list[str],
+        max_sensitivity: str = "private",
+    ) -> dict:
+        """
+        Fetch entity_attributes for a list of entity IDs.
+        max_sensitivity controls which tiers are returned:
+          'public'  — only public attributes
+          'private' — public + private (default)
+          'secret'  — all including secret (never use in query path)
+        Returns {entity_id: {attribute: value}} dict.
+        """
+        if not entity_ids:
+            return {}
+        sensitivity_filter = {
+            "public": ("public",),
+            "private": ("public", "private"),
+            "secret": ("public", "private", "secret"),
+        }.get(max_sensitivity, ("public", "private"))
+
+        try:
+            _ph = ",".join(["%s"] * len(entity_ids))
+            _sh = ",".join(["%s"] * len(sensitivity_filter))
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT entity_id, attribute, value_int, value_float, value_text, value_date "
+                    f"FROM entity_attributes "
+                    f"WHERE user_id = %s AND entity_id IN ({_ph}) "
+                    f"AND sensitivity IN ({_sh})",
+                    [user_id] + list(entity_ids) + list(sensitivity_filter),
+                )
+                attributes = {}
+                for row in cur.fetchall():
+                    eid, attr, vi, vf, vt, vd = row
+                    if eid not in attributes:
+                        attributes[eid] = {}
+                    attributes[eid][attr] = (
+                        vi if vi is not None else
+                        vf if vf is not None else
+                        vt if vt is not None else
+                        str(vd) if vd is not None else None
+                    )
+                return attributes
+        except Exception as e:
+            log.warning("query.attributes_fetch_failed", error=str(e))
+            return {}
+
     query_lower = request.text.lower()
     direct_facts = []
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
@@ -588,6 +640,8 @@ def query(request: QueryRequest):
                                 })
                                 seen.add(key)
 
+            entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
+            attributes = _fetch_attributes(_db_direct, user_id, entity_ids, max_sensitivity="private")
             _db_direct.close()
             if direct_facts:
                 log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
@@ -596,6 +650,7 @@ def query(request: QueryRequest):
                     "facts": direct_facts,
                     "preferred_names": preferred_names,
                     "canonical_identity": _identity,
+                    "attributes": attributes,
                 }
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
@@ -624,11 +679,21 @@ def query(request: QueryRequest):
             if h.get("payload")
         ]
         log.info("query.ok", collection=collection, hits=len(facts))
+        try:
+            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            _entity_ids = list({f["subject"] for f in facts} | {f["object"] for f in facts})
+            attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
+            _attr_db.close()
+        except Exception as _ae:
+            log.warning("query.qdrant_attributes_failed", error=str(_ae))
+            attributes = {}
+
         return {
             "status": "ok",
             "facts": facts,
             "preferred_names": preferred_names,
             "canonical_identity": canonical_identity,
+            "attributes": attributes,
         }
     except Exception as e:
         log.error("query.failed", error=str(e))

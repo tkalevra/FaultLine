@@ -312,6 +312,7 @@ class Filter:
                         facts = _resp_json.get("facts", [])
                         preferred_names = _resp_json.get("preferred_names", {})
                         canonical_identity = _resp_json.get("canonical_identity")
+                        entity_attributes = _resp_json.get("attributes", {})
                         if facts or preferred_names:
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] inlet injecting {len(facts)} facts + {len(preferred_names)} preferred names")
@@ -396,7 +397,15 @@ class Filter:
                                 siblings = [_display_name(s) for s in siblings_raw]
 
                                 if children:
-                                    sentences.append(f"You have {len(children)} {'child' if len(children) == 1 else 'children'}: {', '.join(children)}.")
+                                    child_descriptions = []
+                                    for c in children_raw:
+                                        display = _display_name(c)
+                                        age = entity_attributes.get(c, {}).get("age")
+                                        if age:
+                                            child_descriptions.append(f"{display} (age {age})")
+                                        else:
+                                            child_descriptions.append(display)
+                                    sentences.append(f"You have {len(children)} {'child' if len(children) == 1 else 'children'}: {', '.join(child_descriptions)}.")
                                 if spouses:
                                     sentences.append(f"You are married to {', '.join(set(spouses))}.")
                                 if parents:
@@ -405,7 +414,7 @@ class Filter:
                                     sentences.append(f"Your {'sibling is' if len(siblings) == 1 else 'siblings are'} {', '.join(siblings)}.")
 
                                 # Render remaining facts not already covered
-                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as"}
+                                covered_rels = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
                                 for f in facts:
                                     if f.get("rel_type") in covered_rels:
                                         continue
@@ -413,11 +422,45 @@ class Filter:
                                     obj = f.get("object", "")
                                     rel = f.get("rel_type", "").replace("_", " ")
                                     if identity and subj == identity:
-                                        sentences.append(f"You {rel} {obj}.")
+                                        if rel == "has_pet":
+                                            sentences.append(f"You have a pet named {_display_name(obj)}.")
+                                        elif rel == "owns":
+                                            sentences.append(f"You own {_display_name(obj)}.")
+                                        elif rel == "likes":
+                                            sentences.append(f"You like {obj}.")
+                                        elif rel in ("lives_at", "lives_in"):
+                                            sentences.append(f"You live at {obj}.")
+                                        elif rel == "works_for":
+                                            sentences.append(f"You work for {obj.title()}.")
+                                        elif rel == "ip_address":
+                                            sentences.append(f"Your IP address is {obj}.")
+                                        elif rel == "phone":
+                                            sentences.append(f"Your phone number is {obj}.")
+                                        elif rel == "address":
+                                            sentences.append(f"Your address is {obj}.")
+                                        else:
+                                            sentences.append(f"You {rel} {_display_name(obj)}.")
                                     elif identity and obj == identity:
-                                        sentences.append(f"{subj.title()} {rel} you.")
+                                        sentences.append(f"{_display_name(subj).title()} {rel} you.")
                                     else:
-                                        sentences.append(f"{subj.title()} {rel} {obj}.")
+                                        sentences.append(
+                                            f"{_display_name(subj).title()} {rel} {_display_name(obj)}."
+                                        )
+
+                                # Append known attributes for related entities
+                                if entity_attributes:
+                                    for entity, attrs in entity_attributes.items():
+                                        if entity == identity:
+                                            continue  # user attributes handled above
+                                        attr_parts = []
+                                        if "age" in attrs:
+                                            attr_parts.append(f"age {attrs['age']}")
+                                        if "ip_address" in attrs:
+                                            attr_parts.append(f"IP {attrs['ip_address']}")
+                                        if attr_parts:
+                                            sentences.append(
+                                                f"{_display_name(entity).title()}: {', '.join(attr_parts)}."
+                                            )
 
                                 if sentences:
                                     memory_lines.append("## What I know about you")
