@@ -445,6 +445,11 @@ class Filter:
                                 f"Do not reframe the user as a child or sibling. Only state what the facts explicitly say.\n"
                                 + "\n".join(memory_lines)
                             )
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine DEBUG] identity_display={identity_display}")
+                                print(f"[FaultLine DEBUG] identity_canonical={identity_canonical}")
+                                print(f"[FaultLine DEBUG] identity={identity}")
+                                print(f"[FaultLine DEBUG] memory_block=\n{memory_block}")
                             messages = body.get("messages", [])
                             for i in reversed(range(len(messages))):
                                 if messages[i].get("role") == "user":
