@@ -603,17 +603,6 @@ class Filter:
                     and e.get("object", "").lower() not in _PRONOUNS
                 ]
 
-                # Heuristic: if message contains alias signals and edge is also_known_as,
-                # mark it as a correction to trigger hard_delete and entity rename
-                _ALIAS_SIGNALS = frozenset({"prefers to be called", "prefer to be called",
-                                            "goes by", "go by", "now calls", "now called",
-                                            "new name", "changed name"})
-                text_lower = clean_text.lower()
-                if any(sig in text_lower for sig in _ALIAS_SIGNALS):
-                    for edge in edges:
-                        if edge["rel_type"] == "also_known_as":
-                            edge["is_correction"] = True
-
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
                 asyncio.create_task(
