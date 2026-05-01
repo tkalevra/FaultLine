@@ -369,9 +369,35 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         edge.object.lower() in preferred_objects or
                         (has_preferred and edge.rel_type.lower() in ("also_known_as", "pref_name"))
                     )
+
+                    # For corrections where subject is the user's canonical identity,
+                    # find the entity we're actually aliasing (e.g., spouse, child)
+                    alias_subject = canonical_subject
+                    if (edge.is_correction and
+                        alias_subject == registry.get_canonical_for_user(req.user_id)):
+                        # Subject resolved to user identity. Look for related entities.
+                        try:
+                            with db.cursor() as _cur:
+                                # Find most recent also_known_as/pref_name fact for related entity
+                                _cur.execute(
+                                    "SELECT subject_id FROM facts WHERE user_id = %s"
+                                    " AND rel_type IN ('also_known_as', 'pref_name')"
+                                    " AND subject_id != %s"
+                                    " ORDER BY id DESC LIMIT 1",
+                                    (req.user_id, alias_subject),
+                                )
+                                _row = _cur.fetchone()
+                                if _row:
+                                    alias_subject = _row[0]
+                                    log.info("ingest.correction_subject_resolved",
+                                             original=canonical_subject, resolved=alias_subject,
+                                             rel_type=edge.rel_type)
+                        except Exception as _e:
+                            log.warning("ingest.correction_subject_resolution_failed", error=str(_e))
+
                     registry.register_alias(
                         req.user_id,
-                        canonical_subject,
+                        alias_subject,
                         edge.object.lower(),
                         is_preferred=is_pref,
                     )
@@ -473,12 +499,46 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         user_id, subject, obj, rel_type, source, is_preferred = row
                         if (subject.lower(), obj.lower(), rel_type.lower()) not in correction_keys:
                             continue
+
+                        # For also_known_as/pref_name corrections where subject is user's canonical identity,
+                        # find the actual entity being corrected (e.g., wife entity when user said "my wife...")
+                        correction_subject = subject.lower()
+                        correction_object = obj.lower()
+
+                        if rel_type.lower() in ("also_known_as", "pref_name"):
+                            canonical_user = registry.get_canonical_for_user(user_id)
+                            if canonical_user and correction_subject == canonical_user:
+                                # Subject is the user's canonical ID. Find the entity we're actually correcting
+                                # by looking for the most recent also_known_as/pref_name fact for a related entity
+                                cur.execute(
+                                    "SELECT subject_id FROM facts WHERE user_id = %s"
+                                    " AND rel_type IN ('also_known_as', 'pref_name')"
+                                    " AND subject_id != %s"
+                                    " ORDER BY id DESC LIMIT 1",
+                                    (user_id, correction_subject),
+                                )
+                                candidate = cur.fetchone()
+                                if candidate:
+                                    correction_subject = candidate[0]
+                                    log.info("correction.subject_resolved",
+                                             original=subject, resolved=correction_subject,
+                                             rel_type=rel_type)
+
                         cur.execute(
                             "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
                             " AND object_id = %s AND rel_type = %s",
-                            (user_id, subject.lower(), obj.lower(), rel_type.lower()),
+                            (user_id, correction_subject, correction_object, rel_type.lower()),
                         )
                         result = cur.fetchone()
+                        if not result:
+                            # If the corrected subject's fact doesn't exist yet, look for the fact we just created
+                            # (which might have the wrong subject due to resolution above)
+                            cur.execute(
+                                "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                                " AND object_id = %s AND rel_type = %s",
+                                (user_id, subject.lower(), correction_object, rel_type.lower()),
+                            )
+                            result = cur.fetchone()
                         if not result:
                             continue
                         new_fact_id = result[0]
@@ -488,7 +548,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         )
                         cb_row = cur.fetchone()
                         behavior = cb_row[0] if cb_row else "supersede"
-                        _apply_correction(cur, user_id, subject.lower(), obj.lower(),
+                        _apply_correction(cur, user_id, correction_subject, correction_object,
                                           rel_type.lower(), new_fact_id, behavior)
                         if rel_type.lower() == "also_known_as":
                             cur.execute(
