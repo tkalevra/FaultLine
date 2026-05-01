@@ -613,11 +613,21 @@ class Filter:
                 try:
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
-                    async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                        resp = await client.post(
-                            f"{self.valves.FAULTLINE_URL}/query",
-                            json={"text": text, "user_id": user_id, "top_k": 5},
-                        )
+                    resp = None
+                    for _attempt in range(2):
+                        try:
+                            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                                resp = await client.post(
+                                    f"{self.valves.FAULTLINE_URL}/query",
+                                    json={"text": text, "user_id": user_id, "top_k": 5},
+                                )
+                            break
+                        except httpx.ReadError:
+                            if _attempt == 0:
+                                if self.valves.ENABLE_DEBUG:
+                                    print(f"[FaultLine Filter] /query ReadError on attempt 1, retrying...")
+                                continue
+                            raise
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] /query status={resp.status_code}")
 

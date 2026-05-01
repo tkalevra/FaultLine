@@ -594,17 +594,10 @@ def query(request: QueryRequest):
     user_id = request.user_id or "anonymous"
     collection = derive_collection(user_id)
 
-    # Use a short embed timeout so the filter's request doesn't time out waiting for us.
-    # fallback=False: if nomic is unavailable, return empty rather than searching with a
-    # hash vector that cannot match the nomic-embedded stored facts.
-    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
-    if vector is None:
-        log.warning("query.embed_unavailable — skipping Qdrant search")
-        return {"status": "ok", "facts": [], "preferred_names": {}}
-
     preferred_names = {}
     canonical_identity = None
     baseline_facts = []
+    attributes = {}
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
@@ -779,6 +772,20 @@ def query(request: QueryRequest):
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
 
+    # Embed after graph traversal so Postgres results are returned even when the
+    # embedding service is unavailable. fallback=False: skip Qdrant rather than
+    # searching with a hash vector that can't match nomic-embedded stored facts.
+    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
+    if vector is None:
+        log.warning("query.embed_unavailable — skipping Qdrant search")
+        return {
+            "status": "ok",
+            "facts": direct_facts,
+            "preferred_names": preferred_names,
+            "canonical_identity": canonical_identity,
+            "attributes": attributes,
+        }
+
     try:
         resp = httpx.post(
             f"{qdrant_url}/collections/{collection}/points/search",
@@ -787,10 +794,22 @@ def query(request: QueryRequest):
         )
         if resp.status_code == 404:
             ensure_collection(collection, qdrant_url)
-            return {"status": "ok", "facts": [], "preferred_names": preferred_names}
+            return {
+                "status": "ok",
+                "facts": direct_facts,
+                "preferred_names": preferred_names,
+                "canonical_identity": canonical_identity,
+                "attributes": attributes,
+            }
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
-            return {"status": "ok", "facts": [], "preferred_names": preferred_names}
+            return {
+                "status": "ok",
+                "facts": direct_facts,
+                "preferred_names": preferred_names,
+                "canonical_identity": canonical_identity,
+                "attributes": attributes,
+            }
 
         qdrant_facts = [
             {
