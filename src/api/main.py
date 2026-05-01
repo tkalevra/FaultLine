@@ -458,7 +458,15 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     rows.append((req.user_id, fact_subject, canonical_object, edge.rel_type, req.source, is_preferred))
 
             if rows:
-                committed = manager.commit(rows)
+                # Resolve subject/object to their preferred names before committing
+                # This ensures facts are stored with active identities, not legal names
+                resolved_rows = []
+                for user_id, subject, obj, rel_type, source, is_preferred in rows:
+                    pref_subject = registry.get_preferred_name(user_id, subject) if subject else subject
+                    pref_object = registry.get_preferred_name(user_id, obj) if obj else obj
+                    resolved_rows.append((user_id, pref_subject, pref_object, rel_type, source, is_preferred))
+
+                committed = manager.commit(resolved_rows)
 
                 # Build a map of edges to identify which rows are corrections
                 # Key is (original_subject, object, rel_type); value is whether it's a correction
@@ -470,12 +478,12 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Build set of preferred objects from pref_name rows in this batch
                 # e.g. christopher → chris → pref_name means "chris" is preferred
                 batch_preferred_objects = {
-                    obj.lower() for _, subject, obj, rel_type, _, is_preferred in rows
+                    obj.lower() for _, subject, obj, rel_type, _, is_preferred in resolved_rows
                     if rel_type.lower() == "pref_name" and is_preferred
                 }
 
                 with db.cursor() as cur:
-                    for row in rows:
+                    for row in resolved_rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row
                         if rel_type.lower() == "also_known_as" and is_preferred:
                             cur.execute(
@@ -502,7 +510,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 (req.user_id, preferred_obj),
                             )
 
-                    for row in rows:
+                    for row in resolved_rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row
 
                         # Check if this row came from a correction edge
