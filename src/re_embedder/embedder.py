@@ -295,8 +295,8 @@ def main():
                 for fact_id, uid in superseded:
                     collection = derive_collection(uid)
                     try:
-                        resp = httpx.delete(
-                            f"{qdrant_url}/collections/{collection}/points",
+                        resp = httpx.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
                             json={"points": [fact_id]},
                             timeout=10.0,
                         )
