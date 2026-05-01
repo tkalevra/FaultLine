@@ -186,12 +186,12 @@ Edges with `rel_type` not in the ontology trigger a Qwen approval call. If Qwen 
 Primary tables:
 - `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`. Soft-delete via `superseded_at IS NOT NULL`.
 - `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts (`age`, `height`, `weight`, `born_on`, `born_in`, `nationality`, `occupation`, `has_gender`) routed here at ingest instead of `facts`.
-- `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry.
+- `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry. **Note**: `entity_aliases` stores all known names for an entity (not secondary aliases), with one marked `is_preferred`. Rename to `entity_names` planned.
 - `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior)` — live ontology with correction behavior (supersede/hard_delete/immutable), loaded at startup.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
 
 **Fact lifecycle:**
-- **Creation**: ingest → `INSERT INTO facts` with `confidence=1.0`, `qdrant_synced=false`, `superseded_at=NULL`
+- **Creation**: ingest → resolve subject/object to preferred names via `get_preferred_name()` → `INSERT INTO facts` with `confidence=1.0`, `qdrant_synced=false`, `superseded_at=NULL`. This ensures facts use active (preferred) identities. Legal/historical names remain in `entity_aliases` for reference.
 - **Confirmation**: re-confirm same `(user_id, subject_id, object_id, rel_type)` → `confirmed_count += 1`, `last_seen_at = now()`, `qdrant_synced` unchanged
 - **Retraction (user-driven)**: `/retract` → behavior determined by `rel_types.correction_behavior`:
   - `"supersede"` (default): `superseded_at = now()`, `qdrant_synced = false` (re_embedder deletes Qdrant async)
