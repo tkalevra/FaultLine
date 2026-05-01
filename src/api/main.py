@@ -10,7 +10,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest
+from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse
 
 log = structlog.get_logger()
 
@@ -212,6 +212,18 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
     except Exception as e:
         log.error("extract.gliner2_failed", error=str(e))
         return {"entities": []}
+
+def _delete_from_qdrant(fact_ids: list[int], collection: str, qdrant_url: str) -> None:
+    try:
+        resp = httpx.delete(
+            f"{qdrant_url}/collections/{collection}/points",
+            json={"points": fact_ids},
+            timeout=5.0,
+        )
+        if resp.status_code not in (200, 404):
+            log.warning("qdrant.cleanup_partial", status=resp.status_code, count=len(fact_ids))
+    except Exception as e:
+        log.warning("qdrant.cleanup_failed", error=str(e), count=len(fact_ids))
 
 def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
                       rel_type: str, new_fact_id: int, correction_behavior: str) -> int:
@@ -537,7 +549,7 @@ def query(request: QueryRequest):
             rel_placeholders = ",".join(["%s"] * len(_BASELINE_RELS))
             with db.cursor() as cur:
                 cur.execute(
-                    f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                     f"WHERE user_id = %s AND superseded_at IS NULL "
                     f"AND rel_type IN ({rel_placeholders}) "
                     f"AND (subject_id IN ({placeholders}) OR object_id IN ({placeholders})) "
@@ -545,7 +557,7 @@ def query(request: QueryRequest):
                     [user_id] + list(_BASELINE_RELS) + alias_list + alias_list,
                 )
                 baseline_facts = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3]}
+                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4]}
                     for r in cur.fetchall()
                 ]
             if baseline_facts:
@@ -632,7 +644,7 @@ def query(request: QueryRequest):
                 _placeholders = ",".join(["%s"] * len(_alias_list))
                 with _db_direct.cursor() as _cur:
                     _cur.execute(
-                        f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                        f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                         f"WHERE user_id = %s AND superseded_at IS NULL "
                         f"AND (subject_id IN ({_placeholders}) OR object_id IN ({_placeholders})) "
                         f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
@@ -640,7 +652,7 @@ def query(request: QueryRequest):
                         [user_id] + _alias_list + _alias_list,
                     )
                     direct_facts = [
-                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3]}
+                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4]}
                         for row in _cur.fetchall()
                     ]
 
@@ -656,7 +668,7 @@ def query(request: QueryRequest):
                         _rel_list = list(related)
                         _rel_ph = ",".join(["%s"] * len(_rel_list))
                         _cur.execute(
-                            f"SELECT subject_id, object_id, rel_type, provenance FROM facts "
+                            f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                             f"WHERE user_id = %s AND superseded_at IS NULL "
                             f"AND (subject_id IN ({_rel_ph}) OR object_id IN ({_rel_ph})) "
                             f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
@@ -669,7 +681,7 @@ def query(request: QueryRequest):
                             if key not in seen:
                                 direct_facts.append({
                                     "subject": row[0], "object": row[1],
-                                    "rel_type": row[2], "provenance": row[3]
+                                    "rel_type": row[2], "provenance": row[3], "confidence": row[4]
                                 })
                                 seen.add(key)
 
@@ -702,6 +714,7 @@ def query(request: QueryRequest):
                 "object": h["payload"].get("object"),
                 "rel_type": h["payload"].get("rel_type"),
                 "provenance": h["payload"].get("provenance"),
+                "confidence": h["payload"].get("confidence", 1.0),
             }
             for h in resp.json().get("result", [])
             if h.get("payload")
@@ -751,3 +764,45 @@ def query(request: QueryRequest):
             "preferred_names": preferred_names,
             "canonical_identity": canonical_identity,
         }
+
+@app.post("/retract", response_model=RetractResponse)
+def retract_fact(req: RetractRequest):
+    try:
+        db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        manager = FactStoreManager(db)
+
+        mode = "supersede"
+        note = None
+        if req.rel_type:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT correction_behavior FROM rel_types WHERE rel_type = %s",
+                    (req.rel_type.lower(),),
+                )
+                row = cur.fetchone()
+                if row:
+                    mode = row[0]
+            if mode == "immutable":
+                return RetractResponse(
+                    status="rejected", retracted=0, mode="immutable",
+                    note=f"{req.rel_type} is immutable and cannot be retracted",
+                )
+
+        with db.cursor() as cur:
+            affected_ids = manager.retract(
+                cur, req.user_id, req.subject, req.rel_type, req.old_value, mode
+            )
+            db.commit()
+
+        if affected_ids:
+            collection = derive_collection(req.user_id)
+            qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+            _delete_from_qdrant(affected_ids, collection, qdrant_url)
+
+        return RetractResponse(status="ok", retracted=len(affected_ids), mode=mode, note=note)
+    except Exception as e:
+        log.error("retract.error", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'db' in locals():
+            db.close()

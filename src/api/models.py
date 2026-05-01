@@ -52,3 +52,17 @@ class RelTypeRequest(BaseModel):
     object_role: str = "entity"
     correction_behavior: str = "supersede"
     wikidata_pid: Optional[str] = None
+
+
+class RetractRequest(BaseModel):
+    user_id: str
+    subject: str
+    rel_type: Optional[str] = None
+    old_value: Optional[str] = None
+
+
+class RetractResponse(BaseModel):
+    status: str
+    retracted: int
+    mode: str
+    note: Optional[str] = None
