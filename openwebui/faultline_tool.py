@@ -17,6 +17,67 @@ import httpx
 from pydantic import BaseModel
 
 
+_REALTIME_SIGNALS: frozenset[str] = frozenset({
+    "weather", "forecast", "temperature", "news", "today", "current",
+    "right now", "live", "stock", "price", "score",
+})
+
+_QUERY_INTENT: dict[str, frozenset[str]] = {
+    "location": frozenset({"weather", "where", "address", "forecast", "city",
+                           "located", "location", "home", "residence", "town"}),
+    "family":   frozenset({"family", "children", "kids", "spouse", "wife", "husband",
+                           "parent", "parents", "sibling", "brother", "sister",
+                           "son", "daughter", "partner"}),
+    "work":     frozenset({"work", "job", "career", "employer", "employed",
+                           "company", "occupation", "profession", "office"}),
+    "physical": frozenset({"height", "weight", "tall", "heavy", "body", "size"}),
+    "pets":     frozenset({"pet", "dog", "cat", "animal", "fish", "bird",
+                           "hamster", "rabbit", "snake"}),
+    "identity": frozenset({"name", "who am i", "call me", "known as", "alias"}),
+}
+
+_REL_CATEGORY: dict[str, str] = {
+    "lives_at": "location", "lives_in": "location", "located_in": "location",
+    "address": "location", "born_in": "location",
+    "parent_of": "family", "child_of": "family", "spouse": "family", "sibling_of": "family",
+    "works_for": "work", "occupation": "work",
+    "height": "physical", "weight": "physical", "has_gender": "physical",
+    "has_pet": "pets", "instance_of": "pets",
+    "also_known_as": "identity", "pref_name": "identity", "same_as": "identity",
+    "is_a": "identity",
+}
+
+
+_RETRACTION_SIGNALS: frozenset[str] = frozenset({
+    "forget", "delete", "remove", "retract", "erase",
+    "that's wrong", "thats wrong", "that was wrong", "not true",
+    "that's not right", "thats not right", "incorrect", "no longer",
+    "remove from memory", "forget that", "don't remember",
+    "that information is wrong", "that info is wrong",
+})
+
+_RETRACTION_PROMPT = """\
+You are a retraction extractor for a personal knowledge graph.
+The user wants to remove or correct a stored fact.
+Output ONLY a raw JSON object. No markdown, no explanation.
+
+Fields:
+- "subject": the entity the fact is about. If the user means themselves, use "user".
+- "rel_type": snake_case relationship type (e.g. lives_at, works_for, also_known_as, has_pet, owns, spouse, occupation). Omit if unknown.
+- "old_value": the specific incorrect/outdated value. Omit if unknown or if user wants all facts of that type removed.
+
+Common rel_types: lives_at, lives_in, works_for, occupation, also_known_as, pref_name, has_pet, owns, spouse, likes, dislikes, located_in, age, height, weight.
+
+Examples:
+"forget that I live at my old address" → {"subject": "user", "rel_type": "lives_at"}
+"delete my work information" → {"subject": "user", "rel_type": "works_for"}
+"that info about my family member is wrong" → {"subject": "family_member_name"}
+"remove the fact about my pet" → {"subject": "pet_name", "rel_type": "has_pet"}
+"forget all that" → {}
+
+Output: {} if nothing specific can be extracted."""
+
+
 _TRIPLE_SYSTEM_PROMPT = """\
 You are a relationship fact extractor for a personal knowledge graph.
 Output ONLY a raw JSON array. No markdown, no explanation, no code fences.
@@ -25,7 +86,7 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called Mars", the subject is "marla" not "i".
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For example "My friend who prefers to be called by a nickname" — extract the actual name, not the pronoun.
 - For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being described, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
@@ -44,9 +105,9 @@ RELATIONSHIP RULES (strictly enforced):
    also_known_as, works_for, likes, dislikes, prefers, lives_at, owns,
    age, height, weight.
    You may use other snake_case types if none of the above fit.
-4. also_known_as = nickname or alias ONLY (e.g. "Theo" for "Theodore").
-5. is_a = type or category (e.g. "morkie is_a dog breed").
-6. has_pet = person owns an animal (e.g. "we have a dog named Biskit").
+4. also_known_as = nickname or alias ONLY (e.g. a person's preferred short name).
+5. is_a = type or category (e.g. "dog breed").
+6. has_pet = person owns an animal (e.g. "we have a pet named X").
 7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
    between the descriptor and the name.
 8. Pronoun resolution: replace he/she/it with the named entity if clear.
@@ -62,10 +123,10 @@ RELATIONSHIP RULES (strictly enforced):
 12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
     emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
     NEVER use a nickname or name as the age value.
-    If the sentence contains both an age AND a nickname (e.g. "Desmonde age 12, goes by Des"),
-    emit TWO separate triples:
-    {"subject":"desmonde","object":"12","rel_type":"age"}
-    {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
+    If the sentence contains both an age AND a nickname (e.g. "my friend's age and nickname"),
+    emit TWO separate triples for the same entity:
+    {"subject":"entity_name","object":"12","rel_type":"age"}
+    {"subject":"entity_name","object":"nickname","rel_type":"also_known_as"}
 13. For height patterns ("X is 6ft tall", "X height 6'", "X stands 6 feet", "X is 6' tall"):
     emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
     Normalize units to feet/inches format. Use ' for feet, \" for inches.
@@ -79,8 +140,8 @@ RELATIONSHIP RULES (strictly enforced):
     "not X, it's Y", "correct that to"), extract the correction as a new
     triple with the corrected value. Use prior context to resolve the
     subject. Mark corrected triples with "is_correction": true.
-    e.g. "oh his name is actually Biscuit" (context: dog named Biskit) →
-    {"subject":"biskit","object":"biscuit","rel_type":"also_known_as",
+    e.g. "oh the correct name is X" (context: entity previously mentioned) →
+    {"subject":"entity_name","object":"correct_value","rel_type":"also_known_as",
      "is_correction":true,"low_confidence":false}
 
 OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
@@ -178,8 +239,10 @@ class Filter:
         ENABLED: bool = True
         INGEST_ENABLED: bool = True
         QUERY_ENABLED: bool = True
+        RETRACTION_ENABLED: bool = True
         MAX_MEMORY_SENTENCES: int = 10
         MAX_CONTEXT_TURNS: int = 3
+        MIN_INJECT_CONFIDENCE: float = 0.5
 
     def __init__(self):
         self.valves = self.Valves()
@@ -243,12 +306,95 @@ class Filter:
             pass
         return []
 
+    def _is_realtime_query(self, text: str) -> bool:
+        tl = text.lower()
+        return any(sig in tl for sig in _REALTIME_SIGNALS)
+
+    def _categorize_query(self, text: str) -> set[str]:
+        tl = text.lower()
+        return {cat for cat, kws in _QUERY_INTENT.items() if any(kw in tl for kw in kws)}
+
+    def _filter_relevant_facts(self, facts: list[dict], categories: set[str], identity: Optional[str], is_realtime: bool = False) -> list[dict]:
+        def _garbage(name: str) -> bool:
+            n = (name or "").strip().lower()
+            return len(n) <= 1 or n == "x"
+
+        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
+        clean = [f for f in facts
+                 if not _garbage(f.get("subject", "")) and not _garbage(f.get("object", ""))]
+
+        if is_realtime:
+            allowed = _IDENTITY_RELS | {rt for rt, cat in _REL_CATEGORY.items() if cat == "location"}
+        elif categories:
+            allowed = _IDENTITY_RELS | {rt for rt, cat in _REL_CATEGORY.items() if cat in categories}
+        else:
+            allowed = _IDENTITY_RELS | {
+                "lives_at", "lives_in", "located_in", "address", "born_in", "works_for", "occupation",
+            }
+
+        filtered = [f for f in clean if f.get("rel_type", "") in allowed]
+
+        # Confidence gate: drop facts below threshold
+        min_conf = self.valves.MIN_INJECT_CONFIDENCE
+        if min_conf > 0:
+            high_conf = [f for f in filtered if f.get("confidence", 1.0) >= min_conf]
+            if high_conf:
+                filtered = high_conf
+
+        return filtered if filtered else clean
+
+    def _detect_retraction_intent(self, text: str) -> bool:
+        tl = text.lower().replace("'", "'").replace("'", "'")
+        return any(sig in tl for sig in _RETRACTION_SIGNALS)
+
+    async def _extract_retraction(self, text: str, context: list[dict]) -> dict:
+        try:
+            messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
+            for msg in (context or [])[-2:]:
+                if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                    c = msg.get("content", "")
+                    if isinstance(c, list):
+                        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+                    messages.append({"role": msg["role"], "content": str(c)[:400]})
+            messages.append({"role": "user", "content": text})
+            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
+                resp = await client.post(
+                    self.valves.QWEN_URL,
+                    json={"model": self.valves.QWEN_MODEL, "messages": messages,
+                          "temperature": 0.0, "max_tokens": 100,
+                          "thinking": {"type": "disabled"}},
+                )
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                return json.loads(content) if content else {}
+        except Exception:
+            return {}
+
+    async def _fire_retract(self, user_id: str, subject: str, rel_type: Optional[str] = None,
+                           old_value: Optional[str] = None) -> dict:
+        try:
+            payload = {"user_id": user_id, "subject": subject}
+            if rel_type:
+                payload["rel_type"] = rel_type
+            if old_value:
+                payload["old_value"] = old_value
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                resp = await client.post(f"{self.valves.FAULTLINE_URL}/retract", json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] _fire_retract error: {e}")
+            return {"status": "error", "detail": str(e)}
+
     def _build_memory_block(
         self,
         facts: list[dict],
         preferred_names: dict,
         canonical_identity: Optional[str],
         entity_attributes: dict,
+        is_realtime: bool = False,
+        locations: Optional[list[str]] = None,
     ) -> str:
         identity_display = preferred_names.get("user")
         identity = canonical_identity or identity_display
@@ -262,10 +408,18 @@ class Filter:
                 f"Address the user as 'you', never as a third party."
             )
 
+        if is_realtime:
+            hint = "For real-time information (weather, news, live data): use your available web search tools — do not infer from stored facts."
+            if locations and len(locations) > 1:
+                locs = " and ".join(locations)
+                hint += f" For time-based queries (tomorrow, this weekend, etc.), infer location from context: weekdays→work, weekends→home. Report both {locs} if uncertain."
+            lines.append(hint)
+
         if preferred_names:
             for canonical, preferred in preferred_names.items():
-                if canonical != identity:
-                    lines.append(f"Always call {canonical.title()} by '{preferred.title()}'.")
+                if canonical == "user" or canonical == identity:
+                    continue
+                lines.append(f"Always call {canonical.title()} by '{preferred.title()}'.")
 
         if facts:
             nickname_map = {}
@@ -312,6 +466,10 @@ class Filter:
             for f in facts:
                 if f.get("rel_type") in covered:
                     continue
+                _s = f.get("subject", "").strip().lower()
+                _o = f.get("object", "").strip().lower()
+                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x":
+                    continue
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
                 rel = f.get("rel_type", "").replace("_", " ")
@@ -323,11 +481,13 @@ class Filter:
                     elif rel == "likes":
                         sentences.append(f"You like {obj}.")
                     elif rel in ("lives at", "lives in"):
-                        sentences.append(f"You live at {obj}.")
+                        sentences.append(f"You live at {obj.title()}.")
                     elif rel == "works for":
                         sentences.append(f"You work for {obj.title()}.")
                     elif rel == "address":
-                        sentences.append(f"Your address is {obj}.")
+                        sentences.append(f"Your address is {obj.title()}.")
+                    elif rel in ("is a", "instance of"):
+                        sentences.append(f"You are a {_dn(obj)}.")
                     else:
                         sentences.append(f"You {rel} {_dn(obj)}.")
                 elif identity and obj == identity:
@@ -379,6 +539,34 @@ class Filter:
             _IDENTITY_RE = re.compile(
                 r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
             )
+
+            # Retraction detection — check before normal ingest
+            if self.valves.RETRACTION_ENABLED and self._detect_retraction_intent(text):
+                retraction = await self._extract_retraction(text, body.get("messages", []))
+                if retraction and retraction.get("subject"):
+                    result = await self._fire_retract(
+                        user_id,
+                        retraction["subject"],
+                        retraction.get("rel_type"),
+                        retraction.get("old_value"),
+                    )
+                    if result.get("status") == "ok":
+                        n = result.get("retracted", 0)
+                        mode = result.get("mode", "supersede")
+                        action = "removed" if mode == "hard_delete" else "archived"
+                        note = result.get("note", "")
+                        confirmation = (
+                            f"[Memory] {n} fact(s) {action}"
+                            + (f" for {retraction['subject']}" if retraction['subject'] != 'user' else "")
+                            + (f" ({retraction.get('rel_type', '')})" if retraction.get('rel_type') else "")
+                            + ("." if not note else f". Note: {note}")
+                            + " Do not reference these facts in your response."
+                        )
+                        body["messages"].append({"role": "system", "content": confirmation})
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] retraction: {result}")
+                        return body
+
             will_ingest = self.valves.INGEST_ENABLED and (
                 len(text.split()) >= 5 or bool(_IDENTITY_RE.search(text))
             )
@@ -399,6 +587,7 @@ class Filter:
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
 
+                _PRONOUNS = {"i", "me", "my", "we", "us", "our", "he", "she", "it", "they", "them"}
                 edges = [
                     {
                         "subject": e["subject"],
@@ -410,7 +599,21 @@ class Filter:
                     for e in raw_triples
                     if not e.get("low_confidence", False)
                     and e.get("subject") and e.get("object") and e.get("rel_type")
+                    and e.get("subject", "").lower() not in _PRONOUNS
+                    and e.get("object", "").lower() not in _PRONOUNS
                 ]
+
+                # Heuristic: if message contains alias signals and edge is also_known_as,
+                # mark it as a correction to trigger hard_delete and entity rename
+                _ALIAS_SIGNALS = frozenset({"prefers to be called", "prefer to be called",
+                                            "goes by", "go by", "now calls", "now called",
+                                            "new name", "changed name"})
+                text_lower = clean_text.lower()
+                if any(sig in text_lower for sig in _ALIAS_SIGNALS):
+                    for edge in edges:
+                        if edge["rel_type"] == "also_known_as":
+                            edge["is_correction"] = True
+
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
                 asyncio.create_task(
@@ -441,16 +644,41 @@ class Filter:
                             for f in facts:
                                 print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
 
+                        # Query-relevant filtering
+                        _categories = self._categorize_query(text)
+                        _is_realtime = self._is_realtime_query(text)
+                        if _is_realtime:
+                            _categories.add("location")
+                        facts = self._filter_relevant_facts(
+                            facts, _categories, canonical_identity, is_realtime=_is_realtime
+                        )
+
                         # Inject whenever we have anything useful — let the model decide relevance
                         if facts or preferred_names or canonical_identity:
+                            # Extract locations for temporal reasoning hint
+                            locations = set()
+                            for f in facts:
+                                if f.get("rel_type") in ("lives_at", "lives_in", "works_for"):
+                                    obj = f.get("object", "").strip()
+                                    if obj and len(obj) > 1:
+                                        locations.add(obj)
                             memory_block = self._build_memory_block(
-                                facts, preferred_names, canonical_identity, entity_attributes
+                                facts, preferred_names, canonical_identity, entity_attributes,
+                                is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
                             )
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
 
-                            # Append as system message — safe documented pattern per OpenWebUI spec
-                            body["messages"].append({"role": "system", "content": memory_block})
+                            # Insert immediately before the last user message for best context proximity
+                            msgs = body["messages"]
+                            injected = False
+                            for i in range(len(msgs) - 1, -1, -1):
+                                if msgs[i].get("role") == "user":
+                                    msgs.insert(i, {"role": "system", "content": memory_block})
+                                    injected = True
+                                    break
+                            if not injected:
+                                msgs.append({"role": "system", "content": memory_block})
 
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] INJECTED total_messages={len(body['messages'])}")

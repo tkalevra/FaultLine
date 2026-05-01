@@ -23,7 +23,7 @@ VALUES
   ('child_of',      'Child Of',      'P40',   'wikidata', false, 1.0, 'immutable'),
   ('spouse',        'Spouse',        'P26',   'wikidata', false, 1.0, 'supersede'),
   ('sibling_of',    'Sibling Of',    'P3373', 'wikidata', false, 1.0, 'immutable'),
-  ('also_known_as', 'Also Known As', 'P742',  'wikidata', false, 1.0, 'supersede'),
+  ('also_known_as', 'Also Known As', 'P742',  'wikidata', false, 1.0, 'hard_delete'),
   ('educated_at',   'Educated At',   'P69',   'wikidata', false, 1.0, 'supersede'),
   ('nationality',   'Nationality',   'P27',   'wikidata', false, 1.0, 'supersede'),
   ('occupation',    'Occupation',    'P106',  'wikidata', false, 1.0, 'supersede'),
@@ -32,7 +32,7 @@ VALUES
   ('lives_in',      'Lives In',      'P551',  'wikidata', false, 1.0, 'supersede'),
   ('located_in',    'Located In',    'P131',  'wikidata', false, 1.0, 'supersede'),
   ('same_as',       'Same As',       NULL,    'wikidata', false, 1.0, 'immutable'),
-  ('pref_name',     'Preferred Name',NULL,    'wikidata', false, 1.0, 'supersede')
+  ('pref_name',     'Preferred Name',NULL,    'wikidata', false, 1.0, 'hard_delete')
 ON CONFLICT (rel_type) DO UPDATE SET
     source = 'wikidata',
     wikidata_pid = EXCLUDED.wikidata_pid,

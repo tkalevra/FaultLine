@@ -10,6 +10,10 @@ FaultLine is a **write-validated knowledge graph** pipeline that intercepts Open
 
 ```
 OpenWebUI inlet filter
+  ├─▶ Retraction detection (if "forget", "delete", "wrong", etc.)
+  │     └─▶ Qwen retraction extraction → POST /retract (inline Qdrant cleanup)
+  │           └─▶ confirmation system message → short-circuit (skip ingest/query)
+  │
   ├─▶ POST /extract (preflight)   GLiNER2 entity typing (subject/object type context)
   ├─▶ Qwen triple rewrite   entity-typed structured edge extraction from text
   │     └─▶ POST /ingest (fire-and-forget)
@@ -22,22 +26,28 @@ OpenWebUI inlet filter
         ├─▶ PostgreSQL baseline facts (always returned for known identity)
         ├─▶ PostgreSQL graph traversal (self-referential signals, 2-hop)
         └─▶ Qdrant cosine search (nomic-embed-text, score_threshold: 0.3)
-              └─▶ merged, deduplicated → injected as system message
+              └─▶ filtered by intent (location, family, work, etc.) + confidence gate
+                    └─▶ merged, deduplicated → injected as system message before last user message
 
 OpenWebUI outlet filter
   └─▶ pass-through (no-op)
 ```
 
-## Inlet Short-Circuit
+## Inlet Short-Circuit & Retraction
 
-Before calling Qwen for ingest:
+**Retraction check (first):**
+If text contains retraction signals ("forget", "delete", "wrong", "no longer", etc.), Qwen extracts `{subject, rel_type?, old_value?}` and POSTs to `/retract`. If successful, a confirmation system message is injected and inlet returns early — no ingest or query happens.
+
+**Ingest gate:**
+Before calling Qwen for fact extraction:
 1. Word count ≥ 5, OR message matches a self-identification pattern (`my name is`, `I am`, `call me`, etc.)
 
 If neither condition is met, `will_ingest = False`. `will_query` is always `True` when `QUERY_ENABLED` is set. If both are False the inlet returns immediately with no work done.
 
-Memory is injected whenever `/query` returns facts, a `canonical_identity`, or `preferred_names` — there is no secondary relevance gate. The model decides what is relevant to the current message.
+**Memory injection gate:**
+Facts are filtered by query intent category (location, family, work, pets, physical, identity) before the memory block is built. Additionally, facts below `MIN_INJECT_CONFIDENCE` (default 0.5) are silently excluded. Memory is injected only when facts survive the gate, positioned immediately before the last user message (not appended) for better context proximity.
 
-## Query / Retrieval Path
+## Query / Retrieval Path & Filtering
 
 `/query` runs three parallel sources and merges them before returning:
 
@@ -45,24 +55,28 @@ Memory is injected whenever `/query` returns facts, a `canonical_identity`, or `
 2. **Graph traversal** (PostgreSQL, signal-gated) — when the query contains self-referential signals ("my family", "where do i live", etc.), fetches all facts anchored to the user's identity + 2-hop related entities.
 3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5` embedding, cosine search, `score_threshold: 0.3`, `limit: 10`. Adds associative context not captured by the other two paths.
 
-The three result sets are merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict.
+The three result sets are merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict. Each fact now includes a `confidence` field for downstream filtering.
 
-Memory injection happens in the **inlet** (before the model sees the message). The filter appends a `{"role": "system", "content": memory_block}` to `body["messages"]` — this is the safe documented OpenWebUI pattern. Injecting as a system message avoids a known v0.9.x regression where user message content modifications can be overruled downstream in the filter chain.
+**Filtering gate (in the filter, not the API):**
+Before building the memory block, facts are categorized by query intent (location, family, work, pets, physical, identity). For realtime queries (weather, news, stock, etc.), only location facts + identity facts are injected, plus a hint: "use web search tools — do not infer from stored facts." For specific category matches, only that category + identity facts are injected. Baseline behavior injects location + work + identity. Additionally, any fact below `MIN_INJECT_CONFIDENCE` is excluded (default threshold: 0.5).
+
+Memory injection happens in the **inlet** (before the model sees the message). The filter **inserts** a `{"role": "system", "content": memory_block}` immediately before the last user message — this provides better context proximity than appending. Injecting as a system message avoids a known v0.9.x regression where user message content modifications can be overruled downstream in the filter chain.
 
 ## Key Files
 
 | File | Role |
 |---|---|
-| `src/api/main.py` | FastAPI app — `/ingest` and `/query` endpoints, GLiNER2 lifecycle |
-| `src/api/models.py` | Pydantic request/response models |
+| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract` endpoints, GLiNER2 lifecycle, Qdrant cleanup |
+| `src/api/models.py` | Pydantic models — `IngestRequest`, `QueryRequest`, `RetractRequest`, `RetractResponse` |
 | `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection |
-| `src/fact_store/store.py` | `FactStoreManager.commit()` — single-transaction INSERT with ON CONFLICT DO NOTHING |
+| `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
 | `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers and label maps |
 | `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — canonical ID assignment, alias tracking, preferred name resolution |
-| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts and upserts to per-user Qdrant collections |
-| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — inlet: Qwen rewrite → ingest + memory query/inject; outlet: no-op |
+| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts, upserts to Qdrant, deletes superseded facts |
+| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction detection + Qwen extraction, ingest, query, relevance filtering, confidence gating |
 | `openwebui/faultline_function.py` | OpenWebUI **Function** (tool call) — explicit `store_fact()` with Qwen rewrite |
 | `migrations/001_create_facts.sql` | Schema: `facts` table + `qdrant_synced` column + lowercase trigger |
+| `migrations/007_correction_behavior.sql` | Correction behavior enum (supersede/hard_delete/immutable) per rel_type |
 
 ## GLiNER2 Extraction
 
@@ -167,14 +181,23 @@ Edges with `rel_type` not in the ontology trigger a Qwen approval call. If Qwen 
 | born_in        | P19          | —         | No        | —                | person → location (birthplace)  |
 | has_gender     | P21          | —         | No        | —                | person → gender                 |
 
-## Database Schema
+## Database Schema & Fact Lifecycle
 
 Primary tables:
-- `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`.
+- `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`. Soft-delete via `superseded_at IS NOT NULL`.
 - `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts (`age`, `height`, `weight`, `born_on`, `born_in`, `nationality`, `occupation`, `has_gender`) routed here at ingest instead of `facts`.
 - `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry.
-- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior)` — live ontology, loaded at startup.
+- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior)` — live ontology with correction behavior (supersede/hard_delete/immutable), loaded at startup.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
+
+**Fact lifecycle:**
+- **Creation**: ingest → `INSERT INTO facts` with `confidence=1.0`, `qdrant_synced=false`, `superseded_at=NULL`
+- **Confirmation**: re-confirm same `(user_id, subject_id, object_id, rel_type)` → `confirmed_count += 1`, `last_seen_at = now()`, `qdrant_synced` unchanged
+- **Retraction (user-driven)**: `/retract` → behavior determined by `rel_types.correction_behavior`:
+  - `"supersede"` (default): `superseded_at = now()`, `qdrant_synced = false` (re_embedder deletes Qdrant async)
+  - `"hard_delete"`: SQL DELETE from facts, inline Qdrant delete call
+  - `"immutable"`: no-op, user gets rejection notice
+- **Sync to Qdrant**: re_embedder polls for `qdrant_synced = false`, upserts new facts or deletes superseded ones, marks `qdrant_synced = true`
 
 A DB trigger lowercases `subject_id`, `object_id`, and `rel_type` on every INSERT/UPDATE to `facts`.
 
@@ -214,8 +237,20 @@ REEMBED_INTERVAL=10                 # seconds between re_embedder poll cycles
 
 Two separate artifacts in `openwebui/`:
 
-- **`faultline_tool.py`** — install as an OpenWebUI **Filter** (Admin → Functions → Filters). Inlet: keyword-gated Qwen rewrite → fire-and-forget `/ingest`, then synchronous `/query` → memory injected into user message before model sees it. Outlet: no-op pass-through.
+- **`faultline_tool.py`** — install as an OpenWebUI **Filter** (Admin → Functions → Filters). Inlet flow:
+  1. **Retraction check**: if text contains "forget", "delete", "wrong", etc., Qwen extracts `{subject, rel_type?, old_value?}` → `/retract` → confirmation injected → short-circuit return
+  2. **Normal ingest**: if word count ≥ 5 or identity pattern, GLiNER2 + Qwen rewrite → fire-and-forget `/ingest`
+  3. **Memory query**: synchronous `/query` → filtered by intent category + confidence threshold → inserted immediately before last user message
+  4. Outlet: no-op pass-through.
+
 - **`faultline_function.py`** — install as an OpenWebUI **Function/Tool**. Model explicitly calls `store_fact(text, __user__)`. Qwen rewrites text to triples, strips low-confidence edges, POSTs to `/ingest` with `user_id`.
+
+**Filter valve controls** (Admin → Functions → Filters → Settings):
+- `RETRACTION_ENABLED: bool` — enable/disable fact retraction
+- `INGEST_ENABLED: bool` — enable/disable automatic fact extraction
+- `QUERY_ENABLED: bool` — enable/disable memory injection
+- `MIN_INJECT_CONFIDENCE: float` — facts below this threshold are not injected (default 0.5)
+- `ENABLE_DEBUG: bool` — verbose logging
 
 Defaults differ: Filter (`faultline_tool.py`) defaults to `"http://192.168.40.10:8001"`; Function (`faultline_function.py`) defaults to `"http://faultline:8001"` (Docker service DNS). Verify these match the running service port (internal container port is 8000; external is 8001).
 

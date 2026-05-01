@@ -56,3 +56,35 @@ class FactStoreManager:
                 (penalty, new_id, penalty, old_id),
             )
         self.db_conn.commit()
+
+    def retract(self, cur, user_id: str, subject: str, rel_type: str | None,
+                old_value: str | None, mode: str) -> list[int]:
+        """
+        Retract facts matching the given criteria. Returns list of affected fact IDs.
+        Behavior is controlled by mode: 'hard_delete' (DELETE), 'supersede' (set superseded_at).
+        """
+        conditions = ["user_id = %s", "subject_id = %s", "superseded_at IS NULL"]
+        params = [user_id, subject.lower()]
+
+        if rel_type:
+            conditions.append("rel_type = %s")
+            params.append(rel_type.lower())
+        if old_value:
+            conditions.append("object_id = %s")
+            params.append(old_value.lower())
+
+        where = " AND ".join(conditions)
+
+        cur.execute(f"SELECT id FROM facts WHERE {where}", params)
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            return []
+
+        if mode == "hard_delete":
+            cur.execute(f"DELETE FROM facts WHERE {where}", params)
+        else:  # supersede
+            cur.execute(
+                f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE {where}",
+                params,
+            )
+        return ids
