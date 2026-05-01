@@ -361,6 +361,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
                 canonical_object = registry.resolve(req.user_id, edge.object)
 
+                # Track the actual subject to use for fact creation (may differ from canonical_subject
+                # if this is a correction where subject resolved to user's identity)
+                fact_subject = canonical_subject
+
                 # Register aliases from also_known_as and pref_name edges
                 if edge.rel_type.lower() in ("also_known_as", "pref_name"):
                     is_pref = (
@@ -389,6 +393,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 _row = _cur.fetchone()
                                 if _row:
                                     alias_subject = _row[0]
+                                    fact_subject = alias_subject  # Use resolved subject for fact creation
                                     log.info("ingest.correction_subject_resolved",
                                              original=canonical_subject, resolved=alias_subject,
                                              rel_type=edge.rel_type)
@@ -405,7 +410,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         preferred_objects.add(edge.object.lower())
 
                 # Skip self-referential after resolution
-                if canonical_subject == canonical_object:
+                if fact_subject == canonical_object:
                     continue
 
                 # Route scalar rel_types to entity_attributes instead of facts
@@ -443,22 +448,24 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.scalar_failed", error=str(_e))
                     continue  # Don't process as a relationship fact
 
-                status = gate.validate_edge(canonical_subject, canonical_object, edge.rel_type)["status"]
-                facts.append(FactResult(subject=canonical_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
+                status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
+                facts.append(FactResult(subject=fact_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
                 if status == "valid":
                     is_preferred = (
                         edge.rel_type.lower() in ("also_known_as", "pref_name") and
                         (has_preferred or edge.is_preferred_label)
                     )
-                    rows.append((req.user_id, canonical_subject, canonical_object, edge.rel_type, req.source, is_preferred))
+                    rows.append((req.user_id, fact_subject, canonical_object, edge.rel_type, req.source, is_preferred))
 
             if rows:
                 committed = manager.commit(rows)
 
-                correction_keys = {
-                    (e.subject.lower(), e.object.lower(), e.rel_type.lower())
-                    for e in edges if e.is_correction
-                }
+                # Build a map of edges to identify which rows are corrections
+                # Key is (original_subject, object, rel_type); value is whether it's a correction
+                correction_map = {}
+                for edge in edges:
+                    key = (edge.subject.lower(), edge.object.lower(), edge.rel_type.lower())
+                    correction_map[key] = edge.is_correction
 
                 # Build set of preferred objects from pref_name rows in this batch
                 # e.g. christopher → chris → pref_name means "chris" is preferred
@@ -497,7 +504,16 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     for row in rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row
-                        if (subject.lower(), obj.lower(), rel_type.lower()) not in correction_keys:
+
+                        # Check if this row came from a correction edge
+                        # Match by object and rel_type (subject may have been resolved)
+                        is_correction = any(
+                            e.is_correction and
+                            e.object.lower() == obj.lower() and
+                            e.rel_type.lower() == rel_type.lower()
+                            for e in edges
+                        )
+                        if not is_correction:
                             continue
 
                         # For also_known_as/pref_name corrections where subject is user's canonical identity,
