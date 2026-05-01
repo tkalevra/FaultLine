@@ -31,3 +31,4 @@ Thumbs.db
 # Local secrets
 .env.local
 secrets.json
+.aider*
