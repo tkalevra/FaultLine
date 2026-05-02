@@ -501,10 +501,14 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             if rows:
                 # Resolve subject/object to their preferred names before committing
                 # This ensures facts are stored with active identities, not legal names
+                # EXCEPT: never resolve "user" to a display name — "user" is the stable anchor.
+                # Preferred name resolution is for rendering only, not for storage.
+                # Resolving "user" here would undo the normalization applied earlier
+                # and store facts under a mutable alias instead of the stable placeholder.
                 resolved_rows = []
                 for user_id, subject, obj, rel_type, source, is_preferred in rows:
-                    pref_subject = registry.get_preferred_name(user_id, subject) if subject else subject
-                    pref_object = registry.get_preferred_name(user_id, obj) if obj else obj
+                    pref_subject = subject if subject == "user" else (registry.get_preferred_name(user_id, subject) if subject else subject)
+                    pref_object = obj if obj == "user" else (registry.get_preferred_name(user_id, obj) if obj else obj)
                     resolved_rows.append((user_id, pref_subject, pref_object, rel_type, source, is_preferred))
 
                 committed = manager.commit(resolved_rows)
