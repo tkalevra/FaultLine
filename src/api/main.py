@@ -498,10 +498,15 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
                 facts.append(FactResult(subject=fact_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
                 if status == "valid":
-                    is_preferred = (
-                        edge.rel_type.lower() in ("also_known_as", "pref_name") and
-                        (has_preferred or edge.is_preferred_label or edge.is_correction)
-                    )
+                    # pref_name edges are always preferred by definition — the rel_type itself
+                    # is the preference signal. also_known_as requires explicit signal to be preferred.
+                    if edge.rel_type.lower() == "pref_name":
+                        is_preferred = True
+                    else:
+                        is_preferred = (
+                            edge.rel_type.lower() == "also_known_as" and
+                            (has_preferred or edge.is_preferred_label or edge.is_correction)
+                        )
                     rows.append((req.user_id, fact_subject, canonical_object, edge.rel_type, req.source, is_preferred))
 
             if rows:
@@ -691,7 +696,12 @@ def query(request: QueryRequest):
         registry = EntityRegistry(db)
         canonical_identity = registry.get_canonical_for_user(user_id)
         if canonical_identity:
-            preferred = registry.get_preferred_name(user_id, canonical_identity)
+            # get_canonical_for_user returns an alias value (e.g. "chris"), not the
+            # entity_id "user". get_preferred_name expects entity_id as its second arg.
+            # Always pass "user" as the entity_id to look up the current preferred alias.
+            preferred = registry.get_preferred_name(user_id, "user")
+            if not preferred or preferred == "user":
+                preferred = canonical_identity
             preferred_names = {"user": preferred}
             log.info("query.identity_resolved",
                      canonical=canonical_identity, preferred=preferred, user_id=user_id)
