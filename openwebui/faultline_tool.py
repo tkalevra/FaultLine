@@ -56,6 +56,10 @@ _RETRACTION_SIGNALS: frozenset[str] = frozenset({
     "that information is wrong", "that info is wrong",
 })
 
+_IDENTITY_RE = re.compile(
+    r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
+)
+
 _RETRACTION_PROMPT = """\
 You are a retraction extractor for a personal knowledge graph.
 The user wants to remove or correct a stored fact.
@@ -86,8 +90,9 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For example "My friend who prefers to be called by a nickname" — extract the actual name, not the pronoun.
-- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being described, never the speaker.
+- Third-person pronouns ("her", "his", "she", "he") refer to the nearest named entity in the sentence — NEVER to the user/speaker. Never emit subject="user" for any triple derived from third-person text.
+- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y", "her/his preferred name is Y"), the subject is always the named person (X), never the speaker. Use pref_name: {"subject":"x","object":"y","rel_type":"pref_name"}.
+- Concrete example: "her name is Marla, she prefers to be called Mars" → [{"subject":"marla","object":"mars","rel_type":"pref_name","low_confidence":false}]. This is NOT a triple about the user.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
 RELATIONSHIP RULES (strictly enforced):
@@ -102,23 +107,28 @@ RELATIONSHIP RULES (strictly enforced):
 2. Entities must be specific names or nouns. Lowercase all values.
 3. rel_type must be snake_case. Use the most precise label that fits.
    Common types: is_a, has_pet, parent_of, child_of, spouse, sibling_of,
-   also_known_as, works_for, likes, dislikes, prefers, lives_at, owns,
+   also_known_as, pref_name, works_for, likes, dislikes, prefers, lives_at, owns,
    age, height, weight.
    You may use other snake_case types if none of the above fit.
-4. also_known_as = nickname or alias ONLY (e.g. a person's preferred short name).
+4. also_known_as = a nickname, alias, or alternate name an entity is known by.
+   pref_name = the name a person PREFERS to be called ("prefers to be called", "goes by", "preferred name is").
+   Use pref_name when the text signals a preference; use also_known_as for a simple alternate name.
 5. is_a = type or category (e.g. "dog breed").
-6. has_pet = person owns an animal (e.g. "we have a pet named X").
+6. has_pet = person owns an animal (e.g. "we have a pet named X"). ONLY use has_pet for animals — NEVER for people.
 7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
    between the descriptor and the name.
-8. Pronoun resolution: replace he/she/it with the named entity if clear.
+8. Pronoun resolution: replace he/she/it with the named entity if clear. "he/she/her/his" always refer to a named entity — NEVER to "user".
 9. If unsure, set "low_confidence": true. Never return empty if facts exist.
 10. First-person "my/our/we/I/me" refers to the named user entity if established,
     otherwise use subject "user".
-11. If the message contains a self-identification pattern ("I am X", "I'm X",
-    "my name is X", "call me X"), emit an also_known_as triple:
+11. FIRST-PERSON SELF-IDENTIFICATION ONLY: When the message contains an EXPLICIT first-person
+    self-identification ("I am X", "I'm X", "my name is X", "call me X", "people call me X"),
+    emit an also_known_as triple:
     {"subject":"user","object":"x","rel_type":"also_known_as","low_confidence":false}
-    where X is the proper name, lowercased.
-    The subject is ALWAYS "user", the object is ALWAYS the name. Never reverse this.
+    where X is the proper name, lowercased. The subject is ALWAYS "user", the object is ALWAYS the name.
+    THIS RULE APPLIES ONLY TO FIRST-PERSON TEXT. NEVER apply it to third-person text.
+    WRONG: "she prefers to be called Mars" → {"subject":"user","object":"mars","rel_type":"also_known_as"} ✗
+    CORRECT: "she prefers to be called Mars" (she=Marla from context) → {"subject":"marla","object":"mars","rel_type":"pref_name"} ✓
     NEVER emit {"subject":"name","object":"user"} — that direction is always wrong.
 12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
     emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
@@ -536,10 +546,6 @@ class Filter:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
 
-            _IDENTITY_RE = re.compile(
-                r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
-            )
-
             # Retraction detection — check before normal ingest
             if self.valves.RETRACTION_ENABLED and self._detect_retraction_intent(text):
                 retraction = await self._extract_retraction(text, body.get("messages", []))
@@ -603,11 +609,38 @@ class Filter:
                     and e.get("object", "").lower() not in _PRONOUNS
                 ]
 
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
-                asyncio.create_task(
-                    self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
-                )
+                # Guard: "user → also_known_as/pref_name" edges are only valid when the
+                # text contains an explicit first-person self-identification pattern.
+                # Without this, "her name is Marla, she prefers to be called Mars" produces
+                # "user also_known_as mars", which corrupts the canonical identity chain.
+                _has_self_id = bool(_IDENTITY_RE.search(clean_text))
+                if not _has_self_id:
+                    before = len(edges)
+                    edges = [
+                        e for e in edges
+                        if not (
+                            e["subject"].lower() == "user"
+                            and e["rel_type"].lower() in ("also_known_as", "pref_name")
+                        )
+                    ]
+                    if self.valves.ENABLE_DEBUG and len(edges) < before:
+                        print(
+                            f"[FaultLine Filter] dropped {before - len(edges)} "
+                            f"user→also_known_as/pref_name edge(s): no first-person self-ID in text"
+                        )
+
+                # Only call ingest when there are edges to commit or the text contains
+                # a self-ID pattern that GLiNER2 should process server-side.
+                # Skipping for query-like text (0 edges, no self-ID) prevents an unnecessary
+                # GLiNER2 crash on texts with no extractable entities.
+                if edges or _has_self_id:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
+                    asyncio.create_task(
+                        self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
+                    )
+                elif self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] skipping ingest — no edges and no self-ID")
 
             if will_query:
                 try:
