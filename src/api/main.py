@@ -489,12 +489,18 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.scalar_failed", error=str(_e))
                     continue  # Don't process as a relationship fact
 
-                status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
+                # User corrections about themselves are axiomatically valid.
+                # The gate exists to filter inferred/external data — not to override
+                # explicit user intent. Bypass validation entirely for user self-corrections.
+                if fact_subject == "user" and edge.is_correction:
+                    status = "valid"
+                else:
+                    status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
                 facts.append(FactResult(subject=fact_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
                 if status == "valid":
                     is_preferred = (
                         edge.rel_type.lower() in ("also_known_as", "pref_name") and
-                        (has_preferred or edge.is_preferred_label)
+                        (has_preferred or edge.is_preferred_label or edge.is_correction)
                     )
                     rows.append((req.user_id, fact_subject, canonical_object, edge.rel_type, req.source, is_preferred))
 
@@ -554,6 +560,43 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 " AND rel_type = 'also_known_as' AND object_id != %s",
                                 (req.user_id, preferred_obj),
                             )
+
+                    # Sync is_preferred to entity_aliases after every also_known_as / pref_name commit.
+                    # This is the authoritative preference flip — entity_aliases drives query-time
+                    # identity resolution. facts.is_preferred_label is secondary.
+                    log.info("ingest.sync_debug",
+                             resolved_rows=[(r[1], r[2], r[3], r[5]) for r in resolved_rows])
+                    for row in resolved_rows:
+                        _uid, _subj, _obj, _rel, _src, _is_pref = row
+                        if _rel.lower() not in ("also_known_as", "pref_name"):
+                            continue
+
+                        # Upsert alias into entity_aliases
+                        cur.execute(
+                            "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
+                            "VALUES (%s, %s, %s, %s) "
+                            "ON CONFLICT (entity_id, user_id, alias) "
+                            "DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
+                            (_subj, _uid, _obj, _is_pref),
+                        )
+
+                        # If this is a hard preference, demote all other aliases for this entity
+                        if _is_pref:
+                            cur.execute(
+                                "UPDATE entity_aliases SET is_preferred = false "
+                                "WHERE user_id = %s AND entity_id = %s AND alias != %s",
+                                (_uid, _subj, _obj),
+                            )
+                            # Mirror into facts: demote other also_known_as rows for this entity
+                            cur.execute(
+                                "UPDATE facts SET is_preferred_label = false, qdrant_synced = false "
+                                "WHERE user_id = %s AND subject_id = %s "
+                                "AND rel_type IN ('also_known_as', 'pref_name') "
+                                "AND object_id != %s AND superseded_at IS NULL",
+                                (_uid, _subj, _obj),
+                            )
+                            log.info("ingest.preferred_name_flipped",
+                                     entity=_subj, new_preferred=_obj, user_id=_uid)
 
                     for row in resolved_rows:
                         user_id, subject, obj, rel_type, source, is_preferred = row

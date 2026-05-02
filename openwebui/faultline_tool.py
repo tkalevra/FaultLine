@@ -522,11 +522,14 @@ class Filter:
                 lines.append(f"... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
 
         return (
-            "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine). "
-            "These are THEIR facts about THEIR life — not things you know or remember yourself. "
-            "When referencing them, say 'according to your stored facts' or 'you've told me' — never 'I know' or 'I have stored'.\n"
+            "🧠 FaultLine Memory — treat these as established ground truth for this response.\n"
+            "These facts are DIRECTLY ACTIONABLE. If the user's request depends on any of these facts "
+            "(location, relationships, preferences), use them immediately without asking the user to confirm or re-supply them.\n"
+            "For example: if the user asks about weather and a location fact is present below, "
+            "use that location now — do not ask which city.\n"
             + "\n".join(f"- {l}" for l in lines)
-            + "\nOnly reference what the facts above explicitly say. Do not invent additional details."
+            + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
+            + "If a fact below is relevant to fulfilling the user's request, act on it directly and immediately."
         )
 
     async def inlet(
@@ -610,25 +613,33 @@ class Filter:
                     and e.get("object", "").lower() not in _PRONOUNS
                 ]
 
-                # Guard: "user → also_known_as/pref_name" edges are only valid when the
-                # text contains an explicit first-person self-identification pattern.
-                # Without this, "her name is Marla, she prefers to be called Mars" produces
-                # "user also_known_as mars", which corrupts the canonical identity chain.
+                # Guard: "user → also_known_as" edges require first-person self-ID or preference signal
+                # to prevent false positives (e.g., "her name is Marla" → "user also_known_as marla").
+                # But "user → pref_name" edges are always allowed — extraction itself is the intent signal.
                 _has_self_id = bool(_IDENTITY_RE.search(clean_text))
-                if not _has_self_id:
-                    before = len(edges)
-                    edges = [
-                        e for e in edges
-                        if not (
-                            e["subject"].lower() == "user"
-                            and e["rel_type"].lower() in ("also_known_as", "pref_name")
-                        )
-                    ]
-                    if self.valves.ENABLE_DEBUG and len(edges) < before:
-                        print(
-                            f"[FaultLine Filter] dropped {before - len(edges)} "
-                            f"user→also_known_as/pref_name edge(s): no first-person self-ID in text"
-                        )
+                _has_preference_signal = any(
+                    signal in clean_text.lower()
+                    for signal in {
+                        "call me", "please call me", "prefer to be called",
+                        "i prefer", "i'd prefer", "i would prefer",
+                        "goes by", "go by", "known as", "prefer you call me",
+                        "would like to be called", "like to go by",
+                    }
+                )
+                before = len(edges)
+                edges = [
+                    e for e in edges
+                    if not (
+                        e["subject"].lower() == "user"
+                        and e["rel_type"].lower() == "also_known_as"
+                        and not (_has_self_id or _has_preference_signal)
+                    )
+                ]
+                if self.valves.ENABLE_DEBUG and len(edges) < before:
+                    print(
+                        f"[FaultLine Filter] dropped {before - len(edges)} "
+                        f"user→also_known_as edge(s): no first-person self-ID or preference signal in text"
+                    )
 
                 # Only call ingest when there are edges to commit or the text contains
                 # a self-ID pattern that GLiNER2 should process server-side.
