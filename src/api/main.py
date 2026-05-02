@@ -263,7 +263,7 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
 @app.post("/ingest", response_model=IngestResponse)
 def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     inferred_relations = []
-    if model is not None:
+    if model is not None and not req.edges:
         try:
             constraint = _rel_type_constraint or "is_a|part_of|created_by|works_for|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|has_gender|lives_in|born_in|born_on|nationality|educated_at|occupation|owns|located_in|knows|friend_of|met|age|located_at"
             schema = {
@@ -353,6 +353,20 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             has_preferred = _detect_preference_signal(req.text)
             preferred_objects = set()
 
+            # Load user's current alias set for identity normalization
+            _user_aliases = {"user"}  # Always include the "user" placeholder
+            try:
+                with db.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT object_id FROM facts "
+                        "WHERE user_id = %s AND subject_id = 'user' "
+                        "AND rel_type = 'also_known_as' AND superseded_at IS NULL",
+                        (req.user_id,),
+                    )
+                    _user_aliases.update(row[0] for row in _cur.fetchall())
+            except Exception as _e:
+                log.warning("ingest.user_aliases_load_failed", error=str(_e))
+
             for edge in edges:
                 if edge.subject == edge.object: continue
 
@@ -360,6 +374,22 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
                 canonical_object = registry.resolve(req.user_id, edge.object)
+
+                # Normalize user-identity aliases back to "user" anchor
+                # If canonical_subject is a known alias of the user (e.g., "chris"), rewrite to "user"
+                # so facts are anchored under the identity placeholder, not scattered across aliases.
+                if canonical_subject in _user_aliases and canonical_subject != "user":
+                    log.info("ingest.subject_normalized_to_user",
+                             original=canonical_subject, user_id=req.user_id)
+                    canonical_subject = "user"
+
+                # Similarly for object, but only for rel_types where user can be an object.
+                # Skip also_known_as and pref_name because those edges must preserve the alias as object.
+                if (canonical_object in _user_aliases and canonical_object != "user" and
+                    edge.rel_type.lower() not in ("also_known_as", "pref_name")):
+                    log.info("ingest.object_normalized_to_user",
+                             original=canonical_object, user_id=req.user_id)
+                    canonical_object = "user"
 
                 # Track the actual subject to use for fact creation (may differ from canonical_subject
                 # if this is a correction where subject resolved to user's identity)
@@ -408,6 +438,11 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     )
                     if is_pref and edge.rel_type.lower() == "pref_name":
                         preferred_objects.add(edge.object.lower())
+
+                    # After a new user alias is registered, add it to in-memory set
+                    # so subsequent edges in this batch are immediately normalized
+                    if alias_subject == "user" and edge.rel_type.lower() == "also_known_as":
+                        _user_aliases.add(edge.object.lower())
 
                 # Skip self-referential after resolution
                 if fact_subject == canonical_object:
