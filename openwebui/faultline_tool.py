@@ -446,11 +446,12 @@ class Filter:
                 return nickname_map.get(name, name).title()
 
             sentences = []
+            _user_anchors = {identity, "user"} if identity else {"user"}
 
-            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") in (identity, "user")]
-            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") in (identity, "user")]
-            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in (identity, "user") and f.get("subject") not in spouses_raw]
-            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in (identity, "user")]
+            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") in _user_anchors]
+            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") in _user_anchors]
+            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in _user_anchors and f.get("subject") not in spouses_raw]
+            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in _user_anchors]
 
             if children_raw:
                 descs = []
@@ -483,7 +484,7 @@ class Filter:
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
                 rel = f.get("rel_type", "").replace("_", " ")
-                if identity and subj in (identity, "user"):
+                if identity and subj in _user_anchors:
                     if rel == "has pet":
                         sentences.append(f"You have a pet named {_dn(obj)}.")
                     elif rel == "owns":
@@ -500,7 +501,7 @@ class Filter:
                         sentences.append(f"You are a {_dn(obj)}.")
                     else:
                         sentences.append(f"You {rel} {_dn(obj)}.")
-                elif identity and obj in (identity, "user"):
+                elif identity and obj in _user_anchors:
                     sentences.append(f"{_dn(subj)} {rel} you.")
                 else:
                     sentences.append(f"{_dn(subj)} {rel} {_dn(obj)}.")

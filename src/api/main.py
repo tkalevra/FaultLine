@@ -353,19 +353,25 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             has_preferred = _detect_preference_signal(req.text)
             preferred_objects = set()
 
-            # Load user's current alias set for identity normalization
-            _user_aliases = {"user"}  # Always include the "user" placeholder
+            # Load the full flat alias set for this user from entity_aliases.
+            # entity_aliases is the authoritative registry — all names that resolve
+            # to the user entity regardless of how many hops through also_known_as
+            # they represent. Single query, no chaining, no recursion.
+            _user_aliases = {"user"}
             try:
                 with db.cursor() as _cur:
                     _cur.execute(
-                        "SELECT object_id FROM facts "
-                        "WHERE user_id = %s AND subject_id = 'user' "
-                        "AND rel_type = 'also_known_as' AND superseded_at IS NULL",
+                        "SELECT alias FROM entity_aliases "
+                        "WHERE user_id = %s AND entity_id = 'user'",
                         (req.user_id,),
                     )
                     _user_aliases.update(row[0] for row in _cur.fetchall())
+                log.info("ingest.user_aliases_loaded",
+                         count=len(_user_aliases), user_id=req.user_id)
             except Exception as _e:
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
+                # Fallback: _user_aliases stays as {"user"} — normalization still
+                # works for the "user" placeholder, just won't catch named aliases
 
             for edge in edges:
                 if edge.subject == edge.object: continue
