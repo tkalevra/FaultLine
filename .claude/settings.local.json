@@ -30,7 +30,12 @@
       "Bash(docker exec *)",
       "Bash(git *)",
       "Bash(python -m py_compile src/api/models.py src/fact_store/store.py openwebui/faultline_tool.py)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction --ignore=tests/model_inference --ignore=tests/preprocessing -v)",
+      "Bash(pytest tests/test_pipeline.py::test_validate_and_commit -v)",
+      "Bash(pytest tests/api/test_ingest.py::test_ingest_with_valid_edge -v)",
+      "Bash(pytest tests/api/test_ingest.py::test_correction_hard_delete_migrates_facts -v)",
+      "Bash(pytest tests/api/test_ingest.py::test_health -v)"
     ]
   }
 }
