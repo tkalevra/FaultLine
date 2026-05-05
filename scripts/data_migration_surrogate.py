@@ -39,6 +39,14 @@ def main():
                 )
                 print(f"Deleted garbage facts matching: {condition}, rows={cur.rowcount}")
 
+            # ── Step 0.5: Ensure user surrogate exists in entities ────────────
+            cur.execute(
+                "INSERT INTO entities (id, user_id, entity_type) "
+                "VALUES (%s, %s, 'person') ON CONFLICT (id, user_id) DO NOTHING",
+                (USER_ID, USER_ID)
+            )
+            print(f"Ensured user surrogate exists in entities: {USER_ID}")
+
             # ── Step 1: Build surrogate map for all display-name entities ──
             cur.execute(
                 "SELECT id FROM entities WHERE user_id = %s",
