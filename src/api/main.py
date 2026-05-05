@@ -726,6 +726,7 @@ def query(request: QueryRequest):
                 cur.execute(
                     f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                     f"WHERE user_id = %s AND superseded_at IS NULL "
+                    f"AND (valid_until IS NULL OR valid_until > now()) "
                     f"AND rel_type IN ({rel_placeholders}) "
                     f"AND (subject_id IN ({placeholders}) OR object_id IN ({placeholders})) "
                     f"ORDER BY id",
@@ -821,6 +822,7 @@ def query(request: QueryRequest):
                     _cur.execute(
                         f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                         f"WHERE user_id = %s AND superseded_at IS NULL "
+                        f"AND (valid_until IS NULL OR valid_until > now()) "
                         f"AND (subject_id IN ({_placeholders}) OR object_id IN ({_placeholders})) "
                         f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
                         f"ORDER BY id",
