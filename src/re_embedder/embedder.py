@@ -57,6 +57,40 @@ def fetch_unsynced(db_conn, confidence_threshold: float = 0.0) -> list[dict]:
     ]
 
 
+def fetch_unsynced_staged(db_conn) -> list[dict]:
+    """Fetch staged_facts where qdrant_synced = false and not yet promoted or expired."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, subject_id, object_id, rel_type, provenance, user_id,
+                   confidence, confirmed_count, last_seen_at, fact_class
+            FROM staged_facts
+            WHERE qdrant_synced = false
+              AND promoted_at IS NULL
+              AND expires_at > now()
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": row[0],
+            "subject_id": row[1],
+            "object_id": row[2],
+            "rel_type": row[3],
+            "provenance": row[4],
+            "user_id": row[5] or "anonymous",
+            "confidence": row[6] if row[6] is not None else 0.6,
+            "confirmed_count": row[7] if row[7] is not None else 0,
+            "last_seen_at": row[8],
+            "contradicted_by": None,
+            "staged_id": row[0],
+            "fact_class": row[9],
+        }
+        for row in rows
+    ]
+
+
 def resolve_display_names_for_facts(db_conn, rows: list[dict]) -> list[dict]:
     """
     For each fact row, resolve subject_id and object_id UUID surrogates
@@ -265,6 +299,112 @@ def promote_facts(db_conn) -> None:
     db_conn.commit()
 
 
+def promote_staged_facts(db_conn, promotion_threshold: int = 3) -> int:
+    """
+    Promote Class B staged facts that have reached confirmed_count >= threshold.
+    Inserts into facts table, marks staged row as promoted.
+    Returns count of promoted facts.
+    """
+    promoted = 0
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_id, subject_id, object_id, rel_type,
+                       provenance, confidence
+                FROM staged_facts
+                WHERE fact_class = 'B'
+                  AND confirmed_count >= %s
+                  AND promoted_at IS NULL
+                  AND expires_at > now()
+                """,
+                (promotion_threshold,)
+            )
+            candidates = cur.fetchall()
+
+        for row in candidates:
+            sid, user_id, subject, obj, rel_type, prov, conf = row
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO facts"
+                        " (user_id, subject_id, object_id, rel_type, provenance,"
+                        "  confidence, fact_class, fact_provenance, qdrant_synced)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, 'B', %s, false)"
+                        " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
+                        " DO UPDATE SET"
+                        "   confirmed_count = facts.confirmed_count + 1,"
+                        "   last_seen_at    = now(),"
+                        "   updated_at      = now()",
+                        (user_id, subject, obj, rel_type, prov, conf, prov)
+                    )
+                    cur.execute(
+                        "UPDATE staged_facts SET promoted_at = now() WHERE id = %s",
+                        (sid,)
+                    )
+                db_conn.commit()
+                promoted += 1
+                log.info(
+                    f"re_embedder.promoted fact staged_id={sid} "
+                    f"subject={subject} rel_type={rel_type}"
+                )
+            except Exception as e:
+                db_conn.rollback()
+                log.error(f"re_embedder.promote_failed staged_id={sid}: {e}")
+
+    except Exception as e:
+        log.error(f"re_embedder.promote_staged_error: {e}")
+
+    return promoted
+
+
+def expire_staged_facts(db_conn, qdrant_url: str) -> int:
+    """
+    Delete Class C staged facts past their expires_at.
+    Also deletes their Qdrant vectors.
+    Returns count of expired facts.
+    """
+    expired = 0
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_id FROM staged_facts
+                WHERE expires_at <= now()
+                  AND promoted_at IS NULL
+                """
+            )
+            stale = cur.fetchall()
+
+        for staged_id, user_id in stale:
+            collection = derive_collection(user_id)
+            try:
+                httpx.post(
+                    f"{qdrant_url}/collections/{collection}/points/delete",
+                    json={"points": [staged_id]},
+                    timeout=10.0,
+                )
+            except Exception:
+                pass  # Best effort Qdrant cleanup
+
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM staged_facts WHERE id = %s",
+                        (staged_id,)
+                    )
+                db_conn.commit()
+                expired += 1
+            except Exception as e:
+                db_conn.rollback()
+                log.error(f"re_embedder.expire_failed staged_id={staged_id}: {e}")
+
+    except Exception as e:
+        log.error(f"re_embedder.expire_staged_error: {e}")
+
+    return expired
+
+
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
@@ -326,8 +466,35 @@ def main():
                         log.error(f"re_embedder.row_error fact_id={row['id']}: {e}")
                         continue
 
-                # Promotion step: move short-term to long-term
-                promote_facts(db)
+                # Process staged facts — sync to Qdrant
+                staged_rows = fetch_unsynced_staged(db)
+                if staged_rows:
+                    staged_rows = resolve_display_names_for_facts(db, staged_rows)
+                    log.info(f"re_embedder.staged_batch count={len(staged_rows)}")
+                    for row in staged_rows:
+                        try:
+                            text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
+                            vector = embed_text(text, qwen_api_url)
+                            collection = derive_collection(row["user_id"])
+                            if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                with db.cursor() as cur:
+                                    cur.execute(
+                                        "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
+                                        (row["staged_id"],)
+                                    )
+                                db.commit()
+                        except Exception as e:
+                            log.error(f"re_embedder.staged_row_error id={row['staged_id']}: {e}")
+
+                # Promote eligible Class B staged facts to long-term memory
+                n_promoted = promote_staged_facts(db)
+                if n_promoted:
+                    log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
+
+                # Expire stale Class C staged facts
+                n_expired = expire_staged_facts(db, qdrant_url)
+                if n_expired:
+                    log.info(f"re_embedder.expiry_complete expired={n_expired}")
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:

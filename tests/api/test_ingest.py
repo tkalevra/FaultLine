@@ -67,8 +67,10 @@ def test_ingest_with_valid_edge(client):
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "valid"
-    assert data["committed"] == 1
+    assert data["committed"] == 0        # works_for is Class B — not committed to facts
+    assert data["staged"] == 1           # staged to staged_facts
     assert data["facts"][0]["status"] == "valid"
+    assert data["facts"][0]["fact_class"] == "B"
 
 
 def test_ingest_with_novel_edge():
