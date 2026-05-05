@@ -691,20 +691,20 @@ def query(request: QueryRequest):
     canonical_identity = None
     baseline_facts = []
     attributes = {}
+    user_surrogate = user_id  # OWUI UUID IS the surrogate — always
+    db = None
+    registry = None
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
-        canonical_identity = registry.get_canonical_for_user(user_id)
+        preferred = registry.get_preferred_name(user_id, user_surrogate)
+        if not preferred or preferred == user_surrogate:
+            preferred = "user"
+        preferred_names = {"user": preferred}
+        canonical_identity = preferred  # display name for injection, not for DB queries
         if canonical_identity:
-            # get_canonical_for_user returns an alias value (e.g. "chris"), not the
-            # entity_id "user". get_preferred_name expects entity_id as its second arg.
-            # Always pass "user" as the entity_id to look up the current preferred alias.
-            preferred = registry.get_preferred_name(user_id, "user")
-            if not preferred or preferred == "user":
-                preferred = canonical_identity
-            preferred_names = {"user": preferred}
             log.info("query.identity_resolved",
-                     canonical=canonical_identity, preferred=preferred, user_id=user_id)
+                     surrogate=user_surrogate, preferred=preferred, user_id=user_id)
 
             # Always fetch baseline personal facts (location, attributes) anchored to
             # the user's identity — these won't surface via vector similarity for
@@ -714,13 +714,6 @@ def query(request: QueryRequest):
                 "age", "height", "weight", "works_for", "occupation",
                 "nationality", "has_gender",
             )
-            try:
-                all_aliases = set(registry.get_all_aliases(user_id, canonical_identity)) | {canonical_identity}
-            except Exception:
-                all_aliases = {canonical_identity}
-
-            alias_list = list(all_aliases)
-            placeholders = ",".join(["%s"] * len(alias_list))
             rel_placeholders = ",".join(["%s"] * len(_BASELINE_RELS))
             with db.cursor() as cur:
                 cur.execute(
@@ -728,17 +721,16 @@ def query(request: QueryRequest):
                     f"WHERE user_id = %s AND superseded_at IS NULL "
                     f"AND (valid_until IS NULL OR valid_until > now()) "
                     f"AND rel_type IN ({rel_placeholders}) "
-                    f"AND (subject_id IN ({placeholders}) OR object_id IN ({placeholders})) "
+                    f"AND (subject_id = %s OR object_id = %s) "
                     f"ORDER BY id",
-                    [user_id] + list(_BASELINE_RELS) + alias_list + alias_list,
+                    [user_id] + list(_BASELINE_RELS) + [user_surrogate, user_surrogate],
                 )
                 baseline_facts = [
                     {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4]}
                     for r in cur.fetchall()
                 ]
             if baseline_facts:
-                log.info("query.baseline_facts", count=len(baseline_facts), identity=canonical_identity)
-        db.close()
+                log.info("query.baseline_facts", count=len(baseline_facts), surrogate=user_surrogate)
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
 
@@ -803,30 +795,34 @@ def query(request: QueryRequest):
             log.warning("query.attributes_fetch_failed", error=str(e))
             return {}
 
+    def _resolve_display_names(facts: list[dict], registry, user_id: str) -> list[dict]:
+        """
+        Resolve UUID subject_id/object_id to preferred display names.
+        Falls back to the UUID string if no alias found.
+        """
+        resolved = []
+        for f in facts:
+            resolved.append({
+                **f,
+                "subject": registry.get_preferred_name(user_id, f["subject"]),
+                "object": registry.get_preferred_name(user_id, f["object"]),
+            })
+        return resolved
+
     query_lower = request.text.lower()
     direct_facts = []
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
         try:
-            # Use registry to get all aliases for this user
-            _db_direct = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _registry = EntityRegistry(_db_direct)
-            _identity = canonical_identity or _registry.get_canonical_for_user(user_id)
-
-            if _identity:
-                _user_aliases = set(_registry.get_all_aliases(user_id, _identity)) | {_identity}
-
-                # Also get aliases for spouse entities (2-hop)
-                _alias_list = list(_user_aliases)
-                _placeholders = ",".join(["%s"] * len(_alias_list))
-                with _db_direct.cursor() as _cur:
+            if db and registry and canonical_identity:
+                with db.cursor() as _cur:
                     _cur.execute(
-                        f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                        f"WHERE user_id = %s AND superseded_at IS NULL "
-                        f"AND (valid_until IS NULL OR valid_until > now()) "
-                        f"AND (subject_id IN ({_placeholders}) OR object_id IN ({_placeholders})) "
-                        f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
-                        f"ORDER BY id",
-                        [user_id] + _alias_list + _alias_list,
+                        "SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
+                        "WHERE user_id = %s AND superseded_at IS NULL "
+                        "AND (valid_until IS NULL OR valid_until > now()) "
+                        "AND (subject_id = %s OR object_id = %s) "
+                        "AND rel_type NOT IN ('also_known_as', 'pref_name') "
+                        "ORDER BY id",
+                        [user_id, user_surrogate, user_surrogate],
                     )
                     direct_facts = [
                         {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4]}
@@ -835,11 +831,11 @@ def query(request: QueryRequest):
 
                     # 2-hop: fetch facts for directly related entities
                     related = {
-                        f["object"] for f in direct_facts if f["subject"] in _user_aliases
+                        f["object"] for f in direct_facts if f["subject"] == user_surrogate
                     } | {
-                        f["subject"] for f in direct_facts if f["object"] in _user_aliases
+                        f["subject"] for f in direct_facts if f["object"] == user_surrogate
                     }
-                    related -= _user_aliases
+                    related.discard(user_surrogate)
 
                     if related:
                         _rel_list = list(related)
@@ -862,15 +858,16 @@ def query(request: QueryRequest):
                                 })
                                 seen.add(key)
 
-            entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
-            attributes = _fetch_attributes(_db_direct, user_id, entity_ids, max_sensitivity="private")
-            _db_direct.close()
-            if direct_facts:
-                log.info("query.graph_traversal", identity=_identity, hits=len(direct_facts))
-                # Don't return early — merge with Qdrant results below
-                # Postgres facts are authoritative; Qdrant adds associative context
+                entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
+                attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
+                if direct_facts:
+                    log.info("query.graph_traversal", identity=canonical_identity, hits=len(direct_facts))
+                    # Don't return early — merge with Qdrant results below
+                    # Postgres facts are authoritative; Qdrant adds associative context
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
+        finally:
+            pass
 
     # Embed after graph traversal so Postgres results are returned even when the
     # embedding service is unavailable. fallback=False: skip Qdrant rather than
@@ -878,9 +875,13 @@ def query(request: QueryRequest):
     vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
     if vector is None:
         log.warning("query.embed_unavailable — skipping Qdrant search")
+        # Resolve display names for Postgres facts before returning
+        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
+        resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+        merged_facts = resolved_direct + resolved_baseline
         return {
             "status": "ok",
-            "facts": direct_facts,
+            "facts": merged_facts,
             "preferred_names": preferred_names,
             "canonical_identity": canonical_identity,
             "attributes": attributes,
@@ -894,18 +895,24 @@ def query(request: QueryRequest):
         )
         if resp.status_code == 404:
             ensure_collection(collection, qdrant_url)
+            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
+            resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            merged_facts = resolved_direct + resolved_baseline
             return {
                 "status": "ok",
-                "facts": direct_facts,
+                "facts": merged_facts,
                 "preferred_names": preferred_names,
                 "canonical_identity": canonical_identity,
                 "attributes": attributes,
             }
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
+            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
+            resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            merged_facts = resolved_direct + resolved_baseline
             return {
                 "status": "ok",
-                "facts": direct_facts,
+                "facts": merged_facts,
                 "preferred_names": preferred_names,
                 "canonical_identity": canonical_identity,
                 "attributes": attributes,
@@ -924,28 +931,32 @@ def query(request: QueryRequest):
         ]
         log.info("query.ok", collection=collection, hits=len(qdrant_facts))
 
+        # Resolve display names for Postgres facts before merging (not for Qdrant facts — they already have display names)
+        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
+        resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+
         # Merge: Postgres facts are authoritative, Qdrant adds associative context
         # Deduplicate on (subject, object, rel_type) — Postgres wins on conflict
-        pg_keys = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+        pg_keys = {(f["subject"], f["object"], f["rel_type"]) for f in resolved_direct}
+        merged_facts = resolved_direct.copy()
         for f in qdrant_facts:
             key = (f["subject"], f["object"], f["rel_type"])
             if key not in pg_keys:
-                direct_facts.append(f)
+                merged_facts.append(f)
                 pg_keys.add(key)
 
         # Merge baseline personal facts (location, attributes) — always present for
         # known identities regardless of whether Qdrant or graph traversal returned them.
-        for f in baseline_facts:
+        for f in resolved_baseline:
             key = (f["subject"], f["object"], f["rel_type"])
             if key not in pg_keys:
-                direct_facts.append(f)
+                merged_facts.append(f)
                 pg_keys.add(key)
 
-        facts = direct_facts
-        log.info("query.merged", pg_hits=len(pg_keys), baseline=len(baseline_facts), total=len(facts))
+        log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _entity_ids = list({f["subject"] for f in facts} | {f["object"] for f in facts})
+            _entity_ids = list({f["subject"] for f in merged_facts} | {f["object"] for f in merged_facts})
             attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
             _attr_db.close()
         except Exception as _ae:
@@ -954,7 +965,7 @@ def query(request: QueryRequest):
 
         return {
             "status": "ok",
-            "facts": facts,
+            "facts": merged_facts,
             "preferred_names": preferred_names,
             "canonical_identity": canonical_identity,
             "attributes": attributes,
@@ -966,7 +977,11 @@ def query(request: QueryRequest):
             "facts": [],
             "preferred_names": preferred_names,
             "canonical_identity": canonical_identity,
+            "attributes": {},
         }
+    finally:
+        if db:
+            db.close()
 
 @app.post("/retract", response_model=RetractResponse)
 def retract_fact(req: RetractRequest):
