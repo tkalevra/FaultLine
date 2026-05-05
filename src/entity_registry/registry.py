@@ -132,6 +132,20 @@ class EntityRegistry:
             row = cur.fetchone()
             return row[0] if row else canonical
 
+    def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
+        """Return all display name aliases for a surrogate entity_id."""
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT alias FROM entity_aliases "
+                "WHERE user_id = %s AND entity_id = %s",
+                (user_id, entity_id),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def get_surrogate_for_user(self, user_id: str) -> str:
+        """Return the surrogate UUID for the user entity. Always user_id itself."""
+        return user_id
+
     def get_canonical_for_user(self, user_id: str) -> str:
         """
         Return the canonical entity ID for this user.
