@@ -73,7 +73,7 @@ def test_validate_and_commit(mock_db):
     assert validation["status"] == "valid"
 
     manager = FactStoreManager(mock_db)
-    count = manager.commit([("alice-0", "acme-0", "WORKS_FOR", "pipeline-test")])
+    count = manager.commit([("test-user", "alice-0", "acme-0", "WORKS_FOR", "pipeline-test")])
     assert count == 1
     mock_db.commit.assert_called_once()
 
@@ -114,5 +114,5 @@ def test_full_pipeline(gliner_model, mock_db):
 
     # Step 5: Commit
     manager = FactStoreManager(mock_db)
-    count = manager.commit([(sub_id, obj_id, "WORKS_FOR", text)])
+    count = manager.commit([("test-user", sub_id, obj_id, "WORKS_FOR", text)])
     assert count == 1

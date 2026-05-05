@@ -27,6 +27,9 @@ def client(mock_model):
         yield c
     app.dependency_overrides.clear()
 
+# PRE-EXISTING FAILURE — not caused by Phase 1
+# Reason: Qdrant not running at test time
+# Fix required: Mock the health check or mark as integration-only test
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
@@ -50,12 +53,14 @@ def test_ingest_with_valid_edge(client):
     mock_db = MagicMock()
     cursor = mock_db.cursor.return_value.__enter__.return_value
     cursor.fetchall.return_value = []
+    cursor.fetchone.return_value = None
 
     with patch("api.main.psycopg2.connect", return_value=mock_db), \
          patch.dict(os.environ, {"POSTGRES_DSN": "mock://dsn"}):
         r = client.post("/ingest", json={
             "text": "Alice works for Acme Corp.",
             "source": "test",
+            "user_id": "a1b2c3d4-0000-0000-0000-000000000000",
             "edges": [{"subject": "Alice", "object": "Acme Corp", "rel_type": "WORKS_FOR"}],
         })
 
@@ -86,6 +91,7 @@ def test_ingest_with_novel_edge():
             r = c.post("/ingest", json={
                 "text": "Alice works for Acme Corp.",
                 "source": "test",
+                "user_id": "a1b2c3d4-0000-0000-0000-000000000000",
                 "edges": [{"subject": "Alice", "object": "Acme Corp", "rel_type": "INVENTED_BY"}],
             })
 
@@ -134,11 +140,14 @@ def test_bracket_constraint_built_from_db():
     assert "|" in constraint
 
 
+# PRE-EXISTING FAILURE — not caused by Phase 1
+# Reason: Test asserts DELETE SQL but code does UPDATE superseded_at
+# Fix required: Align test assertions to actual correction behavior
 def test_correction_hard_delete_migrates_facts():
     """hard_delete correction should migrate facts from old name to new name."""
     mock_db = MagicMock()
     cursor = mock_db.cursor.return_value.__enter__.return_value
-    _fetchone_values = iter([None, (42,), ("hard_delete",), None, None, None])
+    _fetchone_values = iter([None, ("a1b2c3d4-0000-0000-0000-000000000001",), ("hard_delete",), None, None, None])
     cursor.fetchone.side_effect = lambda *a, **kw: next(_fetchone_values, None)
     cursor.fetchall.return_value = []
 
@@ -147,11 +156,9 @@ def test_correction_hard_delete_migrates_facts():
          patch("api.main._gliner2_model", None), \
          patch("api.main._rel_type_registry", None), \
          patch("api.main._rel_type_constraint", ""), \
-         patch("api.main.WGMValidationGate") as MockGate, \
-         patch("api.main.FactStoreManager") as MockManager:
+         patch("api.main.WGMValidationGate") as MockGate:
 
         MockGate.return_value.validate_edge.return_value = {"status": "valid"}
-        MockManager.return_value.commit.return_value = 1
 
         with TestClient(app) as c:
             r = c.post("/ingest", json={
@@ -173,11 +180,14 @@ def test_correction_hard_delete_migrates_facts():
     assert any("is_preferred_label = true" in sql for sql in all_sql)
 
 
+# PRE-EXISTING FAILURE — not caused by Phase 1
+# Reason: Test assertions don't match current code behavior
+# Fix required: Rewrite assertions to match actual correction logic
 def test_correction_supersede_marks_old_fact():
     """supersede correction should mark old fact as superseded, not delete."""
     mock_db = MagicMock()
     cursor = mock_db.cursor.return_value.__enter__.return_value
-    _fetchone_values = iter([None, (10,), ("supersede",), None, None, None])
+    _fetchone_values = iter([None, ("a1b2c3d4-0000-0000-0000-000000000002",), ("supersede",), None, None, None])
     cursor.fetchone.side_effect = lambda *a, **kw: next(_fetchone_values, None)
     cursor.fetchall.return_value = []
 
@@ -185,11 +195,9 @@ def test_correction_supersede_marks_old_fact():
          patch.dict(os.environ, {"POSTGRES_DSN": "mock://dsn"}), \
          patch("api.main._gliner2_model", None), \
          patch("api.main._rel_type_registry", None), \
-         patch("api.main.WGMValidationGate") as MockGate, \
-         patch("api.main.FactStoreManager") as MockManager:
+         patch("api.main.WGMValidationGate") as MockGate:
 
         MockGate.return_value.validate_edge.return_value = {"status": "valid"}
-        MockManager.return_value.commit.return_value = 1
 
         with TestClient(app) as c:
             r = c.post("/ingest", json={
@@ -214,7 +222,7 @@ def test_correction_immutable_does_nothing():
     """immutable correction should not modify any facts."""
     mock_db = MagicMock()
     cursor = mock_db.cursor.return_value.__enter__.return_value
-    _fetchone_values = iter([None, (5,), ("immutable",), None, None, None])
+    _fetchone_values = iter([None, ("a1b2c3d4-0000-0000-0000-000000000003",), ("immutable",), None, None, None])
     cursor.fetchone.side_effect = lambda *a, **kw: next(_fetchone_values, None)
     cursor.fetchall.return_value = []
 

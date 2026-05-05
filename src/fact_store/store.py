@@ -62,16 +62,17 @@ class FactStoreManager:
         """
         Retract facts matching the given criteria. Returns list of affected fact IDs.
         Behavior is controlled by mode: 'hard_delete' (DELETE), 'supersede' (set superseded_at).
+        subject and old_value are pre-resolved UUIDs (already lowercase).
         """
         conditions = ["user_id = %s", "subject_id = %s", "superseded_at IS NULL"]
-        params = [user_id, subject.lower()]
+        params = [user_id, subject]
 
         if rel_type:
             conditions.append("rel_type = %s")
             params.append(rel_type.lower())
         if old_value:
             conditions.append("object_id = %s")
-            params.append(old_value.lower())
+            params.append(old_value)
 
         where = " AND ".join(conditions)
 
