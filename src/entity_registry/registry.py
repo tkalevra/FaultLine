@@ -1,7 +1,13 @@
+import uuid
 import psycopg2
 import structlog
 
 log = structlog.get_logger()
+
+
+def _make_surrogate(user_id: str, name: str) -> str:
+    """Generate immutable UUID v5 surrogate for an entity."""
+    return str(uuid.uuid5(uuid.UUID(user_id), name.lower().strip())).lower()
 
 class EntityRegistry:
     """
@@ -20,20 +26,18 @@ class EntityRegistry:
 
     def resolve(self, user_id: str, name: str) -> str:
         """
-        Resolve a name or alias to its canonical entity ID.
+        Resolve a name or alias to its canonical entity ID (UUID surrogate).
         If name is a known alias, returns the canonical ID.
-        If name is already canonical, returns it unchanged.
-        If name is unknown, registers it as a new entity and returns it.
+        If name is already a UUID, returns it unchanged.
+        If name is unknown, generates a UUID v5 surrogate and registers it.
         """
         name = name.lower().strip()
         if not name:
             raise ValueError("Entity name cannot be empty")
 
-        # Special case: resolve 'user' to canonical identity if known
+        # Special case: 'user' resolves directly to the user_id (OWUI UUID)
         if name == "user":
-            canonical = self.get_canonical_for_user(user_id)
-            if canonical:
-                return canonical
+            return user_id
 
         with self.db_conn.cursor() as cur:
             # Check if it's a known alias
@@ -46,7 +50,7 @@ class EntityRegistry:
             if row:
                 return row[0]
 
-            # Check if it's already a canonical entity
+            # Check if it's already a canonical UUID (exact match)
             cur.execute(
                 "SELECT id FROM entities WHERE user_id = %s AND id = %s",
                 (user_id, name),
@@ -55,16 +59,23 @@ class EntityRegistry:
             if row:
                 return row[0]
 
-            # Unknown — register as new canonical entity
+            # Unknown — generate UUID v5 surrogate and register
+            surrogate = _make_surrogate(user_id, name)
             cur.execute(
                 "INSERT INTO entities (id, user_id, entity_type) "
                 "VALUES (%s, %s, 'unknown') "
                 "ON CONFLICT (id, user_id) DO NOTHING",
-                (name, user_id),
+                (surrogate, user_id),
+            )
+            cur.execute(
+                "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
+                "VALUES (%s, %s, %s, true) "
+                "ON CONFLICT (user_id, alias) DO NOTHING",
+                (surrogate, user_id, name),
             )
             self.db_conn.commit()
-            log.info("entity_registry.registered", entity=name, user_id=user_id)
-            return name
+            log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
+            return surrogate
 
     def register_alias(
         self,
@@ -74,14 +85,13 @@ class EntityRegistry:
         is_preferred: bool = False,
     ) -> None:
         """
-        Register an alias for a canonical entity.
+        Register an alias for a canonical entity (UUID).
+        canonical is a UUID string (already lowercase).
+        alias is a display name.
         If is_preferred=True, clears other preferred aliases for this entity.
         """
-        canonical = canonical.lower().strip()
+        canonical = canonical.strip()
         alias = alias.lower().strip()
-
-        if canonical == alias:
-            return
 
         with self.db_conn.cursor() as cur:
             # Ensure canonical entity exists
@@ -122,50 +132,9 @@ class EntityRegistry:
             row = cur.fetchone()
             return row[0] if row else canonical
 
-    def get_all_aliases(self, user_id: str, canonical: str) -> list[str]:
-        """Return all aliases for a canonical entity."""
-        with self.db_conn.cursor() as cur:
-            cur.execute(
-                "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s",
-                (user_id, canonical),
-            )
-            return [row[0] for row in cur.fetchall()]
-
-    def get_canonical_for_user(self, user_id: str) -> str | None:
+    def get_canonical_for_user(self, user_id: str) -> str:
         """
         Return the canonical entity ID for this user.
-        Follows the chain: user → also_known_as → canonical_name
-        The canonical name is the one that has a preferred alias (e.g. christopher → chris).
-        Falls back to any also_known_as target if no preferred chain exists.
+        The OWUI user UUID is the surrogate for the user entity.
         """
-        import structlog as _structlog
-        _log = _structlog.get_logger()
-        with self.db_conn.cursor() as cur:
-            # Get all entities linked to 'user' via also_known_as
-            cur.execute(
-                "SELECT object_id FROM facts "
-                "WHERE user_id = %s AND subject_id = 'user' "
-                "AND rel_type = 'also_known_as' "
-                "ORDER BY is_preferred_label DESC, id ASC",
-                (user_id,),
-            )
-            candidates = [row[0] for row in cur.fetchall()]
-            _log.info("registry.canonical_candidates", user_id=user_id, candidates=candidates)
-
-            if not candidates:
-                return None
-
-            # Prefer the candidate that has a preferred alias in entity_aliases
-            for candidate in candidates:
-                cur.execute(
-                    "SELECT alias FROM entity_aliases "
-                    "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
-                    "LIMIT 1",
-                    (user_id, candidate),
-                )
-                if cur.fetchone():
-                    return candidate
-
-            # Fall back to first candidate
-            return candidates[0]
+        return user_id
