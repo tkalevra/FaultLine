@@ -57,6 +57,48 @@ def fetch_unsynced(db_conn, confidence_threshold: float = 0.0) -> list[dict]:
     ]
 
 
+def resolve_display_names_for_facts(db_conn, rows: list[dict]) -> list[dict]:
+    """
+    For each fact row, resolve subject_id and object_id UUID surrogates
+    to their preferred display names via entity_aliases.
+    Falls back to the UUID string if no alias is found.
+    Returns a new list of dicts with added 'subject_display' and 'object_display' keys.
+    """
+    if not rows:
+        return rows
+
+    # Collect all unique entity IDs across all rows
+    entity_ids = set()
+    for row in rows:
+        entity_ids.add(row["subject_id"])
+        entity_ids.add(row["object_id"])
+
+    # Batch lookup preferred aliases
+    display_map = {}
+    try:
+        placeholders = ",".join(["%s"] * len(entity_ids))
+        with db_conn.cursor() as cur:
+            cur.execute(
+                f"SELECT entity_id, alias FROM entity_aliases "
+                f"WHERE entity_id IN ({placeholders}) AND is_preferred = true",
+                list(entity_ids),
+            )
+            for entity_id, alias in cur.fetchall():
+                display_map[entity_id] = alias
+    except Exception as e:
+        log.warning(f"re_embedder.display_name_lookup_failed: {e}")
+
+    # Attach display names to each row
+    resolved = []
+    for row in rows:
+        resolved.append({
+            **row,
+            "subject_display": display_map.get(row["subject_id"], row["subject_id"]),
+            "object_display": display_map.get(row["object_id"], row["object_id"]),
+        })
+    return resolved
+
+
 def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bool = True) -> list[float] | None:
     """
     Embed text using the nomic-embed-text model via the Ollama/Qwen API.
@@ -166,8 +208,8 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                         "id": int(row["id"]),
                         "vector": vector,
                         "payload": {
-                            "subject": row["subject_id"],
-                            "object": row["object_id"],
+                            "subject": row.get("subject_display", row["subject_id"]),
+                            "object": row.get("object_display", row["object_id"]),
                             "rel_type": row["rel_type"],
                             "provenance": row["provenance"],
                             "user_id": row["user_id"],
@@ -262,9 +304,12 @@ def main():
                             if not ensure_collection(col, qdrant_url):
                                 log.error(f"re_embedder.collection_unavailable collection={col}")
 
+                    # Resolve display names for all rows in batch before embedding
+                    rows = resolve_display_names_for_facts(db, rows)
+
                 for row in rows:
                     try:
-                        text = f"{row['subject_id']} {row['rel_type']} {row['object_id']}"
+                        text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
                         vector = embed_text(text, qwen_api_url)
                         collection = derive_collection(row["user_id"])
 
