@@ -98,20 +98,7 @@ def main():
                 if cur.rowcount:
                     print(f"facts.object_id: {old_id!r} -> {new_id} ({cur.rowcount} rows)")
 
-            # ── Step 4: Rewrite entity_aliases.entity_id ──────────────────
-            for old_id, new_id in surrogate_map.items():
-                if old_id == new_id:
-                    continue
-                cur.execute(
-                    "UPDATE entity_aliases SET entity_id = %s "
-                    "WHERE user_id = %s AND entity_id = %s",
-                    (new_id, USER_ID, old_id)
-                )
-                if cur.rowcount:
-                    print(f"entity_aliases.entity_id: {old_id!r} -> {new_id} ({cur.rowcount} rows)")
-
-            # ── Step 5: Insert new surrogate rows into entities ────────────
-            # Then delete old display-name rows
+            # ── Step 4: Insert all new surrogate rows into entities ─────────
             for old_id, new_id in surrogate_map.items():
                 if old_id == new_id:
                     continue
@@ -129,6 +116,22 @@ def main():
                     (new_id, USER_ID, entity_type)
                 )
 
+            # ── Step 5: Rewrite entity_aliases.entity_id ──────────────────
+            for old_id, new_id in surrogate_map.items():
+                if old_id == new_id:
+                    continue
+                cur.execute(
+                    "UPDATE entity_aliases SET entity_id = %s "
+                    "WHERE user_id = %s AND entity_id = %s",
+                    (new_id, USER_ID, old_id)
+                )
+                if cur.rowcount:
+                    print(f"entity_aliases.entity_id: {old_id!r} -> {new_id} ({cur.rowcount} rows)")
+
+            # ── Step 6: Register display names as aliases in entity_aliases ─
+            for old_id, new_id in surrogate_map.items():
+                if old_id == new_id:
+                    continue
                 # Register the display name as an alias if not already present
                 cur.execute(
                     "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
@@ -136,7 +139,7 @@ def main():
                     (new_id, USER_ID, old_id.lower().strip(), True)
                 )
 
-            # ── Step 6: Delete old display-name entity rows ────────────────
+            # ── Step 7: Delete old display-name entity rows ────────────────
             for old_id, new_id in surrogate_map.items():
                 if old_id == new_id:
                     continue
@@ -147,7 +150,7 @@ def main():
                 if cur.rowcount:
                     print(f"entities: deleted old row {old_id!r}")
 
-            # ── Step 7: Mark all facts for re-embedding ────────────────────
+            # ── Step 8: Mark all facts for re-embedding ────────────────────
             cur.execute(
                 "UPDATE facts SET qdrant_synced = false WHERE user_id = %s",
                 (USER_ID,)
