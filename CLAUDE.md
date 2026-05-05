@@ -19,8 +19,18 @@ OpenWebUI inlet filter
   │     └─▶ POST /ingest (fire-and-forget)
   │           └─▶ GLiNER2 extract_json   typed schema edge extraction (fallback/override)
   │                 └─▶ WGMValidationGate   ontology + conflict check → status
-  │                       └─▶ FactStoreManager.commit()  INSERT INTO facts
-  │                             └─▶ re_embedder (background) → Qdrant upsert
+  │                       └─▶ Fact Classification (Phase 4)
+  │                             ├─▶ Class A (identity/structural)
+  │                             │     └─▶ FactStoreManager.commit()  INSERT INTO facts immediately
+  │                             │           └─▶ re_embedder (background) → Qdrant upsert
+  │                             ├─▶ Class B (behavioral/contextual)
+  │                             │     └─▶ _commit_staged()  INSERT INTO staged_facts
+  │                             │           └─▶ re_embedder promotes to facts when confirmed_count >= 3
+  │                             │                 └─▶ then upserts to Qdrant
+  │                             └─▶ Class C (ephemeral/novel)
+  │                                   └─▶ _commit_staged()  INSERT INTO staged_facts
+  │                                         └─▶ re_embedder upserts to Qdrant
+  │                                               └─▶ expires after 30 days if unconfirmed
   │
   └─▶ POST /query (synchronous, before model sees message)
         ├─▶ PostgreSQL baseline facts (always returned for known identity)
@@ -47,6 +57,52 @@ If neither condition is met, `will_ingest = False`. `will_query` is always `True
 **Memory injection gate:**
 Facts are filtered by query intent category (location, family, work, pets, physical, identity) before the memory block is built. Additionally, facts below `MIN_INJECT_CONFIDENCE` (default 0.5) are silently excluded. Memory is injected only when facts survive the gate, positioned immediately before the last user message (not appended) for better context proximity.
 
+## Fact Classification (Phase 4)
+
+Facts are classified at ingest time into three classes, each with different write paths and lifecycle:
+
+**Class A — Identity/Structural** (write-through to PostgreSQL immediately)
+- pref_name, also_known_as, same_as
+- parent_of, child_of, spouse, sibling_of
+- born_on, born_in, has_gender, nationality
+- instance_of, subclass_of
+- **Confidence**: 1.0 if user-stated or correction, 0.8 if llm_inferred
+- **Lifecycle**: Committed immediately to `facts` table
+- **User corrections always Class A** regardless of rel_type
+- **Qdrant**: Synced by re_embedder after insertion
+
+**Class B — Behavioral/Contextual** (staged, promoted on confirmation)
+- lives_at, lives_in, works_for, occupation
+- educated_at, owns, likes, dislikes, prefers
+- friend_of, knows, met, located_in
+- related_to, has_pet, part_of, created_by
+- **Confidence**: 0.8 if user_stated, 0.6 if llm_inferred
+- **Lifecycle**: Staged to `staged_facts` table with `confirmed_count=0`
+  - Confirmed facts (same subject/object/rel_type) increment `confirmed_count`
+  - Promoted to `facts` when `confirmed_count >= 3`
+  - Then synced to Qdrant
+  - **TTL**: Promoted facts persist indefinitely
+- **Qdrant**: Synced both as staged and after promotion
+
+**Class C — Ephemeral/Novel** (staged, expiring without confirmation)
+- Anything not in A or B
+- Engine-generated types (rel_type with `engine_generated=true`)
+- Confidence < 0.6
+- Novel types rejected by Qwen
+- **Confidence**: 0.4 if llm_inferred
+- **Lifecycle**: Staged to `staged_facts` with `expires_at = now() + 30 days`
+  - No promotion path
+  - Expired facts deleted from `staged_facts` by re_embedder
+  - Qdrant points deleted when staged fact expires
+  - **TTL**: 30 days from first_seen_at or last confirmation
+- **Qdrant**: Synced while active, deleted on expiry
+
+Confidence values determine class assignment:
+- User corrections (`is_correction=True`) → always Class A (confidence=1.0)
+- User-stated facts (`fact_provenance="user_stated"`) → higher confidence (0.8)
+- LLM-inferred facts (`fact_provenance="llm_inferred"`) → lower confidence (0.6)
+- Engine-generated types or confidence < 0.6 → Class C
+
 ## Query / Retrieval Path & Filtering
 
 `/query` runs three parallel sources and merges them before returning:
@@ -66,17 +122,18 @@ Memory injection happens in the **inlet** (before the model sees the message). T
 
 | File | Role |
 |---|---|
-| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract` endpoints, GLiNER2 lifecycle, Qdrant cleanup |
-| `src/api/models.py` | Pydantic models — `IngestRequest`, `QueryRequest`, `RetractRequest`, `RetractResponse` |
+| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract` endpoints, GLiNER2 lifecycle, fact classification (_classify_fact, _commit_staged), Qdrant cleanup |
+| `src/api/models.py` | Pydantic models — `IngestRequest`, `QueryRequest`, `RetractRequest`, `RetractResponse`, `IngestResponse.staged`, `FactResult.fact_class` + `provenance` |
 | `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection |
 | `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
 | `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers and label maps |
 | `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — canonical ID assignment, alias tracking, preferred name resolution |
-| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts, upserts to Qdrant, deletes superseded facts |
+| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts/staged_facts, upserts to Qdrant, promotes Class B, expires Class C, deletes superseded facts |
 | `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction detection + Qwen extraction, ingest, query, relevance filtering, confidence gating |
 | `openwebui/faultline_function.py` | OpenWebUI **Function** (tool call) — explicit `store_fact()` with Qwen rewrite |
 | `migrations/001_create_facts.sql` | Schema: `facts` table + `qdrant_synced` column + lowercase trigger |
 | `migrations/007_correction_behavior.sql` | Correction behavior enum (supersede/hard_delete/immutable) per rel_type |
+| `migrations/012_staged_facts.sql` | Phase 4: `staged_facts` table for Class B/C facts, promotion/expiration indexes, fact_class + fact_provenance columns |
 
 ## GLiNER2 Extraction
 
@@ -184,22 +241,42 @@ Edges with `rel_type` not in the ontology trigger a Qwen approval call. If Qwen 
 ## Database Schema & Fact Lifecycle
 
 Primary tables:
-- `facts(id, user_id, subject_id, object_id, rel_type, provenance, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`. Soft-delete via `superseded_at IS NOT NULL`.
+- `facts(id, user_id, subject_id, object_id, rel_type, provenance, fact_provenance, fact_class, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — relationship edges. Unique on `(user_id, subject_id, object_id, rel_type)`. Soft-delete via `superseded_at IS NOT NULL`. `fact_class` tracks which tier fact came from (always 'A' or promoted 'B'). `fact_provenance` is 'user_stated' or 'llm_inferred'.
+- `staged_facts(id, user_id, subject_id, object_id, rel_type, fact_class, provenance, confidence, confirmed_count, first_seen_at, last_seen_at, expires_at, promoted_at, qdrant_synced)` — short-term memory for Class B and C facts. Unique on `(user_id, subject_id, object_id, rel_type)`. Class B promoted when `confirmed_count >= 3`; Class C auto-deleted when `expires_at <= now()`.
 - `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts (`age`, `height`, `weight`, `born_on`, `born_in`, `nationality`, `occupation`, `has_gender`) routed here at ingest instead of `facts`.
 - `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry. **Note**: `entity_aliases` stores all known names for an entity (not secondary aliases), with one marked `is_preferred`. Rename to `entity_names` planned.
 - `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior)` — live ontology with correction behavior (supersede/hard_delete/immutable), loaded at startup.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
 
-**Fact lifecycle:**
-- **Creation**: ingest → resolve subject/object to preferred names via `get_preferred_name()` → `INSERT INTO facts` with `confidence=1.0`, `qdrant_synced=false`, `superseded_at=NULL`. This ensures facts use active (preferred) identities. Legal/historical names remain in `entity_aliases` for reference.
-- **Confirmation**: re-confirm same `(user_id, subject_id, object_id, rel_type)` → `confirmed_count += 1`, `last_seen_at = now()`, `qdrant_synced` unchanged
-- **Retraction (user-driven)**: `/retract` → behavior determined by `rel_types.correction_behavior`:
-  - `"supersede"` (default): `superseded_at = now()`, `qdrant_synced = false` (re_embedder deletes Qdrant async)
-  - `"hard_delete"`: SQL DELETE from facts, inline Qdrant delete call
-  - `"immutable"`: no-op, user gets rejection notice
-- **Sync to Qdrant**: re_embedder polls for `qdrant_synced = false`, upserts new facts or deletes superseded ones, marks `qdrant_synced = true`
+**Fact lifecycle (Phase 4):**
 
-A DB trigger lowercases `subject_id`, `object_id`, and `rel_type` on every INSERT/UPDATE to `facts`.
+**Class A (Identity/Structural)**
+1. **Classification**: `_classify_fact()` assigns Class A based on rel_type or correction flag
+2. **Creation**: `FactStoreManager.commit()` → `INSERT INTO facts` with `confidence=0.8|1.0`, `fact_class='A'`, `qdrant_synced=false`, `superseded_at=NULL`
+3. **Confirmation**: Re-confirm same `(user_id, subject_id, object_id, rel_type)` → `confirmed_count += 1`, `last_seen_at = now()`, `qdrant_synced` unchanged
+4. **Retraction**: `/retract` → behavior determined by `rel_types.correction_behavior`:
+   - `"supersede"`: `superseded_at = now()`, `qdrant_synced = false` (async Qdrant delete)
+   - `"hard_delete"`: DELETE from facts, inline Qdrant delete
+   - `"immutable"`: no-op, user rejection
+5. **Sync**: re_embedder polls `qdrant_synced = false`, upserts to Qdrant, marks `qdrant_synced = true`
+
+**Class B (Behavioral/Contextual)**
+1. **Classification**: `_classify_fact()` assigns Class B based on rel_type in `_CLASS_B_REL_TYPES`
+2. **Staging**: `_commit_staged()` → `INSERT INTO staged_facts` with `confidence=0.8`, `fact_class='B'`, `expires_at=now()+30d`
+3. **Confirmation**: Re-confirm same surrogate edge → `confirmed_count += 1`, `last_seen_at = now()`, `expires_at = now()+30d` (reset TTL)
+4. **Promotion** (re_embedder): When `confirmed_count >= 3` → `promote_staged_facts()` → INSERT into facts, mark `promoted_at = now()`
+5. **Sync**: re_embedder upserts to Qdrant as staged, then again after promotion
+6. **Expiry**: If `promoted_at IS NULL` after 30 days, fact is auto-deleted by `expire_staged_facts()`
+
+**Class C (Ephemeral/Novel)**
+1. **Classification**: `_classify_fact()` assigns Class C (engine_generated, confidence < 0.6, or unknown rel_type)
+2. **Staging**: `_commit_staged()` → `INSERT INTO staged_facts` with `confidence=0.4`, `fact_class='C'`, `expires_at=now()+30d`
+3. **No promotion path**: Stays in staged_facts or expires
+4. **Sync**: re_embedder upserts to Qdrant while active
+5. **Expiry**: re_embedder deletes from both `staged_facts` and Qdrant when `expires_at <= now()`
+
+DB triggers:
+- Lowercase `subject_id`, `object_id`, `rel_type` on every INSERT/UPDATE to `facts` and `staged_facts`
 
 ## Running / Developing
 
