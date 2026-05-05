@@ -698,6 +698,7 @@ def query(request: QueryRequest):
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
         preferred = registry.get_preferred_name(user_id, user_surrogate)
+        log.info("query.debug_preferred", preferred=preferred, user_surrogate=user_surrogate, user_id=user_id)
         if not preferred or preferred == user_surrogate:
             preferred = "user"
         preferred_names = {"user": preferred}
