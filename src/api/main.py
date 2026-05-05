@@ -48,6 +48,51 @@ _SCALAR_REL_TYPES = {
     "occupation", "has_gender", "height", "weight",
 }
 
+# Fact class taxonomy — determines write path at ingest time
+_CLASS_A_REL_TYPES = frozenset({
+    "pref_name", "also_known_as", "same_as",
+    "parent_of", "child_of", "spouse", "sibling_of",
+    "born_on", "born_in", "has_gender", "nationality",
+    "instance_of", "subclass_of",
+})
+
+_CLASS_B_REL_TYPES = frozenset({
+    "lives_at", "lives_in", "works_for", "occupation",
+    "educated_at", "owns", "likes", "dislikes", "prefers",
+    "friend_of", "knows", "met", "located_in",
+    "related_to", "has_pet", "part_of", "created_by",
+})
+
+# Class C = anything not in A or B, engine_generated types,
+# novel types, or confidence < 0.6
+
+def _classify_fact(
+    rel_type: str,
+    confidence: float,
+    engine_generated: bool = False,
+    is_correction: bool = False,
+) -> str:
+    """
+    Classify a fact as A, B, or C based on rel_type, confidence, and provenance.
+
+    Class A: Identity/structural facts — write-through to PostgreSQL immediately.
+    Class B: Behavioral/contextual facts — staged, promote on confirmation.
+    Class C: Ephemeral/novel facts — staged, expire after 30 days.
+
+    Corrections from the user are always promoted to Class A regardless of rel_type.
+    Engine-generated (novel) types are always Class C regardless of rel_type.
+    """
+    if is_correction:
+        return "A"
+    if engine_generated or confidence < 0.6:
+        return "C"
+    rt = rel_type.lower().strip()
+    if rt in _CLASS_A_REL_TYPES:
+        return "A"
+    if rt in _CLASS_B_REL_TYPES:
+        return "B"
+    return "C"
+
 def _coerce_scalar(value: str) -> tuple:
     """
     Coerce a scalar value string to (value_text, value_int, value_float, value_date).
@@ -94,6 +139,44 @@ def _build_rel_type_constraint(dsn: str) -> str:
     except Exception as e:
         log.warning("startup.constraint_builder_failed", error=str(e))
         return ""
+
+def _commit_staged(
+    db_conn,
+    rows: list[tuple],
+    fact_class: str,
+    confidence: float,
+) -> int:
+    """
+    Insert or update rows in staged_facts.
+    rows: list of (user_id, subject_id, object_id, rel_type, provenance)
+    On conflict, increments confirmed_count and refreshes last_seen_at and expires_at.
+    Returns count of rows attempted.
+    """
+    count = 0
+    try:
+        with db_conn.cursor() as cur:
+            for user_id, subject, obj, rel_type, prov in rows:
+                cur.execute(
+                    "INSERT INTO staged_facts"
+                    " (user_id, subject_id, object_id, rel_type, fact_class,"
+                    "  provenance, confidence, expires_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, now() + interval '30 days')"
+                    " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
+                    " DO UPDATE SET"
+                    "   confirmed_count = staged_facts.confirmed_count + 1,"
+                    "   last_seen_at    = now(),"
+                    "   expires_at      = now() + interval '30 days',"
+                    "   confidence      = GREATEST(staged_facts.confidence, EXCLUDED.confidence),"
+                    "   qdrant_synced   = false",
+                    (user_id, subject, obj, rel_type, fact_class, prov, confidence),
+                )
+                count += 1
+        db_conn.commit()
+        return count
+    except Exception as e:
+        db_conn.rollback()
+        log.warning("ingest.staged_commit_failed", err=str(e))
+        return 0
 
 def get_gliner_model():
     return _gliner2_model
@@ -343,7 +426,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     edges = list(edges_dict.values())
 
-    facts, committed = [], 0
+    facts, committed, staged = [], 0, 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         try:
@@ -496,7 +579,32 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     status = "valid"
                 else:
                     status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
-                facts.append(FactResult(subject=fact_subject, object=canonical_object, rel_type=edge.rel_type, status=status))
+
+                # Look up whether this rel_type is engine_generated
+                is_engine_generated = False
+                if hasattr(_rel_type_registry, 'get') and _rel_type_registry:
+                    rt_meta = _rel_type_registry.get(edge.rel_type.lower(), {})
+                    is_engine_generated = rt_meta.get("engine_generated", False)
+
+                edge_confidence = 1.0 if edge.is_correction else (
+                    0.8 if edge.fact_provenance == "user_stated" else 0.6
+                )
+
+                fact_class = _classify_fact(
+                    edge.rel_type,
+                    edge_confidence,
+                    engine_generated=is_engine_generated,
+                    is_correction=edge.is_correction,
+                )
+
+                facts.append(FactResult(
+                    subject=fact_subject,
+                    object=canonical_object,
+                    rel_type=edge.rel_type,
+                    status=status,
+                    fact_class=fact_class,
+                    provenance=edge.fact_provenance,
+                ))
                 if status == "valid":
                     # pref_name edges are always preferred by definition — the rel_type itself
                     # is the preference signal. also_known_as requires explicit signal to be preferred.
@@ -507,22 +615,45 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             edge.rel_type.lower() == "also_known_as" and
                             (has_preferred or edge.is_preferred_label or edge.is_correction)
                         )
-                    rows.append((req.user_id, fact_subject, canonical_object, edge.rel_type, req.source, is_preferred))
+                    rows.append((
+                        req.user_id, fact_subject, canonical_object,
+                        edge.rel_type, req.source, is_preferred,
+                        fact_class, edge_confidence, is_engine_generated
+                    ))
 
             if rows:
-                # Resolve subject/object to their preferred names before committing
-                # This ensures facts are stored with active identities, not legal names
-                # EXCEPT: never resolve "user" to a display name — "user" is the stable anchor.
-                # Preferred name resolution is for rendering only, not for storage.
-                # Resolving "user" here would undo the normalization applied earlier
-                # and store facts under a mutable alias instead of the stable placeholder.
-                resolved_rows = []
-                for user_id, subject, obj, rel_type, source, is_preferred in rows:
-                    pref_subject = subject if subject == "user" else (registry.get_preferred_name(user_id, subject) if subject else subject)
-                    pref_object = obj if obj == "user" else (registry.get_preferred_name(user_id, obj) if obj else obj)
-                    resolved_rows.append((user_id, pref_subject, pref_object, rel_type, source, is_preferred))
+                # Split rows by fact class — surrogates go directly to commit, no display name resolution
+                # Display names are resolved at READ time only (_resolve_display_names in /query)
+                class_a_rows = []
+                class_b_rows = []
+                class_c_rows = []
 
-                committed = manager.commit(resolved_rows)
+                for user_id, subject, obj, rel_type, source, is_preferred, fact_class, _, is_engine_generated in rows:
+                    if fact_class == "A":
+                        class_a_rows.append((user_id, subject, obj, rel_type, source, is_preferred))
+                    elif fact_class == "B":
+                        class_b_rows.append((user_id, subject, obj, rel_type, source))
+                    else:
+                        class_c_rows.append((user_id, subject, obj, rel_type, source))
+
+                committed = 0
+                staged = 0
+                if class_a_rows:
+                    committed += manager.commit(class_a_rows)
+                    log.info("ingest.class_a_committed", count=len(class_a_rows))
+
+                if class_b_rows:
+                    staged_b = _commit_staged(db, class_b_rows, "B", confidence=0.8)
+                    staged += staged_b
+                    log.info("ingest.class_b_staged", count=staged_b)
+
+                if class_c_rows:
+                    staged_c = _commit_staged(db, class_c_rows, "C", confidence=0.4)
+                    staged += staged_c
+                    log.info("ingest.class_c_staged", count=staged_c)
+
+                # Use class_a_rows for downstream corrections processing
+                resolved_rows = class_a_rows
 
                 # Build a map of edges to identify which rows are corrections
                 # Key is (original_subject, object, rel_type); value is whether it's a correction
@@ -676,8 +807,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     db.commit()
         finally: db.close()
 
-    return IngestResponse(status="valid", committed=committed, 
-                          entities=[EntityResult(entity=r["entity"], label=r["type"], canonical_id=r["canonical_id"]) for r in resolved], 
+    return IngestResponse(status="valid", committed=committed, staged=staged,
+                          entities=[EntityResult(entity=r["entity"], label=r["type"], canonical_id=r["canonical_id"]) for r in resolved],
                           facts=facts)
 
 @app.post("/query")
