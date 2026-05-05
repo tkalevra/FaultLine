@@ -9,6 +9,7 @@ class EdgeInput(BaseModel):
     rel_type: str
     is_preferred_label: bool = False
     is_correction: bool = False
+    fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
 
 
 class IngestRequest(BaseModel):
@@ -36,11 +37,14 @@ class FactResult(BaseModel):
     object: str
     rel_type: str
     status: str
+    fact_class: str = "A"  # A, B, or C
+    provenance: str = "llm_inferred"
 
 
 class IngestResponse(BaseModel):
     status: str
     committed: int
+    staged: int = 0  # Facts written to staged_facts (Class B + C)
     entities: list[EntityResult]
     facts: list[FactResult]
 
