@@ -91,73 +91,34 @@ _TRIPLE_SYSTEM_PROMPT = """\
 You are a relationship fact extractor for a personal knowledge graph.
 Output ONLY a raw JSON array. No markdown, no explanation, no code fences.
 
-RULES:
+ENTITY RULES:
+- NEVER use pronouns (i/me/my/we/our/he/she/her/his/they) as subject or object.
+- Third-person pronouns refer to the nearest named entity, NEVER to the user.
+- Entity names must be proper nouns or named entities only, lowercase.
+- First-person (I/my/we) → subject="user" unless a named entity is established.
 
-ENTITY NAMING RULES (strictly enforced):
-- NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- Third-person pronouns ("her", "his", "she", "he") refer to the nearest named entity in the sentence — NEVER to the user/speaker. Never emit subject="user" for any triple derived from third-person text.
-- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y", "her/his preferred name is Y"), the subject is always the named person (X), never the speaker. Use pref_name: {"subject":"x","object":"y","rel_type":"pref_name"}.
-- Concrete example: "her name is Marla, she prefers to be called Mars" → [{"subject":"marla","object":"mars","rel_type":"pref_name","low_confidence":false}]. This is NOT a triple about the user.
-- Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
+RELATIONSHIP RULES:
+- parent_of: subject IS the parent. child_of: subject IS the child.
+- NEVER emit child_of with the speaker as subject. Use parent_of instead.
+- Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
+- For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
 
-RELATIONSHIP RULES (strictly enforced):
-- "child_of" means the subject IS the child, the object IS the parent. Example: "henry child_of thomas" means henry is thomas's child.
-- "parent_of" means the subject IS the parent, the object IS the child. Example: "thomas parent_of henry" means thomas is henry's parent.
-- Never emit child_of or parent_of between two siblings. If two entities share the same parent, emit sibling_of between them instead.
-- For "X and Y are children of Z", emit three triples: Z parent_of X, Z parent_of Y, X sibling_of Y.
-- Directionality is absolute. When in doubt, prefer parent_of with the parent as subject.
-- NEVER emit child_of where the subject is the person speaking or the established user identity. If the user says "I have children" or "we have children", emit parent_of with the user as subject, never child_of with the user as subject.
+REL_TYPE REFERENCE:
+- also_known_as: nickname or alternate name.
+- pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). Subject is always the named person, never "user".
+- is_a: type or category. has_pet: person owns an animal (NEVER a person).
+- Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight.
+- Use snake_case. Other types allowed if none fit.
 
-1. Extract ALL factual assertions — people, animals, objects, places, preferences.
-2. Entities must be specific names or nouns. Lowercase all values.
-3. rel_type must be snake_case. Use the most precise label that fits.
-   Common types: is_a, has_pet, parent_of, child_of, spouse, sibling_of,
-   also_known_as, pref_name, works_for, likes, dislikes, prefers, lives_at, owns,
-   age, height, weight.
-   You may use other snake_case types if none of the above fit.
-4. also_known_as = a nickname, alias, or alternate name an entity is known by.
-   pref_name = the name a person PREFERS to be called ("prefers to be called", "goes by", "preferred name is").
-   Use pref_name when the text signals a preference; use also_known_as for a simple alternate name.
-5. is_a = type or category (e.g. "dog breed").
-6. has_pet = person owns an animal (e.g. "we have a pet named X"). ONLY use has_pet for animals — NEVER for people.
-7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
-   between the descriptor and the name.
-8. Pronoun resolution: replace he/she/it with the named entity if clear. "he/she/her/his" always refer to a named entity — NEVER to "user".
-9. If unsure, set "low_confidence": true. Never return empty if facts exist.
-10. First-person "my/our/we/I/me" refers to the named user entity if established,
-    otherwise use subject "user".
-11. FIRST-PERSON SELF-IDENTIFICATION ONLY: When the message contains an EXPLICIT first-person
-    self-identification ("I am X", "I'm X", "my name is X", "call me X", "people call me X"),
-    emit an also_known_as triple:
-    {"subject":"user","object":"x","rel_type":"also_known_as","low_confidence":false}
-    where X is the proper name, lowercased. The subject is ALWAYS "user", the object is ALWAYS the name.
-    THIS RULE APPLIES ONLY TO FIRST-PERSON TEXT. NEVER apply it to third-person text.
-    WRONG: "she prefers to be called Mars" → {"subject":"user","object":"mars","rel_type":"also_known_as"} ✗
-    CORRECT: "she prefers to be called Mars" (she=Marla from context) → {"subject":"marla","object":"mars","rel_type":"pref_name"} ✓
-    NEVER emit {"subject":"name","object":"user"} — that direction is always wrong.
-12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
-    emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
-    NEVER use a nickname or name as the age value.
-    If the sentence contains both an age AND a nickname (e.g. "my friend's age and nickname"),
-    emit TWO separate triples for the same entity:
-    {"subject":"entity_name","object":"12","rel_type":"age"}
-    {"subject":"entity_name","object":"nickname","rel_type":"also_known_as"}
-13. For height patterns ("X is 6ft tall", "X height 6'", "X stands 6 feet", "X is 6' tall"):
-    emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
-    Normalize units to feet/inches format. Use ' for feet, \" for inches.
-    For self-statements ("I am 6' tall", "I'm 6ft", "my height is 6 feet"), emit {"subject":"user","object":"6ft","rel_type":"height"}.
-14. For weight patterns ("X weighs 230lbs", "X weight 230 pounds", "X is 230lb"):
-    emit {"subject":"x","object":"230lb","rel_type":"weight"} where object is the weight in pounds (e.g. "230lb").
-    Normalize units to pounds.
-    For self-statements ("I weigh 230lbs", "I'm 230lb", "my weight is 230 pounds"), emit {"subject":"user","object":"230lb","rel_type":"weight"}.
-15. CORRECTION DETECTION: If the message indicates a prior fact was wrong
-    ("actually", "his name is", "it's supposed to be", "I meant",
-    "not X, it's Y", "correct that to"), extract the correction as a new
-    triple with the corrected value. Use prior context to resolve the
-    subject. Mark corrected triples with "is_correction": true.
-    e.g. "oh the correct name is X" (context: entity previously mentioned) →
-    {"subject":"entity_name","object":"correct_value","rel_type":"also_known_as",
-     "is_correction":true,"low_confidence":false}
+SELF-ID: Explicit first-person self-identification only ("I am X", "my name is X", "call me X"):
+→ {"subject":"user","object":"x","rel_type":"also_known_as","low_confidence":false}
+NEVER apply to third-person text. NEVER emit subject="user" from "she/he prefers...".
+
+CORRECTIONS: If text signals a correction ("actually", "not X it's Y", "I meant"):
+→ add "is_correction":true to the corrected triple.
+
+UNITS: age→number only. height→feet format (6ft, 5'10"). weight→pounds (230lb).
+Self-statements for height/weight → subject="user".
 
 OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
 If nothing to extract: []"""
@@ -192,6 +153,10 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
                 messages.extend(turns_to_add)
 
         if memory_facts:
+            _PREF_RELS = {"spouse", "parent_of", "child_of", "also_known_as", "pref_name", "sibling_of"}
+            _priority = [f for f in memory_facts if f.get("rel_type") in _PREF_RELS]
+            _other = [f for f in memory_facts if f.get("rel_type") not in _PREF_RELS]
+            memory_facts = (_priority + _other)[:10]
             entity_lines = []
             for f in memory_facts:
                 subj = f.get("subject", "")
@@ -601,8 +566,16 @@ class Filter:
                             print(f"[FaultLine Filter] retraction: {result}")
                         return body
 
+            _THIRD_PERSON_PREF_SIGNALS: frozenset[str] = frozenset({
+                "call her", "call him", "call them",
+                "her name is", "his name is", "their name is",
+            })
+            _has_third_person_pref = any(sig in text.lower() for sig in _THIRD_PERSON_PREF_SIGNALS)
+
             will_ingest = self.valves.INGEST_ENABLED and (
-                len(text.split()) >= 5 or bool(_IDENTITY_RE.search(text))
+                len(text.split()) >= 5
+                or bool(_IDENTITY_RE.search(text))
+                or _has_third_person_pref
             )
             will_query = self.valves.QUERY_ENABLED
 
@@ -618,6 +591,15 @@ class Filter:
                     cached = _SESSION_MEMORY_CACHE.get(user_id)
                     if cached and (_time.time() - cached[0]) < _SESSION_MEMORY_TTL:
                         _, facts, preferred_names, canonical_identity, entity_attributes = cached
+                        raw_facts_for_extraction = list(facts)
+                        # Filter cached facts for this specific query
+                        _categories = self._categorize_query(text)
+                        _is_realtime = self._is_realtime_query(text)
+                        if _is_realtime:
+                            _categories.add("location")
+                        facts = self._filter_relevant_facts(
+                            facts, _categories, canonical_identity, is_realtime=_is_realtime
+                        )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id={user_id}")
                     else:
@@ -647,8 +629,21 @@ class Filter:
                             preferred_names = data.get("preferred_names", {})
                             canonical_identity = data.get("canonical_identity")
                             entity_attributes = data.get("attributes", {})
+
+                            # Store raw unfiltered facts in cache
                             _SESSION_MEMORY_CACHE[user_id] = (
                                 _time.time(), facts, preferred_names, canonical_identity, entity_attributes
+                            )
+
+                            raw_facts_for_extraction = list(facts)
+
+                            # Filtering happens after cache store, not before
+                            _categories = self._categorize_query(text)
+                            _is_realtime = self._is_realtime_query(text)
+                            if _is_realtime:
+                                _categories.add("location")
+                            facts = self._filter_relevant_facts(
+                                facts, _categories, canonical_identity, is_realtime=_is_realtime
                             )
 
                             if self.valves.ENABLE_DEBUG:
@@ -674,7 +669,7 @@ class Filter:
                 raw_triples = await rewrite_to_triples(
                     clean_text, self.valves, context=body.get("messages", []),
                     typed_entities=typed_entities if typed_entities else None,
-                    memory_facts=facts if facts else None,
+                    memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
                 )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
@@ -740,26 +735,20 @@ class Filter:
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
-                # Query-relevant filtering
-                _categories = self._categorize_query(text)
+                # Filtering already applied in cache hit/miss paths; use filtered facts directly
                 _is_realtime = self._is_realtime_query(text)
-                if _is_realtime:
-                    _categories.add("location")
-                filtered_facts = self._filter_relevant_facts(
-                    facts, _categories, canonical_identity, is_realtime=_is_realtime
-                )
 
                 # Inject whenever we have anything useful — let the model decide relevance
-                if filtered_facts or preferred_names or canonical_identity:
+                if facts or preferred_names or canonical_identity:
                     # Extract locations for temporal reasoning hint
                     locations = set()
-                    for f in filtered_facts:
+                    for f in facts:
                         if f.get("rel_type") in ("lives_at", "lives_in", "works_for"):
                             obj = f.get("object", "").strip()
                             if obj and len(obj) > 1:
                                 locations.add(obj)
                     memory_block = self._build_memory_block(
-                        filtered_facts, preferred_names, canonical_identity, entity_attributes,
+                        facts, preferred_names, canonical_identity, entity_attributes,
                         is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
                     )
                     if self.valves.ENABLE_DEBUG:

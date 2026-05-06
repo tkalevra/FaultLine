@@ -167,10 +167,13 @@ When `req.edges` are supplied (from the Qwen rewrite in the filter), they overri
 ## Qwen Triple Rewrite
 
 Both `faultline_tool.py` and `faultline_function.py` call an LM Studio endpoint before `/ingest` to convert natural language into structured JSON triples. Key constants at module level in both files:
-- `_TRIPLE_SYSTEM_PROMPT` — extraction rules and output schema
+- `_TRIPLE_SYSTEM_PROMPT` — concise extraction rules and output schema (prioritizes clarity over examples)
 - `rewrite_to_triples(text, valves)` — async, returns `[]` on any failure
 
-In the filter (`faultline_tool.py`), `rewrite_to_triples` also accepts `context` (prior conversation turns) and `typed_entities` (GLiNER2 pre-classifications from `/extract`) to guide Qwen's entity type reasoning.
+In the filter (`faultline_tool.py`), `rewrite_to_triples` also accepts:
+- `context` — prior conversation turns for pronoun resolution
+- `typed_entities` — GLiNER2 pre-classifications from `/extract` to guide entity type reasoning
+- `memory_facts` — stored facts for pronoun disambiguation; capped to 10 items with relationship facts (spouse, parent_of, child_of, also_known_as, pref_name, sibling_of) prioritized first to reduce token overhead
 
 Valves controlling Qwen: `QWEN_URL`, `QWEN_MODEL` (default `qwen/qwen3.5-9b`), `QWEN_TIMEOUT`.
 Payload always includes `"thinking": {"type": "disabled"}` to suppress Qwen3 chain-of-thought.

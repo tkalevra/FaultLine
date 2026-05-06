@@ -728,7 +728,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "UPDATE facts SET is_preferred_label = false, qdrant_synced = false "
                                 "WHERE user_id = %s AND subject_id = %s "
                                 "AND rel_type IN ('also_known_as', 'pref_name') "
-                                "AND object_id != %s AND superseded_at IS NULL",
+                                "AND object_id != %s AND superseded_at IS NULL "
+                                "AND hard_delete_flag = false",
                                 (_uid, _subj, _obj),
                             )
                             log.info("ingest.preferred_name_flipped",
@@ -850,6 +851,7 @@ def query(request: QueryRequest):
                 cur.execute(
                     f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                     f"WHERE user_id = %s AND superseded_at IS NULL "
+                    f"AND hard_delete_flag = false "
                     f"AND (valid_until IS NULL OR valid_until > now()) "
                     f"AND rel_type IN ({rel_placeholders}) "
                     f"AND (subject_id = %s OR object_id = %s) "
@@ -949,6 +951,7 @@ def query(request: QueryRequest):
                     _cur.execute(
                         "SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                         "WHERE user_id = %s AND superseded_at IS NULL "
+                        "AND hard_delete_flag = false "
                         "AND (valid_until IS NULL OR valid_until > now()) "
                         "AND (subject_id = %s OR object_id = %s) "
                         "AND rel_type NOT IN ('also_known_as', 'pref_name') "
@@ -974,6 +977,7 @@ def query(request: QueryRequest):
                         _cur.execute(
                             f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                             f"WHERE user_id = %s AND superseded_at IS NULL "
+                            f"AND hard_delete_flag = false "
                             f"AND (subject_id IN ({_rel_ph}) OR object_id IN ({_rel_ph})) "
                             f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
                             f"ORDER BY id",
