@@ -709,6 +709,33 @@ def main():
                     except Exception as e:
                         log.error(f"re_embedder.delete_failed fact_id={fact_id}: {e}")
 
+                # Hard delete pass — remove hard-deleted facts from Qdrant
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, user_id FROM facts "
+                        "WHERE hard_delete_flag = true AND qdrant_synced = false"
+                    )
+                    hard_deleted = cur.fetchall()
+
+                for fact_id, uid in hard_deleted:
+                    collection = derive_collection(uid)
+                    try:
+                        resp = httpx.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
+                            json={"points": [fact_id]},
+                            timeout=10.0,
+                        )
+                        if resp.status_code in (200, 404):
+                            with db.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE facts SET qdrant_synced = true WHERE id = %s",
+                                    (fact_id,),
+                                )
+                            db.commit()
+                            log.info(f"re_embedder.hard_deleted fact_id={fact_id} collection={collection}")
+                    except Exception as e:
+                        log.error(f"re_embedder.hard_delete_failed fact_id={fact_id}: {e}")
+
                 # Reconciliation pass — sync stale payloads and orphaned points
                 stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
                 if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
