@@ -1073,6 +1073,13 @@ def query(request: QueryRequest):
         # Resolve display names for Postgres facts before returning
         resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
         resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+        try:
+            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+            attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
+            _attr_db.close()
+        except Exception:
+            pass
         merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
         return {
             "status": "ok",
@@ -1092,6 +1099,13 @@ def query(request: QueryRequest):
             ensure_collection(collection, qdrant_url)
             resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            try:
+                _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+                _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
+                _attr_db.close()
+            except Exception:
+                pass
             merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
             return {
                 "status": "ok",
@@ -1104,6 +1118,13 @@ def query(request: QueryRequest):
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
             resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            try:
+                _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+                _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
+                _attr_db.close()
+            except Exception:
+                pass
             merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
             return {
                 "status": "ok",
