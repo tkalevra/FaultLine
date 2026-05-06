@@ -494,6 +494,15 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     log.info("ingest.subject_normalized_to_user",
                              original=canonical_subject, user_id=req.user_id)
                     canonical_subject = "user"
+                    # Ensure "user" anchor exists in entities table
+                    with db.cursor() as _cur:
+                        _cur.execute(
+                            "INSERT INTO entities (id, user_id, entity_type)"
+                            " VALUES (%s, %s, %s)"
+                            " ON CONFLICT (id, user_id) DO NOTHING",
+                            ("user", req.user_id, "Person"),
+                        )
+                    db.commit()
 
                 # Similarly for object, but only for rel_types where user can be an object.
                 # Skip also_known_as and pref_name because those edges must preserve the alias as object.
@@ -569,6 +578,15 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     entity=canonical_subject, value=canonical_object)
                         continue
                     try:
+                        # Ensure "user" anchor exists in entities table
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "INSERT INTO entities (id, user_id, entity_type)"
+                                " VALUES (%s, %s, %s)"
+                                " ON CONFLICT (id, user_id) DO NOTHING",
+                                ("user", req.user_id, "Person"),
+                            )
+                        db.commit()
                         with db.cursor() as _cur:
                             _cur.execute(
                                 "INSERT INTO entity_attributes"
@@ -1130,6 +1148,19 @@ def query(request: QueryRequest):
                 merged_facts.append(f)
                 pg_keys.add(key)
 
+        try:
+            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            _entity_ids = list(
+                {"user"} |
+                {f["subject"] for f in merged_facts} |
+                {f["object"] for f in merged_facts}
+            )
+            attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
+            _attr_db.close()
+        except Exception as _ae:
+            log.warning("query.qdrant_attributes_failed", error=str(_ae))
+            attributes = {}
+
         # Merge user entity_attributes as facts (born_on, age, height, etc.)
         for f in _attributes_to_facts(attributes):
             key = (f["subject"], f["object"], f["rel_type"])
@@ -1138,14 +1169,6 @@ def query(request: QueryRequest):
                 pg_keys.add(key)
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
-        try:
-            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _entity_ids = list({f["subject"] for f in merged_facts} | {f["object"] for f in merged_facts})
-            attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
-            _attr_db.close()
-        except Exception as _ae:
-            log.warning("query.qdrant_attributes_failed", error=str(_ae))
-            attributes = {}
 
         return {
             "status": "ok",
