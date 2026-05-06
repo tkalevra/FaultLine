@@ -405,6 +405,188 @@ def expire_staged_facts(db_conn, qdrant_url: str) -> int:
     return expired
 
 
+def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
+    """
+    Full reconciliation pass across all FaultLine Qdrant collections.
+    Scrolls all points, compares payloads to PostgreSQL ground truth,
+    deletes orphaned/superseded points, re-upserts diverged payloads.
+    Returns: {"deleted": int, "reupserted": int, "ok": int, "errors": int}
+    """
+    stats = {"deleted": 0, "reupserted": 0, "ok": 0, "errors": 0}
+
+    # Step 1: Discover all FaultLine collections
+    try:
+        response = httpx.get(f"{qdrant_url}/collections", timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        collections = [
+            c["name"] for c in data.get("result", {}).get("collections", [])
+            if c["name"].startswith("faultline-")
+        ]
+    except Exception as e:
+        log.error(f"re_embedder.reconcile_discover_failed: {e}")
+        return stats
+
+    if not collections:
+        log.info("re_embedder.reconcile no collections found")
+        return stats
+
+    log.info(f"re_embedder.reconcile_start collections={len(collections)}")
+
+    # Process each collection
+    for collection in collections:
+        try:
+            # Step 2: Scroll all points with payload but no vectors
+            all_points = []
+            next_page_offset = None
+
+            while True:
+                scroll_body = {
+                    "limit": 250,
+                    "with_payload": True,
+                    "with_vector": False,
+                }
+                if next_page_offset is not None:
+                    scroll_body["offset"] = next_page_offset
+
+                response = httpx.post(
+                    f"{qdrant_url}/collections/{collection}/points/scroll",
+                    json=scroll_body,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                points = data.get("result", {}).get("points", [])
+                all_points.extend(points)
+
+                next_page_offset = data.get("result", {}).get("next_page_offset")
+                if next_page_offset is None:
+                    break
+
+            if not all_points:
+                continue
+
+            log.info(f"re_embedder.reconcile_scroll collection={collection} count={len(all_points)}")
+
+            # Step 3: Batch fetch PostgreSQL ground truth
+            fact_ids = [
+                p["payload"]["fact_id"] for p in all_points
+                if "fact_id" in p.get("payload", {})
+            ]
+
+            if not fact_ids:
+                continue
+
+            pg_facts = {}
+            with db_conn.cursor() as cur:
+                placeholders = ",".join(["%s"] * len(fact_ids))
+                cur.execute(
+                    f"""
+                    SELECT id, user_id, subject_id, object_id, rel_type, provenance,
+                           confidence, confirmed_count, last_seen_at, contradicted_by,
+                           hard_delete_flag, superseded_at
+                    FROM facts
+                    WHERE id IN ({placeholders})
+                    """,
+                    fact_ids
+                )
+                for row in cur.fetchall():
+                    pg_facts[row[0]] = {
+                        "id": row[0],
+                        "user_id": row[1],
+                        "subject_id": row[2],
+                        "object_id": row[3],
+                        "rel_type": row[4],
+                        "provenance": row[5],
+                        "confidence": row[6],
+                        "confirmed_count": row[7],
+                        "last_seen_at": row[8],
+                        "contradicted_by": row[9],
+                        "hard_delete_flag": row[10],
+                        "superseded_at": row[11],
+                    }
+
+            # Step 4: Reconcile each point
+            for point in all_points:
+                try:
+                    point_id = point["id"]
+                    payload = point.get("payload", {})
+                    fact_id = payload.get("fact_id")
+
+                    # 4a: Check if fact exists in PostgreSQL
+                    if fact_id not in pg_facts:
+                        httpx.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
+                            json={"points": [point_id]},
+                            timeout=10.0
+                        )
+                        stats["deleted"] += 1
+                        log.info(f"re_embedder.reconcile_deleted point_id={point_id} reason=not_in_pg collection={collection}")
+                        continue
+
+                    pg_row = pg_facts[fact_id]
+
+                    # 4b: Check if fact is superseded or hard-deleted
+                    if pg_row["superseded_at"] is not None or pg_row["hard_delete_flag"]:
+                        httpx.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
+                            json={"points": [point_id]},
+                            timeout=10.0
+                        )
+                        stats["deleted"] += 1
+                        reason = "hard_deleted" if pg_row["hard_delete_flag"] else "superseded"
+                        log.info(f"re_embedder.reconcile_deleted point_id={point_id} reason={reason} collection={collection}")
+                        continue
+
+                    # 4c: Build expected payload from PostgreSQL ground truth
+                    resolved_rows = resolve_display_names_for_facts(db_conn, [pg_row])
+                    resolved_row = resolved_rows[0]
+
+                    expected_payload = {
+                        "subject": resolved_row.get("subject_display", pg_row["subject_id"]),
+                        "object": resolved_row.get("object_display", pg_row["object_id"]),
+                        "rel_type": pg_row["rel_type"],
+                        "confidence": pg_row["confidence"],
+                        "confirmed_count": pg_row["confirmed_count"],
+                        "contradicted": pg_row["contradicted_by"] is not None,
+                    }
+
+                    # 4d: Compare payloads (exclude last_seen_at and other fields)
+                    # Use tolerance for confidence (JSON float round-trip drift)
+                    payload_matches = (
+                        payload.get("subject") == expected_payload["subject"]
+                        and payload.get("object") == expected_payload["object"]
+                        and payload.get("rel_type") == expected_payload["rel_type"]
+                        and abs((payload.get("confidence") or 0.0) - expected_payload["confidence"]) <= 0.001
+                        and payload.get("confirmed_count") == expected_payload["confirmed_count"]
+                        and payload.get("contradicted") == expected_payload["contradicted"]
+                    )
+
+                    if not payload_matches:
+                        # 4e: Re-embed and re-upsert
+                        text = f"{expected_payload['subject']} {expected_payload['rel_type']} {expected_payload['object']}"
+                        vector = embed_text(text, qwen_api_url, timeout=30.0, fallback=True)
+                        if upsert_to_qdrant(resolved_row, vector, collection, qdrant_url):
+                            stats["reupserted"] += 1
+                            log.info(f"re_embedder.reconcile_reupserted point_id={point_id} fact_id={fact_id} collection={collection}")
+                        else:
+                            stats["errors"] += 1
+                    else:
+                        # 4f: Payload matches
+                        stats["ok"] += 1
+
+                except Exception as e:
+                    fact_id = point.get("payload", {}).get("fact_id", "unknown")
+                    stats["errors"] += 1
+                    log.error(f"re_embedder.reconcile_point_error point_id={point.get('id')} fact_id={fact_id} collection={collection}: {e}")
+
+        except Exception as e:
+            log.error(f"re_embedder.reconcile_collection_error collection={collection}: {e}")
+
+    return stats
+
+
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
@@ -526,6 +708,11 @@ def main():
                             )
                     except Exception as e:
                         log.error(f"re_embedder.delete_failed fact_id={fact_id}: {e}")
+
+                # Reconciliation pass — sync stale payloads and orphaned points
+                stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
+                if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
+                    log.info(f"re_embedder.reconcile deleted={stats['deleted']} reupserted={stats['reupserted']} ok={stats['ok']} errors={stats['errors']}")
 
             finally:
                 db.close()
