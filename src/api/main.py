@@ -49,6 +49,11 @@ _SCALAR_REL_TYPES = {
     "occupation", "has_gender", "height", "weight",
 }
 
+_UUID_PATTERN = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE
+)
+
 # Fact class taxonomy — determines write path at ingest time
 _CLASS_A_REL_TYPES = frozenset({
     "pref_name", "also_known_as", "same_as",
@@ -479,6 +484,16 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             for edge in edges:
                 if edge.subject == edge.object: continue
 
+                # UUID guard: reject raw edge values that are UUIDs
+                # (canonical_ids may be UUIDs when entities exist without display names, which is fine)
+                if _UUID_PATTERN.match(edge.subject) or _UUID_PATTERN.match(edge.object):
+                    log.warning("ingest.uuid_value_rejected",
+                                subject=edge.subject,
+                                object=edge.object,
+                                rel_type=edge.rel_type,
+                                reason="raw UUID in edge subject or object — likely resolution leak")
+                    continue
+
                 # Capture raw scalar value before entity resolution
                 _raw_object = edge.object
 
@@ -486,6 +501,33 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
                 canonical_object = registry.resolve(req.user_id, edge.object)
+
+                # Persist entity types to entities table if provided (only if currently unknown)
+                if edge.subject_type and canonical_subject != "user":
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE entities SET entity_type = %s"
+                                " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
+                                (edge.subject_type, canonical_subject, req.user_id),
+                            )
+                        db.commit()
+                    except Exception as _e:
+                        log.warning("ingest.subject_type_update_failed",
+                                    entity_id=canonical_subject, entity_type=edge.subject_type, error=str(_e))
+
+                if edge.object_type and canonical_object not in ("user", canonical_subject):
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE entities SET entity_type = %s"
+                                " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
+                                (edge.object_type, canonical_object, req.user_id),
+                            )
+                        db.commit()
+                    except Exception as _e:
+                        log.warning("ingest.object_type_update_failed",
+                                    entity_id=canonical_object, entity_type=edge.object_type, error=str(_e))
 
                 # Normalize user-identity aliases back to "user" anchor
                 # If canonical_subject is a known alias of the user (e.g., "chris"), rewrite to "user"
@@ -619,7 +661,22 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if fact_subject == "user" and edge.is_correction:
                     status = "valid"
                 else:
-                    status = gate.validate_edge(fact_subject, canonical_object, edge.rel_type)["status"]
+                    validation = gate.validate_edge(
+                        fact_subject, canonical_object, edge.rel_type,
+                        user_id=req.user_id,
+                        subject_type=edge.subject_type,
+                        object_type=edge.object_type,
+                    )
+                    status = validation.get("status")
+
+                    # Handle type_mismatch: drop edge, do not commit, entities already exist
+                    if status == "type_mismatch":
+                        log.warning("ingest.type_mismatch",
+                                    subject=fact_subject,
+                                    rel_type=edge.rel_type,
+                                    object=canonical_object,
+                                    reason=validation.get("reason", ""))
+                        continue
 
                 # Look up whether this rel_type is engine_generated
                 is_engine_generated = False

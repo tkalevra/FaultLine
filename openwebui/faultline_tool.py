@@ -35,6 +35,8 @@ _QUERY_INTENT: dict[str, frozenset[str]] = {
     "pets":     frozenset({"pet", "dog", "cat", "animal", "fish", "bird",
                            "hamster", "rabbit", "snake"}),
     "identity": frozenset({"name", "who am i", "call me", "known as", "alias"}),
+    "temporal":  frozenset({"birthday", "born", "birth", "anniversary",
+                            "age", "when was", "how old", "date of birth"}),
 }
 
 _REL_CATEGORY: dict[str, str] = {
@@ -46,6 +48,7 @@ _REL_CATEGORY: dict[str, str] = {
     "has_pet": "pets", "instance_of": "pets",
     "also_known_as": "identity", "pref_name": "identity", "same_as": "identity",
     "is_a": "identity",
+    "born_on": "temporal", "age": "temporal", "anniversary_on": "temporal", "met_on": "temporal",
 }
 
 
@@ -336,14 +339,34 @@ class Filter:
         clean = [f for f in facts
                  if not _garbage(f.get("subject", "")) and not _garbage(f.get("object", ""))]
 
+        # Categories detected from query text via _QUERY_INTENT
+        text_cats = categories  # already computed by _categorize_query
+
+        # Categories present in the actual fact payloads from /query
+        fact_cats = {f.get("category") for f in clean if f.get("category")}
+
+        # Allowed rel_types from static map for text-matched categories
+        static_allowed = {rt for rt, cat in _REL_CATEGORY.items() if cat in text_cats}
+
+        # Baseline categories always included (location, work, identity, temporal for identity anchor)
+        _BASELINE_CATS = {"location", "work", "identity", "temporal"}
+
         if is_realtime:
-            allowed = _IDENTITY_RELS | {rt for rt, cat in _REL_CATEGORY.items() if cat == "location"}
-        elif categories:
-            allowed = _IDENTITY_RELS | {rt for rt, cat in _REL_CATEGORY.items() if cat in categories}
+            allowed_cats = _BASELINE_CATS | {"location"}
+        elif text_cats:
+            allowed_cats = _BASELINE_CATS | text_cats
         else:
-            allowed = _IDENTITY_RELS | {
-                "lives_at", "lives_in", "located_in", "address", "born_in", "works_for", "occupation",
-            }
+            allowed_cats = _BASELINE_CATS
+
+        # Build final allowed rel_types from both sources:
+        # 1. Static _REL_CATEGORY map (existing types)
+        # 2. fact.category field from server payload (DB-driven, catches new types)
+        allowed = (
+            _IDENTITY_RELS
+            | static_allowed
+            | {f.get("rel_type") for f in clean
+               if f.get("category") in allowed_cats and f.get("rel_type")}
+        )
 
         filtered = [f for f in clean if f.get("rel_type", "") in allowed]
 

@@ -10,6 +10,8 @@ class EdgeInput(BaseModel):
     is_preferred_label: bool = False
     is_correction: bool = False
     fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
+    subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
+    object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
 
 
 class IngestRequest(BaseModel):
