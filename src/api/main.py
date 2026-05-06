@@ -17,6 +17,7 @@ log = structlog.get_logger()
 _gliner2_model = None
 _rel_type_registry: RelTypeRegistry = None
 _rel_type_constraint: str = ""
+_REL_TYPE_META: dict = {}
 
 _PREFERENCE_SIGNALS = {
     "goes by", "go by",
@@ -128,6 +129,10 @@ def _extract_identity(text: str) -> str | None:
                 return name
     return None
 
+def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
+    """Return 'user' if entity_id matches the user's own UUID, else return entity_id."""
+    return "user" if entity_id == user_id else entity_id
+
 def _build_rel_type_constraint(dsn: str) -> str:
     """Load rel_types from DB and build pipe-separated bracket constraint."""
     try:
@@ -139,6 +144,20 @@ def _build_rel_type_constraint(dsn: str) -> str:
     except Exception as e:
         log.warning("startup.constraint_builder_failed", error=str(e))
         return ""
+
+def _build_rel_type_meta(dsn: str) -> dict:
+    """Load rel_types metadata (including category) from DB."""
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT rel_type, category FROM rel_types WHERE category IS NOT NULL")
+                meta = {}
+                for rel_type, category in cur.fetchall():
+                    meta[rel_type] = {"category": category}
+        return meta
+    except Exception as e:
+        log.warning("startup.rel_type_meta_builder_failed", error=str(e))
+        return {}
 
 def _commit_staged(
     db_conn,
@@ -183,7 +202,7 @@ def get_gliner_model():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _gliner2_model, _rel_type_registry, _rel_type_constraint
+    global _gliner2_model, _rel_type_registry, _rel_type_constraint, _REL_TYPE_META
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
@@ -199,6 +218,7 @@ async def lifespan(app: FastAPI):
         try:
             _rel_type_registry.get_valid_types()
             _rel_type_constraint = _build_rel_type_constraint(dsn)
+            _REL_TYPE_META = _build_rel_type_meta(dsn)
             log.info("startup.rel_type_registry_ready",
                      count=len(_rel_type_registry._cache),
                      constraint_len=len(_rel_type_constraint))
@@ -459,6 +479,9 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             for edge in edges:
                 if edge.subject == edge.object: continue
 
+                # Capture raw scalar value before entity resolution
+                _raw_object = edge.object
+
                 # Resolve all entity names to canonical form via registry
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
@@ -467,7 +490,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Normalize user-identity aliases back to "user" anchor
                 # If canonical_subject is a known alias of the user (e.g., "chris"), rewrite to "user"
                 # so facts are anchored under the identity placeholder, not scattered across aliases.
-                if canonical_subject in _user_aliases and canonical_subject != "user":
+                if (canonical_subject in _user_aliases or canonical_subject == req.user_id) and canonical_subject != "user":
                     log.info("ingest.subject_normalized_to_user",
                              original=canonical_subject, user_id=req.user_id)
                     canonical_subject = "user"
@@ -539,7 +562,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Route scalar rel_types to entity_attributes instead of facts
                 if edge.rel_type.lower() in _SCALAR_REL_TYPES:
-                    val_text, val_int, val_float, val_date = _coerce_scalar(canonical_object)
+                    val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
                     # Only store if value is meaningful (reject non-numeric age etc.)
                     if edge.rel_type.lower() == "age" and val_int is None:
                         log.warning("ingest.scalar_rejected_non_numeric",
@@ -559,7 +582,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "   value_float = EXCLUDED.value_float,"
                                 "   value_date = EXCLUDED.value_date,"
                                 "   updated_at = now()",
-                                (req.user_id, canonical_subject, edge.rel_type.lower(),
+                                (req.user_id, _resolve_user_anchor(canonical_subject, req.user_id), edge.rel_type.lower(),
                                  val_text, val_int, val_float, val_date, req.source,
                                  "private" if edge.rel_type.lower() in {
                                      "phone", "address", "email", "lives_at", "lives_in", "ip_address"
@@ -942,6 +965,25 @@ def query(request: QueryRequest):
             })
         return resolved
 
+    def _attributes_to_facts(attributes: dict) -> list[dict]:
+        """
+        Convert entity_attributes for "user" to facts format for injection.
+        Each attribute becomes a fact with subject="user", rel_type=attribute.
+        """
+        facts = []
+        user_attrs = attributes.get("user", {})
+        for attribute, value in user_attrs.items():
+            category = _REL_TYPE_META.get(attribute.lower(), {}).get("category")
+            facts.append({
+                "subject": "user",
+                "rel_type": attribute,
+                "object": str(value) if value is not None else None,
+                "confidence": 1.0,
+                "fact_class": "A",
+                "category": category,
+            })
+        return facts
+
     query_lower = request.text.lower()
     direct_facts = []
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
@@ -1013,7 +1055,7 @@ def query(request: QueryRequest):
         # Resolve display names for Postgres facts before returning
         resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
         resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
-        merged_facts = resolved_direct + resolved_baseline
+        merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
         return {
             "status": "ok",
             "facts": merged_facts,
@@ -1032,7 +1074,7 @@ def query(request: QueryRequest):
             ensure_collection(collection, qdrant_url)
             resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
-            merged_facts = resolved_direct + resolved_baseline
+            merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
             return {
                 "status": "ok",
                 "facts": merged_facts,
@@ -1044,7 +1086,7 @@ def query(request: QueryRequest):
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
             resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
-            merged_facts = resolved_direct + resolved_baseline
+            merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
             return {
                 "status": "ok",
                 "facts": merged_facts,
@@ -1083,6 +1125,13 @@ def query(request: QueryRequest):
         # Merge baseline personal facts (location, attributes) — always present for
         # known identities regardless of whether Qdrant or graph traversal returned them.
         for f in resolved_baseline:
+            key = (f["subject"], f["object"], f["rel_type"])
+            if key not in pg_keys:
+                merged_facts.append(f)
+                pg_keys.add(key)
+
+        # Merge user entity_attributes as facts (born_on, age, height, etc.)
+        for f in _attributes_to_facts(attributes):
             key = (f["subject"], f["object"], f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)

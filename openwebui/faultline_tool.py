@@ -61,6 +61,10 @@ _IDENTITY_RE = re.compile(
     r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
 )
 
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
+)
+
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -107,7 +111,7 @@ REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
 - pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). Subject is always the named person, never "user".
 - is_a: type or category. has_pet: person owns an animal (NEVER a person).
-- Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight.
+- Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
 - Use snake_case. Other types allowed if none fit.
 
 SELF-ID: Explicit first-person self-identification only ("I am X", "my name is X", "call me X"):
@@ -119,6 +123,16 @@ CORRECTIONS: If text signals a correction ("actually", "not X it's Y", "I meant"
 
 UNITS: age→number only. height→feet format (6ft, 5'10"). weight→pounds (230lb).
 Self-statements for height/weight → subject="user".
+
+DATES AND EVENTS:
+- For birthday/birth date patterns ("my birthday is X", "born on X", "I was born on X", "born in X"):
+  emit {"subject":"user","object":"<date>","rel_type":"born_on"} where object is the date as stated (e.g. "may 3", "march 15th", "1988-04-02"). Normalize to lowercase.
+- For named recurring events or anniversaries ("our anniversary is X", "X's birthday is Y"):
+  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on"} or "anniversary_on" as appropriate.
+- For meeting/event dates ("we met on X", "we got married on X"):
+  emit the appropriate rel_type (met_on, married_on) with the date as object.
+- Date values must be the date string only — never a name or description.
+- If a month/day pattern appears without a year, emit it as-is ("may 3rd", "december 25").
 
 OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
 If nothing to extract: []"""
@@ -316,7 +330,7 @@ class Filter:
     def _filter_relevant_facts(self, facts: list[dict], categories: set[str], identity: Optional[str], is_realtime: bool = False) -> list[dict]:
         def _garbage(name: str) -> bool:
             n = (name or "").strip().lower()
-            return len(n) <= 1 or n == "x"
+            return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
 
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
         clean = [f for f in facts
@@ -341,6 +355,43 @@ class Filter:
                 filtered = high_conf
 
         return filtered if filtered else clean
+
+    def _build_realtime_context(self, facts: list[dict], identity: Optional[str]) -> Optional[str]:
+        """Build realtime directive from facts. Returns None if no location found."""
+        # Resolve location from lives_at/lives_in facts (prefer lives_at)
+        location = None
+        for f in facts:
+            if f.get("rel_type") == "lives_at" and identity and f.get("subject") in {identity, "user"}:
+                loc = f.get("object", "").strip()
+                if loc:
+                    location = loc
+                    break
+
+        if not location:
+            for f in facts:
+                if f.get("rel_type") == "lives_in" and identity and f.get("subject") in {identity, "user"}:
+                    loc = f.get("object", "").strip()
+                    if loc:
+                        location = loc
+                        break
+
+        if not location:
+            return None
+
+        # Build compact facts for context (e.g., work)
+        compact_parts = []
+        for f in facts:
+            if f.get("rel_type") == "works_for" and identity and f.get("subject") in {identity, "user"}:
+                obj = f.get("object", "").strip()
+                if obj:
+                    compact_parts.append(f"works at {obj.title()}")
+
+        directive = f"The user's location is {location.title()}."
+        if compact_parts:
+            directive += f" Known context for this request: {'; '.join(compact_parts)}."
+        directive += " Use whatever tools or capabilities are available to fulfill this request directly. Do not ask the user to supply information that is already known above."
+
+        return directive
 
     def _detect_retraction_intent(self, text: str) -> bool:
         tl = text.lower().replace("'", "'").replace("'", "'")
@@ -398,7 +449,37 @@ class Filter:
         identity_display = preferred_names.get("user")
         identity = canonical_identity or identity_display
 
-        lines = []
+        # Check if we should use realtime mode
+        if is_realtime:
+            realtime_context = self._build_realtime_context(facts, identity)
+            if realtime_context:
+                # REALTIME MODE with location
+                lines = []
+
+                if identity:
+                    display = identity_display or identity
+                    lines.append(
+                        f"The user is '{display}'. Facts referencing '{identity}' or '{display}' are about the user directly. "
+                        f"Address the user as 'you', never as a third party."
+                    )
+
+                lines.append("DIRECTLY ACTIONABLE: Use the facts and context below immediately to fulfill the request.")
+                lines.append(realtime_context)
+
+                return (
+                    "🧠 FaultLine Memory — treat these as established ground truth for this response.\n"
+                    + "\n".join(f"- {l}" for l in lines)
+                    + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
+                    + "If a fact below is relevant to fulfilling the user's request, act on it directly and immediately."
+                )
+            else:
+                # No location found - fall through to conversational mode
+                is_realtime = False
+
+        # CONVERSATIONAL MODE (from is_realtime=False or fallthrough)
+        lines = [
+            "🧠 FaultLine Memory — reference context. Use facts below only when directly relevant to the current request. Do not volunteer, list, or recite facts unless the user's message explicitly requires them."
+        ]
 
         if identity:
             display = identity_display or identity
@@ -406,13 +487,6 @@ class Filter:
                 f"The user is '{display}'. Facts referencing '{identity}' or '{display}' are about the user directly. "
                 f"Address the user as 'you', never as a third party."
             )
-
-        if is_realtime:
-            hint = "For real-time information (weather, news, live data): use your available web search tools — do not infer from stored facts."
-            if locations and len(locations) > 1:
-                locs = " and ".join(locations)
-                hint += f" For time-based queries (tomorrow, this weekend, etc.), infer location from context: weekdays→work, weekends→home. Report both {locs} if uncertain."
-            lines.append(hint)
 
         if preferred_names:
             for canonical, preferred in preferred_names.items():
@@ -423,6 +497,9 @@ class Filter:
         if facts:
             nickname_map = {}
             by_rel = defaultdict(list)
+
+            _user_anchors = {identity, "user"} if identity else {"user"}
+
             for f in facts:
                 by_rel[f.get("rel_type", "")].append(f)
                 if f.get("rel_type") == "also_known_as":
@@ -434,67 +511,57 @@ class Filter:
             def _dn(name: str) -> str:
                 return nickname_map.get(name, name).title()
 
-            sentences = []
-            _user_anchors = {identity, "user"} if identity else {"user"}
+            # Extract family relationships
+            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
+            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
+            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in _user_anchors and f.get("subject") not in spouses_raw and not bool(_UUID_RE.match(f.get("subject") or ""))]
+            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
 
-            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") in _user_anchors]
-            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") in _user_anchors]
-            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in _user_anchors and f.get("subject") not in spouses_raw]
-            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in _user_anchors]
+            # Build compact family line
+            if children_raw or spouses_raw or siblings_raw:
+                family_parts = []
+                if spouses_raw:
+                    family_parts.append(f"spouse={', '.join(_dn(s) for s in set(spouses_raw))}")
+                if children_raw:
+                    family_parts.append(f"children={', '.join(_dn(c) for c in children_raw)}")
+                if siblings_raw:
+                    family_parts.append(f"siblings={', '.join(_dn(s) for s in siblings_raw)}")
+                lines.append(f"family: {', '.join(family_parts)}")
 
-            if children_raw:
-                descs = []
-                for c in children_raw:
-                    age = entity_attributes.get(c, {}).get("age")
-                    descs.append(f"{_dn(c)} (age {age})" if age else _dn(c))
-                sentences.append(f"You have {len(children_raw)} {'child' if len(children_raw) == 1 else 'children'}: {', '.join(descs)}.")
-            if spouses_raw:
-                sentences.append(f"You are married to {', '.join(_dn(s) for s in set(spouses_raw))}.")
-            if siblings_raw:
-                sentences.append(f"Your {'sibling is' if len(siblings_raw) == 1 else 'siblings are'} {', '.join(_dn(s) for s in siblings_raw)}.")
-
-            if entity_attributes and identity and identity in entity_attributes:
-                ua = entity_attributes[identity]
-                if "height" in ua:
-                    sentences.append(f"You are {ua['height']} tall.")
-                if "weight" in ua:
-                    sentences.append(f"You weigh {ua['weight']}.")
-                if "age" in ua:
-                    sentences.append(f"You are {ua['age']} years old.")
-
+            # Build compact fact lines
             covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
             for f in facts:
                 if f.get("rel_type") in covered:
                     continue
                 _s = f.get("subject", "").strip().lower()
                 _o = f.get("object", "").strip().lower()
-                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x":
+                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x" or bool(_UUID_RE.match(_s)) or bool(_UUID_RE.match(_o)):
                     continue
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
-                rel = f.get("rel_type", "").replace("_", " ")
-                if identity and subj in _user_anchors:
-                    if rel == "has pet":
-                        sentences.append(f"You have a pet named {_dn(obj)}.")
-                    elif rel == "owns":
-                        sentences.append(f"You own {_dn(obj)}.")
-                    elif rel == "likes":
-                        sentences.append(f"You like {obj}.")
-                    elif rel in ("lives at", "lives in"):
-                        sentences.append(f"You live at {obj.title()}.")
-                    elif rel == "works for":
-                        sentences.append(f"You work for {obj.title()}.")
-                    elif rel == "address":
-                        sentences.append(f"Your address is {obj.title()}.")
-                    elif rel in ("is a", "instance of"):
-                        sentences.append(f"You are a {_dn(obj)}.")
-                    else:
-                        sentences.append(f"You {rel} {_dn(obj)}.")
-                elif identity and obj in _user_anchors:
-                    sentences.append(f"{_dn(subj)} {rel} you.")
-                else:
-                    sentences.append(f"{_dn(subj)} {rel} {_dn(obj)}.")
+                rel = f.get("rel_type", "")
 
+                if identity and subj in _user_anchors:
+                    lines.append(f"{rel}: {obj}")
+                elif identity and obj in _user_anchors:
+                    lines.append(f"{_dn(subj)} ← {rel}")
+                else:
+                    lines.append(f"{_dn(subj)} → {rel} → {_dn(obj)}")
+
+            # User entity attributes (compact single line)
+            if identity and identity in entity_attributes:
+                ua = entity_attributes[identity]
+                attr_parts = []
+                if "height" in ua:
+                    attr_parts.append(f"height={ua['height']}")
+                if "weight" in ua:
+                    attr_parts.append(f"weight={ua['weight']}")
+                if "age" in ua:
+                    attr_parts.append(f"age={ua['age']}")
+                if attr_parts:
+                    lines.append(f"physical: {', '.join(attr_parts)}")
+
+            # Non-user entity attributes
             if entity_attributes:
                 for entity, attrs in entity_attributes.items():
                     if entity == identity:
@@ -503,22 +570,17 @@ class Filter:
                     if "age" in attrs:
                         parts.append(f"age {attrs['age']}")
                     if parts:
-                        sentences.append(f"{_dn(entity)}: {', '.join(parts)}.")
+                        lines.append(f"{_dn(entity)}: {', '.join(parts)}.")
 
-            limited = sentences[:self.valves.MAX_MEMORY_SENTENCES]
-            lines.extend(limited)
-            if len(sentences) > self.valves.MAX_MEMORY_SENTENCES:
-                lines.append(f"... and {len(sentences) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
+        # Apply sentence limit
+        limited = lines[:self.valves.MAX_MEMORY_SENTENCES]
+        if len(lines) > self.valves.MAX_MEMORY_SENTENCES:
+            limited.append(f"... and {len(lines) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
 
         return (
-            "🧠 FaultLine Memory — treat these as established ground truth for this response.\n"
-            "These facts are DIRECTLY ACTIONABLE. If the user's request depends on any of these facts "
-            "(location, relationships, preferences), use them immediately without asking the user to confirm or re-supply them.\n"
-            "For example: if the user asks about weather and a location fact is present below, "
-            "use that location now — do not ask which city.\n"
-            + "\n".join(f"- {l}" for l in lines)
+            "\n".join(f"- {l}" for l in limited)
             + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
-            + "If a fact below is relevant to fulfilling the user's request, act on it directly and immediately."
+            + "If a fact below is relevant to fulfilling the user's request, use it directly."
         )
 
     async def inlet(
