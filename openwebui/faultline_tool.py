@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import time as _time
 from collections import defaultdict
 from typing import Optional
 
@@ -59,6 +60,10 @@ _RETRACTION_SIGNALS: frozenset[str] = frozenset({
 _IDENTITY_RE = re.compile(
     r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
 )
+
+# Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
+_SESSION_MEMORY_CACHE: dict[str, tuple] = {}
+_SESSION_MEMORY_TTL: int = 30  # seconds
 
 _RETRACTION_PROMPT = """\
 You are a retraction extractor for a personal knowledge graph.
@@ -158,10 +163,11 @@ OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false
 If nothing to extract: []"""
 
 
-async def rewrite_to_triples(text: str, valves, context: list[dict] = None, typed_entities: list[dict] = None) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
+    Memory_facts provides stored facts for pronoun resolution.
     Returns [] on any failure so the caller can handle the empty-edge case.
     """
     try:
@@ -184,6 +190,24 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
                     prior_turns[-1]["role"] == "user"
                 ) else prior_turns
                 messages.extend(turns_to_add)
+
+        if memory_facts:
+            entity_lines = []
+            for f in memory_facts:
+                subj = f.get("subject", "")
+                obj = f.get("object", "")
+                rel = f.get("rel_type", "")
+                if subj and obj and rel:
+                    # Use USER placeholder for the canonical user identity
+                    subj_display = "USER" if subj in ("user",) else subj
+                    obj_display = "USER" if obj in ("user",) else obj
+                    entity_lines.append(f"- {obj_display} ({rel} of {subj_display})")
+            if entity_lines:
+                hint = (
+                    "Known entities (for pronoun resolution only — do not store these as new facts):\n"
+                    + "\n".join(entity_lines)
+                )
+                messages.append({"role": "system", "content": hint})
 
         user_content = text
         if typed_entities:
@@ -585,6 +609,63 @@ class Filter:
             if not will_ingest and not will_query:
                 return body
 
+            # Initialize memory variables for potential use by rewrite_to_triples
+            facts, preferred_names, canonical_identity, entity_attributes = [], {}, None, {}
+
+            # Run /query first (with caching) so memory facts can aid pronoun resolution during ingest
+            if will_query:
+                try:
+                    cached = _SESSION_MEMORY_CACHE.get(user_id)
+                    if cached and (_time.time() - cached[0]) < _SESSION_MEMORY_TTL:
+                        _, facts, preferred_names, canonical_identity, entity_attributes = cached
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] /query cache hit user_id={user_id}")
+                    else:
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
+                        resp = None
+                        for _attempt in range(2):
+                            try:
+                                async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                                    resp = await client.post(
+                                        f"{self.valves.FAULTLINE_URL}/query",
+                                        json={"text": text, "user_id": user_id, "top_k": 5},
+                                    )
+                                break
+                            except httpx.ReadError:
+                                if _attempt == 0:
+                                    if self.valves.ENABLE_DEBUG:
+                                        print(f"[FaultLine Filter] /query ReadError on attempt 1, retrying...")
+                                    continue
+                                raise
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] /query status={resp.status_code}")
+
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            facts = data.get("facts", [])
+                            preferred_names = data.get("preferred_names", {})
+                            canonical_identity = data.get("canonical_identity")
+                            entity_attributes = data.get("attributes", {})
+                            _SESSION_MEMORY_CACHE[user_id] = (
+                                _time.time(), facts, preferred_names, canonical_identity, entity_attributes
+                            )
+
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] facts={len(facts)} preferred_names={preferred_names} identity={canonical_identity}")
+                                for f in facts:
+                                    print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
+
+                except httpx.ConnectError as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query connection error: {e}")
+                except httpx.TimeoutException as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query timeout: {e}")
+                except Exception as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query error: {type(e).__name__}: {e}")
+
             if will_ingest:
                 _MEMORY_MARKER = "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine)."
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
@@ -593,6 +674,7 @@ class Filter:
                 raw_triples = await rewrite_to_triples(
                     clean_text, self.valves, context=body.get("messages", []),
                     typed_entities=typed_entities if typed_entities else None,
+                    memory_facts=facts if facts else None,
                 )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
@@ -607,7 +689,7 @@ class Filter:
                         "is_correction": e.get("is_correction", False),
                     }
                     for e in raw_triples
-                    if not e.get("low_confidence", False)
+                    if (e.get("rel_type") == "pref_name" or not e.get("low_confidence", False))
                     and e.get("subject") and e.get("object") and e.get("rel_type")
                     and e.get("subject", "").lower() not in _PRONOUNS
                     and e.get("object", "").lower() not in _PRONOUNS
@@ -624,6 +706,8 @@ class Filter:
                         "i prefer", "i'd prefer", "i would prefer",
                         "goes by", "go by", "known as", "prefer you call me",
                         "would like to be called", "like to go by",
+                        "call her", "call him", "call them",  # ← add these
+                        "her name is", "his name is",
                     }
                 )
                 before = len(edges)
@@ -654,91 +738,49 @@ class Filter:
                 elif self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] skipping ingest — no edges and no self-ID")
 
-            if will_query:
-                try:
+            # Build and inject memory block from retrieved facts
+            if will_query and (facts or preferred_names or canonical_identity):
+                # Query-relevant filtering
+                _categories = self._categorize_query(text)
+                _is_realtime = self._is_realtime_query(text)
+                if _is_realtime:
+                    _categories.add("location")
+                filtered_facts = self._filter_relevant_facts(
+                    facts, _categories, canonical_identity, is_realtime=_is_realtime
+                )
+
+                # Inject whenever we have anything useful — let the model decide relevance
+                if filtered_facts or preferred_names or canonical_identity:
+                    # Extract locations for temporal reasoning hint
+                    locations = set()
+                    for f in filtered_facts:
+                        if f.get("rel_type") in ("lives_at", "lives_in", "works_for"):
+                            obj = f.get("object", "").strip()
+                            if obj and len(obj) > 1:
+                                locations.add(obj)
+                    memory_block = self._build_memory_block(
+                        filtered_facts, preferred_names, canonical_identity, entity_attributes,
+                        is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
+                    )
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
-                    resp = None
-                    for _attempt in range(2):
-                        try:
-                            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                                resp = await client.post(
-                                    f"{self.valves.FAULTLINE_URL}/query",
-                                    json={"text": text, "user_id": user_id, "top_k": 5},
-                                )
+                        print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
+
+                    # Insert immediately before the last user message for best context proximity
+                    msgs = body["messages"]
+                    injected = False
+                    for i in range(len(msgs) - 1, -1, -1):
+                        if msgs[i].get("role") == "user":
+                            msgs.insert(i, {"role": "system", "content": memory_block})
+                            injected = True
                             break
-                        except httpx.ReadError:
-                            if _attempt == 0:
-                                if self.valves.ENABLE_DEBUG:
-                                    print(f"[FaultLine Filter] /query ReadError on attempt 1, retrying...")
-                                continue
-                            raise
+                    if not injected:
+                        msgs.append({"role": "system", "content": memory_block})
+
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] /query status={resp.status_code}")
-
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        facts = data.get("facts", [])
-                        preferred_names = data.get("preferred_names", {})
-                        canonical_identity = data.get("canonical_identity")
-                        entity_attributes = data.get("attributes", {})
-
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] facts={len(facts)} preferred_names={preferred_names} identity={canonical_identity}")
-                            for f in facts:
-                                print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
-
-                        # Query-relevant filtering
-                        _categories = self._categorize_query(text)
-                        _is_realtime = self._is_realtime_query(text)
-                        if _is_realtime:
-                            _categories.add("location")
-                        facts = self._filter_relevant_facts(
-                            facts, _categories, canonical_identity, is_realtime=_is_realtime
-                        )
-
-                        # Inject whenever we have anything useful — let the model decide relevance
-                        if facts or preferred_names or canonical_identity:
-                            # Extract locations for temporal reasoning hint
-                            locations = set()
-                            for f in facts:
-                                if f.get("rel_type") in ("lives_at", "lives_in", "works_for"):
-                                    obj = f.get("object", "").strip()
-                                    if obj and len(obj) > 1:
-                                        locations.add(obj)
-                            memory_block = self._build_memory_block(
-                                facts, preferred_names, canonical_identity, entity_attributes,
-                                is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
-                            )
-                            if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
-
-                            # Insert immediately before the last user message for best context proximity
-                            msgs = body["messages"]
-                            injected = False
-                            for i in range(len(msgs) - 1, -1, -1):
-                                if msgs[i].get("role") == "user":
-                                    msgs.insert(i, {"role": "system", "content": memory_block})
-                                    injected = True
-                                    break
-                            if not injected:
-                                msgs.append({"role": "system", "content": memory_block})
-
-                            if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] INJECTED total_messages={len(body['messages'])}")
-                        else:
-                            if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] no facts to inject")
-
-                except httpx.ConnectError as e:
+                        print(f"[FaultLine Filter] INJECTED total_messages={len(body['messages'])}")
+                else:
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] /query connection error: {e}")
-                except httpx.TimeoutException as e:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] /query timeout: {e}")
-                except Exception as e:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] /query error: {type(e).__name__}: {e}")
+                        print(f"[FaultLine Filter] no facts to inject")
 
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
