@@ -72,3 +72,15 @@ class RetractResponse(BaseModel):
     retracted: int
     mode: str
     note: Optional[str] = None
+
+
+class StoreContextRequest(BaseModel):
+    text: str
+    user_id: str = "anonymous"
+    source: str = "openwebui"
+    context_type: str = "unstructured"
+
+
+class StoreContextResponse(BaseModel):
+    status: str  # "stored" or "error"
+    point_id: str  # Qdrant point UUID
