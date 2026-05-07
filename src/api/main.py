@@ -957,7 +957,7 @@ def query(request: QueryRequest):
                     [user_id] + list(_BASELINE_RELS) + [user_surrogate, user_surrogate],
                 )
                 baseline_facts = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4]}
+                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4], "category": _REL_TYPE_META.get(r[2], {}).get("category")}
                     for r in cur.fetchall()
                 ]
             if baseline_facts:
@@ -1076,7 +1076,7 @@ def query(request: QueryRequest):
                         [user_id, user_surrogate, user_surrogate],
                     )
                     direct_facts = [
-                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4]}
+                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4], "category": _REL_TYPE_META.get(row[2], {}).get("category")}
                         for row in _cur.fetchall()
                     ]
 
@@ -1106,7 +1106,8 @@ def query(request: QueryRequest):
                             if key not in seen:
                                 direct_facts.append({
                                     "subject": row[0], "object": row[1],
-                                    "rel_type": row[2], "provenance": row[3], "confidence": row[4]
+                                    "rel_type": row[2], "provenance": row[3], "confidence": row[4],
+                                    "category": _REL_TYPE_META.get(row[2], {}).get("category")
                                 })
                                 seen.add(key)
 
@@ -1198,6 +1199,7 @@ def query(request: QueryRequest):
                 "rel_type": h["payload"].get("rel_type"),
                 "provenance": h["payload"].get("provenance"),
                 "confidence": h["payload"].get("confidence", 1.0),
+                "category": _REL_TYPE_META.get(h["payload"].get("rel_type"), {}).get("category"),
             }
             for h in resp.json().get("result", [])
             if h.get("payload")
