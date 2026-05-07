@@ -23,34 +23,6 @@ _REALTIME_SIGNALS: frozenset[str] = frozenset({
     "right now", "live", "stock", "price", "score",
 })
 
-_QUERY_INTENT: dict[str, frozenset[str]] = {
-    "location": frozenset({"weather", "where", "address", "forecast", "city",
-                           "located", "location", "home", "residence", "town"}),
-    "family":   frozenset({"family", "children", "kids", "spouse", "wife", "husband",
-                           "parent", "parents", "sibling", "brother", "sister",
-                           "son", "daughter", "partner"}),
-    "work":     frozenset({"work", "job", "career", "employer", "employed",
-                           "company", "occupation", "profession", "office"}),
-    "physical": frozenset({"height", "weight", "tall", "heavy", "body", "size"}),
-    "pets":     frozenset({"pet", "dog", "cat", "animal", "fish", "bird",
-                           "hamster", "rabbit", "snake"}),
-    "identity": frozenset({"name", "who am i", "call me", "known as", "alias"}),
-    "temporal":  frozenset({"birthday", "born", "birth", "anniversary",
-                            "age", "when was", "how old", "date of birth"}),
-}
-
-_REL_CATEGORY: dict[str, str] = {
-    "lives_at": "location", "lives_in": "location", "located_in": "location",
-    "address": "location", "born_in": "location",
-    "parent_of": "family", "child_of": "family", "spouse": "family", "sibling_of": "family",
-    "works_for": "work", "occupation": "work",
-    "height": "physical", "weight": "physical", "has_gender": "physical",
-    "has_pet": "pets", "instance_of": "pets",
-    "also_known_as": "identity", "pref_name": "identity", "same_as": "identity",
-    "is_a": "identity",
-    "born_on": "temporal", "age": "temporal", "anniversary_on": "temporal", "met_on": "temporal",
-}
-
 
 _RETRACTION_SIGNALS: frozenset[str] = frozenset({
     "forget", "delete", "remove", "retract", "erase",
@@ -295,7 +267,13 @@ class Filter:
                     json=payload,
                 )
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+                # Bust session cache on successful ingest so next /query fetches fresh data
+                if data.get("status") not in ("error", None):
+                    _SESSION_MEMORY_CACHE.pop(user_id, None)
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] cache busted for user_id={user_id}")
+                return data
         except httpx.ConnectError as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] ingest connection error: {e}")
@@ -326,51 +304,69 @@ class Filter:
         tl = text.lower()
         return any(sig in tl for sig in _REALTIME_SIGNALS)
 
-    def _categorize_query(self, text: str) -> set[str]:
+    def _categorize_query(self, text: str, facts: list[dict]) -> set[str]:
+        """
+        Detect relevant categories from query text, using fact categories
+        present in the server response as the authority.
+        Only returns categories that have actual facts — no phantom matches.
+        """
         tl = text.lower()
-        return {cat for cat, kws in _QUERY_INTENT.items() if any(kw in tl for kw in kws)}
+        _CAT_SIGNALS = {
+            "location":  {"where","address","weather","forecast","city","home",
+                         "location","live","located","residence","town"},
+            "family":    {"family","children","kids","spouse","wife","husband",
+                         "parent","parents","sibling","brother","sister",
+                         "son","daughter","partner","married"},
+            "work":      {"work","job","career","employer","employed",
+                         "company","occupation","profession","office"},
+            "physical":  {"height","weight","tall","heavy","body","size"},
+            "temporal":  {"birthday","born","birth","anniversary","age",
+                         "when was","how old","date of birth"},
+            "pets":      {"pet","dog","cat","animal","fish","bird",
+                         "hamster","rabbit","snake"},
+            "identity":  {"name","who am i","call me","known as","alias"},
+        }
+        fact_cats = {f.get("category") for f in facts if f.get("category")}
 
-    def _filter_relevant_facts(self, facts: list[dict], categories: set[str], identity: Optional[str], is_realtime: bool = False) -> list[dict]:
+        matched = {
+            cat for cat, signals in _CAT_SIGNALS.items()
+            if cat in fact_cats and any(sig in tl for sig in signals)
+        }
+        return matched
+
+    def _filter_relevant_facts(
+        self,
+        facts: list[dict],
+        categories: set[str],
+        identity: Optional[str],
+        is_realtime: bool = False,
+    ) -> list[dict]:
         def _garbage(name: str) -> bool:
             n = (name or "").strip().lower()
             return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
 
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
         clean = [f for f in facts
-                 if not _garbage(f.get("subject", "")) and not _garbage(f.get("object", ""))]
+                if not _garbage(f.get("subject", ""))
+                and not _garbage(f.get("object", ""))]
 
-        # Categories detected from query text via _QUERY_INTENT
-        text_cats = categories  # already computed by _categorize_query
-
-        # Categories present in the actual fact payloads from /query
-        fact_cats = {f.get("category") for f in clean if f.get("category")}
-
-        # Allowed rel_types from static map for text-matched categories
-        static_allowed = {rt for rt, cat in _REL_CATEGORY.items() if cat in text_cats}
-
-        # Baseline categories always included (location, work, identity, temporal for identity anchor)
         _BASELINE_CATS = {"location", "work", "identity", "temporal"}
 
         if is_realtime:
             allowed_cats = _BASELINE_CATS | {"location"}
-        elif text_cats:
-            allowed_cats = _BASELINE_CATS | text_cats
+        elif categories:
+            allowed_cats = _BASELINE_CATS | categories
         else:
             allowed_cats = _BASELINE_CATS
 
-        # Build final allowed rel_types from both sources:
-        # 1. Static _REL_CATEGORY map (existing types)
-        # 2. fact.category field from server payload (DB-driven, catches new types)
         allowed = (
             _IDENTITY_RELS
-            | static_allowed
             | {f.get("rel_type") for f in clean
                if f.get("category") in allowed_cats and f.get("rel_type")}
         )
 
         filtered = [f for f in clean if f.get("rel_type", "") in allowed]
 
-        # Confidence gate: drop facts below threshold
         min_conf = self.valves.MIN_INJECT_CONFIDENCE
         if min_conf > 0:
             high_conf = [f for f in filtered if f.get("confidence", 1.0) >= min_conf]
@@ -379,41 +375,51 @@ class Filter:
 
         return filtered if filtered else clean
 
-    def _build_realtime_context(self, facts: list[dict], identity: Optional[str]) -> Optional[str]:
-        """Build realtime directive from facts. Returns None if no location found."""
-        # Resolve location from lives_at/lives_in facts (prefer lives_at)
+    def _build_realtime_context(
+        self, text: str, facts: list[dict], identity: Optional[str]
+    ) -> Optional[str]:
+        """
+        Build a tool-agnostic realtime directive from known facts.
+        Returns None if no location found — caller falls through to
+        conversational mode.
+        """
         location = None
-        for f in facts:
-            if f.get("rel_type") == "lives_at" and identity and f.get("subject") in {identity, "user"}:
-                loc = f.get("object", "").strip()
-                if loc:
-                    location = loc
-                    break
-
-        if not location:
+        _user_anchors = {identity, "user"} if identity else {"user"}
+        for rt in ("lives_at", "lives_in"):
             for f in facts:
-                if f.get("rel_type") == "lives_in" and identity and f.get("subject") in {identity, "user"}:
-                    loc = f.get("object", "").strip()
+                if (f.get("rel_type") == rt
+                        and f.get("subject") in _user_anchors):
+                    loc = (f.get("object") or "").strip()
                     if loc:
                         location = loc
                         break
+            if location:
+                break
 
         if not location:
             return None
 
-        # Build compact facts for context (e.g., work)
-        compact_parts = []
+        context_parts = []
         for f in facts:
-            if f.get("rel_type") == "works_for" and identity and f.get("subject") in {identity, "user"}:
-                obj = f.get("object", "").strip()
-                if obj:
-                    compact_parts.append(f"works at {obj.title()}")
+            if f.get("subject") not in _user_anchors:
+                continue
+            rt = f.get("rel_type", "")
+            obj = (f.get("object") or "").strip()
+            if not obj or rt in ("lives_at", "lives_in"):
+                continue
+            if rt == "works_for":
+                context_parts.append(f"works at {obj.title()}")
+            elif rt == "born_on":
+                context_parts.append(f"born on {obj}")
 
-        directive = f"The user's location is {location.title()}."
-        if compact_parts:
-            directive += f" Known context for this request: {'; '.join(compact_parts)}."
-        directive += " Use whatever tools or capabilities are available to fulfill this request directly. Do not ask the user to supply information that is already known above."
-
+        directive = (
+            f"The user's location is {location.title()}. "
+            f"Use whatever tools or capabilities are available to fulfill "
+            f"this request directly — do not ask the user to supply "
+            f"information that is already known."
+        )
+        if context_parts:
+            directive += f" Additional context: {'; '.join(context_parts)}."
         return directive
 
     def _detect_retraction_intent(self, text: str) -> bool:
@@ -462,6 +468,7 @@ class Filter:
 
     def _build_memory_block(
         self,
+        text: str,
         facts: list[dict],
         preferred_names: dict,
         canonical_identity: Optional[str],
@@ -474,7 +481,7 @@ class Filter:
 
         # Check if we should use realtime mode
         if is_realtime:
-            realtime_context = self._build_realtime_context(facts, identity)
+            realtime_context = self._build_realtime_context(text, facts, identity)
             if realtime_context:
                 # REALTIME MODE with location
                 lines = []
@@ -678,7 +685,7 @@ class Filter:
                         _, facts, preferred_names, canonical_identity, entity_attributes = cached
                         raw_facts_for_extraction = list(facts)
                         # Filter cached facts for this specific query
-                        _categories = self._categorize_query(text)
+                        _categories = self._categorize_query(text, facts)
                         _is_realtime = self._is_realtime_query(text)
                         if _is_realtime:
                             _categories.add("location")
@@ -723,7 +730,7 @@ class Filter:
                             raw_facts_for_extraction = list(facts)
 
                             # Filtering happens after cache store, not before
-                            _categories = self._categorize_query(text)
+                            _categories = self._categorize_query(text, facts)
                             _is_realtime = self._is_realtime_query(text)
                             if _is_realtime:
                                 _categories.add("location")
@@ -833,7 +840,7 @@ class Filter:
                             if obj and len(obj) > 1:
                                 locations.add(obj)
                     memory_block = self._build_memory_block(
-                        facts, preferred_names, canonical_identity, entity_attributes,
+                        text, facts, preferred_names, canonical_identity, entity_attributes,
                         is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
                     )
                     if self.valves.ENABLE_DEBUG:
