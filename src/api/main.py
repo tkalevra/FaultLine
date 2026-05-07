@@ -630,24 +630,26 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 ("user", req.user_id, "Person"),
                             )
                         db.commit()
+                        _scalar_category = _REL_TYPE_META.get(edge.rel_type.lower(), {}).get("category")
                         with db.cursor() as _cur:
                             _cur.execute(
                                 "INSERT INTO entity_attributes"
                                 " (user_id, entity_id, attribute, value_text, value_int,"
-                                "  value_float, value_date, provenance, sensitivity)"
-                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                                "  value_float, value_date, provenance, sensitivity, category)"
+                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                                 " ON CONFLICT (user_id, entity_id, attribute)"
                                 " DO UPDATE SET"
                                 "   value_text = EXCLUDED.value_text,"
                                 "   value_int = EXCLUDED.value_int,"
                                 "   value_float = EXCLUDED.value_float,"
                                 "   value_date = EXCLUDED.value_date,"
+                                "   category = EXCLUDED.category,"
                                 "   updated_at = now()",
                                 (req.user_id, _resolve_user_anchor(canonical_subject, req.user_id), edge.rel_type.lower(),
                                  val_text, val_int, val_float, val_date, req.source,
                                  "private" if edge.rel_type.lower() in {
                                      "phone", "address", "email", "lives_at", "lives_in", "ip_address"
-                                 } else "public"),
+                                 } else "public", _scalar_category),
                             )
                         db.commit()
                         log.info("ingest.scalar_stored", entity=canonical_subject,
@@ -1005,7 +1007,8 @@ def query(request: QueryRequest):
             _sh = ",".join(["%s"] * len(sensitivity_filter))
             with db_conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT entity_id, attribute, value_int, value_float, value_text, value_date "
+                    f"SELECT entity_id, attribute, value_int, value_float, value_text, "
+                    f"value_date, category "
                     f"FROM entity_attributes "
                     f"WHERE user_id = %s AND entity_id IN ({_ph}) "
                     f"AND sensitivity IN ({_sh})",
@@ -1013,15 +1016,18 @@ def query(request: QueryRequest):
                 )
                 attributes = {}
                 for row in cur.fetchall():
-                    eid, attr, vi, vf, vt, vd = row
+                    eid, attr, vi, vf, vt, vd, cat = row
                     if eid not in attributes:
                         attributes[eid] = {}
-                    attributes[eid][attr] = (
-                        vi if vi is not None else
-                        vf if vf is not None else
-                        vt if vt is not None else
-                        str(vd) if vd is not None else None
-                    )
+                    attributes[eid][attr] = {
+                        "value": (
+                            vi if vi is not None else
+                            vf if vf is not None else
+                            vt if vt is not None else
+                            str(vd) if vd is not None else None
+                        ),
+                        "category": cat,
+                    }
                 return attributes
         except Exception as e:
             log.warning("query.attributes_fetch_failed", error=str(e))
@@ -1048,8 +1054,14 @@ def query(request: QueryRequest):
         """
         facts = []
         user_attrs = attributes.get("user", {})
-        for attribute, value in user_attrs.items():
-            category = _REL_TYPE_META.get(attribute.lower(), {}).get("category")
+        for attribute, attr_data in user_attrs.items():
+            if isinstance(attr_data, dict):
+                value = attr_data.get("value")
+                category = attr_data.get("category")
+            else:
+                # Backward compat: legacy scalar values
+                value = attr_data
+                category = None
             facts.append({
                 "subject": "user",
                 "rel_type": attribute,
