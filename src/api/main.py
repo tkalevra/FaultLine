@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 import httpx
 import psycopg2
@@ -10,7 +11,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse
+from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, StoreContextRequest, StoreContextResponse
 
 log = structlog.get_logger()
 
@@ -1311,3 +1312,80 @@ def retract_fact(req: RetractRequest):
     finally:
         if 'db' in locals():
             db.close()
+
+
+@app.post("/store_context", response_model=StoreContextResponse)
+def store_context(req: StoreContextRequest):
+    """
+    Store unstructured text directly to Qdrant when no typed edges can be extracted.
+    No WGM gate, no Postgres write, direct Qdrant upsert only.
+    """
+    try:
+        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+        qwen_api_url = os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+
+        collection = derive_collection(req.user_id)
+
+        # Ensure collection exists
+        if not ensure_collection(collection, qdrant_url):
+            log.error("store_context.collection_ensure_failed", collection=collection)
+            raise HTTPException(status_code=500, detail="Collection unavailable")
+
+        # Embed the text
+        vector = embed_text(req.text, qwen_api_url, timeout=10.0, fallback=False)
+        if vector is None:
+            log.error("store_context.embed_failed", user_id=req.user_id, text_length=len(req.text))
+            raise HTTPException(status_code=500, detail={"status": "error", "point_id": ""})
+
+        # Generate point ID
+        point_id = str(uuid.uuid4())
+
+        # Upsert to Qdrant
+        response = httpx.put(
+            f"{qdrant_url}/collections/{collection}/points",
+            json={
+                "points": [
+                    {
+                        "id": point_id,
+                        "vector": vector,
+                        "payload": {
+                            "text": req.text,
+                            "source": req.source,
+                            "context_type": req.context_type,
+                            "user_id": req.user_id,
+                            "subject": "user",
+                            "rel_type": "context",
+                            "object": req.text[:120],
+                            "fact_class": "C",
+                            "confidence": 0.4,
+                        },
+                    }
+                ]
+            },
+            timeout=10.0,
+        )
+
+        if response.status_code != 200:
+            log.error(
+                "store_context.upsert_failed",
+                user_id=req.user_id,
+                status=response.status_code,
+                text_length=len(req.text),
+            )
+            raise HTTPException(status_code=500, detail="Qdrant upsert failed")
+
+        log.info(
+            "store_context.stored",
+            user_id=req.user_id,
+            point_id=point_id,
+            context_type=req.context_type,
+            text_length=len(req.text),
+        )
+
+        return StoreContextResponse(status="stored", point_id=point_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("store_context.error", error=str(e), user_id=req.user_id)
+        raise HTTPException(status_code=500, detail=str(e))
