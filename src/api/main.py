@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from typing import Optional
 import httpx
 import psycopg2
 import structlog
@@ -70,6 +71,10 @@ _CLASS_B_REL_TYPES = frozenset({
     "related_to", "has_pet", "part_of", "created_by",
 })
 
+_VALID_CATEGORIES = frozenset({
+    "physical", "temporal", "location", "work", "family", "pets", "identity"
+})
+
 # Class C = anything not in A or B, engine_generated types,
 # novel types, or confidence < 0.6
 
@@ -99,6 +104,63 @@ def _classify_fact(
     if rt in _CLASS_B_REL_TYPES:
         return "B"
     return "C"
+
+def _infer_category(rel_type: str) -> str | None:
+    """
+    Keyword-based category inference — offline fallback only.
+    Used when LLM is unavailable or returns an invalid category.
+    """
+    rt = rel_type.lower()
+    if any(k in rt for k in ("height","weight","gender","age","physical","body")):
+        return "physical"
+    if any(k in rt for k in ("born","birth","anniversary","met_on","married_on")):
+        return "temporal"
+    if any(k in rt for k in ("live","address","location","city","home","reside")):
+        return "location"
+    if any(k in rt for k in ("work","job","employ","occupation","career")):
+        return "work"
+    if any(k in rt for k in ("parent","child","spouse","sibling","family")):
+        return "family"
+    if any(k in rt for k in ("pet","animal","dog","cat","fish","bird")):
+        return "pets"
+    if any(k in rt for k in ("name","alias","known","called","pref")):
+        return "identity"
+    return None
+
+def _assign_category_via_llm(rel_type: str, qwen_api_url: str) -> Optional[str]:
+    """
+    Ask Qwen to assign a category to a novel rel_type.
+    Returns a valid category string or None on failure.
+    Falls back to _infer_category on invalid/empty response.
+    """
+    try:
+        resp = httpx.post(
+            qwen_api_url,
+            json={
+                "model": "qwen2.5-coder",
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        f"What category does the relationship type '{rel_type}' belong to? "
+                        f"Choose exactly one from this list: "
+                        f"physical, temporal, location, work, family, pets, identity. "
+                        f"Return only the single category word, nothing else. "
+                        f"If none fit, return 'other'."
+                    )
+                }],
+                "temperature": 0.0,
+                "max_tokens": 10,
+                "thinking": {"type": "disabled"},
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            raw = resp.json()["choices"][0]["message"]["content"].strip().lower()
+            if raw in _VALID_CATEGORIES:
+                return raw
+    except Exception:
+        pass
+    return _infer_category(rel_type)
 
 def _coerce_scalar(value: str) -> tuple:
     """
@@ -630,7 +692,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 ("user", req.user_id, "Person"),
                             )
                         db.commit()
-                        _scalar_category = _REL_TYPE_META.get(edge.rel_type.lower(), {}).get("category")
+                        _scalar_category = (
+                            _REL_TYPE_META.get(edge.rel_type.lower(), {}).get("category")
+                            or _infer_category(edge.rel_type.lower())
+                        )
                         with db.cursor() as _cur:
                             _cur.execute(
                                 "INSERT INTO entity_attributes"
@@ -960,7 +1025,7 @@ def query(request: QueryRequest):
                     [user_id] + list(_BASELINE_RELS) + [user_surrogate, user_surrogate],
                 )
                 baseline_facts = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4], "category": _REL_TYPE_META.get(r[2], {}).get("category")}
+                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4], "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
                     for r in cur.fetchall()
                 ]
             if baseline_facts:
@@ -1089,7 +1154,7 @@ def query(request: QueryRequest):
                         [user_id, user_surrogate, user_surrogate],
                     )
                     direct_facts = [
-                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4], "category": _REL_TYPE_META.get(row[2], {}).get("category")}
+                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4], "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2])}
                         for row in _cur.fetchall()
                     ]
 
@@ -1120,7 +1185,7 @@ def query(request: QueryRequest):
                                 direct_facts.append({
                                     "subject": row[0], "object": row[1],
                                     "rel_type": row[2], "provenance": row[3], "confidence": row[4],
-                                    "category": _REL_TYPE_META.get(row[2], {}).get("category")
+                                    "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2])
                                 })
                                 seen.add(key)
 
