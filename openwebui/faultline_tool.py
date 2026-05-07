@@ -40,6 +40,12 @@ _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
 )
 
+_IS_PURE_QUESTION = re.compile(
+    r'^\s*(what|who|where|when|how|why|is|are|do|does|can|could|'
+    r'tell|show|list|give|find|get|remind|do you know|have you)\b',
+    re.IGNORECASE
+)
+
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -778,12 +784,37 @@ class Filter:
                 _MEMORY_MARKER = "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine)."
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
-                typed_entities = await self._fetch_entities(clean_text, user_id)
-                raw_triples = await rewrite_to_triples(
-                    clean_text, self.valves, context=body.get("messages", []),
-                    typed_entities=typed_entities if typed_entities else None,
-                    memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                # Compute signals for skip_rewrite check
+                _has_self_id = bool(_IDENTITY_RE.search(clean_text))
+                _has_preference_signal = any(
+                    signal in clean_text.lower()
+                    for signal in {
+                        "call me", "please call me", "prefer to be called",
+                        "i prefer", "i'd prefer", "i would prefer",
+                        "goes by", "go by", "known as", "prefer you call me",
+                        "would like to be called", "like to go by",
+                        "call her", "call him", "call them",
+                        "her name is", "his name is",
+                    }
                 )
+
+                _skip_rewrite = (
+                    bool(_IS_PURE_QUESTION.match(clean_text))
+                    and not _has_self_id
+                    and not _has_preference_signal
+                )
+                if _skip_rewrite:
+                    typed_entities = []
+                    raw_triples = []
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
+                else:
+                    typed_entities = await self._fetch_entities(clean_text, user_id)
+                    raw_triples = await rewrite_to_triples(
+                        clean_text, self.valves, context=body.get("messages", []),
+                        typed_entities=typed_entities if typed_entities else None,
+                        memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                    )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
 
@@ -806,18 +837,6 @@ class Filter:
                 # Guard: "user → also_known_as" edges require first-person self-ID or preference signal
                 # to prevent false positives (e.g., "her name is Marla" → "user also_known_as marla").
                 # But "user → pref_name" edges are always allowed — extraction itself is the intent signal.
-                _has_self_id = bool(_IDENTITY_RE.search(clean_text))
-                _has_preference_signal = any(
-                    signal in clean_text.lower()
-                    for signal in {
-                        "call me", "please call me", "prefer to be called",
-                        "i prefer", "i'd prefer", "i would prefer",
-                        "goes by", "go by", "known as", "prefer you call me",
-                        "would like to be called", "like to go by",
-                        "call her", "call him", "call them",  # ← add these
-                        "her name is", "his name is",
-                    }
-                )
                 before = len(edges)
                 edges = [
                     e for e in edges
