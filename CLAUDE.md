@@ -115,7 +115,7 @@ Confidence values determine class assignment:
 2. **Graph traversal** (PostgreSQL, signal-gated) — when the query contains self-referential signals ("my family", "where do i live", etc.), fetches all facts anchored to the user's identity + 2-hop related entities.
 3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5` embedding, cosine search, `score_threshold: 0.3`, `limit: 10`. Adds associative context not captured by the other two paths.
 
-The three result sets are merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict. Each fact includes a `category` field sourced from `rel_types.category` via the in-memory `_REL_TYPE_META` map, and a `confidence` field for downstream filtering.
+The three result sets are merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict. Each fact includes a `category` field sourced from `rel_types.category` via the in-memory `_REL_TYPE_META` map (loaded at startup from the database and used throughout the request path for category lookups and type constraint validation), and a `confidence` field for downstream filtering.
 
 **Scalar facts as facts:** Entity attributes (age, height, weight, etc.) are returned in both the separate `attributes` dict AND as fact objects in the `facts` list with `rel_type=attribute_name` and appropriate category. This simplifies filter logic by treating all knowledge uniformly as facts.
 
@@ -132,7 +132,7 @@ Memory injection happens in the **inlet** (before the model sees the message). T
 |---|---|
 | `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, fact classification (_classify_fact, _commit_staged), Qdrant cleanup |
 | `src/api/models.py` | Pydantic models — `IngestRequest`, `QueryRequest`, `RetractRequest`, `RetractResponse`, `StoreContextRequest`, `StoreContextResponse`, `IngestResponse.staged`, `FactResult.fact_class` + `provenance` |
-| `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection, type constraint validation |
+| `src/wgm/gate.py` | `WGMValidationGate(db, rel_type_registry)` — ontology check + conflict detection + type constraint validation; validates against `_REL_TYPE_META` loaded at startup |
 | `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
 | `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers and label maps |
 | `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — canonical ID assignment, alias tracking, preferred name resolution |
@@ -264,7 +264,7 @@ Primary tables:
 - `staged_facts(id, user_id, subject_id, object_id, rel_type, fact_class, provenance, confidence, confirmed_count, first_seen_at, last_seen_at, expires_at, promoted_at, qdrant_synced)` — short-term memory for Class B and C facts. Unique on `(user_id, subject_id, object_id, rel_type)`. Class B promoted when `confirmed_count >= 3`; Class C auto-deleted when `expires_at <= now()`.
 - `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts (`age`, `height`, `weight`, `born_on`, `born_in`, `nationality`, `occupation`, `has_gender`) routed here at ingest instead of `facts`. Unique constraint on `(user_id, entity_id, attribute)` prevents duplicates. Values stored as raw strings (no entity resolution on the value side). The "user" anchor entity is created on first scalar write.
 - `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry. `entity_type` check constraint: ('Person','Animal','Organization','Location','Object','Concept','unknown'). **Note**: `entity_aliases` stores all known names for an entity (not secondary aliases), with one marked `is_preferred`. Rename to `entity_names` planned.
-- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior, category)` — live ontology with correction behavior (supersede/hard_delete/immutable) and optional `category` for query intent matching (location, family, work, pets, physical, identity, temporal). Loaded at startup.
+- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior, category, head_types, tail_types)` — live ontology with correction behavior (supersede/hard_delete/immutable), optional `category` for query intent matching (location, family, work, pets, physical, identity, temporal), and optional `head_types`/`tail_types` (entity type constraints as ARRAY). Loaded at startup into `_REL_TYPE_META` in-memory map.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
 
 **Fact lifecycle (Phase 4):**
