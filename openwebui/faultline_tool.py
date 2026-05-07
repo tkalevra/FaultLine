@@ -287,6 +287,27 @@ class Filter:
                 print(f"[FaultLine Filter] ingest error: {e}")
             return {"status": "error", "detail": str(e)}
 
+    async def _fire_store_context(self, text: str, user_id: str) -> None:
+        """
+        Fire-and-forget: store raw text as unstructured context in Qdrant
+        when no typed edges could be extracted. Ensures nothing is silently
+        dropped from natural conversation.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                await client.post(
+                    f"{self.valves.FAULTLINE_URL}/store_context",
+                    json={
+                        "text": text,
+                        "user_id": user_id,
+                        "source": self.valves.DEFAULT_SOURCE,
+                        "context_type": "unstructured",
+                    },
+                )
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] store_context error: {e}")
+
     async def _fetch_entities(self, text: str, user_id: str) -> list[dict]:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -665,7 +686,7 @@ class Filter:
             _has_third_person_pref = any(sig in text.lower() for sig in _THIRD_PERSON_PREF_SIGNALS)
 
             will_ingest = self.valves.INGEST_ENABLED and (
-                len(text.split()) >= 5
+                len(text.split()) >= 3
                 or bool(_IDENTITY_RE.search(text))
                 or _has_third_person_pref
             )
@@ -822,8 +843,16 @@ class Filter:
                     asyncio.create_task(
                         self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
                     )
-                elif self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] skipping ingest — no edges and no self-ID")
+                else:
+                    # No typed edges extracted but text passed the ingest gate.
+                    # Store raw text as unstructured context so nothing is silently
+                    # dropped from natural conversation. Qdrant will surface it via
+                    # vector similarity even without a typed relationship.
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] no edges — storing as unstructured context")
+                    asyncio.create_task(
+                        self._fire_store_context(clean_text, user_id)
+                    )
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
