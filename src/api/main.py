@@ -510,7 +510,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             _cur.execute(
                                 "UPDATE entities SET entity_type = %s"
                                 " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
-                                (edge.subject_type, canonical_subject, req.user_id),
+                                (edge.subject_type.title(), canonical_subject, req.user_id),
                             )
                         db.commit()
                     except Exception as _e:
@@ -523,7 +523,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             _cur.execute(
                                 "UPDATE entities SET entity_type = %s"
                                 " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
-                                (edge.object_type, canonical_object, req.user_id),
+                                (edge.object_type.title(), canonical_object, req.user_id),
                             )
                         db.commit()
                     except Exception as _e:
