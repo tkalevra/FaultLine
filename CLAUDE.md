@@ -350,7 +350,21 @@ The `/ingest` endpoint has code to update entity types from GLiNER2 classificati
    ```
    With instruction: "Preserve the types exactly as classified by GLiNER2. Do not invent new types."
 
-2. **Backend (`src/api/main.py`, line 556-564):** Fixed EdgeInput creation to include subject_type and object_type from GLiNER2:
+2. **Backend Schema (`src/api/main.py`, line 548-554):** Added subject_type and object_type to GLiNER2 schema:
+   ```python
+   schema = {
+       "facts": [
+           "subject::str::...",
+           "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the subject entity.",
+           "object::str::...",
+           "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the object entity.",
+           "rel_type::...::str::...",
+       ]
+   }
+   ```
+   **Critical:** GLiNER2 only returns fields specified in the schema. Without these fields in the schema, GLiNER2 doesn't extract or return type information.
+
+3. **Backend EdgeInput (`src/api/main.py`, line 556-564):** Fixed EdgeInput creation to include subject_type and object_type from GLiNER2:
    ```python
    EdgeInput(
        subject=fact["subject"].lower().strip(),
@@ -362,7 +376,7 @@ The `/ingest` endpoint has code to update entity types from GLiNER2 classificati
    ```
    Previously, types were extracted into `_entity_types` dict but never passed to EdgeInput.
 
-Result: Complete type flow → /ingest receives edges with types → entity_type UPDATE executes → has_pet validation passes.
+Result: Complete type flow → GLiNER2 extracts types → /ingest receives edges with types → entity_type UPDATE executes → has_pet validation passes.
 
 ## /query Endpoint: Self-Referential Graph Traversal (Fixed May 2026)
 
