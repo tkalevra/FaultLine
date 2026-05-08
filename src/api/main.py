@@ -2079,15 +2079,16 @@ def query(request: QueryRequest):
         ]
         log.info("query.ok", collection=collection, hits=len(qdrant_facts))
 
-        # Resolve display names for Postgres facts before merging (not for Qdrant facts — they already have display names)
+        # Resolve display names for all facts before merging
         resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
         resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
+        resolved_qdrant = _resolve_display_names(qdrant_facts, registry, user_id, user_entity_id_for_query) if registry else qdrant_facts
 
         # Merge: Postgres facts are authoritative, Qdrant adds associative context
         # Deduplicate on (subject, object, rel_type) — Postgres wins on conflict
         pg_keys = {(f["subject"], f["object"], f["rel_type"]) for f in resolved_direct}
         merged_facts = resolved_direct.copy()
-        for f in qdrant_facts:
+        for f in resolved_qdrant:
             key = (f["subject"], f["object"], f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)
