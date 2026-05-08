@@ -1490,6 +1490,18 @@ def query(request: QueryRequest):
     # The canonical user entity ID is the OpenWebUI UUID
     user_entity_id_for_query = user_id
 
+    # Initialize database connection and entity registry
+    try:
+        db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        registry = EntityRegistry(db)
+        # Canonical identity is the user's preferred display name for themselves
+        canonical_identity = registry.get_preferred_name(user_id, user_id)
+    except Exception as _e:
+        log.warning("query.db_init_failed", error=str(_e))
+        db = None
+        registry = None
+        canonical_identity = None
+
     query_lower = request.text.lower()
     direct_facts = []
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
