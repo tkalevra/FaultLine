@@ -524,25 +524,38 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             has_preferred = _detect_preference_signal(req.text)
             preferred_objects = set()
 
-            # Load the full flat alias set for this user from entity_aliases.
-            # entity_aliases is the authoritative registry — all names that resolve
-            # to the user entity regardless of how many hops through also_known_as
-            # they represent. Single query, no chaining, no recursion.
+            # Load the full flat alias set for this user - FIXED VERSION
             _user_aliases = {"user"}
             try:
                 with db.cursor() as _cur:
+                    # FIRST: Find the canonical user entity ID (could be 'user' or a UUID)
                     _cur.execute(
-                        "SELECT alias FROM entity_aliases "
-                        "WHERE user_id = %s AND entity_id = 'user'",
+                        "SELECT id FROM entities WHERE user_id = %s AND entity_type = 'Person' "
+                        "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
                         (req.user_id,),
                     )
+                    user_entity_row = _cur.fetchone()
+                    user_entity_id = user_entity_row[0] if user_entity_row else "user"
+
+                    # SECOND: Load all aliases for that entity
+                    _cur.execute(
+                        "SELECT alias FROM entity_aliases WHERE user_id = %s AND entity_id = %s",
+                        (req.user_id, user_entity_id),
+                    )
                     _user_aliases.update(row[0] for row in _cur.fetchall())
+
+                    # THIRD: Also load any aliases from 'user' placeholder if different
+                    if user_entity_id != "user":
+                        _cur.execute(
+                            "SELECT alias FROM entity_aliases WHERE user_id = %s AND entity_id = 'user'",
+                            (req.user_id,),
+                        )
+                        _user_aliases.update(row[0] for row in _cur.fetchall())
+
                 log.info("ingest.user_aliases_loaded",
-                         count=len(_user_aliases), user_id=req.user_id)
+                         count=len(_user_aliases), user_id=req.user_id, entity_id=user_entity_id)
             except Exception as _e:
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
-                # Fallback: _user_aliases stays as {"user"} — normalization still
-                # works for the "user" placeholder, just won't catch named aliases
 
             for edge in edges:
                 if edge.subject == edge.object: continue
@@ -593,11 +606,11 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     entity_id=canonical_object, entity_type=edge.object_type, error=str(_e))
 
                 # Normalize user-identity aliases back to "user" anchor
-                # If canonical_subject is a known alias of the user (e.g., "chris"), rewrite to "user"
-                # so facts are anchored under the identity placeholder, not scattered across aliases.
-                if (canonical_subject in _user_aliases or canonical_subject == req.user_id) and canonical_subject != "user":
+                # Check if canonical_subject matches ANY user alias (case-insensitive)
+                if (canonical_subject.lower() in [a.lower() for a in _user_aliases] or canonical_subject == req.user_id) and canonical_subject != "user":
                     log.info("ingest.subject_normalized_to_user",
-                             original=canonical_subject, user_id=req.user_id)
+                             original=canonical_subject, user_id=req.user_id,
+                             matched_alias=canonical_subject.lower() in [a.lower() for a in _user_aliases])
                     canonical_subject = "user"
                     # Ensure "user" anchor exists in entities table
                     with db.cursor() as _cur:
@@ -995,8 +1008,20 @@ def query(request: QueryRequest):
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
-        preferred = registry.get_preferred_name(user_id, user_surrogate)
-        if not preferred or preferred == user_surrogate:
+        
+        # FIXED: Get the actual user entity ID from entities table
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM entities WHERE user_id = %s AND (id = 'user' OR id = %s) "
+                "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
+                (user_id, user_id),
+            )
+            user_entity_row = cur.fetchone()
+            user_entity_id = user_entity_row[0] if user_entity_row else "user"
+            log.info("query.user_entity_resolved", user_id=user_id, entity_id=user_entity_id)
+        
+        preferred = registry.get_preferred_name(user_id, user_entity_id)
+        if not preferred or preferred == user_entity_id:
             preferred = "user"
         preferred_names = {"user": preferred}
         canonical_identity = preferred  # display name for injection, not for DB queries
@@ -1022,14 +1047,14 @@ def query(request: QueryRequest):
                     f"AND rel_type IN ({rel_placeholders}) "
                     f"AND (subject_id = %s OR object_id = %s) "
                     f"ORDER BY id",
-                    [user_id] + list(_BASELINE_RELS) + [user_surrogate, user_surrogate],
+                    [user_id] + list(_BASELINE_RELS) + [user_entity_id, user_entity_id],
                 )
                 baseline_facts = [
                     {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4], "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
                     for r in cur.fetchall()
                 ]
             if baseline_facts:
-                log.info("query.baseline_facts", count=len(baseline_facts), surrogate=user_surrogate)
+                log.info("query.baseline_facts", count=len(baseline_facts), surrogate=user_entity_id)
     except Exception as e:
         log.warning("query.preferred_names_error", error=str(e))
 
@@ -1098,44 +1123,73 @@ def query(request: QueryRequest):
             log.warning("query.attributes_fetch_failed", error=str(e))
             return {}
 
-    def _resolve_display_names(facts: list[dict], registry, user_id: str) -> list[dict]:
+    def _resolve_display_names(facts: list[dict], registry, user_id: str, user_entity_id: str = "user") -> list[dict]:
         """
         Resolve UUID subject_id/object_id to preferred display names.
         Falls back to the UUID string if no alias found.
         """
         resolved = []
         for f in facts:
+            subject_display = registry.get_preferred_name(user_id, f["subject"])
+            object_display = registry.get_preferred_name(user_id, f["object"])
+            
+            # FIXED: Normalize user entity IDs to "user" placeholder for consistent display
+            if f["subject"] == user_entity_id or subject_display == user_entity_id:
+                subject_display = "user"
+            if f["object"] == user_entity_id or object_display == user_entity_id:
+                object_display = "user"
+            
             resolved.append({
                 **f,
-                "subject": registry.get_preferred_name(user_id, f["subject"]),
-                "object": registry.get_preferred_name(user_id, f["object"]),
+                "subject": subject_display,
+                "object": object_display,
             })
         return resolved
 
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
-        Convert entity_attributes for "user" to facts format for injection.
-        Each attribute becomes a fact with subject="user", rel_type=attribute.
+        Convert entity_attributes to facts format for injection.
+        Each attribute becomes a fact with subject=entity, rel_type=attribute.
+        Works for all entities, not just "user".
         """
         facts = []
-        user_attrs = attributes.get("user", {})
-        for attribute, attr_data in user_attrs.items():
-            if isinstance(attr_data, dict):
-                value = attr_data.get("value")
-                category = attr_data.get("category")
-            else:
-                # Backward compat: legacy scalar values
-                value = attr_data
-                category = None
-            facts.append({
-                "subject": "user",
-                "rel_type": attribute,
-                "object": str(value) if value is not None else None,
-                "confidence": 1.0,
-                "fact_class": "A",
-                "category": category,
-            })
+        for entity_id, entity_attrs in attributes.items():
+            if not isinstance(entity_attrs, dict):
+                continue
+            for attribute, attr_data in entity_attrs.items():
+                if isinstance(attr_data, dict):
+                    value = attr_data.get("value")
+                    category = attr_data.get("category")
+                else:
+                    # Backward compat: legacy scalar values
+                    value = attr_data
+                    category = None
+                if value is not None:
+                    facts.append({
+                        "subject": entity_id,
+                        "rel_type": attribute,
+                        "object": str(value),
+                        "confidence": 1.0,
+                        "fact_class": "A",
+                        "category": category,
+                    })
         return facts
+
+    # FIXED: Get the user entity ID for queries
+    user_entity_id_for_query = "user"
+    if db and registry:
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM entities WHERE user_id = %s AND (id = 'user' OR id = %s) "
+                    "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
+                    (user_id, user_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    user_entity_id_for_query = row[0]
+        except Exception:
+            pass
 
     query_lower = request.text.lower()
     direct_facts = []
@@ -1151,7 +1205,7 @@ def query(request: QueryRequest):
                         "AND (subject_id = %s OR object_id = %s) "
                         "AND rel_type NOT IN ('also_known_as', 'pref_name') "
                         "ORDER BY id",
-                        [user_id, user_surrogate, user_surrogate],
+                        [user_id, user_entity_id_for_query, user_entity_id_for_query],
                     )
                     direct_facts = [
                         {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4], "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2])}
@@ -1160,11 +1214,11 @@ def query(request: QueryRequest):
 
                     # 2-hop: fetch facts for directly related entities
                     related = {
-                        f["object"] for f in direct_facts if f["subject"] == user_surrogate
+                        f["object"] for f in direct_facts if f["subject"] == user_entity_id_for_query
                     } | {
-                        f["subject"] for f in direct_facts if f["object"] == user_surrogate
+                        f["subject"] for f in direct_facts if f["object"] == user_entity_id_for_query
                     }
-                    related.discard(user_surrogate)
+                    related.discard(user_entity_id_for_query)
 
                     if related:
                         _rel_list = list(related)
@@ -1215,6 +1269,7 @@ def query(request: QueryRequest):
     }
 
     has_attribute_signal = any(sig in query_lower for sig in _ATTRIBUTE_SIGNALS)
+    log.info("query.entity_resolution.start", has_attribute_signal=has_attribute_signal, query_lower=query_lower)
 
     if has_attribute_signal and db:
         try:
@@ -1225,6 +1280,7 @@ def query(request: QueryRequest):
                 if t.strip("?.,!").lower() not in _STOPWORDS
                 and len(t.strip("?.,!")) > 1
             ]
+            log.info("query.entity_resolution.tokens", tokens=tokens)
 
             if tokens:
                 # Resolve tokens against entity_aliases for this user
@@ -1240,6 +1296,7 @@ def query(request: QueryRequest):
                         [user_id] + tokens
                     )
                     resolved = cur.fetchall()
+                log.info("query.entity_resolution.resolved", resolved=[(r[0], r[1]) for r in resolved])
 
                 if resolved:
                     resolved_ids = {row[0] for row in resolved}
@@ -1269,6 +1326,7 @@ def query(request: QueryRequest):
                             confirmed_ids.add(row[0])
                         if row[1] in resolved_ids:
                             confirmed_ids.add(row[1])
+                    log.info("query.entity_resolution.confirmed", confirmed_ids=list(confirmed_ids))
 
                     if confirmed_ids:
                         # Fetch facts anchored to confirmed entities
@@ -1293,6 +1351,7 @@ def query(request: QueryRequest):
                             db, user_id, list(confirmed_ids),
                             max_sensitivity="private"
                         )
+                        log.info("query.entity_resolution.attributes", entity_attrs=entity_attrs)
 
                         # Merge into direct_facts and attributes
                         for row in entity_facts:
@@ -1314,7 +1373,7 @@ def query(request: QueryRequest):
                             else:
                                 attributes[entity_id].update(attr_dict)
         except Exception as e:
-            log.warning("query.named_entity_resolution_failed", error=str(e))
+            log.error("query.entity_resolution.error", error=str(e))
 
     # Embed after graph traversal so Postgres results are returned even when the
     # embedding service is unavailable. fallback=False: skip Qdrant rather than
@@ -1323,11 +1382,11 @@ def query(request: QueryRequest):
     if vector is None:
         log.warning("query.embed_unavailable — skipping Qdrant search")
         # Resolve display names for Postgres facts before returning
-        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
-        resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
+        resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+            _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
             attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
             _attr_db.close()
         except Exception:
@@ -1349,11 +1408,11 @@ def query(request: QueryRequest):
         )
         if resp.status_code == 404:
             ensure_collection(collection, qdrant_url)
-            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
-            resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
+            resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
             try:
                 _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
                 attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
                 _attr_db.close()
             except Exception:
@@ -1368,11 +1427,11 @@ def query(request: QueryRequest):
             }
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
-            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
-            resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
+            resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
             try:
                 _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({"user"} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
                 attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
                 _attr_db.close()
             except Exception:
@@ -1401,8 +1460,8 @@ def query(request: QueryRequest):
         log.info("query.ok", collection=collection, hits=len(qdrant_facts))
 
         # Resolve display names for Postgres facts before merging (not for Qdrant facts — they already have display names)
-        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id) if registry else baseline_facts
-        resolved_direct = _resolve_display_names(direct_facts, registry, user_id) if registry else direct_facts
+        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
+        resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
 
         # Merge: Postgres facts are authoritative, Qdrant adds associative context
         # Deduplicate on (subject, object, rel_type) — Postgres wins on conflict
@@ -1425,7 +1484,7 @@ def query(request: QueryRequest):
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
             _entity_ids = list(
-                {"user"} |
+                {user_entity_id_for_query} |
                 {f["subject"] for f in merged_facts} |
                 {f["object"] for f in merged_facts}
             )

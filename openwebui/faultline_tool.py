@@ -6,7 +6,6 @@ required_open_webui_version: 0.9.0
 requirements: httpx
 """
 
-import asyncio
 import json
 import os
 import re
@@ -51,7 +50,8 @@ _CAT_SIGNALS = {
                  "location","live","located","residence","town"},
     "family":    {"family","children","kids","spouse","wife","husband",
                  "parent","parents","sibling","brother","sister",
-                 "son","daughter","partner","married"},
+                 "son","daughter","partner","married", "parent_of", "child_of",
+                 "my family", "tell me about my family", "des", "cyrus", "gabby"},
     "work":      {"work","job","career","employer","employed",
                  "company","occupation","profession","office"},
     "physical":  {"height","weight","tall","heavy","body","size"},
@@ -435,23 +435,48 @@ class Filter:
             n = (name or "").strip().lower()
             return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
 
-        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
+        # Remove garbage facts first
         cleaned = [f for f in facts
                 if not _garbage(f.get("subject", ""))
                 and not _garbage(f.get("object", ""))]
 
-        # Score-based filtering — replaces binary category allowlist
-        # Threshold: fact must score >= RELEVANCE_THRESHOLD to be injected
+        # Family query override - check query text directly
+        query_lower = query.lower()
+        is_family_query = any(term in query_lower for term in
+                             ["family", "son", "daughter", "child", "children",
+                              "kids", "parent", "sibling", "spouse", "wife", "husband"])
+
+        # For family queries, return ALL family-related facts without filtering
+        if is_family_query:
+            family_rel_types = {"parent_of", "child_of", "spouse", "sibling_of"}
+            identity_rel_types = {"also_known_as", "pref_name", "same_as"}
+
+            filtered = []
+            for f in cleaned:
+                rel_type = f.get("rel_type", "")
+                if rel_type in family_rel_types or rel_type in identity_rel_types:
+                    filtered.append(f)
+
+            # Confidence gate (preserve existing behavior)
+            if self.valves.MIN_INJECT_CONFIDENCE > 0:
+                high_conf = [f for f in filtered if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
+                if high_conf:
+                    return high_conf
+
+            return filtered
+
+        # For non-family queries, use normal scoring (keep your existing logic here)
+        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
         RELEVANCE_THRESHOLD = 0.4
 
-        # Identity relationships always pass regardless of score
-        scored = [
-            f for f in cleaned
-            if f.get("rel_type") in _IDENTITY_RELS
-            or self.calculate_relevance_score(f, query) >= RELEVANCE_THRESHOLD
-        ]
+        def should_include_fact(fact: dict) -> bool:
+            if fact.get("rel_type") in _IDENTITY_RELS:
+                return True
+            return self.calculate_relevance_score(fact, query) >= RELEVANCE_THRESHOLD
 
-        # Confidence gate (existing behaviour preserved)
+        scored = [f for f in cleaned if should_include_fact(f)]
+
+        # Confidence gate
         if self.valves.MIN_INJECT_CONFIDENCE > 0:
             high_conf = [f for f in scored if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
             if high_conf:
@@ -714,6 +739,19 @@ class Filter:
             if not text:
                 return body
 
+            # Self-feedback guard — drop messages containing FaultLine debug output
+            # # NO RECURSIVE MATCHING — signals checked against pre-extracted text string only
+            _DEBUG_SIGNALS = (
+                "[FaultLine",
+                "GLiNER2 has pre-classified",
+                "⊢ FaultLine Memory",
+                "FaultLine WGM",
+            )
+            if any(sig in text for sig in _DEBUG_SIGNALS):
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] dropping self-feedback message, text snippet: {text[:80]!r}")
+                return body
+
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
@@ -934,9 +972,8 @@ class Filter:
                 if edges or _has_self_id:
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
-                    asyncio.create_task(
-                        self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
-                    )
+                    # Make it await instead of fire-and-forget
+                    await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
                 else:
                     # No typed edges extracted but text passed the ingest gate.
                     # Store raw text as unstructured context so nothing is silently
@@ -944,9 +981,8 @@ class Filter:
                     # vector similarity even without a typed relationship.
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] no edges — storing as unstructured context")
-                    asyncio.create_task(
-                        self._fire_store_context(clean_text, user_id)
-                    )
+                    # Make it await instead of fire-and-forget
+                    await self._fire_store_context(clean_text, user_id)
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
