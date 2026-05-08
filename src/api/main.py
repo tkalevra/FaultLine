@@ -504,6 +504,67 @@ def _delete_from_qdrant(fact_ids: list[int], collection: str, qdrant_url: str) -
     except Exception as e:
         log.warning("qdrant.cleanup_failed", error=str(e), count=len(fact_ids))
 
+def _extract_pet_descriptor(text: str, pet_name: str) -> Optional[dict]:
+    """
+    Extract pet descriptors (breed, species, color, size) from text context.
+    Pattern: "have/own a [DESCRIPTOR]+ [PET_NAME]" or "[PET_NAME] is a [DESCRIPTOR]+"
+    Returns dict with descriptor type (species/breed/color/size) and value.
+    """
+    patterns = [
+        # "have a [species/breed] [color]? [name]"
+        (r"(?:have|own|got|has)\s+(?:a|an|my)\s+([a-z\s]+?)\s+(?:named|called|named)\s+" + re.escape(pet_name.lower()) + r"\b", "species"),
+        # "[name] is a [species/breed]"
+        (re.escape(pet_name.lower()) + r"\s+is\s+(?:a|an)\s+([a-z\s]+?)(?:\band\b|$)", "species"),
+        # "[name], a [descriptor]"
+        (re.escape(pet_name.lower()) + r",\s+(?:a|an)\s+([a-z\s]+?)(?:,|named|$)", "species"),
+    ]
+
+    text_lower = text.lower()
+    descriptors = []
+
+    for pattern, descriptor_type in patterns:
+        match = re.search(pattern, text_lower, re.IGNORECASE)
+        if match:
+            raw_descriptor = match.group(1).strip().lower()
+            # Clean up descriptor: remove trailing conjunctions, articles, etc.
+            raw_descriptor = re.sub(r"\s+(and|or|named|called).*$", "", raw_descriptor)
+            raw_descriptor = raw_descriptor.strip()
+            if raw_descriptor and len(raw_descriptor) < 50:  # sanity check
+                descriptors.append({
+                    "type": descriptor_type,
+                    "value": raw_descriptor
+                })
+
+    return descriptors if descriptors else None
+
+
+def _infer_type_from_relationship(rel_type: str, entity_position: str) -> Optional[str]:
+    """
+    Infer entity type from relationship semantics.
+    Used as fallback when GLiNER2 classification is uncertain or conflicts with context.
+    entity_position: 'subject' or 'object'
+    """
+    relationship_hints = {
+        "has_pet": {"object": "Animal"},
+        "parent_of": {"subject": "Person", "object": "Person"},
+        "child_of": {"subject": "Person", "object": "Person"},
+        "spouse": {"subject": "Person", "object": "Person"},
+        "sibling_of": {"subject": "Person", "object": "Person"},
+        "works_for": {"subject": "Person", "object": "Organization"},
+        "lives_at": {"subject": "Person", "object": "Location"},
+        "lives_in": {"subject": "Person", "object": "Location"},
+        "located_in": {"object": "Location"},
+        "born_in": {"object": "Location"},
+        "created_by": {"subject": "Person"},
+        "part_of": {"object": "Organization"},
+    }
+
+    rel_hints = relationship_hints.get(rel_type.lower())
+    if rel_hints:
+        return rel_hints.get(entity_position)
+    return None
+
+
 def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
                       rel_type: str, new_fact_id: int, correction_behavior: str) -> int:
     if correction_behavior == "hard_delete":
@@ -711,6 +772,65 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     except Exception as _e:
                         log.warning("ingest.object_type_update_failed",
                                     entity_id=canonical_object, entity_type=edge.object_type, error=str(_e))
+
+                # Relationship-aware type refinement: use relationship semantics to correct/override types
+                # Example: has_pet(we, goose) → object should always be Animal, regardless of GLiNER2 classification
+                rel_type_lower = edge.rel_type.lower()
+                inferred_subject_type = _infer_type_from_relationship(rel_type_lower, "subject")
+                inferred_object_type = _infer_type_from_relationship(rel_type_lower, "object")
+
+                # Apply inferred types if edge types are missing or conflicting
+                final_subject_type = edge.subject_type or inferred_subject_type
+                final_object_type = edge.object_type or inferred_object_type
+
+                if final_subject_type and canonical_subject not in (user_entity_id, canonical_object):
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE entities SET entity_type = %s"
+                                " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
+                                (final_subject_type.title(), canonical_subject, req.user_id),
+                            )
+                        db.commit()
+                    except Exception as _e:
+                        log.warning("ingest.inferred_subject_type_update_failed",
+                                    entity_id=canonical_subject, entity_type=final_subject_type, error=str(_e))
+
+                if final_object_type and canonical_object not in (user_entity_id, canonical_subject):
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE entities SET entity_type = %s"
+                                " WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
+                                (final_object_type.title(), canonical_object, req.user_id),
+                            )
+                        db.commit()
+                    except Exception as _e:
+                        log.warning("ingest.inferred_object_type_update_failed",
+                                    entity_id=canonical_object, entity_type=final_object_type, error=str(_e))
+
+                # Extract and store pet descriptors for has_pet relationships
+                # Example: "we have a cat named goose" → store species="cat" as entity_attribute
+                if rel_type_lower == "has_pet" and canonical_object and canonical_object != user_entity_id:
+                    descriptors = _extract_pet_descriptor(req.text, edge.object)
+                    if descriptors:
+                        try:
+                            with db.cursor() as _cur:
+                                for desc in descriptors:
+                                    _cur.execute(
+                                        "INSERT INTO entity_attributes (user_id, entity_id, attribute, value_text, sensitivity, provenance, category) "
+                                        "VALUES (%s, %s, %s, %s, 'public', 'llm_inferred', 'physical') "
+                                        "ON CONFLICT (user_id, entity_id, attribute) DO UPDATE SET "
+                                        "value_text = EXCLUDED.value_text",
+                                        (req.user_id, canonical_object, desc["type"], desc["value"]),
+                                    )
+                            db.commit()
+                            log.info("ingest.pet_descriptor_stored",
+                                     pet=canonical_object, descriptor_type=descriptors[0]["type"],
+                                     descriptor_value=descriptors[0]["value"])
+                        except Exception as _e:
+                            log.warning("ingest.pet_descriptor_storage_failed",
+                                       pet=canonical_object, error=str(_e))
 
                 # Normalize user-identity aliases to the canonical user UUID
                 if (canonical_subject.lower() in [a.lower() for a in _user_aliases] or canonical_subject == req.user_id) and canonical_subject != user_entity_id:
