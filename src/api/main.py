@@ -1382,6 +1382,25 @@ def retract_fact(req: RetractRequest):
             qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
             _delete_from_qdrant(affected_ids, collection, qdrant_url)
 
+        # Clean up entity_aliases for pref_name hard-delete
+        if req.rel_type and req.rel_type.lower() == "pref_name" and mode == "hard_delete":
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM entity_aliases
+                        WHERE entity_id = %s
+                          AND user_id = %s
+                          AND alias = %s
+                          AND is_preferred = true
+                        """,
+                        (req.subject, req.user_id, req.old_value)
+                    )
+                db.commit()
+            except Exception as e:
+                log.warning("retract.entity_aliases_cleanup_failed",
+                            rel_type=req.rel_type, subject_id=req.subject, error=str(e))
+
         return RetractResponse(status="ok", retracted=len(affected_ids), mode=mode, note=note)
     except Exception as e:
         log.error("retract.error", error=str(e))
