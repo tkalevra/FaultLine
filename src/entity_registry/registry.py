@@ -5,9 +5,22 @@ import structlog
 log = structlog.get_logger()
 
 
+# Stable namespace UUID for deriving surrogates when user_id is not a valid UUID
+_FAULTLINE_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+
+
 def _make_surrogate(user_id: str, name: str) -> str:
-    """Generate immutable UUID v5 surrogate for an entity."""
-    return str(uuid.uuid5(uuid.UUID(user_id), name.lower().strip())).lower()
+    """Generate deterministic UUID v5 surrogate for an entity.
+
+    Uses user_id directly as the namespace if it is a valid UUID.
+    Falls back to a UUID v5 derived from a stable namespace + user_id
+    when user_id is not a valid UUID (e.g., 'anonymous').
+    """
+    try:
+        namespace = uuid.UUID(user_id)
+    except (ValueError, AttributeError):
+        namespace = uuid.uuid5(_FAULTLINE_NAMESPACE, user_id)
+    return str(uuid.uuid5(namespace, name.lower().strip())).lower()
 
 class EntityRegistry:
     """

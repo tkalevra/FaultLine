@@ -9,7 +9,7 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException
 from src.entity_registry.registry import EntityRegistry
 from src.fact_store.store import FactStoreManager
-from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection
+from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
 from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, StoreContextRequest, StoreContextResponse
@@ -201,6 +201,33 @@ def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
     """Return the canonical user UUID if entity_id matches, else return entity_id."""
     return user_id if entity_id == user_id else entity_id
 
+# Emergency fallback constraint used only when DB is completely unreachable.
+# Never used as the primary source — the DB rel_types table is authoritative.
+_EMERGENCY_CONSTRAINT = (
+    "instance_of|subclass_of|part_of|created_by|works_for|"
+    "parent_of|child_of|spouse|sibling_of|also_known_as|pref_name|same_as|"
+    "related_to|likes|dislikes|prefers|owns|located_in|educated_at|"
+    "nationality|occupation|born_on|age|knows|friend_of|met|"
+    "lives_in|born_in|has_gender|has_pet|lives_at|located_at|height|weight"
+)
+
+def _get_constraint() -> str:
+    """
+    Return the rel_type constraint string for GLiNER2 schemas.
+    Uses the startup-built cache if populated; otherwise rebuilds from DB.
+    The emergency fallback is only used when both are unavailable.
+    """
+    global _rel_type_constraint
+    if _rel_type_constraint:
+        return _rel_type_constraint
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        constraint = _build_rel_type_constraint(dsn)
+        if constraint:
+            _rel_type_constraint = constraint
+            return constraint
+    return _EMERGENCY_CONSTRAINT
+
 def _build_rel_type_constraint(dsn: str) -> str:
     """Load rel_types from DB and build pipe-separated bracket constraint."""
     try:
@@ -262,11 +289,77 @@ def _commit_staged(
         return count
     except Exception as e:
         db_conn.rollback()
-        log.warning("ingest.staged_commit_failed", err=str(e))
+        log.error("ingest.staged_commit_failed",
+                  err=str(e),
+                  row_count=len(rows),
+                  fact_class=fact_class,
+                  first_row=str(rows[0]) if rows else "empty")
         return 0
 
 def get_gliner_model():
     return _gliner2_model
+
+def _ensure_schema(dsn: str) -> None:
+    """
+    Apply any pending schema migrations at startup.
+    This is the idempotent equivalent of running migration SQL files —
+    column renames, type changes, seed data. Each statement uses IF EXISTS
+    or information_schema checks so it's safe to run on any DB state.
+    """
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # Rename allowed_head → head_types if the old column exists
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'rel_types' AND column_name = 'allowed_head'"
+                )
+                if cur.fetchone():
+                    cur.execute("ALTER TABLE rel_types RENAME COLUMN allowed_head TO head_types")
+                    log.info("startup.schema_rename", old="allowed_head", new="head_types")
+
+                # Rename allowed_tail → tail_types if the old column exists
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'rel_types' AND column_name = 'allowed_tail'"
+                )
+                if cur.fetchone():
+                    cur.execute("ALTER TABLE rel_types RENAME COLUMN allowed_tail TO tail_types")
+                    log.info("startup.schema_rename", old="allowed_tail", new="tail_types")
+
+                # Alter staged_facts.user_id from UUID to TEXT (conditional)
+                cur.execute(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_name = 'staged_facts' AND column_name = 'user_id'"
+                )
+                row = cur.fetchone()
+                if row and row[0].upper() == 'UUID':
+                    cur.execute("ALTER TABLE staged_facts ALTER COLUMN user_id TYPE TEXT")
+                    cur.execute("ALTER TABLE staged_facts ALTER COLUMN subject_id TYPE TEXT")
+                    cur.execute("ALTER TABLE staged_facts ALTER COLUMN object_id TYPE TEXT")
+                    log.info("startup.schema_staged_facts_uuid_to_text")
+
+                # Seed missing rel_types that are referenced in code but might
+                # not exist in the DB (safe — ON CONFLICT DO NOTHING)
+                _MISSING_TYPES = [
+                    ("lives_at", "Lives At", "location", "supersede"),
+                    ("located_at", "Located At", "location", "supersede"),
+                    ("has_pet", "Has Pet", "pets", "supersede"),
+                    ("height", "Height", "physical", "supersede"),
+                    ("weight", "Weight", "physical", "supersede"),
+                ]
+                for rel_type, label, category, correction_behavior in _MISSING_TYPES:
+                    cur.execute(
+                        "INSERT INTO rel_types (rel_type, label, category, correction_behavior, source) "
+                        "VALUES (%s, %s, %s, %s, 'builtin') "
+                        "ON CONFLICT (rel_type) DO NOTHING",
+                        (rel_type, label, category, correction_behavior),
+                    )
+                conn.commit()
+                log.info("startup.schema_check_complete")
+    except Exception as e:
+        log.warning("startup.schema_check_failed", error=str(e))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -282,6 +375,7 @@ async def lifespan(app: FastAPI):
 
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
+        _ensure_schema(dsn)  # apply pending migrations before reading the schema
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
             _rel_type_registry.get_valid_types()
@@ -370,7 +464,7 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
     if model is None:
         return {"entities": []}
     try:
-        constraint = _rel_type_constraint or "is_a|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|owns|knows|friend_of"
+        constraint = _get_constraint()
         schema = {
             "facts": [
                 "subject::str::The full proper name of the first entity. Never a pronoun.",
@@ -450,7 +544,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     inferred_relations = []
     if model is not None and not req.edges:
         try:
-            constraint = _rel_type_constraint or "is_a|part_of|created_by|works_for|parent_of|child_of|spouse|sibling_of|also_known_as|related_to|likes|dislikes|prefers|has_gender|lives_in|born_in|born_on|nationality|educated_at|occupation|owns|located_in|knows|friend_of|met|age|located_at"
+            constraint = _get_constraint()
             schema = {
                 "facts": [
                     "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
@@ -537,6 +631,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             rows = []
             has_preferred = _detect_preference_signal(req.text)
             preferred_objects = set()
+            # Map canonical UUID → original display name for alias sync (Bug #3 fix)
+            _canonical_to_display: dict[str, str] = {}
 
             # The canonical user entity ID is the OpenWebUI UUID (req.user_id)
             user_entity_id = req.user_id
@@ -554,22 +650,6 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                          count=len(_user_aliases), user_id=req.user_id)
             except Exception as _e:
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
-
-            # Ensure all mentioned entities exist before processing edges
-            for edge in edges:
-                for entity in [edge.subject, edge.object]:
-                    if entity and entity not in [user_entity_id, "user"]:
-                        try:
-                            with db.cursor() as cur:
-                                cur.execute(
-                                    "INSERT INTO entities (id, user_id, entity_type) "
-                                    "VALUES (%s, %s, 'Person') "
-                                    "ON CONFLICT (id, user_id) DO NOTHING",
-                                    (entity.lower(), req.user_id)
-                                )
-                            db.commit()
-                        except Exception:
-                            pass  # Silent fail - entity might exist already
 
             for edge in edges:
                 if edge.subject == edge.object: continue
@@ -598,6 +678,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
                 canonical_object = registry.resolve(req.user_id, edge.object)
+                # Record display name mapping for alias sync (Bug #3 fix)
+                _canonical_to_display[canonical_object] = edge.object.lower()
 
                 # Persist entity types to entities table if provided (only if currently unknown)
                 if edge.subject_type and canonical_subject != user_entity_id:
@@ -817,14 +899,25 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     )
                     status = validation.get("status")
 
-                    # Handle type_mismatch: drop edge, do not commit, entities already exist
+                    # Handle type_mismatch: user-stated facts override type constraints.
+                    # The user is authoritative about their own data. Only reject
+                    # type mismatches from pure inference (no user edges provided).
                     if status == "type_mismatch":
-                        log.warning("ingest.type_mismatch",
-                                    subject=fact_subject,
-                                    rel_type=edge.rel_type,
-                                    object=canonical_object,
-                                    reason=validation.get("reason", ""))
-                        continue
+                        if req.edges:
+                            # User-provided edges bypass type constraints — user is source of truth
+                            status = "valid"
+                            log.info("ingest.type_mismatch_overridden",
+                                     subject=fact_subject,
+                                     rel_type=edge.rel_type,
+                                     object=canonical_object,
+                                     reason="user-provided edges override type constraints")
+                        else:
+                            log.warning("ingest.type_mismatch",
+                                        subject=fact_subject,
+                                        rel_type=edge.rel_type,
+                                        object=canonical_object,
+                                        reason=validation.get("reason", ""))
+                            continue
 
                 # Look up whether this rel_type is engine_generated
                 is_engine_generated = False
@@ -851,7 +944,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     fact_class=fact_class,
                     provenance=edge.fact_provenance,
                 ))
-                if status == "valid":
+                if status in ("valid", "conflict"):
+                    # Conflict facts: the WGM gate already inserted the new fact and marked
+                    # old facts as contradicted. We still need rows populated for downstream
+                    # processing (entity alias sync, Qdrant sync, preference propagation).
                     # pref_name edges are always preferred by definition — the rel_type itself
                     # is the preference signal. also_known_as requires explicit signal to be preferred.
                     if edge.rel_type.lower() == "pref_name":
@@ -891,8 +987,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # Trigger immediate Qdrant sync for Class A facts (don't wait for 10s re_embedder poll)
                     # This ensures attribute queries immediately after ingest get results from both PostgreSQL and Qdrant
                     try:
-                        from src.re_embedder.embedder import ReEmbedder
-                        embedder = ReEmbedder(db)
+                        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+                        qwen_api_url = os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
                         upserted = 0
                         with db.cursor() as cur:
                             # Fetch the facts we just committed (qdrant_synced=false)
@@ -904,22 +1000,33 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             )
                             fresh_facts = cur.fetchall()
                             if fresh_facts:
-                                # Embed and upsert to Qdrant immediately
-                                upserted = embedder.upsert_facts_to_qdrant(
-                                    req.user_id,
-                                    [(f[2], f[3], f[4]) for f in fresh_facts]  # (subject, object, rel_type)
-                                )
-                                # Mark as synced
+                                collection = derive_collection(req.user_id)
+                                ensure_collection(collection, qdrant_url)
+                                for fact_id, fact_user_id, subject, obj, rel_type in fresh_facts:
+                                    text = f"{subject} {rel_type} {obj}"
+                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True)
+                                    if vector is None:
+                                        continue
+                                    row = {
+                                        "id": fact_id,
+                                        "user_id": fact_user_id,
+                                        "subject_id": subject,
+                                        "subject_display": subject,
+                                        "object_id": obj,
+                                        "object_display": obj,
+                                        "rel_type": rel_type,
+                                        "provenance": req.source,
+                                        "confidence": 1.0,
+                                        "confirmed_count": 0,
+                                        "last_seen_at": None,
+                                        "contradicted_by": None,
+                                    }
+                                    if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                        mark_synced(db, fact_id)
+                                        upserted += 1
                                 if upserted > 0:
-                                    fact_ids = [f[0] for f in fresh_facts[:upserted]]
-                                    if fact_ids:
-                                        id_ph = ",".join(["%s"] * len(fact_ids))
-                                        cur.execute(
-                                            f"UPDATE facts SET qdrant_synced = true WHERE id IN ({id_ph})",
-                                            fact_ids
-                                        )
-                                        db.commit()
-                                        log.info("ingest.immediate_qdrant_sync", user_id=req.user_id, synced=upserted)
+                                    db.commit()
+                                    log.info("ingest.immediate_qdrant_sync", user_id=req.user_id, synced=upserted)
                     except Exception as _sync_err:
                         log.warning("ingest.immediate_qdrant_sync_failed", error=str(_sync_err))
                         # Don't fail ingest if immediate Qdrant sync fails — it will retry on next re_embedder poll
@@ -928,6 +1035,55 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     staged_b = _commit_staged(db, class_b_rows, "B", confidence=0.8)
                     staged += staged_b
                     log.info("ingest.class_b_staged", count=staged_b)
+
+                    # Trigger immediate Qdrant sync for Class B staged facts
+                    # so they're available via vector search without waiting for re_embedder poll
+                    try:
+                        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+                        qwen_api_url = os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+                        upserted_b = 0
+                        with db.cursor() as cur:
+                            cur.execute(
+                                "SELECT id, user_id, subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
+                                "WHERE user_id = %s AND qdrant_synced = false AND promoted_at IS NULL AND expires_at > now() "
+                                "ORDER BY id DESC LIMIT %s",
+                                (req.user_id, len(class_b_rows))
+                            )
+                            staged_fresh = cur.fetchall()
+                            if staged_fresh:
+                                collection = derive_collection(req.user_id)
+                                ensure_collection(collection, qdrant_url)
+                                for sf_id, sf_uid, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf in staged_fresh:
+                                    text = f"{sf_subj} {sf_rel} {sf_obj}"
+                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True)
+                                    if vector is None:
+                                        continue
+                                    s_row = {
+                                        "id": sf_id,
+                                        "user_id": sf_uid,
+                                        "subject_id": sf_subj,
+                                        "subject_display": sf_subj,
+                                        "object_id": sf_obj,
+                                        "object_display": sf_obj,
+                                        "rel_type": sf_rel,
+                                        "provenance": sf_prov,
+                                        "confidence": float(sf_conf) if sf_conf else 0.8,
+                                        "confirmed_count": 0,
+                                        "last_seen_at": None,
+                                        "contradicted_by": None,
+                                    }
+                                    if upsert_to_qdrant(s_row, vector, collection, qdrant_url):
+                                        with db.cursor() as _mark:
+                                            _mark.execute(
+                                                "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
+                                                (sf_id,)
+                                            )
+                                        db.commit()
+                                        upserted_b += 1
+                                if upserted_b > 0:
+                                    log.info("ingest.immediate_qdrant_sync_staged", user_id=req.user_id, synced=upserted_b)
+                    except Exception as _sync_err:
+                        log.warning("ingest.immediate_qdrant_sync_staged_failed", error=str(_sync_err))
 
                 if class_c_rows:
                     staged_c = _commit_staged(db, class_c_rows, "C", confidence=0.4)
@@ -989,13 +1145,16 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         if _rel.lower() not in ("also_known_as", "pref_name"):
                             continue
 
+                        # Resolve display name from canonical UUID (Bug #3 fix)
+                        _display_name = _canonical_to_display.get(_obj, _obj)
+
                         # Upsert alias into entity_aliases
                         cur.execute(
                             "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
                             "VALUES (%s, %s, %s, %s) "
-                            "ON CONFLICT (entity_id, user_id, alias) "
+                            "ON CONFLICT (user_id, alias) "
                             "DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
-                            (_subj, _uid, _obj, _is_pref),
+                            (_subj, _uid, _display_name, _is_pref),
                         )
 
                         # If this is a hard preference, demote all other aliases for this entity
@@ -1003,7 +1162,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             cur.execute(
                                 "UPDATE entity_aliases SET is_preferred = false "
                                 "WHERE user_id = %s AND entity_id = %s AND alias != %s",
-                                (_uid, _subj, _obj),
+                                (_uid, _subj, _display_name),
                             )
                             # Mirror into facts: demote other also_known_as rows for this entity
                             cur.execute(
@@ -1112,20 +1271,21 @@ def query(request: QueryRequest):
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
         
-        # FIXED: Get the actual user entity ID from entities table
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM entities WHERE user_id = %s AND (id = 'user' OR id = %s) "
-                "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
-                (user_id, user_id),
-            )
-            user_entity_row = cur.fetchone()
-            user_entity_id = user_entity_row[0] if user_entity_row else "user"
-            log.info("query.user_entity_resolved", user_id=user_id, entity_id=user_entity_id)
+        # Resolve user entity ID — the canonical identity is the user's UUID.
+        # The literal "user" string exists as a legacy entity in some databases
+        # but aliases are registered under the UUID surrogate. Try both.
+        user_entity_id = user_id  # UUID is the authoritative surrogate
+        log.info("query.user_entity_resolved", user_id=user_id, entity_id=user_entity_id)
         
+        # Look up preferred name: try UUID first, then fall back to legacy "user" entity
         preferred = registry.get_preferred_name(user_id, user_entity_id)
         if not preferred or preferred == user_entity_id:
-            preferred = "user"
+            # Try the legacy "user" literal as a fallback
+            preferred_legacy = registry.get_preferred_name(user_id, "user")
+            if preferred_legacy and preferred_legacy != "user":
+                preferred = preferred_legacy
+            else:
+                preferred = "user"
         preferred_names = {"user": preferred}
         canonical_identity = preferred  # display name for injection, not for DB queries
         if canonical_identity:
@@ -1139,23 +1299,9 @@ def query(request: QueryRequest):
                 "lives_at", "lives_in", "address", "located_in", "born_in",
                 "age", "height", "weight", "works_for", "occupation",
                 "nationality", "has_gender",
+                "also_known_as", "pref_name",  # identity — never depend on Qdrant for who the user is
             )
-            rel_placeholders = ",".join(["%s"] * len(_BASELINE_RELS))
-            with db.cursor() as cur:
-                cur.execute(
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                    f"WHERE user_id = %s AND superseded_at IS NULL "
-                    f"AND hard_delete_flag = false "
-                    f"AND (valid_until IS NULL OR valid_until > now()) "
-                    f"AND rel_type IN ({rel_placeholders}) "
-                    f"AND (subject_id = %s OR object_id = %s) "
-                    f"ORDER BY id",
-                    [user_id] + list(_BASELINE_RELS) + [user_entity_id, user_entity_id],
-                )
-                baseline_facts = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2], "provenance": r[3], "confidence": r[4], "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
-                    for r in cur.fetchall()
-                ]
+            baseline_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id, rel_types=_BASELINE_RELS)
             if baseline_facts:
                 log.info("query.baseline_facts", count=len(baseline_facts), surrogate=user_entity_id)
     except Exception as e:
@@ -1249,6 +1395,64 @@ def query(request: QueryRequest):
             })
         return resolved
 
+    def _fetch_user_facts(
+        db_conn,
+        user_id: str,
+        entity_id: str = None,
+        rel_types: tuple[str, ...] = None,
+    ) -> list[dict]:
+        """
+        Fetch facts from BOTH facts and staged_facts tables with a UNION.
+        Ensures Class B/C staged facts are visible to queries immediately,
+        without waiting for promotion or re_embedder sync.
+        Returns list of {subject, object, rel_type, provenance, confidence, category} dicts.
+        """
+        results = []
+        try:
+            with db_conn.cursor() as cur:
+                # Build common WHERE clauses
+                conds = ["user_id = %s"]
+                params = [user_id]
+                
+                # facts-specific filters
+                f_conds = conds + ["superseded_at IS NULL", "hard_delete_flag = false",
+                                   "(valid_until IS NULL OR valid_until > now())"]
+                # staged_facts-specific filters
+                s_conds = conds + ["expires_at > now()", "promoted_at IS NULL"]
+                
+                if rel_types:
+                    ph = ",".join(["%s"] * len(rel_types))
+                    f_conds.append(f"rel_type IN ({ph})")
+                    s_conds.append(f"rel_type IN ({ph})")
+                    params.extend(rel_types)
+                
+                if entity_id:
+                    f_conds.append("(subject_id = %s OR object_id = %s)")
+                    s_conds.append("(subject_id = %s OR object_id = %s)")
+                    params.extend([entity_id, entity_id])
+                
+                f_where = " AND ".join(f_conds)
+                s_where = " AND ".join(s_conds)
+                
+                query = (
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
+                    f"WHERE {f_where} "
+                    f"UNION ALL "
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
+                    f"WHERE {s_where} "
+                    f"ORDER BY rel_type"
+                )
+                cur.execute(query, params)
+                results = [
+                    {"subject": r[0], "object": r[1], "rel_type": r[2],
+                     "provenance": r[3], "confidence": r[4],
+                     "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
+                    for r in cur.fetchall()
+                ]
+        except Exception as e:
+            log.warning("query.fetch_user_facts_failed", error=str(e))
+        return results
+
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
         Convert entity_attributes to facts format for injection.
@@ -1286,39 +1490,26 @@ def query(request: QueryRequest):
     if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
         try:
             if db and registry and canonical_identity:
-                with db.cursor() as _cur:
-                    _cur.execute(
-                        "SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                        "WHERE user_id = %s AND superseded_at IS NULL "
-                        "AND hard_delete_flag = false "
-                        "AND (valid_until IS NULL OR valid_until > now()) "
-                        "AND (subject_id = %s OR object_id = %s) "
-                        "AND rel_type NOT IN ('also_known_as', 'pref_name') "
-                        "ORDER BY id",
-                        [user_id, user_entity_id_for_query, user_entity_id_for_query],
-                    )
-                    direct_facts = [
-                        {"subject": row[0], "object": row[1], "rel_type": row[2], "provenance": row[3], "confidence": row[4], "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2])}
-                        for row in _cur.fetchall()
-                    ]
+                direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
 
-                    # 2-hop: fetch facts for directly related entities
-                    related = {
-                        f["object"] for f in direct_facts if f["subject"] == user_entity_id_for_query
-                    } | {
-                        f["subject"] for f in direct_facts if f["object"] == user_entity_id_for_query
-                    }
-                    related.discard(user_entity_id_for_query)
+                # 2-hop: fetch facts for directly related entities
+                related = {
+                    f["object"] for f in direct_facts if f["subject"] == user_entity_id_for_query
+                } | {
+                    f["subject"] for f in direct_facts if f["object"] == user_entity_id_for_query
+                }
+                related.discard(user_entity_id_for_query)
 
-                    if related:
+                if related:
+                    with db.cursor() as _cur:
                         _rel_list = list(related)
                         _rel_ph = ",".join(["%s"] * len(_rel_list))
                         _cur.execute(
                             f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
                             f"WHERE user_id = %s AND superseded_at IS NULL "
                             f"AND hard_delete_flag = false "
+                            f"AND (valid_until IS NULL OR valid_until > now()) "
                             f"AND (subject_id IN ({_rel_ph}) OR object_id IN ({_rel_ph})) "
-                            f"AND rel_type NOT IN ('also_known_as', 'pref_name') "
                             f"ORDER BY id",
                             [user_id] + _rel_list + _rel_list,
                         )
@@ -1349,7 +1540,8 @@ def query(request: QueryRequest):
     # # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query_lower only
     _ATTRIBUTE_SIGNALS = {
         "old", "age", "height", "tall", "weight", "heavy",
-        "job", "work", "occupation", "born", "birthday"
+        "job", "work", "occupation", "born", "birthday",
+        "live", "address", "home", "location",
     }
 
     _STOPWORDS = {
@@ -1650,14 +1842,37 @@ def query(request: QueryRequest):
                 merged_facts.append(f)
                 pg_keys.add(key)
 
-        # Populate preferred_names with all entities mentioned in facts
-        # so filter can look up display names for attributes
+        # Populate preferred_names only with entities that were registered as
+        # UUID surrogates (real people/places), not fact-value strings like
+        # "systems analyst" or "156 cedar st s".
+        # Build the set of real entity UUIDs from pre-resolution PostgreSQL facts.
+        # # NO RECURSIVE MATCHING — _UUID_RE used against pre-extracted values only
+        _real_entity_ids: set[str] = {user_entity_id_for_query}
+        for f in direct_facts + baseline_facts:
+            if _UUID_PATTERN.match(f.get("subject", "")):
+                _real_entity_ids.add(f["subject"])
+            if _UUID_PATTERN.match(f.get("object", "")):
+                _real_entity_ids.add(f["object"])
+        # Build mapping: UUID → display name (from entity_aliases)
+        _entity_display: dict[str, str] = {}
+        if registry:
+            for eid in _real_entity_ids:
+                display = registry.get_preferred_name(user_id, eid)
+                if display and display != eid:
+                    _entity_display[eid] = display
+
         if registry:
             for f in merged_facts:
-                if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
-                    preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
-                if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
-                    preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
+                # Subject: add if it matches a registered entity UUID OR its display name
+                # matches a known registered entity's display name
+                subj = f["subject"]
+                if subj not in preferred_names and subj != user_entity_id_for_query:
+                    if _UUID_PATTERN.match(subj) or subj in _entity_display.values():
+                        preferred_names[subj] = registry.get_preferred_name(user_id, subj) or subj.title()
+                obj = f["object"]
+                if obj not in preferred_names and obj != user_entity_id_for_query:
+                    if _UUID_PATTERN.match(obj) or obj in _entity_display.values():
+                        preferred_names[obj] = registry.get_preferred_name(user_id, obj) or obj.title()
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
 

@@ -63,6 +63,11 @@ class RelTypeRegistry:
     def all_types(self) -> list[str]:
         return sorted(self.get_valid_types())
 
+    def get(self, rel_type: str, default=None):
+        """Get ontology entry for a rel_type (includes head_types, tail_types, engine_generated)."""
+        self.get_valid_types()  # ensure cache is fresh
+        return self._ontology.get(rel_type.lower(), default or {})
+
 
 # DEPRECATED: Kept for test compatibility. RelTypeRegistry reads from Postgres at runtime.
 # Added W3C-aligned types (instance_of, subclass_of, pref_name, same_as)
@@ -341,15 +346,42 @@ class WGMValidationGate:
             "old_confidence_after_penalty": max(first_old_confidence - 0.5, 0.0),
         }
 
+    def _auto_approve_novel_type(self, rel_type: str) -> bool:
+        """
+        Auto-approve a novel rel_type when LLM validation is unavailable.
+        Inserts into rel_types as engine-generated with moderate confidence.
+        The type will be available immediately; subsequent Qwen runs can
+        upgrade its metadata if needed.
+        Returns True if the type was inserted (or already existed).
+        """
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO rel_types"
+                    " (rel_type, label, engine_generated, confidence, source)"
+                    " VALUES (%s, %s, true, 0.7, 'engine')"
+                    " ON CONFLICT (rel_type) DO NOTHING",
+                    (rel_type, rel_type.replace('_', ' ').title()),
+                )
+            self.db_conn.commit()
+            # Refresh cache so the new type is immediately visible
+            if self.registry:
+                self.registry._refresh()
+                self._ontology = self.registry.get_ontology()
+            return True
+        except Exception:
+            return False
+
     def _try_approve_novel_type(self, rel_type: str) -> bool:
         """
-        Call Qwen to validate a novel rel_type. If approved with confidence >= 0.7,
-        insert into rel_types and return True. Otherwise, insert into pending_types
-        and return False. On Qwen failure, always fall through gracefully (return False).
+        Call Qwen to validate a novel rel_type. If Qwen is unavailable or fails,
+        auto-approves the type so facts are not silently dropped.
+        If approved with confidence >= 0.7, inserts into rel_types and returns True.
+        Otherwise, inserts into pending_types and returns False.
         """
         qwen_url = os.getenv("QWEN_API_URL")
         if not qwen_url:
-            return False
+            return self._auto_approve_novel_type(rel_type)
 
         try:
             response = httpx.post(
@@ -398,5 +430,5 @@ class WGMValidationGate:
                 self.db_conn.commit()
                 return False
         except Exception:
-            # Qwen failure: fall through gracefully, don't approve
-            return False
+            # Qwen failure: auto-approve so facts are not silently dropped
+            return self._auto_approve_novel_type(rel_type)
