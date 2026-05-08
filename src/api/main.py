@@ -779,9 +779,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 inferred_subject_type = _infer_type_from_relationship(rel_type_lower, "subject")
                 inferred_object_type = _infer_type_from_relationship(rel_type_lower, "object")
 
-                # Apply inferred types if edge types are missing or conflicting
-                final_subject_type = edge.subject_type or inferred_subject_type
-                final_object_type = edge.object_type or inferred_object_type
+                # Apply inferred types: prefer relationship semantics if provided (they're more reliable for validation)
+                # If GLiNER2 type conflicts with relationship type, use relationship type
+                final_subject_type = inferred_subject_type or edge.subject_type
+                final_object_type = inferred_object_type or edge.object_type
 
                 if final_subject_type and canonical_subject not in (user_entity_id, canonical_object):
                     try:
