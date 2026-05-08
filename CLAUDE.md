@@ -342,14 +342,27 @@ The `/ingest` endpoint has code to update entity types from GLiNER2 classificati
 6. Entity types never updated: entity stays type='unknown'
 7. Type constraint validation fails: "object_type 'unknown' not allowed for 'has_pet'"
 
-**Fix (May 8, 2026):** Updated `_TRIPLE_SYSTEM_PROMPT` output format in faultline_tool.py to include subject_type and object_type:
-```python
-OUTPUT: [{"subject":"...","subject_type":"...","object":"...","object_type":"...","rel_type":"...","low_confidence":false}]
-```
+**Fix (May 8, 2026):** Two-part fix to ensure entity types flow end-to-end:
 
-With instruction: "Preserve the types exactly as classified by GLiNER2. Do not invent new types."
+1. **Filter (`faultline_tool.py`):** Updated `_TRIPLE_SYSTEM_PROMPT` output format to include subject_type and object_type:
+   ```python
+   OUTPUT: [{"subject":"...","subject_type":"...","object":"...","object_type":"...","rel_type":"...","low_confidence":false}]
+   ```
+   With instruction: "Preserve the types exactly as classified by GLiNER2. Do not invent new types."
 
-Result: Edges now carry type information → entity_type updates execute → has_pet validation passes.
+2. **Backend (`src/api/main.py`, line 556-564):** Fixed EdgeInput creation to include subject_type and object_type from GLiNER2:
+   ```python
+   EdgeInput(
+       subject=fact["subject"].lower().strip(),
+       object=fact["object"].lower().strip(),
+       rel_type=fact["rel_type"].lower().strip(),
+       subject_type=fact.get("subject_type"),  # ← ADDED
+       object_type=fact.get("object_type")     # ← ADDED
+   )
+   ```
+   Previously, types were extracted into `_entity_types` dict but never passed to EdgeInput.
+
+Result: Complete type flow → /ingest receives edges with types → entity_type UPDATE executes → has_pet validation passes.
 
 ## /query Endpoint: Self-Referential Graph Traversal (Fixed May 2026)
 
