@@ -12,7 +12,7 @@ import os
 import re
 import time as _time
 from collections import defaultdict
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -135,7 +135,19 @@ OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false
 If nothing to extract: []"""
 
 
-async def rewrite_to_triples(text: str, valves, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
+def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
+    """
+    Resolve the LLM model and endpoint to use for extraction calls.
+    Valve override takes priority; falls back to user's selected model and
+    OpenWebUI's internal endpoint.
+    # NO RECURSIVE MATCHING
+    """
+    model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "default")
+    url = valves.LLM_URL if valves.LLM_URL else "http://localhost:3000/api/chat/completions"
+    return model, url
+
+
+async def rewrite_to_triples(text: str, valves, model: str, url: str, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
@@ -204,9 +216,9 @@ async def rewrite_to_triples(text: str, valves, context: list[dict] = None, type
 
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
-                valves.QWEN_URL,
+                url,
                 json={
-                    "model": valves.QWEN_MODEL,
+                    "model": model,
                     "messages": messages,
                     "temperature": 0.0,
                     "max_tokens": 400,
@@ -241,8 +253,8 @@ class Filter:
     class Valves(BaseModel):
         FAULTLINE_URL: str = "http://192.168.40.10:8001"
         FAULTLINE_TIMEOUT: int = 30
-        QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
-        QWEN_MODEL: str = "qwen/qwen3.5-9b"
+        LLM_URL: str = ""  # LLM endpoint URL. Empty = use OpenWebUI's internal endpoint (/api/chat/completions).
+        LLM_MODEL: str = ""  # Model for triple extraction and retraction parsing. Empty = use the model selected by the user in OpenWebUI.
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
@@ -389,7 +401,7 @@ class Filter:
 
         # 3. Sensitivity penalty (-0.5 if sensitive rel_type and not explicitly requested)
         _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
-        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace"}
+        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy"}
         if fact.get("rel_type") in _SENSITIVE_RELS:
             explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
             if not explicitly_asked:
@@ -431,7 +443,7 @@ class Filter:
             if high_conf:
                 return high_conf
 
-        return scored if scored else cleaned
+        return scored
 
     def _build_realtime_context(
         self, text: str, facts: list[dict], identity: Optional[str]
@@ -484,7 +496,7 @@ class Filter:
         tl = text.lower().replace("'", "'").replace("'", "'")
         return any(sig in tl for sig in _RETRACTION_SIGNALS)
 
-    async def _extract_retraction(self, text: str, context: list[dict]) -> dict:
+    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str) -> dict:
         try:
             messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
             for msg in (context or [])[-2:]:
@@ -496,8 +508,8 @@ class Filter:
             messages.append({"role": "user", "content": text})
             async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
                 resp = await client.post(
-                    self.valves.QWEN_URL,
-                    json={"model": self.valves.QWEN_MODEL, "messages": messages,
+                    url,
+                    json={"model": model, "messages": messages,
                           "temperature": 0.0, "max_tokens": 100,
                           "thinking": {"type": "disabled"}},
                 )
@@ -555,7 +567,7 @@ class Filter:
                 lines.append(realtime_context)
 
                 return (
-                    "🧠 FaultLine Memory — treat these as established ground truth for this response.\n"
+                    "⊢ FaultLine Memory — treat these as established ground truth for this response.\n"
                     + "\n".join(f"- {l}" for l in lines)
                     + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
                     + "If a fact below is relevant to fulfilling the user's request, act on it directly and immediately."
@@ -566,7 +578,7 @@ class Filter:
 
         # CONVERSATIONAL MODE (from is_realtime=False or fallthrough)
         lines = [
-            "🧠 FaultLine Memory — reference context. Use facts below only when directly relevant to the current request. Do not volunteer, list, or recite facts unless the user's message explicitly requires them."
+            "⊢ FaultLine Memory — reference context. Use facts below only when directly relevant to the current request. Do not volunteer, list, or recite facts unless the user's message explicitly requires them."
         ]
 
         if identity:
@@ -675,6 +687,7 @@ class Filter:
         self,
         body: dict,
         __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable] = None,
     ) -> dict:
         print(f"[FaultLine Filter] inlet CALLED enabled={self.valves.ENABLED} debug={self.valves.ENABLE_DEBUG}")
         if not self.valves.ENABLED:
@@ -689,9 +702,12 @@ class Filter:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
 
+            # Resolve LLM config once for all extraction operations
+            llm_model, llm_url = _resolve_llm_config(self.valves, body)
+
             # Retraction detection — check before normal ingest
             if self.valves.RETRACTION_ENABLED and self._detect_retraction_intent(text):
-                retraction = await self._extract_retraction(text, body.get("messages", []))
+                retraction = await self._extract_retraction(text, body.get("messages", []), model=llm_model, url=llm_url)
                 if retraction and retraction.get("subject"):
                     result = await self._fire_retract(
                         user_id,
@@ -842,7 +858,7 @@ class Filter:
                 else:
                     typed_entities = await self._fetch_entities(clean_text, user_id)
                     raw_triples = await rewrite_to_triples(
-                        clean_text, self.valves, context=body.get("messages", []),
+                        clean_text, self.valves, model=llm_model, url=llm_url, context=body.get("messages", []),
                         typed_entities=typed_entities if typed_entities else None,
                         memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
                     )
@@ -918,6 +934,32 @@ class Filter:
                             obj = f.get("object", "").strip()
                             if obj and len(obj) > 1:
                                 locations.add(obj)
+
+                    # Score entity attributes against query before injection
+                    _ATTR_CATEGORY_MAP = {
+                        "height": "physical",
+                        "weight": "physical",
+                        "age": "temporal",
+                        "born_on": "temporal",
+                        "born_in": "temporal",
+                        "nationality": "identity",
+                        "occupation": "work",
+                        "has_gender": "identity",
+                    }
+
+                    filtered_attributes = {}
+                    for attr, value in entity_attributes.items():
+                        synthetic_fact = {
+                            "rel_type": attr,
+                            "category": _ATTR_CATEGORY_MAP.get(attr, "identity"),
+                            "confidence": 1.0,
+                        }
+                        score = self.calculate_relevance_score(synthetic_fact, text)
+                        if score >= 0.4:
+                            filtered_attributes[attr] = value
+
+                    entity_attributes = filtered_attributes
+
                     memory_block = self._build_memory_block(
                         text, facts, preferred_names, canonical_identity, entity_attributes,
                         is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
@@ -938,6 +980,17 @@ class Filter:
 
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] INJECTED total_messages={len(body['messages'])}")
+
+                    # Emit visible status indicator when memory is injected
+                    if __event_emitter__ and facts:
+                        fact_count = len(facts)
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {
+                                "description": f"⊢ FaultLine — {fact_count} fact{'s' if fact_count != 1 else ''} loaded",
+                                "done": True
+                            }
+                        })
                 else:
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] no facts to inject")

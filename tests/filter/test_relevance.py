@@ -150,3 +150,83 @@ def test_sensitive_rel_with_explicit_ask_not_penalised():
     query = "when was I born"
     score = filter_instance.calculate_relevance_score(fact, query)
     assert score >= 0.4, f"Expected >= 0.4, got {score}"
+
+
+def test_empty_scored_returns_empty_not_cleaned():
+    """
+    _filter_relevant_facts() with all facts scoring below threshold.
+    Verify: returns empty list, NOT the full cleaned list.
+    Bug 1 test: fallback path now returns scored (empty) not cleaned (all facts).
+    """
+    filter_instance = Filter()
+    # Three facts that all score below 0.4 for this query
+    facts = [
+        {
+            "rel_type": "lives_at",
+            "confidence": 0.8,
+            "category": "location",
+            "subject": "user",
+            "object": "123 Main Street",
+        },
+        {
+            "rel_type": "works_for",
+            "confidence": 0.8,
+            "category": "work",
+            "subject": "user",
+            "object": "TechCorp",
+        },
+        {
+            "rel_type": "born_on",
+            "confidence": 0.8,
+            "category": "temporal",
+            "subject": "user",
+            "object": "march 15",
+        },
+    ]
+    # Query with no matching signals and no sensitive term matches
+    query = "what is the weather like"
+    categories = set()  # No categories matched
+    identity = "user"
+
+    filtered = filter_instance._filter_relevant_facts(
+        facts, categories, identity, query=query, is_realtime=False
+    )
+
+    # All facts should be filtered out (no matches, no sensitive term hits)
+    assert len(filtered) == 0, f"Expected 0 facts, got {len(filtered)}"
+
+
+def test_entity_attribute_height_scores_on_tall_query():
+    """
+    Synthetic fact: rel_type="height", category="physical", confidence=1.0
+    Query: "how tall am I?"
+    Expected: score >= 0.4 (tall matches physical signal, "tall" in _SENSITIVE_TERMS prevents penalty).
+    Bug 2 & 3 test: entity attributes should score >= 0.4 on physical queries.
+    """
+    filter_instance = Filter()
+    synthetic_fact = {
+        "rel_type": "height",
+        "category": "physical",
+        "confidence": 1.0,
+    }
+    query = "how tall am I?"
+    score = filter_instance.calculate_relevance_score(synthetic_fact, query)
+    assert score >= 0.4, f"Expected >= 0.4, got {score} for height on 'how tall am I?'"
+
+
+def test_entity_attribute_height_suppressed_on_unrelated_query():
+    """
+    Synthetic fact: rel_type="height", category="physical", confidence=1.0
+    Query: "what is the weather today"
+    Expected: score < 0.4 (no physical signals in query, sensitivity penalty applies).
+    Bug 2 test: entity attributes should not inject on unrelated queries.
+    """
+    filter_instance = Filter()
+    synthetic_fact = {
+        "rel_type": "height",
+        "category": "physical",
+        "confidence": 1.0,
+    }
+    query = "what is the weather today"
+    score = filter_instance.calculate_relevance_score(synthetic_fact, query)
+    assert score < 0.4, f"Expected < 0.4, got {score} for height on weather query"

@@ -14,10 +14,12 @@
 - ✅ **Memory facts prioritization** — cap to 10 items with relationship facts prioritized (spouse, parent_of, child_of, also_known_as, pref_name, sibling_of)
 - ✅ **Deadname prevention** — pref_name gate removed, also_known_as gate kept, preferred name flip flow validated
 - ✅ **entity_attributes normalization** — entity_id normalized to "user" anchor by construction; confirmed by audit
-- ✅ **Promotion pipeline audit** — orphaned Qdrant point fix scoped and prompted; test skeleton drafted
-- ✅ **pref_name retraction alias cleanup** — entity_aliases cleaned up on hard-delete retraction
+- ✅ **Promotion pipeline** — orphaned Qdrant point fix (delete after commit, outside transaction); test skeleton implemented
+- ✅ **pref_name retraction alias cleanup** — entity_aliases hard-deleted on pref_name retraction
 - ✅ **provenance="manual" cleanup** — malformed fact + orphaned entity hard-deleted from DB
-- ✅ **Relevance scoring** — replaced binary category filtering with continuous relevance scoring; PII sensitivity penalty; query-signal-based injection; 7 tests passing
+- ✅ **Relevance scoring** — replaced binary category filtering with continuous scoring; PII sensitivity penalty (-0.5); query-signal match (0–0.6); confidence bonus (0–0.3); threshold 0.4; 7 tests passing
+- ✅ **Memory block branding** — `⊢ FaultLine Memory` header; visible status event emitted via `__event_emitter__` on injection
+- ✅ **LLM model passthrough** — replaced hardcoded `QWEN_MODEL`/`QWEN_URL` valves with `LLM_MODEL`/`LLM_URL`; empty = passthrough user's selected model; eliminates cold-load penalty in LM Studio
 
 ## Pending
 
@@ -28,7 +30,9 @@
    - `src/fact_store/` commit and retraction flows
    - `src/wgm/` type constraint validation
    - OpenWebUI filter inlet logic (cache hit/miss, filtering, injection positioning)
-   - `tests/embedder/test_promotion.py` — promote_staged_facts, expire_staged_facts, poll cycle (prompted, pending Haiku implementation)
+   - `tests/embedder/test_promotion.py` — promote_staged_facts, expire_staged_facts, poll cycle (implemented)
+   - `tests/filter/test_relevance.py` — relevance scoring (7 tests, implemented)
+   - `tests/api/test_retract.py` — pref_name retraction alias cleanup (3 tests, implemented)
 
 2. **Qwen prompt robustness** — expand date/time extraction:
    - Birthday patterns ("born on X", "my birthday is May 3rd")
@@ -44,7 +48,7 @@
 
 4. **Conversation state awareness** — next phase of relevance scoring. Slot into `calculate_relevance_score()` as additional score contributor (0.0–0.4):
    - Mid-operation detection (active command sequence, SSH session, etc.)
-   - Operational fact surfacing when context demands (e.g. "bringing interface down mid-SSH" warning)
+   - Operational fact surfacing when context demands
    - Does not require touching existing scoring structure
 
 ### Medium Priority
@@ -88,3 +92,4 @@
 - **Filter ingest gate:** ≥5 words OR identity pattern OR third-person preference signals. Consider whether word count thresholds still appropriate after prompt simplification.
 - **Promotion pipeline (2026-05-07):** Qdrant orphan fix: delete staged point after commit, outside transaction, best-effort. Reconciliation pass cleans up implicitly via not_in_pg. Race condition deprioritized (single instance). See Low Priority #11 for known reconciliation gap.
 - **Relevance scoring (2026-05-07):** Replaces binary baseline injection. Threshold 0.4. Identity rels always pass. PII penalty -0.5 unless explicitly queried. Conversation state awareness deferred to High Priority #4.
+- **LLM passthrough (2026-05-07):** `LLM_MODEL=""` default means user's selected OpenWebUI model is used for extraction. Set `LLM_MODEL` valve explicitly to pin a model (e.g. for dedicated Qwen extraction). `LLM_URL=""` defaults to OpenWebUI's internal endpoint.
