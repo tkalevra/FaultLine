@@ -1274,7 +1274,9 @@ def query(request: QueryRequest):
         rel_types: tuple[str, ...] = None,
     ) -> list[dict]:
         """
-        Fetch facts from BOTH facts and staged_facts tables with a UNION.
+        Fetch facts from BOTH facts and staged_facts tables.
+        Uses two separate queries (not UNION) to avoid parameter binding
+        issues with psycopg2 shared params across multiple SELECTs.
         Ensures Class B/C staged facts are visible to queries immediately,
         without waiting for promotion or re_embedder sync.
         Returns list of {subject, object, rel_type, provenance, confidence, category} dicts.
@@ -1282,45 +1284,73 @@ def query(request: QueryRequest):
         results = []
         try:
             with db_conn.cursor() as cur:
-                # Build common WHERE clauses
-                conds = ["user_id = %s"]
-                params = [user_id]
-                
-                # facts-specific filters
-                f_conds = conds + ["superseded_at IS NULL", "hard_delete_flag = false",
-                                   "(valid_until IS NULL OR valid_until > now())"]
-                # staged_facts-specific filters
-                s_conds = conds + ["expires_at > now()", "promoted_at IS NULL"]
-                
+                # --- Build base conditions ---
+                f_conds = ["user_id = %s", "superseded_at IS NULL",
+                           "hard_delete_flag = false",
+                           "(valid_until IS NULL OR valid_until > now())"]
+                s_conds = ["user_id = %s", "expires_at > now()",
+                           "promoted_at IS NULL"]
+
                 if rel_types:
                     ph = ",".join(["%s"] * len(rel_types))
                     f_conds.append(f"rel_type IN ({ph})")
                     s_conds.append(f"rel_type IN ({ph})")
-                    params.extend(rel_types)
-                
+
                 if entity_id:
                     f_conds.append("(subject_id = %s OR object_id = %s)")
                     s_conds.append("(subject_id = %s OR object_id = %s)")
-                    params.extend([entity_id, entity_id])
-                
+
                 f_where = " AND ".join(f_conds)
                 s_where = " AND ".join(s_conds)
-                
-                query = (
+
+                # --- Build independent params for each query ---
+                # Common base: user_id
+                base_params = [user_id]
+
+                # Append rel_types and entity_id for each query independently
+                f_params = list(base_params)
+                s_params = list(base_params)
+
+                if rel_types:
+                    f_params.extend(rel_types)
+                    s_params.extend(rel_types)
+
+                if entity_id:
+                    f_params.extend([entity_id, entity_id])
+                    s_params.extend([entity_id, entity_id])
+
+                # --- Query 1: facts table ---
+                f_query = (
                     f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                    f"WHERE {f_where} "
-                    f"UNION ALL "
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
-                    f"WHERE {s_where} "
-                    f"ORDER BY rel_type"
+                    f"WHERE {f_where}"
                 )
-                cur.execute(query, params)
-                results = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2],
-                     "provenance": r[3], "confidence": r[4],
-                     "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
-                    for r in cur.fetchall()
-                ]
+                cur.execute(f_query, f_params)
+                seen = set()
+                for r in cur.fetchall():
+                    key = (r[0], r[1], r[2])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({
+                            "subject": r[0], "object": r[1], "rel_type": r[2],
+                            "provenance": r[3], "confidence": float(r[4]) if r[4] else 0.0,
+                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])
+                        })
+
+                # --- Query 2: staged_facts table ---
+                s_query = (
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
+                    f"WHERE {s_where}"
+                )
+                cur.execute(s_query, s_params)
+                for r in cur.fetchall():
+                    key = (r[0], r[1], r[2])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({
+                            "subject": r[0], "object": r[1], "rel_type": r[2],
+                            "provenance": r[3], "confidence": float(r[4]) if r[4] else 0.0,
+                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])
+                        })
         except Exception as e:
             log.warning("query.fetch_user_facts_failed", error=str(e))
         return results
