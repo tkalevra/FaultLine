@@ -66,6 +66,14 @@ _CAT_SIGNALS = {
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
 
+# Deduplication tracker — prevents the inlet from processing the same text repeatedly.
+# OpenWebUI may call the filter multiple times for the same message (streaming chunks,
+# system message injection triggers, etc.). Without dedup, each call produces another
+# memory injection, which triggers another filter call — a recursive loop.
+# Key: user_id, Value: (last_text_hash, last_processed_at_timestamp)
+_DEDUP_TRACKER: dict[str, tuple[int, float]] = {}
+_DEDUP_WINDOW: float = 5.0  # seconds — ignore duplicate text within this window
+
 _RETRACTION_PROMPT = """\
 You are a retraction extractor for a personal knowledge graph.
 The user wants to remove or correct a stored fact.
@@ -168,15 +176,13 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                         content = " ".join(
                             p.get("text", "") for p in content if isinstance(p, dict)
                         )
-                    # Guard against FaultLine self-feedback loop
-                    # # NO RECURSIVE MATCHING — debug_signals are checked against pre-extracted content string only
-                    _DEBUG_SIGNALS = (
-                        "[FaultLine",
-                        "GLiNER2 has pre-classified",
+                    # Guard against FaultLine self-feedback loop in context
+                    # # NO RECURSIVE MATCHING — markers checked against pre-extracted content string only
+                    _FEEDBACK_MARKERS = (
                         "⊢ FaultLine Memory",
-                        "FaultLine WGM",
+                        "GLiNER2 has pre-classified",
                     )
-                    if content.strip() and not any(sig in content for sig in _DEBUG_SIGNALS):
+                    if content.strip() and not any(marker in content for marker in _FEEDBACK_MARKERS):
                         prior_turns.append({"role": role, "content": content})
             if prior_turns:
                 turns_to_add = prior_turns[:-1] if (
@@ -262,8 +268,87 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
         return []
     except Exception as e:
         if valves.ENABLE_DEBUG:
-            print(f"[FaultLine] rewrite_to_triples failed: {e}")
+            print(f"[FaultLine] rewrite_to_triples failed: {type(e).__name__}: {e}")
         return []
+
+
+def _extract_basic_facts(text: str) -> list[dict]:
+    """
+    Lightweight regex fallback when the LLM is unavailable.
+    Extracts explicit identity and preference signals directly from text.
+    Returns a list of edge dicts suitable for /ingest.
+    """
+    edges = []
+    tl = text.lower()
+
+    # Self-identification patterns: "my name is X", "I am X", "I'm X", "call me X"
+    # Also handle parenthetical forms like "I(Chris) am" or "I (Chris) am"
+    _ID_PATTERNS = [
+        (re.compile(r"\bmy\s+name\s+is\s+([a-z]+)", re.IGNORECASE), "also_known_as"),
+        (re.compile(r"\bi\s*(?:\(([a-z]+)\)|am\s+([a-z]+))", re.IGNORECASE), "also_known_as"),
+        (re.compile(r"\bi'm\s+([a-z]+)", re.IGNORECASE), "also_known_as"),
+        (re.compile(r"\bcall\s+me\s+([a-z]+)", re.IGNORECASE), "pref_name"),
+        (re.compile(r"\bpeople\s+call\s+me\s+([a-z]+)", re.IGNORECASE), "also_known_as"),
+    ]
+
+    _STOPWORDS = {
+        "a", "an", "the", "not", "just", "also", "here", "happy", "glad", "sorry",
+        "married", "single", "divorced", "engaged", "ready", "trying",
+        "going", "looking", "back", "home", "out", "in", "on", "at", "to",
+        "very", "really", "so", "too", "quite", "sure", "afraid", "aware",
+    }
+
+    for pattern, rel_type in _ID_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            # Some patterns have multiple capture groups (e.g., "I(Chris) am" or "I am Chris")
+            name = (m.group(1) or m.group(2) or "").lower().strip()
+            if name and name not in _STOPWORDS and len(name) > 1:
+                edges.append({
+                    "subject": "user",
+                    "object": name,
+                    "rel_type": rel_type,
+                    "is_preferred_label": (rel_type == "pref_name"),
+                    "is_correction": False,
+                })
+
+    # Preference signals: "prefer to be called X", "goes by X"
+    _PREF_PATTERNS = [
+        re.compile(r"\bprefers?\s+to\s+be\s+called\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bprefers?\s+you\s+call\s+(?:me|them|her|him)\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bgoes\s+by\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bgo\s+by\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bpreferred\s+name\s+is\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bplease\s+call\s+me\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"\bknown\s+as\s+([a-z]+)", re.IGNORECASE),
+    ]
+
+    for pattern in _PREF_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = m.group(1).lower().strip()
+            if name and len(name) > 1:
+                edges.append({
+                    "subject": "user",
+                    "object": name,
+                    "rel_type": "pref_name",
+                    "is_preferred_label": True,
+                    "is_correction": False,
+                })
+
+    # Correction signals: explicit "not X, it's Y" or "actually X" patterns
+    _CORRECTION_PATTERNS = [
+        re.compile(r"\b(?:actually|not|no)\s+(?:it's|its|im|i am|i'm|my name is)\s+(?:not\s+)?([a-z]+)", re.IGNORECASE),
+    ]
+
+    _has_correction_signal = any(
+        word in tl for word in ("actually", "not", "wrong", "incorrect", "innacurate", "update")
+    )
+    if _has_correction_signal:
+        for edge in edges:
+            edge["is_correction"] = True
+
+    return edges
 
 
 class Filter:
@@ -287,7 +372,7 @@ class Filter:
         INGEST_ENABLED: bool = True
         QUERY_ENABLED: bool = True
         RETRACTION_ENABLED: bool = True
-        MAX_MEMORY_SENTENCES: int = 10
+        MAX_MEMORY_SENTENCES: int = 20
         MAX_CONTEXT_TURNS: int = 3
         MIN_INJECT_CONFIDENCE: float = 0.5
 
@@ -414,10 +499,18 @@ class Filter:
         score = 0.0
         query_lower = query.lower()  # # NO RECURSIVE MATCHING
 
-        # 1. Query signal match (0.0–0.6)
+        # 1. Query signal match (0.0–0.6) — category keywords + rel_type + object text
         category = fact.get("category", "")
         keywords = _CAT_SIGNALS.get(category, [])
         matches = sum(1 for kw in keywords if kw in query_lower)
+        # Also match against rel_type and object text directly for unclassified facts
+        # e.g., "has_ram" matches "ram", "likes" matches "like"/"favorite"
+        rel_type = fact.get("rel_type", "")
+        if rel_type and any(part in query_lower for part in rel_type.lower().replace("_", " ").split()):
+            matches += 2
+        obj_text = fact.get("object", "").lower()
+        if obj_text and len(obj_text) > 2 and obj_text in query_lower:
+            matches += 1
         score += min(0.6, matches * 0.15)
 
         # 2. Confidence bonus (0.0–0.3)
@@ -662,11 +755,37 @@ class Filter:
                 f"You are the assistant. The user is '{display}'. Speak TO the user using 'you/your'. Never speak AS the user, adopt their perspective, or use first-person pronouns on their behalf."
             )
 
-        if preferred_names:
-            for canonical, preferred in preferred_names.items():
-                if canonical == "user" or canonical == identity:
-                    continue
-                lines.append(f"Always call {canonical.title()} by '{preferred.title()}'.")
+        # Collect entities that appear as subjects or objects in identity/family
+        # facts. Only these are real people/pets/characters that need name
+        # directives. Fact-value strings like "systems analyst" or "156 cedar st s"
+        # never appear in identity/family edges — they're excluded.
+        _named_entities: set[str] = {identity, "user"} if identity else {"user"}
+        _FAMILY_RELS = {"parent_of", "child_of", "spouse", "sibling_of"}
+        _IDENTITY_RELS = {"also_known_as", "pref_name"}
+
+        # Build preferred name directives after identity/family facts.
+        # Only emit directives for entities that were explicitly named or related.
+        _name_directives = []
+        if facts:
+            for f in facts:
+                rel = f.get("rel_type", "")
+                if rel in _FAMILY_RELS or rel in _IDENTITY_RELS:
+                    _named_entities.add(f.get("subject", ""))
+                    _named_entities.add(f.get("object", ""))
+        for canonical, preferred in preferred_names.items():
+            if canonical == "user" or canonical == identity:
+                continue
+            if canonical not in _named_entities and preferred not in _named_entities:
+                continue  # Not a person/character — skip name directive
+            if not preferred or len(preferred) <= 2 or bool(_UUID_RE.match(preferred)):
+                continue
+            if any(c.isdigit() for c in preferred):
+                continue
+            if any(kw in preferred.lower() for kw in ("st ", "street", "ave", "road", "dr ", "lane")):
+                continue
+            _name_directives.append(
+                f"Always call {canonical.title() if len(canonical) > 2 else preferred.title()} by '{preferred.title()}'."
+            )
 
         if facts:
             nickname_map = {}
@@ -699,15 +818,16 @@ class Filter:
             spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in _user_anchors and f.get("subject") not in spouses_raw and not bool(_UUID_RE.match(f.get("subject") or ""))]
             siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
 
-            # Build compact family line
+            # Build compact family line (deduplicate — same entity may appear
+            # under multiple identity anchors like "user" and "chris")
             if children_raw or spouses_raw or siblings_raw:
                 family_parts = []
                 if spouses_raw:
                     family_parts.append(f"spouse={', '.join(_dn(s) for s in set(spouses_raw))}")
                 if children_raw:
-                    family_parts.append(f"children={', '.join(_dn(c) for c in children_raw)}")
+                    family_parts.append(f"children={', '.join(_dn(c) for c in dict.fromkeys(children_raw))}")
                 if siblings_raw:
-                    family_parts.append(f"siblings={', '.join(_dn(s) for s in siblings_raw)}")
+                    family_parts.append(f"siblings={', '.join(_dn(s) for s in dict.fromkeys(siblings_raw))}")
                 lines.append(f"family: {', '.join(family_parts)}")
 
             # Extract and display ages from facts
@@ -803,6 +923,10 @@ class Filter:
                     if attr_parts:
                         lines.append(f"{display_name} is {', '.join(attr_parts)}")
 
+        # Append preferred name directives after facts (they're lower priority)
+        if _name_directives:
+            lines.extend(_name_directives)
+
         # Apply sentence limit
         limited = lines[:self.valves.MAX_MEMORY_SENTENCES]
         if len(lines) > self.valves.MAX_MEMORY_SENTENCES:
@@ -829,20 +953,35 @@ class Filter:
             if not text:
                 return body
 
-            # Self-feedback guard — drop messages containing FaultLine debug output
+            # Deduplication: skip if this exact text was already processed within the window.
+            # OpenWebUI may fire the inlet multiple times for the same message (streaming
+            # chunks, system-message re-evaluation). Without this, each call triggers a new
+            # memory injection → another inlet call → infinite recursive loop.
+            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+            _text_hash = hash(text)
+            _last = _DEDUP_TRACKER.get(user_id)
+            if _last and _last[0] == _text_hash and (_time.time() - _last[1]) < _DEDUP_WINDOW:
+                return body
+            _DEDUP_TRACKER[user_id] = (_text_hash, _time.time())
+
+            # Self-feedback guard — drop messages that are pure FaultLine debug output.
+            # Only match exact system-message markers, not incidental substrings
+            # (e.g., a user profile named "FaultLine WGM Test" should NOT be dropped).
             # # NO RECURSIVE MATCHING — signals checked against pre-extracted text string only
-            _DEBUG_SIGNALS = (
-                "[FaultLine",
-                "GLiNER2 has pre-classified",
+            _FEEDBACK_MARKERS = (
                 "⊢ FaultLine Memory",
-                "FaultLine WGM",
+                "GLiNER2 has pre-classified",
             )
-            if any(sig in text for sig in _DEBUG_SIGNALS):
+            _FEEDBACK_PREFIXES = (
+                "[FaultLine Filter]",
+                "[FaultLine]",
+            )
+            if any(marker in text for marker in _FEEDBACK_MARKERS) or \
+               any(text.lstrip().startswith(prefix) for prefix in _FEEDBACK_PREFIXES):
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] dropping self-feedback message, text snippet: {text[:80]!r}")
                 return body
 
-            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
 
@@ -1034,6 +1173,16 @@ class Filter:
                     )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
+
+                # Fallback: when LLM is unavailable, extract basic identity/preference
+                # facts directly from text using regex patterns. This ensures basic
+                # facts (name, preferred name, corrections) are never silently dropped.
+                if not raw_triples and not _skip_rewrite:
+                    basic_edges = _extract_basic_facts(clean_text)
+                    if basic_edges:
+                        raw_triples = basic_edges
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] regex fallback extracted {len(raw_triples)} basic fact(s)")
 
                 _PRONOUNS = {"i", "me", "my", "we", "us", "our", "he", "she", "it", "they", "them"}
                 edges = [

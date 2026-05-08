@@ -14,14 +14,14 @@ def test_project_structure():
 
 
 def test_validate_novel_type():
-    """Novel rel_type not in ontology → novel; no DB query issued."""
+    """Novel rel_type not in ontology → auto-approved when Qwen unavailable, edge stored."""
     mock_conn = MagicMock()
     gate = WGMValidationGate(mock_conn)
 
     result = gate.validate_edge(1, 2, "unknown_relationship")
 
-    assert result == {"status": "novel"}
-    mock_conn.cursor.assert_not_called()
+    # Without Qwen, novel types are auto-approved so facts are not silently dropped
+    assert result == {"status": "valid"}
 
 
 def test_validate_conflict():
@@ -249,7 +249,7 @@ def test_novel_type_rejected_by_qwen():
 
 
 def test_novel_type_qwen_timeout():
-    """When Qwen times out, the edge does not get approved (graceful failure)."""
+    """When Qwen times out, the novel type is auto-approved so facts are not dropped."""
     from wgm.gate import WGMValidationGate
     from unittest.mock import MagicMock, patch
     import httpx
@@ -261,7 +261,8 @@ def test_novel_type_qwen_timeout():
             gate = WGMValidationGate(mock_db)
             result = gate._try_approve_novel_type("some_type")
 
-    assert result is False
+    # Auto-approve on Qwen failure — facts should not be silently dropped
+    assert result is True
 
 
 def test_symmetric_duplicate_suppressed():
