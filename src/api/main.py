@@ -299,6 +299,35 @@ def _commit_staged(
 def get_gliner_model():
     return _gliner2_model
 
+def _check_entity_id_normalization(dsn: str) -> None:
+    """
+    Check for string entity_ids in facts/staged_facts tables at startup.
+    If found, log a warning and optionally run normalization.
+    """
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) FROM facts
+                    WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
+                """)
+                bad_facts = cur.fetchone()[0]
+
+                cur.execute("""
+                    SELECT COUNT(*) FROM staged_facts
+                    WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
+                """)
+                bad_staged = cur.fetchone()[0]
+
+                if bad_facts > 0 or bad_staged > 0:
+                    log.warning("startup.entity_id_denormalization_detected",
+                                facts_with_string_ids=bad_facts,
+                                staged_facts_with_string_ids=bad_staged,
+                                reason="String entity_ids found; run migrations/018_normalize_entity_ids.py")
+    except Exception as e:
+        log.warning("startup.entity_id_check_failed", error=str(e))
+
+
 def _ensure_schema(dsn: str) -> None:
     """
     Apply any pending schema migrations at startup.
@@ -376,6 +405,7 @@ async def lifespan(app: FastAPI):
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         _ensure_schema(dsn)  # apply pending migrations before reading the schema
+        _check_entity_id_normalization(dsn)  # check for string entity_ids
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
             _rel_type_registry.get_valid_types()
@@ -1089,6 +1119,25 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     ))
 
             if rows:
+                # Filter rows to ensure all entity_ids are UUIDs (prevents string IDs contaminating DB)
+                # Validate all entity_ids are UUIDs before storing
+                validated_rows = []
+                for row in rows:
+                    user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row
+                    if not _UUID_PATTERN.match(subject):
+                        log.error("ingest.invalid_subject_id",
+                                  subject=subject, rel_type=rel_type,
+                                  reason="subject_id must be UUID, not string")
+                        continue  # Skip this fact
+                    if not _UUID_PATTERN.match(obj):
+                        log.error("ingest.invalid_object_id",
+                                  obj=obj, rel_type=rel_type,
+                                  reason="object_id must be UUID, not string")
+                        continue  # Skip this fact
+                    validated_rows.append(row)
+
+                rows = validated_rows
+
                 # Split rows by fact class — surrogates go directly to commit, no display name resolution
                 # Display names are resolved at READ time only (_resolve_display_names in /query)
                 class_a_rows = []
