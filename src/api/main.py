@@ -548,7 +548,9 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             schema = {
                 "facts": [
                     "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
+                    "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the subject entity.",
                     "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
+                    "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the object entity.",
                     f"rel_type::[{constraint}]::str::The relationship type from subject to object. For 'X is a Y' where X is a named entity (person, place, thing), use instance_of. For 'X is a type of Y' where both are categories or classes, use subclass_of. Use pref_name for preferred display names, also_known_as for alternate names.",
                 ]
             }
