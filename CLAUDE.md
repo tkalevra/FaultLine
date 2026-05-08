@@ -329,6 +329,34 @@ Defaults: Filter defaults to `"http://192.168.40.10:8001"`; Function defaults to
 
 - **`faultline_function.py`** — OpenWebUI **Function/Tool**. Explicit `store_fact(text, __user__)`. LLM rewrites to triples → `/ingest`.
 
+## /query Endpoint: Self-Referential Graph Traversal (Fixed May 2026)
+
+The `/query` endpoint detects self-referential signals ("where do i live", "about me", "my family", etc.) and executes a **PostgreSQL graph traversal** to fetch facts anchored to the user's identity. This returns both long-term facts (from `facts` table) and staged facts (from `staged_facts` table) **immediately** without waiting for promotion.
+
+**Critical initialization (line ~1495):**
+```python
+try:
+    db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+    registry = EntityRegistry(db)
+    canonical_identity = registry.get_preferred_name(user_id, user_id)
+except Exception as _e:
+    log.warning("query.db_init_failed", error=str(_e))
+    db = None
+    registry = None
+    canonical_identity = None
+```
+
+**Why this matters:** Without explicit initialization, `db`, `registry`, and `canonical_identity` remain `None`, causing the graph traversal condition (`if db and registry and canonical_identity:`) to always fail. Result: staged facts (Class B location, contact info, behavioral metadata) never reach the Filter, and user memories fail to inject.
+
+**Tested behavior (May 8, 2026):**
+- User tells system: "My home address is 156 Cedar St. S, Kitchener, ON"
+- User queries: "Where do I live?"
+- `/query` endpoint detects signal → initializes db/registry → calls `_fetch_user_facts()`
+- Returns: `lives_at` fact marked `fact_state: "staged"` with TTL/promotion metadata
+- Filter injects fact into memory → LLM answers correctly
+
+The `finally` block (line 1921) ensures `db.close()` on all code paths.
+
 ## Key Principles (Do Not Violate)
 
 - **LLM never has unsupervised write access** — all writes flow through the WGM validation gate
