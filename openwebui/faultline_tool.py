@@ -143,11 +143,11 @@ def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
     # NO RECURSIVE MATCHING
     """
     model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "default")
-    url = valves.LLM_URL if valves.LLM_URL else "http://localhost:3000/api/chat/completions"
+    url = valves.LLM_URL if valves.LLM_URL else "http://host.docker.internal:3000/api/chat/completions"
     return model, url
 
 
-async def rewrite_to_triples(text: str, valves, model: str, url: str, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_header: Optional[str] = None, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
@@ -167,7 +167,15 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, context: l
                         content = " ".join(
                             p.get("text", "") for p in content if isinstance(p, dict)
                         )
-                    if content.strip():
+                    # Guard against FaultLine self-feedback loop
+                    # # NO RECURSIVE MATCHING — debug_signals are checked against pre-extracted content string only
+                    _DEBUG_SIGNALS = (
+                        "[FaultLine",
+                        "GLiNER2 has pre-classified",
+                        "⊢ FaultLine Memory",
+                        "FaultLine WGM",
+                    )
+                    if content.strip() and not any(sig in content for sig in _DEBUG_SIGNALS):
                         prior_turns.append({"role": role, "content": content})
             if prior_turns:
                 turns_to_add = prior_turns[:-1] if (
@@ -214,6 +222,10 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, context: l
             )
         messages.append({"role": "user", "content": user_content})
 
+        headers = {}
+        if auth_header:
+            headers["Authorization"] = auth_header
+
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
                 url,
@@ -224,6 +236,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, context: l
                     "max_tokens": 400,
                     "thinking": {"type": "disabled"},
                 },
+                headers=headers,
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"].strip()
@@ -253,8 +266,9 @@ class Filter:
     class Valves(BaseModel):
         FAULTLINE_URL: str = "http://192.168.40.10:8001"
         FAULTLINE_TIMEOUT: int = 30
-        LLM_URL: str = ""  # LLM endpoint URL. Empty = use OpenWebUI's internal endpoint (/api/chat/completions).
+        LLM_URL: str = ""  # Empty = OpenWebUI internal endpoint (host.docker.internal:3000). Set explicitly for non-Docker or custom LLM endpoints.
         LLM_MODEL: str = ""  # Model for triple extraction and retraction parsing. Empty = use the model selected by the user in OpenWebUI.
+        LLM_API_KEY: str = ""  # Bearer token for LLM endpoint. Required when LLM_URL points to OpenWebUI internal endpoint or any authenticated API.
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
@@ -496,7 +510,7 @@ class Filter:
         tl = text.lower().replace("'", "'").replace("'", "'")
         return any(sig in tl for sig in _RETRACTION_SIGNALS)
 
-    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str) -> dict:
+    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None) -> dict:
         try:
             messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
             for msg in (context or [])[-2:]:
@@ -506,12 +520,16 @@ class Filter:
                         c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
                     messages.append({"role": msg["role"], "content": str(c)[:400]})
             messages.append({"role": "user", "content": text})
+            headers = {}
+            if auth_header:
+                headers["Authorization"] = auth_header
             async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
                 resp = await client.post(
                     url,
                     json={"model": model, "messages": messages,
                           "temperature": 0.0, "max_tokens": 100,
                           "thinking": {"type": "disabled"}},
+                    headers=headers,
                 )
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"].strip()
@@ -702,10 +720,17 @@ class Filter:
 
             # Resolve LLM config once for all extraction operations
             llm_model, llm_url = _resolve_llm_config(self.valves, body)
+            llm_auth = f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None
 
             # Retraction detection — check before normal ingest
             if self.valves.RETRACTION_ENABLED and self._detect_retraction_intent(text):
-                retraction = await self._extract_retraction(text, body.get("messages", []), model=llm_model, url=llm_url)
+                retraction = await self._extract_retraction(
+                    text,
+                    body.get("messages", []),
+                    model=llm_model,
+                    url=llm_url,
+                    auth_header=llm_auth
+                )
                 if retraction and retraction.get("subject"):
                     result = await self._fire_retract(
                         user_id,
@@ -826,7 +851,7 @@ class Filter:
                         print(f"[FaultLine Filter] /query error: {type(e).__name__}: {e}")
 
             if will_ingest:
-                _MEMORY_MARKER = "🧠 The following facts were previously stored by the user in their personal knowledge graph (FaultLine)."
+                _MEMORY_MARKER = "⊢ FaultLine Memory"
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
                 # Compute signals for skip_rewrite check
@@ -856,7 +881,12 @@ class Filter:
                 else:
                     typed_entities = await self._fetch_entities(clean_text, user_id)
                     raw_triples = await rewrite_to_triples(
-                        clean_text, self.valves, model=llm_model, url=llm_url, context=body.get("messages", []),
+                        clean_text,
+                        self.valves,
+                        model=llm_model,
+                        url=llm_url,
+                        auth_header=llm_auth,
+                        context=body.get("messages", []),
                         typed_entities=typed_entities if typed_entities else None,
                         memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
                     )
