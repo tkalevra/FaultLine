@@ -299,7 +299,7 @@ def promote_facts(db_conn) -> None:
     db_conn.commit()
 
 
-def promote_staged_facts(db_conn, promotion_threshold: int = 3) -> int:
+def promote_staged_facts(db_conn, qdrant_url: str, promotion_threshold: int = 3) -> int:
     """
     Promote Class B staged facts that have reached confirmed_count >= threshold.
     Inserts into facts table, marks staged row as promoted.
@@ -344,6 +344,18 @@ def promote_staged_facts(db_conn, promotion_threshold: int = 3) -> int:
                     )
                 db_conn.commit()
                 promoted += 1
+
+                # Best-effort: delete staged Qdrant point after promotion commits
+                try:
+                    collection = derive_collection(user_id)
+                    httpx.post(
+                        f"{qdrant_url}/collections/{collection}/points/delete",
+                        json={"points": [sid]},
+                        timeout=5.0
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to delete staged Qdrant point {sid} after promotion: {e}")
+
                 log.info(
                     f"re_embedder.promoted fact staged_id={sid} "
                     f"subject={subject} rel_type={rel_type}"
@@ -669,7 +681,7 @@ def main():
                             log.error(f"re_embedder.staged_row_error id={row['staged_id']}: {e}")
 
                 # Promote eligible Class B staged facts to long-term memory
-                n_promoted = promote_staged_facts(db)
+                n_promoted = promote_staged_facts(db, qdrant_url)
                 if n_promoted:
                     log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
 
