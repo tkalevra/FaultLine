@@ -1200,6 +1200,122 @@ def query(request: QueryRequest):
         finally:
             pass
 
+    # Named-entity attribute resolution
+    # Triggered when query contains attribute signals
+    # # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query_lower only
+    _ATTRIBUTE_SIGNALS = {
+        "old", "age", "height", "tall", "weight", "heavy",
+        "job", "work", "occupation", "born", "birthday"
+    }
+
+    _STOPWORDS = {
+        "how", "what", "is", "are", "was", "the", "a", "an",
+        "my", "your", "his", "her", "their", "our", "its",
+        "do", "does", "did", "please", "tell", "me", "about"
+    }
+
+    has_attribute_signal = any(sig in query_lower for sig in _ATTRIBUTE_SIGNALS)
+
+    if has_attribute_signal and db:
+        try:
+            # Tokenize query, strip stopwords, get candidate name tokens
+            tokens = [
+                t.strip("?.,!").lower()
+                for t in request.text.split()
+                if t.strip("?.,!").lower() not in _STOPWORDS
+                and len(t.strip("?.,!")) > 1
+            ]
+
+            if tokens:
+                # Resolve tokens against entity_aliases for this user
+                placeholders = ",".join(["%s"] * len(tokens))
+                with db.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT DISTINCT ea.entity_id, ea.alias
+                        FROM entity_aliases ea
+                        WHERE ea.user_id = %s
+                          AND lower(ea.alias) IN ({placeholders})
+                        """,
+                        [user_id] + tokens
+                    )
+                    resolved = cur.fetchall()
+
+                if resolved:
+                    resolved_ids = {row[0] for row in resolved}
+
+                    # Verify each resolved entity is related to the user
+                    # (appears as subject or object in an existing fact)
+                    with db.cursor() as cur:
+                        id_placeholders = ",".join(["%s"] * len(resolved_ids))
+                        cur.execute(
+                            f"""
+                            SELECT DISTINCT subject_id, object_id
+                            FROM facts
+                            WHERE user_id = %s
+                              AND superseded_at IS NULL
+                              AND hard_delete_flag = false
+                              AND (subject_id IN ({id_placeholders})
+                                   OR object_id IN ({id_placeholders}))
+                            """,
+                            [user_id] + list(resolved_ids) + list(resolved_ids)
+                        )
+                        related_rows = cur.fetchall()
+
+                    # Collect confirmed related entity IDs
+                    confirmed_ids = set()
+                    for row in related_rows:
+                        if row[0] in resolved_ids:
+                            confirmed_ids.add(row[0])
+                        if row[1] in resolved_ids:
+                            confirmed_ids.add(row[1])
+
+                    if confirmed_ids:
+                        # Fetch facts anchored to confirmed entities
+                        with db.cursor() as cur:
+                            id_placeholders = ",".join(["%s"] * len(confirmed_ids))
+                            cur.execute(
+                                f"""
+                                SELECT subject_id, object_id, rel_type, provenance, confidence
+                                FROM facts
+                                WHERE user_id = %s
+                                  AND superseded_at IS NULL
+                                  AND hard_delete_flag = false
+                                  AND (subject_id IN ({id_placeholders})
+                                       OR object_id IN ({id_placeholders}))
+                                """,
+                                [user_id] + list(confirmed_ids) + list(confirmed_ids)
+                            )
+                            entity_facts = cur.fetchall()
+
+                        # Fetch attributes for confirmed entities
+                        entity_attrs = _fetch_attributes(
+                            db, user_id, list(confirmed_ids),
+                            max_sensitivity="private"
+                        )
+
+                        # Merge into direct_facts and attributes
+                        for row in entity_facts:
+                            fact = {
+                                "subject": row[0],
+                                "object": row[1],
+                                "rel_type": row[2],
+                                "provenance": row[3],
+                                "confidence": float(row[4]) if row[4] else 0.0,
+                                "category": _REL_TYPE_META.get(row[2], {}).get("category")
+                                            or _infer_category(row[2])
+                            }
+                            if fact not in direct_facts:
+                                direct_facts.append(fact)
+
+                        for entity_id, attr_dict in entity_attrs.items():
+                            if entity_id not in attributes:
+                                attributes[entity_id] = attr_dict
+                            else:
+                                attributes[entity_id].update(attr_dict)
+        except Exception as e:
+            log.warning("query.named_entity_resolution_failed", error=str(e))
+
     # Embed after graph traversal so Postgres results are returned even when the
     # embedding service is unavailable. fallback=False: skip Qdrant rather than
     # searching with a hash vector that can't match nomic-embedded stored facts.
