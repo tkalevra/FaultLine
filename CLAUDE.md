@@ -329,6 +329,28 @@ Defaults: Filter defaults to `"http://192.168.40.10:8001"`; Function defaults to
 
 - **`faultline_function.py`** — OpenWebUI **Function/Tool**. Explicit `store_fact(text, __user__)`. LLM rewrites to triples → `/ingest`.
 
+## Entity Type Classification in /ingest (Fixed May 8, 2026)
+
+The `/ingest` endpoint has code to update entity types from GLiNER2 classifications (line 702-709: `UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'`), but this was never executing because the LLM output didn't include `subject_type` and `object_type` fields.
+
+**The flow:**
+1. GLiNER2 extracts entity types (Person, Animal, Location, etc.) ✓
+2. Filter passes these to LLM as context (faultline_tool.py line 226-239) ✓
+3. **BUG:** LLM output format only had `{subject, object, rel_type, low_confidence}` — missing type fields
+4. `/ingest` receives edges with `subject_type=None, object_type=None`
+5. Code checks `if edge.object_type and canonical_object:` → always False
+6. Entity types never updated: entity stays type='unknown'
+7. Type constraint validation fails: "object_type 'unknown' not allowed for 'has_pet'"
+
+**Fix (May 8, 2026):** Updated `_TRIPLE_SYSTEM_PROMPT` output format in faultline_tool.py to include subject_type and object_type:
+```python
+OUTPUT: [{"subject":"...","subject_type":"...","object":"...","object_type":"...","rel_type":"...","low_confidence":false}]
+```
+
+With instruction: "Preserve the types exactly as classified by GLiNER2. Do not invent new types."
+
+Result: Edges now carry type information → entity_type updates execute → has_pet validation passes.
+
 ## /query Endpoint: Self-Referential Graph Traversal (Fixed May 2026)
 
 The `/query` endpoint detects self-referential signals ("where do i live", "about me", "my family", etc.) and executes a **PostgreSQL graph traversal** to fetch facts anchored to the user's identity. This returns both long-term facts (from `facts` table) and staged facts (from `staged_facts` table) **immediately** without waiting for promotion.

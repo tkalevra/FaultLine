@@ -140,7 +140,13 @@ DATES AND EVENTS:
 - Date values must be the date string only — never a name or description.
 - If a month/day pattern appears without a year, emit it as-is ("may 3rd", "december 25").
 
-OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false}]
+ENTITY TYPES: If entity types were pre-classified (shown as "GLiNER2 has pre-classified"), include them in output:
+- subject_type: Person|Animal|Organization|Location|Object|Concept
+- object_type: Person|Animal|Organization|Location|Object|Concept
+Preserve the types exactly as classified. Do not invent new types.
+
+OUTPUT: [{"subject":"...","subject_type":"...","object":"...","object_type":"...","rel_type":"...","low_confidence":false}]
+subject_type and object_type must be included when available. If no pre-classification, omit or use null.
 If nothing to extract: []"""
 
 
