@@ -559,8 +559,7 @@ class Filter:
                 if identity:
                     display = identity_display or identity
                     lines.append(
-                        f"The user is '{display}'. Facts referencing '{identity}' or '{display}' are about the user directly. "
-                        f"Address the user as 'you', never as a third party."
+                        f"You are the assistant. The user is '{display}'. Speak TO the user using 'you/your'. Never speak AS the user, adopt their perspective, or use first-person pronouns on their behalf."
                     )
 
                 lines.append("DIRECTLY ACTIONABLE: Use the facts and context below immediately to fulfill the request.")
@@ -584,8 +583,7 @@ class Filter:
         if identity:
             display = identity_display or identity
             lines.append(
-                f"The user is '{display}'. Facts referencing '{identity}' or '{display}' are about the user directly. "
-                f"Address the user as 'you', never as a third party."
+                f"You are the assistant. The user is '{display}'. Speak TO the user using 'you/your'. Never speak AS the user, adopt their perspective, or use first-person pronouns on their behalf."
             )
 
         if preferred_names:
