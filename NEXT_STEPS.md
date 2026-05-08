@@ -1,135 +1,90 @@
-# FaultLine — Next Steps
+# FaultLine — Pending Actions
 
-**Status as of 2026-04-30** | Filter v1.3.0. Dual-path query (PostgreSQL baseline + graph traversal + Qdrant). System message injection. All 38 unit + integration tests passing.
+**Current Status (2026-05-07):** Full write-validated knowledge graph pipeline operational. Focus is on extraction refinement, pronoun resolution, and test coverage expansion.
 
----
+## Completed
 
-## Current State
+- ✅ **Dual-path query** — baseline personal facts + vector similarity merge (CLAUDE.md)
+- ✅ **Fact classification (Phase 4)** — Class A/B/C lifecycle with staging and promotion
+- ✅ **Retraction flow** — user-driven fact removal with correction behavior enums
+- ✅ **OpenWebUI Filter** — retraction detection, pronoun resolution via memory facts, confidence gating
+- ✅ **WGM ontology** — Wikidata-aligned rel_types with type constraints and correction behavior
+- ✅ **Re-embedder** — background service for Qdrant sync, fact promotion/expiry
+- ✅ **Streamlined Qwen prompt** — concise extraction rules (ENTITY, RELATIONSHIP, REL_TYPE, UNITS sections)
+- ✅ **Memory facts prioritization** — cap to 10 items with relationship facts prioritized (spouse, parent_of, child_of, also_known_as, pref_name, sibling_of)
+- ✅ **Deadname prevention** — pref_name gate removed, also_known_as gate kept, preferred name flip flow validated
+- ✅ **entity_attributes normalization** — entity_id normalized to "user" anchor by construction; confirmed by audit
+- ✅ **Promotion pipeline audit** — orphaned Qdrant point fix scoped and prompted; test skeleton drafted
+- ✅ **pref_name retraction alias cleanup** — entity_aliases cleaned up on hard-delete retraction
+- ✅ **provenance="manual" cleanup** — malformed fact + orphaned entity hard-deleted from DB
+- ✅ **Relevance scoring** — replaced binary category filtering with continuous relevance scoring; PII sensitivity penalty; query-signal-based injection; 7 tests passing
 
-| Capability | Status |
-|---|---|
-| Fact extraction (GLiNER2 + Qwen rewrite) | ✅ Operational |
-| PostgreSQL persistence with ontology validation | ✅ Operational |
-| Qdrant re-embedder (background sync) | ✅ Operational |
-| `/query` dual-path: baseline facts + graph traversal + Qdrant | ✅ Operational |
-| OpenWebUI filter — system message injection (no relevance gate) | ✅ Operational |
-| Per-user Qdrant collections | ✅ Operational |
-| Short-term → long-term memory promotion (confidence scoring) | ✅ Operational |
+## Pending
 
----
+### High Priority
 
-## Priority 1 — Temporal Awareness
+1. **Test coverage expansion** — `tests/` currently excludes evaluation, feature_extraction, model_inference, preprocessing (intentional stubs). Complete test suite for:
+   - `src/api/main.py` endpoints (_classify_fact, _commit_staged, retraction paths)
+   - `src/fact_store/` commit and retraction flows
+   - `src/wgm/` type constraint validation
+   - OpenWebUI filter inlet logic (cache hit/miss, filtering, injection positioning)
+   - `tests/embedder/test_promotion.py` — promote_staged_facts, expire_staged_facts, poll cycle (prompted, pending Haiku implementation)
 
-Facts exist in time. Without date context the model can't reason about staleness, countdowns, or when something happened.
+2. **Qwen prompt robustness** — expand date/time extraction:
+   - Birthday patterns ("born on X", "my birthday is May 3rd")
+   - Recurring events ("our anniversary is X")
+   - Meeting dates ("we met on X")
+   - Relative dates ("next week", "last month")
+   - Currently prompt supports UNITS (age, height, weight) but needs DATES AND EVENTS section
 
-### 1a — Date storage on facts
+3. **Entity type persistence** — `/extract` pre-classification only updates `entity_type='unknown'` entities. Verify:
+   - Type overwrites don't corrupt existing classifications
+   - Cascade rules (Person → can't be owned, Animal → can't be spouse) enforce correctly at write time
+   - Fallback for entities where type is ambiguous
 
-Add `valid_from` and `valid_until` columns to the `facts` table (nullable `TIMESTAMPTZ`). Migration needed.
+4. **Conversation state awareness** — next phase of relevance scoring. Slot into `calculate_relevance_score()` as additional score contributor (0.0–0.4):
+   - Mid-operation detection (active command sequence, SSH session, etc.)
+   - Operational fact surfacing when context demands (e.g. "bringing interface down mid-SSH" warning)
+   - Does not require touching existing scoring structure
 
-```sql
-ALTER TABLE facts ADD COLUMN valid_from  TIMESTAMPTZ DEFAULT NULL;
-ALTER TABLE facts ADD COLUMN valid_until TIMESTAMPTZ DEFAULT NULL;
-```
+### Medium Priority
 
-Qwen extraction prompt needs rules for temporal assertions:
-- "Chris's birthday is March 12" → `born_on` triple + `valid_from = null` (static, always true)
-- "Jordan is visiting next Thursday" → `lives_at / visiting` triple + `valid_until = <date>`
-- "The concert is May 5th" → event triple + `valid_from = 2026-05-05`
+5. **Session memory cache optimization** — `_SESSION_MEMORY_CACHE` in faultline_tool.py uses 30s TTL. Evaluate:
+   - Cache miss frequency under real OpenWebUI workload
+   - Whether 30s is appropriate for conversation patterns
+   - Option to invalidate cache on successful ingest (currently done)
 
-### 1b — Temporal classification in /ingest
+6. **Edge validation tightening** — UUID leak detection is in place (`_UUID_RE` check). Ensure:
+   - No entity aliases are persisted as raw subject/object strings
+   - Entity resolution at `/ingest` and `/extract` doesn't regress to UUIDs
 
-When a fact is committed, classify it as one of:
-- **static** — true indefinitely (birthdate, name, relationship)
-- **dated** — has a known point-in-time (was born, met someone on date X)
-- **ephemeral** — time-bounded and expires (event, visit, appointment)
+7. **Qdrant collection scoping** — per-user collections via `derive_collection(user_id)`. Verify:
+   - Anonymous/legacy user routing to `QDRANT_COLLECTION` env default
+   - Multi-tenant isolation (no cross-user query leaks)
+   - Deletion on user exit (if applicable)
 
-Store this as a `temporal_class` column: `('static', 'dated', 'ephemeral')`.
+### Low Priority
 
-### 1c — Countdown and elapsed rendering in the filter
+8. **Schema documentation** — update database schema references:
+   - `entity_aliases` planned rename to `entity_names` (CLAUDE.md notes)
+   - `rel_types.category` field usage in query intent matching
+   - `rel_types.head_types` and `tail_types` constraints (ARRAY of entity types)
 
-When the filter builds the memory block, inject time context for dated/ephemeral facts:
+9. **Code cleanup** — remove artifacts:
+   - Delete `FaultLine/` (nested directory, shed-tool artifact)
+   - Confirm test stubs in `tests/evaluation/`, `tests/feature_extraction/`, etc. are intentional
 
-```
-- Jordan is visiting on 2026-05-10 (10 days from now)
-- Chris's birthday was 2026-03-12 (49 days ago)
-- Concert on 2026-04-20 (10 days ago — likely past)
-```
+10. **Integration testing** — full end-to-end flow:
+    - OpenWebUI inlet → retraction, ingest, query → outlet
+    - /ingest → WGM gate → fact classification → re-embedder sync → Qdrant
+    - /query baseline + graph traversal + vector merge → memory injection
 
-This requires the filter to know today's date (trivial) and compare it against `valid_from` / `valid_until`.
+11. **Reconciliation gap** — `reconcile_qdrant()` only queries the `facts` table. Expired `staged_facts` rows that survive a failed Qdrant delete are invisible to reconciliation until the next successful `expire_staged_facts()` run deletes the PG row. No fix needed for single-instance deployment; known limitation.
 
----
+## Notes
 
-## Priority 2 — Memory Regression Gate (Staleness → Archive)
-
-Facts degrade. A `lives_at` from 3 years ago is weaker than one from last week. The system needs a principled way to:
-1. Reduce confidence on facts that haven't been reinforced
-2. Mark facts as **stale** before fully superseding them
-3. Archive (soft-delete from Qdrant, retain in PostgreSQL) facts that have fallen below a threshold
-
-### 2a — Staleness scoring in re_embedder
-
-The re_embedder already runs `promote_facts()` to increase confidence on confirmed facts. Add a symmetric `decay_facts()`:
-
-```python
-def decay_facts(db_conn, decay_rate: float = 0.05) -> None:
-    """Reduce confidence on facts not seen or confirmed recently."""
-    with db_conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE facts
-            SET confidence = GREATEST(confidence - %s, 0.0)
-            WHERE superseded_at IS NULL
-            AND confirmed_count = 0
-            AND last_seen_at < now() - interval '30 days'
-            AND temporal_class != 'static'
-            AND confidence > 0.0
-            """,
-            (decay_rate,)
-        )
-```
-
-Static facts (birthdate, name, relationships) are exempt from decay.
-
-### 2b — Archive threshold
-
-Facts that fall below a configurable `ARCHIVE_CONFIDENCE_THRESHOLD` (default: `0.2`) should be:
-1. Removed from Qdrant (so they stop surfacing in queries) — re_embedder deletion pass handles this via `superseded_at`
-2. Retained in PostgreSQL with `archived_at` timestamp for audit / recovery
-
-Add `archived_at TIMESTAMPTZ DEFAULT NULL` to the facts table. The re_embedder sets this when confidence drops below threshold.
-
-### 2c — Archive threshold as environment variable
-
-```
-ARCHIVE_CONFIDENCE_THRESHOLD=0.2    # below this, remove from Qdrant, keep in PG
-DECAY_INTERVAL_DAYS=30              # days without reinforcement before decay starts
-DECAY_RATE=0.05                     # confidence reduction per decay cycle
-```
-
----
-
-## Priority 3 — Dual Search Path Verification
-
-The `/query` endpoint currently runs three sources and merges them:
-
-| Source | When | What |
-|---|---|---|
-| PostgreSQL baseline | Always (if canonical identity known) | `lives_at`, `age`, `height`, `weight`, `works_for`, etc. |
-| PostgreSQL graph traversal | When query matches self-ref signals | All facts anchored to identity + 2-hop related entities |
-| Qdrant vector search | Always | Cosine similarity ≥ 0.3, limit 10 |
-
-**Verification needed**: confirm that for a cold-start user (no graph traversal triggered, no Qdrant hits above threshold), the baseline path still returns location facts correctly. Test with "What's the weather tomorrow?" against a known `lives_at` fact.
-
-**Potential gap**: the `_SELF_REF_SIGNALS` set in `/query` is checked against `query_lower` (the full query text lowercased). Signals like "my home" and "where do i live" are present. Consider whether conversational fragments like "near me" or "around here" should trigger graph traversal.
-
----
-
-## Backlog
-
-| Item | Notes |
-|---|---|
-| `faultline_function.py` parity | The explicit Tool function doesn't have the same baseline-fetch fix as the filter. Parity pass needed. |
-| Qdrant score threshold tuning | 0.3 may be too high for short or sparse queries. Consider adaptive threshold based on result count. |
-| Fact confidence UI | No way to see or manage individual fact confidence scores from OpenWebUI. |
-| Multi-user isolation audit | Per-user Qdrant collections are implemented; verify no cross-user fact leakage in the merge paths. |
-| Test coverage for `/query` baseline path | No unit tests for the new baseline fact fetch added in the dual-path refactor. |
+- **Qwen prompt changes (2026-05-07):** Simplified from 73 lines to 34 lines. Removed numbered list format, consolidated into ENTITY/RELATIONSHIP/REL_TYPE/UNITS/DATES sections. Next: expand DATES for birthday/anniversary/meeting extraction.
+- **Memory facts capping:** Now prioritizes relationship facts (6 rel_types) before others, capped at 10 total. Reduces Qwen token overhead while preserving pronoun resolution quality.
+- **Filter ingest gate:** ≥5 words OR identity pattern OR third-person preference signals. Consider whether word count thresholds still appropriate after prompt simplification.
+- **Promotion pipeline (2026-05-07):** Qdrant orphan fix: delete staged point after commit, outside transaction, best-effort. Reconciliation pass cleans up implicitly via not_in_pg. Race condition deprioritized (single instance). See Low Priority #11 for known reconciliation gap.
+- **Relevance scoring (2026-05-07):** Replaces binary baseline injection. Threshold 0.4. Identity rels always pass. PII penalty -0.5 unless explicitly queried. Conversation state awareness deferred to High Priority #4.

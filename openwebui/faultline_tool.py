@@ -46,6 +46,22 @@ _IS_PURE_QUESTION = re.compile(
     re.IGNORECASE
 )
 
+_CAT_SIGNALS = {
+    "location":  {"where","address","weather","forecast","city","home",
+                 "location","live","located","residence","town"},
+    "family":    {"family","children","kids","spouse","wife","husband",
+                 "parent","parents","sibling","brother","sister",
+                 "son","daughter","partner","married"},
+    "work":      {"work","job","career","employer","employed",
+                 "company","occupation","profession","office"},
+    "physical":  {"height","weight","tall","heavy","body","size"},
+    "temporal":  {"birthday","born","birth","anniversary","age",
+                 "when was","how old","date of birth"},
+    "pets":      {"pet","dog","cat","animal","fish","bird",
+                 "hamster","rabbit","snake"},
+    "identity":  {"name","who am i","call me","known as","alias"},
+}
+
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -338,21 +354,6 @@ class Filter:
         Only returns categories that have actual facts — no phantom matches.
         """
         tl = text.lower()
-        _CAT_SIGNALS = {
-            "location":  {"where","address","weather","forecast","city","home",
-                         "location","live","located","residence","town"},
-            "family":    {"family","children","kids","spouse","wife","husband",
-                         "parent","parents","sibling","brother","sister",
-                         "son","daughter","partner","married"},
-            "work":      {"work","job","career","employer","employed",
-                         "company","occupation","profession","office"},
-            "physical":  {"height","weight","tall","heavy","body","size"},
-            "temporal":  {"birthday","born","birth","anniversary","age",
-                         "when was","how old","date of birth"},
-            "pets":      {"pet","dog","cat","animal","fish","bird",
-                         "hamster","rabbit","snake"},
-            "identity":  {"name","who am i","call me","known as","alias"},
-        }
         fact_cats = {f.get("category") for f in facts if f.get("category")}
 
         matched = {
@@ -361,11 +362,47 @@ class Filter:
         }
         return matched
 
+    def calculate_relevance_score(self, fact: dict, query: str) -> float:
+        """
+        Score a fact's relevance to the current query.
+        Returns a float in [0.0, 1.0].
+
+        Scoring components:
+          - Query signal match (0.0–0.6): keyword overlap between query and fact category signals
+          - Confidence bonus (0.0–0.3): fact.confidence scaled to 0.3
+          - Sensitivity penalty (-0.5): applied to PII facts not explicitly requested
+
+        NOTE: # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query string only.
+        """
+        score = 0.0
+        query_lower = query.lower()  # # NO RECURSIVE MATCHING
+
+        # 1. Query signal match (0.0–0.6)
+        category = fact.get("category", "")
+        keywords = _CAT_SIGNALS.get(category, [])
+        matches = sum(1 for kw in keywords if kw in query_lower)
+        score += min(0.6, matches * 0.15)
+
+        # 2. Confidence bonus (0.0–0.3)
+        confidence = fact.get("confidence", 0.0)
+        score += confidence * 0.3
+
+        # 3. Sensitivity penalty (-0.5 if sensitive rel_type and not explicitly requested)
+        _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
+        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace"}
+        if fact.get("rel_type") in _SENSITIVE_RELS:
+            explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
+            if not explicitly_asked:
+                score -= 0.5
+
+        return max(0.0, min(1.0, score))
+
     def _filter_relevant_facts(
         self,
         facts: list[dict],
         categories: set[str],
         identity: Optional[str],
+        query: str = "",
         is_realtime: bool = False,
     ) -> list[dict]:
         def _garbage(name: str) -> bool:
@@ -373,34 +410,28 @@ class Filter:
             return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
 
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
-        clean = [f for f in facts
+        cleaned = [f for f in facts
                 if not _garbage(f.get("subject", ""))
                 and not _garbage(f.get("object", ""))]
 
-        _BASELINE_CATS = {"location", "work", "identity", "temporal"}
+        # Score-based filtering — replaces binary category allowlist
+        # Threshold: fact must score >= RELEVANCE_THRESHOLD to be injected
+        RELEVANCE_THRESHOLD = 0.4
 
-        if is_realtime:
-            allowed_cats = _BASELINE_CATS | {"location"}
-        elif categories:
-            allowed_cats = _BASELINE_CATS | categories
-        else:
-            allowed_cats = _BASELINE_CATS
+        # Identity relationships always pass regardless of score
+        scored = [
+            f for f in cleaned
+            if f.get("rel_type") in _IDENTITY_RELS
+            or self.calculate_relevance_score(f, query) >= RELEVANCE_THRESHOLD
+        ]
 
-        allowed = (
-            _IDENTITY_RELS
-            | {f.get("rel_type") for f in clean
-               if f.get("category") in allowed_cats and f.get("rel_type")}
-        )
-
-        filtered = [f for f in clean if f.get("rel_type", "") in allowed]
-
-        min_conf = self.valves.MIN_INJECT_CONFIDENCE
-        if min_conf > 0:
-            high_conf = [f for f in filtered if f.get("confidence", 1.0) >= min_conf]
+        # Confidence gate (existing behaviour preserved)
+        if self.valves.MIN_INJECT_CONFIDENCE > 0:
+            high_conf = [f for f in scored if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
             if high_conf:
-                filtered = high_conf
+                return high_conf
 
-        return filtered if filtered else clean
+        return scored if scored else cleaned
 
     def _build_realtime_context(
         self, text: str, facts: list[dict], identity: Optional[str]
@@ -717,7 +748,7 @@ class Filter:
                         if _is_realtime:
                             _categories.add("location")
                         facts = self._filter_relevant_facts(
-                            facts, _categories, canonical_identity, is_realtime=_is_realtime
+                            facts, _categories, canonical_identity, query=text, is_realtime=_is_realtime
                         )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id={user_id}")
@@ -762,7 +793,7 @@ class Filter:
                             if _is_realtime:
                                 _categories.add("location")
                             facts = self._filter_relevant_facts(
-                                facts, _categories, canonical_identity, is_realtime=_is_realtime
+                                facts, _categories, canonical_identity, query=text, is_realtime=_is_realtime
                             )
 
                             if self.valves.ENABLE_DEBUG:
