@@ -299,33 +299,100 @@ def _commit_staged(
 def get_gliner_model():
     return _gliner2_model
 
-def _check_entity_id_normalization(dsn: str) -> None:
+def _normalize_entity_ids_startup(dsn: str) -> None:
     """
-    Check for string entity_ids in facts/staged_facts tables at startup.
-    If found, log a warning and optionally run normalization.
+    Normalize string entity_ids to UUID v5 surrogates at startup.
+    This is idempotent and safe to run repeatedly.
+
+    Scans facts/staged_facts for non-UUID entity_ids and converts them
+    using EntityRegistry._make_surrogate() logic.
     """
     try:
+        from src.entity_registry.registry import _make_surrogate
+
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
+                # Find all string entity_ids
                 cur.execute("""
-                    SELECT COUNT(*) FROM facts
-                    WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
+                    SELECT DISTINCT user_id, subject_id FROM facts
+                    WHERE subject_id NOT LIKE '%-%-%-%-'
+                    UNION
+                    SELECT DISTINCT user_id, object_id FROM facts
+                    WHERE object_id NOT LIKE '%-%-%-%-'
+                    UNION
+                    SELECT DISTINCT user_id, subject_id FROM staged_facts
+                    WHERE subject_id NOT LIKE '%-%-%-%-'
+                    UNION
+                    SELECT DISTINCT user_id, object_id FROM staged_facts
+                    WHERE object_id NOT LIKE '%-%-%-%-'
                 """)
-                bad_facts = cur.fetchone()[0]
+                string_ids = cur.fetchall()
 
-                cur.execute("""
-                    SELECT COUNT(*) FROM staged_facts
-                    WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
-                """)
-                bad_staged = cur.fetchone()[0]
+                if not string_ids:
+                    log.info("startup.entity_id_normalization_check", status="ok")
+                    return
 
-                if bad_facts > 0 or bad_staged > 0:
-                    log.warning("startup.entity_id_denormalization_detected",
-                                facts_with_string_ids=bad_facts,
-                                staged_facts_with_string_ids=bad_staged,
-                                reason="String entity_ids found; run migrations/018_normalize_entity_ids.py")
+                log.info("startup.entity_id_normalization_starting",
+                         string_id_count=len(string_ids))
+
+                # Build mapping from (user_id, string_id) -> surrogate UUID
+                entity_map = {}
+                for user_id, string_id in string_ids:
+                    if not _UUID_PATTERN.match(string_id):
+                        surrogate = _make_surrogate(user_id, string_id)
+                        entity_map[(user_id, string_id)] = surrogate
+
+                # Update facts table
+                updated_count = 0
+                for (user_id, string_id), surrogate in entity_map.items():
+                    cur.execute(
+                        "UPDATE facts SET subject_id = %s WHERE user_id = %s AND subject_id = %s",
+                        (surrogate, user_id, string_id)
+                    )
+                    updated_count += cur.rowcount
+
+                    cur.execute(
+                        "UPDATE facts SET object_id = %s WHERE user_id = %s AND object_id = %s",
+                        (surrogate, user_id, string_id)
+                    )
+                    updated_count += cur.rowcount
+
+                # Update staged_facts table
+                for (user_id, string_id), surrogate in entity_map.items():
+                    cur.execute(
+                        "UPDATE staged_facts SET subject_id = %s WHERE user_id = %s AND subject_id = %s",
+                        (surrogate, user_id, string_id)
+                    )
+                    updated_count += cur.rowcount
+
+                    cur.execute(
+                        "UPDATE staged_facts SET object_id = %s WHERE user_id = %s AND object_id = %s",
+                        (surrogate, user_id, string_id)
+                    )
+                    updated_count += cur.rowcount
+
+                # Ensure entities are registered
+                for (user_id, string_id), surrogate in entity_map.items():
+                    cur.execute(
+                        "INSERT INTO entities (id, user_id, entity_type) VALUES (%s, %s, 'unknown') "
+                        "ON CONFLICT (id, user_id) DO NOTHING",
+                        (surrogate, user_id)
+                    )
+
+                # Sync aliases
+                for (user_id, string_id), surrogate in entity_map.items():
+                    cur.execute(
+                        "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
+                        "VALUES (%s, %s, %s, true) ON CONFLICT (user_id, alias) DO NOTHING",
+                        (surrogate, user_id, string_id.lower())
+                    )
+
+                conn.commit()
+                log.info("startup.entity_id_normalization_complete",
+                         string_ids_processed=len(entity_map),
+                         rows_updated=updated_count)
     except Exception as e:
-        log.warning("startup.entity_id_check_failed", error=str(e))
+        log.error("startup.entity_id_normalization_failed", error=str(e))
 
 
 def _ensure_schema(dsn: str) -> None:
@@ -405,7 +472,7 @@ async def lifespan(app: FastAPI):
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         _ensure_schema(dsn)  # apply pending migrations before reading the schema
-        _check_entity_id_normalization(dsn)  # check for string entity_ids
+        _normalize_entity_ids_startup(dsn)  # normalize string entity_ids to UUIDs
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
             _rel_type_registry.get_valid_types()
