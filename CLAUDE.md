@@ -329,6 +329,51 @@ Defaults: Filter defaults to `"http://192.168.40.10:8001"`; Function defaults to
 
 - **`faultline_function.py`** — OpenWebUI **Function/Tool**. Explicit `store_fact(text, __user__)`. LLM rewrites to triples → `/ingest`.
 
+## Entity Type Classification & Pet Descriptors (May 8, 2026)
+
+### Type Classification System
+
+Three-layer type inference ensures entities are properly classified even with confusing names:
+
+**Layer 1: GLiNER2 Extraction** → direct entity type classification from text
+**Layer 2: Relationship Semantics** → fallback based on rel_type (has_pet → object is Animal)
+**Layer 3: Descriptor Context** → extract and store rich attributes (species, breed, color)
+
+### Example: "We have a cat named Goose"
+
+**Without robust handling:**
+- GLiNER2 classifies "goose" as Animal (bird species)
+- System creates entity goose:Animal
+- Loses the fact that it's a cat
+- Type mismatch: has_pet expects Animal, but name suggests otherwise
+
+**With robust handling:**
+1. Extract: subject="we", object="goose", rel_type="has_pet", object_type=?
+2. GLiNER2 returns object_type="Animal" (correct by chance)
+3. Relationship inference: has_pet → object MUST be Animal (reinforces)
+4. **Descriptor extraction:** Pattern match "have a CAT named GOOSE" → extract species="cat"
+5. Store species as entity_attribute for goose entity
+6. Result: goose:Animal with attribute species="cat", pref_name="goose"
+
+**Descriptor Extraction (Lines 507-540):**
+- Patterns: "have a [SPECIES] named [NAME]", "[NAME] is a [BREED]", "[NAME], a [DESCRIPTOR]"
+- Extracts: species, breed, color, size → stored as entity_attributes
+- Category: "physical" (like height, weight), marked provenance="llm_inferred"
+
+**Relationship-Aware Type Inference (Lines 542-575):**
+- Maps rel_type → expected entity types
+- Example: has_pet:object → Animal, parent_of:subject/object → Person
+- Used as fallback when GLiNER2 uncertain or conflicts with context
+- Applied after direct type updates but before fact creation
+
+### Type Update Pipeline (Lines 763-834)
+
+For each edge:
+1. **Direct types** (GLiNER2): UPDATE entities WHERE entity_type='unknown' with edge.subject_type/object_type
+2. **Inferred types** (relationship semantics): Use fallback if direct type missing
+3. **Descriptor storage**: For has_pet, extract and store species/breed/color as attributes
+4. Ensures complete entity classification: type + descriptive attributes
+
 ## Entity Type Classification in /ingest (Fixed May 8, 2026)
 
 The `/ingest` endpoint has code to update entity types from GLiNER2 classifications (line 702-709: `UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'`), but this was never executing because the LLM output didn't include `subject_type` and `object_type` fields.
