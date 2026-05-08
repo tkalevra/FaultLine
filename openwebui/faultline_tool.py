@@ -982,6 +982,16 @@ class Filter:
                 _MEMORY_MARKER = "⊢ FaultLine Memory"
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
+                # CRITICAL: Always cache raw text to Qdrant first, regardless of downstream validation.
+                # This ensures no data loss — raw context is retrievable even if structured ingest fails.
+                try:
+                    await self._fire_store_context(clean_text, user_id)
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] raw text cached to Qdrant (store_context)")
+                except Exception as _e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] store_context failed (non-critical): {_e}")
+
                 # Compute signals for skip_rewrite check
                 _has_self_id = bool(_IDENTITY_RE.search(clean_text))
                 _has_preference_signal = any(
@@ -1070,13 +1080,10 @@ class Filter:
                     await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
                 else:
                     # No typed edges extracted but text passed the ingest gate.
-                    # Store raw text as unstructured context so nothing is silently
-                    # dropped from natural conversation. Qdrant will surface it via
-                    # vector similarity even without a typed relationship.
+                    # Raw text already cached to Qdrant at inlet start via upfront store_context call.
+                    # Nothing further to do — structured ingest will be attempted only if edges exist.
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] no edges — storing as unstructured context")
-                    # Make it await instead of fire-and-forget
-                    await self._fire_store_context(clean_text, user_id)
+                        print(f"[FaultLine Filter] no edges extracted; raw text already cached")
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
