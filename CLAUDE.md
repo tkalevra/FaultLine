@@ -24,6 +24,7 @@ OpenWebUI inlet filter
 │     │                       │           └─▶ re_embedder (background) → Qdrant upsert
 │     │                       ├─▶ Class B (behavioral/contextual)
 │     │                       │     └─▶ _commit_staged()  INSERT INTO staged_facts
+│     │                       │           └─▶ immediate Qdrant sync (same as Class A, no poll delay)
 │     │                       │           └─▶ re_embedder promotes when confirmed_count >= 3
 │     │                       │                 └─▶ staged Qdrant point deleted after commit
 │     │                       │                       └─▶ new facts point upserted next poll cycle
@@ -101,8 +102,9 @@ Facts are classified at ingest time into three classes:
 **Class B — Behavioral/Contextual** (staged, promoted on confirmation)
 - lives_at, lives_in, works_for, occupation, educated_at, owns, likes, dislikes, prefers, friend_of, knows, met, located_in, related_to, has_pet, part_of, created_by
 - **Confidence**: 0.8 if user_stated, 0.6 if llm_inferred
-- **Lifecycle**: Staged to `staged_facts`; promoted when `confirmed_count >= 3`; staged Qdrant point deleted after promotion commits (best-effort, outside transaction); new facts point upserted next poll cycle
+- **Lifecycle**: Staged to `staged_facts`; immediate Qdrant sync at ingest time (no poll delay); promoted when `confirmed_count >= 3`; staged Qdrant point deleted after promotion commits (best-effort, outside transaction); new facts point upserted next poll cycle
 - **TTL**: Promoted facts persist indefinitely
+- **Query visibility**: Immediately visible via `_fetch_user_facts()` UNION (PostgreSQL) and immediate Qdrant sync (vector search) — no 3-confirmation wait for retrieval
 
 **Class C — Ephemeral/Novel** (staged, expiring without confirmation)
 - Anything not in A or B; engine-generated types; confidence < 0.6; novel types rejected by LLM
@@ -117,6 +119,12 @@ Facts are classified at ingest time into three classes:
 3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5`, cosine, `score_threshold: 0.3`, `limit: 10`
 
 Merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict.
+
+**`_fetch_user_facts()` UNION helper:** Both the baseline and graph-traversal queries use `_fetch_user_facts(db, user_id, entity_id, rel_types)` which UNIONs the `facts` and `staged_facts` tables. This ensures Class B/C staged facts are immediately visible to all PostgreSQL query paths without waiting for the 3-confirmation promotion cycle. The function is defined at the top of `/query` (before the `try` block) and must remain there — call sites must follow the definition.
+
+**Signal-gating:**
+- `_SELF_REF_SIGNALS`: triggers full graph traversal (2-hop) for queries like "where do i live", "tell me about me", "my family"
+- `_ATTRIBUTE_SIGNALS`: triggers named-entity resolution for queries containing `live`, `address`, `home`, `location`, `age`, `height`, `weight`, `job`, `work`, `occupation`, `born`, `birthday`
 
 **Scalar facts as facts:** Entity attributes returned in both `attributes` dict AND `facts` list. Both paths are now scored before injection.
 
@@ -148,7 +156,7 @@ Embedding model (`text-embedding-nomic-embed-text-v1.5`) remains hardcoded — i
 
 | File | Role |
 |---|---|
-| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, fact classification, Qdrant cleanup, `_assign_category_via_llm()` (model: `CATEGORY_LLM_MODEL`) |
+| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, fact classification, Qdrant cleanup, `_fetch_user_facts()` UNION helper, `_assign_category_via_llm()` (model: `CATEGORY_LLM_MODEL`) |
 | `src/api/models.py` | Pydantic models — IngestRequest, QueryRequest, RetractRequest, RetractResponse, StoreContextRequest, StoreContextResponse |
 | `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection + type constraint validation + novel type approval (model: `WGM_LLM_MODEL`) |
 | `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
@@ -331,6 +339,10 @@ Defaults: Filter defaults to `"http://192.168.40.10:8001"`; Function defaults to
 - **Wren deployment cannot be trusted verbally** — verify edits via `sed` before rebuild
 - **`faultline-{user_id}` per-user collection naming is live** — must never be broken
 - **Fallback leak is fixed** — `_filter_relevant_facts()` returns `scored` only, never `cleaned`
+- **Nested function definitions must precede call sites** — `_fetch_user_facts()` is defined before the `try` block in `/query`; do not move it below its callers
+- **ON CONFLICT must match actual unique constraints** — `entity_aliases` uses `UNIQUE (user_id, alias)`, so all ON CONFLICT clauses must target `(user_id, alias)`, never `(entity_id, user_id, alias)`
+- **No name-based entity pre-creation** — entities are created exclusively via `EntityRegistry.resolve()` which generates UUID v5 surrogates; the old pre-creation loop that inserted raw names as `id` has been removed
+- **Alias sync uses display names, not UUIDs** — `_canonical_to_display` dict maps canonical UUID → original display name; always resolve through this mapping when inserting into `entity_aliases`
 
 ## Do Not Develop Here
 
