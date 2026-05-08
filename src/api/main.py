@@ -1267,6 +1267,65 @@ def query(request: QueryRequest):
     user_surrogate = user_id  # OWUI UUID IS the surrogate — always
     db = None
     registry = None
+    def _fetch_user_facts(
+        db_conn,
+        user_id: str,
+        entity_id: str = None,
+        rel_types: tuple[str, ...] = None,
+    ) -> list[dict]:
+        """
+        Fetch facts from BOTH facts and staged_facts tables with a UNION.
+        Ensures Class B/C staged facts are visible to queries immediately,
+        without waiting for promotion or re_embedder sync.
+        Returns list of {subject, object, rel_type, provenance, confidence, category} dicts.
+        """
+        results = []
+        try:
+            with db_conn.cursor() as cur:
+                # Build common WHERE clauses
+                conds = ["user_id = %s"]
+                params = [user_id]
+                
+                # facts-specific filters
+                f_conds = conds + ["superseded_at IS NULL", "hard_delete_flag = false",
+                                   "(valid_until IS NULL OR valid_until > now())"]
+                # staged_facts-specific filters
+                s_conds = conds + ["expires_at > now()", "promoted_at IS NULL"]
+                
+                if rel_types:
+                    ph = ",".join(["%s"] * len(rel_types))
+                    f_conds.append(f"rel_type IN ({ph})")
+                    s_conds.append(f"rel_type IN ({ph})")
+                    params.extend(rel_types)
+                
+                if entity_id:
+                    f_conds.append("(subject_id = %s OR object_id = %s)")
+                    s_conds.append("(subject_id = %s OR object_id = %s)")
+                    params.extend([entity_id, entity_id])
+                
+                f_where = " AND ".join(f_conds)
+                s_where = " AND ".join(s_conds)
+                
+                query = (
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
+                    f"WHERE {f_where} "
+                    f"UNION ALL "
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
+                    f"WHERE {s_where} "
+                    f"ORDER BY rel_type"
+                )
+                cur.execute(query, params)
+                results = [
+                    {"subject": r[0], "object": r[1], "rel_type": r[2],
+                     "provenance": r[3], "confidence": r[4],
+                     "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
+                    for r in cur.fetchall()
+                ]
+        except Exception as e:
+            log.warning("query.fetch_user_facts_failed", error=str(e))
+        return results
+
+
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
@@ -1394,64 +1453,6 @@ def query(request: QueryRequest):
                 "object": object_display,
             })
         return resolved
-
-    def _fetch_user_facts(
-        db_conn,
-        user_id: str,
-        entity_id: str = None,
-        rel_types: tuple[str, ...] = None,
-    ) -> list[dict]:
-        """
-        Fetch facts from BOTH facts and staged_facts tables with a UNION.
-        Ensures Class B/C staged facts are visible to queries immediately,
-        without waiting for promotion or re_embedder sync.
-        Returns list of {subject, object, rel_type, provenance, confidence, category} dicts.
-        """
-        results = []
-        try:
-            with db_conn.cursor() as cur:
-                # Build common WHERE clauses
-                conds = ["user_id = %s"]
-                params = [user_id]
-                
-                # facts-specific filters
-                f_conds = conds + ["superseded_at IS NULL", "hard_delete_flag = false",
-                                   "(valid_until IS NULL OR valid_until > now())"]
-                # staged_facts-specific filters
-                s_conds = conds + ["expires_at > now()", "promoted_at IS NULL"]
-                
-                if rel_types:
-                    ph = ",".join(["%s"] * len(rel_types))
-                    f_conds.append(f"rel_type IN ({ph})")
-                    s_conds.append(f"rel_type IN ({ph})")
-                    params.extend(rel_types)
-                
-                if entity_id:
-                    f_conds.append("(subject_id = %s OR object_id = %s)")
-                    s_conds.append("(subject_id = %s OR object_id = %s)")
-                    params.extend([entity_id, entity_id])
-                
-                f_where = " AND ".join(f_conds)
-                s_where = " AND ".join(s_conds)
-                
-                query = (
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                    f"WHERE {f_where} "
-                    f"UNION ALL "
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
-                    f"WHERE {s_where} "
-                    f"ORDER BY rel_type"
-                )
-                cur.execute(query, params)
-                results = [
-                    {"subject": r[0], "object": r[1], "rel_type": r[2],
-                     "provenance": r[3], "confidence": r[4],
-                     "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])}
-                    for r in cur.fetchall()
-                ]
-        except Exception as e:
-            log.warning("query.fetch_user_facts_failed", error=str(e))
-        return results
 
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
