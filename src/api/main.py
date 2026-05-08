@@ -1277,9 +1277,11 @@ def query(request: QueryRequest):
         Fetch facts from BOTH facts and staged_facts tables.
         Uses two separate queries (not UNION) to avoid parameter binding
         issues with psycopg2 shared params across multiple SELECTs.
-        Ensures Class B/C staged facts are visible to queries immediately,
-        without waiting for promotion or re_embedder sync.
-        Returns list of {subject, object, rel_type, provenance, confidence, category} dicts.
+        Attaches fact_state metadata so the Filter can distinguish
+        long-term (authoritative) from staged (provisional) facts.
+        Returns list of {subject, object, rel_type, provenance, confidence,
+                          category, fact_state, fact_class,
+                          staged_confirmations, promoted_at, expires_at} dicts.
         """
         results = []
         try:
@@ -1304,10 +1306,7 @@ def query(request: QueryRequest):
                 s_where = " AND ".join(s_conds)
 
                 # --- Build independent params for each query ---
-                # Common base: user_id
                 base_params = [user_id]
-
-                # Append rel_types and entity_id for each query independently
                 f_params = list(base_params)
                 s_params = list(base_params)
 
@@ -1319,9 +1318,10 @@ def query(request: QueryRequest):
                     f_params.extend([entity_id, entity_id])
                     s_params.extend([entity_id, entity_id])
 
-                # --- Query 1: facts table ---
+                # --- Query 1: facts table (long-term) ---
                 f_query = (
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
+                    f"  confirmed_count, fact_class FROM facts "
                     f"WHERE {f_where}"
                 )
                 cur.execute(f_query, f_params)
@@ -1332,13 +1332,20 @@ def query(request: QueryRequest):
                         seen.add(key)
                         results.append({
                             "subject": r[0], "object": r[1], "rel_type": r[2],
-                            "provenance": r[3], "confidence": float(r[4]) if r[4] else 0.0,
-                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])
+                            "provenance": r[3],
+                            "confidence": float(r[4]) if r[4] else 1.0,
+                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                            "fact_state": "long_term",
+                            "fact_class": r[6] if r[6] else "A",
+                            "staged_confirmations": r[5] if r[5] else 0,
+                            "promoted_at": None,
+                            "expires_at": None,
                         })
 
-                # --- Query 2: staged_facts table ---
+                # --- Query 2: staged_facts table (provisional) ---
                 s_query = (
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM staged_facts "
+                    f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
+                    f"  confirmed_count, fact_class, promoted_at, expires_at FROM staged_facts "
                     f"WHERE {s_where}"
                 )
                 cur.execute(s_query, s_params)
@@ -1346,68 +1353,22 @@ def query(request: QueryRequest):
                     key = (r[0], r[1], r[2])
                     if key not in seen:
                         seen.add(key)
+                        promoted = r[7].isoformat() if r[7] else None
+                        expires = r[8].isoformat() if r[8] else None
                         results.append({
                             "subject": r[0], "object": r[1], "rel_type": r[2],
-                            "provenance": r[3], "confidence": float(r[4]) if r[4] else 0.0,
-                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2])
+                            "provenance": r[3],
+                            "confidence": float(r[4]) if r[4] else 0.0,
+                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                            "fact_state": "staged",
+                            "fact_class": r[6] if r[6] else "B",
+                            "staged_confirmations": r[5] if r[5] else 0,
+                            "promoted_at": promoted,
+                            "expires_at": expires,
                         })
         except Exception as e:
             log.warning("query.fetch_user_facts_failed", error=str(e))
         return results
-
-
-    try:
-        db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-        registry = EntityRegistry(db)
-        
-        # Resolve user entity ID — the canonical identity is the user's UUID.
-        # The literal "user" string exists as a legacy entity in some databases
-        # but aliases are registered under the UUID surrogate. Try both.
-        user_entity_id = user_id  # UUID is the authoritative surrogate
-        log.info("query.user_entity_resolved", user_id=user_id, entity_id=user_entity_id)
-        
-        # Look up preferred name: try UUID first, then fall back to legacy "user" entity
-        preferred = registry.get_preferred_name(user_id, user_entity_id)
-        if not preferred or preferred == user_entity_id:
-            # Try the legacy "user" literal as a fallback
-            preferred_legacy = registry.get_preferred_name(user_id, "user")
-            if preferred_legacy and preferred_legacy != "user":
-                preferred = preferred_legacy
-            else:
-                preferred = "user"
-        preferred_names = {"user": preferred}
-        canonical_identity = preferred  # display name for injection, not for DB queries
-        if canonical_identity:
-            log.info("query.identity_resolved",
-                     surrogate=user_surrogate, preferred=preferred, user_id=user_id)
-
-            # Always fetch baseline personal facts (location, attributes) anchored to
-            # the user's identity — these won't surface via vector similarity for
-            # unrelated queries like "what's the weather tomorrow?" but are always useful.
-            _BASELINE_RELS = (
-                "lives_at", "lives_in", "address", "located_in", "born_in",
-                "age", "height", "weight", "works_for", "occupation",
-                "nationality", "has_gender",
-                "also_known_as", "pref_name",  # identity — never depend on Qdrant for who the user is
-            )
-            baseline_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id, rel_types=_BASELINE_RELS)
-            if baseline_facts:
-                log.info("query.baseline_facts", count=len(baseline_facts), surrogate=user_entity_id)
-    except Exception as e:
-        log.warning("query.preferred_names_error", error=str(e))
-
-    # Graph traversal path: if query contains self-referential signals,
-    # fetch facts directly from Postgres anchored to the user's identity.
-    # This bypasses vector similarity which fails for structured relational queries.
-    _SELF_REF_SIGNALS = {
-        "my family", "my children", "my kids", "my wife", "my husband",
-        "my spouse", "my partner", "my parents", "my siblings", "my brother",
-        "my sister", "my son", "my daughter", "about me", "about myself",
-        "who am i", "who i am", "list my", "tell me about me",
-        "what do you know about me", "my pets", "my animals", "my home",
-        "where do i live", "my address", "my age", "my job", "my work",
-    }
-
     def _fetch_attributes(
         db_conn,
         user_id: str,
@@ -1509,6 +1470,7 @@ def query(request: QueryRequest):
                         "object": str(value),
                         "confidence": 1.0,
                         "fact_class": "A",
+                        "fact_state": "long_term",
                         "category": category,
                     })
         return facts
@@ -1550,8 +1512,11 @@ def query(request: QueryRequest):
                             if key not in seen:
                                 direct_facts.append({
                                     "subject": row[0], "object": row[1],
-                                    "rel_type": row[2], "provenance": row[3], "confidence": row[4],
-                                    "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2])
+                                    "rel_type": row[2], "provenance": row[3],
+                                    "confidence": float(row[4]) if row[4] else 1.0,
+                                    "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2]),
+                                    "fact_state": "long_term",
+                                    "fact_class": "A",
                                 })
                                 seen.add(key)
 
@@ -1825,6 +1790,12 @@ def query(request: QueryRequest):
                 "provenance": h["payload"].get("provenance"),
                 "confidence": h["payload"].get("confidence", 1.0),
                 "category": _REL_TYPE_META.get(h["payload"].get("rel_type"), {}).get("category"),
+                "fact_state": (
+                    "long_term" if h["payload"].get("fact_class") in ("A", None)
+                    else "staged" if h["payload"].get("fact_class") == "B"
+                    else "ephemeral"
+                ),
+                "fact_class": h["payload"].get("fact_class", "A"),
             }
             for h in resp.json().get("result", [])
             if h.get("payload")
