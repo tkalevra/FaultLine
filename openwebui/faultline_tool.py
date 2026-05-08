@@ -119,7 +119,8 @@ CORRECTIONS: If text signals a correction ("actually", "not X it's Y", "I meant"
 → add "is_correction":true to the corrected triple.
 
 UNITS: age→number only. height→feet format (6ft, 5'10"). weight→pounds (230lb).
-Self-statements for height/weight → subject="user".
+For age: subject is the PERSON whose age is being stated, NEVER 'user' unless explicitly "I am X years old".
+'My son Des is 12' → subject='des', object='12', rel_type='age'.
 
 DATES AND EVENTS:
 - For birthday/birth date patterns ("my birthday is X", "born on X", "I was born on X", "born in X"):
@@ -189,6 +190,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
             _other = [f for f in memory_facts if f.get("rel_type") not in _PREF_RELS]
             memory_facts = (_priority + _other)[:10]
             entity_lines = []
+            family_members = []
             for f in memory_facts:
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
@@ -198,12 +200,21 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                     subj_display = "USER" if subj in ("user",) else subj
                     obj_display = "USER" if obj in ("user",) else obj
                     entity_lines.append(f"- {obj_display} ({rel} of {subj_display})")
+                    # Track family relationships for attribute resolution
+                    if rel == "parent_of" and subj in ("user",):
+                        family_members.append(f"child: {obj}")
+                    elif rel == "child_of" and obj in ("user",):
+                        family_members.append(f"parent: {subj}")
             if entity_lines:
                 hint = (
                     "Known entities (for pronoun resolution only — do not store these as new facts):\n"
                     + "\n".join(entity_lines)
                 )
                 messages.append({"role": "system", "content": hint})
+            # Add family context hint for attribute queries
+            if family_members:
+                family_hint = f"Known family relationships: {', '.join(family_members)}. When asked about attributes of named family members, extract them with the family member's name as subject."
+                messages.append({"role": "system", "content": family_hint})
 
         user_content = text
         if typed_entities:
@@ -465,7 +476,29 @@ class Filter:
 
             return filtered
 
-        # For non-family queries, use normal scoring (keep your existing logic here)
+        # Detect attribute queries (asking for age, height, weight, birthdate, etc.)
+        _attribute_terms = {"age", "old", "height", "tall", "weight", "heavy", "born", "birthday", "how old", "how tall", "how heavy"}
+        is_attribute_query = any(term in query_lower for term in _attribute_terms)
+
+        if is_attribute_query:
+            scalar_rel_types = {"age", "height", "weight", "born_on", "born_in"}
+            identity_rel_types = {"also_known_as", "pref_name", "same_as", "parent_of", "spouse"}
+
+            filtered = []
+            for f in cleaned:
+                rel_type = f.get("rel_type", "")
+                if rel_type in scalar_rel_types or rel_type in identity_rel_types:
+                    filtered.append(f)
+
+            # Confidence gate
+            if self.valves.MIN_INJECT_CONFIDENCE > 0:
+                high_conf = [f for f in filtered if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
+                if high_conf:
+                    return high_conf
+
+            return filtered
+
+        # For non-family, non-attribute queries, use normal scoring
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
         RELEVANCE_THRESHOLD = 0.4
 
@@ -638,6 +671,7 @@ class Filter:
         if facts:
             nickname_map = {}
             by_rel = defaultdict(list)
+            mentioned_entities = set()
 
             _user_anchors = {identity, "user"} if identity else {"user"}
 
@@ -648,6 +682,13 @@ class Filter:
                     alias = f.get("object", "")
                     if subj and alias and subj != identity:
                         nickname_map[subj] = alias
+                # Collect all entity IDs mentioned in facts for attribute display
+                subj = f.get("subject", "")
+                obj = f.get("object", "")
+                if subj:
+                    mentioned_entities.add(subj)
+                if obj:
+                    mentioned_entities.add(obj)
 
             def _dn(name: str) -> str:
                 return nickname_map.get(name, name).title()
@@ -669,8 +710,21 @@ class Filter:
                     family_parts.append(f"siblings={', '.join(_dn(s) for s in siblings_raw)}")
                 lines.append(f"family: {', '.join(family_parts)}")
 
+            # Extract and display ages from facts
+            ages = []
+            for f in facts:
+                if f.get("rel_type") == "age":
+                    subj = f.get("subject", "")
+                    obj = f.get("object", "")
+                    if subj and obj and subj != "user":
+                        ages.append(f"{_dn(subj)}:{obj}")
+                    elif subj and obj and subj == "user":
+                        ages.append(f"user:{obj}")
+            if ages:
+                lines.append(f"ages: {', '.join(ages)}")
+
             # Build compact fact lines
-            covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name"}
+            covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name", "age"}
             for f in facts:
                 if f.get("rel_type") in covered:
                     continue
@@ -689,29 +743,65 @@ class Filter:
                 else:
                     lines.append(f"{_dn(subj)} → {rel} → {_dn(obj)}")
 
-            # User entity attributes (compact single line)
-            if identity and identity in entity_attributes:
-                ua = entity_attributes[identity]
-                attr_parts = []
-                if "height" in ua:
-                    attr_parts.append(f"height={ua['height']}")
-                if "weight" in ua:
-                    attr_parts.append(f"weight={ua['weight']}")
-                if "age" in ua:
-                    attr_parts.append(f"age={ua['age']}")
-                if attr_parts:
-                    lines.append(f"physical: {', '.join(attr_parts)}")
-
-            # Non-user entity attributes
+            # Display attributes for all entities mentioned in facts
             if entity_attributes:
-                for entity, attrs in entity_attributes.items():
-                    if entity == identity:
+                # Build UUID → display name mapping from preferred_names
+                uuid_to_display = {}
+                for entity_id, display_name in preferred_names.items():
+                    if entity_id not in ("user", identity):
+                        uuid_to_display[entity_id] = display_name
+
+                # User's own attributes (compact single line)
+                if identity and identity in entity_attributes:
+                    ua = entity_attributes[identity]
+                    attr_parts = []
+                    if "height" in ua:
+                        attr_parts.append(f"height={ua['height']}")
+                    if "weight" in ua:
+                        attr_parts.append(f"weight={ua['weight']}")
+                    if "age" in ua:
+                        attr_parts.append(f"age={ua['age']}")
+                    if attr_parts:
+                        lines.append(f"physical: {', '.join(attr_parts)}")
+
+                # Display attributes for non-user entities that appear in facts
+                seen_entities = set()
+                for f in facts:
+                    entity_id = f.get("subject")
+                    if not entity_id or entity_id in ("user", identity) or entity_id in seen_entities:
                         continue
-                    parts = []
-                    if "age" in attrs:
-                        parts.append(f"age {attrs['age']}")
-                    if parts:
-                        lines.append(f"{_dn(entity)}: {', '.join(parts)}.")
+                    if entity_id not in entity_attributes:
+                        continue
+
+                    seen_entities.add(entity_id)
+                    attrs = entity_attributes[entity_id]
+                    if not attrs:
+                        continue
+
+                    # Get display name from mapping (UUID → preferred name)
+                    display_name = uuid_to_display.get(entity_id, entity_id.title())
+
+                    # Format attributes
+                    attr_parts = []
+                    for attr_name, attr_value in attrs.items():
+                        # Handle both dict and scalar values
+                        if isinstance(attr_value, dict):
+                            value = attr_value.get("value")
+                        else:
+                            value = attr_value
+
+                        if value is not None:
+                            if attr_name == "age":
+                                attr_parts.append(f"{value} years old")
+                            elif attr_name == "height":
+                                attr_parts.append(f"{value} tall")
+                            elif attr_name == "weight":
+                                attr_parts.append(f"{value} lbs")
+                            else:
+                                attr_parts.append(f"{attr_name}: {value}")
+
+                    if attr_parts:
+                        lines.append(f"{display_name} is {', '.join(attr_parts)}")
 
         # Apply sentence limit
         limited = lines[:self.valves.MAX_MEMORY_SENTENCES]
@@ -906,10 +996,14 @@ class Filter:
                     }
                 )
 
+                _ATTRIBUTE_REQUESTS = {"how old", "how tall", "how heavy", "what age", "when was"}
+                _is_attribute_question = any(pat in clean_text.lower() for pat in _ATTRIBUTE_REQUESTS)
+
                 _skip_rewrite = (
                     bool(_IS_PURE_QUESTION.match(clean_text))
                     and not _has_self_id
                     and not _has_preference_signal
+                    and not _is_attribute_question
                 )
                 if _skip_rewrite:
                     typed_entities = []
