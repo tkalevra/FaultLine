@@ -1186,20 +1186,32 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     ))
 
             if rows:
-                # Filter rows to ensure all entity_ids are UUIDs (prevents string IDs contaminating DB)
-                # Validate all entity_ids are UUIDs before storing
+                # Filter rows to ensure entity_ids are valid (UUIDs or user_id itself)
+                # Validates that only user_id and UUID v5 surrogates appear in facts
+                # (prevents arbitrary string entity_ids from contaminating DB)
                 validated_rows = []
                 for row in rows:
                     user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row
-                    if not _UUID_PATTERN.match(subject):
+                    # Subject can be: (1) user_id (special case), (2) UUID v5 surrogate
+                    is_valid_subject = (
+                        subject == user_id or
+                        _UUID_PATTERN.match(subject)
+                    )
+                    # Object must be: (1) user_id (for pref_name/also_known_as), (2) UUID v5 surrogate
+                    is_valid_object = (
+                        obj == user_id or
+                        _UUID_PATTERN.match(obj)
+                    )
+
+                    if not is_valid_subject:
                         log.error("ingest.invalid_subject_id",
-                                  subject=subject, rel_type=rel_type,
-                                  reason="subject_id must be UUID, not string")
+                                  subject=subject, rel_type=rel_type, user_id=user_id,
+                                  reason="subject_id must be UUID or user_id")
                         continue  # Skip this fact
-                    if not _UUID_PATTERN.match(obj):
+                    if not is_valid_object:
                         log.error("ingest.invalid_object_id",
-                                  obj=obj, rel_type=rel_type,
-                                  reason="object_id must be UUID, not string")
+                                  obj=obj, rel_type=rel_type, user_id=user_id,
+                                  reason="object_id must be UUID or user_id")
                         continue  # Skip this fact
                     validated_rows.append(row)
 
