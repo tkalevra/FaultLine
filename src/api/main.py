@@ -792,8 +792,12 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.scalar_failed", error=str(_e))
                     # Also create fact row for query retrieval (age/height/weight only)
                     if edge.rel_type.lower() in ("age", "height", "weight"):
+                        # Use coerced scalar value, NOT canonical_object (which is a UUID)
+                        value_to_store = val_text
+                        if val_int is not None:
+                            value_to_store = str(val_int)  # Ensure "12" not "12.0"
                         rows.append((
-                            req.user_id, actual_subject, canonical_object,
+                            req.user_id, actual_subject, value_to_store,
                             edge.rel_type, req.source, False,
                             "A", 1.0, False
                         ))
@@ -883,6 +887,42 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if class_a_rows:
                     committed += manager.commit(class_a_rows)
                     log.info("ingest.class_a_committed", count=len(class_a_rows))
+
+                    # Trigger immediate Qdrant sync for Class A facts (don't wait for 10s re_embedder poll)
+                    # This ensures attribute queries immediately after ingest get results from both PostgreSQL and Qdrant
+                    try:
+                        from src.re_embedder.embedder import ReEmbedder
+                        embedder = ReEmbedder(db)
+                        upserted = 0
+                        with db.cursor() as cur:
+                            # Fetch the facts we just committed (qdrant_synced=false)
+                            cur.execute(
+                                "SELECT id, user_id, subject_id, object_id, rel_type FROM facts "
+                                "WHERE user_id = %s AND qdrant_synced = false AND superseded_at IS NULL "
+                                "ORDER BY id DESC LIMIT %s",
+                                (req.user_id, len(class_a_rows))
+                            )
+                            fresh_facts = cur.fetchall()
+                            if fresh_facts:
+                                # Embed and upsert to Qdrant immediately
+                                upserted = embedder.upsert_facts_to_qdrant(
+                                    req.user_id,
+                                    [(f[2], f[3], f[4]) for f in fresh_facts]  # (subject, object, rel_type)
+                                )
+                                # Mark as synced
+                                if upserted > 0:
+                                    fact_ids = [f[0] for f in fresh_facts[:upserted]]
+                                    if fact_ids:
+                                        id_ph = ",".join(["%s"] * len(fact_ids))
+                                        cur.execute(
+                                            f"UPDATE facts SET qdrant_synced = true WHERE id IN ({id_ph})",
+                                            fact_ids
+                                        )
+                                        db.commit()
+                                        log.info("ingest.immediate_qdrant_sync", user_id=req.user_id, synced=upserted)
+                    except Exception as _sync_err:
+                        log.warning("ingest.immediate_qdrant_sync_failed", error=str(_sync_err))
+                        # Don't fail ingest if immediate Qdrant sync fails — it will retry on next re_embedder poll
 
                 if class_b_rows:
                     staged_b = _commit_staged(db, class_b_rows, "B", confidence=0.8)
@@ -1403,6 +1443,36 @@ def query(request: QueryRequest):
                         )
                         log.info("query.entity_resolution.attributes", entity_attrs=entity_attrs)
 
+                        # Explicitly fetch scalar facts for resolved entities
+                        # (age, height, weight, born_on) to ensure they appear in facts array
+                        scalar_facts = []
+                        with db.cursor() as cur:
+                            id_placeholders = ",".join(["%s"] * len(confirmed_ids))
+                            cur.execute(
+                                f"""
+                                SELECT subject_id, object_id, rel_type, provenance, confidence
+                                FROM facts
+                                WHERE user_id = %s
+                                  AND superseded_at IS NULL
+                                  AND hard_delete_flag = false
+                                  AND rel_type IN ('age', 'height', 'weight', 'born_on')
+                                  AND subject_id IN ({id_placeholders})
+                                """,
+                                [user_id] + list(confirmed_ids)
+                            )
+                            scalar_facts = [
+                                {
+                                    "subject": row[0],
+                                    "object": row[1],
+                                    "rel_type": row[2],
+                                    "provenance": row[3],
+                                    "confidence": float(row[4]) if row[4] else 1.0,
+                                    "category": "physical"
+                                }
+                                for row in cur.fetchall()
+                            ]
+                        log.info("query.entity_resolution.scalar_facts", count=len(scalar_facts))
+
                         # Merge into direct_facts and attributes
                         for row in entity_facts:
                             fact = {
@@ -1416,6 +1486,14 @@ def query(request: QueryRequest):
                             }
                             if fact not in direct_facts:
                                 direct_facts.append(fact)
+
+                        # Merge scalar facts into direct_facts (avoid duplicates)
+                        existing_keys = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+                        for sf in scalar_facts:
+                            key = (sf["subject"], sf["object"], sf["rel_type"])
+                            if key not in existing_keys:
+                                direct_facts.append(sf)
+                                existing_keys.add(key)
 
                         for entity_id, attr_dict in entity_attrs.items():
                             if entity_id not in attributes:
