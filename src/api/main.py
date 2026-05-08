@@ -1475,6 +1475,18 @@ def query(request: QueryRequest):
                     })
         return facts
 
+    # Graph traversal path: if query contains self-referential signals,
+    # fetch facts directly from Postgres anchored to the user's identity.
+    # This bypasses vector similarity which fails for structured relational queries.
+    _SELF_REF_SIGNALS = {
+        "my family", "my children", "my kids", "my wife", "my husband",
+        "my spouse", "my partner", "my parents", "my siblings", "my brother",
+        "my sister", "my son", "my daughter", "about me", "about myself",
+        "who am i", "who i am", "list my", "tell me about me",
+        "what do you know about me", "my pets", "my animals", "my home",
+        "where do i live", "my address", "my age", "my job", "my work",
+    }
+
     # The canonical user entity ID is the OpenWebUI UUID
     user_entity_id_for_query = user_id
 
