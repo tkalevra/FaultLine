@@ -137,7 +137,7 @@ def _assign_category_via_llm(rel_type: str, qwen_api_url: str) -> Optional[str]:
         resp = httpx.post(
             qwen_api_url,
             json={
-                "model": "qwen2.5-coder",
+                "model": os.getenv("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
                 "messages": [{
                     "role": "user",
                     "content": (

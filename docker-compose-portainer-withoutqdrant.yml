@@ -43,6 +43,8 @@ services:
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
       REEMBED_INTERVAL: 5
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen/qwen3.5-9b}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-qwen2.5-coder}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
