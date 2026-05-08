@@ -557,7 +557,9 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 EdgeInput(
                     subject=fact["subject"].lower().strip(),
                     object=fact["object"].lower().strip(),
-                    rel_type=fact["rel_type"].lower().strip()
+                    rel_type=fact["rel_type"].lower().strip(),
+                    subject_type=fact.get("subject_type"),
+                    object_type=fact.get("object_type")
                 )
                 for fact in result.get("facts", [])
                 if fact.get("subject") and fact.get("object") and fact.get("rel_type")
