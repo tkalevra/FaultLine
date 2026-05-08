@@ -61,7 +61,7 @@ _CLASS_A_REL_TYPES = frozenset({
     "pref_name", "also_known_as", "same_as",
     "parent_of", "child_of", "spouse", "sibling_of",
     "born_on", "born_in", "has_gender", "nationality",
-    "instance_of", "subclass_of",
+    "instance_of", "subclass_of", "age", "height", "weight",
 })
 
 _CLASS_B_REL_TYPES = frozenset({
@@ -364,6 +364,8 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
     """
     Run GLiNER2 entity extraction only. Returns typed entities for use
     by the filter before calling Qwen for relationship classification.
+    Post-processes to resolve first-person references (e.g., null objects
+    for child_of relations where user is the implied parent).
     """
     if model is None:
         return {"entities": []}
@@ -379,7 +381,19 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
             ]
         }
         result = model.extract_json(req.text, schema)
-        return {"entities": result.get("facts", [])}
+        resolved_entities = []
+        for entity in result.get("facts", []):
+            # Post-process: if object is null but subject is a person and rel_type implies parent relationship
+            if entity.get("object") is None and entity.get("rel_type") == "child_of":
+                # The user is the implied parent; flip the relationship
+                entity["rel_type"] = "parent_of"
+                entity["object"] = entity.get("subject")
+                entity["object_type"] = entity.get("subject_type")
+                entity["subject"] = "user"
+                entity["subject_type"] = "Person"
+                log.info("extract.null_object_resolved", subject=entity["object"], rel_type="parent_of")
+            resolved_entities.append(entity)
+        return {"entities": resolved_entities}
     except Exception as e:
         log.error("extract.gliner2_failed", error=str(e))
         return {"entities": []}
@@ -541,8 +555,31 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             except Exception as _e:
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
 
+            # Ensure all mentioned entities exist before processing edges
+            for edge in edges:
+                for entity in [edge.subject, edge.object]:
+                    if entity and entity not in [user_entity_id, "user"]:
+                        try:
+                            with db.cursor() as cur:
+                                cur.execute(
+                                    "INSERT INTO entities (id, user_id, entity_type) "
+                                    "VALUES (%s, %s, 'Person') "
+                                    "ON CONFLICT (id, user_id) DO NOTHING",
+                                    (entity.lower(), req.user_id)
+                                )
+                            db.commit()
+                        except Exception:
+                            pass  # Silent fail - entity might exist already
+
             for edge in edges:
                 if edge.subject == edge.object: continue
+
+                # Age fact validation: reject if subject="user" but no explicit self-statement
+                if edge.rel_type.lower() == "age" and edge.subject.lower() == "user":
+                    if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
+                        log.warning("ingest.age_rejected_wrong_subject",
+                                    subject=edge.subject, object=edge.object, text=req.text[:100])
+                        continue
 
                 # UUID guard: reject raw edge values that are UUIDs
                 # (canonical_ids may be UUIDs when entities exist without display names, which is fine)
@@ -669,6 +706,51 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.scalar_rejected_non_numeric",
                                     entity=canonical_subject, value=canonical_object)
                         continue
+
+                    # ROBUST: Determine the TRUE subject by looking at relationship context.
+                    # If the current subject is the user but the text indicates this attribute belongs
+                    # to a related entity (child, spouse, pet, etc.), resolve to that entity instead.
+                    actual_subject = canonical_subject
+
+                    is_user_subject = (actual_subject == user_entity_id or actual_subject == "user")
+
+                    if is_user_subject and len(req.text.split()) > 3:
+                        # Generic relation pattern: "my [relation] [name] is [value]"
+                        # Works for any relation: son, daughter, wife, mother, dog, etc.
+                        relation_pattern = r'\bmy\s+(\w+)\s+([A-Z][a-z]+)\s+(?:is|was|has|turned)\s+(\d+(?:\.\d+)?)\s*(?:years?\s+old|ft|lbs?|lb)?'
+                        match = re.search(relation_pattern, req.text)
+
+                        if match:
+                            relation_type = match.group(1)  # son, daughter, wife, dog, etc.
+                            entity_name = match.group(2).lower()  # Des, Sophia, Spot, etc.
+
+                            # Resolve the mentioned entity to its canonical ID
+                            resolved_entity = registry.resolve(req.user_id, entity_name)
+
+                            # Verify this entity is actually related to the user via existing facts
+                            if resolved_entity and resolved_entity != user_entity_id and resolved_entity != "user":
+                                try:
+                                    with db.cursor() as _verify_cur:
+                                        _verify_cur.execute(
+                                            "SELECT 1 FROM facts "
+                                            "WHERE user_id = %s AND superseded_at IS NULL "
+                                            "AND ((subject_id = %s AND object_id = %s) "
+                                            "OR (subject_id = %s AND object_id = %s)) "
+                                            "LIMIT 1",
+                                            (req.user_id, user_entity_id, resolved_entity,
+                                             resolved_entity, user_entity_id)
+                                        )
+                                        if _verify_cur.fetchone():
+                                            actual_subject = resolved_entity
+                                            log.info("ingest.scalar_redirected",
+                                                     original=canonical_subject,
+                                                     new=actual_subject,
+                                                     relation=relation_type,
+                                                     rel_type=edge.rel_type)
+                                except Exception as _verify_e:
+                                    log.warning("ingest.scalar_relation_verification_failed",
+                                               error=str(_verify_e))
+
                     try:
                         # Ensure user entity exists in entities table
                         with db.cursor() as _cur:
@@ -697,17 +779,24 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "   value_date = EXCLUDED.value_date,"
                                 "   category = EXCLUDED.category,"
                                 "   updated_at = now()",
-                                (req.user_id, canonical_subject, edge.rel_type.lower(),
+                                (req.user_id, actual_subject, edge.rel_type.lower(),
                                  val_text, val_int, val_float, val_date, req.source,
                                  "private" if edge.rel_type.lower() in {
                                      "phone", "address", "email", "lives_at", "lives_in", "ip_address"
                                  } else "public", _scalar_category),
                             )
                         db.commit()
-                        log.info("ingest.scalar_stored", entity=canonical_subject,
+                        log.info("ingest.scalar_stored", entity=actual_subject,
                                  attribute=edge.rel_type, value=canonical_object)
                     except Exception as _e:
                         log.warning("ingest.scalar_failed", error=str(_e))
+                    # Also create fact row for query retrieval (age/height/weight only)
+                    if edge.rel_type.lower() in ("age", "height", "weight"):
+                        rows.append((
+                            req.user_id, actual_subject, canonical_object,
+                            edge.rel_type, req.source, False,
+                            "A", 1.0, False
+                        ))
                     continue  # Don't process as a relationship fact
 
                 # User corrections about themselves are axiomatically valid.
@@ -1353,6 +1442,13 @@ def query(request: QueryRequest):
         except Exception:
             pass
         merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+        # Populate preferred_names with all entities in merged facts
+        if registry:
+            for f in merged_facts:
+                if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
+                    preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
+                if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
+                    preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
         return {
             "status": "ok",
             "facts": merged_facts,
@@ -1379,6 +1475,13 @@ def query(request: QueryRequest):
             except Exception:
                 pass
             merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+            # Populate preferred_names with all entities in merged facts
+            if registry:
+                for f in merged_facts:
+                    if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
+                        preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
+                    if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
+                        preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
             return {
                 "status": "ok",
                 "facts": merged_facts,
@@ -1398,6 +1501,13 @@ def query(request: QueryRequest):
             except Exception:
                 pass
             merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+            # Populate preferred_names with all entities in merged facts
+            if registry:
+                for f in merged_facts:
+                    if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
+                        preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
+                    if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
+                        preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
             return {
                 "status": "ok",
                 "facts": merged_facts,
@@ -1461,6 +1571,15 @@ def query(request: QueryRequest):
             if key not in pg_keys:
                 merged_facts.append(f)
                 pg_keys.add(key)
+
+        # Populate preferred_names with all entities mentioned in facts
+        # so filter can look up display names for attributes
+        if registry:
+            for f in merged_facts:
+                if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
+                    preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
+                if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
+                    preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
 
