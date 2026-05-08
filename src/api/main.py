@@ -198,8 +198,8 @@ def _extract_identity(text: str) -> str | None:
     return None
 
 def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
-    """Return 'user' if entity_id matches the user's own UUID, else return entity_id."""
-    return "user" if entity_id == user_id else entity_id
+    """Return the canonical user UUID if entity_id matches, else return entity_id."""
+    return user_id if entity_id == user_id else entity_id
 
 def _build_rel_type_constraint(dsn: str) -> str:
     """Load rel_types from DB and build pipe-separated bracket constraint."""
@@ -524,36 +524,20 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             has_preferred = _detect_preference_signal(req.text)
             preferred_objects = set()
 
-            # Load the full flat alias set for this user - FIXED VERSION
-            _user_aliases = {"user"}
+            # The canonical user entity ID is the OpenWebUI UUID (req.user_id)
+            user_entity_id = req.user_id
+
+            # Load all aliases for this user's UUID
+            _user_aliases = set()
             try:
                 with db.cursor() as _cur:
-                    # FIRST: Find the canonical user entity ID (could be 'user' or a UUID)
-                    _cur.execute(
-                        "SELECT id FROM entities WHERE user_id = %s AND entity_type = 'Person' "
-                        "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
-                        (req.user_id,),
-                    )
-                    user_entity_row = _cur.fetchone()
-                    user_entity_id = user_entity_row[0] if user_entity_row else "user"
-
-                    # SECOND: Load all aliases for that entity
                     _cur.execute(
                         "SELECT alias FROM entity_aliases WHERE user_id = %s AND entity_id = %s",
                         (req.user_id, user_entity_id),
                     )
                     _user_aliases.update(row[0] for row in _cur.fetchall())
-
-                    # THIRD: Also load any aliases from 'user' placeholder if different
-                    if user_entity_id != "user":
-                        _cur.execute(
-                            "SELECT alias FROM entity_aliases WHERE user_id = %s AND entity_id = 'user'",
-                            (req.user_id,),
-                        )
-                        _user_aliases.update(row[0] for row in _cur.fetchall())
-
                 log.info("ingest.user_aliases_loaded",
-                         count=len(_user_aliases), user_id=req.user_id, entity_id=user_entity_id)
+                         count=len(_user_aliases), user_id=req.user_id)
             except Exception as _e:
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
 
@@ -579,7 +563,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 canonical_object = registry.resolve(req.user_id, edge.object)
 
                 # Persist entity types to entities table if provided (only if currently unknown)
-                if edge.subject_type and canonical_subject != "user":
+                if edge.subject_type and canonical_subject != user_entity_id:
                     try:
                         with db.cursor() as _cur:
                             _cur.execute(
@@ -592,7 +576,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.subject_type_update_failed",
                                     entity_id=canonical_subject, entity_type=edge.subject_type, error=str(_e))
 
-                if edge.object_type and canonical_object not in ("user", canonical_subject):
+                if edge.object_type and canonical_object not in (user_entity_id, canonical_subject):
                     try:
                         with db.cursor() as _cur:
                             _cur.execute(
@@ -605,30 +589,20 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.object_type_update_failed",
                                     entity_id=canonical_object, entity_type=edge.object_type, error=str(_e))
 
-                # Normalize user-identity aliases back to "user" anchor
-                # Check if canonical_subject matches ANY user alias (case-insensitive)
-                if (canonical_subject.lower() in [a.lower() for a in _user_aliases] or canonical_subject == req.user_id) and canonical_subject != "user":
-                    log.info("ingest.subject_normalized_to_user",
-                             original=canonical_subject, user_id=req.user_id,
+                # Normalize user-identity aliases to the canonical user UUID
+                if (canonical_subject.lower() in [a.lower() for a in _user_aliases] or canonical_subject == req.user_id) and canonical_subject != user_entity_id:
+                    log.info("ingest.subject_normalized_to_user_id",
+                             original=canonical_subject, user_id=user_entity_id,
                              matched_alias=canonical_subject.lower() in [a.lower() for a in _user_aliases])
-                    canonical_subject = "user"
-                    # Ensure "user" anchor exists in entities table
-                    with db.cursor() as _cur:
-                        _cur.execute(
-                            "INSERT INTO entities (id, user_id, entity_type)"
-                            " VALUES (%s, %s, %s)"
-                            " ON CONFLICT (id, user_id) DO NOTHING",
-                            ("user", req.user_id, "Person"),
-                        )
-                    db.commit()
+                    canonical_subject = user_entity_id
 
                 # Similarly for object, but only for rel_types where user can be an object.
                 # Skip also_known_as and pref_name because those edges must preserve the alias as object.
-                if (canonical_object in _user_aliases and canonical_object != "user" and
+                if (canonical_object in _user_aliases and canonical_object != user_entity_id and
                     edge.rel_type.lower() not in ("also_known_as", "pref_name")):
-                    log.info("ingest.object_normalized_to_user",
-                             original=canonical_object, user_id=req.user_id)
-                    canonical_object = "user"
+                    log.info("ingest.object_normalized_to_user_id",
+                             original=canonical_object, user_id=user_entity_id)
+                    canonical_object = user_entity_id
 
                 # Track the actual subject to use for fact creation (may differ from canonical_subject
                 # if this is a correction where subject resolved to user's identity)
@@ -680,7 +654,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # After a new user alias is registered, add it to in-memory set
                     # so subsequent edges in this batch are immediately normalized
-                    if alias_subject == "user" and edge.rel_type.lower() == "also_known_as":
+                    if alias_subject == user_entity_id and edge.rel_type.lower() == "also_known_as":
                         _user_aliases.add(edge.object.lower())
 
                 # Skip self-referential after resolution
@@ -696,13 +670,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     entity=canonical_subject, value=canonical_object)
                         continue
                     try:
-                        # Ensure "user" anchor exists in entities table
+                        # Ensure user entity exists in entities table
                         with db.cursor() as _cur:
                             _cur.execute(
                                 "INSERT INTO entities (id, user_id, entity_type)"
                                 " VALUES (%s, %s, %s)"
                                 " ON CONFLICT (id, user_id) DO NOTHING",
-                                ("user", req.user_id, "Person"),
+                                (user_entity_id, req.user_id, "Person"),
                             )
                         db.commit()
                         _scalar_category = (
@@ -723,7 +697,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "   value_date = EXCLUDED.value_date,"
                                 "   category = EXCLUDED.category,"
                                 "   updated_at = now()",
-                                (req.user_id, _resolve_user_anchor(canonical_subject, req.user_id), edge.rel_type.lower(),
+                                (req.user_id, canonical_subject, edge.rel_type.lower(),
                                  val_text, val_int, val_float, val_date, req.source,
                                  "private" if edge.rel_type.lower() in {
                                      "phone", "address", "email", "lives_at", "lives_in", "ip_address"
@@ -739,7 +713,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # User corrections about themselves are axiomatically valid.
                 # The gate exists to filter inferred/external data — not to override
                 # explicit user intent. Bypass validation entirely for user self-corrections.
-                if fact_subject == "user" and edge.is_correction:
+                if fact_subject == user_entity_id and edge.is_correction:
                     status = "valid"
                 else:
                     validation = gate.validate_edge(
@@ -1175,21 +1149,8 @@ def query(request: QueryRequest):
                     })
         return facts
 
-    # FIXED: Get the user entity ID for queries
-    user_entity_id_for_query = "user"
-    if db and registry:
-        try:
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM entities WHERE user_id = %s AND (id = 'user' OR id = %s) "
-                    "ORDER BY CASE WHEN id = 'user' THEN 0 ELSE 1 END LIMIT 1",
-                    (user_id, user_id),
-                )
-                row = cur.fetchone()
-                if row:
-                    user_entity_id_for_query = row[0]
-        except Exception:
-            pass
+    # The canonical user entity ID is the OpenWebUI UUID
+    user_entity_id_for_query = user_id
 
     query_lower = request.text.lower()
     direct_facts = []
