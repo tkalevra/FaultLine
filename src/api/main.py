@@ -1467,13 +1467,23 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                              original=subject, resolved=correction_subject,
                                              rel_type=rel_type)
 
-                        cur.execute(
-                            "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
-                            " AND object_id = %s AND rel_type = %s",
-                            (user_id, correction_subject, correction_object, rel_type.lower()),
-                        )
+                        # For scalar corrections (age, height, weight), look up by subject + rel_type
+                        # (not object, since object is the NEW value)
+                        if rel_type.lower() in _SCALAR_REL_TYPES:
+                            cur.execute(
+                                "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                                " AND rel_type = %s ORDER BY id DESC LIMIT 1",
+                                (user_id, correction_subject, rel_type.lower()),
+                            )
+                        else:
+                            # For identity corrections (also_known_as, pref_name), look up by object value
+                            cur.execute(
+                                "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                                " AND object_id = %s AND rel_type = %s",
+                                (user_id, correction_subject, correction_object, rel_type.lower()),
+                            )
                         result = cur.fetchone()
-                        if not result:
+                        if not result and rel_type.lower() not in _SCALAR_REL_TYPES:
                             # If the corrected subject's fact doesn't exist yet, look for the fact we just created
                             # (which might have the wrong subject due to resolution above)
                             cur.execute(
