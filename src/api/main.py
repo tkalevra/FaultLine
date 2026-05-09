@@ -73,6 +73,22 @@ _VALID_CATEGORIES = frozenset({
     "physical", "temporal", "location", "work", "family", "pets", "identity"
 })
 
+# Temporal event types routed to events table instead of facts
+_TEMPORAL_REL_TYPES = frozenset({
+    "born_on", "born_in",
+    "anniversary_on", "met_on", "married_on",
+    "appointment_on",
+})
+
+_EVENT_RECURRENCE_DEFAULTS = {
+    "born_on": "yearly",
+    "born_in": "once",
+    "anniversary_on": "yearly",
+    "met_on": "once",
+    "married_on": "once",
+    "appointment_on": "once",
+}
+
 # Class C = anything not in A or B, engine_generated types,
 # novel types, or confidence < 0.6
 
@@ -1352,6 +1368,39 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     0.8 if edge.fact_provenance == "user_stated" else 0.6
                 )
 
+                # Temporal event routing: if rel_type is time-based, insert into
+                # events table and skip facts/staged_facts routing entirely.
+                rt_lower = edge.rel_type.lower().strip()
+                if rt_lower in _TEMPORAL_REL_TYPES:
+                    with db.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO events"
+                            " (user_id, subject_id, object_id, event_type, occurs_on, recurrence, confidence)"
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                            " ON CONFLICT (user_id, subject_id, event_type)"
+                            " DO UPDATE SET"
+                            "   object_id = EXCLUDED.object_id,"
+                            "   occurs_on = EXCLUDED.occurs_on,"
+                            "   confidence = EXCLUDED.confidence,"
+                            "   recurrence = COALESCE(events.recurrence, EXCLUDED.recurrence)",
+                            (
+                                req.user_id,
+                                _raw_subject.lower().strip(),
+                                _raw_object.lower().strip(),
+                                rt_lower,
+                                _raw_object.lower().strip(),
+                                _EVENT_RECURRENCE_DEFAULTS.get(rt_lower),
+                                edge_confidence,
+                            ),
+                        )
+                    db.commit()
+                    log.info("ingest.event_stored",
+                             event_type=rt_lower,
+                             subject=_raw_subject.lower().strip(),
+                             occurs_on=_raw_object.lower().strip())
+                    ingested += 1
+                    continue  # skip facts/staged_facts routing
+
                 fact_class = _classify_fact(
                     edge.rel_type,
                     edge_confidence,
@@ -1893,6 +1942,36 @@ def query(request: QueryRequest):
         except Exception as e:
             log.warning("query.fetch_user_facts_failed", error=str(e))
         return results
+
+    def _fetch_user_events(
+        db_conn,
+        user_id: str,
+        entity_id: str = None,
+    ) -> list[dict]:
+        """Fetch events for user from events table, optionally filtered by entity."""
+        results = []
+        try:
+            with db_conn.cursor() as cur:
+                query = "SELECT id, subject_id, object_id, event_type, occurs_on, recurrence, confidence FROM events WHERE user_id = %s"
+                params = [user_id]
+                if entity_id:
+                    query += " AND subject_id = %s"
+                    params.append(entity_id)
+                cur.execute(query, params)
+                for row in cur.fetchall():
+                    results.append({
+                        "id": row[0],
+                        "subject": row[1],
+                        "object": row[2],
+                        "event_type": row[3],
+                        "occurs_on": row[4],
+                        "recurrence": row[5],
+                        "confidence": row[6],
+                        "source": "events_table",
+                    })
+        except Exception as e:
+            log.warning("query.fetch_user_events_failed", error=str(e))
+        return results
     def _fetch_attributes(
         db_conn,
         user_id: str,
@@ -2266,6 +2345,10 @@ def query(request: QueryRequest):
         log.info("query.embed_fail_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
         resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
         merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+        events = _fetch_user_events(db, user_id)
+        if events:
+            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
+            merged_facts.extend(events_resolved)
         log.info("query.embed_fail_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
         # Populate preferred_names with all entities in merged facts
         if registry:
@@ -2303,6 +2386,10 @@ def query(request: QueryRequest):
             log.info("query.404_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+        events = _fetch_user_events(db, user_id)
+        if events:
+            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
+            merged_facts.extend(events_resolved)
             log.info("query.404_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
@@ -2333,6 +2420,10 @@ def query(request: QueryRequest):
             log.info("query.error_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+        events = _fetch_user_events(db, user_id)
+        if events:
+            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
+            merged_facts.extend(events_resolved)
             log.info("query.error_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
