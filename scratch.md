@@ -81,3 +81,22 @@ Code goes directly into source files. This file stays lean.
 3. **code quality** — 33/33 tests pass, main.py parses clean
 
 **Ready for:** Redeploy Docker, then live validation of "tell me about my family" for zero UUID leakage in response.
+
+---
+
+## CRITICAL REGRESSION DISCOVERED (2026-05-11 ~4:15 PM)
+
+**BOTH issues present after dprompt-11 redeploy:**
+
+1. **Memory extraction BROKEN** — Zero facts injected to user. Queries like "tell me about my family" return no facts.
+2. **User ID leak UNFIXED** — Second query response still shows: "your ID is 3f8e6836-72e3-43d4-bbc5-71fc8668b070"
+
+**Assessment:** dprompt-11 fix appears to have broken the memory pipeline entirely, or /query is failing silently. User ID still leaking from different source.
+
+**Action:** dprompt-12 written. Deepseek to debug:
+1. Is /query being called? How many facts returned?
+2. Are facts reaching memory block construction?
+3. Is memory block being injected to messages?
+4. Where is user_id UUID still leaking from? (OpenWebUI context? Facts? Debug output?)
+
+**Critical:** Full-stack debug needed — /query endpoint → Filter memory building → message injection → LLM response.
