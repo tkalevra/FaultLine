@@ -297,6 +297,45 @@ def _commit_staged(
 def get_gliner_model():
     return _gliner2_model
 
+def _cleanup_entity_aliases_startup(dsn: str) -> None:
+    """
+    Clean up corrupted entity_aliases entries where entity_id is a string (not UUID).
+    Entity IDs must always be UUID v5 surrogates or 'user'.
+    This is idempotent and safe to run repeatedly.
+    """
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # Find entity_aliases with string entity_ids (not UUID, not 'user')
+                cur.execute("""
+                    SELECT COUNT(*) FROM entity_aliases
+                    WHERE entity_id NOT LIKE '%-%-%-%-' AND entity_id != 'user'
+                """)
+                bad_count = cur.fetchone()[0]
+
+                if bad_count == 0:
+                    log.info("startup.entity_aliases_cleanup", status="ok")
+                    return
+
+                log.warning("startup.entity_aliases_corrupted_found",
+                           corrupted_count=bad_count)
+
+                # Delete corrupted entries (string entity_ids)
+                # When the system re-ingests the correct edges, it will re-register
+                # with proper UUID entity_ids via registry.register_alias()
+                cur.execute("""
+                    DELETE FROM entity_aliases
+                    WHERE entity_id NOT LIKE '%-%-%-%-' AND entity_id != 'user'
+                """)
+                deleted = cur.rowcount
+                conn.commit()
+
+                log.info("startup.entity_aliases_cleanup_deleted",
+                        deleted_count=deleted)
+    except Exception as e:
+        log.error("startup.entity_aliases_cleanup_failed", error=str(e))
+
+
 def _normalize_entity_ids_startup(dsn: str) -> None:
     """
     Normalize string entity_ids to UUID v5 surrogates at startup.
@@ -470,6 +509,7 @@ async def lifespan(app: FastAPI):
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         _ensure_schema(dsn)  # apply pending migrations before reading the schema
+        _cleanup_entity_aliases_startup(dsn)  # remove corrupted string entity_ids from entity_aliases
         _normalize_entity_ids_startup(dsn)  # normalize string entity_ids to UUIDs
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
