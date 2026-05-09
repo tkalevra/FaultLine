@@ -1467,25 +1467,30 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                              original=subject, resolved=correction_subject,
                                              rel_type=rel_type)
 
-                        # For scalar corrections (age, height, weight), look up by subject + rel_type
-                        # (not object, since object is the NEW value)
-                        if rel_type.lower() in _SCALAR_REL_TYPES:
-                            cur.execute(
-                                "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
-                                " AND rel_type = %s ORDER BY id DESC LIMIT 1",
-                                (user_id, correction_subject, rel_type.lower()),
-                            )
-                        else:
-                            # For identity corrections (also_known_as, pref_name), look up by object value
+                        # Identity rels (also_known_as, pref_name, same_as): lookup by object (the NAME being corrected)
+                        # All other rels: lookup by subject + rel_type (the FACT being corrected, regardless of new value)
+                        # This allows age→10, location→Paris, occupation→Engineer corrections to supersede old values
+                        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
+
+                        if rel_type.lower() in _IDENTITY_RELS:
+                            # Identity: correct the name (object is the name)
                             cur.execute(
                                 "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
                                 " AND object_id = %s AND rel_type = %s",
                                 (user_id, correction_subject, correction_object, rel_type.lower()),
                             )
+                        else:
+                            # Non-identity: correct the fact (find most recent by subject + rel_type)
+                            cur.execute(
+                                "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                                " AND rel_type = %s ORDER BY id DESC LIMIT 1",
+                                (user_id, correction_subject, rel_type.lower()),
+                            )
                         result = cur.fetchone()
-                        if not result and rel_type.lower() not in _SCALAR_REL_TYPES:
-                            # If the corrected subject's fact doesn't exist yet, look for the fact we just created
-                            # (which might have the wrong subject due to resolution above)
+
+                        # Fallback for identity rels: if fact not found by object, try by subject
+                        # (fact might have been inserted with wrong subject due to resolution)
+                        if not result and rel_type.lower() in _IDENTITY_RELS:
                             cur.execute(
                                 "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
                                 " AND object_id = %s AND rel_type = %s",
