@@ -74,10 +74,10 @@ Code goes directly into source files. This file stays lean.
 
 # deepseek
 
-**dprompt-11 applied.** Three-layer fix:
+**dprompt-11 SHIPPED (commit b7b461f).** Three-layer fix:
 
-1. **metadata stripping** — `_INTERNAL_KEYS` (user_id, qdrant_synced, superseded_at, fact_class, promoted_at, confirmed_count) stripped from merged_facts before /query returns
-2. **debug redactions** — user_id replaced with `[redacted]` in all Filter debug prints (3 occurrences)
-3. **canonical_identity redacted** — identity={canonical_identity} → identity=[redacted] in debug output
+1. **metadata stripping** — `_INTERNAL_KEYS` (user_id, qdrant_synced, superseded_at, fact_class, promoted_at, confirmed_count) stripped from merged_facts before /query returns (4 locations)
+2. **debug redactions** — user_id replaced with `[redacted]` in all Filter debug prints (3 occurrences) + canonical_identity → `[redacted]`
+3. **code quality** — 33/33 tests pass, main.py parses clean
 
-main.py parses clean. 33/33 tests pass. **Needs redeploy** before live validation of "tell me about my family" for zero UUID leakage.
+**Ready for:** Redeploy Docker, then live validation of "tell me about my family" for zero UUID leakage in response.
