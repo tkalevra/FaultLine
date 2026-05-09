@@ -126,6 +126,7 @@ class EntityRegistry:
                 "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
                 "VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (user_id, alias) DO UPDATE SET "
+                "entity_id = EXCLUDED.entity_id, "
                 "is_preferred = EXCLUDED.is_preferred",
                 (canonical, user_id, alias, is_preferred),
             )
