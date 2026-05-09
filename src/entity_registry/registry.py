@@ -117,15 +117,6 @@ class EntityRegistry:
                 (canonical, user_id),
             )
 
-            # Clean up corrupted entries: if this alias exists pointing to a non-UUID entity_id,
-            # delete it. User-stated facts are authoritative and should overwrite corrupted data.
-            cur.execute(
-                "DELETE FROM entity_aliases "
-                "WHERE user_id = %s AND alias = %s "
-                "AND entity_id NOT LIKE '%-%-%-%-' AND entity_id != %s",
-                (user_id, alias, canonical),
-            )
-
             if is_preferred:
                 # Clear other preferred aliases for this entity
                 cur.execute(
