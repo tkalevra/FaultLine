@@ -1522,6 +1522,7 @@ def query(request: QueryRequest):
     canonical_identity = None
     baseline_facts = []
     attributes = {}
+    resolved_entity_ids = set()  # Track entities resolved in entity_resolution block
     user_surrogate = user_id  # OWUI UUID IS the surrogate — always
     db = None
     registry = None
@@ -1887,6 +1888,8 @@ def query(request: QueryRequest):
                         if row[1] in resolved_ids:
                             confirmed_ids.add(row[1])
                     log.info("query.entity_resolution.confirmed", confirmed_ids=list(confirmed_ids))
+                    # Track resolved entities so we fetch their attributes later
+                    resolved_entity_ids.update(confirmed_ids)
 
                     if confirmed_ids:
                         # Fetch facts anchored to confirmed entities
@@ -1984,7 +1987,7 @@ def query(request: QueryRequest):
         resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+            _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
             attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
             _attr_db.close()
         except Exception:
@@ -2017,7 +2020,7 @@ def query(request: QueryRequest):
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
             try:
                 _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
                 attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
                 _attr_db.close()
             except Exception:
@@ -2043,7 +2046,7 @@ def query(request: QueryRequest):
             resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
             try:
                 _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline})
+                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
                 attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
                 _attr_db.close()
             except Exception:
@@ -2112,7 +2115,8 @@ def query(request: QueryRequest):
             _entity_ids = list(
                 {user_entity_id_for_query} |
                 {f["subject"] for f in merged_facts} |
-                {f["object"] for f in merged_facts}
+                {f["object"] for f in merged_facts} |
+                resolved_entity_ids  # Include entities resolved in entity_resolution block
             )
             attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
             _attr_db.close()
