@@ -597,6 +597,22 @@ def _update_conversation_context(user_id: str, facts: list[dict], preferred_name
     # # NO RECURSIVE MATCHING — context built from pre-extracted facts/preferred_names only
 
 
+_UUID_ANYWHERE_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def _redact_uuids_from_body(body: dict) -> None:
+    """
+    Nuclear option: scan ALL message content strings for UUID patterns
+    and redact them. Ensures no internal identifiers leak to the LLM.
+    CLAUDE.md hard constraint: user IDs never visible to LLM or end user.
+    # NO RECURSIVE MATCHING — _UUID_ANYWHERE_RE is a static compile-once pattern
+    """
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str) and _UUID_ANYWHERE_RE.search(content):
+            msg["content"] = _UUID_ANYWHERE_RE.sub("[redacted]", content)
+
+
 class Filter:
     """
     OpenWebUI Filter for FaultLine WGM Integration.
@@ -1270,6 +1286,7 @@ class Filter:
                         body["messages"].append({"role": "system", "content": confirmation})
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] retraction: {result}")
+                        _redact_uuids_from_body(body)
                         return body
 
             _THIRD_PERSON_PREF_SIGNALS: frozenset[str] = frozenset({
@@ -1587,6 +1604,11 @@ class Filter:
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] inlet error: {type(e).__name__}: {e}")
+
+        # NUCLEAR OPTION: redact any UUID patterns from all messages before
+        # returning to OpenWebUI. Catches UUIDs from ANY source: OpenWebUI
+        # system prompts, prior messages, memory block, etc.
+        _redact_uuids_from_body(body)
 
         return body
 

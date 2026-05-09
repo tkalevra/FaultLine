@@ -157,3 +157,19 @@ Deepseek to fix definitively with full CLAUDE.md compliance audit.
 **Fix:** Removed all 5 duplicates. Added single clean block in main success path only (after `log.info("query.merged"...)`). Early return paths assemble their own fact lists without `user_id` fields.
 
 **Verification:** main.py parses, 33/33 tests pass. Ready for redeploy.
+
+---
+
+# deepseek — current state audit
+
+**Fix applied:** Nuclear option (`_redact_uuids_from_body()`) strips UUID patterns from ALL messages at every return path. uuid_guard hard check for facts. Nuke on exit.
+
+**Live check still shows 0 facts.** The metadata stripping regression (UnboundLocalError) fix needs container restart. Nuclear option UUID redaction in place regardless.
+
+**Data semantics discovery:** `has_pet` stored as `(mars_UUID → fraggle_UUID)` instead of `(user_UUID → fraggle_UUID)`. Ingest code resolved `user` → mars display entity UUID. Graph traversal (1-hop from user identity anchor) misses it. Qdrant top_k=5/10 doesn't pick it up either.
+
+**Impact:** User asks "Do I have any pets?" → 0 facts returned. Not a retrieval bug — an ingest-side entity resolution issue where first-person `user` was resolved to display entity instead of user identity anchor.
+
+**Fix options:**
+1. Ingest: ensure `user` always maps to user_UUID, not display entity UUID
+2. Query: extend graph traversal to follow identity rels (also_known_as, pref_name, same_as) to find facts on linked entities
