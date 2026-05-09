@@ -2388,9 +2388,9 @@ def query(request: QueryRequest):
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
             events = _fetch_user_events(db, user_id)
-        if events:
-            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
-            merged_facts.extend(events_resolved)
+            if events:
+                events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
+                merged_facts.extend(events_resolved)
             log.info("query.404_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
@@ -2423,9 +2423,9 @@ def query(request: QueryRequest):
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
             events = _fetch_user_events(db, user_id)
-        if events:
-            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
-            merged_facts.extend(events_resolved)
+            if events:
+                events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
+                merged_facts.extend(events_resolved)
             log.info("query.error_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
