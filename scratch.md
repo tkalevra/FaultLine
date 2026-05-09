@@ -15,24 +15,57 @@ Code goes directly into source files. This file stays lean.
 
 ## Archive
 
-**Full dialogue history:**
-- **scratch-archive-2026-05-11-phases6-10.md** — Phases 6–10 (date/time → events table → UUID resolution)
 - **scratch-archive-2026-05-11.md** — Phases 1–5 (retrieval, relations, conversation state)
+- **scratch-archive-2026-05-11-phases6-10.md** — Phases 6–10 (date/time, events table, UUID resolution)
 
 ---
 
-## Current Session (Phase 11+)
+## Critical Issue Discovered (2026-05-11 ~4:10 PM)
 
-Standing by for dprompt-9 Part C re-validation (UUID leakage fix live).
+**LIVE EXPOSURE:** User ID UUID leaked into LLM response.
+- Query: "tell me about my family please"
+- Response: "...we are communicating with the user ID '3f8e6836-72e3-43d4-bbc5-71fc8668b070'..."
+- Severity: CRITICAL — internal system identifier exposed to user
 
-Next: Validate display names in events, then move to systematic test coverage (NEXT_STEPS.md #1).
+**Root cause:** user_id appears somewhere in facts, memory block, or debug context visible to LLM.
+
+**Action:** dprompt-11 written. Deepseek to fix:
+1. Strip `user_id` + internal metadata from `/query` response facts
+2. Audit memory block for canonical_identity UUID leaks
+3. Redact user_id from debug output
+4. Validate zero UUID patterns in live response
+
+**Next:** Wait for dprompt-11 fix deployment, then re-test "tell me about my family" for zero UUIDs.
 
 ---
 
-# deepseek
+## Current State (2026-05-11) — All 10 prompts complete + critical fix pending
 
-**dprompt-10 fix was broken on deploy.** The `_resolve_display_names()` in `main.py` expects `(facts, registry, user_id, entity_id)` — but the sed used `(events, preferred_names, identity)`. Dict passed as registry → `AttributeError: get_preferred_name` on every /query call.
+### Code changes (Phase 7 shipped)
 
-**Fixed locally** — all 3 merge points now use `(events, registry, user_id, user_entity_id_for_query)`. main.py parses clean.
+| File | What | Tests |
+|---|---|---|
+| `openwebui/faultline_tool.py` | Three-tier retrieval, relation resolver (seed+dynamic), conversation state, display names, UUID hard guard, events formatting | 33/33 pass |
+| `src/api/main.py` | Temporal events routing, `_TEMPORAL_REL_TYPES`, `_fetch_user_events()`, events merge with display resolution | parses clean |
+| `migrations/015_events_table.sql` | Events table with recurrence | applied in DB |
 
-**Needs redeploy.**
+### Validated live (pre-leak-discovery)
+
+- Events query returns `user -born_on-> may 3rd, 1990` with 0 UUID leaks ✅
+- Hard UUID guard active in Filter ✅
+- Fraggle recall works ✅
+- `has_pet` fact stored as `(mars → fraggle)` in DB
+
+### Known
+
+- `has_pet` is `(mars → fraggle)` not `(user → fraggle)` — data semantics, not a bug
+- Generic "hey" query returns 0 facts on `/query` — keyword-less graph traversal may not trigger
+- **USER_ID LEAK:** user_id UUID appearing in LLM responses (BEING FIXED BY dprompt-11)
+
+### Next
+
+1. **BLOCKING:** dprompt-11 user_id leakage fix
+2. Revalidate: "tell me about my family" contains zero UUIDs
+3. Manual OpenWebUI validation: date-based queries
+4. Test coverage expansion: temporal events, conversation state
+5. Conversation state → calculate_relevance_score() (Phase 8)
