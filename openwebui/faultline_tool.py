@@ -74,6 +74,10 @@ _SESSION_MEMORY_TTL: int = 30  # seconds
 _DEDUP_TRACKER: dict[str, tuple[int, float]] = {}
 _DEDUP_WINDOW: float = 5.0  # seconds — ignore duplicate text within this window
 
+# Conversation context — per-user pronoun/entity tracking across turns
+_CONVERSATION_CONTEXT: dict[str, dict] = {}
+_CONVERSATION_MAX_ENTITIES: int = 10  # prune entity mentions beyond this
+
 _RETRACTION_PROMPT = """\
 You are a retraction extractor for a personal knowledge graph.
 The user wants to remove or correct a stored fact.
@@ -111,6 +115,7 @@ RELATIONSHIP RULES:
 - NEVER emit child_of with the speaker as subject. Use parent_of instead.
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
+- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
 
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
@@ -131,14 +136,20 @@ For age: subject is the PERSON whose age is being stated, NEVER 'user' unless ex
 'My son Des is 12' → subject='des', object='12', rel_type='age'.
 
 DATES AND EVENTS:
-- For birthday/birth date patterns ("my birthday is X", "born on X", "I was born on X", "born in X"):
+- Birthday/birth date patterns ("my birthday is X", "born on X", "I was born on X", "born in X"):
   emit {"subject":"user","object":"<date>","rel_type":"born_on"} where object is the date as stated (e.g. "may 3", "march 15th", "1988-04-02"). Normalize to lowercase.
-- For named recurring events or anniversaries ("our anniversary is X", "X's birthday is Y"):
-  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on"} or "anniversary_on" as appropriate.
-- For meeting/event dates ("we met on X", "we got married on X"):
-  emit the appropriate rel_type (met_on, married_on) with the date as object.
+- Person's birthday ("Des's birthday is X", "my son's birthday is Y"):
+  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on"}. Example: "My daughter Emma was born on June 15" → (emma, born_on, "june 15").
+- Anniversaries ("our anniversary is X", "our wedding anniversary is X"):
+  emit {"subject":"user" (or both entities if named),"object":"<date>","rel_type":"anniversary_on"}.
+- Meeting/first-encounter dates ("we met on X", "we first met on X"):
+  emit {"subject":"user","object":"<entity>","rel_type":"met_on"} OR use met_on as the date event rel_type depending on context.
+- Marriage/wedding dates ("we got married on X", "we were married on X"):
+  emit {"subject":"user","object":"<date>","rel_type":"married_on"} OR emit spouse relationship separately.
+- Relative date references ("next week", "last month", "in 3 weeks", "a month ago"):
+  Emit the relative date as-is ("next week", "last month", "in 3 weeks") as the object. System will normalize these contextually.
+- Date formats: month/day ("may 3rd", "december 25"), full dates ("march 15, 1990"), years ("born in 1988"), relative ("next thursday", "2 weeks ago").
 - Date values must be the date string only — never a name or description.
-- If a month/day pattern appears without a year, emit it as-is ("may 3rd", "december 25").
 
 ENTITY TYPES: If entity types were pre-classified (shown as "GLiNER2 has pre-classified"), include them in output:
 - subject_type: Person|Animal|Organization|Location|Object|Concept
@@ -297,6 +308,17 @@ def _extract_basic_facts(text: str) -> list[dict]:
         (re.compile(r"\bpeople\s+call\s+me\s+([a-z]+)", re.IGNORECASE), "also_known_as"),
     ]
 
+    # Relationship patterns for possessive forms like "my wife's name is X"
+    _RELATIONSHIP_PATTERNS = [
+        (re.compile(r"\bmy\s+wife'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "spouse"),
+        (re.compile(r"\bmy\s+husband'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "spouse"),
+        (re.compile(r"\bmy\s+partner'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "spouse"),
+        (re.compile(r"\bmy\s+spouse'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "spouse"),
+        (re.compile(r"\bmy\s+child'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "child_of"),
+        (re.compile(r"\bmy\s+son'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "child_of"),
+        (re.compile(r"\bmy\s+daughter'?s?\s+(?:name\s+)?is\s+([a-z]+)", re.IGNORECASE), "child_of"),
+    ]
+
     _STOPWORDS = {
         "a", "an", "the", "not", "just", "also", "here", "happy", "glad", "sorry",
         "married", "single", "divorced", "engaged", "ready", "trying",
@@ -315,6 +337,20 @@ def _extract_basic_facts(text: str) -> list[dict]:
                     "object": name,
                     "rel_type": rel_type,
                     "is_preferred_label": (rel_type == "pref_name"),
+                    "is_correction": False,
+                })
+
+    # Extract relationship facts from possessive forms
+    for pattern, rel_type in _RELATIONSHIP_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = m.group(1).lower().strip()
+            if name and name not in _STOPWORDS and len(name) > 1:
+                edges.append({
+                    "subject": "user",
+                    "object": name,
+                    "rel_type": rel_type,
+                    "is_preferred_label": False,
                     "is_correction": False,
                 })
 
@@ -355,6 +391,201 @@ def _extract_basic_facts(text: str) -> list[dict]:
             edge["is_correction"] = True
 
     return edges
+
+
+def _extract_query_entities(
+    query: str,
+    preferred_names: dict,
+    facts: list[dict] = None,
+) -> set[str]:
+    """
+    Extract entity display names from a query via two strategies.
+
+    Tier 1a: Direct token match — split query into tokens, strip punctuation,
+             match against known display names from preferred_names.
+    Tier 1b: Relational resolution — detect "my X" patterns (my wife, my pet,
+             my son) and resolve to entity via relation walking in facts.
+
+    Returns a set of matched entity display names (all lowercased).
+    """
+    entities = set()
+
+    if not query or not preferred_names:
+        return entities
+
+    query_lower = query.lower()
+
+    # --- Tier 1a: Direct token match against preferred_names ---
+    tokens = [t.strip(".,!?;:\"'()[]{}") for t in query_lower.split()]
+    known_names = {name.lower() for name in preferred_names.values()
+                   if name and len(name) > 1}
+    # # NO RECURSIVE MATCHING — known_names built from pre-extracted preferred_names values only
+    entities.update(token for token in tokens if token in known_names)
+
+    # --- Tier 1b: Relational resolution ("my wife", "my pet", etc.) ---
+    if facts:
+        # Build rel_index: {rel_type: {subject: [objects]}} in one pass
+        rel_index: dict[str, dict[str, list[str]]] = {}
+        for f in facts:
+            rel_type = f.get("rel_type", "")
+            subject = f.get("subject", "")
+            obj = f.get("object", "")
+            if rel_type and subject and obj:
+                rel_index.setdefault(rel_type, {}).setdefault(subject, []).append(obj)
+
+        # Tier 1b: Dynamic relation resolution — scan all (user, rel_type, X) facts
+        # "my X" resolves to X if any (user, *, X) fact exists. Domain-agnostic.
+        # Minimal seed for common relationship terms (wife→spouse, pet→has_pet, etc.)
+        _RELATION_SEED = {
+            "wife": "spouse", "husband": "spouse", "spouse": "spouse",
+            "son": "parent_of", "daughter": "parent_of",
+            "child": "parent_of", "children": "parent_of",
+            "pet": "has_pet", "dog": "has_pet", "cat": "has_pet",
+            "parent": "child_of", "mom": "child_of", "dad": "child_of",
+            "sibling": "sibling_of", "brother": "sibling_of", "sister": "sibling_of",
+        }
+        _PRONOUN_TOKENS = {"my", "i", "me", "our", "we"}
+        for token in tokens:
+            clean_token = token.strip(".,!?;:\"'()[]{}").lower()
+            if clean_token in _PRONOUN_TOKENS:
+                continue
+            # Seed match: map relational term to specific rel_type lookup
+            if clean_token in _RELATION_SEED:
+                rel_type = _RELATION_SEED[clean_token]
+                for obj_entity in rel_index.get(rel_type, {}).get("user", []):
+                    if obj_entity in preferred_names:
+                        entities.add(preferred_names[obj_entity].lower())
+                    else:
+                        entities.add(obj_entity.lower())
+            else:
+                # Dynamic match: scan ALL user→X facts for display name containing token
+                for rel_type, subjects in rel_index.items():
+                    for obj_entity in subjects.get("user", []):
+                        display_name = preferred_names.get(obj_entity, obj_entity).lower()
+                        if clean_token in display_name or display_name in clean_token:
+                            if obj_entity in preferred_names:
+                                entities.add(preferred_names[obj_entity].lower())
+                            else:
+                                entities.add(obj_entity.lower())
+                            break  # first match per token wins
+
+    return entities
+
+
+def _resolve_display_names(
+    facts: list[dict],
+    preferred_names: dict,
+    identity: Optional[str],
+) -> list[dict]:
+    """
+    Convert UUID subject/object in facts to human-readable display names
+    using the preferred_names map from /query.
+
+    Falls back to:
+    - "user" if the UUID matches the canonical identity
+    - the original value if no display name is found (keeps strings/numbers)
+
+    # NO RECURSIVE MATCHING — preferred_names is pre-built from /query response
+    """
+    resolved = []
+    for fact in facts:
+        f = fact.copy()
+        subject = fact.get("subject", "")
+        object_ = fact.get("object", "")
+
+        # Resolve subject UUID → display name
+        if subject in preferred_names:
+            f["subject"] = preferred_names[subject]
+        elif subject == identity:
+            f["subject"] = "user"
+
+        # Resolve object UUID → display name
+        if object_ in preferred_names:
+            f["object"] = preferred_names[object_]
+        elif object_ == identity:
+            f["object"] = "user"
+
+        resolved.append(f)
+    return resolved
+
+
+def _resolve_pronouns(query: str, user_id: str) -> set[str]:
+    """
+    Resolve pronouns (she, he, it, they) to recently mentioned entities
+    from conversation context. Returns set of entity display names.
+    """
+    entities = set()
+    ctx = _CONVERSATION_CONTEXT.get(user_id, {})
+    pronoun_map = ctx.get("pronoun_map", {})
+    mentions = ctx.get("entity_mentions", [])
+
+    query_lower = query.lower()
+
+    # "she"/"he" → map to most recent Person-typed entity
+    for pronoun in ("she", "he"):
+        if pronoun in query_lower and pronoun in pronoun_map:
+            entities.add(pronoun_map[pronoun])
+
+    # "it" → most recent non-Person entity
+    if "it" in query_lower and "it" in pronoun_map:
+        entities.add(pronoun_map["it"])
+
+    # "they" → most recent entity from mentions
+    if "they" in query_lower:
+        if "they" in pronoun_map:
+            entities.add(pronoun_map["they"])
+        elif mentions:
+            entities.add(mentions[-1])
+
+    return entities
+
+
+def _update_conversation_context(user_id: str, facts: list[dict], preferred_names: dict):
+    """
+    Track entity mentions and build pronoun map for next turn.
+    Prunes to last 10 mentions to avoid memory bloat.
+    """
+    ctx = _CONVERSATION_CONTEXT.setdefault(
+        user_id, {"entity_mentions": [], "pronoun_map": {}}
+    )
+    mentions = ctx["entity_mentions"]
+    pronoun_map = ctx["pronoun_map"]
+
+    for fact in facts:
+        rel_type = fact.get("rel_type", "")
+        subject = fact.get("subject", "")
+        obj = fact.get("object", "")
+
+        for entity in (subject, obj):
+            if not entity or entity in ("user",):
+                continue
+            display = preferred_names.get(entity, entity)
+            if display not in mentions:
+                mentions.append(display)
+
+            # Build pronoun map: "she" for spouse, "it" as generic fallback
+            if rel_type in ("spouse",):
+                pronoun_map["she"] = display
+                pronoun_map["he"] = display
+            elif rel_type in ("has_pet", "owns", "instance_of"):
+                pronoun_map["it"] = display
+            elif rel_type in ("sibling_of", "child_of", "parent_of"):
+                pronoun_map["they"] = display
+
+            # Most recent entity always maps to "it" as generic fallback
+            pronoun_map["it"] = display
+
+    # Prune to max entities
+    if len(mentions) > _CONVERSATION_MAX_ENTITIES:
+        ctx["entity_mentions"] = mentions[-_CONVERSATION_MAX_ENTITIES:]
+
+    # Prune pronoun map — keep only keys whose values still appear in mentions
+    remaining = set(ctx["entity_mentions"])
+    for key in list(pronoun_map.keys()):
+        if pronoun_map[key] not in remaining:
+            del pronoun_map[key]
+
+    # # NO RECURSIVE MATCHING — context built from pre-extracted facts/preferred_names only
 
 
 class Filter:
@@ -538,9 +769,31 @@ class Filter:
         facts: list[dict],
         categories: set[str],
         identity: Optional[str],
+        preferred_names: dict = None,
         query: str = "",
         is_realtime: bool = False,
     ) -> list[dict]:
+        """
+        Three-tier entity-centric relevance filtering.
+
+        Tier 1: Entity match — if query mentions a known entity, return all facts
+                where that entity is subject or object. Deterministic, no scoring.
+        Tier 2: Identity fallback — for generic queries with no entity match,
+                return identity-defining facts only (names, family structure).
+        Tier 3: Keyword scoring — fall back to category-based relevance scoring
+                for topic queries that don't name a specific entity.
+
+        The knowledge graph structure from /query IS the relevance signal.
+        Entity scoping determines what to show; graph proximity ranks it.
+        """
+        def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
+            if self.valves.MIN_INJECT_CONFIDENCE > 0:
+                high_conf = [f for f in candidates
+                             if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
+                if high_conf:
+                    return high_conf
+            return candidates
+
         def _garbage(name: str) -> bool:
             n = (name or "").strip().lower()
             return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
@@ -550,54 +803,29 @@ class Filter:
                 if not _garbage(f.get("subject", ""))
                 and not _garbage(f.get("object", ""))]
 
-        # Family query override - check query text directly
-        query_lower = query.lower()
-        is_family_query = any(term in query_lower for term in
-                             ["family", "son", "daughter", "child", "children",
-                              "kids", "parent", "sibling", "spouse", "wife", "husband"])
+        # TIER 1: Entity match — if query mentions a known entity, return all facts about it
+        if preferred_names:
+            entities = _extract_query_entities(query, preferred_names, facts=cleaned)
+            # Merge pronoun-resolved entities from conversation context
+            if identity:
+                pronoun_entities = _resolve_pronouns(query, identity)
+                if pronoun_entities:
+                    entities.update(pronoun_entities)
+            if entities:
+                tier1 = [f for f in cleaned
+                         if f.get("subject", "").lower() in entities
+                         or f.get("object", "").lower() in entities]
+                if tier1:
+                    return _apply_confidence_gate(tier1)
 
-        # For family queries, return ALL family-related facts without filtering
-        if is_family_query:
-            family_rel_types = {"parent_of", "child_of", "spouse", "sibling_of"}
-            identity_rel_types = {"also_known_as", "pref_name", "same_as"}
+        # TIER 2: Identity fallback — for generic queries, return identity facts only
+        _TIER2_IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
+                                "spouse", "parent_of", "child_of", "sibling_of"}
+        tier2 = [f for f in cleaned if f.get("rel_type") in _TIER2_IDENTITY_RELS]
+        if tier2:
+            return _apply_confidence_gate(tier2)
 
-            filtered = []
-            for f in cleaned:
-                rel_type = f.get("rel_type", "")
-                if rel_type in family_rel_types or rel_type in identity_rel_types:
-                    filtered.append(f)
-
-            # Confidence gate (preserve existing behavior)
-            if self.valves.MIN_INJECT_CONFIDENCE > 0:
-                high_conf = [f for f in filtered if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
-                if high_conf:
-                    return high_conf
-
-            return filtered
-
-        # Detect attribute queries (asking for age, height, weight, birthdate, etc.)
-        _attribute_terms = {"age", "old", "height", "tall", "weight", "heavy", "born", "birthday", "how old", "how tall", "how heavy"}
-        is_attribute_query = any(term in query_lower for term in _attribute_terms)
-
-        if is_attribute_query:
-            scalar_rel_types = {"age", "height", "weight", "born_on", "born_in"}
-            identity_rel_types = {"also_known_as", "pref_name", "same_as", "parent_of", "spouse"}
-
-            filtered = []
-            for f in cleaned:
-                rel_type = f.get("rel_type", "")
-                if rel_type in scalar_rel_types or rel_type in identity_rel_types:
-                    filtered.append(f)
-
-            # Confidence gate
-            if self.valves.MIN_INJECT_CONFIDENCE > 0:
-                high_conf = [f for f in filtered if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
-                if high_conf:
-                    return high_conf
-
-            return filtered
-
-        # For non-family, non-attribute queries, use normal scoring
+        # TIER 3: Keyword scoring — fall back to category-based relevance scoring
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
         RELEVANCE_THRESHOLD = 0.4
 
@@ -607,14 +835,8 @@ class Filter:
             return self.calculate_relevance_score(fact, query) >= RELEVANCE_THRESHOLD
 
         scored = [f for f in cleaned if should_include_fact(f)]
+        return _apply_confidence_gate(scored)
 
-        # Confidence gate
-        if self.valves.MIN_INJECT_CONFIDENCE > 0:
-            high_conf = [f for f in scored if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
-            if high_conf:
-                return high_conf
-
-        return scored
 
     def _build_realtime_context(
         self, text: str, facts: list[dict], identity: Optional[str]
@@ -1056,7 +1278,8 @@ class Filter:
                         if _is_realtime:
                             _categories.add("location")
                         facts = self._filter_relevant_facts(
-                            facts, _categories, canonical_identity, query=text, is_realtime=_is_realtime
+                            facts, _categories, canonical_identity,
+                            preferred_names=preferred_names, query=text, is_realtime=_is_realtime
                         )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id={user_id}")
@@ -1101,7 +1324,8 @@ class Filter:
                             if _is_realtime:
                                 _categories.add("location")
                             facts = self._filter_relevant_facts(
-                                facts, _categories, canonical_identity, query=text, is_realtime=_is_realtime
+                                facts, _categories, canonical_identity,
+                                preferred_names=preferred_names, query=text, is_realtime=_is_realtime
                             )
 
                             if self.valves.ENABLE_DEBUG:
@@ -1279,6 +1503,12 @@ class Filter:
                             filtered_attributes[entity_id] = filtered_attrs
 
                     entity_attributes = filtered_attributes
+
+                    # Resolve any remaining UUIDs to display names before building memory
+                    facts = _resolve_display_names(facts, preferred_names, canonical_identity)
+
+                    # Update conversation context for next turn
+                    _update_conversation_context(user_id, facts, preferred_names)
 
                     memory_block = self._build_memory_block(
                         text, facts, preferred_names, canonical_identity, entity_attributes,

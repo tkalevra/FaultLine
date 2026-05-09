@@ -65,6 +65,7 @@ class EntityRegistry:
                 # Validate that entity_id is a UUID (not a corrupted string)
                 # Corrupted entries should be skipped and treated as unknown
                 if entity_id and (entity_id.count('-') == 4 or entity_id == 'user'):
+                    log.info("entity_registry.resolve_alias_found", alias=name, entity_id=entity_id)
                     return entity_id
                 # If entity_id is a string (corrupted), fall through to generate a proper UUID
 
@@ -75,25 +76,31 @@ class EntityRegistry:
             )
             row = cur.fetchone()
             if row:
+                log.info("entity_registry.resolve_uuid_found", name=name)
                 return row[0]
 
             # Unknown — generate UUID v5 surrogate and register
             surrogate = _make_surrogate(user_id, name)
-            cur.execute(
-                "INSERT INTO entities (id, user_id, entity_type) "
-                "VALUES (%s, %s, 'unknown') "
-                "ON CONFLICT (id, user_id) DO NOTHING",
-                (surrogate, user_id),
-            )
-            cur.execute(
-                "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
-                "VALUES (%s, %s, %s, true) "
-                "ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred",
-                (surrogate, user_id, name),
-            )
-            self.db_conn.commit()
-            log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
-            return surrogate
+            log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate)
+            try:
+                cur.execute(
+                    "INSERT INTO entities (id, user_id, entity_type) "
+                    "VALUES (%s, %s, 'unknown') "
+                    "ON CONFLICT (id, user_id) DO NOTHING",
+                    (surrogate, user_id),
+                )
+                cur.execute(
+                    "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
+                    "VALUES (%s, %s, %s, true) "
+                    "ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred",
+                    (surrogate, user_id, name),
+                )
+                self.db_conn.commit()
+                log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
+                return surrogate
+            except Exception as e:
+                log.error("entity_registry.resolve_registration_failed", name=name, error=str(e))
+                raise
 
     def register_alias(
         self,
@@ -143,16 +150,29 @@ class EntityRegistry:
                  canonical=canonical, alias=alias, preferred=is_preferred)
 
     def get_preferred_name(self, user_id: str, canonical: str) -> str:
-        """Return preferred display name for entity, or canonical if none set."""
+        """Return preferred display name for entity, or canonical if none set.
+
+        Skips:
+        - Self-referential aliases where alias == entity_id (useless entries)
+        - UUID aliases (never valid display names, must be human-readable strings)
+        """
+        import re
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
                 "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
-                "LIMIT 1",
+                "ORDER BY alias DESC "
+                "LIMIT 10",
                 (user_id, canonical),
             )
-            row = cur.fetchone()
-            return row[0] if row else canonical
+            _UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+            for row in cur.fetchall():
+                alias = row[0]
+                # Skip self-referential and UUID aliases
+                if alias != canonical and not _UUID_PATTERN.match(alias):
+                    return alias
+            # Fallback to canonical if no valid alias found
+            return canonical
 
     def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
         """Return all display name aliases for a surrogate entity_id."""

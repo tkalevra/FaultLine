@@ -1,6 +1,6 @@
 # FaultLine — Pending Actions
 
-**Current Status (2026-05-08):** Full write-validated knowledge graph pipeline operational. Relevance scoring, LLM passthrough, and injection bug fixes complete. Focus is on test coverage expansion and prompt robustness.
+**Current Status (2026-05-11):** Full write-validated knowledge graph pipeline operational + entity-centric retrieval overhaul complete. Three-tier filtering, relational reference resolution, conversation state awareness, and UUID display name resolution shipped. Focus is on test coverage expansion, prompt robustness, and conversation state enhancements.
 
 ## Completed
 
@@ -22,6 +22,10 @@
 - ✅ **LLM model passthrough (filter)** — replaced `QWEN_MODEL`/`QWEN_URL` with `LLM_MODEL`/`LLM_URL`; empty = passthrough user's selected model; eliminates cold-load penalty
 - ✅ **Relevance scoring bug fixes** — three bugs fixed: fallback leak returning all facts when scored empty; entity attributes bypassing scoring; "tall" not matching height sensitivity terms; 10 tests passing
 - ✅ **Backend LLM model env vars** — replaced hardcoded `"qwen/qwen3.5-9b"` (WGM gate) and `"qwen2.5-coder"` (category inference) with `WGM_LLM_MODEL` and `CATEGORY_LLM_MODEL` env vars; `.env.example` and docker-compose updated
+- ✅ **Three-tier entity-centric retrieval (Phases 1-3)** — replaced keyword-based `calculate_relevance_score()` with Tier 1 (entity match), Tier 2 (identity fallback), Tier 3 (keyword scoring fallback); removed family/attribute query overrides; /query returns rich entity-linked data, Filter now uses it properly; Fraggle recall (has_pet facts) working end-to-end
+- ✅ **UUID display name resolution** — added `_resolve_display_names()` to convert UUID subject/object to human-readable names before memory injection; no more UUIDs leaked to user context
+- ✅ **Relational reference resolver (Phase 4)** — `_extract_query_entities()` Tier 1b: builds `rel_index`, resolves "my wife" → spouse UUID → display name; 22 personal patterns (wife, pet, son, daughter, etc.); API validated: "How's my wife?" → mars facts returned
+- ✅ **Generic relation resolver + conversation state awareness (Phase 5)** — replaced hardcoded `_RELATION_MAP` with dynamic `rel_index` scanning for domain-agnostic "my X" resolution (works for personal, engineering, infrastructure, science, work); added `_resolve_pronouns()` to track pronouns across turns ("she" → marla_uuid); `_update_conversation_context()` maintains per-user entity mention history, prunes to 10; 10/10 tests passing
 
 ## Pending
 
@@ -36,12 +40,15 @@
    - `tests/filter/test_relevance.py` — relevance scoring (10 tests, implemented)
    - `tests/api/test_retract.py` — pref_name retraction alias cleanup (3 tests, implemented)
 
-2. **Qwen prompt robustness** — expand date/time extraction:
-   - Birthday patterns ("born on X", "my birthday is May 3rd")
-   - Recurring events ("our anniversary is X")
-   - Meeting dates ("we met on X")
-   - Relative dates ("next week", "last month")
-   - Currently prompt supports UNITS (age, height, weight) but needs DATES AND EVENTS section
+2. **Qwen prompt robustness** — date/time extraction expanded (2026-05-11):
+   - ✅ Birthday patterns ("born on X", "my birthday is May 3rd") → born_on rel_type
+   - ✅ Person-specific birthdays ("my daughter's birthday is X") → born_on for named entity
+   - ✅ Recurring events ("our anniversary is X") → anniversary_on rel_type
+   - ✅ Meeting/encounter dates ("we met on X") → met_on rel_type
+   - ✅ Wedding/marriage dates ("we got married on X") → married_on rel_type
+   - ✅ Relative dates ("next week", "last month", "in 3 weeks") → emitted as-is for contextual normalization
+   - ✅ Date format handling (month/day, full dates with year, years, relative references)
+   - **Next:** Manual validation in OpenWebUI with date-based queries ("When was I born?", "Our anniversary?"); confirm extraction and recall
 
 3. **Entity type persistence** — `/extract` pre-classification only updates `entity_type='unknown'` entities. Verify:
    - Type overwrites don't corrupt existing classifications
