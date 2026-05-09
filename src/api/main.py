@@ -2387,7 +2387,7 @@ def query(request: QueryRequest):
             log.info("query.404_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
-        events = _fetch_user_events(db, user_id)
+            events = _fetch_user_events(db, user_id)
         if events:
             events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
             merged_facts.extend(events_resolved)
@@ -2422,7 +2422,7 @@ def query(request: QueryRequest):
             log.info("query.error_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
             resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
             merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
-        events = _fetch_user_events(db, user_id)
+            events = _fetch_user_events(db, user_id)
         if events:
             events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
             merged_facts.extend(events_resolved)
