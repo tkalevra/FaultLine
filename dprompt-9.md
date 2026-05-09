@@ -15,7 +15,121 @@
 
 ---
 
-## Test Flow
+## Setup: Baseline Facts for Regression Testing
+
+Before temporal tests, establish baseline facts (non-temporal):
+
+```bash
+# Baseline facts
+curl -X POST http://localhost:8001/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "My wife Marla loves gardening. We have a dog named Fraggle who is a Golden Retriever.",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected baseline facts in DB:
+# - (user, spouse, marla)
+# - (user, has_pet, fraggle)
+# - (marla, likes, gardening)
+# - (fraggle, instance_of, golden_retriever)
+```
+
+SQL verify:
+```sql
+SELECT COUNT(*) FROM facts WHERE user_id = 'test_temporal_123';
+-- Expected: 4+ baseline facts
+```
+
+---
+
+## Part A: Regression Tests (Existing Retrieval)
+
+### Regression 1: Entity Match (Tier 1)
+
+```bash
+# Query: "How's my wife?"
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How'\''s my wife?",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Returns Marla facts (spouse, likes gardening, etc.)
+# - NO temporal events yet (we haven't added dates for Marla)
+# - Tier 1 entity resolution works
+```
+
+Verify:
+```bash
+curl ... | jq '.facts[] | select(.subject == "marla" or .object == "marla")'
+# Should return spouse + marla's facts
+```
+
+### Regression 2: Pet Recall (has_pet)
+
+```bash
+# Query: "Tell me about my pet"
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Tell me about my pet",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Returns Fraggle facts (has_pet relationship)
+# - Memory shows: "fraggle is a golden retriever"
+# - Relational resolution works ("my pet" → has_pet)
+```
+
+### Regression 3: Identity Fallback (Tier 2)
+
+```bash
+# Query: "Tell me about myself"
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Tell me about myself",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Returns all user-anchored facts (spouse, pet, likes, etc.)
+# - Keyword scoring for relevance
+# - No errors from new events table
+```
+
+### Regression 4: Three-Tier Retrieval (all tiers)
+
+```bash
+# Query with multiple keywords (spouse + pet + likes)
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What do my wife and pet like?",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Tier 1: matches "wife" (marla), "pet" (fraggle)
+# - Returns marla + fraggle facts
+# - Likes relationships included
+```
+
+### Regression 5: No Temporal Events in Baseline
+
+```sql
+-- Verify baseline facts didn't accidentally create events
+SELECT COUNT(*) FROM events WHERE user_id = 'test_temporal_123';
+-- Expected: 0 (no temporal rel_types in baseline)
+```
+
+---
+
+## Part B: Temporal Events Tests (NEW)
 
 ### Step 1: Extract Birthday (curl + SQL)
 
@@ -176,6 +290,96 @@ docker logs faultline-api | grep -i "⭐\|📅\|memory\|event"
 
 ---
 
+## Part C: Mixed Queries (Temporal + Regular Facts)
+
+### Mixed 1: Spouse with Birthday
+
+```bash
+# We already have: (user, spouse, marla)
+# Now add: (marla, born_on, "june 15, 1992")
+curl -X POST http://localhost:8001/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Marla was born on June 15, 1992",
+    "user_id": "test_temporal_123"
+  }'
+
+# Query: "When was my wife born?"
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "When was my wife born?",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Returns spouse fact (marla)
+# - Returns temporal event (marla, born_on, "june 15, 1992")
+# - Both in single response
+# - Memory shows: "marla's born_on: june 15, 1992 (annually)"
+```
+
+SQL verify:
+```sql
+SELECT * FROM facts WHERE user_id = 'test_temporal_123' AND rel_type = 'spouse';
+SELECT * FROM events WHERE user_id = 'test_temporal_123' AND event_type = 'born_on';
+-- Expected: 1 spouse fact + 1 born_on event
+```
+
+### Mixed 2: Pet with Age + Attributes
+
+```bash
+# We have: (user, has_pet, fraggle)
+# Add: age + temporal info
+curl -X POST http://localhost:8001/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Fraggle is 5 years old, born on March 10, 2021",
+    "user_id": "test_temporal_123"
+  }'
+
+# Query: "How old is my pet and when was he born?"
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How old is my pet and when was he born?",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - has_pet fact (fraggle)
+# - age attribute (5)
+# - temporal event (born_on, march 10, 2021)
+# - All three in response
+```
+
+### Mixed 3: Conversation State + Temporal
+
+```bash
+# Turn 1: Establish temporal facts + entities
+curl -X POST http://localhost:8001/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "My wife Marla was born June 15, 1992",
+    "user_id": "test_temporal_123"
+  }'
+
+# Turn 2: Query using pronoun
+curl -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "When was she born?",
+    "user_id": "test_temporal_123"
+  }'
+
+# Expected:
+# - Pronoun "she" resolves to marla via conversation state
+# - Returns marla's born_on event
+# - Memory shows: "marla's born_on: june 15, 1992"
+```
+
+---
+
 ## Edge Cases to Validate
 
 1. **Fuzzy date:**
@@ -233,6 +437,23 @@ docker logs faultline-api | grep -i "⭐\|📅\|memory\|event"
 
 ## Checklist
 
+### Regression (Existing Functionality)
+- ✅ Baseline facts extract to facts table (spouse, has_pet, likes)
+- ✅ Entity match (Tier 1) retrieves wife/pet facts correctly
+- ✅ Relational resolution ("my wife", "my pet") still works
+- ✅ Identity fallback (Tier 2) returns user-anchored facts
+- ✅ Keyword scoring (Tier 3) ranks relevant facts
+- ✅ Three-tier retrieval doesn't regress with events table present
+- ✅ No baseline facts accidentally become events
+- ✅ Display name resolution works for existing facts
+
+### Mixed Queries (Temporal + Regular)
+- ✅ Spouse + birthday returns both fact + event
+- ✅ Pet + age + born_on returns all three
+- ✅ Conversation state pronouns resolve with temporal events
+- ✅ Memory injection shows mixed facts + events
+- ✅ Memory formatting: facts as bullets, events as ⭐/📅
+
 ### Extraction
 - ✅ Birthday patterns extract to events table
 - ✅ Anniversaries extract with recurrence="yearly"
@@ -271,21 +492,45 @@ docker logs faultline-api | grep -i "⭐\|📅\|memory\|event"
 ## Done When
 
 All checks pass:
+
+**Regression (baseline must not break):**
+- ✅ 5 regression tests pass (entity match, pet recall, identity fallback, three-tier, no temporal in baseline)
+- ✅ Baseline facts still in facts table (spouse, has_pet, likes)
+- ✅ Query retrieval unchanged for non-temporal facts
+
+**Temporal events:**
 - ✅ 5 basic curl tests succeed (birthday, appointment, spouse+birthday, query, memory)
-- ✅ SQL validates storage (events table has correct rows)
+- ✅ SQL validates storage (events table has correct rows, schema correct)
 - ✅ 4 edge cases pass (fuzzy, correction, multiple, no-relative)
-- ✅ Logs show clean execution (no errors)
+
+**Mixed queries:**
+- ✅ 3 mixed tests pass (spouse+birthday, pet+age+born_on, pronouns+temporal)
+- ✅ Memory injection shows both facts and events correctly formatted
+- ✅ Conversation state works with temporal events
+
+**Logs & validation:**
+- ✅ Logs show clean execution (no errors, event routing visible)
 - ✅ Fact count and formatting correct in memory injection
+- ✅ No regressions on query retrieval
 
 ---
 
 ## Report Back
 
 Return:
-1. Summary table: test | status | details
-2. Any errors from curl/SQL/logs
-3. Screenshot of events table (full row for one event)
-4. Log snippet showing memory injection
-5. Any regressions on non-temporal facts
+1. **Summary table:** Part | Test | Status | Details
+   - Part A (Regression): 5 tests
+   - Part B (Temporal): 5 basic + 4 edge cases
+   - Part C (Mixed): 3 tests
+2. **SQL snapshots:** 
+   - Baseline facts count
+   - Events table (1-2 sample rows)
+   - Mixed query results
+3. **Logs:**
+   - Event extraction success
+   - Query merge (events in response)
+   - Memory formatting (⭐/📅 visible)
+4. **Any errors** from curl/SQL/logs
+5. **Regression validation:** Confirm no breakage of existing retrieval
 
-Ship it.
+Ship comprehensive validation report.
