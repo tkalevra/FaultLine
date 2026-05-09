@@ -1138,7 +1138,16 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 fact_subject = canonical_subject
 
                 # Register aliases from also_known_as and pref_name edges
+                # CRITICAL: Skip self-referential aliases (where object == canonical subject)
+                # These are useless and pollute the alias registry
                 if edge.rel_type.lower() in ("also_known_as", "pref_name"):
+                    # Skip if object resolves to the same entity as subject
+                    if canonical_object == canonical_subject:
+                        log.info("ingest.alias_skipped_self_referential",
+                                alias=edge.object, entity=canonical_subject, rel_type=edge.rel_type)
+                        # Skip alias registration AND fact creation
+                        continue
+
                     is_pref = (
                         edge.rel_type.lower() == "pref_name" or
                         edge.is_preferred_label or
@@ -1437,6 +1446,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_object_scalar",
                                       obj=obj, rel_type=rel_type, user_id=user_id,
                                       reason="object value cannot be empty for scalar rel_type")
+                            continue
+                        # CRITICAL: pref_name and also_known_as must NEVER have UUID objects
+                        # A UUID as a display name is meaningless and breaks display resolution
+                        if rt_lower in ("pref_name", "also_known_as") and _UUID_PATTERN.match(obj):
+                            log.error("ingest.invalid_identity_rel_uuid_object",
+                                      rel_type=rel_type, object=obj, subject=subject,
+                                      reason=f"{rel_type} object must be a display name string, not a UUID")
                             continue
                     else:
                         # Relationship rel_type: object must be UUID or user_id
@@ -1939,13 +1955,18 @@ def query(request: QueryRequest):
         for f in facts:
             subject_display = registry.get_preferred_name(user_id, f["subject"])
             object_display = registry.get_preferred_name(user_id, f["object"])
-            
+
+            if f.get("rel_type") == "spouse":
+                log.info("query.resolve_display_names.spouse",
+                        original_subject=f["subject"], resolved_subject=subject_display,
+                        original_object=f["object"], resolved_object=object_display)
+
             # FIXED: Normalize user entity IDs to "user" placeholder for consistent display
             if f["subject"] == user_entity_id or subject_display == user_entity_id:
                 subject_display = "user"
             if f["object"] == user_entity_id or object_display == user_entity_id:
                 object_display = "user"
-            
+
             resolved.append({
                 **f,
                 "subject": subject_display,
