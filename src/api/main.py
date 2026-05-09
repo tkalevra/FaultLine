@@ -1320,12 +1320,20 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     ))
 
             if rows:
+                # Rel_types that ALWAYS have scalar (string) objects, never UUID references
+                _SCALAR_OBJECT_RELS = {
+                    'pref_name', 'also_known_as',  # identity: display names (strings)
+                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
+                    'occupation', 'nationality',  # descriptive: single-word or phrase
+                }
+
                 # Filter rows to ensure entity_ids are valid (UUIDs or user_id itself)
                 # Validates that only user_id and UUID v5 surrogates appear in facts
                 # (prevents arbitrary string entity_ids from contaminating DB)
                 validated_rows = []
                 for row in rows:
                     user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row
+                    rt_lower = rel_type.lower() if rel_type else ''
 
                     # If subject is a string (not UUID), try to resolve it
                     if subject and not _UUID_PATTERN.match(subject) and subject != user_id:
@@ -1338,37 +1346,51 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     original=row[1], error=str(_e), rel_type=rel_type)
                             continue
 
-                    # If object is a string (not UUID), try to resolve it
+                    # If object is a string, only resolve if rel_type expects UUID objects
+                    # Skip resolution for rel_types in _SCALAR_OBJECT_RELS (pref_name, age, etc.)
                     if obj and not _UUID_PATTERN.match(obj) and obj != user_id:
-                        try:
-                            obj = registry.resolve(user_id, obj)
-                            log.info("ingest.object_resolved_during_validation",
-                                   original=row[2], resolved=obj, rel_type=rel_type)
-                        except Exception as _e:
-                            log.error("ingest.object_resolution_failed_validation",
-                                    original=row[2], error=str(_e), rel_type=rel_type)
-                            continue
+                        if rt_lower not in _SCALAR_OBJECT_RELS:
+                            try:
+                                obj = registry.resolve(user_id, obj)
+                                log.info("ingest.object_resolved_during_validation",
+                                       original=row[2], resolved=obj, rel_type=rel_type)
+                            except Exception as _e:
+                                log.error("ingest.object_resolution_failed_validation",
+                                        original=row[2], error=str(_e), rel_type=rel_type)
+                                continue
 
-                    # Now validate that subject and object are UUIDs or user_id
+                    # Now validate: subject must be UUID or user_id
                     is_valid_subject = (
                         subject == user_id or
                         _UUID_PATTERN.match(subject)
                     )
-                    is_valid_object = (
-                        obj == user_id or
-                        _UUID_PATTERN.match(obj)
-                    )
-
                     if not is_valid_subject:
                         log.error("ingest.invalid_subject_id",
                                   subject=subject, rel_type=rel_type, user_id=user_id,
                                   reason="subject_id must be UUID or user_id")
                         continue  # Skip this fact
-                    if not is_valid_object:
-                        log.error("ingest.invalid_object_id",
-                                  obj=obj, rel_type=rel_type, user_id=user_id,
-                                  reason="object_id must be UUID or user_id")
-                        continue  # Skip this fact
+
+                    # Object validation depends on rel_type:
+                    # - For scalar rel_types: object can be ANY string (value)
+                    # - For relationship rel_types: object must be UUID or user_id
+                    if rt_lower in _SCALAR_OBJECT_RELS:
+                        # Scalar rel_type: object can be any non-empty string
+                        if not obj or not obj.strip():
+                            log.error("ingest.invalid_object_scalar",
+                                      obj=obj, rel_type=rel_type, user_id=user_id,
+                                      reason="object value cannot be empty for scalar rel_type")
+                            continue
+                    else:
+                        # Relationship rel_type: object must be UUID or user_id
+                        is_valid_object = (
+                            obj == user_id or
+                            _UUID_PATTERN.match(obj)
+                        )
+                        if not is_valid_object:
+                            log.error("ingest.invalid_object_id",
+                                      obj=obj, rel_type=rel_type, user_id=user_id,
+                                      reason="object_id must be UUID or user_id for relationship rel_type")
+                            continue  # Skip this fact
 
                     # Update row with resolved subject/object if they changed
                     updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated)
