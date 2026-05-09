@@ -388,16 +388,26 @@ Let's validate what we built works.
 
 **Phase 9: Temporal Events Validation (curl + SQL + logs).** See `dprompt-9.md`.
 
-Code is live. Validate end-to-end:
-- Extraction: 5 curl POST /ingest tests (birthday, appointment, spouse+birthday, correction, multiple)
-- Storage: SQL SELECT from events table (schema, recurrence, confidence, UNIQUE constraint)
-- Query: Merge validation via /query (events appear with source="events_table")
-- Memory: Event formatting in Filter (⭐ yearly, 📅 once)
-- Logs: Docker logs show clean execution
+Code is live. Validate comprehensively:
 
-Edge cases: fuzzy dates, corrections, no relative dates.
+**Part A (Regression):** Ensure existing retrieval unchanged
+- Baseline facts (spouse, has_pet, likes) still work
+- Entity match, pet recall, identity fallback, three-tier retrieval
+- No regressions from new events table
 
-Ship validation report.
+**Part B (Temporal):** New functionality
+- 5 basic tests: birthday, appointment, spouse+birthday, query, memory
+- 4 edge cases: fuzzy dates, corrections, multiple, no-relative
+- Storage validation: events table schema, recurrence, confidence
+
+**Part C (Mixed):** Integration of both
+- Spouse + birthday (fact + event merge)
+- Pet + age + born_on (three fact types in one query)
+- Conversation state resolving temporal events
+
+Comprehensive validation: 13 curl/SQL tests, logs inspection, regression confirmation.
+
+Ship full validation report.
 
 ---
 
