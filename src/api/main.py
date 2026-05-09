@@ -2400,13 +2400,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
-        return {
-                "status": "ok",
-                "facts": merged_facts,
-                "preferred_names": preferred_names,
-                "canonical_identity": canonical_identity,
-                "attributes": attributes,
-            }
+            return {
+                    "status": "ok",
+                    "facts": merged_facts,
+                    "preferred_names": preferred_names,
+                    "canonical_identity": canonical_identity,
+                    "attributes": attributes,
+                }
         if resp.status_code != 200:
             log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
             resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
@@ -2435,13 +2435,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
-        return {
-                "status": "ok",
-                "facts": merged_facts,
-                "preferred_names": preferred_names,
-                "canonical_identity": canonical_identity,
-                "attributes": attributes,
-            }
+            return {
+                    "status": "ok",
+                    "facts": merged_facts,
+                    "preferred_names": preferred_names,
+                    "canonical_identity": canonical_identity,
+                    "attributes": attributes,
+                }
 
         qdrant_facts = [
             {
