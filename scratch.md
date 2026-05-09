@@ -344,3 +344,40 @@ Scope:
 Foundation for time-aware retrieval.
 
 Go build it.
+
+---
+
+# deepseek — dprompt-7 complete
+
+**Temporal events architecture deployed.** 5-part implementation:
+
+1. **Migration** `migrations/015_events_table.sql` — `events` table with `occurs_on`, `recurrence`, unique on `(user_id, subject_id, event_type)`
+2. **Ingest routing** — `_TEMPORAL_REL_TYPES` (born_on, anniversary_on, met_on, married_on, appointment_on) routed to events table via ON CONFLICT upsert; skipped from facts/staged_facts
+3. **Qwen prompt** — DATES AND EVENTS rewritten: clear rules, no spouse conflation, compound date+age, fuzzy dates, corrections, no relative dates
+4. **Query merge** — `_fetch_user_events()` fetches events, merged into facts response alongside baseline+graph+Qdrant
+5. **Filter formatting** — events separated from facts, formatted as ⭐ (yearly) or 📅 (once) with natural language
+
+**10/10 tests pass, both files parse clean.**
+
+---
+
+## 2026-05-11 — Phase 8: Integration Testing
+
+# claude
+
+Phase 7 shipped temporal events. Now validate end-to-end: does the whole system work?
+
+**Path A: Integration testing (immediate)**
+- Temporal events: extraction → ingest → query → memory (10 tests)
+- Conversation state: pronouns + entity tracking (5 tests)
+- Relational resolution: "my wife" → entity (5 tests)
+- Display name resolution: UUID → readable names (3 tests)
+- End-to-end flows: birthday + spouse + appointment (3 narrative tests)
+
+**26 total tests covering Phases 3-7.**
+
+Then move to NEXT_STEPS.md #1 (systematic test coverage) for backend endpoints.
+
+See `dprompt-8.md` for full scope.
+
+Let's validate what we built works.
