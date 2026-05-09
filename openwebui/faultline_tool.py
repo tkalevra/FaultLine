@@ -136,19 +136,28 @@ For age: subject is the PERSON whose age is being stated, NEVER 'user' unless ex
 'My son Des is 12' → subject='des', object='12', rel_type='age'.
 
 DATES AND EVENTS:
-- Birthday/birth date patterns ("my birthday is X", "born on X", "I was born on X", "born in X"):
-  emit {"subject":"user","object":"<date>","rel_type":"born_on"} where object is the date as stated (e.g. "may 3", "march 15th", "1988-04-02"). Normalize to lowercase.
-- Person's birthday ("Des's birthday is X", "my son's birthday is Y"):
-  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on"}. Example: "My daughter Emma was born on June 15" → (emma, born_on, "june 15").
-- Anniversaries ("our anniversary is X", "our wedding anniversary is X"):
-  emit {"subject":"user" (or both entities if named),"object":"<date>","rel_type":"anniversary_on"}.
-- Meeting/first-encounter dates ("we met on X", "we first met on X"):
-  emit {"subject":"user","object":"<entity>","rel_type":"met_on"} OR use met_on as the date event rel_type depending on context.
-- Marriage/wedding dates ("we got married on X", "we were married on X"):
-  emit {"subject":"user","object":"<date>","rel_type":"married_on"} OR emit spouse relationship separately.
-- Relative date references ("next week", "last month", "in 3 weeks", "a month ago"):
-  Emit the relative date as-is ("next week", "last month", "in 3 weeks") as the object. System will normalize these contextually.
-- Date formats: month/day ("may 3rd", "december 25"), full dates ("march 15, 1990"), years ("born in 1988"), relative ("next thursday", "2 weeks ago").
+- NEVER emit spouse, met, married facts as relationship edges when a date is involved.
+  Emit the date as a separate event fact FIRST, then emit relationships separately.
+- Birthday patterns ("born on X", "my birthday is Y", "X's birthday is Z"):
+  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on"}.
+  Date formats: "may 3", "june 10, 1990", "15th", "1988", "june" (month only).
+- Anniversary patterns ("our anniversary is X", "X anniversary is Y"):
+  emit {"subject":"user" or entity,"object":"<date>","rel_type":"anniversary_on"}.
+- Meeting dates ("we met on X", "we first met on X"):
+  emit {"subject":"user","object":"<date>","rel_type":"met_on"}.
+- Marriage/wedding dates ("married on X", "got married on X"):
+  emit {"subject":"user","object":"<date>","rel_type":"married_on"}.
+- One-time events (appointments, deadlines) with future/past relevance:
+  emit {"subject":"<entity>","object":"<date>","rel_type":"appointment_on"}.
+- Compound date+age ("I'm 25, born on May 3"):
+  emit BOTH (user, age, "25") AND (user, born_on, "may 3").
+- Corrections ("Actually born June 3, not May 3"):
+  emit {"subject":"<entity>","object":"<date>","rel_type":"born_on","is_correction":true}.
+- Fuzzy/partial dates ("sometime in 1990", "around May"):
+  emit as-is with "low_confidence":true.
+- Day-only patterns ("my birthday is the 3rd"):
+  emit "3rd" as the date.
+- NEVER emit relative dates ("next week", "last month") — omit entirely.
 - Date values must be the date string only — never a name or description.
 
 ENTITY TYPES: If entity types were pre-classified (shown as "GLiNER2 has pre-classified"), include them in output:
@@ -1071,6 +1080,23 @@ class Filter:
             if ages:
                 lines.append(f"ages: {', '.join(ages)}")
 
+
+            # Format temporal events with natural language
+            events = [f for f in facts if f.get("source") == "events_table"]
+            for evt in events:
+                recurrence = evt.get("recurrence", "once")
+                rel_type = evt.get("rel_type", evt.get("event_type", ""))
+                subj = evt.get("subject", "")
+                obj = evt.get("object", evt.get("occurs_on", ""))
+                if recurrence == "yearly":
+                    lines.append(f"⭐ {subj}\'s {rel_type.replace("_", " ")}: {obj} (annually)")
+                elif recurrence == "once":
+                    lines.append(f"📅 {subj} {rel_type.replace("_", " ")}: {obj}")
+                else:
+                    lines.append(f"{rel_type}: {obj}")
+
+            # Remove events from facts list so they don't appear twice
+            facts = [f for f in facts if f.get("source") != "events_table"]
             # Build compact fact lines
             covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name", "age"}
             for f in facts:
@@ -1537,7 +1563,7 @@ class Filter:
                         await __event_emitter__({
                             "type": "status",
                             "data": {
-                                "description": f"⊢ FaultLine — {fact_count} fact{'s' if fact_count != 1 else ''} loaded",
+                                "description": f"⊢ FaultLine — {fact_count} fact{('s' if fact_count != 1 else '')} loaded",
                                 "done": True
                             }
                         })
