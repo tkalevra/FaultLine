@@ -53,7 +53,7 @@ class EntityRegistry:
             return user_id
 
         with self.db_conn.cursor() as cur:
-            # Check if it's a known alias
+            # Check if it's a known alias (but only if it points to a valid UUID)
             cur.execute(
                 "SELECT entity_id FROM entity_aliases "
                 "WHERE user_id = %s AND alias = %s",
@@ -61,7 +61,12 @@ class EntityRegistry:
             )
             row = cur.fetchone()
             if row:
-                return row[0]
+                entity_id = row[0]
+                # Validate that entity_id is a UUID (not a corrupted string)
+                # Corrupted entries should be skipped and treated as unknown
+                if entity_id and (entity_id.count('-') == 4 or entity_id == 'user'):
+                    return entity_id
+                # If entity_id is a string (corrupted), fall through to generate a proper UUID
 
             # Check if it's already a canonical UUID (exact match)
             cur.execute(
