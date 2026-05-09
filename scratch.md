@@ -71,6 +71,57 @@ Let's understand the landscape before making changes.
 
 ---
 
+# deepseek — dprompt-6 response (cont.)
+
+Deepseek provided thorough audit: rel_type gaps, clarity issues, 15 test cases.
+
+Two paths emerged:
+- **Path A:** Add missing rel_types (`anniversary_on`, `met_on`, `married_on`)
+- **Path B:** Collapse to `born_on` only, simplify
+
+But both paths are **too narrow**. Time awareness is foundational, not a side feature.
+
+# chris
+
+Path A doesn't account for broader temporal architecture needs. Temporal facts aren't all the same semantic category:
+
+**One-time future events** (appointments, deadlines):
+- "appointment July 16 2026" → relevance decreases as date approaches/passes
+- Once past, becomes historical
+- Query: "how much time until...?" or "how long ago was...?"
+
+**Recurring events** (birthdays, anniversaries):
+- "May 3rd" → relevant every May 3rd, regardless of year
+- Recurrence rules matter
+- Query: "when's my next birthday?", "anniversary coming up?"
+
+**Historical events** ("we met June 15, 2020"):
+- Relevance *grows* as past recedes (more sentimental)
+- Duration-based queries: "how long have we known each other?"
+
+**Durations** ("together 5 years"):
+- Computed from temporal facts
+- Dynamic, changes every day
+
+This suggests we need **temporal semantics**, not just date strings:
+- Event type (one-time vs recurring)
+- Temporal direction (future vs past vs ongoing)
+- Reference frame (absolute date vs relative/recurring)
+- Possibly a dedicated `events` table or temporal schema
+
+**Before we implement date extraction or add rel_types, we need the architectural foundation.**
+
+**Questions for Deepseek:**
+1. What should the temporal fact model be? Do we extend `born_on` or design a dedicated events/temporal schema?
+2. Should events have type metadata (one-time vs recurring, future vs past)?
+3. How should `/query` handle temporal relevance? Should it rank future events higher? Age past events by recency?
+4. Do we need a separate `events` table, or can `entity_attributes` + rel_types handle it?
+5. What's the minimal schema to support all four semantic categories (one-time future, recurring, historical, duration)?
+
+Let's design the temporal architecture before we code.
+
+---
+
 ## 2026-05-11 — Phase 4 direction
 
 # claude
@@ -190,3 +241,71 @@ Two parts, one file:
 Robustness first: graceful fallbacks, bounded memory, no new dependencies.
 
 Go ship it.
+
+---
+
+# deepseek — dprompt-6 evaluation
+
+## Rel_type audit
+
+DB has **37 rel_types**, but **0 of 3 date-specific** ones referenced in prompt:
+- `born_on` ✅ exists
+- `born_in` ✅ exists
+- `anniversary_on` ❌ NOT in DB
+- `met_on` ❌ NOT in DB
+- `married_on` ❌ NOT in DB
+- `met` ✅ exists but means "has met (person)", not a date
+
+**Impact:** LLM emits `anniversary_on`/`met_on`/`married_on` → WGM gate treats as novel types → either creates them (if LLM-in-chain works) or rejects the edge (dropped). Unpredictable.
+
+**Recommendation:** Replace all three with `born_on` (or register them properly). `born_on` already handles "date associated with person/event" — anniversary is just a recurring date.
+
+## Clarity issues
+
+1. **"emit subject=user (or both entities if named)"** — ambiguous. LLM doesn't know when to emit one vs two edges. Fix: always emit single edge with subject=user for first-person statements, subject=named entity for third-person.
+2. **"OR emit spouse relationship separately"** — gives LLM two options. Fix: always extract date as `born_on`, never conflate with relationship type.
+3. **"depending on context"** — undefined. Fix: remove, give explicit rule.
+4. **Relative dates stored as-is** — "next week" in a knowledge graph becomes stale immediately. Recommendation: drop relative date support for now, or store with reference timestamp.
+
+## Coverage gaps
+
+| Pattern | Example | Status |
+|---|---|---|
+| Simple birthday | "born on May 3" | Covered ✅ |
+| Self birthday | "my birthday is June 10" | Covered ✅ |
+| Other birthday | "Des's birthday is May 3" | Covered ✅ |
+| Year only | "born in 1988" | Covered ✅ |
+| Anniversary | "our anniversary is June 20" | ❓ unclear rel_type |
+| Compound age+date | "I'm 25, born on May 3" | ❌ not covered |
+| Fuzzy date | "sometime in 1990", "around May" | ❌ not covered |
+| Duration+date | "together 5 years, anniversary June 20" | ❌ not covered |
+| Date correction | "Actually born June 3, not May 3" | ❌ not covered |
+| Past date reference | "we met on june 15 2020" | ❓ unclear rel_type |
+| Month only | "born in June" | Partial ⚠️ |
+| Day only | "birthday is the 3rd" | ❌ not covered |
+
+## Proposed fix (Option B: has gaps)
+
+1. **Collapse to `born_on` only** — anniversary, wedding, met dates all use `born_on`. Simpler, no novel type dependency.
+2. **Add compound patterns** — "age X, born Y" extracts both age + born_on
+3. **Add correction hint** — "is_correction:true when date is being corrected"
+4. **Simplify relative dates** — drop or mark "low_confidence:true"
+5. **Add Day-only pattern** — "birthday is the 3rd" stores as "3rd"
+
+## 15 test cases
+
+1. "I was born on May 3rd" → (user, born_on, "may 3rd")
+2. "My birthday is June 10, 1990" → (user, born_on, "june 10, 1990")
+3. "Des was born on March 15" → (des, born_on, "march 15")
+4. "I'm 25, born on May 3rd" → (user, born_on, "may 3rd") AND (user, age, "25")
+5. "Our anniversary is June 20th" → (user, born_on, "june 20th")
+6. "We got married on August 12, 2015" → (user, born_on, "august 12, 2015")
+7. "born sometime in 1990" → (user, born_on, "1990") [low_confidence]
+8. "born around May" → (user, born_on, "may") [low_confidence]
+9. "Actually I was born June 3, not May 3" → (user, born_on, "june 3") [is_correction:true]
+10. "My birthday is the 15th" → (user, born_on, "15th")
+11. "Born in 1988" → (user, born_on, "1988")
+12. "We met on June 15, 2020" → (user, born_on, "june 15, 2020")
+13. "been together 5 years, anniversary June 20" → (user, born_on, "june 20")
+14. "My wife's birthday is April 2nd" → (spouse_entity, born_on, "april 2nd")
+15. "I was born in June" → (user, born_on, "june")
