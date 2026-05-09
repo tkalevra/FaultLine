@@ -173,3 +173,44 @@ Deepseek to fix definitively with full CLAUDE.md compliance audit.
 **Fix options:**
 1. Ingest: ensure `user` always maps to user_UUID, not display entity UUID
 2. Query: extend graph traversal to follow identity rels (also_known_as, pref_name, same_as) to find facts on linked entities
+
+---
+
+# deepseek — review.md complete
+
+Comprehensive ecosystem review: FaultLine vs. Mem0/vector-accumulation. Positions advantages (WGM validation, Class A/B/C lifecycle, PostgreSQL-as-truth) and gaps (no observability, no benchmarks, entity resolution ambiguity, no BM25 lexical search). 15 recommendations (immediate/short-term/medium-term/long-term). **Review identifies architectural strengths but doesn't address current memory injection failure.**
+
+---
+
+**dprompt-13 complete.** Three-part fix: metadata stripping (single block), debug redactions, nuclear UUID redaction. Regression (events merge out-of-block) fixed. main.py parses, 33/33 pass.
+
+**Live status AFTER redeploy:** UUID leak eliminated (good), BUT facts still not injecting. Spouse fact verified in DB (fact_id=62, rel_type=spouse, confidence=1.0) but `/query` not returning it.
+
+**Next:** dprompt-14 to validate /query baseline retrieval path. Fact exists in DB but lost somewhere in retrieval → relevance gate → stripping → return pipeline.
+
+---
+
+# deepseek — ddprompt-2 validation report
+
+## Live API results
+- Metadata stripping: ✅ no user_id field in any facts
+- UUID display: ⚠️ 2/26 facts have UUID objects (26371e21-..., 79f59173-...) — unnamed entities without display names
+- has_pet: stored as (mars → fraggle), not (user → fraggle) — ingest-side entity resolution issue
+- canonicaI_identity UUID still in response — Filter should handle this
+
+## Need to fix
+1. Add nuclear UUID redaction in Filter — strip all UUID patterns from all messages before returning to OpenWebUI
+2. Guard against canonical_identity UUID leaking through _build_memory_block
+3. has_pet ingest-side fix (separate issue)
+
+---
+
+# deepseek — dprompt-8 complete
+
+**33/33 filter tests pass (10 existing + 23 new):**
+- 8 conversation state tests (pronouns, pruning, isolation)
+- 10 relation resolver tests (seed + dynamic, fallback, domain-agnostic)
+- 5 display name tests (UUID→name, canonical→user, preservation)
+- 10 relevance tests (no regressions)
+
+**API-dependent tests (temporal ingest/query) require Docker — not run.**
