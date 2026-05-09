@@ -549,50 +549,59 @@ User says: "My wife's name is Marla" → "My wife prefers Mars"
 - Calls `get_preferred_name(user_id, UUID_marla)` → returns "mars"
 - Displays: "My spouse is mars" ✓
 
-## Scalar Fact Corrections (May 9, 2026)
+## Fact Corrections: Broad Lookup Strategy (May 9, 2026)
 
-Corrections to scalar facts (age, height, weight) now properly supersede old values.
+Corrections to any fact type now properly supersede old values by looking up based on the relationship type, not the new value. This works for scalars (age, location, birthday), relationship facts (works_for, educated_at, occupation), and any other fact type.
 
 ### The Problem
 
-When a user corrected a scalar fact (e.g., "Gabby is actually 12, not 8"), the system was looking for a fact with `object_id = "12"` (the NEW value), but the old fact had `object_id = "8"` (the OLD value). The lookup failed, and both facts remained in the database.
+Correction lookup was designed for identity facts (renaming entities). It searched for `object_id = NEW_VALUE`, which works when correcting "what someone is called" but fails for value corrections like "Gabby is actually 12, not 8" or "I live in Paris now, not Toronto" — the old fact has the old value, not the new one.
 
-### The Fix
+### The Solution: Two-Tier Lookup
 
-Scalar corrections now use a different lookup strategy (lines 1471-1478 in `/ingest`):
-
-**Before:**
+**Tier 1: Identity rels (also_known_as, pref_name, same_as)**
 ```python
-# Looked for fact with object = NEW_VALUE (wrong!)
-SELECT id FROM facts WHERE user_id = ? AND subject_id = ? 
+# Lookup by object = the NAME being corrected
+SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
   AND object_id = ? AND rel_type = ?
 ```
+Correct use case: "Actually, call me Mars, not Marla" → search for fact with `object_id='marla'`
 
-**After:**
+**Tier 2: All other rels (age, location, occupation, lives_at, born_on, etc.)**
 ```python
-# For scalars: lookup by subject + rel_type (ignores object value)
-if rel_type.lower() in _SCALAR_REL_TYPES:
-    SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
-      AND rel_type = ? ORDER BY id DESC LIMIT 1
-# For identity types: still lookup by object value (correct for name changes)
-else:
-    SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
-      AND object_id = ? AND rel_type = ?
+# Lookup by subject + rel_type = find most recent fact
+SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
+  AND rel_type = ? ORDER BY id DESC LIMIT 1
+```
+Correct use case: "I'm actually 10, not 8" → search for ANY age fact for this entity, find most recent, supersede it
+
+### Example Flows
+
+**Age Correction:**
+```
+User: "Gabby is 8"  → Fact: (gabby_uuid, "8", "age")
+User: "Actually 10" (correction) → Lookup: (gabby_uuid, "age") 
+                                 → Find & supersede old fact
+                                 → Create new fact: (gabby_uuid, "10", "age")
 ```
 
-This allows the correction behavior (supersede or hard_delete) to properly mark the old scalar fact as superseded when a correction is applied.
+**Location Correction:**
+```
+User: "I live in Toronto"  → Fact: (user_uuid, "Toronto", "lives_in")
+User: "Actually Paris now" (correction) → Lookup: (user_uuid, "lives_in")
+                                       → Find & supersede old fact
+                                       → Create new fact: (user_uuid, "Paris", "lives_in")
+```
 
-### Example Flow
+**Birthday Correction:**
+```
+User: "Born on May 3"  → Fact: (user_uuid, "may 3", "born_on")
+User: "Actually June 15" (correction) → Lookup: (user_uuid, "born_on")
+                                     → Find & supersede old fact
+                                     → Create new fact: (user_uuid, "june 15", "born_on")
+```
 
-User says: "Gabby is 8" → "Actually, Gabby is 10" (correction)
-
-1. **First ingest:** age fact stored as `(gabby_uuid, "8", "age")`
-2. **Second ingest (correction):**
-   - Entity_attributes updated: gabby.age = 10
-   - Correction lookup finds old fact by `(gabby_uuid, "age")` → finds ID of fact with "8"
-   - Correction behavior applied: old fact marked `superseded_at = now()`
-   - New fact created: `(gabby_uuid, "10", "age")`
-3. **Result:** Old fact still exists but marked superseded; current age is 10
+The principle: **Non-identity facts are value-based. A correction replaces the previous value for that entity + relationship type. Lookup by the relationship, not the new value.**
 
 ## Key Principles (Do Not Violate)
 
