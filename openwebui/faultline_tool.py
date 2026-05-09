@@ -1089,9 +1089,9 @@ class Filter:
                 subj = evt.get("subject", "")
                 obj = evt.get("object", evt.get("occurs_on", ""))
                 if recurrence == "yearly":
-                    lines.append(f"⭐ {subj}\'s {rel_type.replace("_", " ")}: {obj} (annually)")
+                    lines.append(f"⭐ {subj}'s {rel_type.replace('_', ' ')}: {obj} (annually)")
                 elif recurrence == "once":
-                    lines.append(f"📅 {subj} {rel_type.replace("_", " ")}: {obj}")
+                    lines.append(f"📅 {subj} {rel_type.replace('_', ' ')}: {obj}")
                 else:
                     lines.append(f"{rel_type}: {obj}")
 
