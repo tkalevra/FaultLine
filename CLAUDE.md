@@ -489,6 +489,66 @@ Memory injection: Fact ready for Filter to inject into conversation ✓
 
 **Status:** Entity normalization complete. System ready for beta testing. 🎉
 
+## Identity Rel_Type & Alias Registration (May 9, 2026)
+
+Identity rel_types (`pref_name`, `also_known_as`, `same_as`) define how entities are displayed. When processed:
+
+### Consistent Alias Registration Logic
+
+**When `pref_name` or `also_known_as` edges are ingested:**
+
+1. **Lines 953-959 in `/ingest`**: Calculate `is_pref` boolean
+   - `pref_name` edges: always `is_pref=True` (rel_type itself is the preference signal)
+   - `also_known_as` edges: `is_pref=True` only if `is_preferred_label=True`, `has_preferred=True`, or object in `preferred_objects` set
+   
+2. **Lines 987-992 in `/ingest`**: Call `registry.register_alias(canonical_subject, edge.object, is_preferred=is_pref)`
+   - For pref_name: registers the object as a **preferred alias** for the subject's canonical UUID
+   - Example: edge `(marla, pref_name, mars)` → registers "mars" as preferred alias for UUID(marla)
+
+3. **In `registry.register_alias()` (lines 117-131)**:
+   - If `is_preferred=True`: clears other preferred aliases for the entity (only one preferred per entity)
+   - Uses `ON CONFLICT (user_id, alias) DO UPDATE` to ensure is_preferred is always set correctly
+   - This handles stale data: if "mars" was registered with is_preferred=FALSE by an older process, it gets corrected to TRUE
+
+### Identity Rel_Type Semantics
+
+| Rel_Type | Semantics | Preferred? | Example |
+|---|---|---|---|
+| `pref_name` | Entity's preferred display name | Always preferred | (marla, pref_name, mars) → display as "mars" |
+| `also_known_as` | Alternate name/nickname | Only if explicitly marked preferred | (marla, also_known_as, mal) → display as "marla" unless marked preferred |
+| `same_as` | Identity synonym (Wikidata-style) | Not used for display | (marla, same_as, marlene) → identity equivalence, no preferred |
+
+### Display Name Resolution
+
+When `/query` returns facts or Filter injects memory:
+
+1. Fact object_id is a UUID (e.g., `54214459-...`)
+2. System calls `_resolve_display_names()` → `registry.get_preferred_name(user_id, uuid)`
+3. `get_preferred_name()` queries: `SELECT alias FROM entity_aliases WHERE entity_id=uuid AND is_preferred=true`
+4. Returns preferred alias (e.g., "mars") or falls back to UUID if none exists
+
+**Critical:** If an alias exists but `is_preferred=FALSE`, it's **invisible** to display resolution. This is why the fix ensures all aliases are registered with correct is_preferred values.
+
+### Spouse Facts Example
+
+User says: "My wife's name is Marla" → "My wife prefers Mars"
+
+**Ingest 1:**
+- Edge: `(user, spouse, marla)`
+- `marla` resolved to UUID via `registry.resolve()` → creates `entity_aliases(UUID_marla, marla, is_preferred=true)`
+- Fact stored: `(user_uuid, spouse, UUID_marla)`
+
+**Ingest 2:**
+- Edge: `(marla, pref_name, mars)`
+- `registry.register_alias(UUID_marla, "mars", is_preferred=true)`
+  - Clears: `entity_aliases(UUID_marla, marla, is_preferred=false)`
+  - Adds: `entity_aliases(UUID_marla, mars, is_preferred=true)`
+
+**Query:**
+- `/query` returns spouse fact: `(user_uuid, spouse, UUID_marla)`
+- Calls `get_preferred_name(user_id, UUID_marla)` → returns "mars"
+- Displays: "My spouse is mars" ✓
+
 ## Key Principles (Do Not Violate)
 
 - **LLM never has unsupervised write access** — all writes flow through the WGM validation gate
@@ -504,6 +564,7 @@ Memory injection: Fact ready for Filter to inject into conversation ✓
 - **No name-based entity pre-creation** — entities are created exclusively via `EntityRegistry.resolve()` which generates UUID v5 surrogates; the old pre-creation loop that inserted raw names as `id` has been removed
 - **Alias sync uses display names, not UUIDs** — `_canonical_to_display` dict maps canonical UUID → original display name; always resolve through this mapping when inserting into `entity_aliases`
 - **All entity_ids must be UUIDs or user_id** — `/ingest` validates that subject_id and object_id are either UUID v5 surrogates or the special user_id value; startup normalization converts any legacy string IDs; string entity_ids break graph traversal
+- **Alias registration must use ON CONFLICT DO UPDATE** — `EntityRegistry.resolve()` and normalization use `INSERT ... ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred` to ensure stale aliases (with is_preferred=FALSE from older processes) are corrected when newer code encounters them. This ensures spouse and other identity relationships resolve to display names via `get_preferred_name()`, which requires is_preferred=TRUE.
 
 ## Do Not Develop Here
 
