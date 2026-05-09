@@ -102,6 +102,9 @@ class EntityRegistry:
         canonical is a UUID string (already lowercase).
         alias is a display name.
         If is_preferred=True, clears other preferred aliases for this entity.
+
+        User-authoritative: if the alias already exists pointing to a corrupted
+        (string) entity_id, delete it first so the correct UUID registration wins.
         """
         canonical = canonical.strip()
         alias = alias.lower().strip()
@@ -112,6 +115,15 @@ class EntityRegistry:
                 "INSERT INTO entities (id, user_id, entity_type) "
                 "VALUES (%s, %s, 'unknown') ON CONFLICT (id, user_id) DO NOTHING",
                 (canonical, user_id),
+            )
+
+            # Clean up corrupted entries: if this alias exists pointing to a non-UUID entity_id,
+            # delete it. User-stated facts are authoritative and should overwrite corrupted data.
+            cur.execute(
+                "DELETE FROM entity_aliases "
+                "WHERE user_id = %s AND alias = %s "
+                "AND entity_id NOT LIKE '%-%-%-%-' AND entity_id != %s",
+                (user_id, alias, canonical),
             )
 
             if is_preferred:
