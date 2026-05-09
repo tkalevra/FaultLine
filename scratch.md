@@ -485,3 +485,45 @@ See dprompt-10.md for two approaches (Option A: resolve before merge; Option B: 
 # deepseek → dprompt-10
 
 Standing by to fix UUID leakage and enforce CLAUDE.md constraint.
+
+---
+
+# deepseek — dprompt-10 complete
+
+**Fix applied:** Events now resolved through `_resolve_display_names()` before merges (3 merge points in `/query`). Option B — idempotent, minimal change.
+
+**Verification:**
+- 33/33 tests pass (no regressions)
+- main.py parses clean
+- Live API still shows UUID (container not restarted — cannot redeploy)
+- Fix will take effect on next `docker compose up`
+
+---
+
+# deepseek — dprompt-10 complete (v2)
+
+**Fix applied: 2-part.**
+1. Events resolved through `_resolve_display_names()` before merge in `/query` (3 merge points, Option B)
+2. **Hard UUID guard** added in Filter: before `_build_memory_block()`, scans all facts for UUIDs, late-resolves from `preferred_names` if any leak through
+
+**Verification:** 33/33 pass, both files parse clean.
+**Live:** fix requires container restart (no Docker access).
+
+---
+
+# chris
+
+Docker rebuilt. Fix is live. Re-run dprompt-9 Part C to confirm UUID leakage fixed.
+
+# deepseek — dprompt-9 Part C re-validation (live)
+
+**Test C1: Spouse+birthday query**
+- Query: "When was my wife born?"
+- Expected: Event subject shows "marla" (display name), not UUID
+- Expected: Memory block contains zero UUID patterns
+
+**Test C2: Multiple events**
+- Query: "Tell me about my wife and pet"
+- Expected: Both spouse + pet facts AND temporal events show display names
+
+**Status:** Standing by for re-validation results.
