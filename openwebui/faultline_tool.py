@@ -890,19 +890,15 @@ class Filter:
                     if attr_parts:
                         lines.append(f"physical: {', '.join(attr_parts)}")
 
-                # Display attributes for non-user entities that appear in facts
+                # Display attributes for non-user entities (iterate over entity_attributes which is keyed by UUID)
                 seen_entities = set()
-                for f in facts:
-                    entity_id = f.get("subject")
+                for entity_id, attrs in entity_attributes.items():
                     if not entity_id or entity_id in ("user", identity) or entity_id in seen_entities:
                         continue
-                    if entity_id not in entity_attributes:
+                    if not attrs:
                         continue
 
                     seen_entities.add(entity_id)
-                    attrs = entity_attributes[entity_id]
-                    if not attrs:
-                        continue
 
                     # Get display name from mapping (UUID → preferred name)
                     display_name = uuid_to_display.get(entity_id, entity_id.title())
@@ -1268,15 +1264,19 @@ class Filter:
                     }
 
                     filtered_attributes = {}
-                    for attr, value in entity_attributes.items():
-                        synthetic_fact = {
-                            "rel_type": attr,
-                            "category": _ATTR_CATEGORY_MAP.get(attr, "identity"),
-                            "confidence": 1.0,
-                        }
-                        score = self.calculate_relevance_score(synthetic_fact, text)
-                        if score >= 0.4:
-                            filtered_attributes[attr] = value
+                    for entity_id, attrs in entity_attributes.items():
+                        filtered_attrs = {}
+                        for attr, value in attrs.items():
+                            synthetic_fact = {
+                                "rel_type": attr,
+                                "category": _ATTR_CATEGORY_MAP.get(attr, "identity"),
+                                "confidence": 1.0,
+                            }
+                            score = self.calculate_relevance_score(synthetic_fact, text)
+                            if score >= 0.4:
+                                filtered_attrs[attr] = value
+                        if filtered_attrs:
+                            filtered_attributes[entity_id] = filtered_attrs
 
                     entity_attributes = filtered_attributes
 

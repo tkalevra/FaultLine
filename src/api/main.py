@@ -1326,12 +1326,34 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 validated_rows = []
                 for row in rows:
                     user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row
-                    # Subject can be: (1) user_id (special case), (2) UUID v5 surrogate
+
+                    # If subject is a string (not UUID), try to resolve it
+                    if subject and not _UUID_PATTERN.match(subject) and subject != user_id:
+                        try:
+                            subject = registry.resolve(user_id, subject)
+                            log.info("ingest.subject_resolved_during_validation",
+                                   original=row[1], resolved=subject, rel_type=rel_type)
+                        except Exception as _e:
+                            log.error("ingest.subject_resolution_failed_validation",
+                                    original=row[1], error=str(_e), rel_type=rel_type)
+                            continue
+
+                    # If object is a string (not UUID), try to resolve it
+                    if obj and not _UUID_PATTERN.match(obj) and obj != user_id:
+                        try:
+                            obj = registry.resolve(user_id, obj)
+                            log.info("ingest.object_resolved_during_validation",
+                                   original=row[2], resolved=obj, rel_type=rel_type)
+                        except Exception as _e:
+                            log.error("ingest.object_resolution_failed_validation",
+                                    original=row[2], error=str(_e), rel_type=rel_type)
+                            continue
+
+                    # Now validate that subject and object are UUIDs or user_id
                     is_valid_subject = (
                         subject == user_id or
                         _UUID_PATTERN.match(subject)
                     )
-                    # Object must be: (1) user_id (for pref_name/also_known_as), (2) UUID v5 surrogate
                     is_valid_object = (
                         obj == user_id or
                         _UUID_PATTERN.match(obj)
@@ -1347,7 +1369,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                   obj=obj, rel_type=rel_type, user_id=user_id,
                                   reason="object_id must be UUID or user_id")
                         continue  # Skip this fact
-                    validated_rows.append(row)
+
+                    # Update row with resolved subject/object if they changed
+                    updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated)
+                    validated_rows.append(updated_row)
 
                 rows = validated_rows
 
@@ -2136,7 +2161,11 @@ def query(request: QueryRequest):
             _attr_db.close()
         except Exception:
             pass
-        merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+        attr_facts = _attributes_to_facts(attributes)
+        log.info("query.embed_fail_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
+        resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
+        merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+        log.info("query.embed_fail_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
         # Populate preferred_names with all entities in merged facts
         if registry:
             for f in merged_facts:
@@ -2169,7 +2198,11 @@ def query(request: QueryRequest):
                 _attr_db.close()
             except Exception:
                 pass
-            merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+            attr_facts = _attributes_to_facts(attributes)
+            log.info("query.404_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
+            resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
+            merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+            log.info("query.404_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
                 for f in merged_facts:
@@ -2195,7 +2228,11 @@ def query(request: QueryRequest):
                 _attr_db.close()
             except Exception:
                 pass
-            merged_facts = resolved_direct + resolved_baseline + _attributes_to_facts(attributes)
+            attr_facts = _attributes_to_facts(attributes)
+            log.info("query.error_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
+            resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
+            merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
+            log.info("query.error_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
             # Populate preferred_names with all entities in merged facts
             if registry:
                 for f in merged_facts:
@@ -2254,26 +2291,34 @@ def query(request: QueryRequest):
                 merged_facts.append(f)
                 pg_keys.add(key)
 
+        # Extract entity IDs from PRE-RESOLUTION facts to get UUIDs, not display names
+        pre_resolution_fact_ids = {user_entity_id_for_query} | resolved_entity_ids
+        for f in direct_facts + baseline_facts + qdrant_facts:
+            if _UUID_PATTERN.match(f.get("subject", "")):
+                pre_resolution_fact_ids.add(f["subject"])
+            if _UUID_PATTERN.match(f.get("object", "")):
+                pre_resolution_fact_ids.add(f["object"])
+
         try:
             _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _entity_ids = list(
-                {user_entity_id_for_query} |
-                {f["subject"] for f in merged_facts} |
-                {f["object"] for f in merged_facts} |
-                resolved_entity_ids  # Include entities resolved in entity_resolution block
-            )
-            attributes = _fetch_attributes(_attr_db, user_id, _entity_ids, max_sensitivity="private")
+            attributes = _fetch_attributes(_attr_db, user_id, list(pre_resolution_fact_ids), max_sensitivity="private")
             _attr_db.close()
         except Exception as _ae:
             log.warning("query.qdrant_attributes_failed", error=str(_ae))
             attributes = {}
 
         # Merge user entity_attributes as facts (born_on, age, height, etc.)
-        for f in _attributes_to_facts(attributes):
+        attr_facts = _attributes_to_facts(attributes)
+        log.info("query.attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
+        resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
+        attr_added = 0
+        for f in resolved_attr_facts:
             key = (f["subject"], f["object"], f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)
                 pg_keys.add(key)
+                attr_added += 1
+        log.info("query.attributes_merged", added=attr_added, total_after=len(merged_facts))
 
         # Populate preferred_names only with entities that were registered as
         # UUID surrogates (real people/places), not fact-value strings like
