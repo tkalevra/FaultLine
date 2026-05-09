@@ -603,6 +603,30 @@ User: "Actually June 15" (correction) → Lookup: (user_uuid, "born_on")
 
 The principle: **Non-identity facts are value-based. A correction replaces the previous value for that entity + relationship type. Lookup by the relationship, not the new value.**
 
+### Storage: Scalar Facts in entity_attributes Only
+
+Scalar facts (age, height, weight, born_on, etc.) are stored ONLY in the `entity_attributes` table, not in `facts`. This table has built-in ON CONFLICT DO UPDATE logic (line 1078-1085) that automatically handles both inserts and corrections:
+
+```sql
+ON CONFLICT (user_id, entity_id, attribute)
+DO UPDATE SET
+  value_text = EXCLUDED.value_text,
+  value_int = EXCLUDED.value_int,
+  value_float = EXCLUDED.value_float,
+  ...
+```
+
+**Why this matters:**
+- Initial fact: `INSERT INTO entity_attributes (user, gabby, age, value_int=10)`
+- Correction: `INSERT INTO entity_attributes (user, gabby, age, value_int=12)` → conflict on (user, gabby, age) → UPDATE value_int to 12
+- No validation rejection: scalar values like "12" never enter facts table (which validates UUIDs only)
+- Corrections persist across chats: /query retrieves current value from entity_attributes
+
+**Related code:**
+- Lines 1006-1096 in `/ingest`: scalar facts routed to entity_attributes, not facts
+- `/query` retrieves scalars via `_fetch_entity_attributes()` (lines 1632-1700)
+- Correction logic applies only to relationship facts (facts table), not scalars (handled by ON CONFLICT)
+
 ## Key Principles (Do Not Violate)
 
 - **LLM never has unsupervised write access** — all writes flow through the WGM validation gate
