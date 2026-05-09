@@ -35,7 +35,8 @@
       "Bash(pytest tests/test_pipeline.py::test_validate_and_commit -v)",
       "Bash(pytest tests/api/test_ingest.py::test_ingest_with_valid_edge -v)",
       "Bash(pytest tests/api/test_ingest.py::test_correction_hard_delete_migrates_facts -v)",
-      "Bash(pytest tests/api/test_ingest.py::test_health -v)"
+      "Bash(pytest tests/api/test_ingest.py::test_health -v)",
+      "Bash(python3 *)"
     ]
   }
 }

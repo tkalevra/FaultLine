@@ -1533,6 +1533,19 @@ class Filter:
                     # Resolve any remaining UUIDs to display names before building memory
                     facts = _resolve_display_names(facts, preferred_names, canonical_identity)
 
+                    # HARD GUARD: validate no UUIDs leaked into resolved facts
+                    # CLAUDE.md constraint: "display names must never be UUIDs in user-facing output"
+                    # # NO RECURSIVE MATCHING — _UUID_RE is a static compile-once pattern
+                    for _f in facts:
+                        for _field in ("subject", "object"):
+                            _val = _f.get(_field, "")
+                            if _val and _UUID_RE.match(str(_val)):
+                                _display = preferred_names.get(_val, _val)
+                                if _display != _val:
+                                    _f[_field] = _display
+                                    if self.valves.ENABLE_DEBUG:
+                                        print(f"[FaultLine Filter] uuid_guard: late-resolved {_field}={_val[:12]}→{_display}")
+
                     # Update conversation context for next turn
                     _update_conversation_context(user_id, facts, preferred_names)
 

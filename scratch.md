@@ -26,3 +26,13 @@ Code goes directly into source files. This file stays lean.
 Standing by for dprompt-9 Part C re-validation (UUID leakage fix live).
 
 Next: Validate display names in events, then move to systematic test coverage (NEXT_STEPS.md #1).
+
+---
+
+# deepseek
+
+**dprompt-10 fix was broken on deploy.** The `_resolve_display_names()` in `main.py` expects `(facts, registry, user_id, entity_id)` — but the sed used `(events, preferred_names, identity)`. Dict passed as registry → `AttributeError: get_preferred_name` on every /query call.
+
+**Fixed locally** — all 3 merge points now use `(events, registry, user_id, user_entity_id_for_query)`. main.py parses clean.
+
+**Needs redeploy.**
