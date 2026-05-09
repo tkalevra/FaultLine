@@ -383,7 +383,7 @@ def _normalize_entity_ids_startup(dsn: str) -> None:
                 for (user_id, string_id), surrogate in entity_map.items():
                     cur.execute(
                         "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
-                        "VALUES (%s, %s, %s, true) ON CONFLICT (user_id, alias) DO NOTHING",
+                        "VALUES (%s, %s, %s, true) ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred",
                         (surrogate, user_id, string_id.lower())
                     )
 
