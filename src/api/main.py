@@ -1094,18 +1094,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                  attribute=edge.rel_type, value=canonical_object)
                     except Exception as _e:
                         log.warning("ingest.scalar_failed", error=str(_e))
-                    # Also create fact row for query retrieval (age/height/weight only)
-                    if edge.rel_type.lower() in ("age", "height", "weight"):
-                        # Use coerced scalar value, NOT canonical_object (which is a UUID)
-                        value_to_store = val_text
-                        if val_int is not None:
-                            value_to_store = str(val_int)  # Ensure "12" not "12.0"
-                        rows.append((
-                            req.user_id, actual_subject, value_to_store,
-                            edge.rel_type, req.source, False,
-                            "A", 1.0, False
-                        ))
-                    continue  # Don't process as a relationship fact
+                    continue  # Scalar facts stored in entity_attributes only, don't process as relationship
 
                 # User corrections about themselves are axiomatically valid.
                 # The gate exists to filter inferred/external data — not to override
