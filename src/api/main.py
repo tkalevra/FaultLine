@@ -966,12 +966,29 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Capture raw scalar value before entity resolution
                 _raw_object = edge.object
 
+                # Rel_types that ALWAYS have scalar (string) objects, never UUID references
+                _SCALAR_OBJECT_RELS = {
+                    'pref_name', 'also_known_as',  # identity: display names (strings)
+                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
+                    'occupation', 'nationality',  # descriptive: single-word or phrase
+                }
+
                 # Resolve all entity names to canonical form via registry
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
-                canonical_object = registry.resolve(req.user_id, edge.object)
+
+                # For scalar rel_types, object is a string value (not an entity reference)
+                # Skip resolution and keep the raw string value
+                if edge.rel_type.lower() in _SCALAR_OBJECT_RELS:
+                    canonical_object = edge.object.lower().strip()
+                else:
+                    # For relationship rel_types, resolve object to UUID
+                    canonical_object = registry.resolve(req.user_id, edge.object)
+
                 # Record display name mapping for alias sync (Bug #3 fix)
-                _canonical_to_display[canonical_object] = edge.object.lower()
+                # Only record for relationship facts where canonical_object is a UUID
+                if edge.rel_type.lower() not in _SCALAR_OBJECT_RELS:
+                    _canonical_to_display[canonical_object] = edge.object.lower()
 
                 # Persist entity types to entities table if provided (only if currently unknown)
                 if edge.subject_type and canonical_subject != user_entity_id:
@@ -987,7 +1004,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.subject_type_update_failed",
                                     entity_id=canonical_subject, entity_type=edge.subject_type, error=str(_e))
 
-                if edge.object_type and canonical_object not in (user_entity_id, canonical_subject):
+                # Only update entity types for relationship facts (not scalar values)
+                if edge.object_type and edge.rel_type.lower() not in _SCALAR_OBJECT_RELS and canonical_object not in (user_entity_id, canonical_subject):
                     try:
                         with db.cursor() as _cur:
                             _cur.execute(
