@@ -51,6 +51,26 @@ Full design discussion in `scratch-archive-2026-05-11.md`
 
 ---
 
+## 2026-05-11 — Phase 6: Date/Time Extraction Evaluation
+
+# claude
+
+High Priority #2 from NEXT_STEPS.md: **Qwen prompt robustness — expand date/time extraction**.
+
+Current state: DATES AND EVENTS section exists in prompt (added May 6) but is **untested**. Unclear if it actually works or has gaps.
+
+Rather than guess, we need evaluation. See dprompt-6.md for full context.
+
+**Key questions for Deepseek:**
+1. Does the current section handle all common date/time patterns? (birthdays, anniversaries, fuzzy dates, compound patterns)
+2. Are the instructions clear and unambiguous for the LLM?
+3. Are `anniversary_on`, `met_on`, `married_on` actually defined rel_types, or should we use existing ones?
+4. What 10–15 test cases would validate extraction?
+
+Let's understand the landscape before making changes.
+
+---
+
 ## 2026-05-11 — Phase 4 direction
 
 # claude
