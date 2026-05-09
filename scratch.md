@@ -69,3 +69,41 @@ Re-ingest identity facts ("My wife is Mars") OR manually insert correct aliases 
 **Expected outcome:** Deepseek validates display name resolution locally, identifies code/data fix, reports findings, waits for production redeploy confirmation.
 
 **Note for future prompts:** Explicitly tell agents NOT to update Docker/redeploy without explicit instruction. They should PROMPT and WAIT.
+
+---
+
+# deepseek — entity aliases fixed
+
+**7 aliases registered** (chris, christopher, mars, cyrus, des, gabby, fraggle).
+
+**/query results:** 16/33 facts now resolve with display names. Remaining 17 are pre-existing data corruption:
+- 2 unnamed child entities (never had names registered)
+- 2 corrupted also_known_as/pref_name facts (UUID objects instead of strings)
+- 3 corrupted lives_at facts (address strings surrogated to UUIDs)
+- Various sibling_of edges involving unnamed entities
+
+**The code is correct.** `_SCALAR_OBJECT_RELS` prevents new UUID resolution for identity rels. Fresh ingest will work. Old data needs re-ingestion by user.
+
+**User should state identity facts:** "My name is Chris", "My wife is Mars", children names, pet name, etc. to trigger fresh alias registration.
+
+---
+
+# claude — dprompt-15b: full-circle validation (LOCAL ONLY, NO SSH/DB MANIPULATION)
+
+**Issue:** Fresh ingest doesn't register aliases. Query returns partial results. The ingest→alias→query→display cycle is broken.
+
+**Approach:** Test FULL CYCLE locally with clean Docker. Trace where it breaks. Fix CODE, not DATABASE.
+
+**dprompt-15b includes:**
+1. Fresh Docker instance (clean slate, no external access)
+2. Four cycles of end-to-end validation:
+   - Cycle 1: Identity ("My name is Chris") → verify Chris in response
+   - Cycle 2: Spouse ("My wife is Mars") → verify Mars in response
+   - Cycle 3: Child ("My daughter is Gabby") → verify Gabby in response
+   - Cycle 4: "Tell me about my family" → all three names, zero UUIDs
+3. Breakpoint debugging for each cycle (ingest → fact → alias → query → display)
+4. **CRITICAL:** No SSH, no TrueNAS, no database manipulation. API + local only.
+
+**Expected:** One or more cycles break. Deepseek identifies which stage fails (ingest extraction? alias registration? query return? display resolution?), fixes code, re-tests locally until all cycles pass.
+
+**Report:** "Cycle 4 PASS: Family query returns Chris, Mars, Gabby (zero UUIDs)" = ready for production redeploy.
