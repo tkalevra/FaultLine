@@ -2357,6 +2357,12 @@ def query(request: QueryRequest):
                     preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
                 if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                     preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
+        # Strip internal metadata before returning to Filter
+        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
+        for _f in merged_facts:
+            for _k in _INTERNAL_KEYS:
+                _f.pop(_k, None)
+
         return {
             "status": "ok",
             "facts": merged_facts,
@@ -2398,7 +2404,13 @@ def query(request: QueryRequest):
                         preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
-            return {
+            # Strip internal metadata before returning to Filter
+        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
+        for _f in merged_facts:
+            for _k in _INTERNAL_KEYS:
+                _f.pop(_k, None)
+
+        return {
                 "status": "ok",
                 "facts": merged_facts,
                 "preferred_names": preferred_names,
@@ -2432,7 +2444,13 @@ def query(request: QueryRequest):
                         preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
-            return {
+            # Strip internal metadata before returning to Filter
+        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
+        for _f in merged_facts:
+            for _k in _INTERNAL_KEYS:
+                _f.pop(_k, None)
+
+        return {
                 "status": "ok",
                 "facts": merged_facts,
                 "preferred_names": preferred_names,
@@ -2545,6 +2563,18 @@ def query(request: QueryRequest):
                         preferred_names[obj] = registry.get_preferred_name(user_id, obj) or obj.title()
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
+
+        # Strip internal metadata before returning to Filter
+        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
+        for _f in merged_facts:
+            for _k in _INTERNAL_KEYS:
+                _f.pop(_k, None)
+
+        # Strip internal metadata before returning to Filter
+        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
+        for _f in merged_facts:
+            for _k in _INTERNAL_KEYS:
+                _f.pop(_k, None)
 
         return {
             "status": "ok",

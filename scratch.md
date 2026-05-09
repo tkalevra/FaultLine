@@ -69,3 +69,15 @@ Code goes directly into source files. This file stays lean.
 3. Manual OpenWebUI validation: date-based queries
 4. Test coverage expansion: temporal events, conversation state
 5. Conversation state → calculate_relevance_score() (Phase 8)
+
+---
+
+# deepseek
+
+**dprompt-11 applied.** Three-layer fix:
+
+1. **metadata stripping** — `_INTERNAL_KEYS` (user_id, qdrant_synced, superseded_at, fact_class, promoted_at, confirmed_count) stripped from merged_facts before /query returns
+2. **debug redactions** — user_id replaced with `[redacted]` in all Filter debug prints (3 occurrences)
+3. **canonical_identity redacted** — identity={canonical_identity} → identity=[redacted] in debug output
+
+main.py parses clean. 33/33 tests pass. **Needs redeploy** before live validation of "tell me about my family" for zero UUID leakage.

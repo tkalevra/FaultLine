@@ -662,7 +662,7 @@ class Filter:
                 if data.get("status") not in ("error", None):
                     _SESSION_MEMORY_CACHE.pop(user_id, None)
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] cache busted for user_id={user_id}")
+                        print(f"[FaultLine Filter] cache busted for user_id=[redacted]")
                 return data
         except httpx.ConnectError as e:
             if self.valves.ENABLE_DEBUG:
@@ -1233,7 +1233,7 @@ class Filter:
                 return body
 
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] user_id={user_id} text='{text[:80]}'")
+                print(f"[FaultLine Filter] user_id=[redacted] text='{text[:80]}'")
 
             # Resolve LLM config once for all extraction operations
             llm_model, llm_url = _resolve_llm_config(self.valves, body)
@@ -1308,7 +1308,7 @@ class Filter:
                             preferred_names=preferred_names, query=text, is_realtime=_is_realtime
                         )
                         if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] /query cache hit user_id={user_id}")
+                            print(f"[FaultLine Filter] /query cache hit user_id=[redacted]")
                     else:
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
@@ -1355,7 +1355,7 @@ class Filter:
                             )
 
                             if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] facts={len(facts)} preferred_names={preferred_names} identity={canonical_identity}")
+                                print(f"[FaultLine Filter] facts={len(facts)} preferred_names={preferred_names} identity=[redacted]")
                                 for f in facts:
                                     print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
 
