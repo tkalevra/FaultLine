@@ -46,10 +46,8 @@ _IDENTITY_STOPWORDS = {
     "excited", "sorry", "glad", "grateful", "proud", "tired", "done",
 }
 
-_SCALAR_REL_TYPES = {
-    "age", "born_on", "born_in", "nationality",
-    "occupation", "has_gender", "height", "weight",
-}
+# _SCALAR_REL_TYPES removed — replaced by classify_fact_type() which uses
+# value-driven heuristics + DB-driven ontology hints (rel_types.tail_types).
 
 _UUID_PATTERN = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -662,6 +660,138 @@ def _infer_type_from_relationship(rel_type: str, entity_position: str) -> Option
     return None
 
 
+def classify_fact_type(
+    rel_type: str,
+    object_value: str,
+    registry,  # EntityRegistry instance
+    user_id: str,
+) -> dict:
+    """
+    Dynamically classify whether a fact's object is a scalar value or an entity
+    reference. Replaces the hardcoded _SCALAR_REL_TYPES set.
+
+    Layered heuristics, evaluated in order, first match wins:
+
+        L0  same_as rel_type                   → relationship (semantic constant)
+        L1  Integer / float / % / IP / currency / measurement / height  → scalar
+        L2  ISO date / slash date / year / month+day                    → scalar
+        L3  UUID pattern                                                → relationship
+        L4  entity_aliases lookup (known name)                           → relationship
+        L5  Email / URL / phone / long text / value-indicator / capital  → mixed
+        L6  rel_types.tail_types from DB ontology                        → mixed
+        L7  Fallback                                                    → uncertain
+
+    Returns:
+        {"type": "scalar" | "relationship" | "uncertain",
+         "confidence": float (0.0–1.0),
+         "reason": str}
+    """
+    import re
+
+    stripped = object_value.strip()
+    if not stripped:
+        return {"type": "uncertain", "confidence": 0.0, "reason": "empty value"}
+
+    stripped_lower = stripped.lower()
+    rt_lower = rel_type.lower()
+
+    # L0 — Semantic constant: same_as is owl:sameAs (entity identity, both UUIDs)
+    if rt_lower == "same_as":
+        return {"type": "relationship", "confidence": 1.0,
+                "reason": "same_as is definitionally entity→entity"}
+
+    # L1 — Numeric / technical patterns  (confidence ≥ 0.95)
+    if re.match(r'^-?\d+$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "integer pattern"}
+    if re.match(r'^-?\d+\.\d+$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "float pattern"}
+    if re.match(r'^-?\d+(\.\d+)?%$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "percentage pattern"}
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "IPv4 address pattern"}
+    if re.match(r'^[\$\£\€\¥]\d{1,3}(,\d{3})*(\.\d{2})?$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "currency pattern"}
+    if re.match(r'^\d+(\.\d+)?\s*(cm|kg|lbs?|pounds?|ft|feet|inch(?:es)?|'
+                r'miles?|km|mph?|kph?|meters?|metres?|grams?|ounces?|oz)$',
+                stripped_lower):
+        return {"type": "scalar", "confidence": 0.95, "reason": "measurement with unit"}
+    if re.match(r"^\d+\s*['\"]?\s*\d*\s*[\"]?\s*$", stripped):
+        return {"type": "scalar", "confidence": 0.95, "reason": "height measurement (ft/in)"}
+
+    # L2 — Date / time patterns  (confidence ≥ 0.85)
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', stripped):
+        return {"type": "scalar", "confidence": 0.95, "reason": "ISO date (YYYY-MM-DD)"}
+    if re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?', stripped):
+        return {"type": "scalar", "confidence": 0.95, "reason": "ISO datetime pattern"}
+    if re.match(r'^\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}$', stripped):
+        return {"type": "scalar", "confidence": 0.90, "reason": "slash-date pattern"}
+    if re.match(r'^(19|20)\d{2}$', stripped):
+        return {"type": "scalar", "confidence": 0.85, "reason": "year-only pattern"}
+    _MONTH_RE = (r'(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|'
+                 r'may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|'
+                 r'oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)')
+    if re.match(rf'^{_MONTH_RE}\s+\d{{1,2}}(?:st|nd|rd|th)?$', stripped_lower):
+        return {"type": "scalar", "confidence": 0.90, "reason": "month-name + day pattern"}
+
+    # L3 — UUID pattern  (definitive relationship)
+    if _UUID_PATTERN.match(stripped):
+        return {"type": "relationship", "confidence": 0.98, "reason": "UUID pattern"}
+
+    # L4 — Entity alias lookup  (DB: entity_aliases)
+    try:
+        with registry.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM entity_aliases WHERE user_id = %s AND alias = %s LIMIT 1",
+                (user_id, stripped_lower),
+            )
+            if cur.fetchone():
+                return {"type": "relationship", "confidence": 0.90, "reason": "known entity alias"}
+    except Exception:
+        pass
+
+    # L5 — String-pattern heuristics
+    word_count = len(stripped.split())
+    if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', stripped):
+        return {"type": "scalar", "confidence": 0.98, "reason": "email pattern"}
+    if stripped_lower.startswith(('http://', 'https://', 'www.', 'ftp://')):
+        return {"type": "scalar", "confidence": 0.98, "reason": "URL pattern"}
+    if re.match(r'^\+?[\d\s\-\(\)\.]{7,}$', stripped):
+        return {"type": "scalar", "confidence": 0.90, "reason": "phone-number pattern"}
+    if word_count >= 5:
+        return {"type": "scalar", "confidence": 0.80, "reason": f"descriptive string ({word_count} words)"}
+    _VALUE_INDICATORS = frozenset({
+        "street", "road", "avenue", "lane", "drive", "boulevard",
+        "court", "place", "highway", "circle", "square",
+        "engineer", "doctor", "teacher", "student", "manager",
+        "director", "president", "ceo", "cto", "cfo",
+        "professor", "nurse", "lawyer", "artist", "writer",
+        "consultant", "analyst", "developer", "designer", "scientist",
+    })
+    if any(word in stripped_lower for word in _VALUE_INDICATORS):
+        return {"type": "scalar", "confidence": 0.75, "reason": "value-indicator term detected"}
+    if word_count == 1 and stripped[0].isupper():
+        return {"type": "relationship", "confidence": 0.70, "reason": "single capitalized word (probable name)"}
+
+    # L6 — DB-driven rel-type ontology hints  (tail_types from rel_types)
+    if _rel_type_registry is not None:
+        try:
+            rt_meta = _rel_type_registry.get(rt_lower, {})
+            tail_types = rt_meta.get("tail_types")
+            if tail_types == ["SCALAR"]:
+                return {"type": "scalar", "confidence": 0.90, "reason": "rel_type ontology: tail_types=SCALAR"}
+            if (tail_types and tail_types != ["ANY"]
+                    and "ANY" not in tail_types
+                    and "SCALAR" not in tail_types):
+                return {"type": "relationship", "confidence": 0.85,
+                        "reason": f"rel_type ontology: tail_types={tail_types}"}
+        except Exception:
+            pass
+
+    # L7 — Fallback
+    return {"type": "uncertain", "confidence": 0.50,
+            "reason": "ambiguous — no pattern or ontology hint matched"}
+
+
 def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
                       rel_type: str, new_fact_id: int, correction_behavior: str) -> int:
     if correction_behavior == "hard_delete":
@@ -1002,8 +1132,22 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if fact_subject == canonical_object:
                     continue
 
-                # Route scalar rel_types to entity_attributes instead of facts
-                if edge.rel_type.lower() in _SCALAR_REL_TYPES:
+                # Dynamically classify scalar vs relationship (replaces hardcoded _SCALAR_REL_TYPES)
+                classification = classify_fact_type(
+                    edge.rel_type.lower(), _raw_object.lower().strip(), registry, req.user_id)
+
+                # Three-tier confidence logging (never reject, WGM gate enforces downstream)
+                conf = classification.get("confidence", 0.5)
+                if 0.60 <= conf < 0.80:
+                    log.info("ingest.classifier_low_confidence",
+                             rel_type=edge.rel_type.lower(), object=_raw_object,
+                             type=classification["type"], confidence=conf, reason=classification["reason"])
+                elif conf < 0.60:
+                    log.warning("ingest.classifier_uncertain",
+                                rel_type=edge.rel_type.lower(), object=_raw_object,
+                                type=classification["type"], confidence=conf, reason=classification["reason"])
+
+                if classification["type"] == "scalar":
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
                     # Only store if value is meaningful (reject non-numeric age etc.)
                     if edge.rel_type.lower() == "age" and val_int is None:
