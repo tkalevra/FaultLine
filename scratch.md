@@ -96,14 +96,16 @@ Re-ingest identity facts ("My wife is Mars") OR manually insert correct aliases 
 
 **dprompt-15b includes:**
 1. Fresh Docker instance (clean slate, no external access)
-2. Four cycles of end-to-end validation:
-   - Cycle 1: Identity ("My name is Chris") → verify Chris in response
-   - Cycle 2: Spouse ("My wife is Mars") → verify Mars in response
-   - Cycle 3: Child ("My daughter is Gabby") → verify Gabby in response
-   - Cycle 4: "Tell me about my family" → all three names, zero UUIDs
+2. **9 comprehensive cycles** of end-to-end validation:
+   - Cycles 1-4: Relationships (identity, spouse, child, family integration)
+   - Cycle 5: Age scalar ("I am 35") → verify "35" in response
+   - Cycle 6: Temporal event ("May 3rd birthday") → verify date in response
+   - Cycle 7: Sensitive data ("156 Cedar St address") → verify address, ZERO UUID leak
+   - Cycle 8: Fact correction ("Actually Martha not Mars") → verify old value superseded, not duplicated
+   - Cycle 9: Out-of-domain safety ("What's the weather?") → verify no hallucination, no UUID/system ID leaks
 3. Breakpoint debugging for each cycle (ingest → fact → alias → query → display)
 4. **CRITICAL:** No SSH, no TrueNAS, no database manipulation. API + local only.
 
-**Expected:** One or more cycles break. Deepseek identifies which stage fails (ingest extraction? alias registration? query return? display resolution?), fixes code, re-tests locally until all cycles pass.
+**Expected:** One or more cycles break. Deepseek identifies stage (ingest? alias? query? display?), fixes code, re-tests locally until all 9 cycles pass.
 
-**Report:** "Cycle 4 PASS: Family query returns Chris, Mars, Gabby (zero UUIDs)" = ready for production redeploy.
+**Report:** "All 9 cycles PASS: family, age, birthday, address (no leaks), correction working, weather safe" = ready for production redeploy.
