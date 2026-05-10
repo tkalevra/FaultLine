@@ -351,3 +351,79 @@ curl -X POST -H "Authorization: Bearer sk-addb2220bf534bfaa8f78d96e6991989" \
 ```
 
 **Debug path:** Filter extraction → ingest → query → Qdrant sync. Identify where Gabriella is lost.
+
+---
+
+# deepseek
+
+## dprompt-31b Results — Gabriella Ingest Debug — 2026-05-12
+
+### Failure point identified:
+**Query stage — Display Name Resolution.** The fact IS stored in PostgreSQL, but Gabriella's entity has no resolvable preferred name, so the parent_of fact is filtered out during display name resolution in /query.
+
+### Root cause: Name collision between user and Gabriella entity
+
+Both the USER entity (`3f8e6836...`) and the Gabriella entity (`d4bf6c7b...`) have `pref_name = "gabby"` with `is_preferred_label = true`. The entity_aliases registry can only hold one preferred alias "gabby" → it went to the user entity. Gabriella's entity has:
+- `pref_name = gabby` (is_preferred_label=true) but alias `gabby` is NOT preferred (already claimed by user)
+- Alias `gabriella` with `is_preferred = false`
+
+### Evidence:
+
+**Database — parent_of fact EXISTS:**
+```
+parent_of | user(gabby) → d4bf6c7b... | object_alias = (empty)
+```
+The third child IS stored: user → parent_of → gabriella-entity. But object_alias is empty.
+
+**Database — Gabriella entity:**
+```
+pref_name = gabby (is_preferred_label=true)
+alias gabriella (is_preferred=false)
+```
+
+**Database — User entity:**
+```
+pref_name = gabby (is_preferred_label=true)
+alias gabby (is_preferred=true)
+```
+
+**Filter /query log — preferred_names:**
+```
+{'mars': 'mars', 'gabby': 'gabby', 'cyrus': 'cyrus', 'desmonde': 'desmonde', ...}
+```
+Only ONE "gabby" entry — maps to user. Gabriella's entity has no preferred name visible.
+
+**Live query result:** "Your family includes your spouse, Mars, and your two children, Cyrus and Desmonde." — Gabriella missing.
+
+### Additional issues found:
+- Two artifact aliases created: `"who's 10 and goes by gabby"` and `"who is 10 and goes by gabby"` — LLM extracted full phrases as names
+- No `age=10` fact found for Gabriella entity (scalar facts may also be missing)
+
+### Conclusion:
+**Ingest works.** The `parent_of` fact for Gabriella is stored correctly. **Query fails** because the entity's display name can't be resolved — the preferred name "gabby" collides with the user's preferred name. The filter's `_resolve_display_names()` or `/query`'s `get_preferred_name()` returns nothing for Gabriella's entity because "gabby" is already taken and "gabriella" is not preferred.
+
+### Next:
+Awaiting direction on fix (likely: make `_resolve_display_names()` fall back to non-preferred aliases when no preferred name exists, or ensure new entities get unique preferred names).
+
+**Logs saved:** `gabriella_debug.log` (96 lines)
+
+---
+
+## #deepseek NEXT: dprompt-32b — Conflict Resolution System (Self-Healing Name Collisions)
+
+**CRITICAL PRODUCTION FIX: Name collisions break display resolution. Implement non-destructive conflict handling.**
+
+- **Prompt:** `dprompt-32b.md`
+- **Spec reference:** `dprompt-32.md`
+- **Issue:** When two entities claim same pref_name (user="gabby", child="gabby"), only one can be marked preferred. Loser entity becomes invisible in /query.
+- **Solution:** entity_name_conflicts table + re-embedder LLM-powered resolution
+- **Constraint:** Non-destructive. All names preserved; re-embedder assigns unique preferred names via LLM context.
+- **Completion:** Update scratch, then STOP and wait for direction
+
+**Implementation order:**
+1. migrations/021_name_conflicts.sql (schema)
+2. src/entity_registry/registry.py (collision detection at ingest)
+3. src/re_embedder/embedder.py (resolve_name_conflicts + LLM resolver)
+4. src/api/main.py (fallback alias resolution in /query)
+
+**After dprompt-32b:** Test suite will be rewritten for full-path validation (ingest → conflict → resolve → query cycles).
