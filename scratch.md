@@ -219,3 +219,59 @@ Read dprompt-26. Understand it. THEN code dprompt-27.
 - `dprompt-26.md` — architecture clarification (graph vs hierarchy)
 
 **Test goal for both phases:** "where do mars and fraggle live?" returns both entities + full hierarchical context
+
+---
+
+# deepseek
+
+## ✓ DONE: dprompt-27b (Graph Traversal) — 2026-05-12
+
+- Added `_REL_TYPE_GRAPH` and `_REL_TYPE_HIERARCHY` frozensets to `src/api/main.py`
+- Implemented `_graph_traverse(db_conn, user_id, entity_id, max_hops=1)` — single-hop graph traversal across facts + staged_facts, filtered by `_REL_TYPE_GRAPH`
+- Rewrote `/query` loop: `_graph_traverse()` discovers connected entities, `_fetch_user_facts()` fetches facts per entity, deduplicates
+- Replaced inline 2-hop logic with proper function call
+- Baseline identity facts fetch now always runs when db available (not gated on self-referential signals)
+- Test suite: 109 passed, 2 pre-existing Qdrant failures, 7 skipped — no regressions
+- Syntax: `python -m py_compile src/api/main.py` clean
+
+**Ready for dprompt-28b (hierarchy expansion)**
+
+---
+
+## ✓ DONE: dprompt-28b (Hierarchy Expansion) — 2026-05-12
+
+- Implemented `_hierarchy_expand(db_conn, user_id, entity_id, direction="up", max_depth=3)` using SQL `WITH RECURSIVE` CTE with cycle protection via depth tracking
+- Queries both `facts` and `staged_facts` for `_REL_TYPE_HIERARCHY` types (`instance_of`, `subclass_of`, `part_of`, `is_a`)
+- Supports bidirectional traversal: `direction="up"` (entity → class chain), `direction="down"` (class → members)
+- Integrated into `/query`: after graph traversal, each connected entity gets hierarchy-expanded upward; new hierarchy entities get facts fetched via `_fetch_user_facts()`
+- Deduplication across graph + hierarchy + baseline facts
+- Test suite: 109 passed, 7 skipped, 0 regressions
+- Syntax clean
+
+**Query flow:** baseline facts → graph traverse → hierarchy expand → attributes → Qdrant → merge/score
+**Test scenario:** "where do mars and fraggle live?" should return both entities + full classification chains
+**System ready for production query expansion.**
+
+---
+
+## #deepseek NEXT: dprompt-29b — Comprehensive Validation Suite (Tests Only, No Code Changes)
+
+**CRITICAL: This is validation, NOT improvement. Write tests only. Do NOT modify source code.**
+
+- **Prompt:** `dprompt-29b.md`
+- **Spec reference:** `dprompt-29.md`
+- **Deliverable:** `tests/api/test_dprompt29_comprehensive.py` (8 test scenarios)
+- **Hard constraint:** ONLY test files. Zero source code changes. If you find bugs, document only; do not fix.
+- **Completion:** Update scratch with entry from dprompt-29b.md "Upon Completion" template, then STOP and wait for direction
+
+**8 scenarios to validate:**
+1. Basic graph + hierarchy query
+2. Novel rel_type handling
+3. Fact promotion (Class B → facts)
+4. Hierarchy cycles (defensive)
+5. Deep hierarchy chains
+6. Mixed entity types
+7. Relevance scoring + sensitivity
+8. Re-embedder reconciliation
+
+**Expected outcome:** All 8 pass, 109+ existing tests pass, zero regressions.
