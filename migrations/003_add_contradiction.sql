@@ -1,0 +1,5 @@
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS
+  contradicted_by INT REFERENCES facts(id) ON DELETE SET NULL;
+
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS
+  contradiction_confidence_penalty FLOAT NOT NULL DEFAULT 0.0;
