@@ -457,16 +457,17 @@ Awaiting direction on fix (likely: make `_resolve_display_names()` fall back to 
 
 ---
 
-## #deepseek NEXT: dprompt-34b — Pre-Prod Validation (Full-Path Tests)
+## #deepseek NEXT: dprompt-34b — Pre-Prod Live Testing (OpenWebUI API)
 
 **Database ready:** Wiped on truenas. Schema dropped and recreated.
 
 - **Prompt:** `dprompt-34b.md`
 - **Spec reference:** `dprompt-34.md`
-- **Deliverable:** Run all 23 full-path scenarios against PostgreSQL on truenas; manual validation of natural queries
-- **Key setup:** SSH tunnel `ssh -L 5433:localhost:5432 truenas`, POSTGRES_DSN points to localhost:5433
-- **Constraint:** All 23 must pass. Zero failures. If any fail: document and stop (no fixes).
-- **Validation:** "What's my family" query returns all family entities with preferred names (no UUIDs, no missing)
-- **Completion:** Update scratch with template from dprompt-34b.md "Upon Completion", commit log file to git, then STOP and wait for direction
+- **Live instance:** https://hairbrush.helpdeskpro.ca/?models=faultline-wgm-test-10
+- **Bearer token:** `sk-addb2220bf534bfaa8f78d96e6991989` (locked, no switches)
+- **Test method:** curl API calls to OpenWebUI Filter
+- **5 scenarios:** Family ingest, Gabriella collision (canary), system metadata, sensitivity gating, transitive relationships
+- **Validation:** Query results use entity NAMES (not UUIDs), all entities visible, collisions resolved, sensitivity gate works
+- **Completion:** Document all 5 scenario results in scratch, then STOP and wait for direction
 
-**Why this matters:** Unit tests said production-ready. Gabriella bug proved otherwise. Pre-prod validation confirms dprompt-32b fix works: collisions detected, LLM-resolved, entities visible. All 23 passing = system is shippable.
+**Why this matters:** Unit tests said production-ready. Live testing with Gabriella collision proved them wrong. This validation confirms dprompt-32b fix works end-to-end: collisions detected + LLM-resolved + entities visible with correct names in actual queries. That's production-ready.
