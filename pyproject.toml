@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultline-wgm"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "gliner2",
+    "huggingface_hub>=0.23.0,<1.0.0",
+    "psycopg2-binary",
+    "httpx",
+    "structlog",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-mock",
+    "requests",
+    "fastapi>=0.110",
+    "uvicorn[standard]",
+    "pydantic>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
