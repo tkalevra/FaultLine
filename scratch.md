@@ -254,24 +254,21 @@ Read dprompt-26. Understand it. THEN code dprompt-27.
 
 ---
 
-## #deepseek NEXT: dprompt-29b — Comprehensive Validation Suite (Tests Only, No Code Changes)
+## #deepseek NEXT: dprompt-29b → dprompt-30b Sequence
 
-**CRITICAL: This is validation, NOT improvement. Write tests only. Do NOT modify source code.**
-
+**Phase 1: Validation (dprompt-29b)**
 - **Prompt:** `dprompt-29b.md`
-- **Spec reference:** `dprompt-29.md`
-- **Deliverable:** `tests/api/test_dprompt29_comprehensive.py` (8 test scenarios)
-- **Hard constraint:** ONLY test files. Zero source code changes. If you find bugs, document only; do not fix.
-- **Completion:** Update scratch with entry from dprompt-29b.md "Upon Completion" template, then STOP and wait for direction
+- **Spec:** `dprompt-29.md`
+- **Deliverable:** `tests/api/test_dprompt29_comprehensive.py` (8 validation scenarios)
+- **Constraint:** Tests only, no source code changes
+- **Completion:** Update scratch, commit, STOP and wait for phase 2 direction
 
-**8 scenarios to validate:**
-1. Basic graph + hierarchy query
-2. Novel rel_type handling
-3. Fact promotion (Class B → facts)
-4. Hierarchy cycles (defensive)
-5. Deep hierarchy chains
-6. Mixed entity types
-7. Relevance scoring + sensitivity
-8. Re-embedder reconciliation
+**Phase 2: QA Stress Testing (dprompt-30b) — START ONLY AFTER dprompt-29b PASSES**
+- **Prompt:** `dprompt-30b.md`
+- **Spec:** `dprompt-30.md`
+- **Deliverable:** `tests/api/test_dprompt30_qa_suite.py` (15 real-world QA scenarios)
+- **Constraint:** Tests only, no source code changes
+- **Goal:** Empirical proof system is production-ready
+- **Completion:** Update scratch with "System is PRODUCTION-READY" statement, then STOP
 
-**Expected outcome:** All 8 pass, 109+ existing tests pass, zero regressions.
+**dprompt-29b validates we didn't break anything. dprompt-30b proves it works for real usage.**
