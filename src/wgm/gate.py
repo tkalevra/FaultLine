@@ -261,13 +261,11 @@ class WGMValidationGate:
         valid_types = self.registry.get_valid_types() if self.registry else set(SEED_ONTOLOGY.keys())
 
         if rt not in valid_types:
-            # Novel type: try Qwen approval
-            if not self._try_approve_novel_type(rt):
-                return {"status": "novel"}
-            # Refresh cache if registry exists
-            if self.registry:
-                self.registry._refresh()
-                self._ontology = self.registry.get_ontology()
+            # Novel type: do NOT attempt LLM approval at ingest time.
+            # Return "unknown" so the ingest layer stores as Class C (ephemeral)
+            # and records the candidate in ontology_evaluations for async review
+            # by the re-embedder. See dprompt-17.
+            return {"status": "unknown"}
 
         # Check type constraints
         type_ok, type_reason = self._check_type_constraints(
@@ -327,10 +325,24 @@ class WGMValidationGate:
 
             cur.execute(
                 "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"
-                " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                " VALUES (%s, %s, %s, %s, %s)"
+                " ON CONFLICT (user_id, subject_id, object_id, rel_type) DO NOTHING"
+                " RETURNING id",
                 (user_id, subject_id, object_id, rt, provenance or ""),
             )
-            new_id = cur.fetchone()[0]
+            row = cur.fetchone()
+            # If the fact already exists (ON CONFLICT DO NOTHING returned no row),
+            # we still mark old conflicting facts as contradicted.
+            if row:
+                new_id = row[0]
+            else:
+                # Look up the existing fact id for contradiction marking
+                cur.execute(
+                    "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                    " AND object_id = %s AND rel_type = %s",
+                    (user_id, subject_id, object_id, rt),
+                )
+                new_id = cur.fetchone()[0]
 
         self.db_conn.commit()
 
