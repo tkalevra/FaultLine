@@ -44,6 +44,11 @@ _IDENTITY_STOPWORDS = {
     "going", "looking", "back", "home", "out", "in", "on", "at", "to",
     "very", "really", "so", "too", "quite", "sure", "afraid", "aware",
     "excited", "sorry", "glad", "grateful", "proud", "tired", "done",
+    # Words commonly falsely captured by preference/identity patterns
+    "prefer", "prefers", "preferred", "called", "name", "named",
+    "family", "children", "kids", "wife", "husband", "spouse",
+    "she", "he", "they", "them", "her", "him", "his",
+    "goes", "known", "likes", "like", "want", "wants",
 }
 
 # _SCALAR_REL_TYPES removed — replaced by classify_fact_type() which uses
@@ -211,6 +216,31 @@ def _extract_identity(text: str) -> str | None:
                 return name
     return None
 
+
+# Patterns for extracting explicitly preferred names from preference signals
+_PREFERRED_NAME_PATTERNS = [
+    # Must NOT be preceded by "who" — those are third-person.
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+to\s+be\s+called\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+you\s+call\s+(?:me|them|her|him)\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bgoes\s+by\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bgo\s+by\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bpreferred\s+name\s+is\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"\bplease\s+call\s+me\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bknown\s+as\s+([a-z]+)", re.IGNORECASE),
+    re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\blike\s+to\s+(?:be|go)\s+(?:by|called)\s+([a-z]+)", re.IGNORECASE),
+]
+
+
+def _extract_preferred_name(text: str) -> str | None:
+    """Return the preferred name if a preference signal is found with an explicit name."""
+    for pattern in _PREFERRED_NAME_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            name = m.group(1).lower().strip()
+            if name not in _IDENTITY_STOPWORDS and len(name) > 1:
+                return name
+    return None
+
 def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
     """Return the canonical user UUID if entity_id matches, else return entity_id."""
     return user_id if entity_id == user_id else entity_id
@@ -366,18 +396,22 @@ def _normalize_entity_ids_startup(dsn: str) -> None:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
                 # Find all string entity_ids
+                # CRITICAL: Exclude scalar rel_types (also_known_as, pref_name) from object_id
+                # normalization — their objects are display names, not entity references.
                 cur.execute("""
                     SELECT DISTINCT user_id, subject_id FROM facts
                     WHERE subject_id NOT LIKE '%-%-%-%-'
                     UNION
                     SELECT DISTINCT user_id, object_id FROM facts
                     WHERE object_id NOT LIKE '%-%-%-%-'
+                      AND rel_type NOT IN ('also_known_as', 'pref_name')
                     UNION
                     SELECT DISTINCT user_id, subject_id FROM staged_facts
                     WHERE subject_id NOT LIKE '%-%-%-%-'
                     UNION
                     SELECT DISTINCT user_id, object_id FROM staged_facts
                     WHERE object_id NOT LIKE '%-%-%-%-'
+                      AND rel_type NOT IN ('also_known_as', 'pref_name')
                 """)
                 string_ids = cur.fetchall()
 
@@ -628,8 +662,14 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
         result = model.extract_json(req.text, schema)
         resolved_entities = []
         for entity in result.get("facts", []):
+            # Post-process: if subject is null, the user is the implied subject
+            if entity.get("subject") is None and entity.get("object") is not None and entity.get("rel_type"):
+                entity["subject"] = "user"
+                entity["subject_type"] = "Person"
+                log.info("extract.null_subject_resolved",
+                         rel_type=entity["rel_type"], object=entity["object"])
             # Post-process: if object is null but subject is a person and rel_type implies parent relationship
-            if entity.get("object") is None and entity.get("rel_type") == "child_of":
+            elif entity.get("object") is None and entity.get("rel_type") == "child_of":
                 # The user is the implied parent; flip the relationship
                 entity["rel_type"] = "parent_of"
                 entity["object"] = entity.get("subject")
@@ -899,6 +939,11 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 ]
             }
             result = model.extract_json(req.text, schema)
+            # Post-process: resolve null subjects to "user" (first-person)
+            for fact in result.get("facts", []):
+                if fact.get("subject") is None and fact.get("object") is not None and fact.get("rel_type"):
+                    fact["subject"] = "user"
+                    fact["subject_type"] = "Person"
             raw_inferred = [
                 EdgeInput(
                     subject=fact["subject"].lower().strip(),
@@ -955,20 +1000,63 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         key = (edge.subject, edge.object, edge.rel_type)
         edges_dict[key] = edge
 
-    # Auto-synthesize also_known_as if user identifies themselves
+    # Auto-synthesize identity and preference edges from text patterns.
+    # These catch what GLiNER2/LLM miss: self-identification and explicit preferences.
     detected_identity = _extract_identity(req.text)
+    detected_preferred = _extract_preferred_name(req.text)
+
     if detected_identity:
+        # If a preferred name is ALSO stated and differs from the identity name,
+        # the identity name is the formal/legal name (not preferred) and the
+        # preferred name gets a pref_name edge marked preferred.
+        has_explicit_pref = detected_preferred and detected_preferred != detected_identity
         identity_key = ("user", detected_identity, "also_known_as")
         if identity_key not in edges_dict:
             edges_dict[identity_key] = EdgeInput(
                 subject="user",
                 object=detected_identity,
                 rel_type="also_known_as",
+                is_preferred_label=not has_explicit_pref,  # only preferred if no explicit pref_name
+                is_correction=False,
+            )
+
+    if detected_preferred:
+        pref_key = ("user", detected_preferred, "pref_name")
+        if pref_key not in edges_dict:
+            edges_dict[pref_key] = EdgeInput(
+                subject="user",
+                object=detected_preferred,
+                rel_type="pref_name",
                 is_preferred_label=True,
                 is_correction=False,
             )
 
     edges = list(edges_dict.values())
+
+    # Augment with compound extraction: regex-based patterns catch what
+    # GLiNER2 misses in chained/compound text (marriage, children, ages,
+    # third-person preferences). Runs in <1ms, no LLM call.
+    try:
+        from src.extraction.compound import extract_compound_facts
+        compound_edges = extract_compound_facts(req.text)
+        _existing_keys = {(e.subject.lower(), e.object.lower(), e.rel_type.lower()) for e in edges}
+        for ce in compound_edges:
+            _key = (ce["subject"].lower(), ce["object"].lower(), ce["rel_type"].lower())
+            if _key not in _existing_keys:
+                edges.append(EdgeInput(
+                    subject=ce["subject"],
+                    object=ce["object"],
+                    rel_type=ce["rel_type"],
+                    is_preferred_label=ce.get("is_preferred_label", False),
+                    is_correction=ce.get("is_correction", False),
+                ))
+                _existing_keys.add(_key)
+        if len(edges) > len(edges_dict):
+            log.info("ingest.compound_augment",
+                     gliner_count=len(edges_dict),
+                     compound_added=len(edges) - len(edges_dict))
+    except Exception as _e:
+        log.warning("ingest.compound_extraction_failed", error=str(_e))
 
     facts, committed, staged = [], 0, 0
     if edges:
@@ -983,7 +1071,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             _canonical_to_display: dict[str, str] = {}
 
             # The canonical user entity ID is the OpenWebUI UUID (req.user_id)
-            user_entity_id = req.user_id
+            # Resolve to UUID surrogate for consistent storage (non-UUID user_ids produce deterministic UUIDs)
+            if _UUID_PATTERN.match(req.user_id):
+                user_entity_id = req.user_id
+            else:
+                from src.entity_registry.registry import _make_surrogate
+                user_entity_id = _make_surrogate(req.user_id, req.user_id)
+                log.info("ingest.user_id_surrogate", original=req.user_id, surrogate=user_entity_id)
 
             # Load all aliases for this user's UUID
             _user_aliases = set()
@@ -1002,12 +1096,19 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             for edge in edges:
                 if edge.subject == edge.object: continue
 
-                # Age fact validation: reject if subject="user" but no explicit self-statement
-                if edge.rel_type.lower() == "age" and edge.subject.lower() == "user":
-                    if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
-                        log.warning("ingest.age_rejected_wrong_subject",
-                                    subject=edge.subject, object=edge.object, text=req.text[:100])
+                # Age fact validation: reject non-numeric age objects (GLiNER2 false positives)
+                if edge.rel_type.lower() == "age":
+                    _raw_obj = edge.object.strip()
+                    if not re.match(r'^-?\d+$', _raw_obj):
+                        log.warning("ingest.age_rejected_non_numeric_object",
+                                    subject=edge.subject, object=_raw_obj,
+                                    reason="age object must be numeric")
                         continue
+                    if edge.subject.lower() == "user":
+                        if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
+                            log.warning("ingest.age_rejected_wrong_subject",
+                                        subject=edge.subject, object=edge.object, text=req.text[:100])
+                            continue
 
                 # UUID guard: reject raw edge values that are UUIDs
                 # (canonical_ids may be UUIDs when entities exist without display names, which is fine)
@@ -1154,6 +1255,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 fact_subject = canonical_subject
 
                 # Register aliases from also_known_as and pref_name edges
+                is_pref = False  # default for non-identity edges
+
                 # CRITICAL: Skip self-referential aliases (where object == canonical subject)
                 # These are useless and pollute the alias registry
                 if edge.rel_type.lower() in ("also_known_as", "pref_name"):
@@ -1164,11 +1267,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # Skip alias registration AND fact creation
                         continue
 
+                    # pref_name edges are ALWAYS preferred — the rel_type itself is the signal.
+                    # For also_known_as: only preferred if explicitly flagged or if the object
+                    # was marked preferred by a pref_name edge in the same batch.
                     is_pref = (
                         edge.rel_type.lower() == "pref_name" or
                         edge.is_preferred_label or
-                        edge.object.lower() in preferred_objects or
-                        (has_preferred and edge.rel_type.lower() in ("also_known_as", "pref_name"))
+                        edge.object.lower() in preferred_objects
                     )
 
                     # For corrections where subject is the user's canonical identity,
@@ -1358,11 +1463,46 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         reason=validation.get("reason", ""))
                             continue
 
+                is_engine_generated = False  # default
+
+                # Handle unknown rel_type: store as Class C and record for async evaluation.
+                # The re-embedder will evaluate usage patterns and decide to approve/map/reject.
+                if status == "unknown":
+                    is_engine_generated = True  # force Class C
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "INSERT INTO ontology_evaluations"
+                                " (user_id, candidate_rel_type, candidate_subject_type,"
+                                "  candidate_object_type, first_text_snippet,"
+                                "  extraction_confidence, extraction_method,"
+                                "  sample_subject_id, sample_object,"
+                                "  occurrence_count, last_seen_at)"
+                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
+                                " ON CONFLICT (user_id, candidate_rel_type, sample_subject_id, sample_object)"
+                                " DO UPDATE SET"
+                                "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
+                                "   last_seen_at = now()",
+                                (req.user_id, edge.rel_type.lower(),
+                                 edge.subject_type, edge.object_type,
+                                 req.text[:500], 0.5, 'ingest',
+                                 fact_subject, canonical_object),
+                            )
+                        db.commit()
+                        log.info("ingest.unknown_rel_type_recorded",
+                                 rel_type=edge.rel_type.lower(),
+                                 subject_type=edge.subject_type,
+                                 object_type=edge.object_type)
+                    except Exception as _e:
+                        log.warning("ingest.ontology_eval_insert_failed",
+                                    rel_type=edge.rel_type.lower(), error=str(_e))
+
                 # Look up whether this rel_type is engine_generated
-                is_engine_generated = False
-                if hasattr(_rel_type_registry, 'get') and _rel_type_registry:
-                    rt_meta = _rel_type_registry.get(edge.rel_type.lower(), {})
-                    is_engine_generated = rt_meta.get("engine_generated", False)
+                if not is_engine_generated:
+                    is_engine_generated = False
+                    if hasattr(_rel_type_registry, 'get') and _rel_type_registry:
+                        rt_meta = _rel_type_registry.get(edge.rel_type.lower(), {})
+                        is_engine_generated = rt_meta.get("engine_generated", False)
 
                 edge_confidence = 1.0 if edge.is_correction else (
                     0.8 if edge.fact_provenance == "user_stated" else 0.6
@@ -1420,18 +1560,11 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # Conflict facts: the WGM gate already inserted the new fact and marked
                     # old facts as contradicted. We still need rows populated for downstream
                     # processing (entity alias sync, Qdrant sync, preference propagation).
-                    # pref_name edges are always preferred by definition — the rel_type itself
-                    # is the preference signal. also_known_as requires explicit signal to be preferred.
-                    if edge.rel_type.lower() == "pref_name":
-                        is_preferred = True
-                    else:
-                        is_preferred = (
-                            edge.rel_type.lower() == "also_known_as" and
-                            (has_preferred or edge.is_preferred_label or edge.is_correction)
-                        )
+                    # Use the is_pref value computed earlier (which already accounts for
+                    # pref_name semantics, explicit flags, and cross-batch preference objects).
                     rows.append((
                         req.user_id, fact_subject, canonical_object,
-                        edge.rel_type, req.source, is_preferred,
+                        edge.rel_type, req.source, is_pref,
                         fact_class, edge_confidence, is_engine_generated
                     ))
 
@@ -1737,10 +1870,12 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         user_id, subject, obj, rel_type, source, is_preferred = row
 
                         # Check if this row came from a correction edge
-                        # Match by object and rel_type (subject may have been resolved)
+                        # Match by object and rel_type (subject may have been resolved).
+                        # obj is the resolved UUID; use _canonical_to_display to get the original name.
+                        _display_name = _canonical_to_display.get(obj.lower(), obj.lower())
                         is_correction = any(
                             e.is_correction and
-                            e.object.lower() == obj.lower() and
+                            e.object.lower() == _display_name and
                             e.rel_type.lower() == rel_type.lower()
                             for e in edges
                         )
@@ -2053,6 +2188,16 @@ def query(request: QueryRequest):
             })
         return resolved
 
+    def _clean_preferred_names(pns: dict) -> dict:
+        """Remove entries where the display name is a UUID or empty string.
+        These are not human-readable and leak internal identifiers to the filter.
+        # NO RECURSIVE MATCHING — _UUID_PATTERN is a static compile-once pattern.
+        """
+        return {
+            k: v for k, v in pns.items()
+            if v and not _UUID_PATTERN.match(str(v))
+        }
+
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
         Convert entity_attributes to facts format for injection.
@@ -2093,17 +2238,30 @@ def query(request: QueryRequest):
         "who am i", "who i am", "list my", "tell me about me",
         "what do you know about me", "my pets", "my animals", "my home",
         "where do i live", "my address", "my age", "my job", "my work",
+        # Domain-agnostic: any "tell me about X" or "what is/are X" should
+        # trigger graph traversal to surface all stored facts for relevance scoring.
+        "tell me about", "what do you know", "what you know",
+        "what is", "what are", "how many", "how much",
+        "list all", "show me", "describe",
     }
 
     # The canonical user entity ID is the OpenWebUI UUID
-    user_entity_id_for_query = user_id
+    # If the user_id is a non-UUID string (e.g., test user), resolve to surrogate
+    if _UUID_PATTERN.match(user_id):
+        user_entity_id_for_query = user_id
+    else:
+        from src.entity_registry.registry import _make_surrogate
+        user_entity_id_for_query = _make_surrogate(user_id, user_id)
 
     # Initialize database connection and entity registry
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
         # Canonical identity is the user's preferred display name for themselves
-        canonical_identity = registry.get_preferred_name(user_id, user_id)
+        canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_query)
+        # If the result is a UUID or empty, fall back to user_id for readability.
+        if not canonical_identity or _UUID_PATTERN.match(canonical_identity):
+            canonical_identity = user_id
     except Exception as _e:
         log.warning("query.db_init_failed", error=str(_e))
         db = None
@@ -2116,6 +2274,32 @@ def query(request: QueryRequest):
         try:
             if db and registry and canonical_identity:
                 direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
+
+                # Resolve named entities from query (e.g., "aurora", "system")
+                # and fetch their facts for domain-agnostic queries.
+                # _fetch_user_facts already searches both subject_id AND object_id
+                # when entity_id is provided, so one call covers both directions.
+                # Scan both capitalized words AND lowercase tokens that match known aliases.
+                _query_words = set(re.findall(r'\b([A-Z][a-z]+)\b', request.text))
+                _query_words.discard("Tell")
+                # Also check lowercase tokens against entity_aliases
+                _common_words = {'the','and','for','you','are','that','what','how','who','tell','know','about','with','from','your','this','have','been','does','will','name','system'}
+                for _token in request.text.lower().split():
+                    _token = _token.strip('.,!?;:()[]{}"\'')
+                    if len(_token) > 2 and _token not in _common_words and _token not in _query_words:
+                        _query_words.add(_token)
+                for _word in _query_words:
+                    try:
+                        _entity_id = registry.resolve(user_id, _word)
+                        if _entity_id and _entity_id != user_entity_id_for_query:
+                            _extra = _fetch_user_facts(db, user_id, entity_id=_entity_id)
+                            if _extra:
+                                direct_facts.extend(_extra)
+                                log.info("query.entity_resolved",
+                                         word=_word, entity_id=_entity_id,
+                                         extra_facts=len(_extra))
+                    except Exception:
+                        pass
 
                 # 2-hop: fetch facts for directly related entities
                 related = {
@@ -2361,7 +2545,7 @@ def query(request: QueryRequest):
         return {
             "status": "ok",
             "facts": merged_facts,
-            "preferred_names": preferred_names,
+            "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
             "attributes": attributes,
         }
@@ -2403,7 +2587,7 @@ def query(request: QueryRequest):
             return {
                     "status": "ok",
                     "facts": merged_facts,
-                    "preferred_names": preferred_names,
+                    "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
                     "attributes": attributes,
                 }
@@ -2438,7 +2622,7 @@ def query(request: QueryRequest):
             return {
                     "status": "ok",
                     "facts": merged_facts,
-                    "preferred_names": preferred_names,
+                    "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
                     "attributes": attributes,
                 }
@@ -2558,7 +2742,7 @@ def query(request: QueryRequest):
         return {
             "status": "ok",
             "facts": merged_facts,
-            "preferred_names": preferred_names,
+            "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
             "attributes": attributes,
         }
@@ -2567,7 +2751,7 @@ def query(request: QueryRequest):
         return {
             "status": "ok",
             "facts": [],
-            "preferred_names": preferred_names,
+            "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
             "attributes": {},
         }
