@@ -333,4 +333,21 @@ Read dprompt-26. Understand it. THEN code dprompt-27.
 - **Deliverable:** Docker logs + database inspection + failure point identified
 - **Completion:** Update scratch with findings, then STOP and wait for direction
 
+**Quick curl reference (if needed):**
+```bash
+# Test auth
+curl -s -H "Authorization: Bearer sk-addb2220bf534bfaa8f78d96e6991989" \
+  https://hairbrush.helpdeskpro.ca/api/models | jq '.data[] | select(.id == "faultline-wgm-test-10")'
+
+# Send message to chat (for ingest)
+curl -X POST -H "Authorization: Bearer sk-addb2220bf534bfaa8f78d96e6991989" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "faultline-wgm-test-10",
+    "messages": [{"role": "user", "content": "We have a third Daughter, Gabriella who is 10 and goes by Gabby"}],
+    "stream": false
+  }' \
+  https://hairbrush.helpdeskpro.ca/api/chat/completions
+```
+
 **Debug path:** Filter extraction → ingest → query → Qdrant sync. Identify where Gabriella is lost.
