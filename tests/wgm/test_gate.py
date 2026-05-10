@@ -14,14 +14,15 @@ def test_project_structure():
 
 
 def test_validate_novel_type():
-    """Novel rel_type not in ontology → auto-approved when Qwen unavailable, edge stored."""
+    """Novel rel_type not in ontology → returns 'unknown' for async evaluation (dprompt-17)."""
     mock_conn = MagicMock()
     gate = WGMValidationGate(mock_conn)
 
     result = gate.validate_edge(1, 2, "unknown_relationship")
 
-    # Without Qwen, novel types are auto-approved so facts are not silently dropped
-    assert result == {"status": "valid"}
+    # Novel types are no longer approved at ingest time.
+    # The ingest layer stores them as Class C and records in ontology_evaluations.
+    assert result["status"] == "unknown"
 
 
 def test_validate_conflict():

@@ -119,7 +119,7 @@ RELATIONSHIP RULES:
 
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
-- pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). Subject is always the named person, never "user".
+- pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). For first-person preferences ("I prefer to be called X", "call me X"), subject IS "user". For third-person ("she goes by X", "his preferred name is Y"), subject is the named person.
 - is_a: type or category. has_pet: person owns an animal (NEVER a person).
 - Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
 - Use snake_case. Other types allowed if none fit.
@@ -364,14 +364,16 @@ def _extract_basic_facts(text: str) -> list[dict]:
                 })
 
     # Preference signals: "prefer to be called X", "goes by X"
+    # CRITICAL: (?<!who )(?<!she )(?<!he )(?<!it )(?<!they ) ensures "who prefers X" is NOT captured as
+    # first-person — those are third-person and handled by the LLM.
     _PREF_PATTERNS = [
-        re.compile(r"\bprefers?\s+to\s+be\s+called\s+([a-z]+)", re.IGNORECASE),
-        re.compile(r"\bprefers?\s+you\s+call\s+(?:me|them|her|him)\s+([a-z]+)", re.IGNORECASE),
-        re.compile(r"\bgoes\s+by\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+to\s+be\s+called\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+you\s+call\s+(?:me|them|her|him)\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bgoes\s+by\s+([a-z]+)", re.IGNORECASE),
         re.compile(r"\bgo\s+by\s+([a-z]+)", re.IGNORECASE),
-        re.compile(r"\bpreferred\s+name\s+is\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bpreferred\s+name\s+is\s+([a-z]+)", re.IGNORECASE),
         re.compile(r"\bplease\s+call\s+me\s+([a-z]+)", re.IGNORECASE),
-        re.compile(r"\bknown\s+as\s+([a-z]+)", re.IGNORECASE),
+        re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bknown\s+as\s+([a-z]+)", re.IGNORECASE),
     ]
 
     for pattern in _PREF_PATTERNS:
@@ -1443,15 +1445,50 @@ class Filter:
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
 
-                # Fallback: when LLM is unavailable, extract basic identity/preference
-                # facts directly from text using regex patterns. This ensures basic
-                # facts (name, preferred name, corrections) are never silently dropped.
-                if not raw_triples and not _skip_rewrite:
-                    basic_edges = _extract_basic_facts(clean_text)
-                    if basic_edges:
+                # Augment: always run regex extraction for preference and correction
+                # signals even when the LLM returned triples. The LLM prompt is
+                # imperfect and can miss explicit preferences ("I prefer to be called X").
+                # Regex-extracted pref_name and correction edges are definitive and
+                # take priority over any LLM-inferred edges.
+                # Use compound extractor (src/extraction/compound.py) for robust
+                # chained-text extraction. Falls back to local _extract_basic_facts
+                # if the module isn't available (e.g., in a different deployment).
+                basic_edges = []
+                if not _skip_rewrite:
+                    try:
+                        from src.extraction.compound import extract_compound_facts
+                        basic_edges = extract_compound_facts(clean_text)
+                    except ImportError:
+                        basic_edges = _extract_basic_facts(clean_text)
+                    except Exception:
+                        basic_edges = _extract_basic_facts(clean_text)
+                if basic_edges:
+                    # Only keep correction edges from regex.
+                    # The LLM handles preferences (pref_name) correctly — regex
+                    # augment for pref_name produces false positives when the
+                    # text contains third-person preferences ("who prefers X",
+                    # "she prefers Y"). Corrections are unambiguous and safe to
+                    # add regardless of context.
+                    _augment_edges = [
+                        e for e in basic_edges
+                        if e.get("is_correction")
+                    ]
+                    # Merge: existing triples + augment edges (dedup by key)
+                    _existing_keys = {(e.get("subject"), e.get("object"), e.get("rel_type"))
+                                      for e in raw_triples if e.get("subject") and e.get("object")}
+                    for aug in _augment_edges:
+                        _key = (aug["subject"], aug["object"], aug["rel_type"])
+                        if _key not in _existing_keys:
+                            raw_triples.append(aug)
+                            _existing_keys.add(_key)
+                    if self.valves.ENABLE_DEBUG and _augment_edges:
+                        print(f"[FaultLine Filter] regex augment added {len(_augment_edges)} correction edge(s) "
+                              f"to LLM output")
+                    # Full fallback: if LLM returned nothing at all, use ALL basic edges
+                    if not raw_triples:
                         raw_triples = basic_edges
                         if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] regex fallback extracted {len(raw_triples)} basic fact(s)")
+                            print(f"[FaultLine Filter] regex full fallback extracted {len(raw_triples)} basic fact(s)")
 
                 _PRONOUNS = {"i", "me", "my", "we", "us", "our", "he", "she", "it", "they", "them"}
                 edges = [

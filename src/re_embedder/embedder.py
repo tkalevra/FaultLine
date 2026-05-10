@@ -599,6 +599,163 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     return stats
 
 
+def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
+    """
+    dprompt-17: Evaluate novel rel_type candidates from ontology_evaluations.
+    Runs each poll cycle. Decisions:
+      - 'approved': occurrence_count >= 3 → INSERT into rel_types
+      - 'mapped':   similarity to existing type > 0.85 → rewrite staged_facts
+      - 'rejected': neither → leave as Class C, let expiry handle it
+
+    Returns: {"approved": int, "mapped": int, "rejected": int, "errors": int}
+    """
+    stats = {"approved": 0, "mapped": 0, "rejected": 0, "errors": 0}
+
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, candidate_rel_type, candidate_subject_type,"
+                "       candidate_object_type, first_text_snippet, occurrence_count,"
+                "       sample_subject_id, sample_object"
+                " FROM ontology_evaluations"
+                " WHERE re_embedder_decision IS NULL"
+                " ORDER BY occurrence_count DESC, last_seen_at DESC"
+            )
+            candidates = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.ontology_eval_fetch_failed: {e}")
+        return stats
+
+    if not candidates:
+        return stats
+
+    log.info(f"re_embedder.ontology_eval_candidates count={len(candidates)}")
+
+    # Load existing rel_types for similarity comparison
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT rel_type FROM rel_types ORDER BY rel_type")
+            existing_types = [row[0] for row in cur.fetchall()]
+    except Exception:
+        existing_types = []
+
+    for row in candidates:
+        eval_id, user_id, candidate_rel, subj_type, obj_type, snippet, occ, subj_id, obj = row
+        try:
+            decision = None
+            reason = ""
+            best_fit = None
+            best_score = 0.0
+
+            # ── Decision 1: Pattern frequency ──────────────────────────
+            if occ >= 3:
+                decision = "approved"
+                reason = f"occurrence_count={occ} >= 3"
+
+            # ── Decision 2: Semantic similarity ─────────────────────────
+            if not decision and existing_types:
+                # Embed the candidate rel_type for comparison
+                candidate_vector = embed_text(
+                    f"relationship: {candidate_rel}",
+                    qwen_api_url, timeout=10.0, fallback=True
+                )
+                if candidate_vector:
+                    # Compute cosine similarity to each existing type
+                    best_score = 0.0
+                    best_fit = None
+                    for ext in existing_types:
+                        ext_vector = embed_text(
+                            f"relationship: {ext}",
+                            qwen_api_url, timeout=10.0, fallback=True
+                        )
+                        if ext_vector:
+                            sim = _cosine_similarity(candidate_vector, ext_vector)
+                            if sim > best_score:
+                                best_score = sim
+                                best_fit = ext
+
+                    if best_score > 0.85 and best_fit:
+                        decision = "mapped"
+                        reason = f"similarity={best_score:.3f} to '{best_fit}'"
+
+            # ── Decision 3: Reject ──────────────────────────────────────
+            if not decision:
+                decision = "rejected"
+                reason = f"occ={occ} < 3, no strong match (best={best_fit}:{best_score:.3f})" if best_fit else "no match"
+
+            # ── Apply decision ──────────────────────────────────────────
+            with db_conn.cursor() as cur:
+                if decision == "approved":
+                    # Register the new rel_type
+                    label = candidate_rel.replace('_', ' ').title()
+                    cur.execute(
+                        "INSERT INTO rel_types (rel_type, label, engine_generated, confidence, source)"
+                        " VALUES (%s, %s, true, 0.7, 're_embedder')"
+                        " ON CONFLICT (rel_type) DO NOTHING",
+                        (candidate_rel, label),
+                    )
+                    stats["approved"] += 1
+                    log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} {reason}")
+
+                elif decision == "mapped" and best_fit:
+                    # Rewrite staged_facts using this rel_type to use best_fit instead
+                    cur.execute(
+                        "UPDATE staged_facts SET rel_type = %s, qdrant_synced = false"
+                        " WHERE rel_type = %s AND promoted_at IS NULL AND expires_at > now()",
+                        (best_fit, candidate_rel),
+                    )
+                    n_rewritten = cur.rowcount
+                    stats["mapped"] += 1
+                    log.info(
+                        f"re_embedder.ontology_mapped "
+                        f"from={candidate_rel} to={best_fit} "
+                        f"rewritten={n_rewritten} score={best_score:.3f}"
+                    )
+
+                else:
+                    stats["rejected"] += 1
+                    log.info(f"re_embedder.ontology_rejected rel_type={candidate_rel} {reason}")
+
+                # Update evaluation record
+                cur.execute(
+                    "UPDATE ontology_evaluations SET"
+                    "  re_embedder_decision = %s,"
+                    "  re_embedder_confidence = %s,"
+                    "  decision_timestamp = now(),"
+                    "  decision_reason = %s,"
+                    "  best_fit_rel_type = %s,"
+                    "  best_fit_score = %s,"
+                    "  created_rel_type = %s"
+                    " WHERE id = %s",
+                    (decision,
+                     0.7 if decision == "approved" else (best_score if decision == "mapped" else 0.3),
+                     reason, best_fit, best_score,
+                     candidate_rel if decision == "approved" else (best_fit if decision == "mapped" else None),
+                     eval_id),
+                )
+
+            db_conn.commit()
+
+        except Exception as e:
+            db_conn.rollback()
+            stats["errors"] += 1
+            log.error(f"re_embedder.ontology_eval_error eval_id={eval_id} rel_type={candidate_rel}: {e}")
+
+    return stats
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
@@ -684,6 +841,17 @@ def main():
                 n_promoted = promote_staged_facts(db, qdrant_url)
                 if n_promoted:
                     log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
+
+                # Evaluate novel ontology candidates (dprompt-17)
+                ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
+                if any(v > 0 for v in ontology_stats.values()):
+                    log.info(
+                        f"re_embedder.ontology_eval "
+                        f"approved={ontology_stats['approved']} "
+                        f"mapped={ontology_stats['mapped']} "
+                        f"rejected={ontology_stats['rejected']} "
+                        f"errors={ontology_stats['errors']}"
+                    )
 
                 # Expire stale Class C staged facts
                 n_expired = expire_staged_facts(db, qdrant_url)

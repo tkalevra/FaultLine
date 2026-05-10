@@ -11,101 +11,66 @@ plans, or test cases here. Use it to:
 
 Code goes directly into source files. This file stays lean.
 
+**LENGTH RULE:** If this file exceeds 150 lines, archive everything between the
+"## Archive" section and the "---" separator as `scratch-archive-YYYY-MM-DD.md`,
+then condense the remaining content to a concise current state summary. The
+instruction header stays; only the dialogue and state sections get archived.
+
 ---
 
 ## Archive
 
 - **scratch-archive-2026-05-11.md** — Phases 1–5 (retrieval, relations, conversation state)
 - **scratch-archive-2026-05-11-phases6-10.md** — Phases 6–10 (date/time, events table, UUID resolution)
+- **scratch-archive-2026-05-11-dprompt15b.md** — dprompt-15b full-circle validation (7 code fixes, 9-cycle results)
+- **scratch-archive-2026-05-11-dprompt16-17.md** — dprompt-16/17: preference chain, compound extraction, self-building ontology, filter augment fix
 
 ---
 
-## Current State (2026-05-11) — /query fixed, data issues remain
+## Current State (2026-05-11)
 
-### What works
-- `/query` returns 25 facts for "tell me about my family" including spouse
-- Metadata stripping active (no `user_id` in response)
-- Nuclear UUID redaction in Filter (`_redact_uuids_from_body()`)
-- 33/33 filter tests pass, main.py parses clean
+### What's built and verified
 
-### What's broken (data quality)
-- **entity_aliases table empty** for user 3f8e6836 — all `preferred_names` are UUID→UUID instead of UUID→display name. Spouse fact shows `user -spouse-> 54214459-...` instead of `user -spouse-> mars`
-- **has_pet** stored as `(mars → fraggle)` not `(user → fraggle)` — ingest-side entity resolution issue
+**Ingest pipeline** — compound text extraction via `src/extraction/compound.py`, null-subject resolution, user-id-to-surrogate mapping, auto-synthesized `pref_name` + `also_known_as` from text patterns.
 
-### Root cause
-entity_aliases corrupted during old ingest: UUID→UUID instead of UUID→display name. Original display names lost when `_SCALAR_OBJECT_RELS` fix wasn't in place (string objects got resolved to UUIDs).
+**Preference chain** — `_extract_preferred_name()` with 8 patterns, Qwen prompt allowing first-person `pref_name`, auto-synthesis with correct `is_preferred_label` assignment.
 
-### Solution
-Re-ingest identity facts ("My wife is Mars") OR manually insert correct aliases in entity_aliases table. Test locally before production.
+**Filter augment (critical fix)** — No longer injects regex-extracted `pref_name` edges. Only correction edges are augmented. Qwen handles preferences; regex handles corrections. This was the root cause of false-positive `pref_name(user, mars)` demoting `chris`.
 
-### Next
-1. **dprompt-15:** Direct API validation + local Docker testing (autonomous iteration)
-2. Fix entity_aliases (code fix or manual alias insertion)
-3. Conversation state → calculate_relevance_score() (Phase 8)
+**Pronoun guards** — `(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )` on first-person preference patterns across `main.py`, `compound.py`, `faultline_tool.py`. Defensive hardening.
+
+**Stopwords** — `_IDENTITY_STOPWORDS` and `_STOPWORDS` expanded with 15+ words falsely captured as names.
+
+**Self-building ontology (dprompt-17)** — Ingest no longer approves novel rel_types via LLM. Unknown types → Class C + `ontology_evaluations`. Re-embedder evaluates asynchronously (frequency ≥ 3 → approve, cosine similarity > 0.85 → map to existing, else reject). Migration 018 applied.
+
+**Gate hardening** — `ON CONFLICT DO NOTHING` on conflict INSERT in `WGMValidationGate`. Novel types return `"unknown"` instead of calling `_try_approve_novel_type()`.
+
+### Known gaps
+
+- **Domain-agnostic retrieval**: System facts (subject="system") not reachable via graph traversal unless system entity is linked to user. Aurura query returns 0 facts in test env.
+- **`inlet ...\npost`**: No such endpoint — filter calls `/extract` then `/ingest`, not `/inlet post`. Verify pre-prod OpenWebUI filter valve configuration.
+- **entity_aliases cleanup**: Startup deletes/recreates aliases on restart with pre-existing mixed data. Not a regression.
+- **Docker bridge**: Firewalld blocks bridge forwarding on dev host. `docker-compose-dev.yml` uses host networking.
+
+### Test suite
+
+109 passed, 5 skipped, 0 regressions, 1 known gap (aurora retrieval).
+
+### Files changed
+
+| File | Key changes |
+|------|-------------|
+| `src/api/main.py` | `_extract_preferred_name()`, auto-synthesis, `is_pref` fix, age validation, compound augment, query signals, `unknown` rel_type handling, `_clean_preferred_names` |
+| `src/wgm/gate.py` | `ON CONFLICT DO NOTHING`, `"unknown"` return for novel types |
+| `src/re_embedder/embedder.py` | `evaluate_ontology_candidates()`, cosine similarity, main loop |
+| `openwebui/faultline_tool.py` | LLM prompt fix, augment only corrections, compound extractor, pronoun guards |
+| `src/extraction/compound.py` | NEW — compound + generic extraction |
+| `src/entity_registry/registry.py` | `resolve("user")` surrogate, `_is_valid_uuid()` |
+| `migrations/018_ontology_evaluations.sql` | NEW |
+| `tests/api/test_query_compound.py` | NEW |
 
 ---
 
 # deepseek
 
-**entity_aliases data corruption confirmed.** All aliases are UUID→UUID (fb331dd4-... etc.), not human-readable names. Original display names (mars, cyrus, des, gabby) were lost during old ingest when `_SCALAR_OBJECT_RELS` fix wasn't in place and string objects got resolved to UUID surrogates.
-
-**Not recoverable by code** — user needs to re-state identity facts in chat for fresh alias registration.
-
-**6 aliases inserted** from existing string-object facts (also_known_as/pref_name). Better than 0, but still UUIDs.
-
----
-
-# claude — dprompt-15 strategy
-
-**Workflow change:** Deepseek spins up LOCAL Docker instance to test autonomously. No waiting for user redeploy, faster iteration.
-
-**dprompt-15 includes:**
-1. Direct `/query` API validation script (5 tests: baseline retrieval, metadata stripping, UUID leakage, display name resolution, fact count)
-2. Local docker-compose setup instructions
-3. Entity aliases fix (manual SQL or code fix)
-4. Validation loop until all 5 tests pass
-5. **CRITICAL:** PROMPT user before touching production (don't cowboy rebuild)
-
-**Expected outcome:** Deepseek validates display name resolution locally, identifies code/data fix, reports findings, waits for production redeploy confirmation.
-
-**Note for future prompts:** Explicitly tell agents NOT to update Docker/redeploy without explicit instruction. They should PROMPT and WAIT.
-
----
-
-# deepseek — entity aliases fixed
-
-**7 aliases registered** (chris, christopher, mars, cyrus, des, gabby, fraggle).
-
-**/query results:** 16/33 facts now resolve with display names. Remaining 17 are pre-existing data corruption:
-- 2 unnamed child entities (never had names registered)
-- 2 corrupted also_known_as/pref_name facts (UUID objects instead of strings)
-- 3 corrupted lives_at facts (address strings surrogated to UUIDs)
-- Various sibling_of edges involving unnamed entities
-
-**The code is correct.** `_SCALAR_OBJECT_RELS` prevents new UUID resolution for identity rels. Fresh ingest will work. Old data needs re-ingestion by user.
-
-**User should state identity facts:** "My name is Chris", "My wife is Mars", children names, pet name, etc. to trigger fresh alias registration.
-
----
-
-# claude — dprompt-15b: full-circle validation (LOCAL ONLY, NO SSH/DB MANIPULATION)
-
-**Issue:** Fresh ingest doesn't register aliases. Query returns partial results. The ingest→alias→query→display cycle is broken.
-
-**Approach:** Test FULL CYCLE locally with clean Docker. Trace where it breaks. Fix CODE, not DATABASE.
-
-**dprompt-15b includes:**
-1. Fresh Docker instance (clean slate, no external access)
-2. **9 comprehensive cycles** of end-to-end validation:
-   - Cycles 1-4: Relationships (identity, spouse, child, family integration)
-   - Cycle 5: Age scalar ("I am 35") → verify "35" in response
-   - Cycle 6: Temporal event ("May 3rd birthday") → verify date in response
-   - Cycle 7: Sensitive data ("156 Cedar St address") → verify address, ZERO UUID leak
-   - Cycle 8: Fact correction ("Actually Martha not Mars") → verify old value superseded, not duplicated
-   - Cycle 9: Out-of-domain safety ("What's the weather?") → verify no hallucination, no UUID/system ID leaks
-3. Breakpoint debugging for each cycle (ingest → fact → alias → query → display)
-4. **CRITICAL:** No SSH, no TrueNAS, no database manipulation. API + local only.
-
-**Expected:** One or more cycles break. Deepseek identifies stage (ingest? alias? query? display?), fixes code, re-tests locally until all 9 cycles pass.
-
-**Report:** "All 9 cycles PASS: family, age, birthday, address (no leaks), correction working, weather safe" = ready for production redeploy.
+**Validation task:** See **validate-birthday-persistence.md** for debugging birthday fact retrieval across chats. Brief summary: User provided birthday in Chat 1, new Chat 2 says "I don't know." Trace whether it's in storage (PostgreSQL/Qdrant), retrieval (`/query`), or injection (Filter).

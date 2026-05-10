@@ -37,6 +37,15 @@ class EntityRegistry:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
+    @staticmethod
+    def _is_valid_uuid(value: str) -> bool:
+        """Check if a string is a valid UUID."""
+        try:
+            uuid.UUID(value)
+            return True
+        except (ValueError, AttributeError):
+            return False
+
     def resolve(self, user_id: str, name: str) -> str:
         """
         Resolve a name or alias to its canonical entity ID (UUID surrogate).
@@ -48,9 +57,21 @@ class EntityRegistry:
         if not name:
             raise ValueError("Entity name cannot be empty")
 
-        # Special case: 'user' resolves directly to the user_id (OWUI UUID)
+        # Special case: 'user' resolves to the canonical user entity ID.
+        # If user_id is a valid UUID, use it directly.
+        # If not (e.g., test user strings), derive a deterministic UUID surrogate.
         if name == "user":
-            return user_id
+            entity_id = user_id if self._is_valid_uuid(user_id) else _make_surrogate(user_id, user_id)
+            # Ensure the user entity exists
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO entities (id, user_id, entity_type) "
+                    "VALUES (%s, %s, 'Person') "
+                    "ON CONFLICT (id, user_id) DO NOTHING",
+                    (entity_id, user_id),
+                )
+            self.db_conn.commit()
+            return entity_id
 
         with self.db_conn.cursor() as cur:
             # Check if it's a known alias (but only if it points to a valid UUID)
@@ -171,7 +192,8 @@ class EntityRegistry:
                 # Skip self-referential and UUID aliases
                 if alias != canonical and not _UUID_PATTERN.match(alias):
                     return alias
-            # Fallback to canonical if no valid alias found
+            # Fallback to canonical if no valid alias found.
+            # Callers must handle UUID fallback (e.g., _clean_preferred_names).
             return canonical
 
     def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
@@ -185,12 +207,20 @@ class EntityRegistry:
             return [row[0] for row in cur.fetchall()]
 
     def get_surrogate_for_user(self, user_id: str) -> str:
-        """Return the surrogate UUID for the user entity. Always user_id itself."""
-        return user_id
+        """Return the surrogate UUID for the user entity.
+        If user_id is a valid UUID, returns it directly.
+        Otherwise derives a deterministic UUID v5 surrogate.
+        """
+        if self._is_valid_uuid(user_id):
+            return user_id
+        return _make_surrogate(user_id, user_id)
 
     def get_canonical_for_user(self, user_id: str) -> str:
         """
         Return the canonical entity ID for this user.
-        The OWUI user UUID is the surrogate for the user entity.
+        If user_id is a valid UUID, returns it directly.
+        Otherwise derives a deterministic UUID v5 surrogate.
         """
-        return user_id
+        if self._is_valid_uuid(user_id):
+            return user_id
+        return _make_surrogate(user_id, user_id)
