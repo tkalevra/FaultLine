@@ -271,5 +271,4 @@ FaultLine/
 ```
 
 ## License
-
-[License information]
+MIT — see [LICENSE](LICENSE) for full terms
