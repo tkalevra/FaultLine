@@ -1,0 +1,27 @@
+# Development artifacts
+dprompt-*.md
+scratch*.md
+DEEPSEEK_INSTRUCTION_TEMPLATE.md
+compact-instruct.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# Tests and dev scripts
+tests/
+check_entity_ids.py
+scripts/
+
+# Logs and temp
+*.log
+.deepseek/
