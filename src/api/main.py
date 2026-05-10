@@ -1588,6 +1588,18 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
+    _negation_pattern = re.compile(r'\bnot\s+([a-z]+)', re.IGNORECASE)
+    _negated_names = {m.lower() for m in _negation_pattern.findall(req.text)}
+    if _negated_names:
+        for key, edge in list(edges_dict.items()):
+            if (edge.rel_type.lower() in ("pref_name", "also_known_as")
+                    and edge.object.lower() in _negated_names):
+                edges_dict[key] = EdgeInput(
+                    subject=edge.subject, object=edge.object,
+                    rel_type=edge.rel_type, is_preferred_label=edge.is_preferred_label,
+                    is_correction=True, subject_type=edge.subject_type,
+                    object_type=edge.object_type)
+
     edges = list(edges_dict.values())
 
 
@@ -2503,6 +2515,22 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             cur.execute(
                                 "UPDATE facts SET is_preferred_label = true WHERE id = %s",
                                 (new_fact_id,),
+                            )
+
+                        if rel_type.lower() == "pref_name":
+                            cur.execute(
+                                "UPDATE entity_aliases SET is_preferred = false "
+                                "WHERE user_id = %s AND entity_id = %s",
+                                (user_id, correction_subject),
+                            )
+                            _corrected_obj_display = _canonical_to_display.get(
+                                correction_object, correction_object)
+                            cur.execute(
+                                "INSERT INTO entity_aliases (user_id, entity_id, alias, is_preferred) "
+                                "VALUES (%s, %s, %s, true) "
+                                "ON CONFLICT (user_id, alias) DO UPDATE SET "
+                                "entity_id = EXCLUDED.entity_id, is_preferred = true",
+                                (user_id, correction_subject, _corrected_obj_display),
                             )
 
                     db.commit()
