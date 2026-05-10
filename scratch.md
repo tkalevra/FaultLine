@@ -27,10 +27,6 @@ instruction header stays; only the dialogue and state sections get archived.
 
 ---
 
-# deepseek
-
-**To fix:** See **dprompt-18.md** — Birthday fact filtered by sensitivity penalty. Need to add age-related terms to `_SENSITIVE_TERMS` in `/query` endpoint.
-
 ---
 
 ## Current State (2026-05-11)
@@ -54,7 +50,7 @@ instruction header stays; only the dialogue and state sections get archived.
 ### Known gaps
 
 - **Domain-agnostic retrieval**: System facts (subject="system") not reachable via graph traversal unless system entity is linked to user.
-- **Birthday relevance scoring**: `born_on` facts killed by sensitivity penalty (-0.5) when query uses "how old" instead of "born"/"birth". `_SENSITIVE_TERMS` needs `"old"` and `"age"` added.
+- **Birthday relevance scoring**: FIXED 2026-05-11 — `"old"`, `"age"`, `"how old"` added to `_SENSITIVE_TERMS` in filter's `calculate_relevance_score()`. See dprompt-18.
 - **entity_aliases cleanup**: Startup deletes/recreates aliases on restart with pre-existing mixed data. Not a regression.
 - **Docker bridge**: Firewalld blocks bridge forwarding on dev host. `docker-compose-dev.yml` uses host networking.
 

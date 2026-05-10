@@ -14,7 +14,7 @@ User's query: `"how old am I?"` → No match in `_SENSITIVE_TERMS` → penalty a
 
 ## Fix
 
-**File:** `src/api/main.py`, `/query` endpoint (around line 1698)
+**File:** `openwebui/faultline_tool.py`, `calculate_relevance_score()` method
 
 **Change:**
 ```python
