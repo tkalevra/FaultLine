@@ -409,21 +409,32 @@ Awaiting direction on fix (likely: make `_resolve_display_names()` fall back to 
 
 ---
 
-## #deepseek NEXT: dprompt-32b — Conflict Resolution System (Self-Healing Name Collisions)
+## ✓ DONE: dprompt-32b (Conflict Resolution System) — 2026-05-12
 
-**CRITICAL PRODUCTION FIX: Name collisions break display resolution. Implement non-destructive conflict handling.**
+- Created `migrations/021_name_conflicts.sql` — entity_name_conflicts table with UNIQUE constraint + indexes
+- Updated `src/entity_registry/registry.py`: `register_alias()` detects collisions, stores them as pending, inserts alias as non-preferred for new entity
+- Added `registry.get_any_alias()` — fallback to non-preferred aliases when preferred name missing
+- Updated `src/re_embedder/embedder.py`: `resolve_name_conflicts()` evaluates pending conflicts via LLM context, assigns winner/loser with fallback aliases
+- Added `_llm_resolve_conflict()` — LLM-powered entity disambiguation with JSON response parsing
+- Integrated conflict resolution into re-embedder main loop (after ontology evaluation, before expiry)
+- Updated `src/api/main.py`: `_resolve_display_names()` falls back to non-preferred aliases via `get_any_alias()` when preferred name is a UUID
+- Test suite: 111 passed, 30 skipped, 0 regressions
+- Non-destructive: all names preserved, only preferred status changes
 
-- **Prompt:** `dprompt-32b.md`
-- **Spec reference:** `dprompt-32.md`
-- **Issue:** When two entities claim same pref_name (user="gabby", child="gabby"), only one can be marked preferred. Loser entity becomes invisible in /query.
-- **Solution:** entity_name_conflicts table + re-embedder LLM-powered resolution
-- **Constraint:** Non-destructive. All names preserved; re-embedder assigns unique preferred names via LLM context.
-- **Completion:** Update scratch, then STOP and wait for direction
+**System is now self-healing for name collisions.**
 
-**Implementation order:**
-1. migrations/021_name_conflicts.sql (schema)
-2. src/entity_registry/registry.py (collision detection at ingest)
-3. src/re_embedder/embedder.py (resolve_name_conflicts + LLM resolver)
-4. src/api/main.py (fallback alias resolution in /query)
+---
 
-**After dprompt-32b:** Test suite will be rewritten for full-path validation (ingest → conflict → resolve → query cycles).
+## #deepseek NEXT: dprompt-33b — Full-Path Integration Test Suite
+
+**Unit tests missed the Gabriella bug. We're rewriting the test suite from unit-level to full-path integration validation.**
+
+- **Prompt:** `dprompt-33b.md`
+- **Spec reference:** `dprompt-33.md`
+- **Deliverable:** `tests/api/test_suite_full_path.py` with 23 full-path scenarios
+- **Key pattern:** Setup → Ingest → Collision check (if applicable) → Re-embedder cycle → Query verify → Assert
+- **Coverage:** base integration (5), collision+resolution (6), hierarchy+graph (4), sensitivity+novel (4), idempotency+edge (4)
+- **Constraint:** Tests only, no code changes. Full cycles, no mocking the pipeline.
+- **Completion:** Update scratch with template from dprompt-33b.md "Upon Completion", then STOP and wait for direction
+
+**Why this matters:** dprompt-29b and dprompt-30b validated components independently. Gabriella bug lived in the integration layer. Full-path tests run the complete pipeline: ingest → collision → resolve → query. That's where bugs hide. That's where we catch them now.
