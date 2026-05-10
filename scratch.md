@@ -457,17 +457,16 @@ Awaiting direction on fix (likely: make `_resolve_display_names()` fall back to 
 
 ---
 
-## #claude: Pre-Prod Validation (2026-05-10)
+## #deepseek NEXT: dprompt-34b — Pre-Prod Validation (Full-Path Tests)
 
-**Status:** Database wiped. Ready for full-path test run.
+**Database ready:** Wiped on truenas. Schema dropped and recreated.
 
-**Blocker:** PostgreSQL on truenas not accepting direct TCP connections. Need clarification:
-1. Should I use SSH tunnel (forwarding 5432)?
-2. Should I run tests via docker exec inside faultline container?
-3. Is there a different exposed port/hostname?
+- **Prompt:** `dprompt-34b.md`
+- **Spec reference:** `dprompt-34.md`
+- **Deliverable:** Run all 23 full-path scenarios against PostgreSQL on truenas; manual validation of natural queries
+- **Key setup:** SSH tunnel `ssh -L 5433:localhost:5432 truenas`, POSTGRES_DSN points to localhost:5433
+- **Constraint:** All 23 must pass. Zero failures. If any fail: document and stop (no fixes).
+- **Validation:** "What's my family" query returns all family entities with preferred names (no UUIDs, no missing)
+- **Completion:** Update scratch with template from dprompt-34b.md "Upon Completion", commit log file to git, then STOP and wait for direction
 
-**Also clarify test scope:** For "What's my family" validation:
-- Run full-path tests with seeded data → query via `/query` endpoint? (unit-level validation)
-- Or test via live OpenWebUI Filter against instance? (integration validation)
-
-Awaiting direction on connection method + test strategy.
+**Why this matters:** Unit tests said production-ready. Gabriella bug proved otherwise. Pre-prod validation confirms dprompt-32b fix works: collisions detected, LLM-resolved, entities visible. All 23 passing = system is shippable.
