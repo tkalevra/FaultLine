@@ -27,6 +27,12 @@ instruction header stays; only the dialogue and state sections get archived.
 
 ---
 
+# deepseek
+
+**To fix:** See **dprompt-18.md** — Birthday fact filtered by sensitivity penalty. Need to add age-related terms to `_SENSITIVE_TERMS` in `/query` endpoint.
+
+---
+
 ## Current State (2026-05-11)
 
 ### What's built and verified
@@ -47,8 +53,8 @@ instruction header stays; only the dialogue and state sections get archived.
 
 ### Known gaps
 
-- **Domain-agnostic retrieval**: System facts (subject="system") not reachable via graph traversal unless system entity is linked to user. Aurura query returns 0 facts in test env.
-- **`inlet ...\npost`**: No such endpoint — filter calls `/extract` then `/ingest`, not `/inlet post`. Verify pre-prod OpenWebUI filter valve configuration.
+- **Domain-agnostic retrieval**: System facts (subject="system") not reachable via graph traversal unless system entity is linked to user.
+- **Birthday relevance scoring**: `born_on` facts killed by sensitivity penalty (-0.5) when query uses "how old" instead of "born"/"birth". `_SENSITIVE_TERMS` needs `"old"` and `"age"` added.
 - **entity_aliases cleanup**: Startup deletes/recreates aliases on restart with pre-existing mixed data. Not a regression.
 - **Docker bridge**: Firewalld blocks bridge forwarding on dev host. `docker-compose-dev.yml` uses host networking.
 
@@ -68,9 +74,3 @@ instruction header stays; only the dialogue and state sections get archived.
 | `src/entity_registry/registry.py` | `resolve("user")` surrogate, `_is_valid_uuid()` |
 | `migrations/018_ontology_evaluations.sql` | NEW |
 | `tests/api/test_query_compound.py` | NEW |
-
----
-
-# deepseek
-
-**Validation task:** See **validate-birthday-persistence.md** for debugging birthday fact retrieval across chats. Brief summary: User provided birthday in Chat 1, new Chat 2 says "I don't know." Trace whether it's in storage (PostgreSQL/Qdrant), retrieval (`/query`), or injection (Filter).

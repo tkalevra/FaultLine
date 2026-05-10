@@ -783,7 +783,7 @@ class Filter:
 
         # 3. Sensitivity penalty (-0.5 if sensitive rel_type and not explicitly requested)
         _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
-        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy"}
+        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy", "old", "age", "how old"}
         if fact.get("rel_type") in _SENSITIVE_RELS:
             explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
             if not explicitly_asked:
