@@ -2842,6 +2842,51 @@ def query(request: QueryRequest):
         except Exception:
             return cleaned
 
+    def _build_entity_types(pns: dict) -> dict:
+        """Build entity_types dict parallel to preferred_names.
+
+        Maps entity_id (UUID or display string) → entity_type from the entities table.
+        For UUID keys: batch query the entities table directly.
+        For non-UUID keys: resolve via entity_aliases → entities JOIN.
+        Graceful degradation: returns empty dict on DB error.
+        """
+        entity_types = {}
+        if not db:
+            return entity_types
+
+        # UUID-keyed entries: batch query entities table
+        _uuid_keys_in_pns = [k for k in pns if _UUID_PATTERN.match(str(k))]
+        if _uuid_keys_in_pns:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, entity_type FROM entities "
+                        "WHERE user_id = %s AND id = ANY(%s)",
+                        (user_id, _uuid_keys_in_pns),
+                    )
+                    for entity_id, etype in cur.fetchall():
+                        entity_types[entity_id] = etype or "unknown"
+            except Exception:
+                pass  # graceful — missing entity_types is non-fatal
+
+        # Non-UUID keys (display-name strings): resolve via entity_aliases → entities
+        _non_uuid_keys = [k for k in pns if not _UUID_PATTERN.match(str(k))]
+        if _non_uuid_keys:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT ea.alias, COALESCE(e.entity_type, 'unknown') "
+                        "FROM entity_aliases ea "
+                        "LEFT JOIN entities e ON e.id = ea.entity_id AND e.user_id = ea.user_id "
+                        "WHERE ea.user_id = %s AND ea.alias = ANY(%s)",
+                        (user_id, _non_uuid_keys),
+                    )
+                    for alias, etype in cur.fetchall():
+                        entity_types[alias] = etype or "unknown"
+            except Exception:
+                pass
+        return entity_types
+
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
         Convert entity_attributes to facts format for injection.
@@ -3255,11 +3300,13 @@ def query(request: QueryRequest):
                 if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                     preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+        entity_types = _build_entity_types(preferred_names)
         return {
             "status": "ok",
             "facts": merged_facts,
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
+            "entity_types": entity_types,
             "attributes": attributes,
         }
 
@@ -3297,11 +3344,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+            entity_types_404 = _build_entity_types(preferred_names)
             return {
                     "status": "ok",
                     "facts": merged_facts,
                     "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
+                    "entity_types": entity_types_404,
                     "attributes": attributes,
                 }
         if resp.status_code != 200:
@@ -3332,11 +3381,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+            entity_types_err = _build_entity_types(preferred_names)
             return {
                     "status": "ok",
                     "facts": merged_facts,
                     "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
+                    "entity_types": entity_types_err,
                     "attributes": attributes,
                 }
 
@@ -3458,11 +3509,13 @@ def query(request: QueryRequest):
             for _k in _INTERNAL_KEYS:
                 _f.pop(_k, None)
 
+        entity_types = _build_entity_types(preferred_names)
         return {
             "status": "ok",
             "facts": merged_facts,
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
+            "entity_types": entity_types,
             "attributes": attributes,
         }
     except Exception as e:
@@ -3470,6 +3523,7 @@ def query(request: QueryRequest):
         return {
             "status": "ok",
             "facts": [],
+            "entity_types": {},
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
             "attributes": {},
