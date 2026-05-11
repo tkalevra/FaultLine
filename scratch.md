@@ -82,3 +82,34 @@ then condense the remaining content to a concise current state summary.
 
 ---
 
+
+## 🐛 CRITICAL: dBug-report-006 (Query Response Validation)
+
+#claude: Validated family query response against pre-prod database. Found **genuine bugs**:
+
+### Investigation Results
+- **Staged facts:** owns morkie + owns fraggle (violates dprompt-58 constraint)
+- **Committed facts:** Bidirectional impossibilities (Des, Cyrus both child_of AND parent_of user)
+- **Spouse facts:** 3 stored, should be 1 (should keep conf=1 only)
+- **UUID exposure:** "7E4Bff75-706E-mix" in response (Fraggle UUID, should be hidden)
+- **Pet logic:** Morkie shown as separate dog when should be type-only
+
+### Root Causes
+- dprompt-58 constraint applies to facts table only, not staged_facts
+- dprompt-59 conflict detection incomplete for staged patterns
+- No bidirectional relationship validation
+- dprompt-61 dedup may not handle staged facts
+- Response builder exposing UUIDs
+
+### Pre-Prod Cleanup (Done)
+```
+DELETE 2 conflicting staged facts (owns morkie, owns fraggle)
+DELETE 3 bidirectional impossible parent_of facts
+DELETE 2 lower-confidence spouse facts
+```
+
+**Status:** dBug-report-006 written + committed. Pre-prod cleaned.
+
+**Next:** dprompt-62 (staged fact validation + bidirectional rules).
+
+---
