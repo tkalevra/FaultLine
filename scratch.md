@@ -25,6 +25,33 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
+---
+
+## #deepseek NEXT TASK: dprompt-68 (MCP Server Wrapper)
+
+**Read:** dprompt-68b.md completely before starting.
+
+**Summary:** Create MCP server wrapper for FaultLine. Implement 5 tools (extract, ingest, query, retract, store_context) that expose existing FastAPI endpoints via MCP protocol.
+
+**CRITICAL:**
+- DEV BRANCH ONLY — create new files in `src/mcp/` and `tests/mcp/`
+- NO EXISTING FILE MODIFICATIONS
+- NO GIT COMMITS — work in progress only, user will decide
+- Follow dprompt-68b.md execution sequence exactly
+- All tests must pass (new + existing)
+
+**Deliverables:**
+- src/mcp/server.py
+- src/mcp/tools.py
+- src/mcp/__init__.py
+- mcp_server.py
+- tests/mcp/test_server.py
+- Update this scratch.md with completion status
+
+**When done:** Update scratch.md with status, then STOP and await user review.
+
+---
+
 ## Current State (2026-05-13 evening)
 
 ### Production (GitHub: tkalevra/FaultLine)
