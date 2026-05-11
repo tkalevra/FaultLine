@@ -123,7 +123,7 @@ class Function:
 
         FAULTLINE_URL: str = "http://faultline:8001"
         FAULTLINE_TIMEOUT: int = 20
-        QWEN_URL: str = os.getenv("QWEN_URL", "http://192.168.40.20:1234/v1/chat/completions")
+        QWEN_URL: str = os.getenv("QWEN_URL", "http://localhost:11434/v1/chat/completions")
         QWEN_MODEL: str = "qwen/qwen3.5-9b"
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"

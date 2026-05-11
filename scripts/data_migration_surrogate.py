@@ -9,7 +9,7 @@ import os
 import uuid
 import psycopg2
 
-DSN = os.environ.get("POSTGRES_DSN", "postgresql://faultline:faultline@192.168.40.10:5432/faultline_test")
+DSN = os.environ.get("POSTGRES_DSN", "postgresql://faultline:faultline@localhost:5432/faultline_test")
 USER_ID = "3f8e6836-72e3-43d4-bbc5-71fc8668b070"
 
 def make_surrogate(user_id: str, name: str) -> str:

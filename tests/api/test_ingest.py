@@ -33,7 +33,12 @@ def client(mock_model):
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    data = r.json()
+    assert "status" in data
+    assert data["status"] in ("ok", "degraded", "unhealthy")
+    assert "database" in data
+    assert "qdrant" in data
+    assert "llm" in data
 
 
 def test_ingest_extract_only(client):

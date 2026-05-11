@@ -121,6 +121,7 @@ REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
 - pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). For first-person preferences ("I prefer to be called X", "call me X"), subject IS "user". For third-person ("she goes by X", "his preferred name is Y"), subject is the named person.
 - is_a: type or category. has_pet: person owns an animal (NEVER a person).
+- member_of: entity belongs to a taxonomy group. Use when user states membership ("my pets are family" → subject=pet_entity, object="family", rel_type="member_of"). Object is the taxonomy group name.
 - Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
 - Use snake_case. Other types allowed if none fit.
 

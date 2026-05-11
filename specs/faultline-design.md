@@ -127,7 +127,7 @@ Expected: FAIL
 import httpx
 
 class SchemaOracleService:
-    ENDPOINT = os.getenv('QWEN_ENDPOINT', "http://192.168.40.20:1234/v1/chat/completions")
+    ENDPOINT = os.getenv('QWEN_ENDPOINT', "http://localhost:11434/v1/chat/completions")
     
     @staticmethod
     def classify_edge(message_content: str, endpoint: str | None) -> dict:

@@ -54,6 +54,8 @@ _IDENTITY_STOPWORDS = {
 # _SCALAR_REL_TYPES removed — replaced by classify_fact_type() which uses
 # value-driven heuristics + DB-driven ontology hints (rel_types.tail_types).
 
+
+
 _UUID_PATTERN = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
     re.IGNORECASE
@@ -72,6 +74,27 @@ _CLASS_B_REL_TYPES = frozenset({
     "educated_at", "owns", "likes", "dislikes", "prefers",
     "friend_of", "knows", "met", "located_in",
     "related_to", "has_pet", "part_of", "created_by",
+})
+
+# ── dprompt-27: Graph + Hierarchy traversal systems ────────────────────────
+# Two orthogonal traversal systems (dprompt-26 architecture):
+#   GRAPH:     connectivity — who am I connected to?
+#   HIERARCHY: composition + classification — what are they, what do they belong to?
+
+_REL_TYPE_GRAPH = frozenset({
+    # Direct connection to user / between entities
+    "spouse", "parent_of", "child_of", "sibling_of",
+    "has_pet", "knows", "friend_of", "met",
+    "works_for", "lives_at", "lives_in", "located_in",
+    "owns", "educated_at", "member_of",
+    # Self-referential (identity anchors)
+    "pref_name", "also_known_as", "same_as",
+    "age", "height", "weight", "born_on", "nationality",
+    "has_gender", "occupation",
+})
+
+_REL_TYPE_HIERARCHY = frozenset({
+    "instance_of", "subclass_of", "part_of", "is_a", "member_of",
 })
 
 _VALID_CATEGORIES = frozenset({
@@ -252,7 +275,7 @@ _EMERGENCY_CONSTRAINT = (
     "parent_of|child_of|spouse|sibling_of|also_known_as|pref_name|same_as|"
     "related_to|likes|dislikes|prefers|owns|located_in|educated_at|"
     "nationality|occupation|born_on|age|knows|friend_of|met|"
-    "lives_in|born_in|has_gender|has_pet|lives_at|located_at|height|weight"
+    "lives_in|born_in|has_gender|has_pet|lives_at|located_at|height|weight|member_of"
 )
 
 def _get_constraint() -> str:
@@ -313,7 +336,8 @@ def _commit_staged(
     count = 0
     try:
         with db_conn.cursor() as cur:
-            for user_id, subject, obj, rel_type, prov in rows:
+            for row in rows:
+                user_id, subject, obj, rel_type, prov = row[0], row[1], row[2], row[3], row[4]
                 cur.execute(
                     "INSERT INTO staged_facts"
                     " (user_id, subject_id, object_id, rel_type, fact_class,"
@@ -355,7 +379,7 @@ def _cleanup_entity_aliases_startup(dsn: str) -> None:
                 # Find entity_aliases with string entity_ids (not UUID, not 'user')
                 cur.execute("""
                     SELECT COUNT(*) FROM entity_aliases
-                    WHERE entity_id NOT LIKE '%-%-%-%-' AND entity_id != 'user'
+                    WHERE entity_id NOT LIKE '%-%-%-%-%' AND entity_id != 'user'
                 """)
                 bad_count = cur.fetchone()[0]
 
@@ -371,7 +395,7 @@ def _cleanup_entity_aliases_startup(dsn: str) -> None:
                 # with proper UUID entity_ids via registry.register_alias()
                 cur.execute("""
                     DELETE FROM entity_aliases
-                    WHERE entity_id NOT LIKE '%-%-%-%-' AND entity_id != 'user'
+                    WHERE entity_id NOT LIKE '%-%-%-%-%' AND entity_id != 'user'
                 """)
                 deleted = cur.rowcount
                 conn.commit()
@@ -400,17 +424,17 @@ def _normalize_entity_ids_startup(dsn: str) -> None:
                 # normalization — their objects are display names, not entity references.
                 cur.execute("""
                     SELECT DISTINCT user_id, subject_id FROM facts
-                    WHERE subject_id NOT LIKE '%-%-%-%-'
+                    WHERE subject_id NOT LIKE '%-%-%-%-%'
                     UNION
                     SELECT DISTINCT user_id, object_id FROM facts
-                    WHERE object_id NOT LIKE '%-%-%-%-'
+                    WHERE object_id NOT LIKE '%-%-%-%-%'
                       AND rel_type NOT IN ('also_known_as', 'pref_name')
                     UNION
                     SELECT DISTINCT user_id, subject_id FROM staged_facts
-                    WHERE subject_id NOT LIKE '%-%-%-%-'
+                    WHERE subject_id NOT LIKE '%-%-%-%-%'
                     UNION
                     SELECT DISTINCT user_id, object_id FROM staged_facts
-                    WHERE object_id NOT LIKE '%-%-%-%-'
+                    WHERE object_id NOT LIKE '%-%-%-%-%'
                       AND rel_type NOT IN ('also_known_as', 'pref_name')
                 """)
                 string_ids = cur.fetchall()
@@ -530,6 +554,13 @@ def _ensure_schema(dsn: str) -> None:
                     ("has_pet", "Has Pet", "pets", "supersede"),
                     ("height", "Height", "physical", "supersede"),
                     ("weight", "Weight", "physical", "supersede"),
+                    ("has_ip", "Has IP Address", "system", "supersede"),
+                    ("has_os", "Has Operating System", "system", "supersede"),
+                    ("has_hostname", "Has Hostname", "system", "supersede"),
+                    ("hostname", "Hostname", "system", "supersede"),
+                    ("fqdn", "Fully Qualified Domain Name", "system", "supersede"),
+                    ("ip_address", "IP Address", "system", "supersede"),
+                    ("member_of", "Member Of", "identity", "supersede"),
                 ]
                 for rel_type, label, category, correction_behavior in _MISSING_TYPES:
                     cur.execute(
@@ -538,15 +569,510 @@ def _ensure_schema(dsn: str) -> None:
                         "ON CONFLICT (rel_type) DO NOTHING",
                         (rel_type, label, category, correction_behavior),
                     )
+
+                # ── Migration 019: entity_taxonomies (data-driven grouping system) ──
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS entity_taxonomies (
+                        id BIGSERIAL PRIMARY KEY,
+                        taxonomy_name VARCHAR(64) NOT NULL UNIQUE,
+                        description TEXT,
+                        member_entity_types TEXT[] NOT NULL DEFAULT '{}',
+                        rel_types_defining_group TEXT[] NOT NULL DEFAULT '{}',
+                        has_transitivity BOOLEAN DEFAULT false,
+                        transitive_rel_types TEXT[] DEFAULT '{}',
+                        is_hierarchical BOOLEAN DEFAULT false,
+                        parent_rel_type VARCHAR(64),
+                        source VARCHAR(32) DEFAULT 'seeded',
+                        created_at TIMESTAMP DEFAULT now()
+                    )
+                """)
+
+                # Pre-seed core taxonomies (idempotent — ON CONFLICT DO NOTHING)
+                _CORE_TAXONOMIES = [
+                    ("family", "Nuclear family members linked by kinship relationships",
+                     ["Person"], ["parent_of", "child_of", "spouse", "sibling_of"], True,
+                     ["lives_in", "lives_at", "works_for", "has_pet", "pref_name", "also_known_as", "age", "born_on", "occupation", "nationality"],
+                     False, None),
+                    ("household", "Entities living in the same residence — people and animals",
+                     ["Person", "Animal"], ["lives_at", "lives_in", "member_of"], True,
+                     ["has_pet", "spouse", "parent_of", "child_of", "sibling_of", "pref_name", "also_known_as", "works_for"],
+                     False, None),
+                    ("work", "Employment, team, and organizational relationships",
+                     ["Person", "Organization"], ["works_for", "part_of", "reports_to"], True,
+                     ["located_in", "occupation", "educated_at", "pref_name", "also_known_as", "lives_in"],
+                     False, None),
+                    ("location", "Geographic and spatial containment hierarchies",
+                     ["Location"], ["located_in", "located_at", "lives_in", "lives_at"], True,
+                     ["works_for", "educated_at", "born_in"],
+                     True, "located_in"),
+                    ("computer_system", "IT infrastructure, hardware, and software component hierarchies",
+                     ["Concept", "Object"], ["instance_of", "has_component", "part_of"], True,
+                     ["located_in", "created_by", "hostname", "fqdn", "ip_address", "has_ram", "has_storage", "expires_on"],
+                     True, "part_of"),
+                ]
+                for name, desc, member_types, def_rels, trans, trans_rels, hier, parent in _CORE_TAXONOMIES:
+                    cur.execute(
+                        "INSERT INTO entity_taxonomies (taxonomy_name, description, member_entity_types,"
+                        " rel_types_defining_group, has_transitivity, transitive_rel_types,"
+                        " is_hierarchical, parent_rel_type, source)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'seeded')"
+                        " ON CONFLICT (taxonomy_name) DO NOTHING",
+                        (name, desc, member_types, def_rels, trans, trans_rels, hier, parent),
+                    )
+
+
+
                 conn.commit()
                 log.info("startup.schema_check_complete")
     except Exception as e:
         log.warning("startup.schema_check_failed", error=str(e))
 
 
+# ── Entity Taxonomies (dprompt-20) ───────────────────────────────────────────
+# Data-driven grouping system — replaces brittle hardcoded extraction patterns.
+
+_TAXONOMY_CACHE: list[dict] = []
+
+
+def _load_taxonomies(dsn: str) -> list[dict]:
+    """Load all entity taxonomies from DB. Called at startup."""
+    global _TAXONOMY_CACHE
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_name = 'entity_taxonomies'
+                    )
+                """)
+                if not cur.fetchone()[0]:
+                    return []
+                cur.execute(
+                    "SELECT taxonomy_name, description, member_entity_types,"
+                    " rel_types_defining_group, has_transitivity, transitive_rel_types,"
+                    " is_hierarchical, parent_rel_type, source"
+                    " FROM entity_taxonomies ORDER BY taxonomy_name"
+                )
+                taxonomies = [
+                    {
+                        "taxonomy_name": row[0],
+                        "description": row[1],
+                        "member_entity_types": row[2] or [],
+                        "rel_types_defining_group": row[3] or [],
+                        "has_transitivity": row[4],
+                        "transitive_rel_types": row[5] or [],
+                        "is_hierarchical": row[6],
+                        "parent_rel_type": row[7],
+                        "source": row[8],
+                    }
+                    for row in cur.fetchall()
+                ]
+                _TAXONOMY_CACHE = taxonomies
+                log.info("startup.taxonomies_loaded", count=len(taxonomies))
+                return taxonomies
+    except Exception as e:
+        log.warning("startup.taxonomies_load_failed", error=str(e))
+        return []
+
+
+def _apply_taxonomy_rules(
+    rows: list[tuple],
+    user_id: str,
+    db_conn,
+) -> list[tuple]:
+    """
+    Given ingest rows, check each fact against registered taxonomies.
+    Returns the same rows unchanged — taxonomy context is for Phase 3 query expansion.
+    Does NOT change fact_class or storage path.
+    """
+    global _TAXONOMY_CACHE
+
+    taxonomies = _TAXONOMY_CACHE
+    if not taxonomies or not rows:
+        return rows
+
+    for i, row in enumerate(rows):
+        user_id_row, subject, obj, rel_type, source, is_pref, fact_class, confidence, is_engine = row
+        rt_lower = rel_type.lower().strip() if rel_type else ""
+
+        for tax in taxonomies:
+            def_rels = [r.lower() for r in tax.get("rel_types_defining_group", [])]
+            if rt_lower in def_rels:
+                log.info(
+                    "taxonomy.match",
+                    rel_type=rt_lower,
+                    taxonomy=tax["taxonomy_name"],
+                    subject=subject,
+                    object=obj,
+                )
+                break
+
+    return rows
+
+
+def _llm_suggest_taxonomy(
+    subject: str,
+    rel_type: str,
+    obj: str,
+    qwen_api_url: str,
+    db_conn,
+) -> dict | None:
+    """
+    Ask the LLM whether a novel rel_type defines a group membership taxonomy.
+    Returns a dict for INSERT into entity_taxonomies, or None.
+    Deferred enhancement — returns None for now.
+    """
+    return None
+
+
+def _fetch_transitive_members(
+    db_conn,
+    user_id: str,
+    taxonomy_name: str,
+) -> set[str]:
+    """
+    Given a taxonomy name (e.g., 'family'), return all entity UUIDs that are
+    transitive members — direct relations PLUS entities reachable via
+    transitive_rel_types from direct members.
+    """
+    tax = None
+    for t in _TAXONOMY_CACHE:
+        if t["taxonomy_name"] == taxonomy_name:
+            tax = t
+            break
+    if not tax or not tax.get("has_transitivity"):
+        return set()
+
+    try:
+        with db_conn.cursor() as cur:
+            # Direct members: entities related to user via defining rel_types
+            cur.execute(
+                "SELECT DISTINCT object_id FROM facts"
+                " WHERE user_id = %s AND subject_id = %s"
+                " AND rel_type = ANY(%s)"
+                " AND superseded_at IS NULL",
+                (user_id, user_id, tax["rel_types_defining_group"]),
+            )
+            direct = {row[0] for row in cur.fetchall()}
+
+            # Also include from staged_facts
+            cur.execute(
+                "SELECT DISTINCT object_id FROM staged_facts"
+                " WHERE user_id = %s AND subject_id = %s"
+                " AND rel_type = ANY(%s)",
+                (user_id, user_id, tax["rel_types_defining_group"]),
+            )
+            direct.update(row[0] for row in cur.fetchall())
+
+            if not direct:
+                return set()
+
+            # Transitive members: for each direct member, find entities via transitive_rel_types
+            transitive = set()
+            trans_rels = tax.get("transitive_rel_types", [])
+            if trans_rels:
+                # Use a batch query approach for efficiency
+                member_list = list(direct)
+                cur.execute(
+                    "SELECT DISTINCT object_id FROM facts"
+                    " WHERE user_id = %s AND subject_id = ANY(%s)"
+                    " AND rel_type = ANY(%s)"
+                    " AND superseded_at IS NULL",
+                    (user_id, member_list, trans_rels),
+                )
+                transitive.update(row[0] for row in cur.fetchall())
+
+                cur.execute(
+                    "SELECT DISTINCT object_id FROM staged_facts"
+                    " WHERE user_id = %s AND subject_id = ANY(%s)"
+                    " AND rel_type = ANY(%s)",
+                    (user_id, member_list, trans_rels),
+                )
+                transitive.update(row[0] for row in cur.fetchall())
+
+            all_members = direct | transitive
+            log.info(
+                "taxonomy.transitive_members",
+                taxonomy=taxonomy_name,
+                direct_count=len(direct),
+                transitive_count=len(transitive),
+                total=len(all_members),
+            )
+            return all_members
+    except Exception as e:
+        log.warning("taxonomy.transitive_members_failed", error=str(e), taxonomy=taxonomy_name)
+        return set()
+
+
+def _graph_traverse(
+    db_conn,
+    user_id: str,
+    entity_id: str,
+    max_hops: int = 1,
+    graph_rel_types: frozenset = _REL_TYPE_GRAPH,
+) -> set[str]:
+    """
+    Single-hop graph traversal — find all entities directly connected to entity_id
+    via rel_types in graph_rel_types. Searches both facts and staged_facts.
+
+    Returns set of connected entity UUIDs (does NOT include the starting entity).
+    """
+    connected: set[str] = set()
+    graph_rels = list(graph_rel_types)
+    try:
+        with db_conn.cursor() as cur:
+            # Find entities where entity_id is the subject
+            cur.execute(
+                "SELECT DISTINCT object_id FROM facts"
+                " WHERE user_id = %s AND subject_id = %s"
+                " AND rel_type = ANY(%s)"
+                " AND superseded_at IS NULL",
+                (user_id, entity_id, graph_rels),
+            )
+            connected.update(row[0] for row in cur.fetchall())
+
+            # Find entities where entity_id is the object
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM facts"
+                " WHERE user_id = %s AND object_id = %s"
+                " AND rel_type = ANY(%s)"
+                " AND superseded_at IS NULL",
+                (user_id, entity_id, graph_rels),
+            )
+            connected.update(row[0] for row in cur.fetchall())
+
+            # Also search staged_facts
+            cur.execute(
+                "SELECT DISTINCT object_id FROM staged_facts"
+                " WHERE user_id = %s AND subject_id = %s"
+                " AND rel_type = ANY(%s)",
+                (user_id, entity_id, graph_rels),
+            )
+            connected.update(row[0] for row in cur.fetchall())
+
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM staged_facts"
+                " WHERE user_id = %s AND object_id = %s"
+                " AND rel_type = ANY(%s)",
+                (user_id, entity_id, graph_rels),
+            )
+            connected.update(row[0] for row in cur.fetchall())
+
+        connected.discard(entity_id)  # Don't include self
+        return connected
+    except Exception as e:
+        log.warning("graph_traverse.failed", error=str(e), entity_id=entity_id)
+        return set()
+
+
+def _hierarchy_expand(
+    db_conn,
+    user_id: str,
+    entity_id: str,
+    direction: str = "up",
+    max_depth: int = 3,
+) -> set[str]:
+    """
+    Traverse hierarchy chains from entity_id via _REL_TYPE_HIERARCHY rel_types.
+    Uses SQL CTE (WITH RECURSIVE) with cycle protection via depth tracking.
+
+    direction="up":  entity → instance_of/subclass_of → parent class (classification chain)
+    direction="down": class → instance_of/subclass_of → members (class membership)
+
+    Returns set of entity UUIDs in the chain (includes the starting entity).
+    """
+    hier_rels = list(_REL_TYPE_HIERARCHY)
+    chain: set[str] = {entity_id}
+
+    try:
+        with db_conn.cursor() as cur:
+            if direction == "up":
+                cur.execute("""
+                    WITH RECURSIVE hierarchy_chain AS (
+                        SELECT subject_id, object_id, rel_type, 1 AS depth
+                        FROM facts
+                        WHERE user_id = %s AND subject_id = %s
+                          AND rel_type = ANY(%s)
+                          AND superseded_at IS NULL
+
+                        UNION ALL
+
+                        SELECT f.subject_id, f.object_id, f.rel_type, hc.depth + 1
+                        FROM facts f
+                        JOIN hierarchy_chain hc ON f.subject_id = hc.object_id
+                        WHERE f.user_id = %s
+                          AND f.rel_type = ANY(%s)
+                          AND f.superseded_at IS NULL
+                          AND hc.depth < %s
+                    )
+                    SELECT DISTINCT object_id FROM hierarchy_chain
+                """, (user_id, entity_id, hier_rels, user_id, hier_rels, max_depth))
+                chain.update(row[0] for row in cur.fetchall())
+
+                # Also search staged_facts
+                cur.execute("""
+                    WITH RECURSIVE hierarchy_chain AS (
+                        SELECT subject_id, object_id, rel_type, 1 AS depth
+                        FROM staged_facts
+                        WHERE user_id = %s AND subject_id = %s
+                          AND rel_type = ANY(%s)
+
+                        UNION ALL
+
+                        SELECT f.subject_id, f.object_id, f.rel_type, hc.depth + 1
+                        FROM staged_facts f
+                        JOIN hierarchy_chain hc ON f.subject_id = hc.object_id
+                        WHERE f.user_id = %s
+                          AND f.rel_type = ANY(%s)
+                          AND hc.depth < %s
+                    )
+                    SELECT DISTINCT object_id FROM hierarchy_chain
+                """, (user_id, entity_id, hier_rels, user_id, hier_rels, max_depth))
+                chain.update(row[0] for row in cur.fetchall())
+
+            elif direction == "down":
+                cur.execute("""
+                    WITH RECURSIVE hierarchy_chain AS (
+                        SELECT subject_id, object_id, rel_type, 1 AS depth
+                        FROM facts
+                        WHERE user_id = %s AND object_id = %s
+                          AND rel_type = ANY(%s)
+                          AND superseded_at IS NULL
+
+                        UNION ALL
+
+                        SELECT f.subject_id, f.object_id, f.rel_type, hc.depth + 1
+                        FROM facts f
+                        JOIN hierarchy_chain hc ON f.object_id = hc.subject_id
+                        WHERE f.user_id = %s
+                          AND f.rel_type = ANY(%s)
+                          AND f.superseded_at IS NULL
+                          AND hc.depth < %s
+                    )
+                    SELECT DISTINCT subject_id FROM hierarchy_chain
+                """, (user_id, entity_id, hier_rels, user_id, hier_rels, max_depth))
+                chain.update(row[0] for row in cur.fetchall())
+
+                cur.execute("""
+                    WITH RECURSIVE hierarchy_chain AS (
+                        SELECT subject_id, object_id, rel_type, 1 AS depth
+                        FROM staged_facts
+                        WHERE user_id = %s AND object_id = %s
+                          AND rel_type = ANY(%s)
+
+                        UNION ALL
+
+                        SELECT f.subject_id, f.object_id, f.rel_type, hc.depth + 1
+                        FROM staged_facts f
+                        JOIN hierarchy_chain hc ON f.object_id = hc.subject_id
+                        WHERE f.user_id = %s
+                          AND f.rel_type = ANY(%s)
+                          AND hc.depth < %s
+                    )
+                    SELECT DISTINCT subject_id FROM hierarchy_chain
+                """, (user_id, entity_id, hier_rels, user_id, hier_rels, max_depth))
+                chain.update(row[0] for row in cur.fetchall())
+
+        return chain
+    except Exception as e:
+        log.warning("hierarchy_expand.failed", error=str(e), entity_id=entity_id, direction=direction)
+        return {entity_id}
+
+
+# ── dprompt-41: Production Readiness ─────────────────────────────────────────
+
+def _validate_startup_config() -> dict:
+    """Validate required environment variables at startup. Raises RuntimeError on failure."""
+    required = {
+        "POSTGRES_DSN": os.environ.get("POSTGRES_DSN"),
+        "QDRANT_URL": os.environ.get("QDRANT_URL", "http://qdrant:6333"),
+        "QWEN_API_URL": os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions"),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        log.warning("startup.missing_env_vars", missing=missing,
+                    detail="Set these variables for full functionality. App will start but may be degraded.")
+
+    config = {
+        "postgres_dsn": "***",  # sanitized
+        "qdrant_url": required["QDRANT_URL"],
+        "qwen_api_url": required["QWEN_API_URL"],
+        "httpx_timeout": int(os.environ.get("HTTPX_TIMEOUT", "10")),
+        "db_timeout": int(os.environ.get("DB_TIMEOUT", "30")),
+        "qdrant_timeout": int(os.environ.get("QDRANT_TIMEOUT", "10")),
+        "db_pool_size": int(os.environ.get("DB_POOL_SIZE", "10")),
+        "rate_limit_per_min": int(os.environ.get("RATE_LIMIT_PER_MIN", "100")),
+    }
+    log.info("startup.config_validated", **{k: v for k, v in config.items() if k != "postgres_dsn"})
+    return config
+
+
+# In-memory health cache
+_health_cache: dict = {}
+_health_cache_ts: float = 0.0
+_embedder_stats: dict = {
+    "last_run": None, "facts_synced": 0, "facts_promoted": 0,
+    "facts_expired": 0, "error_count": 0, "last_error": None,
+}
+
+
+def _check_db_health(dsn: str) -> bool:
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def _check_qdrant_health(url: str) -> bool:
+    try:
+        resp = httpx.get(f"{url}/collections", timeout=2.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_llm_health(url: str) -> bool:
+    try:
+        resp = httpx.get(url.replace("/chat/completions", "/models"), timeout=2.0)
+        return resp.status_code in (200, 404)  # 404 = endpoint exists, just GET not supported
+    except Exception:
+        return False
+
+
+# Rate limiter: per-user_id tracking
+_RATE_TRACKER: dict[str, list[float]] = {}
+_RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "100"))
+
+
+def _check_rate_limit(user_id: str) -> bool:
+    now = __import__("time").time()
+    window = now - 60
+    _RATE_TRACKER.setdefault(user_id, [])
+    _RATE_TRACKER[user_id] = [t for t in _RATE_TRACKER[user_id] if t > window]
+    if len(_RATE_TRACKER[user_id]) >= _RATE_LIMIT:
+        return False
+    _RATE_TRACKER[user_id].append(now)
+    return True
+
+
+# Timeout helpers
+_HTTPX_TIMEOUT = int(os.environ.get("HTTPX_TIMEOUT", "10"))
+_DB_TIMEOUT = int(os.environ.get("DB_TIMEOUT", "30"))
+_QDRANT_TIMEOUT = int(os.environ.get("QDRANT_TIMEOUT", "10"))
+
+# ── End dprompt-41 ──────────────────────────────────────────────────────────
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _gliner2_model, _rel_type_registry, _rel_type_constraint, _REL_TYPE_META
+
+    # dprompt-41: validate startup config (fail fast)
+    _validate_startup_config()
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
@@ -561,6 +1087,7 @@ async def lifespan(app: FastAPI):
         _ensure_schema(dsn)  # apply pending migrations before reading the schema
         _cleanup_entity_aliases_startup(dsn)  # remove corrupted string entity_ids from entity_aliases
         _normalize_entity_ids_startup(dsn)  # normalize string entity_ids to UUIDs
+        _load_taxonomies(dsn)  # load entity_taxonomies cache for ingest/query
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
             _rel_type_registry.get_valid_types()
@@ -587,9 +1114,40 @@ app = FastAPI(title="FaultLine WGM", lifespan=lifespan)
 
 @app.get("/health")
 def health():
+    """Health check with dependency status. Caches result for 5 seconds."""
+    import time as _time
+    global _health_cache, _health_cache_ts
+    _now = _time.time()
+    if _health_cache and (_now - _health_cache_ts) < 5:
+        return _health_cache
+
     if _gliner2_model is None:
         raise HTTPException(status_code=503, detail="Model loading")
-    return {"status": "ok"}
+
+    dsn = os.environ.get("POSTGRES_DSN", "")
+    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qwen_url = os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+
+    db_ok = _check_db_health(dsn) if dsn else False
+    qdrant_ok = _check_qdrant_health(qdrant_url)
+    llm_ok = _check_llm_health(qwen_url)
+
+    all_ok = db_ok and qdrant_ok and llm_ok
+    status = "ok" if all_ok else "degraded"
+    if not db_ok:
+        status = "unhealthy"
+
+    _health_cache = {
+        "status": status,
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_now)),
+        "database": "ok" if db_ok else "unreachable",
+        "qdrant": "ok" if qdrant_ok else "unreachable",
+        "llm": "ok" if llm_ok else "unreachable",
+        "re_embedder": _embedder_stats,
+        "model_loaded": True,
+    }
+    _health_cache_ts = _now
+    return _health_cache
 
 @app.post("/ontology/rel_types")
 def add_rel_type(req: RelTypeRequest):
@@ -1020,7 +1578,17 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
-    if detected_preferred:
+    # Guard: if another named entity is mentioned with a preference signal
+    # (e.g., "Desmonde prefers Des"), skip auto-synthesis for the user.
+    # The LLM already extracted the correct entity assignment.
+    _third_party_pref = re.compile(
+        r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
+        re.IGNORECASE
+    )
+    _third_party_matches = {m.group(1).lower() for m in _third_party_pref.finditer(req.text)}
+    _skip_user_pref = bool(_third_party_matches and _third_party_matches != {"user"})
+
+    if detected_preferred and not _skip_user_pref:
         pref_key = ("user", detected_preferred, "pref_name")
         if pref_key not in edges_dict:
             edges_dict[pref_key] = EdgeInput(
@@ -1031,32 +1599,32 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
+    # dprompt-45: Detect negated pref_name corrections in text patterns.
+    # "My name is X, not Y" or "Call me X, not Y" → supersede the Y fact.
+    # Searches for "not <Word>" where <Word> matches a pref_name edge object.
+    _negation_pattern = re.compile(r'\bnot\s+([a-z]+)', re.IGNORECASE)
+    _negated_names = {m.lower() for m in _negation_pattern.findall(req.text)}
+    if _negated_names:
+        for key, edge in list(edges_dict.items()):
+            if (edge.rel_type.lower() in ("pref_name", "also_known_as")
+                    and edge.object.lower() in _negated_names):
+                # Mark the negated name as a correction — it should supersede the old fact
+                corrected_edge = EdgeInput(
+                    subject=edge.subject,
+                    object=edge.object,
+                    rel_type=edge.rel_type,
+                    is_preferred_label=edge.is_preferred_label,
+                    is_correction=True,
+                    subject_type=edge.subject_type,
+                    object_type=edge.object_type,
+                )
+                edges_dict[key] = corrected_edge
+                log.info("ingest.negated_name_correction_detected",
+                         negated_name=edge.object, rel_type=edge.rel_type)
+
     edges = list(edges_dict.values())
 
-    # Augment with compound extraction: regex-based patterns catch what
-    # GLiNER2 misses in chained/compound text (marriage, children, ages,
-    # third-person preferences). Runs in <1ms, no LLM call.
-    try:
-        from src.extraction.compound import extract_compound_facts
-        compound_edges = extract_compound_facts(req.text)
-        _existing_keys = {(e.subject.lower(), e.object.lower(), e.rel_type.lower()) for e in edges}
-        for ce in compound_edges:
-            _key = (ce["subject"].lower(), ce["object"].lower(), ce["rel_type"].lower())
-            if _key not in _existing_keys:
-                edges.append(EdgeInput(
-                    subject=ce["subject"],
-                    object=ce["object"],
-                    rel_type=ce["rel_type"],
-                    is_preferred_label=ce.get("is_preferred_label", False),
-                    is_correction=ce.get("is_correction", False),
-                ))
-                _existing_keys.add(_key)
-        if len(edges) > len(edges_dict):
-            log.info("ingest.compound_augment",
-                     gliner_count=len(edges_dict),
-                     compound_added=len(edges) - len(edges_dict))
-    except Exception as _e:
-        log.warning("ingest.compound_extraction_failed", error=str(_e))
+
 
     facts, committed, staged = [], 0, 0
     if edges:
@@ -1337,11 +1905,25 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 if classification["type"] == "scalar":
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
-                    # Only store if value is meaningful (reject non-numeric age etc.)
-                    if edge.rel_type.lower() == "age" and val_int is None:
-                        log.warning("ingest.scalar_rejected_non_numeric",
-                                    entity=canonical_subject, value=canonical_object)
-                        continue
+                    # Only store if value is meaningful
+                    if edge.rel_type.lower() == "age":
+                        if val_int is None:
+                            log.warning("ingest.scalar_rejected_non_numeric",
+                                        entity=canonical_subject, value=canonical_object)
+                            continue
+                        # dprompt-36: entity-type-aware age validation
+                        if val_int < 0:
+                            log.warning("ingest.scalar_rejected_negative_age",
+                                        entity=canonical_subject, age=val_int)
+                            continue
+                        # Person entities: strict 0-150 range
+                        # Non-Person entities (Planet, Mountain, etc.): no upper limit
+                        _entity_type = edge.subject_type or "unknown"
+                        if _entity_type.lower() == "person" and val_int > 150:
+                            log.info("ingest.person_age_rejected_out_of_range",
+                                     entity=canonical_subject, age=val_int,
+                                     raw_input=_raw_object)
+                            continue
 
                     # ROBUST: Determine the TRUE subject by looking at relationship context.
                     # If the current subject is the user but the text indicates this attribute belongs
@@ -1567,6 +2149,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         edge.rel_type, req.source, is_pref,
                         fact_class, edge_confidence, is_engine_generated
                     ))
+
+            # Apply taxonomy rules to annotate facts with grouping context
+            if rows:
+                rows = _apply_taxonomy_rules(rows, req.user_id, db)
 
             if rows:
                 # Rel_types that ALWAYS have scalar (string) objects, never UUID references
@@ -1953,6 +2539,31 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 (new_fact_id,),
                             )
 
+                        # dprompt-45: When pref_name correction occurs, update entity_aliases.
+                        # Clear old preferred aliases for this entity, set the corrected name as preferred.
+                        if rel_type.lower() == "pref_name":
+                            # Get the display name for the corrected subject entity
+                            _corrected_display = registry.get_preferred_name(user_id, correction_subject)
+                            # Clear old preferred flags for this entity
+                            cur.execute(
+                                "UPDATE entity_aliases SET is_preferred = false "
+                                "WHERE user_id = %s AND entity_id = %s",
+                                (user_id, correction_subject),
+                            )
+                            # Set the corrected object as preferred
+                            _corrected_obj_display = _canonical_to_display.get(
+                                correction_object, correction_object)
+                            cur.execute(
+                                "INSERT INTO entity_aliases (user_id, entity_id, alias, is_preferred) "
+                                "VALUES (%s, %s, %s, true) "
+                                "ON CONFLICT (user_id, alias) DO UPDATE SET "
+                                "entity_id = EXCLUDED.entity_id, is_preferred = true",
+                                (user_id, correction_subject, _corrected_obj_display),
+                            )
+                            log.info("ingest.pref_name_correction_aliases_updated",
+                                     entity=correction_subject,
+                                     corrected_name=_corrected_obj_display)
+
                     db.commit()
         finally: db.close()
 
@@ -2163,12 +2774,24 @@ def query(request: QueryRequest):
     def _resolve_display_names(facts: list[dict], registry, user_id: str, user_entity_id: str = "user") -> list[dict]:
         """
         Resolve UUID subject_id/object_id to preferred display names.
-        Falls back to the UUID string if no alias found.
+        dprompt-32: Falls back to non-preferred aliases when preferred name is missing
+        (e.g., name collision loser entities).
         """
         resolved = []
         for f in facts:
             subject_display = registry.get_preferred_name(user_id, f["subject"])
             object_display = registry.get_preferred_name(user_id, f["object"])
+
+            # dprompt-32: if preferred name is a UUID (no human-readable alias found),
+            # fall back to any non-preferred alias so the entity isn't invisible
+            if subject_display and _UUID_PATTERN.match(str(subject_display)):
+                fallback = registry.get_any_alias(user_id, f["subject"])
+                if fallback:
+                    subject_display = fallback
+            if object_display and _UUID_PATTERN.match(str(object_display)):
+                fallback = registry.get_any_alias(user_id, f["object"])
+                if fallback:
+                    object_display = fallback
 
             if f.get("rel_type") == "spouse":
                 log.info("query.resolve_display_names.spouse",
@@ -2228,18 +2851,13 @@ def query(request: QueryRequest):
                     })
         return facts
 
-    # Graph traversal path: if query contains self-referential signals,
-    # fetch facts directly from Postgres anchored to the user's identity.
-    # This bypasses vector similarity which fails for structured relational queries.
-    _SELF_REF_SIGNALS = {
-        "my family", "my children", "my kids", "my wife", "my husband",
-        "my spouse", "my partner", "my parents", "my siblings", "my brother",
-        "my sister", "my son", "my daughter", "about me", "about myself",
-        "who am i", "who i am", "list my", "tell me about me",
-        "what do you know about me", "my pets", "my animals", "my home",
-        "where do i live", "my address", "my age", "my job", "my work",
-        # Domain-agnostic: any "tell me about X" or "what is/are X" should
-        # trigger graph traversal to surface all stored facts for relevance scoring.
+    # ── Taxonomy-driven query intent (dprompt-23) ──────────────────────────
+    # Detect intent → load taxonomy → fetch ONLY rel_types in that taxonomy.
+    # No hardcoded signal sets. Entity_taxonomies table IS the map.
+    #
+    # Generic fallback signals: queries that don't match a taxonomy but still
+    # need graph traversal (e.g., "tell me about", "what is", bare questions).
+    _GENERIC_SELF_REF_SIGNALS = {
         "tell me about", "what do you know", "what you know",
         "what is", "what are", "how many", "how much",
         "list all", "show me", "describe",
@@ -2257,9 +2875,7 @@ def query(request: QueryRequest):
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
-        # Canonical identity is the user's preferred display name for themselves
         canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_query)
-        # If the result is a UUID or empty, fall back to user_id for readability.
         if not canonical_identity or _UUID_PATTERN.match(canonical_identity):
             canonical_identity = user_id
     except Exception as _e:
@@ -2270,78 +2886,154 @@ def query(request: QueryRequest):
 
     query_lower = request.text.lower()
     direct_facts = []
-    if any(signal in query_lower for signal in _SELF_REF_SIGNALS):
+
+    # dprompt-47: detect query intent by keyword → map to taxonomy group
+    _TAXONOMY_KEYWORDS = {
+        "family": {"my family", "my children", "my kids", "my wife", "my husband",
+                    "my spouse", "my son", "my daughter", "my parents", "my sibling",
+                    "my brother", "my sister", "my mother", "my father", "tell me about my family"},
+        "household": {"my pets", "my animals", "my household", "tell me about my pets",
+                       "who lives with me", "my home"},
+        "work": {"my job", "my work", "my boss", "my coworkers", "my colleagues",
+                  "who do i work with", "my employer", "my office"},
+        "location": {"where do i live", "my address", "my city", "my country",
+                      "my location", "where am i", "my neighbourhood"},
+        "computer_system": {"my computer", "my laptop", "my server", "my device",
+                             "my system", "my machine", "my workstation"},
+    }
+    _detected_taxonomy = None
+    for _tax_name, _keywords in _TAXONOMY_KEYWORDS.items():
+        if any(_kw in query_lower for _kw in _keywords):
+            _detected_taxonomy = _tax_name
+            log.info("query.taxonomy_detected", taxonomy=_tax_name, query=query_lower[:80])
+            break
+
+    # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
+    if db and registry and canonical_identity:
+        direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
+
+    if direct_facts or (db and registry and canonical_identity):
         try:
-            if db and registry and canonical_identity:
-                direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
+            # Resolve named entities from query (e.g., "aurora", "system")
+            # and fetch their facts for domain-agnostic queries.
+            # _fetch_user_facts already searches both subject_id AND object_id
+            # when entity_id is provided, so one call covers both directions.
+            # Scan both capitalized words AND lowercase tokens that match known aliases.
+            _query_words = set(re.findall(r'\b([A-Z][a-z]+)\b', request.text))
+            _query_words.discard("Tell")
+            # Also check lowercase tokens against entity_aliases
+            _common_words = {'the','and','for','you','are','that','what','how','who','tell','know','about','with','from','your','this','have','been','does','will','name','system'}
+            for _token in request.text.lower().split():
+                _token = _token.strip('.,!?;:()[]{}"\'')
+                if len(_token) > 2 and _token not in _common_words and _token not in _query_words:
+                    _query_words.add(_token)
+            for _word in _query_words:
+                try:
+                    _entity_id = registry.resolve(user_id, _word)
+                    if _entity_id and _entity_id != user_entity_id_for_query:
+                        _extra = _fetch_user_facts(db, user_id, entity_id=_entity_id)
+                        if _extra:
+                            direct_facts.extend(_extra)
+                            log.info("query.entity_resolved",
+                                     word=_word, entity_id=_entity_id,
+                                     extra_facts=len(_extra))
+                except Exception:
+                    pass
 
-                # Resolve named entities from query (e.g., "aurora", "system")
-                # and fetch their facts for domain-agnostic queries.
-                # _fetch_user_facts already searches both subject_id AND object_id
-                # when entity_id is provided, so one call covers both directions.
-                # Scan both capitalized words AND lowercase tokens that match known aliases.
-                _query_words = set(re.findall(r'\b([A-Z][a-z]+)\b', request.text))
-                _query_words.discard("Tell")
-                # Also check lowercase tokens against entity_aliases
-                _common_words = {'the','and','for','you','are','that','what','how','who','tell','know','about','with','from','your','this','have','been','does','will','name','system'}
-                for _token in request.text.lower().split():
-                    _token = _token.strip('.,!?;:()[]{}"\'')
-                    if len(_token) > 2 and _token not in _common_words and _token not in _query_words:
-                        _query_words.add(_token)
-                for _word in _query_words:
-                    try:
-                        _entity_id = registry.resolve(user_id, _word)
-                        if _entity_id and _entity_id != user_entity_id_for_query:
-                            _extra = _fetch_user_facts(db, user_id, entity_id=_entity_id)
-                            if _extra:
-                                direct_facts.extend(_extra)
-                                log.info("query.entity_resolved",
-                                         word=_word, entity_id=_entity_id,
-                                         extra_facts=len(_extra))
-                    except Exception:
-                        pass
+            # dprompt-27: graph traversal — find connected entities via _REL_TYPE_GRAPH
+            _connected = _graph_traverse(db, user_id, user_entity_id_for_query)
+            if _connected:
+                # dprompt-47c: hierarchy-chain-aware taxonomy filter
+                if _detected_taxonomy:
+                    _tax = next((t for t in _TAXONOMY_CACHE if t["taxonomy_name"] == _detected_taxonomy), None)
+                    if _tax and _tax.get("member_entity_types"):
+                        _allowed_types = set(_tax["member_entity_types"])
+                        if "ANY" not in _allowed_types:
+                            _filtered = set()
+                            # Batch-fetch entity types for all connected entities
+                            _entity_types = {}
+                            with db.cursor() as _tc:
+                                for _eid in _connected:
+                                    _tc.execute(
+                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                        (_eid, user_id))
+                                    _row = _tc.fetchone()
+                                    _entity_types[_eid] = _row[0] if _row else "unknown"
+                            # Filter: direct type match OR hierarchy-chain match
+                            for _eid in _connected:
+                                _etype = _entity_types.get(_eid, "unknown")
+                                # Fast path: direct type match
+                                if _etype in _allowed_types:
+                                    _filtered.add(_eid)
+                                    continue
+                                # Slow path: walk hierarchy chain upward
+                                if _etype == "unknown" or _etype not in _allowed_types:
+                                    try:
+                                        _chain = _hierarchy_expand(db, user_id, _eid, direction="up", max_depth=3)
+                                        for _aid in _chain:
+                                            _atype = _entity_types.get(_aid)
+                                            if not _atype:
+                                                with db.cursor() as _hc:
+                                                    _hc.execute(
+                                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                                        (_aid, user_id))
+                                                    _arow = _hc.fetchone()
+                                                    _atype = _arow[0] if _arow else "unknown"
+                                                    _entity_types[_aid] = _atype
+                                            if _atype in _allowed_types:
+                                                _filtered.add(_eid)
+                                                break
+                                    except Exception:
+                                        pass  # hierarchy walk failed — entity stays excluded
+                            log.info("query.taxonomy_filter",
+                                     taxonomy=_detected_taxonomy,
+                                     allowed_types=list(_allowed_types),
+                                     before=len(_connected), after=len(_filtered))
+                            _connected = _filtered
 
-                # 2-hop: fetch facts for directly related entities
-                related = {
-                    f["object"] for f in direct_facts if f["subject"] == user_entity_id_for_query
-                } | {
-                    f["subject"] for f in direct_facts if f["object"] == user_entity_id_for_query
-                }
-                related.discard(user_entity_id_for_query)
-
-                if related:
-                    with db.cursor() as _cur:
-                        _rel_list = list(related)
-                        _rel_ph = ",".join(["%s"] * len(_rel_list))
-                        _cur.execute(
-                            f"SELECT subject_id, object_id, rel_type, provenance, confidence FROM facts "
-                            f"WHERE user_id = %s AND superseded_at IS NULL "
-                            f"AND hard_delete_flag = false "
-                            f"AND (valid_until IS NULL OR valid_until > now()) "
-                            f"AND (subject_id IN ({_rel_ph}) OR object_id IN ({_rel_ph})) "
-                            f"ORDER BY id",
-                            [user_id] + _rel_list + _rel_list,
-                        )
+                log.info("query.graph_traverse", identity=canonical_identity,
+                         connected_count=len(_connected))
+                for _conn_id in _connected:
+                    _conn_facts = _fetch_user_facts(db, user_id, entity_id=_conn_id)
+                    if _conn_facts:
                         seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
-                        for row in _cur.fetchall():
-                            key = (row[0], row[1], row[2])
-                            if key not in seen:
-                                direct_facts.append({
-                                    "subject": row[0], "object": row[1],
-                                    "rel_type": row[2], "provenance": row[3],
-                                    "confidence": float(row[4]) if row[4] else 1.0,
-                                    "category": _REL_TYPE_META.get(row[2], {}).get("category") or _infer_category(row[2]),
-                                    "fact_state": "long_term",
-                                    "fact_class": "A",
-                                })
-                                seen.add(key)
+                        for _cf in _conn_facts:
+                            _key = (_cf["subject"], _cf["object"], _cf["rel_type"])
+                            if _key not in seen:
+                                direct_facts.append(_cf)
+                                seen.add(_key)
+                log.info("query.graph_traverse_complete",
+                         connected_entities=len(_connected),
+                         total_facts=len(direct_facts))
 
-                entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
-                attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
-                if direct_facts:
-                    log.info("query.graph_traversal", identity=canonical_identity, hits=len(direct_facts))
-                    # Don't return early — merge with Qdrant results below
-                    # Postgres facts are authoritative; Qdrant adds associative context
+                # dprompt-28: hierarchy expansion — enrich each connected entity with taxonomy
+                _enriched = set(_connected)
+                for _conn_id in _connected:
+                    _upchain = _hierarchy_expand(db, user_id, _conn_id, direction="up", max_depth=3)
+                    _enriched.update(_upchain)
+                # Fetch facts for hierarchy entities not already covered
+                _new_entities = _enriched - _connected - {user_entity_id_for_query}
+                if _new_entities:
+                    seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+                    for _hid in _new_entities:
+                        _hfacts = _fetch_user_facts(db, user_id, entity_id=_hid)
+                        if _hfacts:
+                            for _hf in _hfacts:
+                                _key = (_hf["subject"], _hf["object"], _hf["rel_type"])
+                                if _key not in seen:
+                                    direct_facts.append(_hf)
+                                    seen.add(_key)
+                    log.info("query.hierarchy_expanded",
+                             enriched_entities=len(_enriched),
+                             new_hierarchy_facts=sum(1 for f in direct_facts if f.get("rel_type") in _REL_TYPE_HIERARCHY),
+                             total_facts=len(direct_facts))
+
+            entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
+            attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
+            if direct_facts:
+                log.info("query.graph_traversal", identity=canonical_identity, hits=len(direct_facts))
+                # Don't return early — merge with Qdrant results below
+                # Postgres facts are authoritative; Qdrant adds associative context
         except Exception as _e:
             log.warning("query.graph_traversal_failed", error=str(_e))
         finally:
@@ -2718,18 +3410,24 @@ def query(request: QueryRequest):
                 if display and display != eid:
                     _entity_display[eid] = display
 
+        # Always populate preferred_names for UUID entities that appear in facts,
+        # even when no alias is registered. This ensures the Filter can resolve
+        # UUIDs to display names and won't drop facts via _garbage().
         if registry:
             for f in merged_facts:
-                # Subject: add if it matches a registered entity UUID OR its display name
-                # matches a known registered entity's display name
-                subj = f["subject"]
-                if subj not in preferred_names and subj != user_entity_id_for_query:
-                    if _UUID_PATTERN.match(subj) or subj in _entity_display.values():
-                        preferred_names[subj] = registry.get_preferred_name(user_id, subj) or subj.title()
-                obj = f["object"]
-                if obj not in preferred_names and obj != user_entity_id_for_query:
-                    if _UUID_PATTERN.match(obj) or obj in _entity_display.values():
-                        preferred_names[obj] = registry.get_preferred_name(user_id, obj) or obj.title()
+                for field in ("subject", "object"):
+                    val = f[field]
+                    if not val or val in preferred_names or val == user_entity_id_for_query:
+                        continue
+                    # Resolve: prefer alias, fall back to the value itself
+                    resolved = registry.get_preferred_name(user_id, val)
+                    if resolved and resolved != val:
+                        preferred_names[val] = resolved
+                    elif _UUID_PATTERN.match(val):
+                        # UUID with no alias — still register so Filter resolves it
+                        preferred_names[val] = val
+                    elif val in _entity_display.values():
+                        preferred_names[val] = val
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
 

@@ -134,8 +134,8 @@ class TestQuerySystemAurora:
         text = (
             "The system is a Ryzen 7, with 64Gb of ram, "
             "a 2TB M.2 Hard drive, the hostname is Aurora, "
-            "fqdn of aurora.helpdeskpro.ca, "
-            "the internal ip is 192.168.40.20 running Windows 11, "
+            "fqdn of server.example.com, "
+            "the internal ip is 10.0.0.100 running Linux, "
             "the certificate expires on November 27th 2026."
         )
 
