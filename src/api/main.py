@@ -94,7 +94,7 @@ _REL_TYPE_GRAPH = frozenset({
 })
 
 _REL_TYPE_HIERARCHY = frozenset({
-    "instance_of", "subclass_of", "part_of", "is_a",
+    "instance_of", "subclass_of", "part_of", "is_a", "member_of",
 })
 
 _VALID_CATEGORIES = frozenset({
@@ -560,6 +560,7 @@ def _ensure_schema(dsn: str) -> None:
                     ("hostname", "Hostname", "system", "supersede"),
                     ("fqdn", "Fully Qualified Domain Name", "system", "supersede"),
                     ("ip_address", "IP Address", "system", "supersede"),
+                    ("member_of", "Member Of", "identity", "supersede"),
                 ]
                 for rel_type, label, category, correction_behavior in _MISSING_TYPES:
                     cur.execute(
@@ -2788,14 +2789,35 @@ def query(request: QueryRequest):
         return resolved
 
     def _clean_preferred_names(pns: dict) -> dict:
-        """Remove entries where the display name is a UUID or empty string.
-        These are not human-readable and leak internal identifiers to the filter.
+        """Remove UUIDs, empty strings, and Concept/unknown entity types.
+
+        Concept entities (e.g. "pets", "family", "dog") are taxonomy labels,
+        not named entities. Excluding them prevents the Filter's Tier 1 entity
+        matching from returning only member_of/is_a facts for category queries.
         # NO RECURSIVE MATCHING — _UUID_PATTERN is a static compile-once pattern.
         """
-        return {
+        cleaned = {
             k: v for k, v in pns.items()
             if v and not _UUID_PATTERN.match(str(v))
         }
+        if not cleaned or not db:
+            return cleaned
+        # dprompt-50: exclude Concept/unknown entities from name resolution
+        _uuid_keys = [k for k in cleaned if _UUID_PATTERN.match(str(k))]
+        if not _uuid_keys:
+            return cleaned
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM entities WHERE user_id = %s AND id = ANY(%s) "
+                    "AND entity_type NOT IN ('Concept', 'unknown')",
+                    (user_id, _uuid_keys),
+                )
+                allowed = {row[0] for row in cur.fetchall()}
+            return {k: v for k, v in cleaned.items()
+                    if not _UUID_PATTERN.match(str(k)) or k in allowed}
+        except Exception:
+            return cleaned
 
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
