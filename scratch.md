@@ -163,3 +163,12 @@ Note: Both facts in staged_facts (unconfirmed Class B). Should have been caught 
 
 Ready for user retest.
 
+
+## Natural Language Tense: Cyrus "Studies" not "Studied"
+
+#claude: User noted output says Cyrus "studied" (past) but should be "studies" (present — ongoing).
+
+This is a natural language rendering issue (Filter/LLM tense logic), not a database issue. Fact `educated_at` is correct; output tense needs adjustment.
+
+Note for future: `educated_at` should render present tense if entity is still enrolled, past tense if graduated.
+
