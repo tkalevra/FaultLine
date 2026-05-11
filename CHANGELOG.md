@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.5 (2026-05-13) — Bidirectional Relationship Validation
+
+**Ingest pipeline:** `_validate_bidirectional_relationships()` prevents impossible bidirectional relationships (`child_of` + `parent_of`). Keeps higher confidence, supersedes lower. Checks `facts` + `staged_facts`.
+
+**Fixes:** dBug-report-006 (bidirectional impossibilities, staged gap)
+
 ## v1.0.4 (2026-05-12) — Query Deduplication & Alias Metadata
 
 **Query path:** `/query` deduplicates facts by `(subject_uuid, rel_type, object_uuid)` after merge, keeping highest confidence per triple. `_aliases` metadata attached to each fact with all entity names and `is_preferred` flag.
