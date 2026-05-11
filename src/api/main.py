@@ -2929,6 +2929,8 @@ def query(request: QueryRequest):
                 **f,
                 "subject": subject_display,
                 "object": object_display,
+                "_subject_id": f["subject"],   # dprompt-61: preserve UUID for dedup
+                "_object_id": f["object"],     # dprompt-61: preserve UUID for dedup
             })
         return resolved
 
@@ -2962,6 +2964,27 @@ def query(request: QueryRequest):
                     if not _UUID_PATTERN.match(str(k)) or k in allowed}
         except Exception:
             return cleaned
+
+    def _get_entity_aliases(entity_id: str) -> list[dict]:
+        """Return all aliases for an entity UUID with is_preferred flag.
+        Returns empty list on DB error or if entity has no aliases.
+        """
+        if not db or not entity_id:
+            return []
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT alias, is_preferred FROM entity_aliases "
+                    "WHERE user_id = %s AND entity_id = %s "
+                    "ORDER BY is_preferred DESC, alias",
+                    (user_id, entity_id),
+                )
+                return [
+                    {"name": row[0], "is_preferred": row[1]}
+                    for row in cur.fetchall()
+                ]
+        except Exception:
+            return []
 
     def _build_entity_types(pns: dict) -> dict:
         """Build entity_types dict parallel to preferred_names.
@@ -3623,6 +3646,31 @@ def query(request: QueryRequest):
                         preferred_names[val] = val
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
+
+        # ── dprompt-61: Deduplicate by entity UUID + attach alias metadata ──
+        # Facts may have different display names for the same entity_id
+        # (e.g., christopher spouse mars AND chris spouse mars). Deduplicate
+        # using underlying UUIDs (_subject_id, _object_id) preserved by _resolve_display_names.
+        _deduped: dict[tuple, dict] = {}
+        for _f in merged_facts:
+            _sid = _f.pop("_subject_id", _f.get("subject", ""))
+            _oid = _f.pop("_object_id", _f.get("object", ""))
+            _key = (_sid, _f.get("rel_type", ""), _oid)
+            if _key not in _deduped or _deduped[_key].get("confidence", 0) < _f.get("confidence", 0):
+                _deduped[_key] = _f
+
+        # Attach alias metadata for each deduplicated fact
+        _aliased_facts = []
+        for (_sid, _rel, _oid), _f in _deduped.items():
+            _f["_aliases"] = {
+                "subject": _get_entity_aliases(_sid),
+                "object": _get_entity_aliases(_oid),
+            }
+            _aliased_facts.append(_f)
+
+        merged_facts = _aliased_facts
+        log.info("query.deduplicated", before=len(pg_keys), after=len(merged_facts))
+        # ── end dprompt-61 ──────────────────────────────────────────────────
 
         # Strip internal metadata before returning to Filter
         _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")

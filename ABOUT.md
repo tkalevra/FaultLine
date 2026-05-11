@@ -1,5 +1,15 @@
 # FaultLine
 
+## v1.0.4 (2026-05-12) — Query Deduplication & Alias Metadata
+
+**Query path:** `/query` now deduplicates facts by `(subject_uuid, rel_type, object_uuid)` and attaches `_aliases` metadata with all entity names and `is_preferred` flag. Eliminates duplicate facts from alias redundancy.
+
+**Effect:** Single "spouse Mars" fact instead of duplicate per alias. Filter gets clean deduplicated results with full alias context.
+
+**Fixes:** dBug-report-005 (alias redundancy in query results)
+
+---
+
 ## v1.0.3 (2026-05-12) — Semantic Conflict Detection
 
 **Ingest pipeline:** Added `_detect_semantic_conflicts()` — auto-supersedes ownership/relationship facts when the object entity is defined as a type/category/component via hierarchy relationships (instance_of, subclass_of, part_of, member_of).
