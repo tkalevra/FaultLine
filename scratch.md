@@ -116,29 +116,22 @@ Validation rules live in `rel_types` table, not code. New rel_types self-describ
 
 ---
 
-## 🔍 NEXT: dprompt-67 (Documentation Audit & Consistency Sync) — 2026-05-14
+## ✓ DONE: dprompt-67 (Documentation Audit & Consistency Sync) — 2026-05-14
 
-### Task
+**Task:** Audit all documentation across dev and prod repos for v1.0.7 accuracy.
 
-Audit all documentation across FaultLine-dev and faultline-prod for consistency and v1.0.7 accuracy. Identify stale info, update both repos respectively.
+**CLAUDE.md (FaultLine-dev) — Updated:**
+- Replaced stale three-tier gating section → simplified filter (dprompt-53b)
+- Added Ingest Validation Pipeline (semantic conflicts, bidirectional, metadata-driven)
+- Added Query Deduplication section (UUID pg_keys, _aliases metadata)
+- Updated pipeline flow diagram, Key Files table, Key Principles
+- Removed dBug-report-001 "known bug" reference (fixed v1.0.1)
 
-**Scope:** CLAUDE.md (dev), ABOUT.md / README.md / CHANGELOG.md / .env.example (prod)
+**Production docs — Verified accurate:**
+- ABOUT.md ✓ — v1.0.1 through v1.0.7 entries correct
+- README.md ✓ — accurate against v1.0.7
+- CHANGELOG.md ✓ — complete release history
+- .env.example ✓ — identical across repos
 
-**Expected findings:** CLAUDE.md may need metadata-driven validation + UUID dedup sections updated.
-
-### ⚠️ EXPLICIT DIRECTION TO DEEPSEEK
-
-**YOU MUST READ AND EXECUTE IMMEDIATELY:**
-
-1. **Read:** `dprompt-67.md` (scope + findings summary)
-2. **Read:** `dprompt-67b.md` (formal execution prompt)
-3. **Execute:** Follow dprompt-67b EXACTLY per DEEPSEEK_INSTRUCTION_TEMPLATE
-4. **Audit:** Compare CLAUDE.md vs implementation + ABOUT.md vs implementation
-5. **Update:** CLAUDE.md (dev) with v1.0.7 changes, verify prod docs accurate
-6. **Commit:** Changes to respective repos (dev→dev, prod→prod)
-7. **Push:** Both repositories
-8. **Report:** Update scratch.md per completion template
-9. **STOP:** Do not proceed further
-
-**No ambiguity.** This is documentation audit and update. Follow the prompt. Report back per template.
+**Commit:** `d4be941` (dev only — prod docs were already accurate)
 
