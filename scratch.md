@@ -73,6 +73,8 @@ Validation rules live in `rel_types` table, not code. New rel_types self-describ
 - Tests: 114 passed, 0 regressions ✓
 - Zero hardcoded validation constants remaining ✓
 
-**Deployment needed:** Rebuild backend container on truenas (migration 022 + code).
+**Deployment:** v1.0.6 pushed to GitHub (`65d5ef4`). Validated per SOP: syntax clean, docker valid, secrets audit clean, docs updated.
+
+**Status:** AWAITING USER VERIFICATION per PRODUCTION_DEPLOYMENT_GUIDE.md Step 10.
 
 ---
