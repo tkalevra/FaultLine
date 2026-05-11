@@ -2375,10 +2375,12 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     fact_class=fact_class,
                     provenance=edge.fact_provenance,
                 ))
-                if status in ("valid", "conflict"):
+                if status in ("valid", "conflict", "unknown"):
                     # Conflict facts: the WGM gate already inserted the new fact and marked
                     # old facts as contradicted. We still need rows populated for downstream
                     # processing (entity alias sync, Qdrant sync, preference propagation).
+                    # Unknown status (novel rel_types): WGM returned "unknown", recorded in ontology_evaluations.
+                    # Route to Class C staging for re-embedder async evaluation.
                     # Use the is_pref value computed earlier (which already accounts for
                     # pref_name semantics, explicit flags, and cross-batch preference objects).
                     rows.append((
