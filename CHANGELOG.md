@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.7 (2026-05-14) — Query Deduplication Fix
+
+**Query path:** pg_keys dedup uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Fixes duplicate facts when same entity has multiple aliases (chris/user → single deduplicated fact).
+
+**Fixes:** dBug-report-008
+
 ## v1.0.6 (2026-05-13) — Metadata-Driven Validation
 
 **rel_types table:** Added metadata columns (`is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`). `_get_rel_type_metadata()` with caching replaces all hardcoded validation constants. New rel_types self-describe constraints without code changes.
