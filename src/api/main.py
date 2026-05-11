@@ -1076,6 +1076,104 @@ def _detect_semantic_conflicts(
     return ("keep", None)
 
 
+# ── dprompt-62: Bidirectional Relationship Validation ─────────────────────────
+# Prevents impossible bidirectional relationships like child_of + parent_of
+# coexisting for the same entity pair. Inverse relationships should NOT both
+# exist — the semantics make them contradictory.
+
+# Rel_types with inverses that should NOT coexist
+_BIDIRECTIONAL_INVERSES = {
+    "child_of": "parent_of",
+    "parent_of": "child_of",
+}
+
+
+def _validate_bidirectional_relationships(
+    db_conn,
+    user_id: str,
+    subject: str,
+    rel_type: str,
+    obj: str,
+    confidence: float,
+) -> str:
+    """
+    Check if a new fact would create an impossible bidirectional relationship.
+
+    If both child_of AND parent_of exist for the same subject-object pair,
+    keep the higher-confidence version and supersede the lower.
+
+    Returns:
+      - "keep": no conflict, proceed
+      - "supersede_existing": existing inverse fact superseded (new is higher conf)
+      - "supersede_new": new fact should be skipped (existing is higher conf)
+    """
+    rt_lower = rel_type.lower().strip() if rel_type else ""
+    inverse = _BIDIRECTIONAL_INVERSES.get(rt_lower)
+    if not inverse or not db_conn:
+        return "keep"
+
+    try:
+        with db_conn.cursor() as cur:
+            # Check facts table for inverse relationship
+            cur.execute(
+                "SELECT id, confidence FROM facts "
+                "WHERE user_id = %s AND subject_id = %s AND object_id = %s "
+                "AND rel_type = %s AND superseded_at IS NULL "
+                "LIMIT 1",
+                (user_id, subject, obj, inverse),
+            )
+            inverse_fact = cur.fetchone()
+
+            if not inverse_fact:
+                # Check staged_facts table
+                cur.execute(
+                    "SELECT id, confidence FROM staged_facts "
+                    "WHERE user_id = %s AND subject_id = %s AND object_id = %s "
+                    "AND rel_type = %s "
+                    "LIMIT 1",
+                    (user_id, subject, obj, inverse),
+                )
+                inverse_fact = cur.fetchone()
+
+            if inverse_fact:
+                inverse_id, inverse_conf = inverse_fact
+                if confidence > inverse_conf:
+                    # New fact has higher confidence — supersede existing inverse
+                    cur.execute(
+                        "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+                        "WHERE id = %s",
+                        (inverse_id,),
+                    )
+                    if cur.rowcount == 0:
+                        # Might be in staged_facts
+                        cur.execute(
+                            "DELETE FROM staged_facts WHERE id = %s",
+                            (inverse_id,),
+                        )
+                    log.info(
+                        "ingest.bidirectional_conflict_resolved",
+                        kept=f"{subject} {rt_lower} {obj} (conf={confidence})",
+                        superseded=f"{subject} {inverse} {obj} (conf={inverse_conf})",
+                        reason="new_higher_confidence",
+                    )
+                    return "keep"  # allow new fact through
+                else:
+                    # Existing inverse has higher or equal confidence — skip new
+                    log.info(
+                        "ingest.bidirectional_conflict_resolved",
+                        kept=f"{subject} {inverse} {obj} (conf={inverse_conf})",
+                        superseded=f"{subject} {rt_lower} {obj} (conf={confidence})",
+                        reason="existing_higher_confidence",
+                    )
+                    return "supersede_new"
+
+    except Exception as e:
+        log.warning("ingest.bidirectional_validation_failed", error=str(e),
+                    subject=subject, rel_type=rt_lower, obj=obj)
+
+    return "keep"
+
+
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
 
 def _validate_startup_config() -> dict:
@@ -2360,6 +2458,32 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 rows = conflict_free_rows
                 # ── end dprompt-59 ──────────────────────────────────────────
+
+                # ── dprompt-62: Bidirectional validation ─────────────────────
+                # Prevent impossible bidirectional relationships (child_of + parent_of
+                # for same pair). Keep higher confidence, supersede lower.
+                _bidir_rows = []
+                _bidir_count = 0
+                for row in rows:
+                    _uid, _subj, _obj, _rel, _src, _pref, _fclass, _conf, _eng = row
+                    bidir_decision = _validate_bidirectional_relationships(
+                        db, req.user_id, _subj, _rel, _obj, _conf,
+                    )
+                    if bidir_decision == "supersede_new":
+                        log.info("ingest.bidirectional_superseded",
+                                 rel_type=_rel, subject=_subj, object=_obj,
+                                 confidence=_conf)
+                        _bidir_count += 1
+                        continue
+                    _bidir_rows.append(row)
+
+                if _bidir_count > 0:
+                    log.info("ingest.bidirectional_resolved", count=_bidir_count,
+                             user_id=req.user_id)
+                    db.commit()
+
+                rows = _bidir_rows
+                # ── end dprompt-62 ──────────────────────────────────────────
 
                 # Split rows by fact class — surrogates go directly to commit, no display name resolution
                 # Display names are resolved at READ time only (_resolve_display_names in /query)
