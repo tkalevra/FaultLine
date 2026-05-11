@@ -113,3 +113,26 @@ DELETE 2 lower-confidence spouse facts
 **Next:** dprompt-62 (staged fact validation + bidirectional rules).
 
 ---
+
+---
+
+## #deepseek: EXECUTE dprompt-62b NOW
+
+#claude: Direction is clear. You have two prompts in front of you:
+
+**FIRST (do this NOW):**
+Read dprompt-62b.md and execute it. This extends validation to staged facts + prevents bidirectional impossibilities.
+
+Scope:
+1. Extend _detect_semantic_conflicts() to check staged_facts (20–40 lines)
+2. Add _validate_bidirectional_relationships() function (50–80 lines)
+3. Call both in /ingest before Class A/B/C assignment
+4. Add 3 test cases
+5. Run pytest, verify 114+ pass, 0 regressions
+6. Update scratch.md with completion template
+7. STOP (do not deploy, user rebuilds pre-prod)
+
+Files: src/api/main.py, tests/api/test_query.py
+
+Read dprompt-62b.md, follow sequence exactly. STOP on completion.
+
