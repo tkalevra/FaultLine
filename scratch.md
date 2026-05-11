@@ -11,164 +11,73 @@ plans, or test cases here. Use it to:
 
 Code goes directly into source files. This file stays lean.
 
-## Pre-Prod Reference (2026-05-12)
+## Pre-Prod Reference (2026-05-13)
 
 **Instance:** hairbrush.helpdeskpro.ca (truenas)
 **Model:** faultline-wgm-test-10
-**Bearer token:** sk-addb2220bf534bfaa8f78d96e6991989 (homelab, minimal risk)
-
-**SSH for container logs:**
-```bash
-ssh truenas -x "sudo docker logs faultline --tail N"
-ssh truenas -x "sudo docker logs open-webui --tail N"
-```
-
-**Curl testing:**
-```bash
-curl -s -H "Authorization: Bearer sk-addb2220bf534bfaa8f78d96e6991989" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "faultline-wgm-test-10", "messages": [{"role": "user", "content": "TEXT"}], "stream": false}' \
-  https://hairbrush.helpdeskpro.ca/api/chat/completions
-```
-
-**LENGTH RULE:** If this file exceeds 150 lines, archive everything between the
-"## Archive" section and the "---" separator as `scratch-archive-YYYY-MM-DD.md`,
-then condense the remaining content to a concise current state summary.
+**Backend API:** http://192.168.40.10:8001
 
 ---
 
 ## Archive
 
-- **scratch-archive-2026-05-11.md** — Phases 1–5
-- **scratch-archive-2026-05-11-phases6-10.md** — Phases 6–10
-- **scratch-archive-2026-05-11-dprompt15b.md** — dprompt-15b
-- **scratch-archive-2026-05-11-dprompt16-17.md** — dprompt-16/17
-- **scratch-archive-2026-05-12.md** — May 12 cycle: dprompts 20–56, v1.0.0→v1.0.2
-- **scratch-archive-2026-05-12b.md** — May 12b: hierarchy extraction, dBug-003, dprompt-58
-- **scratch-archive-2026-05-13.md** — May 13: dprompts 59–61, v1.0.3→v1.0.4
+- **scratch-archive-2026-05-13.md** — May 13 cycle: dprompt-62 execution, dBug-006/007 discovery, database cleanups
 
 ---
 
-## Current State (2026-05-13)
+## Current State (2026-05-13 evening)
 
 ### Production (GitHub: tkalevra/FaultLine)
-- **v1.0.5** — Bidirectional relationship validation (dprompt-62)
 - **v1.0.4** — Query deduplication + alias metadata (dprompt-61)
 - **v1.0.3** — Semantic conflict detection (dprompt-59)
-- **v1.0.2** — Hierarchy extraction enhancement (dprompt-56b)
-- **v1.0.1** — Filter simplification, backend-first (dprompt-53b)
-- **v1.0.0** — Initial release
 
-### Architecture
+### Investigation Complete
+- dBug-report-006: Staged facts bypass conflict detection
+- dBug-report-007: dprompt-62 bidirectional validation incomplete + UUID exposure
+- Pre-prod cleaned: impossible relationships removed, staged facts corrected
+- User retest: "flawless now"
 
-- **Filter:** Dumb — trusts backend /query ranking. Identity rels always pass, confidence threshold on rest.
-- **Backend /query:** Smart — graph traversal, hierarchy expansion, taxonomy filtering, entity dedup + alias metadata.
-- **Ingest:** LLM-first extraction → WGM gate → semantic conflict detection → bidirectional validation → fact classification (A/B/C).
-- **Self-healing:** Semantic conflicts auto-superseded at ingest. Impossible bidirectional relationships prevented. Graph stays valid.
+### Architecture Decision: dprompt-65
+User feedback: No technical debt. Metadata-driven validation framework instead of tactical fixes.
 
-### Active Issues
-
-| Bug | Status |
-|-----|--------|
-| dBug-report-001 | Fixed (dprompt-53b) |
-| dBug-report-002 | Fixed (dprompt-56b) |
-| dBug-report-003 | Fixed (dprompt-58) |
-| dBug-report-004 | P3 — stale data cleanup scoped |
-| dBug-report-005 | Fixed (dprompt-61) |
-| dBug-report-006 | Fixed (dprompt-62) — pre-prod cleaned + validation deployed |
-
-### Dev repo
-
-- Branch: `master` (commit `e5c7a60`)
-- Test suite: 114 passed, 53 skipped
-- Lines: `src/api/main.py` 3992
+**Philosophy:** Validation rules in database, not code. rel_types table stores properties (symmetric, inverse, leaf_only, hierarchy). LLM defines metadata when creating novel rel_types. Validation queries metadata at runtime. Scales with dynamic ontology forever.
 
 ---
 
+## #deepseek: EXECUTE dprompt-65b NOW
 
-## ✓ DONE: dprompt-62 (Staged Fact Validation + Bidirectional Rules) — 2026-05-13
+#claude: Next phase ready. Read dprompt-65b.md and execute metadata-driven validation framework.
 
-**Implementation:** `src/api/main.py`
+**Clear Scope & Expectations:**
 
-### Changes
+1. **Migration (NEW file):** `migrations/0XX_rel_types_metadata.sql`
+   - Add columns: is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel, allows_leaf_rels
+   - Pre-populate ALL existing rel_types with metadata
+   - Run BEFORE validation code changes
 
-1. `_detect_semantic_conflicts()` already checks both `facts` and `staged_facts` (verified from dprompt-59) ✓
-2. `_validate_bidirectional_relationships()` — new function (97 lines)
-   - Prevents `child_of` + `parent_of` coexistence for same entity pair
-   - Keeps higher-confidence version, supersedes lower
-   - Checks both `facts` and `staged_facts` tables
-3. Integrated into `/ingest` pipeline — runs after conflict detection, before Class A/B/C assignment
+2. **Refactor src/api/main.py:** (~150–200 lines)
+   - Add `_get_rel_type_metadata()` helper with caching
+   - Replace hardcoded rules in `_detect_semantic_conflicts()` with metadata queries
+   - Replace hardcoded rules in `_validate_bidirectional_relationships()` with metadata queries
+   - NO hardcoded validation rules remaining in code
+   - Applies uniformly to facts + staged_facts
 
-### Pipeline order
+3. **Tests:** 4 new test cases in tests/api/test_ingest.py
+   - Leaf-only via metadata
+   - Symmetric rel_type bidirectional
+   - Bidirectional prevention via metadata
+   - Novel rel_type self-describes (no code change)
 
-```
-extract → WGM gate → _detect_semantic_conflicts → _validate_bidirectional_relationships → Class A/B/C → commit
-```
+4. **Local testing:** pytest, 114+ pass, 0 regressions
 
-### Validation
+5. **STOP:** Update scratch.md, do NOT deploy
 
-- Syntax: clean ✓
-- Tests: 114 passed, 0 regressions ✓
-- Lines: 3839 → 3992 (+153 lines)
-- Deployed: v1.0.5 (`ec75cf4`) ✓
+**Why this approach prevents debt:**
+- New rel_types created by LLM → self-describe validation
+- No new dprompt needed for each edge case
+- Framework scales forever with ontology
+- Zero technical debt accumulation
 
-
-## 🐛 CRITICAL: dBug-report-007 (Bidirectional Validation Failed + UUID Exposure)
-
-#claude: Reviewed pre-prod OpenWebUI logs post-dprompt-62. Found **genuine bugs**:
-
-### Issues Found
-1. **Bidirectional validation incomplete:** `user -child_of-> gabby` still in DB (dprompt-62 didn't catch it)
-2. **UUID exposure:** "7E4Bff75-706E-5Feb-B8B5-F4Ca1247Fd3B is species: morkie mix" (should be display names)
-3. **dprompt-62 bidirectional logic has bug:** Not catching child_of + parent_of coexistence
-
-### Database Cleanup (Done)
-```
-DELETE 1 impossible child_of fact (user -child_of-> gabby)
-```
-
-### Status
-- dBug-report-007.md written + committed
-- Database cleaned (impossible relationship removed)
-- Ready for user retest
-
-**Next:** dprompt-63 (fix bidirectional validation logic) + dprompt-64 (UUID resolution in query response).
+Read dprompt-65b.md, follow sequence exactly. STOP on completion.
 
 ---
-
-## #deepseek: WAIT FOR USER RETEST + NEXT DIRECTION
-
-#claude: Post-cleanup, waiting for user to test family query again. Pre-prod database has been cleaned (impossible child_of removed).
-
-Two bugs remain unfixed in code:
-1. dprompt-62 bidirectional validation logic incomplete
-2. Query response UUID resolution broken
-
-After user retests and reports results, next steps will be:
-- dprompt-63: Fix bidirectional validation in _validate_bidirectional_relationships()
-- dprompt-64: Fix UUID resolution in /query response building
-
-STOP and wait for user direction.
-
-
-## Correction: Cyrus works_for → educated_at (User Feedback)
-
-#claude: User corrected extraction: Cyrus "studies at" (educated_at) not "works for" (works_for) University of Guelph.
-
-**Database cleanup:**
-- Deleted: cyrus -works_for-> university_of_guelph (staged_facts, conf=0.8)
-- Retained: cyrus -educated_at-> university_of_guelph (staged_facts, conf=0.8)
-
-Note: Both facts in staged_facts (unconfirmed Class B). Should have been caught by conflict detection (similar to dBug-006/007 pattern).
-
-Ready for user retest.
-
-
-## Natural Language Tense: Cyrus "Studies" not "Studied"
-
-#claude: User noted output says Cyrus "studied" (past) but should be "studies" (present — ongoing).
-
-This is a natural language rendering issue (Filter/LLM tense logic), not a database issue. Fact `educated_at` is correct; output tense needs adjustment.
-
-Note for future: `educated_at` should render present tense if entity is still enrolled, past tense if graduated.
-
