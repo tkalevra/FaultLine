@@ -1,5 +1,23 @@
 # FaultLine
 
+## v1.0.1 (2026-05-12) — Filter Simplification
+
+**Architecture:** Filter now implements backend-first approach
+- Removed three-tier relevance gating logic from Filter
+- Simplified to: identity rels always pass + confidence threshold gating only
+- Filter trusts backend /query ranking (Class A > B > C + confidence) as authoritative
+- No entity-type gating, no concept filtering, no tier fallback logic
+
+**Result:** Category queries now return complete facts
+- "tell me about our pets" → returns has_pet facts ✓
+- "tell me about my family" → returns spouse + children + pets ✓
+- No UUID leaks in responses ✓
+
+**Fixes:** dBug-report-001 (Tier 2 Identity Fallback Blocks Tier 3 after Concept Filter)
+**See:** docs/ARCHITECTURE_QUERY_DESIGN.md for design principle
+
+---
+
 A write-validated knowledge graph pipeline that extracts entities and relationships from natural language, validates them against an ontology, and persists them to PostgreSQL with Qdrant vector indexing for semantic memory recall.
 
 ## Features
