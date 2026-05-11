@@ -275,7 +275,7 @@ _EMERGENCY_CONSTRAINT = (
     "parent_of|child_of|spouse|sibling_of|also_known_as|pref_name|same_as|"
     "related_to|likes|dislikes|prefers|owns|located_in|educated_at|"
     "nationality|occupation|born_on|age|knows|friend_of|met|"
-    "lives_in|born_in|has_gender|has_pet|lives_at|located_at|height|weight"
+    "lives_in|born_in|has_gender|has_pet|lives_at|located_at|height|weight|member_of"
 )
 
 def _get_constraint() -> str:
@@ -980,6 +980,102 @@ def _hierarchy_expand(
         return {entity_id}
 
 
+# ── dprompt-59: Semantic Conflict Detection ──────────────────────────────────
+# Detects when new facts contradict existing graph structure and auto-resolves.
+# The graph IS the source of truth — hierarchy/type relationships define what
+# entities ARE, and independent relationships (owns, has_pet, etc.) must respect
+# those semantics.
+
+# Rel_types that define WHAT an entity is (type/category/component)
+_HIERARCHY_DEFINING_RELS = frozenset({
+    "instance_of", "subclass_of", "is_a", "member_of", "part_of",
+})
+
+# Rel_types that should NOT apply to type/category/component entities
+# (these are for leaf/instance entities only)
+_LEAF_ONLY_RELS = frozenset({
+    "owns", "has_pet", "works_for", "lives_in", "lives_at",
+})
+
+
+def _detect_semantic_conflicts(
+    db_conn,
+    user_id: str,
+    subject: str,
+    rel_type: str,
+    obj: str,
+) -> tuple[str, str | None]:
+    """
+    Check if a new fact contradicts existing graph structure.
+
+    Returns (decision, reason):
+      - ("keep", None): No conflict — proceed with ingest.
+      - ("supersede_new", reason): New fact semantically invalid — skip it.
+      - ("supersede_existing_ids", reason): Existing fact(s) contradicted — supersede them.
+
+    Principle: If X instance_of Y, Y is a TYPE, not a separate entity.
+    Do not allow owns/has_pet/works_for on type entities.
+    """
+    rt_lower = rel_type.lower().strip() if rel_type else ""
+    obj_id = str(obj).lower().strip() if obj else ""
+
+    # Only check non-hierarchy relationship types
+    if rt_lower in _HIERARCHY_DEFINING_RELS:
+        return ("keep", None)
+
+    # Only check leaf-only relationship types against hierarchy objects
+    if rt_lower not in _LEAF_ONLY_RELS:
+        return ("keep", None)
+
+    if not db_conn or not obj_id:
+        return ("keep", None)
+
+    try:
+        with db_conn.cursor() as cur:
+            # Check: is the object entity the object of any hierarchy relationship?
+            cur.execute(
+                "SELECT id, subject_id, rel_type FROM facts "
+                "WHERE user_id = %s AND object_id = %s "
+                "AND rel_type = ANY(%s) "
+                "AND superseded_at IS NULL "
+                "LIMIT 1",
+                (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+            )
+            hierarchy_fact = cur.fetchone()
+
+            if not hierarchy_fact:
+                # Also check staged_facts
+                cur.execute(
+                    "SELECT id, subject_id, rel_type FROM staged_facts "
+                    "WHERE user_id = %s AND object_id = %s "
+                    "AND rel_type = ANY(%s) "
+                    "LIMIT 1",
+                    (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+                )
+                hierarchy_fact = cur.fetchone()
+
+            if hierarchy_fact:
+                fact_id, hierarchy_subject, hierarchy_rel = hierarchy_fact
+                reason = (
+                    f"type_conflict: {obj_id} is object of {hierarchy_rel} "
+                    f"(defined by {hierarchy_subject}) — cannot also be {rt_lower} target"
+                )
+                log.info(
+                    "ingest.semantic_conflict_detected",
+                    obj=obj_id,
+                    new_rel=rt_lower,
+                    existing_hierarchy=f"{hierarchy_subject} {hierarchy_rel} {obj_id}",
+                    decision="supersede_new",
+                )
+                return ("supersede_new", reason)
+
+    except Exception as e:
+        log.warning("ingest.semantic_conflict_check_failed", error=str(e),
+                    subject=subject, rel_type=rt_lower, obj=obj_id)
+
+    return ("keep", None)
+
+
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
 
 def _validate_startup_config() -> dict:
@@ -1578,6 +1674,9 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
+    # Guard: if another named entity is mentioned with a preference signal
+    # (e.g., "Desmonde prefers Des"), skip auto-synthesis for the user.
+    # The LLM already extracted the correct entity assignment.
     _third_party_pref = re.compile(
         r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
         re.IGNORECASE
@@ -1596,17 +1695,28 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
+    # dprompt-45: Detect negated pref_name corrections in text patterns.
+    # "My name is X, not Y" or "Call me X, not Y" → supersede the Y fact.
+    # Searches for "not <Word>" where <Word> matches a pref_name edge object.
     _negation_pattern = re.compile(r'\bnot\s+([a-z]+)', re.IGNORECASE)
     _negated_names = {m.lower() for m in _negation_pattern.findall(req.text)}
     if _negated_names:
         for key, edge in list(edges_dict.items()):
             if (edge.rel_type.lower() in ("pref_name", "also_known_as")
                     and edge.object.lower() in _negated_names):
-                edges_dict[key] = EdgeInput(
-                    subject=edge.subject, object=edge.object,
-                    rel_type=edge.rel_type, is_preferred_label=edge.is_preferred_label,
-                    is_correction=True, subject_type=edge.subject_type,
-                    object_type=edge.object_type)
+                # Mark the negated name as a correction — it should supersede the old fact
+                corrected_edge = EdgeInput(
+                    subject=edge.subject,
+                    object=edge.object,
+                    rel_type=edge.rel_type,
+                    is_preferred_label=edge.is_preferred_label,
+                    is_correction=True,
+                    subject_type=edge.subject_type,
+                    object_type=edge.object_type,
+                )
+                edges_dict[key] = corrected_edge
+                log.info("ingest.negated_name_correction_detected",
+                         negated_name=edge.object, rel_type=edge.rel_type)
 
     edges = list(edges_dict.values())
 
@@ -2226,6 +2336,31 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 rows = validated_rows
 
+                # ── dprompt-59: Semantic conflict detection ──────────────────
+                # Before committing, check each fact against existing graph structure.
+                # If X instance_of Y exists, don't allow owns/has_pet/works_for on Y.
+                conflict_free_rows = []
+                conflict_count = 0
+                for row in rows:
+                    _uid, _subj, _obj, _rel, _src, _pref, _fclass, _conf, _eng = row
+                    decision, reason = _detect_semantic_conflicts(
+                        db, req.user_id, _subj, _rel, _obj,
+                    )
+                    if decision == "supersede_new":
+                        log.info("ingest.conflict_superseded",
+                                 rel_type=_rel, subject=_subj, object=_obj, reason=reason)
+                        conflict_count += 1
+                        continue  # skip this fact — it's semantically invalid
+                    conflict_free_rows.append(row)
+
+                if conflict_count > 0:
+                    log.info("ingest.conflicts_resolved", count=conflict_count,
+                             user_id=req.user_id)
+                    db.commit()
+
+                rows = conflict_free_rows
+                # ── end dprompt-59 ──────────────────────────────────────────
+
                 # Split rows by fact class — surrogates go directly to commit, no display name resolution
                 # Display names are resolved at READ time only (_resolve_display_names in /query)
                 class_a_rows = []
@@ -2525,12 +2660,18 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 (new_fact_id,),
                             )
 
+                        # dprompt-45: When pref_name correction occurs, update entity_aliases.
+                        # Clear old preferred aliases for this entity, set the corrected name as preferred.
                         if rel_type.lower() == "pref_name":
+                            # Get the display name for the corrected subject entity
+                            _corrected_display = registry.get_preferred_name(user_id, correction_subject)
+                            # Clear old preferred flags for this entity
                             cur.execute(
                                 "UPDATE entity_aliases SET is_preferred = false "
                                 "WHERE user_id = %s AND entity_id = %s",
                                 (user_id, correction_subject),
                             )
+                            # Set the corrected object as preferred
                             _corrected_obj_display = _canonical_to_display.get(
                                 correction_object, correction_object)
                             cur.execute(
@@ -2540,6 +2681,9 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 "entity_id = EXCLUDED.entity_id, is_preferred = true",
                                 (user_id, correction_subject, _corrected_obj_display),
                             )
+                            log.info("ingest.pref_name_correction_aliases_updated",
+                                     entity=correction_subject,
+                                     corrected_name=_corrected_obj_display)
 
                     db.commit()
         finally: db.close()
@@ -2819,6 +2963,51 @@ def query(request: QueryRequest):
         except Exception:
             return cleaned
 
+    def _build_entity_types(pns: dict) -> dict:
+        """Build entity_types dict parallel to preferred_names.
+
+        Maps entity_id (UUID or display string) → entity_type from the entities table.
+        For UUID keys: batch query the entities table directly.
+        For non-UUID keys: resolve via entity_aliases → entities JOIN.
+        Graceful degradation: returns empty dict on DB error.
+        """
+        entity_types = {}
+        if not db:
+            return entity_types
+
+        # UUID-keyed entries: batch query entities table
+        _uuid_keys_in_pns = [k for k in pns if _UUID_PATTERN.match(str(k))]
+        if _uuid_keys_in_pns:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, entity_type FROM entities "
+                        "WHERE user_id = %s AND id = ANY(%s)",
+                        (user_id, _uuid_keys_in_pns),
+                    )
+                    for entity_id, etype in cur.fetchall():
+                        entity_types[entity_id] = etype or "unknown"
+            except Exception:
+                pass  # graceful — missing entity_types is non-fatal
+
+        # Non-UUID keys (display-name strings): resolve via entity_aliases → entities
+        _non_uuid_keys = [k for k in pns if not _UUID_PATTERN.match(str(k))]
+        if _non_uuid_keys:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT ea.alias, COALESCE(e.entity_type, 'unknown') "
+                        "FROM entity_aliases ea "
+                        "LEFT JOIN entities e ON e.id = ea.entity_id AND e.user_id = ea.user_id "
+                        "WHERE ea.user_id = %s AND ea.alias = ANY(%s)",
+                        (user_id, _non_uuid_keys),
+                    )
+                    for alias, etype in cur.fetchall():
+                        entity_types[alias] = etype or "unknown"
+            except Exception:
+                pass
+        return entity_types
+
     def _attributes_to_facts(attributes: dict) -> list[dict]:
         """
         Convert entity_attributes to facts format for injection.
@@ -2903,7 +3092,9 @@ def query(request: QueryRequest):
     for _tax_name, _keywords in _TAXONOMY_KEYWORDS.items():
         if any(_kw in query_lower for _kw in _keywords):
             _detected_taxonomy = _tax_name
+            log.info("query.taxonomy_detected", taxonomy=_tax_name, query=query_lower[:80])
             break
+
     # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
     if db and registry and canonical_identity:
         direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
@@ -2939,22 +3130,54 @@ def query(request: QueryRequest):
             # dprompt-27: graph traversal — find connected entities via _REL_TYPE_GRAPH
             _connected = _graph_traverse(db, user_id, user_entity_id_for_query)
             if _connected:
+                # dprompt-47c: hierarchy-chain-aware taxonomy filter
                 if _detected_taxonomy:
                     _tax = next((t for t in _TAXONOMY_CACHE if t["taxonomy_name"] == _detected_taxonomy), None)
                     if _tax and _tax.get("member_entity_types"):
                         _allowed_types = set(_tax["member_entity_types"])
                         if "ANY" not in _allowed_types:
                             _filtered = set()
+                            # Batch-fetch entity types for all connected entities
+                            _entity_types = {}
                             with db.cursor() as _tc:
                                 for _eid in _connected:
                                     _tc.execute(
                                         "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
                                         (_eid, user_id))
                                     _row = _tc.fetchone()
-                                    _etype = _row[0] if _row else "unknown"
-                                    if _etype in _allowed_types:
-                                        _filtered.add(_eid)
+                                    _entity_types[_eid] = _row[0] if _row else "unknown"
+                            # Filter: direct type match OR hierarchy-chain match
+                            for _eid in _connected:
+                                _etype = _entity_types.get(_eid, "unknown")
+                                # Fast path: direct type match
+                                if _etype in _allowed_types:
+                                    _filtered.add(_eid)
+                                    continue
+                                # Slow path: walk hierarchy chain upward
+                                if _etype == "unknown" or _etype not in _allowed_types:
+                                    try:
+                                        _chain = _hierarchy_expand(db, user_id, _eid, direction="up", max_depth=3)
+                                        for _aid in _chain:
+                                            _atype = _entity_types.get(_aid)
+                                            if not _atype:
+                                                with db.cursor() as _hc:
+                                                    _hc.execute(
+                                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                                        (_aid, user_id))
+                                                    _arow = _hc.fetchone()
+                                                    _atype = _arow[0] if _arow else "unknown"
+                                                    _entity_types[_aid] = _atype
+                                            if _atype in _allowed_types:
+                                                _filtered.add(_eid)
+                                                break
+                                    except Exception:
+                                        pass  # hierarchy walk failed — entity stays excluded
+                            log.info("query.taxonomy_filter",
+                                     taxonomy=_detected_taxonomy,
+                                     allowed_types=list(_allowed_types),
+                                     before=len(_connected), after=len(_filtered))
                             _connected = _filtered
+
                 log.info("query.graph_traverse", identity=canonical_identity,
                          connected_count=len(_connected))
                 for _conn_id in _connected:
@@ -3198,11 +3421,13 @@ def query(request: QueryRequest):
                 if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                     preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+        entity_types = _build_entity_types(preferred_names)
         return {
             "status": "ok",
             "facts": merged_facts,
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
+            "entity_types": entity_types,
             "attributes": attributes,
         }
 
@@ -3240,11 +3465,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+            entity_types_404 = _build_entity_types(preferred_names)
             return {
                     "status": "ok",
                     "facts": merged_facts,
                     "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
+                    "entity_types": entity_types_404,
                     "attributes": attributes,
                 }
         if resp.status_code != 200:
@@ -3275,11 +3502,13 @@ def query(request: QueryRequest):
                     if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
+            entity_types_err = _build_entity_types(preferred_names)
             return {
                     "status": "ok",
                     "facts": merged_facts,
                     "preferred_names": _clean_preferred_names(preferred_names),
                     "canonical_identity": canonical_identity,
+                    "entity_types": entity_types_err,
                     "attributes": attributes,
                 }
 
@@ -3401,11 +3630,13 @@ def query(request: QueryRequest):
             for _k in _INTERNAL_KEYS:
                 _f.pop(_k, None)
 
+        entity_types = _build_entity_types(preferred_names)
         return {
             "status": "ok",
             "facts": merged_facts,
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
+            "entity_types": entity_types,
             "attributes": attributes,
         }
     except Exception as e:
@@ -3413,6 +3644,7 @@ def query(request: QueryRequest):
         return {
             "status": "ok",
             "facts": [],
+            "entity_types": {},
             "preferred_names": _clean_preferred_names(preferred_names),
             "canonical_identity": canonical_identity,
             "attributes": {},

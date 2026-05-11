@@ -1,5 +1,15 @@
 # FaultLine
 
+## v1.0.3 (2026-05-12) — Semantic Conflict Detection
+
+**Ingest pipeline:** Added `_detect_semantic_conflicts()` — auto-supersedes ownership/relationship facts when the object entity is defined as a type/category/component via hierarchy relationships (instance_of, subclass_of, part_of, member_of).
+
+**Principle:** If `X instance_of Y`, Y is a TYPE, not a separate entity — don't allow `owns`/`has_pet`/`works_for` on it. Graph self-heals through semantic validation.
+
+**Fixes:** dBug-report-003/004 (type/ownership conflict cleanup)
+
+---
+
 ## v1.0.2 (2026-05-12) — Hierarchy Extraction Enhancement
 
 **Filter prompt:** Hierarchy relationships (`instance_of`, `subclass_of`, `member_of`, `part_of`) moved to primary extraction list with 6 multi-domain examples (taxonomic, organizational, infrastructure, hardware, geographical, software).

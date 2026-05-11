@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.3 (2026-05-12) — Semantic Conflict Detection
+
+**Ingest pipeline:** `_detect_semantic_conflicts()` added before Class A/B/C commit. Auto-supersedes ownership/relationship facts when the object entity is already defined as a type/category via hierarchy rels.
+
+**Principle:** The graph IS the source of truth. If `X instance_of Y`, Y is a TYPE — don't allow `owns`/`has_pet`/`works_for` on type entities. Graph self-heals.
+
+**Fixes:** dBug-report-003/004 (type/ownership conflict cleanup)
+
 ## v1.0.2 (2026-05-12) — Hierarchy Extraction Enhancement
 
 **Filter prompt:** Hierarchy relationships (`instance_of`, `subclass_of`, `member_of`, `part_of`) moved to primary extraction list in `_TRIPLE_SYSTEM_PROMPT` with 6 multi-domain examples.
