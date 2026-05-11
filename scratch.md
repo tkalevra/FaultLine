@@ -25,25 +25,43 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
-## #deepseek NEXT TASK: dprompt-69 (Open-Ended Extraction + RAG Fallback)
+## ✓ INVESTIGATION & FIX: dprompt-69 Pre-Prod Validation (dBug-010 Root Cause) — 2026-05-15
 
-**Read completely:** dprompt-69b.md before starting.
+**Finding:** dprompt-69 extraction works ✓, but novel rel_types silently dropped from ingest pipeline due to routing bug (dBug-010).
 
-**Summary:** Eliminate silent failures. Loosen extraction prompt to encourage novel rel_types (health, ephemeral, transient). Add RAG fallback when extraction fails. No information lost.
+**Root Cause:** Line 2378 in `src/api/main.py` — status condition `if status in ("valid", "conflict")` excludes "unknown" → novel rel_types never reach staged_facts despite being classified as Class C.
 
-**CRITICAL:**
-- Extract prompt change: Explicit novel rel_type examples + encouragement
-- RAG fallback: If extraction returns [], call /store_context (raw text to Qdrant)
-- Tests: Verify novel extraction + fallback behavior
-- NO WGM/validation/re-embedder changes (they already handle this)
-- NO GIT COMMITS — work in progress, user decides
+**Evidence:**
+- /ingest returns facts with status="unknown", fact_class="C" ✓
+- But committed=0, staged=0 ✗ (facts skipped from rows)
+- staged_facts empty for has_injury/currently_at/is_resting ✗
+- ontology_evaluations has entries ✓ (WGM working)
 
-**Deliverables:**
-1. openwebui/faultline_tool.py — updated extraction prompt + RAG fallback
-2. tests/filter/test_relevance.py — 3 new tests (novel types, fallback, edge cases)
-3. Update scratch.md with status when complete
+**Fix:** 1-line change (commit b6b5d67)
+- Line 2378: Add "unknown" to status check
+- Result: Novel rel_types now route → Class C staging → re-embedder evaluation
 
-**When done:** Report to scratch.md (template in dprompt-69b), STOP and await review.
+**Next:** Docker rebuild pre-prod to validate fix. Health facts should stage as Class C.
+
+---
+
+## ✓ DONE: dprompt-69 (Open-Ended Extraction + RAG Fallback) — 2026-05-15
+
+**Task:** Eliminate silent failures — loosen extraction prompt, verify RAG fallback.
+
+**Findings:**
+- RAG fallback already existed: `_fire_store_context` at line 1338 caches raw text to Qdrant upfront before extraction
+- Extraction prompt was missing encouragement for novel/ephemeral rel_types
+
+**Changes:**
+- `openwebui/faultline_tool.py`: Added NOVEL & EPHEMERAL REL_TYPES section to `_TRIPLE_SYSTEM_PROMPT`
+  - 6 categories: health/status, ephemeral location, activity/state, transient events, uncertain/exploratory
+  - Confidence 0.4, Class C staging, 4 concrete examples
+- `tests/filter/test_relevance.py`: 3 new tests (prompt validation, fallback method existence, edge formatting)
+
+**Tests:** 15 passed (12 existing + 3 new), 0 regressions, no commits.
+
+**Next:** User review + manual pre-prod validation.
 
 ---
 
