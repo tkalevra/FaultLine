@@ -1577,7 +1577,14 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
-    if detected_preferred:
+    _third_party_pref = re.compile(
+        r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
+        re.IGNORECASE
+    )
+    _third_party_matches = {m.group(1).lower() for m in _third_party_pref.finditer(req.text)}
+    _skip_user_pref = bool(_third_party_matches and _third_party_matches != {"user"})
+
+    if detected_preferred and not _skip_user_pref:
         pref_key = ("user", detected_preferred, "pref_name")
         if pref_key not in edges_dict:
             edges_dict[pref_key] = EdgeInput(
