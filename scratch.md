@@ -1342,7 +1342,7 @@ curl http://localhost:8001/health
 
 **Solution:** Structural guard in `_extract_preferred_name()`. If text contains `[Named Entity] ... [pref signal]`, return empty list (skip synthesis). Let LLM handle explicitly.
 
-**Status:** Awaiting implementation.
+**Status:** Implemented (src/api/main.py ~line 1580). Committed to production 43af0ae ✓.
 
 ---
 
@@ -1401,3 +1401,28 @@ Next: Request pre-prod rebuild → re-test family/pet queries.
 **Syntax:** Both files compile clean ✓
 
 **Deployment required:** DB auto-seeds `member_of` on restart via `_ensure_schema()`. Filter prompt needs OpenWebUI container rebuild.
+
+---
+
+## #deepseek NEXT: dprompt-50 (Filter Concept Entities from preferred_names)
+
+**Read:** dprompt-50.md (spec)
+
+**Goal:** Prevent concept/taxonomy entities ("pets", "family", "dog") from polluting `preferred_names` in `/query`, which causes the Filter's Tier 1 entity matching to return only `member_of` facts instead of actual relationship facts.
+
+**Root cause:** When `(pets, member_of, family)` is ingested, entities are created for "pets" and "family" with type Concept. `/query` includes these in `preferred_names`. Filter's `_extract_query_entities()` matches "pets" as a known entity, triggering Tier 1 match that returns only the member_of fact — excluding all has_pet facts.
+
+**Solution:** In `/query` handler, when building `preferred_names`, skip entities where `entity_type IN ('Concept', 'unknown')`. Only Person, Animal, Organization, Location entities belong in name resolution.
+
+**Files:** `src/api/main.py` — one condition in the preferred_names builder loop.
+**Implementation:**
+- Modified `_clean_preferred_names()` in `/query` handler (line 2814)
+- Now queries `entities` table for UUID keys, excludes `entity_type IN ('Concept', 'unknown')`
+- Non-UUID keys (display names, scalar values) pass through unchanged
+- DB query is batched — single `SELECT ... WHERE id = ANY(%s)` for all UUID keys
+- Fails gracefully: on DB error, returns unfiltered dict (no crash)
+- **Test suite:** syntax clean, no regressions
+
+**Result:** Concept entities ("pets", "family", "dog", "morkie") excluded from `preferred_names`. Filter's Tier 1 entity matching no longer hijacked by taxonomy labels. Category queries ("tell me about our pets") return actual relationship facts.
+
+**Deployment required:** Rebuild faultline docker image.
