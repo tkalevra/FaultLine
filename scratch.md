@@ -28,19 +28,23 @@ Code goes directly into source files. This file stays lean.
 ## Current State (2026-05-13 evening)
 
 ### Production (GitHub: tkalevra/FaultLine)
+- **v1.0.6** — Metadata-driven validation framework (dprompt-65)
+- **v1.0.5** — Bidirectional relationship validation (dprompt-62)
 - **v1.0.4** — Query deduplication + alias metadata (dprompt-61)
 - **v1.0.3** — Semantic conflict detection (dprompt-59)
 
-### Investigation Complete
-- dBug-report-006: Staged facts bypass conflict detection
-- dBug-report-007: dprompt-62 bidirectional validation incomplete + UUID exposure
-- Pre-prod cleaned: impossible relationships removed, staged facts corrected
-- User retest: "flawless now"
+### Architecture
+- **Ingest pipeline:** LLM extract → WGM gate → semantic conflict detection → bidirectional validation → fact classification (A/B/C) — all validation now metadata-driven via `rel_types` table
+- **Self-healing:** Semantic conflicts + bidirectional impossibilities auto-superseded. Validation scales with dynamic ontology.
+- **Zero hardcoded validation rules** — all replaced with `_get_rel_type_metadata()` queries
 
-### Architecture Decision: dprompt-65
-User feedback: No technical debt. Metadata-driven validation framework instead of tactical fixes.
+### Bugs Closed
+dBug-report-001 through dBug-report-007 all resolved. One P3 cleanup (dBug-004) scoped for future.
 
-**Philosophy:** Validation rules in database, not code. rel_types table stores properties (symmetric, inverse, leaf_only, hierarchy). LLM defines metadata when creating novel rel_types. Validation queries metadata at runtime. Scales with dynamic ontology forever.
+### Dev repo
+- Branch: `master` (commit `b34b3be`)
+- Test suite: 114 passed, 53 skipped
+- Lines: `src/api/main.py` 4006
 
 ---
 
