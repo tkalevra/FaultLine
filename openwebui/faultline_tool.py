@@ -103,9 +103,24 @@ RELATIONSHIP RULES:
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
 - pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). For first-person preferences ("I prefer to be called X", "call me X"), subject IS "user". For third-person ("she goes by X", "his preferred name is Y"), subject is the named person.
-- is_a: type or category. has_pet: person owns an animal (NEVER a person).
-- member_of: entity belongs to a taxonomy group. Use when user states membership ("my pets are family" → subject=pet_entity, object="family", rel_type="member_of"). Object is the taxonomy group name.
-- Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
+- has_pet: person owns an animal (NEVER a person).
+
+HIERARCHY RELATIONSHIPS — extract these whenever you see type/classification/part-of patterns. They appear in every domain and are as important as family relationships:
+- instance_of: entity IS a specific type or breed ("Fraggle is a morkie" → fraggle instance_of morkie)
+- subclass_of: type IS a subclass of another ("a morkie is a kind of dog" → morkie subclass_of dog)
+- member_of: entity belongs to a group or taxonomy ("my pets are family" → pets member_of family)
+- part_of: entity is a component of a larger whole ("Engineering dept of TechCorp" → engineering part_of techcorp)
+- is_a: type or category (deprecated; prefer instance_of or subclass_of).
+
+Hierarchy chains across domains (extract EVERY link in the chain):
+- Taxonomic: "I have a dog named Fraggle, a morkie" → fraggle instance_of morkie, morkie subclass_of dog, dog subclass_of animal
+- Organizational: "Alice is an engineer in Engineering at TechCorp" → alice instance_of engineer, engineer member_of engineering, engineering part_of techcorp
+- Infrastructure: "Server 192.168.1.1 is in subnet 192.168.1.0/24 on the main network" → 192.168.1.1 part_of subnet_192_168_1, subnet_192_168_1 part_of network_main
+- Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
+- Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
+- Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
+
+Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
 
 SELF-ID: Explicit first-person self-identification only ("I am X", "my name is X", "call me X"):
@@ -392,7 +407,6 @@ def _extract_query_entities(
     query: str,
     preferred_names: dict,
     facts: list[dict] = None,
-    entity_types: dict = None,
 ) -> set[str]:
     """
     Extract entity display names from a query via two strategies.
@@ -417,16 +431,6 @@ def _extract_query_entities(
                    if name and len(name) > 1}
     # # NO RECURSIVE MATCHING — known_names built from pre-extracted preferred_names values only
     entities.update(token for token in tokens if token in known_names)
-
-    # --- dprompt-52: Skip tokens matching Concept/unknown entity types ---
-    # Prevent taxonomy labels ("pets", "family", "dog") from hijacking Tier 1
-    if entity_types:
-        _CONCEPT_TYPES = {"concept", "unknown"}
-        entities = {
-            token for token in entities
-            if entity_types.get(token, "").lower() not in _CONCEPT_TYPES
-        }
-    # --- end dprompt-52 ---
 
     # --- Tier 1b: Relational resolution ("my wife", "my pet", etc.) ---
     if facts:
@@ -760,17 +764,16 @@ class Filter:
         identity: Optional[str],
         preferred_names: dict = None,
         query: str = "",
-        entity_types: dict = None,
     ) -> list[dict]:
         """
-        Three-tier entity-centric relevance filtering.
+        Simplified relevance filtering — trusts backend /query ranking.
 
-        Tier 1: Entity match — if query mentions a known entity, return all facts
-                where that entity is subject or object. Deterministic, no scoring.
-        Tier 2: Identity fallback — for generic queries with no entity match,
-                return identity-defining facts only (names, family structure).
-        Tier 3: Graph-proximity pass-through — backend already ranked by relevance.
-                Only gate by confidence + sensitivity.
+        Identity rels always pass. Everything else passes if confidence >= threshold
+        (defaulting to MIN_INJECT_CONFIDENCE valve or 0.4). Sensitivity penalty
+        still applies to PII facts unless explicitly asked.
+
+        Backend /query returns facts ranked by class (A > B > C) + confidence.
+        Filter trusts that order — no entity-type gating, no tier fallback logic.
         """
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
@@ -789,51 +792,25 @@ class Filter:
                 if not _garbage(f.get("subject", ""))
                 and not _garbage(f.get("object", ""))]
 
-        # TIER 1: Entity match — if query mentions a known entity, return all facts about it
-        if preferred_names:
-            entities = _extract_query_entities(query, preferred_names, facts=cleaned, entity_types=entity_types)
-            # Merge pronoun-resolved entities from conversation context
-            if identity:
-                pronoun_entities = _resolve_pronouns(query, identity)
-                if pronoun_entities:
-                    entities.update(pronoun_entities)
-            if entities:
-                tier1 = [f for f in cleaned
-                         if f.get("subject", "").lower() in entities
-                         or f.get("object", "").lower() in entities]
-                if tier1:
-                    return _apply_confidence_gate(tier1)
+        # Simplified gate: identity rels always pass; others pass by confidence
+        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
+                          "spouse", "parent_of", "child_of", "sibling_of"}
+        threshold = self.valves.MIN_INJECT_CONFIDENCE or 0.4
 
-        # TIER 2: Identity fallback — for generic queries with no entity match,
-        # return identity-defining facts (names, family structure).
-        # This runs for ALL non-entity-matched queries — correct behavior.
-        _TIER2_IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
-                                "spouse", "parent_of", "child_of", "sibling_of"}
-        tier2 = [f for f in cleaned if f.get("rel_type") in _TIER2_IDENTITY_RELS]
-        if tier2:
-            return _apply_confidence_gate(tier2)
-
-        # TIER 3: Graph-proximity pass-through — backend already ranked by relevance.
-        # Only gate by confidence. Sensitivity penalty applied per-fact.
-        _RELEVANCE_THRESHOLD = 0.0  # confidence-only; graph structure is the signal
-        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
-
-        def should_include_fact(fact: dict) -> bool:
-            # Identity facts always pass (names, aliases)
-            if fact.get("rel_type") in _IDENTITY_RELS:
-                return True
-            # Gate by confidence + sensitivity
-            return self.calculate_relevance_score(fact, query) >= _RELEVANCE_THRESHOLD
-
-        scored = [f for f in cleaned if should_include_fact(f)]
+        passed = []
+        for f in cleaned:
+            rel = f.get("rel_type", "")
+            if rel in _IDENTITY_RELS:
+                passed.append(f)
+                continue
+            score = self.calculate_relevance_score(f, query)
+            if score >= 0.0:  # confidence-only; sensitivity penalty applies inside
+                passed.append(f)
 
         if self.valves.ENABLE_DEBUG:
-            dropped = len(cleaned) - len(scored)
-            if dropped > 0:
-                print(f"[FaultLine Filter] relevance dropped {dropped} facts "
-                      f"(kept {len(scored)}/{len(cleaned)})")
+            print(f"[FaultLine Filter] filtered: {len(passed)}/{len(cleaned)} facts")
 
-        return _apply_confidence_gate(scored)
+        return _apply_confidence_gate(passed)
 
 
     def _build_realtime_context(
@@ -1286,12 +1263,11 @@ class Filter:
                 try:
                     cached = _SESSION_MEMORY_CACHE.get(user_id)
                     if cached and (_time.time() - cached[0]) < _SESSION_MEMORY_TTL:
-                        _, facts, preferred_names, canonical_identity, entity_attributes, entity_types = cached
+                        _, facts, preferred_names, canonical_identity, entity_attributes = cached
                         raw_facts_for_extraction = list(facts)
                         # Filter cached facts for this specific query
                         facts = self._filter_relevant_facts(
-                            facts, canonical_identity,
-                            preferred_names=preferred_names, query=text, entity_types=entity_types,
+                            facts, canonical_identity, query=text,
                         )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id=[redacted]")
@@ -1322,20 +1298,17 @@ class Filter:
                             preferred_names = data.get("preferred_names", {})
                             canonical_identity = data.get("canonical_identity")
                             entity_attributes = data.get("attributes", {})
-                            entity_types = data.get("entity_types", {})
 
                             # Store raw unfiltered facts in cache
                             _SESSION_MEMORY_CACHE[user_id] = (
-                                _time.time(), facts, preferred_names, canonical_identity,
-                                entity_attributes, entity_types,
+                                _time.time(), facts, preferred_names, canonical_identity, entity_attributes
                             )
 
                             raw_facts_for_extraction = list(facts)
 
                             # Filtering happens after cache store, not before
                             facts = self._filter_relevant_facts(
-                                facts, canonical_identity,
-                                preferred_names=preferred_names, query=text, entity_types=entity_types,
+                                facts, canonical_identity, query=text,
                             )
 
                             if self.valves.ENABLE_DEBUG:
