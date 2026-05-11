@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.0.2 (2026-05-12) — Hierarchy Extraction Enhancement
+
+**Filter prompt:** Hierarchy relationships (`instance_of`, `subclass_of`, `member_of`, `part_of`) moved to primary extraction list in `_TRIPLE_SYSTEM_PROMPT` with 6 multi-domain examples.
+
+**Changes:**
+- Added HIERARCHY RELATIONSHIPS section to Filter prompt with definitions and chain examples
+- Moved `instance_of`, `subclass_of`, `member_of`, `part_of` from absent/weak to "Common" (primary) extraction list
+- 6 multi-domain examples: taxonomic, organizational, infrastructure, hardware, geographical, software
+
+**Fixes:**
+- dBug-report-002: Hierarchical Entity Relationships Missing
+- `part_of` previously had 0 facts — now extracted with Class B confidence
+- `instance_of` and `member_of` now extracted with complete multi-link chains
+
 ## v1.0.1 (2026-05-12) — Filter Simplification
 
 **Architecture:** Backend-first query design. Filter no longer implements three-tier gating — it trusts backend /query ranking (Class A > B > C + confidence).
