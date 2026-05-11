@@ -28,10 +28,22 @@ Code goes directly into source files. This file stays lean.
 ## Current State (2026-05-13 evening)
 
 ### Production (GitHub: tkalevra/FaultLine)
+- **v1.0.7** — Query deduplication fix — UUID keys (dprompt-66)
 - **v1.0.6** — Metadata-driven validation framework (dprompt-65)
 - **v1.0.5** — Bidirectional relationship validation (dprompt-62)
 - **v1.0.4** — Query deduplication + alias metadata (dprompt-61)
-- **v1.0.3** — Semantic conflict detection (dprompt-59)
+
+### Active Issues
+
+| Bug | Status |
+|-----|--------|
+| dBug-report-001 — 007 | Fixed |
+| dBug-report-008 | Fixed (dprompt-66) — pre-prod validated ✓ |
+
+### Dev repo
+
+- Branch: `master` (commit `1c3614c`)
+- Test suite: 114 passed, 53 skipped
 
 ### Architecture
 - **Ingest pipeline:** LLM extract → WGM gate → semantic conflict detection → bidirectional validation → fact classification (A/B/C) — all validation now metadata-driven via `rel_types` table
@@ -99,4 +111,5 @@ Validation rules live in `rel_types` table, not code. New rel_types self-describ
 - Tests: 114 passed, 0 regressions ✓
 
 **Pre-prod validation pending:** User must rebuild faultline backend container. Current pre-prod still shows 4 parent_of facts (old code). After rebuild: expect 2 parent_of (des, cyrus only).
+- **Deployed:** v1.0.7 (`915b0c8`) ✓ — pre-prod validated, 2 parent_of facts confirmed.
 
