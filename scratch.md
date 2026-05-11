@@ -11,6 +11,35 @@ plans, or test cases here. Use it to:
 
 Code goes directly into source files. This file stays lean.
 
+## Pre-Prod Reference (2026-05-12)
+
+**Instance:** hairbrush.helpdeskpro.ca (truenas)
+**Model:** faultline-wgm-test-10
+**Bearer token:** sk-addb2220bf534bfaa8f78d96e6991989 (homelab, minimal risk)
+
+**SSH for container logs:**
+```bash
+ssh truenas -x "sudo docker logs faultline --tail N"           # FaultLine backend
+ssh truenas -x "sudo docker logs faultline-postgres --tail N"   # PostgreSQL
+ssh truenas -x "sudo docker logs open-webui --tail N"           # OpenWebUI (Filter runs here)
+```
+
+**Curl testing (via chat API):**
+```bash
+# Ingest (sends message through filter → extract → ingest → query → inject)
+curl -s -H "Authorization: Bearer sk-addb2220bf534bfaa8f78d96e6991989" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "faultline-wgm-test-10", "messages": [{"role": "user", "content": "TEXT"}], "stream": false}' \
+  https://hairbrush.helpdeskpro.ca/api/chat/completions
+
+# Backend health check (from within docker network)
+ssh truenas -x "sudo docker exec open-webui curl -s -m 5 http://192.168.40.10:8001/health"
+```
+
+**Container status:**
+- faultline: healthy, faultline-wgm:latest, IP 172.16.18.3, running since 2026-05-11 08:19
+- open-webui: contains Filter plugin loaded via DB (function_faultline_wgm_tool_for_openwebui_functions)
+
 **LENGTH RULE:** If this file exceeds 150 lines, archive everything between the
 "## Archive" section and the "---" separator as `scratch-archive-YYYY-MM-DD.md`,
 then condense the remaining content to a concise current state summary. The
@@ -1426,3 +1455,127 @@ Next: Request pre-prod rebuild → re-test family/pet queries.
 **Result:** Concept entities ("pets", "family", "dog", "morkie") excluded from `preferred_names`. Filter's Tier 1 entity matching no longer hijacked by taxonomy labels. Category queries ("tell me about our pets") return actual relationship facts.
 
 **Deployment required:** Rebuild faultline docker image.
+
+---
+
+## #deepseek NEXT: dprompt-51b (Graph-Proximity Relevance — Replace Keyword Scoring)
+
+**Read:** dprompt-51b.md (executable prompt)
+
+**Goal:** Replace the Filter's keyword-based relevance scoring with graph-proximity-based gating. The backend already computes graph distance, hierarchy membership, and taxonomy filtering — the Filter should trust that structure instead of re-judging relevance with brittle `_CAT_SIGNALS` keyword lists.
+
+**Key changes in `openwebui/faultline_tool.py`:**
+- Remove `_categorize_query()` entirely
+- Simplify `calculate_relevance_score()` — drop keyword-match component (0.0–0.6), keep only confidence bonus + sensitivity penalty
+- Replace Tier 3 keyword scoring with confidence-only pass-through (threshold 0.0)
+- Remove `categories`/`is_realtime` parameters from `_filter_relevant_facts()`
+- Tier 2 becomes pure identity fallback for non-entity-matched queries
+
+**Why:** "our pets", "her family", "their kids" all fail today because keyword lists are exact-match on possessive pronouns. Graph proximity from `/query` already encodes what's relevant — connected entities are relevant by definition.
+
+**Status:** IMPLEMENTED + VALIDATED in pre-prod — 2026-05-12
+
+### dprompt-51b Validation Results (Pre-Prod)
+
+**Filter code deployed:** ✓ Confirmed via API — no `_CAT_SIGNALS`, no `_categorize_query`, `Graph-proximity pass-through` present, `_RELEVANCE_THRESHOLD = 0.0`.
+
+| Test | Query | Result | Notes |
+|------|-------|--------|-------|
+| 1 | "tell me about fraggle" | ✓ PASS | Entity-name match → Tier 1 → returns has_pet facts. "Fraggle is your dog" |
+| 2 | "tell me about her family" | ✓ PASS | "her family" works without "my family" keyword. Returns spouse + pets |
+| 3 | "how are you" | ✓ PASS | Identity facts returned. No sensitive facts leaked (no address/birthday) |
+| 4 | "tell me about our pets" | ⚠ BLOCKED | dprompt-50 not deployed — concept entities in `preferred_names` cause Tier 1 to match "pets" → returns only `member_of` fact |
+
+**Root cause for test 4:** Backend `/query` returns 25 facts including `has_pet` (fraggle, morkie), but `preferred_names` includes concept entities (`pets`, `family`, `dog`). Filter's Tier 1 entity match finds "pets" in query → returns only `pets -member_of-> family` (1 fact). All `has_pet` facts excluded.
+
+**Fix chain:**
+1. **dprompt-50** (backend `src/api/main.py`): Exclude `Concept`/`unknown` entities from `preferred_names` — NOT DEPLOYED to pre-prod faultline container
+2. **dprompt-51b** (filter): Already deployed and working — correctly trusts backend
+
+Once dprompt-50 deployed: "tell me about our pets" → no "pets" in preferred_names → Tier 1 skipped → Tier 2 skipped (has_pet not identity) → Tier 3 passes all has_pet facts (0.0 threshold) → full pet facts injected ✓
+
+---
+
+# deepseek
+
+## dprompt-51b Pre-Prod Validation — Key Insights (2026-05-12)
+
+**dprompt-51b deployed and working.** Filter correctly trusts backend graph-proximity. But Tier 1 hijacks category queries:
+
+| Query | Backend facts | Filter injects | Root cause |
+|-------|--------------|----------------|------------|
+| "tell me about fraggle" | 30 (has_pet, spouse...) | has_pet ✓ | "fraggle" = Animal → Tier 1 works |
+| "tell me about our pets" | 30 (has_pet, spouse...) | 1 (member_of only) ✗ | "pets" = Concept → Tier 1 returns taxonomy edge only |
+| "tell me about her family" | 30 | spouse + pets ✓ | Pronoun resolved, no concept token match |
+
+**Failure chain:** `preferred_names` contains concept entities (`pets`, `family`, `dog`) — ingested via `member_of`/`instance_of`. Tier 1 matches "pets" as entity → returns only `pets -member_of-> family`. All `has_pet` excluded.
+
+**dprompt-50's `_clean_preferred_names` didn't fix it:** Only filters UUID-keyed entries. Concept entities have non-UUID string keys → pass through unchanged.
+
+**Architecture insight:** The ontology already has `entity_type` (Person, Animal, Concept...). Filter just needs this metadata at Tier 1 to distinguish named entities from taxonomy labels. Solution: add `entity_types` dict to `/query` response.
+
+## ✓ DONE: dprompt-52b (Entity-Type-Aware Tier 1 Matching) — 2026-05-12
+
+**Implementation:**
+- Backend: Added `_build_entity_types()` inner function in `/query` handler — batched queries `entities` table (UUID keys) and `entity_aliases→entities` JOIN (string keys)
+- Backend: Added `"entity_types"` to all 5 `/query` response paths (embed fail, 404, error, success, exception)
+- Filter: `_extract_query_entities()` accepts optional `entity_types` dict, filters out Concept/unknown entity types from Tier 1a token matches
+- Filter: `_filter_relevant_facts()` accepts and forwards `entity_types` parameter
+- Filter: `inlet()` extracts `entity_types` from `/query` response, passes through call chain, includes in session cache tuple
+
+**How it works:**
+- Query "tell me about our pets" → "pets" is Concept → skipped in Tier 1 → Tier 3 pass-through → has_pet facts flow
+- Query "tell me about fraggle" → "fraggle" is Animal → Tier 1 matches → returns Fraggle facts
+- Missing `entity_types` key → backward compatible (Filter behaves as today)
+- `_clean_preferred_names` retained as defense-in-depth
+
+**Test suite:** 114 passed, 53 skipped, 0 regressions ✓
+
+**Deployment required:** Rebuild faultline backend container + OpenWebUI filter update.
+
+**Next:** Rebuild pre-prod containers → validate 4 test scenarios.
+
+---
+
+## #deepseek BUG FOUND: dBug-report-001 — Tier 2 Identity Fallback Blocks Tier 3 — 2026-05-12
+
+**Root cause:** Tier 2 fires on empty Tier 1 result, treating "concept-filtered query" the same as "genuinely generic query." Filter's three-tier gating logic is brittle.
+
+**Architecture critique:** The Filter shouldn't implement Tier logic at all. It should trust backend ranking.
+
+**See:** `docs/ARCHITECTURE_QUERY_DESIGN.md` — explains why Filter is dumb, backend is smart.
+
+---
+
+## #deepseek NEXT: dprompt-53b (Filter Simplification — Remove Brittle Gating)
+
+**This is a paradigm shift, not a patch.**
+
+Current architecture:
+- Filter implements Tier 1/2/3 logic with Concept filtering
+- Backend returns 30 facts, Filter gates them down to 16 based on heuristics
+- Result: category queries blocked, UUID leaks
+
+Correct architecture:
+- Backend extraction/ontology/hierarchy captures all relevance
+- Backend returns facts ranked by class (A > B > C) + confidence
+- Filter is dumb: inject facts in returned order, no gating
+- Only gate on: (a) identity rels always pass, (b) sensitive rels on explicit ask, (c) confidence threshold 0.4
+
+**Read first:**
+- `docs/ARCHITECTURE_QUERY_DESIGN.md` — architectural principle with dinner example
+- `dprompt-53.md` — specification
+
+**Execute:**
+- `dprompt-53b.md` — formal prompt using DEEPSEEK_INSTRUCTION_TEMPLATE
+
+**Key constraints:**
+- Investigation: pre-prod only (SSH to truenas, check logs)
+- Code: FaultLine-dev only (local modifications)
+- Deployment: User rebuild/redeploy pre-prod (you ask for it)
+- Test: Local validation first, then live validation after rebuild
+
+**Status:** Ready for implementation.
+
+---
+

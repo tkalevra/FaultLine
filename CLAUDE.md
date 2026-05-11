@@ -24,7 +24,7 @@ OpenWebUI inlet filter
 │     │                       │           └─▶ re_embedder (background) → Qdrant upsert
 │     │                       ├─▶ Class B (behavioral/contextual)
 │     │                       │     └─▶ _commit_staged()  INSERT INTO staged_facts
-│     │                       │           └─▶ immediate Qdrant sync (same as Class A, no poll delay)
+│     │                       │           └─▶ immediate Qdrant sync (no poll delay)
 │     │                       │           └─▶ re_embedder promotes when confirmed_count >= 3
 │     │                       │                 └─▶ staged Qdrant point deleted after commit
 │     │                       │                       └─▶ new facts point upserted next poll cycle
@@ -39,12 +39,13 @@ OpenWebUI inlet filter
 │
 └─▶ POST /query (synchronous, before model sees message)
 ├─▶ PostgreSQL baseline facts (always returned for known identity)
-├─▶ PostgreSQL graph traversal (self-referential signals, 2-hop)
-└─▶ Qdrant cosine search (nomic-embed-text, score_threshold: 0.3)
-└─▶ calculate_relevance_score() gate (threshold 0.4)
-└─▶ entity attributes scored separately before injection
-└─▶ merged, deduplicated → injected as system message before last user message
-└─▶ ⊢ FaultLine Memory header + event_emitter status notification
+├─▶ PostgreSQL graph traversal   `_graph_traverse()` single-hop across facts + staged_facts
+├─▶ PostgreSQL hierarchy expansion   `_hierarchy_expand()` upward classification chains
+├─▶ Taxonomy-aware entity filtering   `_TAXONOMY_KEYWORDS` → `member_entity_types` gate
+├─▶ Qdrant cosine search (nomic-embed-text, score_threshold: 0.3, limit: 10)
+├─▶ entity_types metadata   `_build_entity_types()` parallel to preferred_names
+├─▶ merged, deduplicated → injected as system message before last user message
+├─▶ ⊢ FaultLine Memory header + event_emitter status notification
 OpenWebUI outlet filter
 └─▶ pass-through (no-op)
 
@@ -63,30 +64,35 @@ Before calling the LLM for fact extraction:
 
 If neither condition is met, `will_ingest = False`. `will_query` is always `True` when `QUERY_ENABLED` is set.
 
-**Memory injection gate:**
-Facts are scored via `calculate_relevance_score()` before injection. Facts scoring below 0.4 are excluded. Entity attributes are scored separately using synthetic fact dicts before reaching `_build_memory_block()`. Identity relationships (`also_known_as`, `pref_name`, `same_as`) always pass regardless of score. Memory is injected only when facts survive the gate, positioned immediately before the last user message. A visible status notification is emitted via `__event_emitter__` showing fact count.
+## Three-Tier Filter Relevance Gating (dprompt-51b/52b)
 
-## Relevance Scoring
+The Filter's `_filter_relevant_facts()` uses a three-tier gating system. Backend graph-proximity is authoritative — the Filter trusts backend ranking rather than re-judging relevance with keyword lists.
+
+**Tier 1 — Entity-name match:**
+If the query mentions a known entity (matched via `_extract_query_entities()` against `preferred_names`), return all facts where that entity is subject or object. Entity types from `entity_types` metadata are used to skip Concept/unknown entities — preventing taxonomy labels ("pets", "family", "dog") from hijacking this tier.
+
+**Tier 2 — Identity fallback:**
+For genuinely generic queries ("how are you") with no entity match, return identity-defining facts only: `also_known_as`, `pref_name`, `same_as`, `spouse`, `parent_of`, `child_of`, `sibling_of`.
+
+**Tier 3 — Graph-proximity pass-through:**
+All remaining facts pass through with confidence-only gating (`_RELEVANCE_THRESHOLD = 0.0`). Identity facts (`also_known_as`, `pref_name`, `same_as`) always pass. Sensitivity penalty still applies per-fact via `calculate_relevance_score()`.
+
+**Known bug (dBug-report-001):** Tier 2 intercepts queries where Tier 1 entities were filtered out by Concept/unknown — the empty entities set falls through to Tier 2's identity return, blocking Tier 3 from passing `has_pet` and other category facts. Fix: skip Tier 2 when entity_types stripped all Tier 1 matches.
+
+**`entity_types` metadata:** The `/query` backend now returns an `entity_types` dict alongside `preferred_names`, built by `_build_entity_types()` from the `entities` table (UUID keys) and `entity_aliases→entities` JOIN (string keys). The Filter's `_extract_query_entities()` uses this to distinguish Person/Animal/Organization/Location from Concept/unknown.
+
+## Relevance Scoring (simplified — dprompt-51b)
 
 `calculate_relevance_score(fact, query) -> float [0.0, 1.0]`
 
-Three components:
+Two components (keyword match component removed — graph structure is the signal):
 
-1. **Query signal match (0.0–0.6):** keyword overlap between lowercased query and `_CAT_SIGNALS[fact.category]`, capped at 0.6
-2. **Confidence bonus (0.0–0.3):** `fact.confidence * 0.3`
-3. **Sensitivity penalty (-0.5):** applied when `fact.rel_type` is in `_SENSITIVE_RELS` (`born_on`, `lives_at`, `lives_in`, `height`, `weight`, `born_in`) and no explicit request term found in query
-
-`_SENSITIVE_TERMS`: `{"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy"}`
+1. **Confidence bonus (0.0–0.3):** `fact.confidence * 0.3`
+2. **Sensitivity penalty (-0.5):** applied when `fact.rel_type` is in `_SENSITIVE_RELS` (`born_on`, `lives_at`, `lives_in`, `height`, `weight`, `born_in`) and no explicit request term found in query
 
 Identity rels (`also_known_as`, `pref_name`, `same_as`) always bypass scoring.
 
-Threshold: `RELEVANCE_THRESHOLD = 0.4` (local constant in `_filter_relevant_facts()`).
-
-**Critical:** `_filter_relevant_facts()` returns `scored` (never falls back to `cleaned`). When no facts score above threshold, nothing injects. The previous fallback leak (`return scored if scored else cleaned`) has been removed.
-
-**Entity attributes:** Filtered via synthetic fact dicts with `_ATTR_CATEGORY_MAP` before reaching `_build_memory_block()`. Not injected unconditionally.
-
-Conversation state awareness is planned as a future score contributor (0.0–0.4) — see NEXT_STEPS.md.
+Tier 3 uses `_RELEVANCE_THRESHOLD = 0.0` — confidence-only gating. Graph-proximity from `/query` already encodes what's relevant.
 
 ## Fact Classification (Phase 4)
 
@@ -107,102 +113,73 @@ Facts are classified at ingest time into three classes:
 - **Query visibility**: Immediately visible via `_fetch_user_facts()` UNION (PostgreSQL) and immediate Qdrant sync (vector search) — no 3-confirmation wait for retrieval
 
 **Class C — Ephemeral/Novel** (staged, expiring without confirmation)
-- Anything not in A or B; engine-generated types; confidence < 0.6; novel types rejected by LLM
+- Anything not in A or B; engine-generated types; confidence < 0.6
 - **Confidence**: 0.4 if llm_inferred
 - **Lifecycle**: Staged with `expires_at = now() + 30 days`; no promotion path; deleted by re_embedder on expiry
 
 ## Query / Retrieval Path & Filtering
 
-`/query` runs three parallel sources:
-1. **Baseline facts** (PostgreSQL, always) — identity-anchored scalar and relationship facts
-2. **Graph traversal** (PostgreSQL, signal-gated) — self-referential signals, 2-hop
-3. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5`, cosine, `score_threshold: 0.3`, `limit: 10`
+`/query` runs multiple parallel sources:
+1. **Baseline facts** (PostgreSQL, always) — identity-anchored scalar and relationship facts via `_fetch_user_facts()`
+2. **Graph traversal** — `_graph_traverse(db, user_id, entity_id, max_hops=1)` single-hop across `_REL_TYPE_GRAPH` rels, fetching from both `facts` and `staged_facts`
+3. **Hierarchy expansion** — `_hierarchy_expand(db, user_id, entity_id, direction="up", max_depth=3)` walks `instance_of`, `subclass_of`, `part_of`, `is_a`, `member_of` chains via SQL `WITH RECURSIVE` CTE
+4. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5`, cosine, `score_threshold: 0.3`, `limit: 10`
+5. **Entity attributes** — `_attributes_to_facts()` converts `entity_attributes` rows to fact dicts, merged into the fact list
 
 Merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict.
 
-**`_fetch_user_facts()` UNION helper:** Both the baseline and graph-traversal queries use `_fetch_user_facts(db, user_id, entity_id, rel_types)` which UNIONs the `facts` and `staged_facts` tables. This ensures Class B/C staged facts are immediately visible to all PostgreSQL query paths without waiting for the 3-confirmation promotion cycle. The function is defined at the top of `/query` (before the `try` block) and must remain there — call sites must follow the definition.
+### Graph + Hierarchy Traversal (dprompt-27/28)
 
-**Signal-gating:**
-- `_SELF_REF_SIGNALS`: triggers full graph traversal (2-hop) for queries like "where do i live", "tell me about me", "my family"
-- `_ATTRIBUTE_SIGNALS`: triggers named-entity resolution for queries containing `live`, `address`, `home`, `location`, `age`, `height`, `weight`, `job`, `work`, `occupation`, `born`, `birthday`
+Two orthogonal traversal systems:
 
-**Scalar facts as facts:** Entity attributes returned in both `attributes` dict AND `facts` list. Both paths are now scored before injection.
+- **Graph (`_REL_TYPE_GRAPH`):** connectivity — who am I connected to? spouse, parent_of, child_of, sibling_of, has_pet, knows, friend_of, met, works_for, lives_at, lives_in, located_in, owns, educated_at, member_of + identity anchors (pref_name, also_known_as, same_as, age, height, weight, born_on, nationality, has_gender, occupation)
+- **Hierarchy (`_REL_TYPE_HIERARCHY`):** composition + classification — what are they, what do they belong to? instance_of, subclass_of, part_of, is_a, member_of
 
-## LLM Configuration
+`_hierarchy_expand()` supports bidirectional traversal:
+- `direction="up"`: entity → class chain (e.g., fraggle → instance_of → dog → subclass_of → animal)
+- `direction="down"`: class → members
 
-### Filter (`openwebui/faultline_tool.py`)
+Cycle protection via depth tracking in the CTE.
 
-Model resolution via `_resolve_llm_config(valves, body)`:
-- `LLM_MODEL` valve non-empty → use that model (explicit override)
-- `LLM_MODEL` valve empty → passthrough `body.get("model")` (user's selected OpenWebUI model)
-- `LLM_URL` valve non-empty → use that endpoint
-- `LLM_URL` valve empty → use OpenWebUI's internal endpoint
+### Taxonomy-Aware Query Filtering (dprompt-47/47c)
 
-Eliminates cold-load penalties in LM Studio when the user's selected model is already warm.
+`_TAXONOMY_KEYWORDS` maps query keywords to taxonomy groups (family→Person, household→Person+Animal, work→Person+Organization, location→Location, computer_system→Concept+Object). After graph traversal, connected entities are filtered by `member_entity_types` from the matching taxonomy.
 
-### Backend (`src/wgm/gate.py`, `src/api/main.py`)
+Hierarchy-chain-aware: entities with unknown type walk `_hierarchy_expand()` upward to validate membership (e.g., entity type "unknown" but chain resolves to "Animal" → passes household filter).
 
-All backend LLM model strings are env-var controlled:
+### Entity Type Metadata in /query (dprompt-52)
 
-| Env Var | Default | Purpose |
-|---|---|---|
-| `WGM_LLM_MODEL` | `qwen/qwen3.5-9b` | Novel type validation in `WGMValidationGate._try_approve_novel_type()` |
-| `CATEGORY_LLM_MODEL` | `qwen2.5-coder` | Category inference in `_assign_category_via_llm()` |
-| `QWEN_API_URL` | `http://localhost:11434/v1/chat/completions` | LLM endpoint for all backend calls |
+`_build_entity_types()` builds an `entity_types` dict parallel to `preferred_names`:
+- UUID keys: batched query of `entities` table
+- String (display-name) keys: `entity_aliases` → `entities` JOIN
 
-Embedding model (`text-embedding-nomic-embed-text-v1.5`) remains hardcoded — infrastructure, not user-configurable.
+Returned in `/query` response JSON as `"entity_types"`. The Filter uses this to skip Concept/unknown entities in Tier 1 matching.
 
-## Key Files
+### `_fetch_user_facts()` UNION helper
 
-| File | Role |
-|---|---|
-| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, fact classification, Qdrant cleanup, `_fetch_user_facts()` UNION helper, `_assign_category_via_llm()` (model: `CATEGORY_LLM_MODEL`) |
-| `src/api/models.py` | Pydantic models — IngestRequest, QueryRequest, RetractRequest, RetractResponse, StoreContextRequest, StoreContextResponse |
-| `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection + type constraint validation + novel type approval (model: `WGM_LLM_MODEL`) |
-| `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
-| `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` — entity resolution helpers |
-| `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — canonical ID assignment, alias tracking, preferred name resolution |
-| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts/staged_facts, promotes Class B (deletes staged Qdrant point post-promotion), expires Class C, runs reconciliation pass |
-| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction detection + LLM extraction, ingest/unstructured fallback, relevance-scored query injection, `⊢ FaultLine Memory` branding, `__event_emitter__` status |
-| `openwebui/faultline_function.py` | OpenWebUI **Function** (tool call) — explicit `store_fact()` with LLM rewrite |
-| `migrations/001_create_facts.sql` | Schema: `facts` table + `qdrant_synced` column + lowercase trigger |
-| `migrations/007_correction_behavior.sql` | Correction behavior enum (supersede/hard_delete/immutable) per rel_type |
-| `migrations/012_staged_facts.sql` | Phase 4: `staged_facts` table, promotion/expiration indexes, fact_class + fact_provenance columns |
-| `migrations/013_rel_type_category.sql` | Adds `category TEXT` to `rel_types` for query intent matching |
-| `migrations/014_entity_attributes_unique.sql` | Unique `(user_id, entity_id, attribute)` on `entity_attributes` |
+Defined before the `try` block in `/query`. UNIONs `facts` and `staged_facts` tables. Ensures Class B/C staged facts are immediately visible to all PostgreSQL query paths without waiting for the 3-confirmation promotion cycle. Call sites must follow the definition — do not move below callers.
 
-## GLiNER2 Extraction
+## Name Conflict Resolution (dprompt-32b)
 
-Both `/ingest` and `/extract` use `model.extract_json(text, schema)`. The `rel_type` constraint is built dynamically from the `rel_types` DB table at startup via `_build_rel_type_constraint`; comprehensive hardcoded fallback used when DB is unavailable.
+When two entities claim the same preferred name ("gabby" for both user and child), the system detects and resolves collisions:
 
-`/ingest` schema — 3 fields:
-```python
-{
-    "facts": [
-        "subject::str::The full proper name of the first entity. Never a pronoun.",
-        "object::str::The full proper name of the second entity. Never a pronoun.",
-        "rel_type::[<db-loaded constraint>]::str::The relationship type from subject to object.",
-    ]
-}
-```
+- `entity_name_conflicts` table: stores pending disputes with UNIQUE constraint
+- `registry.register_alias()`: detects collisions, inserts as non-preferred for new entity, stores as pending
+- `registry.get_any_alias()`: fallback to non-preferred aliases when preferred name missing
+- `re_embedder.resolve_name_conflicts()`: evaluates pending conflicts via LLM context, assigns winner/loser with fallback aliases
+- `_resolve_display_names()` in `/query`: falls back to non-preferred aliases via `get_any_alias()` when preferred name is a UUID
 
-`/extract` (preflight) schema — 5 fields:
-```python
-{
-    "facts": [
-        "subject::str::...", "object::str::...", "rel_type::[...]::str::...",
-        "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::...",
-        "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::...",
-    ]
-}
-```
-The bracket syntax (`[a|b|c]`) is native GLiNER2 choices constraint — do not change it.
+Non-destructive: all names preserved, only preferred status changes.
 
-**Edge validation:** UUID values in subject or object rejected before entity resolution.
+## Entity Type Classification
 
-**Type persistence:** `subject_type`/`object_type` persisted to `entities` table only when current `entity_type = 'unknown'`.
+Three-layer type inference via GLiNER2 extraction → relationship semantics fallback → descriptor context.
 
-When `req.edges` are supplied (from LLM rewrite), they override GLiNER2 inferred edges.
+**Entity type persistence:** `subject_type`/`object_type` persisted to `entities` table only when current `entity_type = 'unknown'`.
+
+**Type flow:** GLiNER2 extracts types → Filter passes to LLM as context → LLM includes in output → `/ingest` receives edges with types → `entity_type` UPDATE executes.
+
+**Age validation (dprompt-36b):** Entity-type-aware — Person ages 0–150 (strict), non-Person any non-negative (no upper limit). Negative ages rejected for all types.
 
 ## Qdrant Collection Naming
 
@@ -220,7 +197,19 @@ Both Filter and Function pass the OpenWebUI user UUID as `user_id`.
 3. Post-commit (outside transaction, best-effort): DELETE staged Qdrant point
 4. Next poll cycle: upsert new facts-table point to Qdrant
 
-**Known reconciliation gap:** `reconcile_qdrant()` only queries `facts` table. Expired `staged_facts` rows surviving a failed Qdrant delete are invisible to reconciliation until next successful expiry run. No fix needed for single-instance deployment.
+**Expiry:** Class C rows with `expires_at <= now()` are deleted from `staged_facts`.
+
+**Ontology evaluation:** `evaluate_ontology_candidates()` — frequency ≥ 3 → approve novel rel_type, cosine similarity > 0.85 → map to existing.
+
+**Name conflict resolution:** `resolve_name_conflicts()` — LLM-powered entity disambiguation integrated into main loop.
+
+## Production Hardening (dprompt-41b)
+
+- **Startup validation:** `_validate_startup_config()` checks POSTGRES_DSN, QDRANT_URL, QWEN_API_URL. Logs warning if missing (non-fatal).
+- **Health endpoint:** `/health` returns JSON with database, qdrant, llm, re_embedder status. 5s cache.
+- **Timeouts:** Configurable via `HTTPX_TIMEOUT` (10s), `DB_TIMEOUT` (30s), `QDRANT_TIMEOUT` (10s).
+- **Rate limiting:** `_check_rate_limit()` per-user_id tracking, 100 req/min default (`RATE_LIMIT_PER_MIN`).
+- **Query fallback:** PostgreSQL-only response when embedding/Qdrant unavailable.
 
 ## WGM Ontology
 
@@ -230,16 +219,16 @@ Triple model `(subject_id, rel_type, object_id)` aligned to Wikidata PIDs. SKOS/
 
 **Inverse:** parent_of ↔ child_of
 
-Novel `rel_type` values → LLM approval call (model: `WGM_LLM_MODEL`). Confidence ≥ 0.7 → auto-approve. Lower → `pending_types`, edge dropped.
+**Self-building (dprompt-17):** Novel `rel_type` values → Class C + `ontology_evaluations`. Re-embedder evaluates asynchronously (frequency ≥ 3 → approve, cosine > 0.85 → map, else reject). No LLM approval calls at ingest time.
 
 **Type constraints:** `rel_types.head_types` and `tail_types` (ARRAY). `ARRAY['ANY']` = unconstrained. `ARRAY['SCALAR']` = scalar value.
 
 | rel_type | Wikidata PID | Inverse | Symmetric | W3C Mapping | Notes |
 |---|---|---|---|---|---|
-| is_a | P31/P279 | — | No | rdf:type (dep.) | **deprecated** |
 | instance_of | P31 | — | No | rdf:type | NOT transitive |
 | subclass_of | P279 | — | No | rdfs:subClassOf | IS transitive |
 | part_of | P361 | — | No | — | component → whole |
+| member_of | — | — | No | — | entity → group taxonomy |
 | created_by | P170 (inv) | — | No | — | creation → creator |
 | works_for | P108 (inv) | — | No | — | employee → employer |
 | parent_of | P40 | child_of | No | — | parent → child |
@@ -250,34 +239,92 @@ Novel `rel_type` values → LLM approval call (model: `WGM_LLM_MODEL`). Confiden
 | pref_name | — | — | No | skos:prefLabel | entity → preferred name |
 | same_as | Q39893449 | same_as | Yes | owl:sameAs | identity, symmetric |
 | related_to | P1659 | — | No | skos:related | loose link |
-| likes | — | — | No | — | subject preference |
-| dislikes | — | — | No | — | subject preference |
-| prefers | — | — | No | — | subject preference |
+| likes/dislikes/prefers | — | — | No | — | subject preference |
 | owns | P1830 (inv) | — | No | — | owner → property |
 | located_in | P131 | — | No | — | entity → location |
+| lives_in | P551 | — | No | — | person → location (residence) |
+| lives_at | — | — | No | — | person → address |
+| born_in | P19 | — | No | — | person → location (birthplace) |
+| has_pet | — | — | No | — | person → animal |
+| has_gender | P21 | — | No | — | person → gender |
 | educated_at | P69 | — | No | — | student → institution |
 | nationality | P27 | — | No | — | person → country |
 | occupation | P106 | — | No | — | person → profession |
 | born_on | P569 | — | No | — | person → date |
 | age | — | — | No | — | person → value |
+| height/weight | — | — | No | — | physical measurements |
 | knows | P1891 | knows | Yes | — | symmetric |
 | friend_of | — | friend_of | Yes | — | symmetric |
 | met | — | met | Yes | — | symmetric |
-| lives_in | P551 | — | No | — | person → location (residence) |
-| born_in | P19 | — | No | — | person → location (birthplace) |
-| has_gender | P21 | — | No | — | person → gender |
 
 ## Database Schema & Fact Lifecycle
 
 Primary tables:
 - `facts(id, user_id, subject_id, object_id, rel_type, provenance, fact_provenance, fact_class, created_at, qdrant_synced, superseded_at, confidence, confirmed_count, last_seen_at, contradicted_by, is_preferred_label)` — unique on `(user_id, subject_id, object_id, rel_type)`. Soft-delete via `superseded_at IS NOT NULL`.
 - `staged_facts(id, user_id, subject_id, object_id, rel_type, fact_class, provenance, confidence, confirmed_count, first_seen_at, last_seen_at, expires_at, promoted_at, qdrant_synced)` — Class B promoted when `confirmed_count >= 3`; Class C auto-deleted when `expires_at <= now()`.
-- `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity)` — scalar facts. Unique on `(user_id, entity_id, attribute)`. `entity_id` always normalized to `"user"` anchor for user-identity scalars.
+- `entity_attributes(user_id, entity_id, attribute, value_text, value_int, value_float, value_date, provenance, sensitivity, category)` — scalar facts. Unique on `(user_id, entity_id, attribute)`. `entity_id` always normalized to `"user"` anchor for user-identity scalars.
 - `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry. Note: `entity_aliases` rename to `entity_names` planned.
+- `entity_name_conflicts(id, user_id, alias, entity_id_a, entity_id_b, status, resolved_by, resolved_at, created_at)` — pending name collision disputes. UNIQUE on `(user_id, alias)`.
+- `entity_taxonomies(id, taxonomy_name, description, member_entity_types, rel_types_defining_group, has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type)` — data-driven grouping system. Pre-seeded with family, household, work, location, computer_system.
 - `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior, category, head_types, tail_types)` — live ontology. Loaded at startup into `_REL_TYPE_META`.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
+- `ontology_evaluations` — frequency + cosine similarity tracking for self-building ontology.
 
 DB triggers: Lowercase `subject_id`, `object_id`, `rel_type` on every INSERT/UPDATE. **NO RECURSIVE MATCHING** — all string comparisons must use pre-lowercased values only.
+
+## Entity ID vs Display Name: Semantic Distinction
+
+**CRITICAL: Violations cause entity loss.**
+
+- **Entity UUIDs:** UUID v5 surrogates. Stored in `facts.subject_id`, `facts.object_id` (relationship facts), `entities.id`, `entity_aliases.entity_id`. Never store display names in `*_id` columns.
+- **Display Names:** Human-readable strings. Stored in `entity_aliases.alias` (lowercased), `entity_attributes.value_*`.
+
+### Which Rel_Types Have UUID Objects vs String Objects
+
+**SCALAR REL_TYPES (object must be STRING):** pref_name, also_known_as, age, height, weight, born_on, occupation, nationality
+
+**RELATIONSHIP REL_TYPES (object must be UUID or user_id):** has_pet, spouse, parent_of, child_of, friend_of, knows, met, works_for, educated_at, located_in, lives_in, lives_at, born_in, likes, dislikes, prefers, same_as
+
+The `/ingest` validation block has `_SCALAR_OBJECT_RELS` — objects for scalar rels are NEVER resolved to UUIDs. Objects for relationship rels are ALWAYS resolved.
+
+## Key Files
+
+| File | Role |
+|---|---|
+| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, `_graph_traverse()`, `_hierarchy_expand()`, `_build_entity_types()`, `_clean_preferred_names()`, `_fetch_user_facts()` UNION helper, fact classification, `_TAXONOMY_KEYWORDS`, startup normalization, age validation |
+| `src/api/models.py` | Pydantic models — EdgeInput (with subject_type/object_type), IngestRequest, QueryRequest, RetractRequest, StoreContextRequest |
+| `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection + type constraint validation |
+| `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
+| `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` |
+| `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — UUID v5 surrogates, alias tracking, preferred name resolution, conflict detection |
+| `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts/staged_facts, promotes Class B, expires Class C, evaluates ontology candidates, resolves name conflicts, Qdrant reconciliation |
+| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction + LLM extraction, three-tier relevance gating (entity match → identity fallback → graph-proximity pass-through), `entity_types`-aware Tier 1, `/query` caching, `⊢ FaultLine Memory` injection |
+| `openwebui/faultline_function.py` | OpenWebUI **Function** — explicit `store_fact()` with LLM rewrite |
+| `migrations/012_staged_facts.sql` | `staged_facts` table, promotion/expiration indexes |
+| `migrations/019_entity_taxonomies.sql` | `entity_taxonomies` table + 5 core taxonomies |
+| `migrations/021_name_conflicts.sql` | `entity_name_conflicts` table |
+| `docker-compose.yml` | Docker orchestration — `network: host` build, env-var-driven configuration |
+| `docker-entrypoint.sh` | Migration runner + uvicorn startup + re-embedder background launch |
+| `BUGS/` | Bug reports — see `dBug-report-001.md` |
+
+## Key Principles (Do Not Violate)
+
+- **LLM never has unsupervised write access** — all writes flow through the WGM validation gate
+- **PostgreSQL is authoritative** — Qdrant is a derived read-only view
+- **Write-time normalization** — `entity_id` normalized to `"user"` anchor at write time
+- **No recursive matching** — all string comparisons use pre-lowercased values; guard comments required where `# NO RECURSIVE MATCHING` appears
+- **`entity_aliases` is the authoritative alias registry**
+- **`faultline-{user_id}` per-user collection naming is live** — must never be broken
+- **Nested function definitions must precede call sites** — `_fetch_user_facts()` is defined before the `try` block in `/query`; do not move it below its callers
+- **ON CONFLICT must match actual unique constraints** — `entity_aliases` uses `UNIQUE (user_id, alias)`, so all ON CONFLICT clauses must target `(user_id, alias)`, never `(entity_id, user_id, alias)`
+- **No name-based entity pre-creation** — entities are created exclusively via `EntityRegistry.resolve()` which generates UUID v5 surrogates
+- **Alias sync uses display names, not UUIDs** — `_canonical_to_display` dict maps canonical UUID → original display name
+- **All entity_ids must be UUIDs or user_id** — `/ingest` validates this; startup normalization converts legacy string IDs
+- **Scalar rel_types have STRING objects, relationship rel_types have UUID objects** — `_SCALAR_OBJECT_RELS` defines the split. Never resolve objects for scalar rels; always resolve for relationship rels.
+- **Alias registration must use ON CONFLICT DO UPDATE** — ensures stale preferred flags are corrected
+- **Graph + hierarchy are separate traversal systems** — `_REL_TYPE_GRAPH` (connectivity) and `_REL_TYPE_HIERARCHY` (composition) are orthogonal. Do not conflate them.
+- **Backend graph-proximity is authoritative for relevance** — Filter Tier 3 trusts backend ranking. No keyword-based re-scoring.
+- **entity_types metadata is additive** — missing key → backward compatible. No new DB queries in Filter.
 
 ## Running / Developing
 
@@ -287,440 +334,29 @@ pip install -e ".[test]"
 pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
               --ignore=tests/model_inference --ignore=tests/preprocessing
 
-pytest tests/embedder/test_promotion.py -v
-pytest tests/filter/test_relevance.py -v
-pytest tests/api/test_retract.py -v
-
 uvicorn src.api.main:app --host 0.0.0.0 --port 8001 --reload
 docker compose up --build
 ```
 
 ## Environment Variables
+```
 POSTGRES_DSN=postgresql://user:pass@localhost:5432/faultline
+POSTGRES_USER=faultline
+POSTGRES_PASSWORD=faultline
+POSTGRES_DB=faultline
 QWEN_API_URL=http://localhost:11434/v1/chat/completions
 WGM_LLM_MODEL=qwen/qwen3.5-9b
 CATEGORY_LLM_MODEL=qwen2.5-coder
 QDRANT_URL=http://qdrant:6333
 QDRANT_COLLECTION=faultline-test
 REEMBED_INTERVAL=10
-
-## OpenWebUI Integration
-
-Two artifacts in `openwebui/`:
-
-- **`faultline_tool.py`** — OpenWebUI **Filter**. Inlet flow:
-  1. **Retraction check**: LLM extracts → `/retract` → entity_aliases cleanup (pref_name) → short-circuit
-  2. **LLM config resolution**: `_resolve_llm_config(valves, body)` — model and URL resolved once per inlet call
-  3. **Memory query**: `/query` → relevance scored (threshold 0.4) → entity attributes scored separately → injected before last user message → `⊢ FaultLine Memory` header → `__event_emitter__` status
-  4. **Ingest flow**: typed edges → `/ingest`; unstructured fallback → `/store_context`
-  5. Outlet: no-op pass-through
-
-**Filter valves:**
-- `RETRACTION_ENABLED: bool`
-- `INGEST_ENABLED: bool`
-- `QUERY_ENABLED: bool`
-- `MIN_INJECT_CONFIDENCE: float` (default 0.5)
-- `LLM_MODEL: str` (empty = passthrough user's model)
-- `LLM_URL: str` (empty = OpenWebUI internal endpoint)
-- `QWEN_TIMEOUT: int` (default 10)
-- `ENABLE_DEBUG: bool`
-
-Defaults: Filter defaults to `"http://192.168.40.10:8001"`; Function defaults to `"http://faultline:8001"`. Internal port 8000; external 8001.
-
-- **`faultline_function.py`** — OpenWebUI **Function/Tool**. Explicit `store_fact(text, __user__)`. LLM rewrites to triples → `/ingest`.
-
-## Entity Type Classification & Pet Descriptors (May 8, 2026)
-
-### Type Classification System
-
-Three-layer type inference ensures entities are properly classified even with confusing names:
-
-**Layer 1: GLiNER2 Extraction** → direct entity type classification from text
-**Layer 2: Relationship Semantics** → fallback based on rel_type (has_pet → object is Animal)
-**Layer 3: Descriptor Context** → extract and store rich attributes (species, breed, color)
-
-### Example: "We have a cat named Goose"
-
-**Without robust handling:**
-- GLiNER2 classifies "goose" as Animal (bird species)
-- System creates entity goose:Animal
-- Loses the fact that it's a cat
-- Type mismatch: has_pet expects Animal, but name suggests otherwise
-
-**With robust handling:**
-1. Extract: subject="we", object="goose", rel_type="has_pet", object_type=?
-2. GLiNER2 returns object_type="Animal" (correct by chance)
-3. Relationship inference: has_pet → object MUST be Animal (reinforces)
-4. **Descriptor extraction:** Pattern match "have a CAT named GOOSE" → extract species="cat"
-5. Store species as entity_attribute for goose entity
-6. Result: goose:Animal with attribute species="cat", pref_name="goose"
-
-**Descriptor Extraction (Lines 507-540):**
-- Patterns: "have a [SPECIES] named [NAME]", "[NAME] is a [BREED]", "[NAME], a [DESCRIPTOR]"
-- Extracts: species, breed, color, size → stored as entity_attributes
-- Category: "physical" (like height, weight), marked provenance="llm_inferred"
-
-**Relationship-Aware Type Inference (Lines 542-575):**
-- Maps rel_type → expected entity types
-- Example: has_pet:object → Animal, parent_of:subject/object → Person
-- Used as fallback when GLiNER2 uncertain or conflicts with context
-- Applied after direct type updates but before fact creation
-
-### Type Update Pipeline (Lines 763-834)
-
-For each edge:
-1. **Direct types** (GLiNER2): UPDATE entities WHERE entity_type='unknown' with edge.subject_type/object_type
-2. **Inferred types** (relationship semantics): Use fallback if direct type missing
-3. **Descriptor storage**: For has_pet, extract and store species/breed/color as attributes
-4. Ensures complete entity classification: type + descriptive attributes
-
-## Entity Type Classification in /ingest (Fixed May 8, 2026)
-
-The `/ingest` endpoint has code to update entity types from GLiNER2 classifications (line 702-709: `UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'`), but this was never executing because the LLM output didn't include `subject_type` and `object_type` fields.
-
-**The flow:**
-1. GLiNER2 extracts entity types (Person, Animal, Location, etc.) ✓
-2. Filter passes these to LLM as context (faultline_tool.py line 226-239) ✓
-3. **BUG:** LLM output format only had `{subject, object, rel_type, low_confidence}` — missing type fields
-4. `/ingest` receives edges with `subject_type=None, object_type=None`
-5. Code checks `if edge.object_type and canonical_object:` → always False
-6. Entity types never updated: entity stays type='unknown'
-7. Type constraint validation fails: "object_type 'unknown' not allowed for 'has_pet'"
-
-**Fix (May 8, 2026):** Two-part fix to ensure entity types flow end-to-end:
-
-1. **Filter (`faultline_tool.py`):** Updated `_TRIPLE_SYSTEM_PROMPT` output format to include subject_type and object_type:
-   ```python
-   OUTPUT: [{"subject":"...","subject_type":"...","object":"...","object_type":"...","rel_type":"...","low_confidence":false}]
-   ```
-   With instruction: "Preserve the types exactly as classified by GLiNER2. Do not invent new types."
-
-2. **Backend Schema (`src/api/main.py`, line 548-554):** Added subject_type and object_type to GLiNER2 schema:
-   ```python
-   schema = {
-       "facts": [
-           "subject::str::...",
-           "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the subject entity.",
-           "object::str::...",
-           "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the object entity.",
-           "rel_type::...::str::...",
-       ]
-   }
-   ```
-   **Critical:** GLiNER2 only returns fields specified in the schema. Without these fields in the schema, GLiNER2 doesn't extract or return type information.
-
-3. **Backend EdgeInput (`src/api/main.py`, line 556-564):** Fixed EdgeInput creation to include subject_type and object_type from GLiNER2:
-   ```python
-   EdgeInput(
-       subject=fact["subject"].lower().strip(),
-       object=fact["object"].lower().strip(),
-       rel_type=fact["rel_type"].lower().strip(),
-       subject_type=fact.get("subject_type"),  # ← ADDED
-       object_type=fact.get("object_type")     # ← ADDED
-   )
-   ```
-   Previously, types were extracted into `_entity_types` dict but never passed to EdgeInput.
-
-Result: Complete type flow → GLiNER2 extracts types → /ingest receives edges with types → entity_type UPDATE executes → has_pet validation passes.
-
-## /query Endpoint: Self-Referential Graph Traversal (Fixed May 2026)
-
-The `/query` endpoint detects self-referential signals ("where do i live", "about me", "my family", etc.) and executes a **PostgreSQL graph traversal** to fetch facts anchored to the user's identity. This returns both long-term facts (from `facts` table) and staged facts (from `staged_facts` table) **immediately** without waiting for promotion.
-
-**Critical initialization (line ~1495):**
-```python
-try:
-    db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-    registry = EntityRegistry(db)
-    canonical_identity = registry.get_preferred_name(user_id, user_id)
-except Exception as _e:
-    log.warning("query.db_init_failed", error=str(_e))
-    db = None
-    registry = None
-    canonical_identity = None
+HTTPX_TIMEOUT=10
+DB_TIMEOUT=30
+QDRANT_TIMEOUT=10
+DB_POOL_SIZE=10
+RATE_LIMIT_PER_MIN=100
+FAULTLINE_API_URL=http://localhost:8001
 ```
-
-**Why this matters:** Without explicit initialization, `db`, `registry`, and `canonical_identity` remain `None`, causing the graph traversal condition (`if db and registry and canonical_identity:`) to always fail. Result: staged facts (Class B location, contact info, behavioral metadata) never reach the Filter, and user memories fail to inject.
-
-**Tested behavior (May 8, 2026):**
-- User tells system: "My home address is 156 Cedar St. S, Kitchener, ON"
-- User queries: "Where do I live?"
-- `/query` endpoint detects signal → initializes db/registry → calls `_fetch_user_facts()`
-- Returns: `lives_at` fact marked `fact_state: "staged"` with TTL/promotion metadata
-- Filter injects fact into memory → LLM answers correctly
-
-The `finally` block (line 1921) ensures `db.close()` on all code paths.
-
-## Entity ID Normalization (May 8, 2026 — Beta Ready)
-
-**Problem:** Facts were stored with string entity_ids ("marla", "fraggle") instead of UUID v5 surrogates generated by `EntityRegistry._make_surrogate()`, breaking graph traversal in `/query`.
-
-**Solution:** Automatic normalization at startup + validation on ingest.
-
-### Startup Normalization
-
-Function `_normalize_entity_ids_startup(dsn)` runs during `/ingest` lifespan (after schema migrations):
-1. Scans `facts` and `staged_facts` for non-UUID entity_ids (pattern: `NOT LIKE '%-%-%-%-'`)
-2. For each string_id, generates deterministic UUID v5 surrogate: `_make_surrogate(user_id, string_id)`
-3. Updates all `subject_id` and `object_id` references atomically
-4. Registers entities in `entities` table
-5. Syncs `entity_aliases` to preserve display names
-6. Logs summary: string_ids_processed, rows_updated
-
-**Idempotent:** If no string entity_ids exist, function skips silently. Safe to run repeatedly.
-
-### Ingest Validation
-
-All facts in `/ingest` (lines 1194-1204) are validated before storage:
-- `subject_id` must be: user_id OR UUID v5 surrogate
-- `object_id` must be: user_id OR UUID v5 surrogate
-
-Rejects with `ingest.invalid_subject_id` / `ingest.invalid_object_id` logs. Prevents string IDs from contaminating the database.
-
-### Testing (May 8, 2026)
-
-Verified end-to-end flow:
-```
-POST /ingest: "My home address is 123 Main St" → lives_at staged as Class B ✓
-POST /query: "Where do I live?" → fact retrieved with fact_state="staged" ✓
-Graph traversal: Self-referential signal detected, baseline facts returned ✓
-Memory injection: Fact ready for Filter to inject into conversation ✓
-```
-
-**Status:** Entity normalization complete. System ready for beta testing. 🎉
-
-## Identity Rel_Type & Alias Registration (May 9, 2026)
-
-Identity rel_types (`pref_name`, `also_known_as`, `same_as`) define how entities are displayed. When processed:
-
-### Consistent Alias Registration Logic
-
-**When `pref_name` or `also_known_as` edges are ingested:**
-
-1. **Lines 953-959 in `/ingest`**: Calculate `is_pref` boolean
-   - `pref_name` edges: always `is_pref=True` (rel_type itself is the preference signal)
-   - `also_known_as` edges: `is_pref=True` only if `is_preferred_label=True`, `has_preferred=True`, or object in `preferred_objects` set
-   
-2. **Lines 987-992 in `/ingest`**: Call `registry.register_alias(canonical_subject, edge.object, is_preferred=is_pref)`
-   - For pref_name: registers the object as a **preferred alias** for the subject's canonical UUID
-   - Example: edge `(marla, pref_name, mars)` → registers "mars" as preferred alias for UUID(marla)
-
-3. **In `registry.register_alias()` (lines 117-131)**:
-   - If `is_preferred=True`: clears other preferred aliases for the entity (only one preferred per entity)
-   - Uses `ON CONFLICT (user_id, alias) DO UPDATE` to ensure is_preferred is always set correctly
-   - This handles stale data: if "mars" was registered with is_preferred=FALSE by an older process, it gets corrected to TRUE
-
-### Identity Rel_Type Semantics
-
-| Rel_Type | Semantics | Preferred? | Example |
-|---|---|---|---|
-| `pref_name` | Entity's preferred display name | Always preferred | (marla, pref_name, mars) → display as "mars" |
-| `also_known_as` | Alternate name/nickname | Only if explicitly marked preferred | (marla, also_known_as, mal) → display as "marla" unless marked preferred |
-| `same_as` | Identity synonym (Wikidata-style) | Not used for display | (marla, same_as, marlene) → identity equivalence, no preferred |
-
-### Display Name Resolution
-
-When `/query` returns facts or Filter injects memory:
-
-1. Fact object_id is a UUID (e.g., `54214459-...`)
-2. System calls `_resolve_display_names()` → `registry.get_preferred_name(user_id, uuid)`
-3. `get_preferred_name()` queries: `SELECT alias FROM entity_aliases WHERE entity_id=uuid AND is_preferred=true`
-4. Returns preferred alias (e.g., "mars") or falls back to UUID if none exists
-
-**Critical:** If an alias exists but `is_preferred=FALSE`, it's **invisible** to display resolution. This is why the fix ensures all aliases are registered with correct is_preferred values.
-
-### Spouse Facts Example
-
-User says: "My wife's name is Marla" → "My wife prefers Mars"
-
-**Ingest 1:**
-- Edge: `(user, spouse, marla)`
-- `marla` resolved to UUID via `registry.resolve()` → creates `entity_aliases(UUID_marla, marla, is_preferred=true)`
-- Fact stored: `(user_uuid, spouse, UUID_marla)`
-
-**Ingest 2:**
-- Edge: `(marla, pref_name, mars)`
-- `registry.register_alias(UUID_marla, "mars", is_preferred=true)`
-  - Clears: `entity_aliases(UUID_marla, marla, is_preferred=false)`
-  - Adds: `entity_aliases(UUID_marla, mars, is_preferred=true)`
-
-**Query:**
-- `/query` returns spouse fact: `(user_uuid, spouse, UUID_marla)`
-- Calls `get_preferred_name(user_id, UUID_marla)` → returns "mars"
-- Displays: "My spouse is mars" ✓
-
-## Entity ID vs Display Name: Semantic Distinction (May 9, 2026)
-
-**CRITICAL: This section defines what values live where. Violations cause entity loss.**
-
-### The Two Kinds of Entity References
-
-1. **Entity UUIDs (Canonical IDs)** — UUID v5 surrogates generated by `EntityRegistry._make_surrogate()`
-   - Always lowercased, match pattern `^[0-9a-f]{8}-[0-9a-f]{4}-...`
-   - **Storage:** `facts.subject_id`, `facts.object_id` (for relationship facts ONLY)
-   - **Storage:** `entities.id`, `entity_aliases.entity_id`
-   - **Never stored:** display names in any `*_id` column
-
-2. **Display Names (Strings)** — Human-readable names, aliases, measurement values
-   - Can be any non-empty string: "mars", "Paris", "10", "May 3"
-   - **Storage:** `entity_aliases.alias` (normalized to lowercase)
-   - **Storage:** `entity_attributes.value_text|value_int|value_float|value_date` (scalar facts)
-   - **Never stored:** in `*_id` columns
-
-### Which Rel_Types Have UUID Objects vs String Objects
-
-**SCALAR REL_TYPES (object must be STRING):**
-- `pref_name`: preferred display name for entity
-- `also_known_as`: alternate name/alias for entity
-- `age`: person's age (numeric string: "10", "25")
-- `height`, `weight`: measurements (string: "5'10\"", "160 lbs")
-- `born_on`: date of birth (string: "May 3", "1990-05-03")
-- `occupation`: person's job/profession (string: "teacher", "software engineer")
-- `nationality`: person's nationality (string: "Canadian", "British")
-
-**RELATIONSHIP REL_TYPES (object must be UUID or user_id):**
-- `has_pet`: subject → object_uuid (pet entity)
-- `spouse`: subject → object_uuid (spouse entity)
-- `parent_of`, `child_of`: subject → object_uuid
-- `friend_of`, `knows`, `met`: subject → object_uuid
-- `works_for`, `educated_at`: subject → object_uuid (organization)
-- `located_in`, `lives_in`, `lives_at`, `born_in`: subject → object_uuid (location)
-- `likes`, `dislikes`, `prefers`: subject → object_uuid or string (depends on context; default to UUID)
-- `same_as`: subject_uuid → object_uuid (identity equivalence)
-
-### Validation Block Semantics (Lines 1322–1392)
-
-The `/ingest` endpoint validates each row before storage:
-
-1. **Subject validation (always UUID or user_id):**
-   - If subject is string (not UUID, not user_id) → call `registry.resolve(user_id, subject)` → converts to UUID
-   - After resolution, subject MUST be UUID or user_id; skip row if not
-
-2. **Object validation (depends on rel_type):**
-   - If rel_type IN `_SCALAR_OBJECT_RELS` (pref_name, age, etc.):
-     - Object can be ANY non-empty string (measurement, date, name, etc.)
-     - **Do NOT resolve** object to UUID
-   - Else (relationship rel_type):
-     - If object is string → try `registry.resolve(user_id, object)` → converts to UUID
-     - After resolution, object MUST be UUID or user_id; skip row if not
-
-3. **Database storage:**
-   - Subjects always stored as UUID (or user_id)
-   - Objects stored as UUID for relationships, STRING for scalars
-
-### Example: Marla → Mars Fix (May 9, 2026)
-
-**Wrong (pre-fix):** Edge `(marla, pref_name, mars)`
-1. Validation resolves subject: "marla" → UUID_marla
-2. Validation resolves object: "mars" → UUID_mars (WRONG! mars should stay as string)
-3. Stored fact: `(UUID_marla, pref_name, UUID_mars)` ← fact lost because object should be string
-4. Result: Entity "mars" created; pref_name fact useless
-
-**Right (post-fix):** Edge `(marla, pref_name, mars)`
-1. Validation resolves subject: "marla" → UUID_marla
-2. Validation sees rel_type='pref_name' in `_SCALAR_OBJECT_RELS` → skip object resolution
-3. Validate object: "mars" is non-empty string ✓
-4. Stored fact: `(UUID_marla, pref_name, "mars")` ← correct, object is display name
-5. Registry stores: `entity_aliases(UUID_marla, "mars", is_preferred=true)`
-6. Display resolution: `get_preferred_name(user_id, UUID_marla)` → "mars" ✓
-
-**Key insight:** If rel_type is in `_SCALAR_OBJECT_RELS`, the object column stores a **STRING VALUE**, not an entity reference. Never resolve these to UUIDs.
-
-## Fact Corrections: Broad Lookup Strategy (May 9, 2026)
-
-Corrections to any fact type now properly supersede old values by looking up based on the relationship type, not the new value. This works for scalars (age, location, birthday), relationship facts (works_for, educated_at, occupation), and any other fact type.
-
-### The Problem
-
-Correction lookup was designed for identity facts (renaming entities). It searched for `object_id = NEW_VALUE`, which works when correcting "what someone is called" but fails for value corrections like "Gabby is actually 12, not 8" or "I live in Paris now, not Toronto" — the old fact has the old value, not the new one.
-
-### The Solution: Two-Tier Lookup
-
-**Tier 1: Identity rels (also_known_as, pref_name, same_as)**
-```python
-# Lookup by object = the NAME being corrected
-SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
-  AND object_id = ? AND rel_type = ?
-```
-Correct use case: "Actually, call me Mars, not Marla" → search for fact with `object_id='marla'`
-
-**Tier 2: All other rels (age, location, occupation, lives_at, born_on, etc.)**
-```python
-# Lookup by subject + rel_type = find most recent fact
-SELECT id FROM facts WHERE user_id = ? AND subject_id = ?
-  AND rel_type = ? ORDER BY id DESC LIMIT 1
-```
-Correct use case: "I'm actually 10, not 8" → search for ANY age fact for this entity, find most recent, supersede it
-
-### Example Flows
-
-**Age Correction:**
-```
-User: "Gabby is 8"  → Fact: (gabby_uuid, "8", "age")
-User: "Actually 10" (correction) → Lookup: (gabby_uuid, "age") 
-                                 → Find & supersede old fact
-                                 → Create new fact: (gabby_uuid, "10", "age")
-```
-
-**Location Correction:**
-```
-User: "I live in Toronto"  → Fact: (user_uuid, "Toronto", "lives_in")
-User: "Actually Paris now" (correction) → Lookup: (user_uuid, "lives_in")
-                                       → Find & supersede old fact
-                                       → Create new fact: (user_uuid, "Paris", "lives_in")
-```
-
-**Birthday Correction:**
-```
-User: "Born on May 3"  → Fact: (user_uuid, "may 3", "born_on")
-User: "Actually June 15" (correction) → Lookup: (user_uuid, "born_on")
-                                     → Find & supersede old fact
-                                     → Create new fact: (user_uuid, "june 15", "born_on")
-```
-
-The principle: **Non-identity facts are value-based. A correction replaces the previous value for that entity + relationship type. Lookup by the relationship, not the new value.**
-
-### Storage: Scalar Facts in entity_attributes Only
-
-Scalar facts (age, height, weight, born_on, etc.) are stored ONLY in the `entity_attributes` table, not in `facts`. This table has built-in ON CONFLICT DO UPDATE logic (line 1078-1085) that automatically handles both inserts and corrections:
-
-```sql
-ON CONFLICT (user_id, entity_id, attribute)
-DO UPDATE SET
-  value_text = EXCLUDED.value_text,
-  value_int = EXCLUDED.value_int,
-  value_float = EXCLUDED.value_float,
-  ...
-```
-
-**Why this matters:**
-- Initial fact: `INSERT INTO entity_attributes (user, gabby, age, value_int=10)`
-- Correction: `INSERT INTO entity_attributes (user, gabby, age, value_int=12)` → conflict on (user, gabby, age) → UPDATE value_int to 12
-- No validation rejection: scalar values like "12" never enter facts table (which validates UUIDs only)
-- Corrections persist across chats: /query retrieves current value from entity_attributes
-
-**Related code:**
-- Lines 1006-1096 in `/ingest`: scalar facts routed to entity_attributes, not facts
-- `/query` retrieves scalars via `_fetch_entity_attributes()` (lines 1632-1700)
-- Correction logic applies only to relationship facts (facts table), not scalars (handled by ON CONFLICT)
-
-## Key Principles (Do Not Violate)
-
-- **LLM never has unsupervised write access** — all writes flow through the WGM validation gate
-- **PostgreSQL is authoritative** — Qdrant is a derived read-only view
-- **Write-time normalization** — `entity_id` normalized to `"user"` anchor at write time
-- **No recursive matching** — all string comparisons use pre-lowercased values; guard comments required
-- **`entity_aliases` is the authoritative alias registry**
-- **Wren deployment cannot be trusted verbally** — verify edits via `sed` before rebuild
-- **`faultline-{user_id}` per-user collection naming is live** — must never be broken
-- **Fallback leak is fixed** — `_filter_relevant_facts()` returns `scored` only, never `cleaned`
-- **Nested function definitions must precede call sites** — `_fetch_user_facts()` is defined before the `try` block in `/query`; do not move it below its callers
-- **ON CONFLICT must match actual unique constraints** — `entity_aliases` uses `UNIQUE (user_id, alias)`, so all ON CONFLICT clauses must target `(user_id, alias)`, never `(entity_id, user_id, alias)`
-- **No name-based entity pre-creation** — entities are created exclusively via `EntityRegistry.resolve()` which generates UUID v5 surrogates; the old pre-creation loop that inserted raw names as `id` has been removed
-- **Alias sync uses display names, not UUIDs** — `_canonical_to_display` dict maps canonical UUID → original display name; always resolve through this mapping when inserting into `entity_aliases`
-- **All entity_ids must be UUIDs or user_id** — `/ingest` validates that subject_id and object_id are either UUID v5 surrogates or the special user_id value; startup normalization converts any legacy string IDs; string entity_ids break graph traversal
-- **Scalar rel_types have STRING objects, relationship rel_types have UUID objects** — The validation block (lines 1322–1392) has `_SCALAR_OBJECT_RELS` set that defines which rel_types expect string values (pref_name, age, born_on, etc.) vs UUID references (spouse, has_pet, works_for, etc.). Never resolve objects for scalar rel_types; always resolve for relationship rel_types. Violating this loses entities (e.g., pref_name edge stored with UUID object instead of string).
-- **Alias registration must use ON CONFLICT DO UPDATE** — `EntityRegistry.resolve()` and normalization use `INSERT ... ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred` to ensure stale aliases (with is_preferred=FALSE from older processes) are corrected when newer code encounters them. This ensures spouse and other identity relationships resolve to display names via `get_preferred_name()`, which requires is_preferred=TRUE.
 
 ## Do Not Develop Here
 

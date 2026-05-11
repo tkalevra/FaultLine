@@ -45,23 +45,6 @@ _IS_PURE_QUESTION = re.compile(
     re.IGNORECASE
 )
 
-_CAT_SIGNALS = {
-    "location":  {"where","address","weather","forecast","city","home",
-                 "location","live","located","residence","town"},
-    "family":    {"family","children","kids","spouse","wife","husband",
-                 "parent","parents","sibling","brother","sister",
-                 "son","daughter","partner","married", "parent_of", "child_of",
-                 "my family", "tell me about my family", "des", "cyrus", "gabby"},
-    "work":      {"work","job","career","employer","employed",
-                 "company","occupation","profession","office"},
-    "physical":  {"height","weight","tall","heavy","body","size"},
-    "temporal":  {"birthday","born","birth","anniversary","age",
-                 "when was","how old","date of birth"},
-    "pets":      {"pet","dog","cat","animal","fish","bird",
-                 "hamster","rabbit","snake"},
-    "identity":  {"name","who am i","call me","known as","alias"},
-}
-
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -409,6 +392,7 @@ def _extract_query_entities(
     query: str,
     preferred_names: dict,
     facts: list[dict] = None,
+    entity_types: dict = None,
 ) -> set[str]:
     """
     Extract entity display names from a query via two strategies.
@@ -433,6 +417,16 @@ def _extract_query_entities(
                    if name and len(name) > 1}
     # # NO RECURSIVE MATCHING — known_names built from pre-extracted preferred_names values only
     entities.update(token for token in tokens if token in known_names)
+
+    # --- dprompt-52: Skip tokens matching Concept/unknown entity types ---
+    # Prevent taxonomy labels ("pets", "family", "dog") from hijacking Tier 1
+    if entity_types:
+        _CONCEPT_TYPES = {"concept", "unknown"}
+        entities = {
+            token for token in entities
+            if entity_types.get(token, "").lower() not in _CONCEPT_TYPES
+        }
+    # --- end dprompt-52 ---
 
     # --- Tier 1b: Relational resolution ("my wife", "my pet", etc.) ---
     if facts:
@@ -734,57 +728,25 @@ class Filter:
         tl = text.lower()
         return any(sig in tl for sig in _REALTIME_SIGNALS)
 
-    def _categorize_query(self, text: str, facts: list[dict]) -> set[str]:
-        """
-        Detect relevant categories from query text, using fact categories
-        present in the server response as the authority.
-        Only returns categories that have actual facts — no phantom matches.
-        """
-        tl = text.lower()
-        fact_cats = {f.get("category") for f in facts if f.get("category")}
-
-        matched = {
-            cat for cat, signals in _CAT_SIGNALS.items()
-            if cat in fact_cats and any(sig in tl for sig in signals)
-        }
-        return matched
-
     def calculate_relevance_score(self, fact: dict, query: str) -> float:
         """
-        Score a fact's relevance to the current query.
-        Returns a float in [0.0, 1.0].
-
-        Scoring components:
-          - Query signal match (0.0–0.6): keyword overlap between query and fact category signals
-          - Confidence bonus (0.0–0.3): fact.confidence scaled to 0.3
-          - Sensitivity penalty (-0.5): applied to PII facts not explicitly requested
+        Score a fact's relevance. Graph proximity is determined by the backend;
+        the Filter only gates by confidence and sensitivity.
 
         NOTE: # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query string only.
         """
         score = 0.0
         query_lower = query.lower()  # # NO RECURSIVE MATCHING
 
-        # 1. Query signal match (0.0–0.6) — category keywords + rel_type + object text
-        category = fact.get("category", "")
-        keywords = _CAT_SIGNALS.get(category, [])
-        matches = sum(1 for kw in keywords if kw in query_lower)
-        # Also match against rel_type and object text directly for unclassified facts
-        # e.g., "has_ram" matches "ram", "likes" matches "like"/"favorite"
-        rel_type = fact.get("rel_type", "")
-        if rel_type and any(part in query_lower for part in rel_type.lower().replace("_", " ").split()):
-            matches += 2
-        obj_text = fact.get("object", "").lower()
-        if obj_text and len(obj_text) > 2 and obj_text in query_lower:
-            matches += 1
-        score += min(0.6, matches * 0.15)
-
-        # 2. Confidence bonus (0.0–0.3)
+        # Confidence bonus (0.0–0.3)
         confidence = fact.get("confidence", 0.0)
         score += confidence * 0.3
 
-        # 3. Sensitivity penalty (-0.5 if sensitive rel_type and not explicitly requested)
+        # Sensitivity penalty (-0.5 for PII facts not explicitly requested)
         _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
-        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy", "old", "age", "how old"}
+        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight",
+                            "birthplace", "tall", "how tall", "heavy", "how heavy",
+                            "old", "age", "how old"}
         if fact.get("rel_type") in _SENSITIVE_RELS:
             explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
             if not explicitly_asked:
@@ -795,11 +757,10 @@ class Filter:
     def _filter_relevant_facts(
         self,
         facts: list[dict],
-        categories: set[str],
         identity: Optional[str],
         preferred_names: dict = None,
         query: str = "",
-        is_realtime: bool = False,
+        entity_types: dict = None,
     ) -> list[dict]:
         """
         Three-tier entity-centric relevance filtering.
@@ -808,11 +769,8 @@ class Filter:
                 where that entity is subject or object. Deterministic, no scoring.
         Tier 2: Identity fallback — for generic queries with no entity match,
                 return identity-defining facts only (names, family structure).
-        Tier 3: Keyword scoring — fall back to category-based relevance scoring
-                for topic queries that don't name a specific entity.
-
-        The knowledge graph structure from /query IS the relevance signal.
-        Entity scoping determines what to show; graph proximity ranks it.
+        Tier 3: Graph-proximity pass-through — backend already ranked by relevance.
+                Only gate by confidence + sensitivity.
         """
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
@@ -833,7 +791,7 @@ class Filter:
 
         # TIER 1: Entity match — if query mentions a known entity, return all facts about it
         if preferred_names:
-            entities = _extract_query_entities(query, preferred_names, facts=cleaned)
+            entities = _extract_query_entities(query, preferred_names, facts=cleaned, entity_types=entity_types)
             # Merge pronoun-resolved entities from conversation context
             if identity:
                 pronoun_entities = _resolve_pronouns(query, identity)
@@ -846,23 +804,35 @@ class Filter:
                 if tier1:
                     return _apply_confidence_gate(tier1)
 
-        # TIER 2: Identity fallback — for generic queries, return identity facts only
+        # TIER 2: Identity fallback — for generic queries with no entity match,
+        # return identity-defining facts (names, family structure).
+        # This runs for ALL non-entity-matched queries — correct behavior.
         _TIER2_IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
                                 "spouse", "parent_of", "child_of", "sibling_of"}
         tier2 = [f for f in cleaned if f.get("rel_type") in _TIER2_IDENTITY_RELS]
         if tier2:
             return _apply_confidence_gate(tier2)
 
-        # TIER 3: Keyword scoring — fall back to category-based relevance scoring
+        # TIER 3: Graph-proximity pass-through — backend already ranked by relevance.
+        # Only gate by confidence. Sensitivity penalty applied per-fact.
+        _RELEVANCE_THRESHOLD = 0.0  # confidence-only; graph structure is the signal
         _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
-        RELEVANCE_THRESHOLD = 0.4
 
         def should_include_fact(fact: dict) -> bool:
+            # Identity facts always pass (names, aliases)
             if fact.get("rel_type") in _IDENTITY_RELS:
                 return True
-            return self.calculate_relevance_score(fact, query) >= RELEVANCE_THRESHOLD
+            # Gate by confidence + sensitivity
+            return self.calculate_relevance_score(fact, query) >= _RELEVANCE_THRESHOLD
 
         scored = [f for f in cleaned if should_include_fact(f)]
+
+        if self.valves.ENABLE_DEBUG:
+            dropped = len(cleaned) - len(scored)
+            if dropped > 0:
+                print(f"[FaultLine Filter] relevance dropped {dropped} facts "
+                      f"(kept {len(scored)}/{len(cleaned)})")
+
         return _apply_confidence_gate(scored)
 
 
@@ -1316,16 +1286,12 @@ class Filter:
                 try:
                     cached = _SESSION_MEMORY_CACHE.get(user_id)
                     if cached and (_time.time() - cached[0]) < _SESSION_MEMORY_TTL:
-                        _, facts, preferred_names, canonical_identity, entity_attributes = cached
+                        _, facts, preferred_names, canonical_identity, entity_attributes, entity_types = cached
                         raw_facts_for_extraction = list(facts)
                         # Filter cached facts for this specific query
-                        _categories = self._categorize_query(text, facts)
-                        _is_realtime = self._is_realtime_query(text)
-                        if _is_realtime:
-                            _categories.add("location")
                         facts = self._filter_relevant_facts(
-                            facts, _categories, canonical_identity,
-                            preferred_names=preferred_names, query=text, is_realtime=_is_realtime
+                            facts, canonical_identity,
+                            preferred_names=preferred_names, query=text, entity_types=entity_types,
                         )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id=[redacted]")
@@ -1356,22 +1322,20 @@ class Filter:
                             preferred_names = data.get("preferred_names", {})
                             canonical_identity = data.get("canonical_identity")
                             entity_attributes = data.get("attributes", {})
+                            entity_types = data.get("entity_types", {})
 
                             # Store raw unfiltered facts in cache
                             _SESSION_MEMORY_CACHE[user_id] = (
-                                _time.time(), facts, preferred_names, canonical_identity, entity_attributes
+                                _time.time(), facts, preferred_names, canonical_identity,
+                                entity_attributes, entity_types,
                             )
 
                             raw_facts_for_extraction = list(facts)
 
                             # Filtering happens after cache store, not before
-                            _categories = self._categorize_query(text, facts)
-                            _is_realtime = self._is_realtime_query(text)
-                            if _is_realtime:
-                                _categories.add("location")
                             facts = self._filter_relevant_facts(
-                                facts, _categories, canonical_identity,
-                                preferred_names=preferred_names, query=text, is_realtime=_is_realtime
+                                facts, canonical_identity,
+                                preferred_names=preferred_names, query=text, entity_types=entity_types,
                             )
 
                             if self.valves.ENABLE_DEBUG:
@@ -1578,7 +1542,7 @@ class Filter:
                                 "confidence": 1.0,
                             }
                             score = self.calculate_relevance_score(synthetic_fact, text)
-                            if score >= 0.4:
+                            if score >= 0.0:
                                 filtered_attrs[attr] = value
                         if filtered_attrs:
                             filtered_attributes[entity_id] = filtered_attrs

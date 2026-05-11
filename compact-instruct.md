@@ -61,6 +61,19 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 ---
 
+## Core Architecture Principle: Filter Dumb, Backend Smart
+
+**The Filter does NOT gate.** The backend handles extraction, ontology, hierarchy, and ranking. The Filter trusts backend results and injects them unchanged.
+
+**Query example:** "Where should my son and I go for dinner tomorrow?"
+- Backend extracts: user identity, hierarchy (son = child_of), locations, restaurants, temporal context
+- Backend ranks by class (A > B > C) + confidence
+- Filter injects facts in returned order. Done.
+
+**Why this matters:** Tier 1/2/3 logic, keyword lists, Concept filtering — all brittle. They break when ontology evolves or new rel_types added. Backend-first design scales. See `docs/ARCHITECTURE_QUERY_DESIGN.md`.
+
+---
+
 ## Current State (2026-05-12)
 
 ### What's Built
@@ -70,6 +83,7 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 - **Self-building ontology** — novel rel_types → Class C, re-embedder evaluates asynchronously
 - **Validation suite** — dprompt-29b: 8 scenarios passed, 110 tests, 0 regressions
 - **QA suite** — dprompt-30b: 15 real-world scenarios passed, marked PRODUCTION-READY
+- **Production deployment** — v1.0 shipped, live on GitHub
 
 ### Critical Bug Found (dprompt-31b)
 **Name collision breaks query display resolution:**
@@ -149,39 +163,49 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 - Updates scratch upon completion (uses template provided in prompt)
 - Waits for explicit direction before next task
 
+**Work environment boundaries (CRITICAL):**
+- **Investigation:** Pre-Prod Only (via SSH: `ssh truenas -x "sudo docker logs [container]"`)
+- **Code modifications:** FaultLine-dev Only (`/home/chris/Documents/013-GIT/FaultLine-dev/`)
+- **Deployment:** User-triggered (waits for STOP clause, then user rebuilds pre-prod)
+- **Test:** Local test suite first, live validation after user rebuild
+
 **How to keep him productive:**
 - Lock scope: "Tests only", "No refactoring", "Do NOT modify src/"
 - Lock model: "ONLY use faultline-wgm-test-10"
 - Lock constraints: Wrong/Right pairs, MUST/MAY, explicit boundaries
+- Lock locations: "Investigation pre-prod only", "Code changes FaultLine-dev only"
 - Provide curl examples if API interaction is needed
 - Provide test templates if testing is needed
+- Always include STOP clause for rebuild/redeploy decisions
 - Always tell him what to write back to scratch upon completion
 
 **When he goes off-rails:**
 - He tries to optimize/refactor when not asked
 - He switches models when told "use X model"
 - He implements features beyond the scope
-- **Fix:** Revert direction in scratch, add "CRITICAL" flag, lock constraints tighter
+- He tries to deploy to pre-prod directly
+- **Fix:** Revert direction in scratch, add "CRITICAL" flag, lock constraints tighter, emphasize boundaries
 
 ---
 
 ## Next Steps (Priority Order)
 
-### Immediate (dprompt-32b)
-1. deepseek implements conflict resolution system
-2. Schema migration 021 applied
-3. Ingest collision detection live
-4. Re-embedder resolves conflicts via LLM
-5. /query handles missing preferred names
-6. Gabriella bug fixed (test: ingest → collision → resolve → query returns her)
+### Immediate: Architectural Shift (dprompt-53b)
+**Simplify Filter — Remove Brittle Gating Logic**
+1. Read `docs/ARCHITECTURE_QUERY_DESIGN.md` — architectural principle
+2. Read `dprompt-53.md` (spec) + `dprompt-53b.md` (formal prompt)
+3. Implement: Remove Tier 1/2/3 logic, Concept filtering, entity_types parameter from Filter
+4. Result: Filter injects backend facts in returned order (no re-gating)
+5. Local test: pytest suite passes
+6. **STOP:** User rebuilds pre-prod, then live validation ("our pets" query returns has_pet facts)
 
-### After dprompt-32b
-**Rewrite test suite (dprompt-33?)**
-- Current tests: unit-level, isolated
-- New tests: full-path validation (ingest → query → verify)
-- Test scenarios: all 15 from dprompt-30 + collision scenarios
-- File: `tests/api/test_suite_full_path.py`
-- Goal: integration failures like Gabriella bug are caught
+**Why this matters:** dBug-report-001 revealed that Tier 2 fallback blocks Tier 3 when Tier 1 is empty (due to Concept filtering). The real issue: Filter shouldn't implement gating at all. Backend's extraction + ontology + hierarchy + ranking is authoritative. Filter must trust it.
+
+### After dprompt-53b (Post-Rebuild)
+**Follow-up: Backend Cleanup**
+- Remove `entity_types` from `/query` response (no longer needed)
+- Prevent Concept/unknown entities from polluting `preferred_names` (ingest issue)
+- Strengthen extraction to avoid "concept entities" entirely
 
 ### Future Considerations
 - Domain-agnostic retrieval (system facts not in graph)
