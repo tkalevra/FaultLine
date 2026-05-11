@@ -120,6 +120,8 @@ Hierarchy chains across domains (extract EVERY link in the chain):
 - Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
 - Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
 
+HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Fraggle, a morkie" → extract fraggle instance_of morkie AND user has_pet fraggle, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
+
 Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
 
