@@ -41,7 +41,12 @@ Code goes directly into source files. This file stays lean.
 - Line 2378: Add "unknown" to status check
 - Result: Novel rel_types now route → Class C staging → re-embedder evaluation
 
-**Next:** Docker rebuild pre-prod to validate fix. Health facts should stage as Class C.
+**VALIDATION (Post-Deploy):**
+- /ingest response: staged=3 ✓ (was 0 before fix)
+- staged_facts query: 3 rows with has_injury/currently_at/is_resting, fact_class='C', confidence=0.4 ✓
+- /query response: Health facts injected {has_injury: back, currently_at: chiropractor, is_resting: bed} ✓
+
+**RESULT:** dprompt-69 + dBug-010 fix = Complete success. Novel rel_types now flow through full pipeline.
 
 ---
 
