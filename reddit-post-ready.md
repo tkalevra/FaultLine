@@ -42,13 +42,13 @@ OpenWebUI Message (e.g., "I have a dog named Max, a golden retriever")
 └─────────────────────────────────────────────────────┘
         ↓
 ┌─────────────────────────────────────────────────────┐
-│ Layer 2: SEMANTIC VALIDATION (dprompt-59)          │
+│ Layer 2: SEMANTIC VALIDATION (Metadata-Driven)    │
 │ ────────────────────────────────────────────────── │
-│ At ingest time:                                     │
-│ - Query: Is morkie object of a hierarchy rel?     │
-│ - If yes + new fact violates semantics            │
-│ - Auto-supersede the conflicting fact             │
-│ (Catches anything that slips through)             │
+│ At ingest time, query validation rules from DB:   │
+│ - rel_types table stores: is_leaf_only, inverse,  │
+│   is_symmetric, is_hierarchy_rel, etc.           │
+│ - If fact violates constraint → auto-supersede   │
+│ (New rel_types self-describe their rules)         │
 └─────────────────────────────────────────────────────┘
         ↓
 ┌─────────────────────────────────────────────────────┐
@@ -96,11 +96,13 @@ Model responds with accurate, consistent information.
 
 | Feature | Traditional RAG | FaultLine |
 |---------|-----------------|-----------|
-| **Data validation** | Post-hoc or none | Write-time, multi-layer |
-| **Conflict detection** | Ignored | Graph-aware, semantic |
+| **Data validation** | Post-hoc or none | Write-time, multi-layer, metadata-driven |
+| **Validation rules** | Hardcoded or absent | Live in database (rel_types table) |
+| **Conflict detection** | Ignored | Graph-aware, semantic, automatic |
 | **Cleanup** | Manual | Automatic (with reasons logged) |
 | **Hierarchies** | Weak or absent | Full support (instance_of, subclass_of, part_of, member_of) |
-| **User corrections** | Stored as new facts | Auto-supersedes conflicts |
+| **Duplicate facts** | Ignored | UUID-based deduplication (no display-name duplicates) |
+| **User corrections** | Stored as new facts | Auto-supersedes conflicts (non-destructive) |
 | **Graph quality** | Degrades over time | Improves over time |
 
 ### The Tech Stack
@@ -114,16 +116,21 @@ Model responds with accurate, consistent information.
 
 ### What's Live Right Now
 
-- **Version:** v1.0.3 (Conflict Detection & Auto-Superseding)
-- **Status:** Production-ready
+- **Version:** v1.0.7 (Query Deduplication + Metadata-Driven Validation)
+- **Status:** Production-ready, fully tested
 - **Tests:** 114+ passing, 0 regressions
 - **Architecture:** Dumb Filter (trusts backend) + Smart Backend (validates all writes)
 
 **Latest features:**
+- ✅ Metadata-driven validation framework (validation rules live in database, not code)
+- ✅ UUID-based query deduplication (no duplicate facts with different display names)
 - ✅ Multi-domain hierarchy extraction (taxonomies, org charts, infrastructure, locations, software)
 - ✅ Semantic conflict detection (auto-resolves based on graph structure)
-- ✅ Retraction flow (user corrections handled explicitly)
+- ✅ Bidirectional relationship validation (prevents impossible parent/child combinations)
+- ✅ Name collision resolution (LLM-powered entity disambiguation)
+- ✅ Retraction flow (user corrections handled explicitly, non-destructive)
 - ✅ Audit trail (why facts were kept/rejected is logged)
+- ✅ 8 production bugs fixed (dBug-001 through dBug-008, all closed)
 
 ### Get Started
 
