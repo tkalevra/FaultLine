@@ -196,6 +196,23 @@ class EntityRegistry:
             # Callers must handle UUID fallback (e.g., _clean_preferred_names).
             return canonical
 
+    def get_any_alias(self, user_id: str, entity_id: str) -> str | None:
+        """Return first available alias for an entity (preferred or not).
+
+        Used as fallback when get_preferred_name returns a UUID — ensures
+        the entity has at least one human-readable name for display resolution.
+        Returns None if no alias exists.
+        """
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT alias FROM entity_aliases "
+                "WHERE user_id = %s AND entity_id = %s "
+                "ORDER BY is_preferred DESC LIMIT 1",
+                (user_id, entity_id),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
     def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
         """Return all display name aliases for a surrogate entity_id."""
         with self.db_conn.cursor() as cur:
