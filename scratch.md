@@ -112,3 +112,26 @@ extract → WGM gate → _detect_semantic_conflicts → _validate_bidirectional_
 - Lines: 3839 → 3992 (+153 lines)
 - Deployed: v1.0.5 (`ec75cf4`) ✓
 
+
+## 🐛 CRITICAL: dBug-report-007 (Bidirectional Validation Failed + UUID Exposure)
+
+#claude: Reviewed pre-prod OpenWebUI logs post-dprompt-62. Found **genuine bugs**:
+
+### Issues Found
+1. **Bidirectional validation incomplete:** `user -child_of-> gabby` still in DB (dprompt-62 didn't catch it)
+2. **UUID exposure:** "7E4Bff75-706E-5Feb-B8B5-F4Ca1247Fd3B is species: morkie mix" (should be display names)
+3. **dprompt-62 bidirectional logic has bug:** Not catching child_of + parent_of coexistence
+
+### Database Cleanup (Done)
+```
+DELETE 1 impossible child_of fact (user -child_of-> gabby)
+```
+
+### Status
+- dBug-report-007.md written + committed
+- Database cleaned (impossible relationship removed)
+- Ready for user retest
+
+**Next:** dprompt-63 (fix bidirectional validation logic) + dprompt-64 (UUID resolution in query response).
+
+---
