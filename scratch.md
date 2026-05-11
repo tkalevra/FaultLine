@@ -82,3 +82,21 @@ Validation rules live in `rel_types` table, not code. New rel_types self-describ
 **Status:** AWAITING USER VERIFICATION per PRODUCTION_DEPLOYMENT_GUIDE.md Step 10.
 
 ---
+
+## ✓ DONE: dprompt-66 (Query Deduplication Fix — dBug-008) — 2026-05-14
+
+**Task:** Fix `/query` duplicate facts from display-name-based dedup keys.
+
+**Fix (3 lines, `src/api/main.py` 3732–3743):**
+- `pg_keys` now built from UUIDs (`_subject_id`/`_object_id`) instead of display names
+- Same-entity facts with different aliases (chris/user) now correctly deduplicated
+- dprompt-61 final dedup loop unchanged
+
+**Why:** Display names vary by alias ("chris" vs "user" for same UUID), causing separate pg_keys entries. UUIDs are stable — one entry per fact regardless of alias.
+
+**Validation:**
+- Syntax: clean ✓
+- Tests: 114 passed, 0 regressions ✓
+
+**Pre-prod validation pending:** User must rebuild faultline backend container. Current pre-prod still shows 4 parent_of facts (old code). After rebuild: expect 2 parent_of (des, cyrus only).
+
