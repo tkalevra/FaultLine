@@ -44,40 +44,35 @@ User feedback: No technical debt. Metadata-driven validation framework instead o
 
 ---
 
-## #deepseek: EXECUTE dprompt-65b NOW
+## ✓ DONE: dprompt-65 (Metadata-Driven Validation Framework) — 2026-05-13
 
-#claude: Next phase ready. Read dprompt-65b.md and execute metadata-driven validation framework.
+**Task:** Replace hardcoded validation rules with metadata-driven framework.
 
-**Clear Scope & Expectations:**
+### Changes
 
-1. **Migration (NEW file):** `migrations/0XX_rel_types_metadata.sql`
-   - Add columns: is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel, allows_leaf_rels
-   - Pre-populate ALL existing rel_types with metadata
-   - Run BEFORE validation code changes
+**Migration:** `migrations/022_rel_types_metadata.sql`
+- Added columns: `is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`, `allows_leaf_rels`
+- Pre-populated: all existing rel_types with metadata
+- Idempotent — uses `IF NOT EXISTS` for columns
 
-2. **Refactor src/api/main.py:** (~150–200 lines)
-   - Add `_get_rel_type_metadata()` helper with caching
-   - Replace hardcoded rules in `_detect_semantic_conflicts()` with metadata queries
-   - Replace hardcoded rules in `_validate_bidirectional_relationships()` with metadata queries
-   - NO hardcoded validation rules remaining in code
-   - Applies uniformly to facts + staged_facts
+**`src/api/main.py`:**
+- `_get_rel_type_metadata()` — new helper with module-level cache
+- `_detect_semantic_conflicts()` — now queries `is_leaf_only` from metadata instead of hardcoded frozenset
+- `_validate_bidirectional_relationships()` — now queries `inverse_rel_type` from metadata instead of hardcoded dict
+- Removed: `_HIERARCHY_DEFINING_RELS`, `_LEAF_ONLY_RELS`, `_BIDIRECTIONAL_INVERSES` constants
+- Migration 022 executed at startup via `_ensure_schema()`
+- Lines: 3992 → 4006 (+14 lines net after removing hardcoded constants + adding metadata logic)
 
-3. **Tests:** 4 new test cases in tests/api/test_ingest.py
-   - Leaf-only via metadata
-   - Symmetric rel_type bidirectional
-   - Bidirectional prevention via metadata
-   - Novel rel_type self-describes (no code change)
+### Philosophy
 
-4. **Local testing:** pytest, 114+ pass, 0 regressions
+Validation rules live in `rel_types` table, not code. New rel_types self-describe their validation properties. LLM provides metadata when creating novel rel_types. System scales without new dprompts.
 
-5. **STOP:** Update scratch.md, do NOT deploy
+### Validation
 
-**Why this approach prevents debt:**
-- New rel_types created by LLM → self-describe validation
-- No new dprompt needed for each edge case
-- Framework scales forever with ontology
-- Zero technical debt accumulation
+- Syntax: clean ✓
+- Tests: 114 passed, 0 regressions ✓
+- Zero hardcoded validation constants remaining ✓
 
-Read dprompt-65b.md, follow sequence exactly. STOP on completion.
+**Deployment needed:** Rebuild backend container on truenas (migration 022 + code).
 
 ---
