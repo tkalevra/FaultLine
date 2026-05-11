@@ -3728,11 +3728,13 @@ def query(request: QueryRequest):
         resolved_qdrant = _resolve_display_names(qdrant_facts, registry, user_id, user_entity_id_for_query) if registry else qdrant_facts
 
         # Merge: Postgres facts are authoritative, Qdrant adds associative context
-        # Deduplicate on (subject, object, rel_type) — Postgres wins on conflict
-        pg_keys = {(f["subject"], f["object"], f["rel_type"]) for f in resolved_direct}
+        # Deduplicate on (subject_uuid, rel_type, object_uuid) — Postgres wins.
+        # Use UUIDs from _subject_id/_object_id, not display names, because same
+        # UUID may have different aliases (e.g., "chris" vs "user" for user entity).
+        pg_keys = {(f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"]) for f in resolved_direct}
         merged_facts = resolved_direct.copy()
         for f in resolved_qdrant:
-            key = (f["subject"], f["object"], f["rel_type"])
+            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)
                 pg_keys.add(key)
@@ -3740,7 +3742,7 @@ def query(request: QueryRequest):
         # Merge baseline personal facts (location, attributes) — always present for
         # known identities regardless of whether Qdrant or graph traversal returned them.
         for f in resolved_baseline:
-            key = (f["subject"], f["object"], f["rel_type"])
+            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)
                 pg_keys.add(key)

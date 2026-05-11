@@ -1,5 +1,13 @@
 # FaultLine
 
+## v1.0.7 (2026-05-14) — Query Deduplication Fix
+
+**Query path:** `/query` pg_keys dedup now uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Same-entity facts with different aliases (chris/user) no longer create duplicates. Family queries return correct child count consistently.
+
+**Fixes:** dBug-report-008 (duplicate parent_of facts from alias variation)
+
+---
+
 ## v1.0.6 (2026-05-13) — Metadata-Driven Validation Framework
 
 **Architecture:** Validation rules moved from code to database. `rel_types` table now stores validation properties (`is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`). `_get_rel_type_metadata()` queries metadata at runtime. Hardcoded validation constants eliminated.
