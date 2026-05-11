@@ -1637,7 +1637,68 @@ Production deployment workflow:
 - Tag: v1.0.1 (mandatory release tagging)
 - STOP: No live testing until user verification
 
-**Status:** Ready for execution. Deepseek can start dprompt-54b now.
+## ✓ DONE: dprompt-54b (Production Deployment — dprompt-53b) — 2026-05-12
+
+**Task:** Deploy dprompt-53b (Filter simplification) from FaultLine-dev to faultline-prod.
+
+**Files Copied (faultline-prod):**
+- `openwebui/faultline_tool.py` — FaultLine-dev → faultline-prod (sanitized: 192.168.40.10 → localhost)
+
+**Documentation Updated:**
+- `ABOUT.md`: Added v1.0.1 release summary (Filter simplification, backend-first architecture)
+- `CHANGELOG.md`: Created with v1.0.1 and v1.0.0 entries
+
+**Sanitization Audit:**
+- Bearer tokens: None found ✓
+- Personal names: None in code (Mars in function.py is prompt example, not personal data) ✓
+- Server IPs: Sanitized (192.168.40.10 → localhost) ✓
+- Email addresses: None found ✓
+
+**Validation:**
+- Syntax: `python -m py_compile` clean ✓
+- Docker: `docker compose config` clean ✓
+- Git status: working tree clean (pushed files) ✓
+
+**Release:**
+- Commit: `18ef8b9` "dprompt-53b: Filter simplification — backend-first architecture"
+- Tag: `v1.0.1` created ✓
+- Push: `origin/main` + `--tags` pushed to GitHub ✓
+
+**GitHub:** https://github.com/tkalevra/FaultLine — v1.0.1 tag visible ✓
+
+**AWAITING USER VERIFICATION.**
 
 ---
 
+
+## #deepseek NEXT: dprompt-55b (Hierarchical Entity Extraction Investigation)
+
+**Investigate general pattern of missing hierarchy relationships.**
+
+**Observation:** When users describe hierarchical relationships (type-of, instance-of, part-of, member-of), the system doesn't consistently establish those relationships.
+
+**Example (not the problem, just the example):** "Tell me about my family. I have a dog named Fraggle, a morkie."
+- Extracted: fraggle, morkie, dog as three separate entities
+- Expected: fraggle `instance_of` morkie; morkie `subclass_of` dog
+- Result: Hierarchy chain broken
+
+**Real question:** Is this systematic? Where in the pipeline are hierarchy relationships lost? What's the GENERAL pattern?
+
+**Root cause options (H1-H5):**
+- H1: Filter LLM doesn't extract hierarchy facts (prompt doesn't ask)
+- H2: Type metadata exists but isn't converted to facts
+- H3: WGM gate rejects hierarchy facts (unknown rel_types)
+- H4: Entity registry doesn't infer hierarchies
+- H5: Hierarchy facts classified as Class C and expired
+
+**Investigation scope:** Query pre-prod database, inspect logs, find pattern, identify root cause.
+
+**Key principle:** Find the GENERAL weakness, not a special case. System must handle ANY hierarchy robustly (orgs, locations, taxonomies, breeds, etc.). Investigation reveals where the pipeline breaks for all hierarchies.
+
+**Read first:**
+- `dprompt-55.md` — specification (problem framing, hypotheses H1-H5)
+- `dprompt-55b.md` — formal prompt (sequence of database/log queries)
+
+**Status:** Ready for execution. Deepseek can start dprompt-55b now.
+
+---
