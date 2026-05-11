@@ -1,5 +1,13 @@
 # FaultLine
 
+## v1.0.5 (2026-05-13) — Bidirectional Relationship Validation
+
+**Ingest pipeline:** Added `_validate_bidirectional_relationships()` — prevents impossible bidirectional relationships (`child_of` + `parent_of` for same entity pair). Keeps higher-confidence version, supersedes lower. Checks both `facts` and `staged_facts`.
+
+**Fixes:** dBug-report-006 (bidirectional impossibilities, staged fact validation gaps)
+
+---
+
 ## v1.0.4 (2026-05-12) — Query Deduplication & Alias Metadata
 
 **Query path:** `/query` now deduplicates facts by `(subject_uuid, rel_type, object_uuid)` and attaches `_aliases` metadata with all entity names and `is_preferred` flag. Eliminates duplicate facts from alias redundancy.
