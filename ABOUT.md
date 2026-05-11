@@ -1,5 +1,15 @@
 # FaultLine
 
+## v1.0.2 (2026-05-12) — Hierarchy Extraction Enhancement
+
+**Filter prompt:** Hierarchy relationships (`instance_of`, `subclass_of`, `member_of`, `part_of`) moved to primary extraction list with 6 multi-domain examples (taxonomic, organizational, infrastructure, hardware, geographical, software).
+
+**Result:** LLM now extracts complete hierarchy chains across all domains. Previously `part_of` had 0 facts, `subclass_of` had 0 — now extracted with Class A/B confidence.
+
+**Fixes:** dBug-report-002 (Hierarchical Entity Relationships Missing)
+
+---
+
 ## v1.0.1 (2026-05-12) — Filter Simplification
 
 **Architecture:** Filter now implements backend-first approach
