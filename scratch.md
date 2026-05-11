@@ -25,13 +25,33 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
+## #deepseek NEXT TASK: dprompt-69 (Open-Ended Extraction + RAG Fallback)
+
+**Read completely:** dprompt-69b.md before starting.
+
+**Summary:** Eliminate silent failures. Loosen extraction prompt to encourage novel rel_types (health, ephemeral, transient). Add RAG fallback when extraction fails. No information lost.
+
+**CRITICAL:**
+- Extract prompt change: Explicit novel rel_type examples + encouragement
+- RAG fallback: If extraction returns [], call /store_context (raw text to Qdrant)
+- Tests: Verify novel extraction + fallback behavior
+- NO WGM/validation/re-embedder changes (they already handle this)
+- NO GIT COMMITS — work in progress, user decides
+
+**Deliverables:**
+1. openwebui/faultline_tool.py — updated extraction prompt + RAG fallback
+2. tests/filter/test_relevance.py — 3 new tests (novel types, fallback, edge cases)
+3. Update scratch.md with status when complete
+
+**When done:** Report to scratch.md (template in dprompt-69b), STOP and await review.
+
 ---
 
 ## ✓ DONE: dprompt-68 (MCP Server Wrapper) — 2026-05-14
 
 **Task:** Create MCP server wrapper for FaultLine endpoints.
 
-### Files created (dev only — no commits)
+### Files created + committed to dev
 
 | File | Lines | Purpose |
 |------|-------|---------|
@@ -61,7 +81,7 @@ Code goes directly into source files. This file stays lean.
 
 ### Existing tests: 114 passed, 0 regressions ✓
 
-**No commits made.** No existing files modified. Awaiting user review.
+**Committed:** `ad02200` (server+tools), `cd8f49e` (test suite).
 
 **Next:** User reviews code, approves, then decides on commit/merge strategy.
 
@@ -84,8 +104,10 @@ Code goes directly into source files. This file stays lean.
 
 ### Dev repo
 
-- Branch: `master` (commit `1c3614c`)
-- Test suite: 114 passed, 53 skipped
+- Branch: `master` (commit `ad02200`)
+- Test suite: 127 passed (114 existing + 13 MCP), 53 skipped
+- MCP server: `src/mcp/` + `tests/mcp/` committed
+- Lines: `src/api/main.py` 4006 + new MCP module
 
 ### Architecture
 - **Ingest pipeline:** LLM extract → WGM gate → semantic conflict detection → bidirectional validation → fact classification (A/B/C) — all validation now metadata-driven via `rel_types` table
