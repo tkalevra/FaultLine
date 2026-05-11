@@ -103,9 +103,24 @@ RELATIONSHIP RULES:
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
 - pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). For first-person preferences ("I prefer to be called X", "call me X"), subject IS "user". For third-person ("she goes by X", "his preferred name is Y"), subject is the named person.
-- is_a: type or category. has_pet: person owns an animal (NEVER a person).
-- member_of: entity belongs to a taxonomy group. Use when user states membership ("my pets are family" → subject=pet_entity, object="family", rel_type="member_of"). Object is the taxonomy group name.
-- Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
+- has_pet: person owns an animal (NEVER a person).
+
+HIERARCHY RELATIONSHIPS — extract these whenever you see type/classification/part-of patterns. They appear in every domain and are as important as family relationships:
+- instance_of: entity IS a specific type or breed ("Fraggle is a morkie" → fraggle instance_of morkie)
+- subclass_of: type IS a subclass of another ("a morkie is a kind of dog" → morkie subclass_of dog)
+- member_of: entity belongs to a group or taxonomy ("my pets are family" → pets member_of family)
+- part_of: entity is a component of a larger whole ("Engineering dept of TechCorp" → engineering part_of techcorp)
+- is_a: type or category (deprecated; prefer instance_of or subclass_of).
+
+Hierarchy chains across domains (extract EVERY link in the chain):
+- Taxonomic: "I have a dog named Fraggle, a morkie" → fraggle instance_of morkie, morkie subclass_of dog, dog subclass_of animal
+- Organizational: "Alice is an engineer in Engineering at TechCorp" → alice instance_of engineer, engineer member_of engineering, engineering part_of techcorp
+- Infrastructure: "Server 192.168.1.1 is in subnet 192.168.1.0/24 on the main network" → 192.168.1.1 part_of subnet_192_168_1, subnet_192_168_1 part_of network_main
+- Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
+- Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
+- Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
+
+Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
 
 SELF-ID: Explicit first-person self-identification only ("I am X", "my name is X", "call me X"):
