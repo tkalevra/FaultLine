@@ -165,4 +165,8 @@ Drop them in the comments or open an issue on GitHub. We're actively building th
 
 ---
 
+**Update:** This project evolved from [an earlier discussion on memory approaches in OpenWebUI](https://www.reddit.com/r/OpenWebUI/comments/1szyer4/trying_a_different_approach_to_memory_in/). We built FaultLine to solve the exact problem discussed there: keeping personal knowledge graphs clean and semantically valid instead of letting hallucinations and conflicts pile up over time.
+
+---
+
 That's it! Copy/paste the section between the dashes into Reddit. It's ready to go.
