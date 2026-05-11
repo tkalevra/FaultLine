@@ -1547,35 +1547,97 @@ Once dprompt-50 deployed: "tell me about our pets" → no "pets" in preferred_na
 
 ---
 
-## #deepseek NEXT: dprompt-53b (Filter Simplification — Remove Brittle Gating)
+## ✓ DONE: dprompt-53b (Filter Simplification — Remove Brittle Gating) — 2026-05-12
 
-**This is a paradigm shift, not a patch.**
+**Paradigm shift: Filter is now dumb, backend is smart.**
 
-Current architecture:
-- Filter implements Tier 1/2/3 logic with Concept filtering
-- Backend returns 30 facts, Filter gates them down to 16 based on heuristics
-- Result: category queries blocked, UUID leaks
+### Changes (FaultLine-dev)
 
-Correct architecture:
-- Backend extraction/ontology/hierarchy captures all relevance
-- Backend returns facts ranked by class (A > B > C) + confidence
-- Filter is dumb: inject facts in returned order, no gating
-- Only gate on: (a) identity rels always pass, (b) sensitive rels on explicit ask, (c) confidence threshold 0.4
+**`openwebui/faultline_tool.py`:**
+- Removed `_TIER1*`, `_TIER2*`, `_TIER3*` tier constants and all tier-based filtering
+- Removed `entity_types` parameter from `_extract_query_entities()`, `_filter_relevant_facts()`, and all `inlet()` call sites
+- Removed Concept/unknown entity type filtering (`_CONCEPT_TYPES` checks)
+- Removed `entity_types` from session cache tuple (6-element → 5-element)
+- Simplified `_filter_relevant_facts()` to: identity rels always pass; everything else passes if confidence ≥ threshold; sensitivity penalty still applies
+- Code size: 1621 → 1579 lines (—42 lines)
+
+### New `_filter_relevant_facts()` logic
+
+```python
+_IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
+                  "spouse", "parent_of", "child_of", "sibling_of"}
+for f in cleaned:
+    if f["rel_type"] in _IDENTITY_RELS:
+        passed.append(f)       # always pass
+    elif calculate_relevance_score(f, query) >= 0.0:
+        passed.append(f)       # confidence + sensitivity gate
+return _apply_confidence_gate(passed)
+```
+
+No entity-type gating. No tier fallback. Backend /query ranking is authoritative.
+
+### Local validation
+- Syntax: clean ✓
+- Test suite: 114 passed, 53 skipped, 3 pre-existing failures, 0 regressions ✓
+
+### Pre-Prod Rebuild Required
+- User must rebuild OpenWebUI docker image on truenas to deploy
+- User must run validation: "tell me about our pets" (should return has_pet facts)
+- User must run: "how are you" (should return identity facts only)
+- Backend `/query` still returns `entity_types` — harmless, Filter ignores it
+
+**AWAITING USER REBUILD AND RE-VALIDATION.**
+
+---
+
+## ✓ VERIFIED: dprompt-53b Live (Pre-Prod) — 2026-05-12
+
+**Filter deployed and validated against pre-prod.**
+
+| Query | Result | Notes |
+|-------|--------|-------|
+| "tell me about our pets" | "You own both **Fraggle** and a **morkie**" | has_pet facts flowing ✓, entity types + age context ✓ |
+| "how are you" | Mentions Gabby, Cyrus, Des, Fraggle, morkie | Identity facts present, no UUID leaks ✓ |
+| "tell me about my family" | Mars (spouse) + 3 children + 2 dogs | Family + pets all visible ✓ |
+
+**Filter log:** `filtered: 27/27 facts` — all facts pass through, no tier gating.
+
+**System is production-ready. All category queries unblocked.**
+
+---
+
+## #deepseek NEXT: dprompt-54b (Production Deployment — dprompt-53b)
+
+**Production deployment SOP is now formalized and reusable for all future releases.**
+
+Current state:
+- dprompt-53b completed and validated in pre-prod
+- Filter simplification verified live (category queries working)
+- Code ready to move to production (faultline-prod repo)
+
+Production deployment workflow:
+1. **Identify** changed files (openwebui/faultline_tool.py from dprompt-53b)
+2. **Audit** for secrets: bearer tokens, personal names, server IPs, emails
+3. **Copy** to faultline-prod with sanitization
+4. **Update** ABOUT.md with v1.0.1 release summary
+5. **Validate** build (docker compose config, python -m py_compile)
+6. **Commit** clear message, **Tag** v1.0.1
+7. **Push** to GitHub (main + tags)
+8. **STOP** for user verification
 
 **Read first:**
-- `docs/ARCHITECTURE_QUERY_DESIGN.md` — architectural principle with dinner example
-- `dprompt-53.md` — specification
-
-**Execute:**
-- `dprompt-53b.md` — formal prompt using DEEPSEEK_INSTRUCTION_TEMPLATE
+- `docs/PRODUCTION_DEPLOYMENT_GUIDE.md` — standard operating procedure (reusable for all deployments)
+- `dprompt-54.md` — specification for this deployment
+- `dprompt-54b.md` — formal executable prompt
 
 **Key constraints:**
-- Investigation: pre-prod only (SSH to truenas, check logs)
-- Code: FaultLine-dev only (local modifications)
-- Deployment: User rebuild/redeploy pre-prod (you ask for it)
-- Test: Local validation first, then live validation after rebuild
+- Copy only changed files (no refactoring, no new code)
+- Sanitize: grep verify no secrets in committed code
+- Validate: docker-compose.yml + syntax before push
+- Tag: v1.0.1 (mandatory release tagging)
+- STOP: No live testing until user verification
 
-**Status:** Ready for implementation.
+**Status:** Ready for execution. Deepseek can start dprompt-54b now.
 
 ---
 
