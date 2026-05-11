@@ -620,7 +620,34 @@ def _ensure_schema(dsn: str) -> None:
                         (name, desc, member_types, def_rels, trans, trans_rels, hier, parent),
                     )
 
-
+                # ── Migration 022: rel_types metadata (dprompt-65) ──
+                # Add validation columns to rel_types + pre-populate metadata.
+                # Idempotent: uses IF NOT EXISTS for columns, UPDATE for data.
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='rel_types' AND column_name='is_symmetric')
+                        THEN ALTER TABLE rel_types ADD COLUMN is_symmetric BOOLEAN DEFAULT FALSE; END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='rel_types' AND column_name='inverse_rel_type')
+                        THEN ALTER TABLE rel_types ADD COLUMN inverse_rel_type VARCHAR(100) DEFAULT NULL; END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='rel_types' AND column_name='is_leaf_only')
+                        THEN ALTER TABLE rel_types ADD COLUMN is_leaf_only BOOLEAN DEFAULT FALSE; END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='rel_types' AND column_name='is_hierarchy_rel')
+                        THEN ALTER TABLE rel_types ADD COLUMN is_hierarchy_rel BOOLEAN DEFAULT FALSE; END IF;
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name='rel_types' AND column_name='allows_leaf_rels')
+                        THEN ALTER TABLE rel_types ADD COLUMN allows_leaf_rels TEXT[] DEFAULT NULL; END IF;
+                    END $$;
+                """)
+                cur.execute("UPDATE rel_types SET is_symmetric=TRUE WHERE rel_type IN ('spouse','sibling_of','knows','friend_of','met','same_as')")
+                cur.execute("UPDATE rel_types SET inverse_rel_type='child_of' WHERE rel_type='parent_of'")
+                cur.execute("UPDATE rel_types SET inverse_rel_type='parent_of' WHERE rel_type='child_of'")
+                cur.execute("UPDATE rel_types SET is_leaf_only=TRUE WHERE rel_type IN ('owns','has_pet','works_for','lives_in','lives_at','educated_at','likes','dislikes','prefers')")
+                cur.execute("UPDATE rel_types SET is_hierarchy_rel=TRUE WHERE rel_type IN ('instance_of','subclass_of','member_of','part_of','is_a')")
 
                 conn.commit()
                 log.info("startup.schema_check_complete")
@@ -986,16 +1013,40 @@ def _hierarchy_expand(
 # entities ARE, and independent relationships (owns, has_pet, etc.) must respect
 # those semantics.
 
-# Rel_types that define WHAT an entity is (type/category/component)
-_HIERARCHY_DEFINING_RELS = frozenset({
-    "instance_of", "subclass_of", "is_a", "member_of", "part_of",
-})
+# ── dprompt-65: Metadata-driven — queries rel_types table instead of hardcoded ─
+# Module-level metadata cache, populated lazily and refreshed on cache miss.
+_REL_TYPE_METADATA_CACHE: dict[str, dict] = {}
 
-# Rel_types that should NOT apply to type/category/component entities
-# (these are for leaf/instance entities only)
-_LEAF_ONLY_RELS = frozenset({
-    "owns", "has_pet", "works_for", "lives_in", "lives_at",
-})
+
+def _get_rel_type_metadata(db_conn, rel_type: str) -> dict:
+    """Return validation metadata for a rel_type from the database.
+    Cached at module level; cache miss queries DB once per rel_type per process.
+    Returns defaults (all false) if DB unavailable or rel_type not found.
+    """
+    rt = rel_type.lower().strip() if rel_type else ""
+    if not rt:
+        return {}
+    if rt in _REL_TYPE_METADATA_CACHE:
+        return _REL_TYPE_METADATA_CACHE[rt]
+    defaults = {"is_symmetric": False, "inverse_rel_type": None,
+                "is_leaf_only": False, "is_hierarchy_rel": False}
+    if not db_conn:
+        return defaults
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel "
+                "FROM rel_types WHERE rel_type = %s", (rt,))
+            row = cur.fetchone()
+            if row:
+                meta = {"is_symmetric": row[0], "inverse_rel_type": row[1],
+                        "is_leaf_only": row[2], "is_hierarchy_rel": row[3]}
+                _REL_TYPE_METADATA_CACHE[rt] = meta
+                return meta
+    except Exception:
+        pass
+    _REL_TYPE_METADATA_CACHE[rt] = defaults
+    return defaults
 
 
 def _detect_semantic_conflicts(
@@ -1019,18 +1070,17 @@ def _detect_semantic_conflicts(
     rt_lower = rel_type.lower().strip() if rel_type else ""
     obj_id = str(obj).lower().strip() if obj else ""
 
-    # Only check non-hierarchy relationship types
-    if rt_lower in _HIERARCHY_DEFINING_RELS:
-        return ("keep", None)
+    meta = _get_rel_type_metadata(db_conn, rt_lower)
 
     # Only check leaf-only relationship types against hierarchy objects
-    if rt_lower not in _LEAF_ONLY_RELS:
+    if not meta.get("is_leaf_only"):
         return ("keep", None)
 
     if not db_conn or not obj_id:
         return ("keep", None)
 
     try:
+        _hierarchy_defining = ["instance_of","subclass_of","is_a","member_of","part_of"]
         with db_conn.cursor() as cur:
             # Check: is the object entity the object of any hierarchy relationship?
             cur.execute(
@@ -1039,7 +1089,7 @@ def _detect_semantic_conflicts(
                 "AND rel_type = ANY(%s) "
                 "AND superseded_at IS NULL "
                 "LIMIT 1",
-                (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+                (user_id, obj_id, _hierarchy_defining),
             )
             hierarchy_fact = cur.fetchone()
 
@@ -1050,7 +1100,7 @@ def _detect_semantic_conflicts(
                     "WHERE user_id = %s AND object_id = %s "
                     "AND rel_type = ANY(%s) "
                     "LIMIT 1",
-                    (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+                    (user_id, obj_id, _hierarchy_defining),
                 )
                 hierarchy_fact = cur.fetchone()
 
@@ -1081,12 +1131,6 @@ def _detect_semantic_conflicts(
 # coexisting for the same entity pair. Inverse relationships should NOT both
 # exist — the semantics make them contradictory.
 
-# Rel_types with inverses that should NOT coexist
-_BIDIRECTIONAL_INVERSES = {
-    "child_of": "parent_of",
-    "parent_of": "child_of",
-}
-
 
 def _validate_bidirectional_relationships(
     db_conn,
@@ -1108,15 +1152,18 @@ def _validate_bidirectional_relationships(
       - "supersede_new": new fact should be skipped (existing is higher conf)
     """
     rt_lower = rel_type.lower().strip() if rel_type else ""
-    inverse = _BIDIRECTIONAL_INVERSES.get(rt_lower)
-    if not inverse or not db_conn:
+    if not db_conn:
+        return "keep"
+
+    meta = _get_rel_type_metadata(db_conn, rt_lower)
+    inverse = meta.get("inverse_rel_type") if meta else None
+    if not inverse:
         return "keep"
 
     try:
         with db_conn.cursor() as cur:
-            # Check facts table for inverse relationship
             cur.execute(
-                "SELECT id, confidence FROM facts "
+                "SELECT id, confidence, 'facts' as source FROM facts "
                 "WHERE user_id = %s AND subject_id = %s AND object_id = %s "
                 "AND rel_type = %s AND superseded_at IS NULL "
                 "LIMIT 1",
@@ -1125,9 +1172,8 @@ def _validate_bidirectional_relationships(
             inverse_fact = cur.fetchone()
 
             if not inverse_fact:
-                # Check staged_facts table
                 cur.execute(
-                    "SELECT id, confidence FROM staged_facts "
+                    "SELECT id, confidence, 'staged' as source FROM staged_facts "
                     "WHERE user_id = %s AND subject_id = %s AND object_id = %s "
                     "AND rel_type = %s "
                     "LIMIT 1",
@@ -1136,20 +1182,17 @@ def _validate_bidirectional_relationships(
                 inverse_fact = cur.fetchone()
 
             if inverse_fact:
-                inverse_id, inverse_conf = inverse_fact
+                inverse_id, inverse_conf, inverse_source = inverse_fact
                 if confidence > inverse_conf:
-                    # New fact has higher confidence — supersede existing inverse
-                    cur.execute(
-                        "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
-                        "WHERE id = %s",
-                        (inverse_id,),
-                    )
-                    if cur.rowcount == 0:
-                        # Might be in staged_facts
+                    if inverse_source == 'staged':
                         cur.execute(
                             "DELETE FROM staged_facts WHERE id = %s",
                             (inverse_id,),
                         )
+                    else:
+                        cur.execute(
+                            "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+                            "WHERE id = %s", (inverse_id,))
                     log.info(
                         "ingest.bidirectional_conflict_resolved",
                         kept=f"{subject} {rt_lower} {obj} (conf={confidence})",

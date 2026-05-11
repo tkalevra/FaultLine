@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.6 (2026-05-13) — Metadata-Driven Validation
+
+**rel_types table:** Added metadata columns (`is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`). `_get_rel_type_metadata()` with caching replaces all hardcoded validation constants. New rel_types self-describe constraints without code changes.
+
+**Migration:** 022_rel_types_metadata.sql (idempotent column expansion + metadata pre-population).
+
 ## v1.0.5 (2026-05-13) — Bidirectional Relationship Validation
 
 **Ingest pipeline:** `_validate_bidirectional_relationships()` prevents impossible bidirectional relationships (`child_of` + `parent_of`). Keeps higher confidence, supersedes lower. Checks `facts` + `staged_facts`.
