@@ -45,23 +45,6 @@ _IS_PURE_QUESTION = re.compile(
     re.IGNORECASE
 )
 
-_CAT_SIGNALS = {
-    "location":  {"where","address","weather","forecast","city","home",
-                 "location","live","located","residence","town"},
-    "family":    {"family","children","kids","spouse","wife","husband",
-                 "parent","parents","sibling","brother","sister",
-                 "son","daughter","partner","married", "parent_of", "child_of",
-                 "my family", "tell me about my family", "des", "cyrus", "gabby"},
-    "work":      {"work","job","career","employer","employed",
-                 "company","occupation","profession","office"},
-    "physical":  {"height","weight","tall","heavy","body","size"},
-    "temporal":  {"birthday","born","birth","anniversary","age",
-                 "when was","how old","date of birth"},
-    "pets":      {"pet","dog","cat","animal","fish","bird",
-                 "hamster","rabbit","snake"},
-    "identity":  {"name","who am i","call me","known as","alias"},
-}
-
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -121,6 +104,7 @@ REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
 - pref_name: explicitly preferred name ("goes by", "prefers to be called", "preferred name is"). For first-person preferences ("I prefer to be called X", "call me X"), subject IS "user". For third-person ("she goes by X", "his preferred name is Y"), subject is the named person.
 - is_a: type or category. has_pet: person owns an animal (NEVER a person).
+- member_of: entity belongs to a taxonomy group. Use when user states membership ("my pets are family" → subject=pet_entity, object="family", rel_type="member_of"). Object is the taxonomy group name.
 - Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on.
 - Use snake_case. Other types allowed if none fit.
 
@@ -159,23 +143,6 @@ DATES AND EVENTS:
   emit "3rd" as the date.
 - NEVER emit relative dates ("next week", "last month") — omit entirely.
 - Date values must be the date string only — never a name or description.
-
-SYSTEM METADATA: Extract technical properties as structured facts.
-- "IP is X", "IP address is X" → {subject, object=X, rel_type="has_ip"}
-- "OS is Y", "running Y", "operating system is Y" → {subject, object=Y, rel_type="has_os"}
-- "hostname is Z", "named Z", "called Z" (for devices/computers, NOT people) → {subject, object=Z, rel_type="has_hostname"}
-- "FQDN is X" → {subject, object=X, rel_type="fqdn"}
-- "RAM", "memory", "GB" → {subject, object="32GB", rel_type="has_ram"}
-- "disk", "storage", "NVMe", "SSD" → {subject, object="500GB NVMe", rel_type="has_storage"}
-- "certificate expires on X", "SSL expires X" → {subject, object=X, rel_type="expires_on"}
-- Subject for system facts is the device/computer name (e.g., "workstation-x"), NOT "user".
-
-TRANSITIVE RELATIONSHIPS: Extract connections between third parties.
-- "A knows B", "A is friends with B" → {subject=A, object=B, rel_type="knows"}
-- "A is friend of B" → {subject=A, object=B, rel_type="friend_of"}
-- "A met B" → {subject=A, object=B, rel_type="met"}
-- "A is related to B" → {subject=A, object=B, rel_type="related_to"}
-- These are symmetric — both directions are equivalent.
 
 ENTITY TYPES: If entity types were pre-classified (shown as "GLiNER2 has pre-classified"), include them in output:
 - subject_type: Person|Animal|Organization|Location|Object|Concept
@@ -750,57 +717,25 @@ class Filter:
         tl = text.lower()
         return any(sig in tl for sig in _REALTIME_SIGNALS)
 
-    def _categorize_query(self, text: str, facts: list[dict]) -> set[str]:
-        """
-        Detect relevant categories from query text, using fact categories
-        present in the server response as the authority.
-        Only returns categories that have actual facts — no phantom matches.
-        """
-        tl = text.lower()
-        fact_cats = {f.get("category") for f in facts if f.get("category")}
-
-        matched = {
-            cat for cat, signals in _CAT_SIGNALS.items()
-            if cat in fact_cats and any(sig in tl for sig in signals)
-        }
-        return matched
-
     def calculate_relevance_score(self, fact: dict, query: str) -> float:
         """
-        Score a fact's relevance to the current query.
-        Returns a float in [0.0, 1.0].
-
-        Scoring components:
-          - Query signal match (0.0–0.6): keyword overlap between query and fact category signals
-          - Confidence bonus (0.0–0.3): fact.confidence scaled to 0.3
-          - Sensitivity penalty (-0.5): applied to PII facts not explicitly requested
+        Score a fact's relevance. Graph proximity is determined by the backend;
+        the Filter only gates by confidence and sensitivity.
 
         NOTE: # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query string only.
         """
         score = 0.0
         query_lower = query.lower()  # # NO RECURSIVE MATCHING
 
-        # 1. Query signal match (0.0–0.6) — category keywords + rel_type + object text
-        category = fact.get("category", "")
-        keywords = _CAT_SIGNALS.get(category, [])
-        matches = sum(1 for kw in keywords if kw in query_lower)
-        # Also match against rel_type and object text directly for unclassified facts
-        # e.g., "has_ram" matches "ram", "likes" matches "like"/"favorite"
-        rel_type = fact.get("rel_type", "")
-        if rel_type and any(part in query_lower for part in rel_type.lower().replace("_", " ").split()):
-            matches += 2
-        obj_text = fact.get("object", "").lower()
-        if obj_text and len(obj_text) > 2 and obj_text in query_lower:
-            matches += 1
-        score += min(0.6, matches * 0.15)
-
-        # 2. Confidence bonus (0.0–0.3)
+        # Confidence bonus (0.0–0.3)
         confidence = fact.get("confidence", 0.0)
         score += confidence * 0.3
 
-        # 3. Sensitivity penalty (-0.5 if sensitive rel_type and not explicitly requested)
+        # Sensitivity penalty (-0.5 for PII facts not explicitly requested)
         _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
-        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight", "birthplace", "tall", "how tall", "heavy", "how heavy", "old", "age", "how old"}
+        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight",
+                            "birthplace", "tall", "how tall", "heavy", "how heavy",
+                            "old", "age", "how old"}
         if fact.get("rel_type") in _SENSITIVE_RELS:
             explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
             if not explicitly_asked:
@@ -811,24 +746,19 @@ class Filter:
     def _filter_relevant_facts(
         self,
         facts: list[dict],
-        categories: set[str],
         identity: Optional[str],
         preferred_names: dict = None,
         query: str = "",
-        is_realtime: bool = False,
     ) -> list[dict]:
         """
-        Three-tier entity-centric relevance filtering.
+        Simplified relevance filtering — trusts backend /query ranking.
 
-        Tier 1: Entity match — if query mentions a known entity, return all facts
-                where that entity is subject or object. Deterministic, no scoring.
-        Tier 2: Identity fallback — for generic queries with no entity match,
-                return identity-defining facts only (names, family structure).
-        Tier 3: Keyword scoring — fall back to category-based relevance scoring
-                for topic queries that don't name a specific entity.
+        Identity rels always pass. Everything else passes if confidence >= threshold
+        (defaulting to MIN_INJECT_CONFIDENCE valve or 0.4). Sensitivity penalty
+        still applies to PII facts unless explicitly asked.
 
-        The knowledge graph structure from /query IS the relevance signal.
-        Entity scoping determines what to show; graph proximity ranks it.
+        Backend /query returns facts ranked by class (A > B > C) + confidence.
+        Filter trusts that order — no entity-type gating, no tier fallback logic.
         """
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
@@ -847,39 +777,25 @@ class Filter:
                 if not _garbage(f.get("subject", ""))
                 and not _garbage(f.get("object", ""))]
 
-        # TIER 1: Entity match — if query mentions a known entity, return all facts about it
-        if preferred_names:
-            entities = _extract_query_entities(query, preferred_names, facts=cleaned)
-            # Merge pronoun-resolved entities from conversation context
-            if identity:
-                pronoun_entities = _resolve_pronouns(query, identity)
-                if pronoun_entities:
-                    entities.update(pronoun_entities)
-            if entities:
-                tier1 = [f for f in cleaned
-                         if f.get("subject", "").lower() in entities
-                         or f.get("object", "").lower() in entities]
-                if tier1:
-                    return _apply_confidence_gate(tier1)
+        # Simplified gate: identity rels always pass; others pass by confidence
+        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
+                          "spouse", "parent_of", "child_of", "sibling_of"}
+        threshold = self.valves.MIN_INJECT_CONFIDENCE or 0.4
 
-        # TIER 2: Identity fallback — for generic queries, return identity facts only
-        _TIER2_IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
-                                "spouse", "parent_of", "child_of", "sibling_of"}
-        tier2 = [f for f in cleaned if f.get("rel_type") in _TIER2_IDENTITY_RELS]
-        if tier2:
-            return _apply_confidence_gate(tier2)
+        passed = []
+        for f in cleaned:
+            rel = f.get("rel_type", "")
+            if rel in _IDENTITY_RELS:
+                passed.append(f)
+                continue
+            score = self.calculate_relevance_score(f, query)
+            if score >= 0.0:  # confidence-only; sensitivity penalty applies inside
+                passed.append(f)
 
-        # TIER 3: Keyword scoring — fall back to category-based relevance scoring
-        _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as"}
-        RELEVANCE_THRESHOLD = 0.4
+        if self.valves.ENABLE_DEBUG:
+            print(f"[FaultLine Filter] filtered: {len(passed)}/{len(cleaned)} facts")
 
-        def should_include_fact(fact: dict) -> bool:
-            if fact.get("rel_type") in _IDENTITY_RELS:
-                return True
-            return self.calculate_relevance_score(fact, query) >= RELEVANCE_THRESHOLD
-
-        scored = [f for f in cleaned if should_include_fact(f)]
-        return _apply_confidence_gate(scored)
+        return _apply_confidence_gate(passed)
 
 
     def _build_realtime_context(
@@ -1335,13 +1251,8 @@ class Filter:
                         _, facts, preferred_names, canonical_identity, entity_attributes = cached
                         raw_facts_for_extraction = list(facts)
                         # Filter cached facts for this specific query
-                        _categories = self._categorize_query(text, facts)
-                        _is_realtime = self._is_realtime_query(text)
-                        if _is_realtime:
-                            _categories.add("location")
                         facts = self._filter_relevant_facts(
-                            facts, _categories, canonical_identity,
-                            preferred_names=preferred_names, query=text, is_realtime=_is_realtime
+                            facts, canonical_identity, query=text,
                         )
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id=[redacted]")
@@ -1381,13 +1292,8 @@ class Filter:
                             raw_facts_for_extraction = list(facts)
 
                             # Filtering happens after cache store, not before
-                            _categories = self._categorize_query(text, facts)
-                            _is_realtime = self._is_realtime_query(text)
-                            if _is_realtime:
-                                _categories.add("location")
                             facts = self._filter_relevant_facts(
-                                facts, _categories, canonical_identity,
-                                preferred_names=preferred_names, query=text, is_realtime=_is_realtime
+                                facts, canonical_identity, query=text,
                             )
 
                             if self.valves.ENABLE_DEBUG:
@@ -1462,14 +1368,50 @@ class Filter:
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
 
-                # LLM-First extraction pipeline (dprompt-22):
-                # Trust LLM extraction for all relationship types. No regex augment.
-                # compound.py is legacy — kept for reference only.
-                # Fallback: if LLM returned nothing, use lightweight local extraction.
-                if not raw_triples and not _skip_rewrite:
-                    raw_triples = _extract_basic_facts(clean_text)
-                    if self.valves.ENABLE_DEBUG and raw_triples:
-                        print(f"[FaultLine Filter] LLM returned empty — local fallback extracted {len(raw_triples)} basic fact(s)")
+                # Augment: always run regex extraction for preference and correction
+                # signals even when the LLM returned triples. The LLM prompt is
+                # imperfect and can miss explicit preferences ("I prefer to be called X").
+                # Regex-extracted pref_name and correction edges are definitive and
+                # take priority over any LLM-inferred edges.
+                # Use compound extractor (src/extraction/compound.py) for robust
+                # chained-text extraction. Falls back to local _extract_basic_facts
+                # if the module isn't available (e.g., in a different deployment).
+                basic_edges = []
+                if not _skip_rewrite:
+                    try:
+                        from src.extraction.compound import extract_compound_facts
+                        basic_edges = extract_compound_facts(clean_text)
+                    except ImportError:
+                        basic_edges = _extract_basic_facts(clean_text)
+                    except Exception:
+                        basic_edges = _extract_basic_facts(clean_text)
+                if basic_edges:
+                    # Only keep correction edges from regex.
+                    # The LLM handles preferences (pref_name) correctly — regex
+                    # augment for pref_name produces false positives when the
+                    # text contains third-person preferences ("who prefers X",
+                    # "she prefers Y"). Corrections are unambiguous and safe to
+                    # add regardless of context.
+                    _augment_edges = [
+                        e for e in basic_edges
+                        if e.get("is_correction")
+                    ]
+                    # Merge: existing triples + augment edges (dedup by key)
+                    _existing_keys = {(e.get("subject"), e.get("object"), e.get("rel_type"))
+                                      for e in raw_triples if e.get("subject") and e.get("object")}
+                    for aug in _augment_edges:
+                        _key = (aug["subject"], aug["object"], aug["rel_type"])
+                        if _key not in _existing_keys:
+                            raw_triples.append(aug)
+                            _existing_keys.add(_key)
+                    if self.valves.ENABLE_DEBUG and _augment_edges:
+                        print(f"[FaultLine Filter] regex augment added {len(_augment_edges)} correction edge(s) "
+                              f"to LLM output")
+                    # Full fallback: if LLM returned nothing at all, use ALL basic edges
+                    if not raw_triples:
+                        raw_triples = basic_edges
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] regex full fallback extracted {len(raw_triples)} basic fact(s)")
 
                 _PRONOUNS = {"i", "me", "my", "we", "us", "our", "he", "she", "it", "they", "them"}
                 edges = [
@@ -1477,8 +1419,6 @@ class Filter:
                         "subject": e["subject"],
                         "object": e["object"],
                         "rel_type": e["rel_type"],
-                        "subject_type": e.get("subject_type"),
-                        "object_type": e.get("object_type"),
                         "is_preferred_label": e.get("is_preferred_label", False),
                         "is_correction": e.get("is_correction", False),
                     }
@@ -1560,7 +1500,7 @@ class Filter:
                                 "confidence": 1.0,
                             }
                             score = self.calculate_relevance_score(synthetic_fact, text)
-                            if score >= 0.4:
+                            if score >= 0.0:
                                 filtered_attrs[attr] = value
                         if filtered_attrs:
                             filtered_attributes[entity_id] = filtered_attrs
