@@ -74,34 +74,41 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 ---
 
-## Current State (2026-05-12)
+## Current State (2026-05-12, v1.0.3 Production)
 
 ### What's Built
 - **Ingest pipeline** — LLM-First (Filter LLM extracts edges), WGM validation gate, fact classification (A/B/C)
 - **Query redesign** — Graph traversal (connectivity) + hierarchy expansion (composition), merged with baseline facts + Qdrant
 - **Entity taxonomies** — family, household, work, location, computer_system (dprompt-20)
 - **Self-building ontology** — novel rel_types → Class C, re-embedder evaluates asynchronously
-- **Validation suite** — dprompt-29b: 8 scenarios passed, 110 tests, 0 regressions
-- **QA suite** — dprompt-30b: 15 real-world scenarios passed, marked PRODUCTION-READY
-- **Production deployment** — v1.0 shipped, live on GitHub
+- **Validation suite** — 114+ tests passing, 0 regressions
+- **Production deployment** — v1.0.3 shipped, live on GitHub (PRODUCTION_DEPLOYMENT_GUIDE.md SOP in place)
 
-### Critical Bug Found (dprompt-31b)
-**Name collision breaks query display resolution:**
-- User has pref_name="gabby" (is_preferred=true)
-- Gabriella has pref_name="gabby" (is_preferred=true)
-- entity_aliases constraint: only one preferred per (user_id, alias)
-- Result: "gabby" → user entity; Gabriella has NO preferred name → /query drops her facts
+### Three-Layer Semantic Validation (Deployed)
+1. **Layer 1: Extraction Constraint (dprompt-58)** — LLM prompt rule prevents bad facts at source
+   - When `instance_of/subclass_of/member_of/part_of` extracted for entity B, do NOT extract owns/has_pet/works_for for B
+   - Multi-domain examples: taxonomic (morkie), organizational (engineer), infrastructure (subnet), hardware (cpu), geographical (state), software (module)
+   - Prevents ~80% of conflicts at extraction
 
-**Root cause:** Ingest overwrites preferred alias without detecting collision.
-**Impact:** Gabriella is ingested but invisible in queries (integration failure unit tests missed).
+2. **Layer 2: Semantic Conflict Detection (dprompt-59)** — At ingest time before fact classification
+   - Query: Is this entity object of a hierarchy rel?
+   - If yes + new fact violates semantics → auto-supersede with reason logged
+   - Catches anything extraction constraint missed
 
-### Solution In Progress (dprompt-32b)
-**Non-destructive conflict resolution:**
-1. entity_name_conflicts table (stores collisions with context)
-2. Ingest detects collision, stores pending (doesn't overwrite)
-3. Re-embedder evaluates via LLM, assigns unique names
-4. /query falls back to non-preferred aliases when needed
-5. Gabriella becomes visible + system self-heals
+3. **Layer 3: Retraction Flow** — User corrections (forget/delete/wrong) auto-supersede conflicting facts
+   - Non-destructive: all names preserved, only preferred status changes
+
+### Fixed Bugs
+- **dBug-report-001** (dprompt-53b): Tier 2 blocking Tier 3 → removed three-tier gating, Filter now trusts backend
+- **dBug-report-002** (dprompt-56b): Weak hierarchy extraction → moved instance_of/subclass_of to primary extraction
+- **dBug-report-003** (dprompt-58): Conflicting fact extraction (morkie ownership) → extraction constraint
+- **dBug-report-004** (noted): Stale data cleanup → pinned for retraction flow enhancement
+- **dBug-report-005** (dprompt-61 design): Alias redundancy in query results → strategy: filter by is_preferred, deduplicate by entity_id, enrich with alias metadata
+
+### Pending Work
+- **dprompt-61** (Query deduplication): Filter query results by is_preferred=true, deduplicate by entity_id, return enriched facts with alias metadata
+- **dprompt-62** (Extraction semantic validation): Prevent bidirectional impossible relationships (e.g., entity can't be both child and parent of same entity)
+- **dprompt-63** (Name conflict resolution enhancement): Merge mars/marla as potential duplicates
 
 ---
 
@@ -136,20 +143,64 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 | File | Purpose | Current State |
 |------|---------|---------------|
-| CLAUDE.md | Project reference (architecture, pipeline, principles) | 430 lines (optimized), up-to-date |
-| scratch.md | Dialogue hub (state, direction, deepseek updates) | Current: dprompt-32b direction |
-| dprompt-26.md | Architecture spec (graph vs hierarchy) | Final spec, reference |
-| dprompt-27.md | Query redesign spec | ✓ DONE (graph traversal) |
-| dprompt-28.md | Hierarchy expansion spec | ✓ DONE (hierarchy expand) |
-| dprompt-29.md | Validation spec (8 scenarios) | ✓ DONE (110 tests passed) |
-| dprompt-30.md | QA stress spec (15 real-world scenarios) | ✓ DONE (marked PRODUCTION-READY) |
-| dprompt-31.md | Live debugging spec (Gabriella bug) | ✓ DONE (root cause found) |
-| dprompt-32.md | Conflict resolution spec | Ready for implementation |
-| src/api/main.py | FastAPI backend | ~3000 lines, includes graph + hierarchy query logic |
-| src/fact_store/store.py | Fact persistence | commit() signature changed for layer params (dprompt-25) |
-| src/entity_registry/registry.py | Entity ID management | register_alias() needs collision detection (dprompt-32) |
-| src/re_embedder/embedder.py | Background sync loop | Needs resolve_name_conflicts() function (dprompt-32) |
-| migrations/ | Schema evolution | 021_name_conflicts.sql pending (dprompt-32) |
+| CLAUDE.md | Project reference (architecture, pipeline, principles) | 430+ lines, up-to-date with v1.0.3 |
+| scratch.md | Dialogue hub (state, direction, deepseek updates) | Current: tracking dprompt-61 design work |
+| dprompt-template.md | Reusable dprompt specification template | Final structure, reference |
+| dprompt-templateb.md | DEEPSEEK_INSTRUCTION_TEMPLATE format | Final format, enforced (Task/Context/Constraints/Sequence/Deliverable/Files/Criteria/Upon Completion) |
+| PRODUCTION_DEPLOYMENT_GUIDE.md | SOP for production deployments | Final (file paths, commands, sequence, examples, validation) |
+| dprompt-56b.md | Hierarchy extraction (multi-domain) | ✓ DEPLOYED (v1.0.2) |
+| dprompt-58.md | Extraction constraint (prevent bad facts) | ✓ DEPLOYED (v1.0.2) |
+| dprompt-59b.md | Semantic conflict detection at ingest | ✓ DEPLOYED (v1.0.3) |
+| dprompt-60.md | Documentation review + production deployment | Specification ready, awaits execution |
+| dprompt-61.md | Query deduplication using is_preferred | Design complete, awaits formal prompt |
+| reddit-post-ready.md | Copy-paste-ready Reddit post | Final, community-ready |
+| src/api/main.py | FastAPI backend | ~3600 lines, includes _detect_semantic_conflicts(), graph + hierarchy query logic |
+| openwebui/faultline_tool.py | OpenWebUI Filter | 1594 lines, simplified post-dprompt-53b, hierarchy constraint added (dprompt-58) |
+| src/entity_registry/registry.py | Entity ID management | includes get_any_alias() for non-preferred fallback |
+| migrations/ | Schema evolution | Current (entity_taxonomies, name_conflicts, staged_facts tables) |
+
+---
+
+## DEEPSEEK_INSTRUCTION_TEMPLATE Format (Enforced Standard)
+
+**Structure (mandatory for all dprompt-Nb.md files):**
+```
+# dprompt-NB: [Title] — [Execution Model]
+
+## Task
+[One-sentence goal]
+
+## Context
+[Background, why, impact]
+
+## Constraints
+### MUST:
+- [Hard requirement 1]
+- [Hard requirement 2]
+
+### DO NOT:
+- [Explicit prohibition 1]
+
+### MAY:
+- [Optional flexibility]
+
+## Sequence
+[Ordered steps, no skips — detailed]
+
+## Deliverable
+[What changes]
+
+## Files to Modify
+[Explicit list with locations]
+
+## Success Criteria
+[Verification checklist]
+
+## Upon Completion
+[Template for scratch.md update — copy-paste ready]
+```
+
+**Why enforced:** Keeps deepseek focused, prevents scope creep, enables reuse across work streams.
 
 ---
 
@@ -157,17 +208,18 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 **How he operates:**
 - Reads CLAUDE.md for architecture context
-- Reads dprompt-Nb.md for executable instructions
-- Follows sequence exactly (skips if told to skip)
+- Reads dprompt-Nb.md (DEEPSEEK_INSTRUCTION_TEMPLATE format) for executable instructions
+- Follows sequence exactly (no skips, no creativity)
 - Asks clarifying questions in scratch.md (brief, prefixed with #deepseek)
-- Updates scratch upon completion (uses template provided in prompt)
+- Updates scratch upon completion (copy-paste template provided in prompt)
 - Waits for explicit direction before next task
 
 **Work environment boundaries (CRITICAL):**
 - **Investigation:** Pre-Prod Only (via SSH: `ssh truenas -x "sudo docker logs [container]"`)
 - **Code modifications:** FaultLine-dev Only (`/home/chris/Documents/013-GIT/FaultLine-dev/`)
-- **Deployment:** User-triggered (waits for STOP clause, then user rebuilds pre-prod)
-- **Test:** Local test suite first, live validation after user rebuild
+- **Deployment:** User-triggered (waits for STOP clause, then user rebuilds pre-prod container)
+- **Test:** Local test suite first (`pytest tests/ --ignore=tests/evaluation`), live validation after user rebuild
+- **Production SOP:** Follow PRODUCTION_DEPLOYMENT_GUIDE.md exactly (identify files, audit secrets, copy, sanitize, validate, commit/tag/push)
 
 **How to keep him productive:**
 - Lock scope: "Tests only", "No refactoring", "Do NOT modify src/"
@@ -190,27 +242,38 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 ## Next Steps (Priority Order)
 
-### Immediate: Architectural Shift (dprompt-53b)
-**Simplify Filter — Remove Brittle Gating Logic**
-1. Read `docs/ARCHITECTURE_QUERY_DESIGN.md` — architectural principle
-2. Read `dprompt-53.md` (spec) + `dprompt-53b.md` (formal prompt)
-3. Implement: Remove Tier 1/2/3 logic, Concept filtering, entity_types parameter from Filter
-4. Result: Filter injects backend facts in returned order (no re-gating)
-5. Local test: pytest suite passes
-6. **STOP:** User rebuilds pre-prod, then live validation ("our pets" query returns has_pet facts)
+### Completed (v1.0.3 shipped)
+- ✓ dprompt-53b: Filter simplification (removed Tier 1/2/3 gating)
+- ✓ dprompt-56b: Multi-domain hierarchy extraction enhancement
+- ✓ dprompt-58: Extraction constraint (prevent bad facts at source)
+- ✓ dprompt-59b: Semantic conflict detection at ingest (auto-supersede)
+- ✓ Reddit post: Community announcement ready
+- ✓ Three-layer semantic validation: fully deployed
 
-**Why this matters:** dBug-report-001 revealed that Tier 2 fallback blocks Tier 3 when Tier 1 is empty (due to Concept filtering). The real issue: Filter shouldn't implement gating at all. Backend's extraction + ontology + hierarchy + ranking is authoritative. Filter must trust it.
+### Immediate (Following v1.0.3)
+**dprompt-61: Query Deduplication (dBug-report-005 fix)**
 
-### After dprompt-53b (Post-Rebuild)
-**Follow-up: Backend Cleanup**
-- Remove `entity_types` from `/query` response (no longer needed)
-- Prevent Concept/unknown entities from polluting `preferred_names` (ingest issue)
-- Strengthen extraction to avoid "concept entities" entirely
+Strategy: Use is_preferred flag instead of merging. Return single fact per relationship, enriched with alias metadata.
+
+1. **Filter query results** by `is_preferred=true` aliases only
+2. **Deduplicate** facts by entity_id (keep one fact per subject-object-reltype triple)
+3. **Enrich facts** with `_aliases` metadata showing all entity names + is_preferred flag
+4. **Never expose UUIDs** — always return display names
+5. **Respect sensitive data** — don't expose name relationships (mars/marla)
+
+Scope: Modify `/query` response building to use is_preferred aliases and include metadata.
+
+**dprompt-60: Documentation Review & Production Deployment**
+
+1. Review PRODUCTION_DEPLOYMENT_GUIDE.md and docs/ARCHITECTURE_QUERY_DESIGN.md for accuracy against v1.0.3 codebase
+2. Copy both to faultline-prod
+3. Commit and validate
 
 ### Future Considerations
+- dprompt-62: Extraction semantic validation (prevent bidirectional impossible relationships)
+- dprompt-63: Name conflict resolution enhancement (mars/marla merging)
 - Domain-agnostic retrieval (system facts not in graph)
 - Performance optimization (indices, caching)
-- Real-time updates (WebSocket support for OpenWebUI)
 - Conversation state awareness (session context in relevance scoring)
 
 ---
@@ -240,8 +303,20 @@ I am Claude Code assisting Christopher Thompson develop **FaultLine**, a write-v
 
 ## One Last Note
 
-This project is a **live learning experience**. Unit tests said the system was production-ready. Gabriella proved otherwise. The conflict resolution system makes FaultLine **self-aware**: it detects problems, evaluates them with context (via LLM), and heals itself.
+This project is a **live learning experience in semantic validation**.
 
-That's the philosophy here: **write code that understands its own failures and fixes them autonomously.**
+**v1.0.0 learned:** Unit tests claimed production-ready. Gabriella's collision proved otherwise. Lesson: internal testing misses integration failures.
 
-Keep that in mind when designing next phases.
+**v1.0.1–v1.0.2 learned:** Extraction is the critical bottleneck. Bad facts at source cascade. Lesson: prevention beats cleanup. Three-layer validation (extraction constraint + conflict detection + retraction) catches problems at all entry points.
+
+**v1.0.3 learned:** Semantic validation requires **graph awareness**. Can't validate facts in isolation. The system must understand structure (hierarchy, composition, relationships) to enforce rules.
+
+**Philosophy:** Write code that:
+1. Prevents bad data at write time (extraction constraint, semantic gating)
+2. Detects conflicts when they slip through (graph-aware validation)
+3. Heals itself when user corrects (retraction flow, non-destructive updates)
+4. Understands its own failures and adapts (re-embedder evaluates novel types, resolves collisions via LLM)
+
+**For next phases:** Every new feature (new rel_type, new taxonomy, new extraction pattern) must ask: "How does this integrate with graph traversal, hierarchy expansion, and conflict detection?" If it requires hardcoded gating or brittle rules, it's not ready.
+
+That's the bar: **semantic awareness, not brittle automation.**
