@@ -27,28 +27,43 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
-## #deepseek NEXT TASK: dprompt-68 (MCP Server Wrapper)
+## ✓ DONE: dprompt-68 (MCP Server Wrapper) — 2026-05-14
 
-**Read:** dprompt-68b.md completely before starting.
+**Task:** Create MCP server wrapper for FaultLine endpoints.
 
-**Summary:** Create MCP server wrapper for FaultLine. Implement 5 tools (extract, ingest, query, retract, store_context) that expose existing FastAPI endpoints via MCP protocol.
+### Files created (dev only — no commits)
 
-**CRITICAL:**
-- DEV BRANCH ONLY — create new files in `src/mcp/` and `tests/mcp/`
-- NO EXISTING FILE MODIFICATIONS
-- NO GIT COMMITS — work in progress only, user will decide
-- Follow dprompt-68b.md execution sequence exactly
-- All tests must pass (new + existing)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/mcp/__init__.py` | 0 | Module init |
+| `src/mcp/tools.py` | 175 | 5 tool schemas + validation helpers |
+| `src/mcp/server.py` | 244 | MCP stdio server + async API call handlers |
+| `mcp_server.py` | 41 | Root entry point (CLI) |
+| `tests/mcp/test_server.py` | 314 | 13 tests with mocked FaultLine API |
 
-**Deliverables:**
-- src/mcp/server.py
-- src/mcp/tools.py
-- src/mcp/__init__.py
-- mcp_server.py
-- tests/mcp/test_server.py
-- Update this scratch.md with completion status
+### Tool coverage
 
-**When done:** Update scratch.md with status, then STOP and await user review.
+| Tool | Endpoint | Schema | Tests |
+|------|----------|--------|-------|
+| extract | POST /extract | text, user_id | success + invalid |
+| ingest | POST /ingest | text, user_id, edges, source | success + invalid edges |
+| query | POST /query | text, user_id, top_k | success + timeout + 500 |
+| retract | POST /retract | user_id, subject, rel_type?, old_value?, behavior? | success + invalid subject |
+| store_context | POST /store_context | text, user_id | success + invalid |
+
+### Tests: 13 passed, 0 failed ✓
+
+- Schema compliance: 5 tool schemas valid ✓
+- Success cases: all 5 tools return correct response ✓
+- Error handling: timeout, HTTP 500, invalid input → error dicts ✓
+- User_id isolation: different user_ids → different params ✓
+- Unknown tool: error returned ✓
+
+### Existing tests: 114 passed, 0 regressions ✓
+
+**No commits made.** No existing files modified. Awaiting user review.
+
+**Next:** User reviews code, approves, then decides on commit/merge strategy.
 
 ---
 
