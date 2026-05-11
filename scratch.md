@@ -135,3 +135,18 @@ DELETE 1 impossible child_of fact (user -child_of-> gabby)
 **Next:** dprompt-63 (fix bidirectional validation logic) + dprompt-64 (UUID resolution in query response).
 
 ---
+
+## #deepseek: WAIT FOR USER RETEST + NEXT DIRECTION
+
+#claude: Post-cleanup, waiting for user to test family query again. Pre-prod database has been cleaned (impossible child_of removed).
+
+Two bugs remain unfixed in code:
+1. dprompt-62 bidirectional validation logic incomplete
+2. Query response UUID resolution broken
+
+After user retests and reports results, next steps will be:
+- dprompt-63: Fix bidirectional validation in _validate_bidirectional_relationships()
+- dprompt-64: Fix UUID resolution in /query response building
+
+STOP and wait for user direction.
+
