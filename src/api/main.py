@@ -2863,6 +2863,25 @@ def query(request: QueryRequest):
     query_lower = request.text.lower()
     direct_facts = []
 
+    # dprompt-47: detect query intent by keyword → map to taxonomy group
+    _TAXONOMY_KEYWORDS = {
+        "family": {"my family", "my children", "my kids", "my wife", "my husband",
+                    "my spouse", "my son", "my daughter", "my parents", "my sibling",
+                    "my brother", "my sister", "my mother", "my father", "tell me about my family"},
+        "household": {"my pets", "my animals", "my household", "tell me about my pets",
+                       "who lives with me", "my home"},
+        "work": {"my job", "my work", "my boss", "my coworkers", "my colleagues",
+                  "who do i work with", "my employer", "my office"},
+        "location": {"where do i live", "my address", "my city", "my country",
+                      "my location", "where am i", "my neighbourhood"},
+        "computer_system": {"my computer", "my laptop", "my server", "my device",
+                             "my system", "my machine", "my workstation"},
+    }
+    _detected_taxonomy = None
+    for _tax_name, _keywords in _TAXONOMY_KEYWORDS.items():
+        if any(_kw in query_lower for _kw in _keywords):
+            _detected_taxonomy = _tax_name
+            break
     # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
     if db and registry and canonical_identity:
         direct_facts = _fetch_user_facts(db, user_id, entity_id=user_entity_id_for_query)
@@ -2898,6 +2917,22 @@ def query(request: QueryRequest):
             # dprompt-27: graph traversal — find connected entities via _REL_TYPE_GRAPH
             _connected = _graph_traverse(db, user_id, user_entity_id_for_query)
             if _connected:
+                if _detected_taxonomy:
+                    _tax = next((t for t in _TAXONOMY_CACHE if t["taxonomy_name"] == _detected_taxonomy), None)
+                    if _tax and _tax.get("member_entity_types"):
+                        _allowed_types = set(_tax["member_entity_types"])
+                        if "ANY" not in _allowed_types:
+                            _filtered = set()
+                            with db.cursor() as _tc:
+                                for _eid in _connected:
+                                    _tc.execute(
+                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                        (_eid, user_id))
+                                    _row = _tc.fetchone()
+                                    _etype = _row[0] if _row else "unknown"
+                                    if _etype in _allowed_types:
+                                        _filtered.add(_eid)
+                            _connected = _filtered
                 log.info("query.graph_traverse", identity=canonical_identity,
                          connected_count=len(_connected))
                 for _conn_id in _connected:
