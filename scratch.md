@@ -150,3 +150,16 @@ After user retests and reports results, next steps will be:
 
 STOP and wait for user direction.
 
+
+## Correction: Cyrus works_for → educated_at (User Feedback)
+
+#claude: User corrected extraction: Cyrus "studies at" (educated_at) not "works for" (works_for) University of Guelph.
+
+**Database cleanup:**
+- Deleted: cyrus -works_for-> university_of_guelph (staged_facts, conf=0.8)
+- Retained: cyrus -educated_at-> university_of_guelph (staged_facts, conf=0.8)
+
+Note: Both facts in staged_facts (unconfirmed Class B). Should have been caught by conflict detection (similar to dBug-006/007 pattern).
+
+Ready for user retest.
+
