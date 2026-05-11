@@ -52,6 +52,7 @@ then condense the remaining content to a concise current state summary.
 ## Current State (2026-05-13)
 
 ### Production (GitHub: tkalevra/FaultLine)
+- **v1.0.5** — Bidirectional relationship validation (dprompt-62)
 - **v1.0.4** — Query deduplication + alias metadata (dprompt-61)
 - **v1.0.3** — Semantic conflict detection (dprompt-59)
 - **v1.0.2** — Hierarchy extraction enhancement (dprompt-56b)
@@ -62,8 +63,8 @@ then condense the remaining content to a concise current state summary.
 
 - **Filter:** Dumb — trusts backend /query ranking. Identity rels always pass, confidence threshold on rest.
 - **Backend /query:** Smart — graph traversal, hierarchy expansion, taxonomy filtering, entity dedup + alias metadata.
-- **Ingest:** LLM-first extraction → WGM gate → semantic conflict detection → fact classification (A/B/C).
-- **Self-healing:** Semantic conflicts auto-superseded at ingest. Graph stays valid.
+- **Ingest:** LLM-first extraction → WGM gate → semantic conflict detection → bidirectional validation → fact classification (A/B/C).
+- **Self-healing:** Semantic conflicts auto-superseded at ingest. Impossible bidirectional relationships prevented. Graph stays valid.
 
 ### Active Issues
 
@@ -74,41 +75,16 @@ then condense the remaining content to a concise current state summary.
 | dBug-report-003 | Fixed (dprompt-58) |
 | dBug-report-004 | P3 — stale data cleanup scoped |
 | dBug-report-005 | Fixed (dprompt-61) |
+| dBug-report-006 | Fixed (dprompt-62) — pre-prod cleaned + validation deployed |
 
 ### Dev repo
 
-- Branch: `master` (commit `2e1fd11`)
+- Branch: `master` (commit `e5c7a60`)
 - Test suite: 114 passed, 53 skipped
+- Lines: `src/api/main.py` 3992
 
 ---
 
-
-## 🐛 CRITICAL: dBug-report-006 (Query Response Validation)
-
-#claude: Validated family query response against pre-prod database. Found **genuine bugs**:
-
-### Investigation Results
-- **Staged facts:** owns morkie + owns fraggle (violates dprompt-58 constraint)
-- **Committed facts:** Bidirectional impossibilities (Des, Cyrus both child_of AND parent_of user)
-- **Spouse facts:** 3 stored, should be 1 (should keep conf=1 only)
-- **UUID exposure:** "7E4Bff75-706E-mix" in response (Fraggle UUID, should be hidden)
-- **Pet logic:** Morkie shown as separate dog when should be type-only
-
-### Root Causes
-- dprompt-58 constraint applies to facts table only, not staged_facts
-- dprompt-59 conflict detection incomplete for staged patterns
-- No bidirectional relationship validation
-- dprompt-61 dedup may not handle staged facts
-- Response builder exposing UUIDs
-
-### Pre-Prod Cleanup (Done)
-```
-DELETE 2 conflicting staged facts (owns morkie, owns fraggle)
-DELETE 3 bidirectional impossible parent_of facts
-DELETE 2 lower-confidence spouse facts
-```
-
-**Status:** dBug-report-006 written + committed. Pre-prod cleaned.
 
 ## ✓ DONE: dprompt-62 (Staged Fact Validation + Bidirectional Rules) — 2026-05-13
 
@@ -134,6 +110,5 @@ extract → WGM gate → _detect_semantic_conflicts → _validate_bidirectional_
 - Syntax: clean ✓
 - Tests: 114 passed, 0 regressions ✓
 - Lines: 3839 → 3992 (+153 lines)
-
-**Deployment needed:** Rebuild backend container on truenas.
+- Deployed: v1.0.5 (`ec75cf4`) ✓
 
