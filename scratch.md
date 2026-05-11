@@ -87,17 +87,34 @@ None. All active issues resolved.
 
 ---
 
-## #deepseek NEXT: dprompt-cleanup-001 (Documentation Commit + Data Cleanup Scope)
+## ✓ DONE: dprompt-cleanup-001 (Documentation Commit + Cleanup Scope) — 2026-05-12
 
-**Status:** Ready for execution
+**Commit:** `9309fce` — 11 files (3 dprompt specs, 3 bug reports, 2 archives, scratch)
+- dBug-report-004 created: stale `user owns morkie` cleanup scoped as P3 for retraction flow enhancement
+- Git status clean, all docs archived
 
-**Context:** dprompt-58 (extraction constraint) completed and code-committed. Remaining: commit documentation files and scope the stale data cleanup issue.
+**All issues closed.** No pending work. Awaiting direction.
 
-**Task:**
-1. Stage and commit dprompt-56/57/58 specs, bug reports, archive files
-2. Create dBug-report-004 documenting stale `user owns morkie` cleanup need
-3. Scope cleanup as P3 issue for future retraction flow enhancement
+---
 
-**Execution:** Follow dprompt-cleanup-001.md sequence. One commit, two purposes (docs + scope). STOP with completion report.
+## ✓ DONE: dprompt-59 (Conflict Detection & Auto-Superseding) — 2026-05-12
 
-Stand by.
+**Implementation:** Added `_detect_semantic_conflicts()` to `src/api/main.py`. Runs before Class A/B/C commit in `/ingest` pipeline.
+
+### How it works
+
+1. When a new fact arrives, checks if the `object` entity already appears as object of a hierarchy relationship (`instance_of`, `subclass_of`, `is_a`, `member_of`, `part_of`)
+2. If the object IS a type/category/component, and the new fact's rel_type is a leaf-only rel (`owns`, `has_pet`, `works_for`, `lives_in`, `lives_at`), the new fact is auto-superseded
+3. The existing hierarchy relationship is preserved — the graph stays semantically valid
+
+### Example
+
+- `fraggle instance_of morkie` exists → `user owns morkie` is auto-superseded with reason: "type_conflict: morkie is object of instance_of"
+- `alice instance_of engineer` exists → `alice works_for engineer` is auto-superseded
+
+### Validation
+
+- Syntax: clean, lines: 3580 → 3674 (+94 lines)
+- Tests: 114 passed, 0 regressions
+
+**Deployment needed:** Rebuild faultline backend container on truenas.
