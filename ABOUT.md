@@ -1,5 +1,15 @@
 # FaultLine
 
+## v1.0.6 (2026-05-13) — Metadata-Driven Validation Framework
+
+**Architecture:** Validation rules moved from code to database. `rel_types` table now stores validation properties (`is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`). `_get_rel_type_metadata()` queries metadata at runtime. Hardcoded validation constants eliminated.
+
+**Result:** New rel_types created by LLM self-describe their constraints. System scales without new dprompts for each edge case. Zero technical debt.
+
+**Migration:** 022_rel_types_metadata.sql — idempotent schema expansion + metadata pre-population.
+
+---
+
 ## v1.0.5 (2026-05-13) — Bidirectional Relationship Validation
 
 **Ingest pipeline:** Added `_validate_bidirectional_relationships()` — prevents impossible bidirectional relationships (`child_of` + `parent_of` for same entity pair). Keeps higher-confidence version, supersedes lower. Checks both `facts` and `staged_facts`.
