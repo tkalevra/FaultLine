@@ -113,3 +113,32 @@ Validation rules live in `rel_types` table, not code. New rel_types self-describ
 **Pre-prod validation pending:** User must rebuild faultline backend container. Current pre-prod still shows 4 parent_of facts (old code). After rebuild: expect 2 parent_of (des, cyrus only).
 - **Deployed:** v1.0.7 (`915b0c8`) ✓ — pre-prod validated, 2 parent_of facts confirmed.
 
+
+---
+
+## 🔍 NEXT: dprompt-67 (Documentation Audit & Consistency Sync) — 2026-05-14
+
+### Task
+
+Audit all documentation across FaultLine-dev and faultline-prod for consistency and v1.0.7 accuracy. Identify stale info, update both repos respectively.
+
+**Scope:** CLAUDE.md (dev), ABOUT.md / README.md / CHANGELOG.md / .env.example (prod)
+
+**Expected findings:** CLAUDE.md may need metadata-driven validation + UUID dedup sections updated.
+
+### ⚠️ EXPLICIT DIRECTION TO DEEPSEEK
+
+**YOU MUST READ AND EXECUTE IMMEDIATELY:**
+
+1. **Read:** `dprompt-67.md` (scope + findings summary)
+2. **Read:** `dprompt-67b.md` (formal execution prompt)
+3. **Execute:** Follow dprompt-67b EXACTLY per DEEPSEEK_INSTRUCTION_TEMPLATE
+4. **Audit:** Compare CLAUDE.md vs implementation + ABOUT.md vs implementation
+5. **Update:** CLAUDE.md (dev) with v1.0.7 changes, verify prod docs accurate
+6. **Commit:** Changes to respective repos (dev→dev, prod→prod)
+7. **Push:** Both repositories
+8. **Report:** Update scratch.md per completion template
+9. **STOP:** Do not proceed further
+
+**No ambiguity.** This is documentation audit and update. Follow the prompt. Report back per template.
+
