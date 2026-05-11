@@ -6,7 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FaultLine is a **write-validated knowledge graph** pipeline that intercepts OpenWebUI conversations, extracts named entities and relationships, validates them against an ontology, and persists them to PostgreSQL. Qdrant is a derived vector index — facts flow Postgres → Qdrant via the re-embedder and are queried for memory recall during the inlet phase.
 
-## Pipeline Flow
+## Architecture (v1.0.7)
+
+### Filter (openwebui/faultline_tool.py)
+**Filter is dumb, backend is smart.** Filter no longer implements three-tier gating. It trusts backend `/query` ranking (Class A > B > C + confidence) and injects facts in returned order. Identity relationships always pass; everything else passes if confidence ≥ threshold (0.4 default). Sensitivity penalty still applies to PII facts.
+
+### Ingest Pipeline (src/api/main.py)
+```
+LLM extract → WGM gate → semantic conflict detection → bidirectional validation → Class A/B/C → commit
+```
+All validation is **metadata-driven** via `rel_types` table (`is_leaf_only`, `is_hierarchy_rel`, `inverse_rel_type`, `is_symmetric`). `_get_rel_type_metadata()` queries metadata at runtime — no hardcoded validation constants. New rel_types self-describe their constraints. Graph self-heals through semantic conflict auto-superseding.
+
+### Query Path (src/api/main.py)
+```
+baseline facts → graph traversal → hierarchy expansion → Qdrant search → attributes → UUID-based dedup → _aliases metadata → return
+```
+- `pg_keys` uses `_subject_id`/`_object_id` (UUIDs), not display names — prevents duplicate facts from alias variation
+- `_get_entity_aliases()` attaches `_aliases` metadata to each fact
+- Merged and deduplicated on `(subject_uuid, rel_type, object_uuid)` with PostgreSQL winning on conflict
+
+## Pipeline Flow (detailed)
 OpenWebUI inlet filter
 ├─▶ Retraction detection (if "forget", "delete", "wrong", etc.)
 │     └─▶ LLM retraction extraction → POST /retract (inline Qdrant cleanup)
@@ -18,20 +37,22 @@ OpenWebUI inlet filter
 │     ├─▶ POST /ingest (fire-and-forget) [typed edges]
 │     │     └─▶ GLiNER2 extract_json   typed schema edge extraction (fallback/override)
 │     │           └─▶ WGMValidationGate   ontology + conflict check → status
-│     │                 └─▶ Fact Classification (Phase 4)
-│     │                       ├─▶ Class A (identity/structural)
-│     │                       │     └─▶ FactStoreManager.commit()  INSERT INTO facts immediately
-│     │                       │           └─▶ re_embedder (background) → Qdrant upsert
-│     │                       ├─▶ Class B (behavioral/contextual)
-│     │                       │     └─▶ _commit_staged()  INSERT INTO staged_facts
-│     │                       │           └─▶ immediate Qdrant sync (no poll delay)
-│     │                       │           └─▶ re_embedder promotes when confirmed_count >= 3
-│     │                       │                 └─▶ staged Qdrant point deleted after commit
-│     │                       │                       └─▶ new facts point upserted next poll cycle
-│     │                       └─▶ Class C (ephemeral/novel)
-│     │                             └─▶ _commit_staged()  INSERT INTO staged_facts
-│     │                                   └─▶ re_embedder upserts to Qdrant
-│     │                                         └─▶ expires after 30 days if unconfirmed
+│     │                 └─▶ _detect_semantic_conflicts   auto-supersedes type/ownership conflicts
+│     │                       └─▶ _validate_bidirectional_relationships   prevents child_of + parent_of coexistence
+│     │                             └─▶ Fact Classification (Phase 4)
+│     │                                   ├─▶ Class A (identity/structural)
+│     │                                   │     └─▶ FactStoreManager.commit()  INSERT INTO facts immediately
+│     │                                   │           └─▶ re_embedder (background) → Qdrant upsert
+│     │                                   ├─▶ Class B (behavioral/contextual)
+│     │                                   │     └─▶ _commit_staged()  INSERT INTO staged_facts
+│     │                                   │           └─▶ immediate Qdrant sync (no poll delay)
+│     │                                   │           └─▶ re_embedder promotes when confirmed_count >= 3
+│     │                                   │                 └─▶ staged Qdrant point deleted after commit
+│     │                                   │                       └─▶ new facts point upserted next poll cycle
+│     │                                   └─▶ Class C (ephemeral/novel)
+│     │                                         └─▶ _commit_staged()  INSERT INTO staged_facts
+│     │                                               └─▶ re_embedder upserts to Qdrant
+│     │                                                     └─▶ expires after 30 days if unconfirmed
 │     └─▶ POST /store_context (fire-and-forget) [no typed edges]
 │           └─▶ Embed text (nomic-embed-text) → direct Qdrant upsert
 │                 └─▶ fact_class=C, confidence=0.4, rel_type="context"
@@ -44,6 +65,8 @@ OpenWebUI inlet filter
 ├─▶ Taxonomy-aware entity filtering   `_TAXONOMY_KEYWORDS` → `member_entity_types` gate
 ├─▶ Qdrant cosine search (nomic-embed-text, score_threshold: 0.3, limit: 10)
 ├─▶ entity_types metadata   `_build_entity_types()` parallel to preferred_names
+├─▶ UUID-based deduplication   `pg_keys` uses `_subject_id`/`_object_id`, not display names
+├─▶ _aliases metadata   `_get_entity_aliases()` attaches all entity names with is_preferred flag
 ├─▶ merged, deduplicated → injected as system message before last user message
 ├─▶ ⊢ FaultLine Memory header + event_emitter status notification
 OpenWebUI outlet filter
@@ -64,22 +87,17 @@ Before calling the LLM for fact extraction:
 
 If neither condition is met, `will_ingest = False`. `will_query` is always `True` when `QUERY_ENABLED` is set.
 
-## Three-Tier Filter Relevance Gating (dprompt-51b/52b)
+## Filter Relevance Gating (Simplified — dprompt-53b)
 
-The Filter's `_filter_relevant_facts()` uses a three-tier gating system. Backend graph-proximity is authoritative — the Filter trusts backend ranking rather than re-judging relevance with keyword lists.
+Filter is **dumb** — trusts backend `/query` ranking. Backend graph-proximity is authoritative.
 
-**Tier 1 — Entity-name match:**
-If the query mentions a known entity (matched via `_extract_query_entities()` against `preferred_names`), return all facts where that entity is subject or object. Entity types from `entity_types` metadata are used to skip Concept/unknown entities — preventing taxonomy labels ("pets", "family", "dog") from hijacking this tier.
+**Identity facts** (`also_known_as`, `pref_name`, `same_as`, `spouse`, `parent_of`, `child_of`, `sibling_of`) always pass.
 
-**Tier 2 — Identity fallback:**
-For genuinely generic queries ("how are you") with no entity match, return identity-defining facts only: `also_known_as`, `pref_name`, `same_as`, `spouse`, `parent_of`, `child_of`, `sibling_of`.
+**Everything else** passes if confidence ≥ threshold (default 0.4 via `MIN_INJECT_CONFIDENCE` valve).
 
-**Tier 3 — Graph-proximity pass-through:**
-All remaining facts pass through with confidence-only gating (`_RELEVANCE_THRESHOLD = 0.0`). Identity facts (`also_known_as`, `pref_name`, `same_as`) always pass. Sensitivity penalty still applies per-fact via `calculate_relevance_score()`.
+**Sensitivity penalty** still applies per-fact via `calculate_relevance_score()` — PII facts gated unless explicitly asked.
 
-**Known bug (dBug-report-001):** Tier 2 intercepts queries where Tier 1 entities were filtered out by Concept/unknown — the empty entities set falls through to Tier 2's identity return, blocking Tier 3 from passing `has_pet` and other category facts. Fix: skip Tier 2 when entity_types stripped all Tier 1 matches.
-
-**`entity_types` metadata:** The `/query` backend now returns an `entity_types` dict alongside `preferred_names`, built by `_build_entity_types()` from the `entities` table (UUID keys) and `entity_aliases→entities` JOIN (string keys). The Filter's `_extract_query_entities()` uses this to distinguish Person/Animal/Organization/Location from Concept/unknown.
+**No tier gating, no entity-type filtering, no Concept/unknown checks.** Filter injects backend-ranked facts in returned order.
 
 ## Relevance Scoring (simplified — dprompt-51b)
 
@@ -92,7 +110,35 @@ Two components (keyword match component removed — graph structure is the signa
 
 Identity rels (`also_known_as`, `pref_name`, `same_as`) always bypass scoring.
 
-Tier 3 uses `_RELEVANCE_THRESHOLD = 0.0` — confidence-only gating. Graph-proximity from `/query` already encodes what's relevant.
+## Ingest Validation Pipeline (dprompt-59/62/65)
+
+All validation runs before Class A/B/C assignment. Pipeline order:
+
+```
+extract → WGM gate → _detect_semantic_conflicts → _validate_bidirectional_relationships → Class A/B/C → commit
+```
+
+### Semantic Conflict Detection (dprompt-59)
+
+`_detect_semantic_conflicts()` auto-supersedes ownership/relationship facts when the object entity is already defined as a type/category/component via hierarchy relationships. Checks both `facts` and `staged_facts` tables.
+
+**Principle:** If `X instance_of Y`, Y is a TYPE, not a separate entity — don't allow `owns`/`has_pet`/`works_for` on type entities.
+
+### Bidirectional Validation (dprompt-62)
+
+`_validate_bidirectional_relationships()` prevents impossible bidirectional relationships (`child_of` + `parent_of` for same entity pair). Keeps higher-confidence version, supersedes lower.
+
+### Metadata-Driven Validation (dprompt-65)
+
+All validation is **metadata-driven** via `rel_types` table columns: `is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`. `_get_rel_type_metadata()` queries metadata at runtime with module-level cache. Zero hardcoded validation constants remain — all replaced with metadata queries. New rel_types created by LLM self-describe their constraints without code changes.
+
+## Query Deduplication (dprompt-61/66)
+
+`/query` deduplicates facts by entity UUID, not display names:
+
+1. **Pg_keys:** Uses `_subject_id`/`_object_id` (UUIDs preserved by `_resolve_display_names`) instead of display names — prevents duplicates when same entity has multiple aliases (chris/user → single fact)
+2. **Final dedup pass:** Groups facts by `(subject_uuid, rel_type, object_uuid)`, keeps highest confidence
+3. **Alias metadata:** `_get_entity_aliases()` attaches `_aliases` dict with all entity names and `is_preferred` flag
 
 ## Fact Classification (Phase 4)
 
@@ -126,7 +172,9 @@ Facts are classified at ingest time into three classes:
 4. **Vector similarity** (Qdrant) — `nomic-embed-text-v1.5`, cosine, `score_threshold: 0.3`, `limit: 10`
 5. **Entity attributes** — `_attributes_to_facts()` converts `entity_attributes` rows to fact dicts, merged into the fact list
 
-Merged and deduplicated on `(subject, object, rel_type)` with PostgreSQL winning on conflict.
+**Merging:** PostgreSQL facts are authoritative, Qdrant adds associative context. Deduplicated on `(subject_uuid, rel_type, object_uuid)` using `_subject_id`/`_object_id` UUID keys (not display names).
+
+**Final pass:** Facts grouped by UUID triple, highest confidence kept. `_aliases` metadata attached to each fact.
 
 ### Graph + Hierarchy Traversal (dprompt-27/28)
 
@@ -153,7 +201,7 @@ Hierarchy-chain-aware: entities with unknown type walk `_hierarchy_expand()` upw
 - UUID keys: batched query of `entities` table
 - String (display-name) keys: `entity_aliases` → `entities` JOIN
 
-Returned in `/query` response JSON as `"entity_types"`. The Filter uses this to skip Concept/unknown entities in Tier 1 matching.
+Returned in `/query` response JSON as `"entity_types"`.
 
 ### `_fetch_user_facts()` UNION helper
 
@@ -223,6 +271,8 @@ Triple model `(subject_id, rel_type, object_id)` aligned to Wikidata PIDs. SKOS/
 
 **Type constraints:** `rel_types.head_types` and `tail_types` (ARRAY). `ARRAY['ANY']` = unconstrained. `ARRAY['SCALAR']` = scalar value.
 
+**Metadata columns (dprompt-65):** `is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`, `allows_leaf_rels` — validation framework queries these at runtime. No hardcoded rules.
+
 | rel_type | Wikidata PID | Inverse | Symmetric | W3C Mapping | Notes |
 |---|---|---|---|---|---|
 | instance_of | P31 | — | No | rdf:type | NOT transitive |
@@ -266,7 +316,7 @@ Primary tables:
 - `entities(id, user_id, entity_type)` + `entity_aliases(entity_id, user_id, alias, is_preferred)` — canonical entity registry. Note: `entity_aliases` rename to `entity_names` planned.
 - `entity_name_conflicts(id, user_id, alias, entity_id_a, entity_id_b, status, resolved_by, resolved_at, created_at)` — pending name collision disputes. UNIQUE on `(user_id, alias)`.
 - `entity_taxonomies(id, taxonomy_name, description, member_entity_types, rel_types_defining_group, has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type)` — data-driven grouping system. Pre-seeded with family, household, work, location, computer_system.
-- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior, category, head_types, tail_types)` — live ontology. Loaded at startup into `_REL_TYPE_META`.
+- `rel_types(rel_type, label, wikidata_pid, engine_generated, confidence, source, correction_behavior, category, head_types, tail_types, is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel, allows_leaf_rels)` — live ontology with validation metadata (dprompt-65). Loaded at startup into `_REL_TYPE_META`. `_get_rel_type_metadata()` queries at runtime.
 - `pending_types(id, rel_type, subject_id, object_id, flagged_at)` — novel types awaiting approval.
 - `ontology_evaluations` — frequency + cosine similarity tracking for self-building ontology.
 
@@ -291,21 +341,22 @@ The `/ingest` validation block has `_SCALAR_OBJECT_RELS` — objects for scalar 
 
 | File | Role |
 |---|---|
-| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, `_graph_traverse()`, `_hierarchy_expand()`, `_build_entity_types()`, `_clean_preferred_names()`, `_fetch_user_facts()` UNION helper, fact classification, `_TAXONOMY_KEYWORDS`, startup normalization, age validation |
+| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract`, `/store_context` endpoints, GLiNER2 lifecycle, `_graph_traverse()`, `_hierarchy_expand()`, `_build_entity_types()`, `_clean_preferred_names()`, `_fetch_user_facts()` UNION helper, `_get_entity_aliases()`, `_detect_semantic_conflicts()`, `_validate_bidirectional_relationships()`, `_get_rel_type_metadata()`, fact classification, `_TAXONOMY_KEYWORDS`, startup normalization, age validation |
 | `src/api/models.py` | Pydantic models — EdgeInput (with subject_type/object_type), IngestRequest, QueryRequest, RetractRequest, StoreContextRequest |
 | `src/wgm/gate.py` | `WGMValidationGate` — ontology check + conflict detection + type constraint validation |
 | `src/fact_store/store.py` | `FactStoreManager` — `commit()` for ingest, `retract()` for user-driven fact removal |
 | `src/schema_oracle/oracle.py` | `resolve_entities()`, `LABEL_MAP`, `GLIREL_LABELS` |
 | `src/entity_registry/registry.py` | DB-backed `EntityRegistry` — UUID v5 surrogates, alias tracking, preferred name resolution, conflict detection |
 | `src/re_embedder/embedder.py` | Background poll loop — embeds unsynced facts/staged_facts, promotes Class B, expires Class C, evaluates ontology candidates, resolves name conflicts, Qdrant reconciliation |
-| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction + LLM extraction, three-tier relevance gating (entity match → identity fallback → graph-proximity pass-through), `entity_types`-aware Tier 1, `/query` caching, `⊢ FaultLine Memory` injection |
+| `openwebui/faultline_tool.py` | OpenWebUI **Filter** — retraction + LLM extraction, simplified confidence gating (identity rels always pass), `/query` caching, `⊢ FaultLine Memory` injection |
 | `openwebui/faultline_function.py` | OpenWebUI **Function** — explicit `store_fact()` with LLM rewrite |
 | `migrations/012_staged_facts.sql` | `staged_facts` table, promotion/expiration indexes |
 | `migrations/019_entity_taxonomies.sql` | `entity_taxonomies` table + 5 core taxonomies |
 | `migrations/021_name_conflicts.sql` | `entity_name_conflicts` table |
+| `migrations/022_rel_types_metadata.sql` | `rel_types` validation metadata columns (dprompt-65) |
 | `docker-compose.yml` | Docker orchestration — `network: host` build, env-var-driven configuration |
 | `docker-entrypoint.sh` | Migration runner + uvicorn startup + re-embedder background launch |
-| `BUGS/` | Bug reports — see `dBug-report-001.md` |
+| `BUGS/` | Bug reports — dBug-001 through dBug-008 |
 
 ## Key Principles (Do Not Violate)
 
@@ -323,8 +374,9 @@ The `/ingest` validation block has `_SCALAR_OBJECT_RELS` — objects for scalar 
 - **Scalar rel_types have STRING objects, relationship rel_types have UUID objects** — `_SCALAR_OBJECT_RELS` defines the split. Never resolve objects for scalar rels; always resolve for relationship rels.
 - **Alias registration must use ON CONFLICT DO UPDATE** — ensures stale preferred flags are corrected
 - **Graph + hierarchy are separate traversal systems** — `_REL_TYPE_GRAPH` (connectivity) and `_REL_TYPE_HIERARCHY` (composition) are orthogonal. Do not conflate them.
-- **Backend graph-proximity is authoritative for relevance** — Filter Tier 3 trusts backend ranking. No keyword-based re-scoring.
-- **entity_types metadata is additive** — missing key → backward compatible. No new DB queries in Filter.
+- **Backend graph-proximity is authoritative for relevance** — Filter trusts backend ranking. No keyword-based re-scoring.
+- **Validation is metadata-driven** — `rel_types` table stores validation properties. `_get_rel_type_metadata()` queries at runtime. No hardcoded validation constants. New rel_types self-describe.
+- **Deduplication uses UUIDs, not display names** — `pg_keys` built from `_subject_id`/`_object_id`. Display names vary by alias, UUIDs are stable.
 
 ## Running / Developing
 
