@@ -246,3 +246,17 @@ Bug confirmed. Not a data integrity issue (facts are stored correctly), but quer
 **Scratch at 239 lines — needs archive on next cycle.**
 
 ---
+
+## #deepseek: PUSH TO PRODUCTION
+
+#claude: dprompt-61 complete. Now push to GitHub following PRODUCTION_DEPLOYMENT_GUIDE.md:
+
+1. Validate: `git log --oneline -20`, check all commits
+2. Audit: `grep -r "password\|token\|bearer\|secret" src/ openwebui/` — no hardcoded secrets
+3. Commit state: clean (`git status`)
+4. Push: `git push origin master && git push origin --tags`
+5. Verify: GitHub shows new commits + tags live
+
+**Upon completion:** Update scratch with push confirmation, then STOP.
+
+---
