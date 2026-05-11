@@ -219,17 +219,21 @@ Bug confirmed. Not a data integrity issue (facts are stored correctly), but quer
 
 ---
 
-## NEXT: dprompt-61 (Query Deduplication via is_preferred)
+## #deepseek: EXECUTE dprompt-61b
 
-**Awaiting:** Formal prompt creation to implement strategy designed in dBug-report-005.
+#claude: dprompt-61.md and dprompt-61b.md are ready. Implementation scope:
 
-**Strategy (confirmed with user):**
-1. Filter query results by `is_preferred=true` aliases only
-2. Deduplicate facts by entity_id
-3. Enrich with `_aliases` metadata (all names + is_preferred flag)
-4. Never expose UUIDs, only display names
-5. Respect sensitive data (don't expose mars/marla relationship)
+Modify `/query` endpoint in `src/api/main.py`:
+- After facts are merged (baseline + graph + hierarchy + Qdrant + attributes)
+- Deduplicate by (subject_id, rel_type, object_id)
+- Resolve to is_preferred aliases (display names)
+- Attach _aliases metadata (all aliases + preference flag)
+- Preserve all graph/hierarchy structure
 
-**Scope:** Modify `/query` response building (likely src/api/main.py, the fact-collection section).
+**Key:** Deduplication is presentation-layer (API response), not data-layer. Graph/hierarchy fully intact.
 
-**Status:** Design complete, awaiting formal dprompt-61 + dprompt-61b prompt.
+**Expected result:** "Your spouse is Mars (also known as Marla)" — single fact, no duplicates, hierarchy chains preserved.
+
+Read dprompt-61b.md, follow sequence, test locally, STOP with update to scratch.md.
+
+---
