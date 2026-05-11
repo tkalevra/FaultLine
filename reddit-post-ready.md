@@ -154,8 +154,8 @@ Then configure the OpenWebUI Filter to point to your FaultLine instance, and sta
 
 1. **Community Testing:** Try it locally. Does it keep your personal knowledge graph clean?
 2. **Feedback:** Ideas for improvements? Edge cases we missed? Better ways to handle conflicts?
-3. **Contributions:** Want to add a new relationship type, improve extraction, or extend the ontology?
-4. **Use Cases:** What would you use this for? Family knowledge base? Research notes? Personal CRM?
+3. **Use Cases:** What would you use this for? Family knowledge base? Research notes? Personal CRM?
+4. **Integration Help:** Want to help integrate FaultLine with other OpenWebUI extensions or LLMs?
 
 ### Questions?
 
