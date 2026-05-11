@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.4 (2026-05-12) — Query Deduplication & Alias Metadata
+
+**Query path:** `/query` deduplicates facts by `(subject_uuid, rel_type, object_uuid)` after merge, keeping highest confidence per triple. `_aliases` metadata attached to each fact with all entity names and `is_preferred` flag.
+
+**Effect:** No more duplicate facts from alias redundancy (christopher spouse mars + chris spouse mars → single deduplicated fact). Filter gets clean results.
+
+**Fixes:** dBug-report-005 (alias redundancy in query results)
+
 ## v1.0.3 (2026-05-12) — Semantic Conflict Detection
 
 **Ingest pipeline:** `_detect_semantic_conflicts()` added before Class A/B/C commit. Auto-supersedes ownership/relationship facts when the object entity is already defined as a type/category via hierarchy rels.
