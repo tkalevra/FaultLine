@@ -132,6 +132,10 @@ Example:
 
 ## Upon Completion
 
+**⚠️ MANDATORY: Update scratch.md with this exact template (copy-paste, fill in values). This is NON-NEGOTIABLE.**
+
+Your completion report in scratch.md IS your proof of work. No report = task incomplete. Every dprompt execution MUST update scratch.md before STOP.
+
 **Update scratch.md with this exact template (copy-paste, fill in values):**
 
 ```markdown
