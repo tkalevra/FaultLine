@@ -219,21 +219,30 @@ Bug confirmed. Not a data integrity issue (facts are stored correctly), but quer
 
 ---
 
-## #deepseek: EXECUTE dprompt-61b
+## ✓ DONE: dprompt-61 (Query Deduplication via is_preferred) — 2026-05-12
 
-#claude: dprompt-61.md and dprompt-61b.md are ready. Implementation scope:
+**Implementation:** `src/api/main.py` — `/query` endpoint dedup + alias metadata.
 
-Modify `/query` endpoint in `src/api/main.py`:
-- After facts are merged (baseline + graph + hierarchy + Qdrant + attributes)
-- Deduplicate by (subject_id, rel_type, object_id)
-- Resolve to is_preferred aliases (display names)
-- Attach _aliases metadata (all aliases + preference flag)
-- Preserve all graph/hierarchy structure
+### Changes
 
-**Key:** Deduplication is presentation-layer (API response), not data-layer. Graph/hierarchy fully intact.
+1. `_resolve_display_names()`: now preserves original UUIDs as `_subject_id`/`_object_id` for downstream dedup
+2. `_get_entity_aliases()`: new helper — returns all aliases for an entity UUID with is_preferred flag
+3. Dedup pass after merge: groups facts by `(subject_uuid, rel_type, object_uuid)`, keeps highest confidence per triple, attaches `_aliases` metadata
+4. Lines: 3674 → 3839 (+165 lines)
 
-**Expected result:** "Your spouse is Mars (also known as Marla)" — single fact, no duplicates, hierarchy chains preserved.
+### Effect
 
-Read dprompt-61b.md, follow sequence, test locally, STOP with update to scratch.md.
+- `christopher spouse mars` + `chris spouse mars` → single `user spouse mars` with `_aliases` showing both names
+- No UUIDs exposed in response
+- Graph/hierarchy chains fully preserved
+
+### Validation
+
+- Syntax: clean ✓
+- Tests: 114 passed, 0 regressions ✓
+
+**Deployment needed:** Rebuild faultline backend container on truenas.
+
+**Scratch at 239 lines — needs archive on next cycle.**
 
 ---
