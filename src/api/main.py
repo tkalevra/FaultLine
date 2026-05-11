@@ -980,6 +980,102 @@ def _hierarchy_expand(
         return {entity_id}
 
 
+# ── dprompt-59: Semantic Conflict Detection ──────────────────────────────────
+# Detects when new facts contradict existing graph structure and auto-resolves.
+# The graph IS the source of truth — hierarchy/type relationships define what
+# entities ARE, and independent relationships (owns, has_pet, etc.) must respect
+# those semantics.
+
+# Rel_types that define WHAT an entity is (type/category/component)
+_HIERARCHY_DEFINING_RELS = frozenset({
+    "instance_of", "subclass_of", "is_a", "member_of", "part_of",
+})
+
+# Rel_types that should NOT apply to type/category/component entities
+# (these are for leaf/instance entities only)
+_LEAF_ONLY_RELS = frozenset({
+    "owns", "has_pet", "works_for", "lives_in", "lives_at",
+})
+
+
+def _detect_semantic_conflicts(
+    db_conn,
+    user_id: str,
+    subject: str,
+    rel_type: str,
+    obj: str,
+) -> tuple[str, str | None]:
+    """
+    Check if a new fact contradicts existing graph structure.
+
+    Returns (decision, reason):
+      - ("keep", None): No conflict — proceed with ingest.
+      - ("supersede_new", reason): New fact semantically invalid — skip it.
+      - ("supersede_existing_ids", reason): Existing fact(s) contradicted — supersede them.
+
+    Principle: If X instance_of Y, Y is a TYPE, not a separate entity.
+    Do not allow owns/has_pet/works_for on type entities.
+    """
+    rt_lower = rel_type.lower().strip() if rel_type else ""
+    obj_id = str(obj).lower().strip() if obj else ""
+
+    # Only check non-hierarchy relationship types
+    if rt_lower in _HIERARCHY_DEFINING_RELS:
+        return ("keep", None)
+
+    # Only check leaf-only relationship types against hierarchy objects
+    if rt_lower not in _LEAF_ONLY_RELS:
+        return ("keep", None)
+
+    if not db_conn or not obj_id:
+        return ("keep", None)
+
+    try:
+        with db_conn.cursor() as cur:
+            # Check: is the object entity the object of any hierarchy relationship?
+            cur.execute(
+                "SELECT id, subject_id, rel_type FROM facts "
+                "WHERE user_id = %s AND object_id = %s "
+                "AND rel_type = ANY(%s) "
+                "AND superseded_at IS NULL "
+                "LIMIT 1",
+                (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+            )
+            hierarchy_fact = cur.fetchone()
+
+            if not hierarchy_fact:
+                # Also check staged_facts
+                cur.execute(
+                    "SELECT id, subject_id, rel_type FROM staged_facts "
+                    "WHERE user_id = %s AND object_id = %s "
+                    "AND rel_type = ANY(%s) "
+                    "LIMIT 1",
+                    (user_id, obj_id, list(_HIERARCHY_DEFINING_RELS)),
+                )
+                hierarchy_fact = cur.fetchone()
+
+            if hierarchy_fact:
+                fact_id, hierarchy_subject, hierarchy_rel = hierarchy_fact
+                reason = (
+                    f"type_conflict: {obj_id} is object of {hierarchy_rel} "
+                    f"(defined by {hierarchy_subject}) — cannot also be {rt_lower} target"
+                )
+                log.info(
+                    "ingest.semantic_conflict_detected",
+                    obj=obj_id,
+                    new_rel=rt_lower,
+                    existing_hierarchy=f"{hierarchy_subject} {hierarchy_rel} {obj_id}",
+                    decision="supersede_new",
+                )
+                return ("supersede_new", reason)
+
+    except Exception as e:
+        log.warning("ingest.semantic_conflict_check_failed", error=str(e),
+                    subject=subject, rel_type=rt_lower, obj=obj_id)
+
+    return ("keep", None)
+
+
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
 
 def _validate_startup_config() -> dict:
@@ -2239,6 +2335,31 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     validated_rows.append(updated_row)
 
                 rows = validated_rows
+
+                # ── dprompt-59: Semantic conflict detection ──────────────────
+                # Before committing, check each fact against existing graph structure.
+                # If X instance_of Y exists, don't allow owns/has_pet/works_for on Y.
+                conflict_free_rows = []
+                conflict_count = 0
+                for row in rows:
+                    _uid, _subj, _obj, _rel, _src, _pref, _fclass, _conf, _eng = row
+                    decision, reason = _detect_semantic_conflicts(
+                        db, req.user_id, _subj, _rel, _obj,
+                    )
+                    if decision == "supersede_new":
+                        log.info("ingest.conflict_superseded",
+                                 rel_type=_rel, subject=_subj, object=_obj, reason=reason)
+                        conflict_count += 1
+                        continue  # skip this fact — it's semantically invalid
+                    conflict_free_rows.append(row)
+
+                if conflict_count > 0:
+                    log.info("ingest.conflicts_resolved", count=conflict_count,
+                             user_id=req.user_id)
+                    db.commit()
+
+                rows = conflict_free_rows
+                # ── end dprompt-59 ──────────────────────────────────────────
 
                 # Split rows by fact class — surrogates go directly to commit, no display name resolution
                 # Display names are resolved at READ time only (_resolve_display_names in /query)
