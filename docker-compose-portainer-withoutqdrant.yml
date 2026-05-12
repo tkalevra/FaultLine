@@ -1,0 +1,104 @@
+version: "3.8"
+
+# FaultLine WGM — Portainer Stack (WITHOUT Qdrant)
+#
+# This compose file assumes you already have Qdrant running in a separate stack.
+# It will connect to your existing Qdrant instance via the shared network.
+#
+# IMPORTANT: This compose file references a PRE-BUILT Docker image.
+# Before deploying this stack in Portainer, build the image on your Docker host:
+#
+#   cd /path/to/FaultLine
+#   docker build -t faultline-wgm:latest .
+#
+# PREREQUISITES:
+#   ✓ Qdrant already running (e.g., in rag-ai-qdrant stack)
+#   ✓ Qdrant network name: rag-ai-qdrant_default
+#   ✓ Qdrant hostname: qdrant
+#   ✓ Qdrant port: 6333
+#
+# DEPLOYMENT OPTIONS:
+#   Option 1: Web Editor (Portainer UI)
+#     → Stacks → Add Stack → Web Editor → Paste this file → Deploy
+#
+#   Option 2: Git Repository (recommended for version control)
+#     → Stacks → Add Stack → Git Repository
+#     → Repository URL, Branch, Compose path: docker-compose-portainer-withoutqdrant.yml
+#
+# REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
+#   QWEN_API_URL       - LLM endpoint, e.g. http://192.168.1.x:11434/v1/chat/completions
+#   POSTGRES_PASSWORD  - Database password for 'faultline' user (optional, defaults to 'faultline')
+
+services:
+
+  faultline:
+    image: faultline-wgm:latest
+    container_name: faultline
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_test
+      QWEN_API_URL: ${QWEN_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: faultline-test
+      REEMBED_INTERVAL: 5
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen/qwen3.5-9b}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-qwen2.5-coder}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - faultline-net
+      - rag-ai-qdrant_default
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: faultline-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
+      POSTGRES_DB: faultline_test
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - faultline-net
+
+volumes:
+  pg-data:
+    name: faultline-pg-data
+
+networks:
+  faultline-net:
+    name: faultline-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1500
+
+  # Reference to existing Qdrant network
+  rag-ai-qdrant_default:
+    external: true
+    name: rag-ai-qdrant_default
