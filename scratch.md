@@ -45,36 +45,93 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
-## #deepseek TASK: dprompt-70b (Bidirectional Relationship Completeness — dBug-012 Fix)
+## ✓ DONE: dprompt-70b (Bidirectional Relationship Completeness — dBug-012) — 2026-05-15
 
-**READ:** `dprompt-70b.md` — Full execution instructions (DEEPSEEK_INSTRUCTION_TEMPLATE format)
+**Task:** Fix incomplete bidirectional relationships via two-phase approach.
 
-**TL;DR:**
-- Fix: Update extraction prompt to mandate bidirectional emission + update ingest to auto-create missing inverses
-- Files: `openwebui/faultline_tool.py` + `src/api/main.py`
-- Scope: Two files, two changes, no schema changes
-- Tests: Full suite must pass, 0 regressions
-- Constraint: NO COMMITS until user reviews and approves
+**Phase A — Extraction prompt (openwebui/faultline_tool.py):**
+- Added BIDIRECTIONAL EMISSION rule to `_TRIPLE_SYSTEM_PROMPT`
+- Covers parent_of/child_of, spouse, sibling_of with concrete example
 
-**dBug-012 Background:**
-Knowledge graph has incomplete bidirectional relationships (parent_of/child_of, spouse). Pre-prod verified 3 concrete gaps:
-- `gabby -child_of-> chris` (1.0) but **MISSING** `chris -parent_of-> gabby`
-- `des -parent_of-> chris` (wrong direction, should be child_of)
-- `chris -spouse-> mars` (1.0) but **MISSING** `mars -spouse-> chris`
+**Phase B — Ingest auto-create (src/api/main.py):**
+- `_validate_bidirectional_relationships()` now auto-creates missing inverses
+- Call site creates inverse row with same confidence, fact_class, swapped subject/object
+- Logged as `ingest.bidirectional_inverse_created`
 
-Root causes: LLM extraction prompt doesn't instruct both-directional emission; ingest validates conflicts but doesn't create missing inverses.
+**Pre-Prod Validation:** ✓ Complete  
+**Tests:** 114 passed, 0 regressions ✓  
+**Code committed:** ✓ Yes
 
-**Two-Phase Fix:**
-- Phase A: Extraction prompt now mandates BOTH directions (parent_of AND child_of, spouse bidirectional, etc.)
-- Phase B: Ingest auto-creates missing inverses (if only one direction arrives, create the other)
+---
 
-**When Done:**
-1. All tests pass (0 regressions)
-2. Update scratch.md with completion entry (template in dprompt-70b.md Section 6)
-3. STOP immediately — do NOT commit
-4. Await user review and approval
+## 🚀 NEXT: Production Deployment (dprompt-71-style, follow PRODUCTION_DEPLOYMENT_GUIDE.md EXACTLY)
 
-**Next:** Read dprompt-70b.md fully, follow Sequence steps 1–7, execute carefully.
+**⚠️ CRITICAL MIGRATION SCOPE:**
+
+**ONLY these 2 files migrate to faultline-prod:**
+- `openwebui/faultline_tool.py` (extraction prompt update)
+- `src/api/main.py` (ingest auto-create logic)
+
+**DO NOT overwrite these production files** (already synced in prod):
+- `ABOUT.md` (production docs maintained separately)
+- `README.md` (production docs maintained separately)
+- Any other files not explicitly listed above
+
+**Migration Process:**
+
+1. Identify changed files (above: 2 files only)
+2. Cherry-pick from FaultLine-dev → faultline-prod (do NOT merge entire branches)
+3. Audit for secrets (none expected)
+4. Docker build validation
+5. Commit with v1.0.8 tag + message
+6. Post-deploy verification (test bidirectional facts created)
+7. Update ABOUT.md in prod with v1.0.8 entry
+
+**Reference:** Follow PRODUCTION_DEPLOYMENT_GUIDE.md Step 1–10 (10-step SOP)
+
+**Status:** Ready for user to trigger production deployment process.
+
+---
+
+## #deepseek — DEPLOYMENT INSTRUCTIONS (If user approves)
+
+**Do NOT start until user explicitly says "deploy" or "proceed with deployment"**
+
+**When user says deploy:**
+
+1. **Cherry-pick ONLY 2 files to faultline-prod:**
+   ```bash
+   cd /home/chris/Documents/013-GIT/faultline-prod
+   git fetch origin
+   
+   # Get commit hashes from FaultLine-dev (ask user or check git log)
+   # Cherry-pick ONLY the two files:
+   git cherry-pick <commit-hash>
+   
+   # OR manually copy if cherry-pick is complex:
+   cp /home/chris/Documents/013-GIT/FaultLine-dev/openwebui/faultline_tool.py ./openwebui/
+   cp /home/chris/Documents/013-GIT/FaultLine-dev/src/api/main.py ./src/api/
+   ```
+
+2. **Verify NO other files changed:**
+   ```bash
+   git status
+   # Expected: ONLY these 2 files appear
+   # If ABOUT.md, README.md, or others appear → STOP and ask user
+   ```
+
+3. **Follow PRODUCTION_DEPLOYMENT_GUIDE.md steps 3–10:**
+   - Audit secrets (none expected)
+   - Docker build
+   - Commit with v1.0.8 tag
+   - Post-deploy test
+   - Update ABOUT.md in prod with v1.0.8 entry
+
+4. **When done:**
+   - Update scratch.md with deployment success entry
+   - STOP — await user confirmation
+
+**CRITICAL:** Do NOT merge entire branches. Cherry-pick these 2 files only. Do NOT overwrite production documentation.
 
 ---
 
