@@ -1810,8 +1810,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # Only Person-type entities should have alias resolution applied
             _entity_types: dict[str, str] = {}
             for fact in result.get("facts", []):
-                subj = fact.get("subject", "").lower().strip()
-                obj = fact.get("object", "").lower().strip()
+                subj = (fact.get("subject") or "").lower().strip()
+                obj = (fact.get("object") or "").lower().strip()
                 if subj and fact.get("subject_type"):
                     _entity_types[subj] = fact["subject_type"].lower()
                 if obj and fact.get("object_type"):
