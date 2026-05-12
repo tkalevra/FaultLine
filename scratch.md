@@ -45,29 +45,25 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
-## 🔴 BUG CONFIRMED: dBug-012 — Incomplete Bidirectional Relationships (2026-05-15)
+## 🟢 READY: dprompt-70b (Bidirectional Relationship Fix) — 2026-05-15
 
-**Investigation complete.** Pre-prod database audited. 3 gaps found across 5 parent_of/child_of facts and 1 spouse fact.
+**Execution prompt ready:** `dprompt-70b.md` (DEEPSEEK_INSTRUCTION_TEMPLATE format)
 
-### Verified gaps
+**dBug-012 Investigation Summary:**
+- ✓ Pre-prod database audited: 3 concrete gaps found
+- ✓ Root causes identified: LLM prompt doesn't mandate both directions, ingest doesn't auto-create missing inverses
+- ✓ Two-phase fix proposed: extraction prompt + ingest auto-create
+- ✓ Formal execution prompt created with MUST/DO NOT/MAY constraints
 
-| Fact | Inverse | Status |
-|------|---------|--------|
-| `gabby child_of chris` (1.0) | `chris parent_of gabby` | **MISSING** |
-| `des parent_of chris` (1.0) | Should be `des child_of chris` | **WRONG DIRECTION** |
-| `chris parent_of des` (0.5) | `des child_of chris` | Missing — but des has wrong-direction parent_of instead |
-| `chris spouse mars` (1.0) | `mars spouse chris` | **MISSING** (symmetric) |
-| `cyrus child_of chris` (1.0) | `chris parent_of cyrus` (1.0) | ✓ Complete |
+**Gaps verified:**
+- `gabby -child_of-> chris` (1.0) → **MISSING** `chris -parent_of-> gabby`
+- `des -parent_of-> chris` (1.0) → should be `des -child_of-> chris` (wrong direction)
+- `chris -spouse-> mars` (1.0) → **MISSING** `mars -spouse-> chris` (symmetric)
+- `cyrus -child_of-> chris` (1.0) ✓ complete
 
-### Root causes
-1. **Prompt**: No bidirectional emission instruction in `_TRIPLE_SYSTEM_PROMPT`
-2. **Ingest**: `_validate_bidirectional_relationships()` handles conflicts but doesn't create missing inverses
+**Recommendation:** Implement both phases (extract prompt fix + ingest auto-create for resilience)
 
-### Suggestion file
-**`BUGS/dBug-012-suggestion.md`** — scopes two-phase fix: prompt + ingest auto-create
-
-### Next
-Review suggestion. Decide on fix approach (prompt only, ingest only, or both per dprompt-69b recommendation).
+**Next:** Execute dprompt-70b → implement fix → test → review
 
 ---
 
