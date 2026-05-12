@@ -2,6 +2,26 @@
 
 All notable changes to FaultLine will be documented in this file.
 
+## [v1.0.11] - 2026-05-15
+
+### Added
+- BACKEND_LLM_URL valve to Filter and Function: optional direct backend LLM endpoint for extraction calls
+- User UUID injection as chat_id in extraction requests to prevent OpenWebUI NoneType crash
+
+### Fixed
+- **dBug-016:** OpenWebUI Filter integration failure — extraction requests without chat_id caused NoneType crash in middleware. User UUID now injected as chat_id to satisfy OpenWebUI's key-existence check.
+
+### Changed
+- `rewrite_to_triples()` and `_extract_retraction()` now accept user_uuid parameter
+- Extraction calls route via BACKEND_LLM_URL if configured, else OpenWebUI with UUID injection
+
+### Testing
+- 141 tests passed, 0 regressions
+
+### Files Changed
+- openwebui/faultline_tool.py
+- openwebui/faultline_function.py
+
 ## [v1.0.10] - 2026-05-15
 
 ### Added
