@@ -11,11 +11,31 @@ plans, or test cases here. Use it to:
 
 Code goes directly into source files. This file stays lean.
 
-## Pre-Prod Reference (2026-05-13)
+## Pre-Prod Reference (2026-05-15)
 
 **Instance:** hairbrush.helpdeskpro.ca (truenas)
 **Model:** faultline-wgm-test-10
 **Backend API:** http://192.168.40.10:8001
+**Version:** v1.0.7 (Query deduplication fix, metadata-driven validation, MCP server)
+
+---
+
+## Current Status (2026-05-15)
+
+### Completed This Cycle
+- ✓ dprompt-65: Metadata-driven validation framework (zero hardcoded constants)
+- ✓ dprompt-66: Query deduplication fix (dBug-008, UUID-based pg_keys)
+- ✓ dprompt-67: Documentation audit (CLAUDE.md, README, ABOUT.md synchronized)
+- ✓ dprompt-68: MCP server wrapper for FaultLine endpoints (13 tests passing)
+- ✓ dprompt-69: Open-ended extraction + RAG fallback (novel rel_types)
+- ✓ dBug-010: Novel rel_types silently dropped (fixed line 2378, status check)
+- ✓ dBug-011: Investigation complete (bidirectional relationship gap identified)
+
+### Test Suite Status
+- 127 tests passing (114 existing + 13 MCP)
+- 53 skipped
+- 0 failures
+- Full regression validation complete
 
 ---
 
@@ -110,7 +130,7 @@ For Gabby: only `gabby -child_of-> user` exists (created from somewhere), but no
 
 ---
 
-## ✓ VALIDATION: dBug-009/010/011 Status — 2026-05-15
+## ✓ VALIDATION: dBug-009/010 Status — 2026-05-15
 
 **dBug-009 (Health/ephemeral facts not persisting): FIXED ✓**
 NOVEL & EPHEMERAL REL_TYPES section in `_TRIPLE_SYSTEM_PROMPT`. Pre-prod validated: `has_injury`, `currently_at`, `is_resting` flow through pipeline.
@@ -118,10 +138,8 @@ NOVEL & EPHEMERAL REL_TYPES section in `_TRIPLE_SYSTEM_PROMPT`. Pre-prod validat
 **dBug-010 (Novel rel_types not staged): FIXED ✓**
 Line 2378 now includes `"unknown"` in status check. Pre-prod validated: staged_facts has Class C rows.
 
-**dBug-011 (/query returns empty): PRIMARY RESOLVED ✓**
-`/query` returns 46 facts (was 0). Gabby present via `child_of`. Remaining secondary issues (display-name duplicates, bidirectional stale data) are cosmetic/preexisting. Bug can be closed.
-
-**All bugs through dBug-011 validated. No blocking issues.**
+**dBug-011 (Incomplete bidirectional relationships): Investigation Complete — Next Phase TBD**
+Root cause identified: LLM extraction prompt doesn't instruct both-directional emission, ingest doesn't auto-create missing inverses. See detailed analysis above and formal report in BUGS/dBug-report-011.md. Awaiting decision: fix prompt, fix ingest, or both.
 
 ---
 
