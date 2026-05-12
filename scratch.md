@@ -45,25 +45,36 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
-## 🟢 READY: dprompt-70b (Bidirectional Relationship Fix) — 2026-05-15
+## #deepseek TASK: dprompt-70b (Bidirectional Relationship Completeness — dBug-012 Fix)
 
-**Execution prompt ready:** `dprompt-70b.md` (DEEPSEEK_INSTRUCTION_TEMPLATE format)
+**READ:** `dprompt-70b.md` — Full execution instructions (DEEPSEEK_INSTRUCTION_TEMPLATE format)
 
-**dBug-012 Investigation Summary:**
-- ✓ Pre-prod database audited: 3 concrete gaps found
-- ✓ Root causes identified: LLM prompt doesn't mandate both directions, ingest doesn't auto-create missing inverses
-- ✓ Two-phase fix proposed: extraction prompt + ingest auto-create
-- ✓ Formal execution prompt created with MUST/DO NOT/MAY constraints
+**TL;DR:**
+- Fix: Update extraction prompt to mandate bidirectional emission + update ingest to auto-create missing inverses
+- Files: `openwebui/faultline_tool.py` + `src/api/main.py`
+- Scope: Two files, two changes, no schema changes
+- Tests: Full suite must pass, 0 regressions
+- Constraint: NO COMMITS until user reviews and approves
 
-**Gaps verified:**
-- `gabby -child_of-> chris` (1.0) → **MISSING** `chris -parent_of-> gabby`
-- `des -parent_of-> chris` (1.0) → should be `des -child_of-> chris` (wrong direction)
-- `chris -spouse-> mars` (1.0) → **MISSING** `mars -spouse-> chris` (symmetric)
-- `cyrus -child_of-> chris` (1.0) ✓ complete
+**dBug-012 Background:**
+Knowledge graph has incomplete bidirectional relationships (parent_of/child_of, spouse). Pre-prod verified 3 concrete gaps:
+- `gabby -child_of-> chris` (1.0) but **MISSING** `chris -parent_of-> gabby`
+- `des -parent_of-> chris` (wrong direction, should be child_of)
+- `chris -spouse-> mars` (1.0) but **MISSING** `mars -spouse-> chris`
 
-**Recommendation:** Implement both phases (extract prompt fix + ingest auto-create for resilience)
+Root causes: LLM extraction prompt doesn't instruct both-directional emission; ingest validates conflicts but doesn't create missing inverses.
 
-**Next:** Execute dprompt-70b → implement fix → test → review
+**Two-Phase Fix:**
+- Phase A: Extraction prompt now mandates BOTH directions (parent_of AND child_of, spouse bidirectional, etc.)
+- Phase B: Ingest auto-creates missing inverses (if only one direction arrives, create the other)
+
+**When Done:**
+1. All tests pass (0 regressions)
+2. Update scratch.md with completion entry (template in dprompt-70b.md Section 6)
+3. STOP immediately — do NOT commit
+4. Await user review and approval
+
+**Next:** Read dprompt-70b.md fully, follow Sequence steps 1–7, execute carefully.
 
 ---
 
