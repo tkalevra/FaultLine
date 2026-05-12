@@ -407,6 +407,7 @@ def expire_staged_facts(db_conn, qdrant_url: str) -> int:
                     )
                 db_conn.commit()
                 expired += 1
+                log.info(f"re_embedder.expired staged_id={staged_id} user_id={user_id}")
             except Exception as e:
                 db_conn.rollback()
                 log.error(f"re_embedder.expire_failed staged_id={staged_id}: {e}")
@@ -696,6 +697,16 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     )
                     stats["approved"] += 1
                     log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} {reason}")
+
+                    # Refresh unified metadata cache so the newly approved rel_type
+                    # is immediately available to the ingest pipeline without waiting
+                    # for next container restart (dprompt-76b / dBug-015).
+                    try:
+                        from src.api.main import _refresh_rel_type_cache
+                        _refresh_rel_type_cache()
+                        log.info(f"re_embedder.cache_refresh trigger=ontology_approved rel_type={candidate_rel}")
+                    except Exception as _cache_err:
+                        log.warning(f"re_embedder.cache_refresh_failed rel_type={candidate_rel}: {_cache_err}")
 
                 elif decision == "mapped" and best_fit:
                     # Rewrite staged_facts using this rel_type to use best_fit instead
