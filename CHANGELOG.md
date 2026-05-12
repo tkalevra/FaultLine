@@ -2,6 +2,21 @@
 
 All notable changes to FaultLine will be documented in this file.
 
+## [v1.0.10] - 2026-05-15
+
+### Added
+- Pre-seeded 6 medical domain rel_types (migration 025)
+- Cache refresh trigger in re_embedder: approved novel rel_types live immediately
+
+### Fixed
+- **dBug-015:** Medical rel_types no longer rejected as novel candidates
+
+### Testing
+- 140 tests passed, 0 regressions
+
+### Migration
+- **025_medical_rel_types.sql:** Pre-seeds has_medical_condition, has_symptom, has_injury, affected_body_part, has_medication, has_allergy
+
 ## [v1.0.9] - 2026-05-15
 
 ### Added
