@@ -81,27 +81,32 @@ OUTPUT: [{"subject":"...","object":"...","rel_type":"...","low_confidence":false
 If nothing to extract: []"""
 
 
-async def rewrite_to_triples(text: str, valves) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, user_uuid: Optional[str] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Returns [] on any failure so the caller can handle the empty-edge case.
     """
     try:
+        final_url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else valves.QWEN_URL
+        request_data = {
+            "model": valves.QWEN_MODEL,
+            "messages": [
+                {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "repeat_penalty": 1.0,
+            "max_tokens": 400,
+            "thinking": {"type": "disabled"},
+        }
+        if not valves.BACKEND_LLM_URL and user_uuid:
+            request_data["chat_id"] = user_uuid
+
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
-                valves.QWEN_URL,
-                json={
-                    "model": valves.QWEN_MODEL,
-                    "messages": [
-                        {"role": "system", "content": _TRIPLE_SYSTEM_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "repeat_penalty": 1.0,
-                    "max_tokens": 400,
-                    "thinking": {"type": "disabled"},
-                },
+                final_url,
+                json=request_data,
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"].strip()
@@ -125,6 +130,7 @@ class Function:
         FAULTLINE_TIMEOUT: int = 20
         QWEN_URL: str = os.getenv("QWEN_URL", "http://localhost:11434/v1/chat/completions")
         QWEN_MODEL: str = "qwen/qwen3.5-9b"
+        BACKEND_LLM_URL: str = ""  # Direct backend LLM endpoint. If set, extraction calls use this instead of QWEN_URL.
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
