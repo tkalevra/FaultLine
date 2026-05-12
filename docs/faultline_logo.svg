@@ -1,0 +1,22 @@
+<svg width="100%" viewBox="0 0 690 410" role="img" style="" xmlns="http://www.w3.org/2000/svg">
+<title style="fill:rgb(0, 0, 0);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:18px;font-weight:400;text-anchor:start;dominant-baseline:auto">FaultLine logo</title>
+<desc style="fill:rgb(0, 0, 0);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:18px;font-weight:400;text-anchor:start;dominant-baseline:auto">FaultLine logo featuring the turnstile symbol and wordmark on a dark background</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<rect width="680" height="400" fill="#0F0F0F" rx="12" style="fill:rgb(15, 15, 15);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:18px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<rect x="40" y="40" width="600" height="320" fill="#0F0F0F" rx="8" style="fill:rgb(15, 15, 15);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:18px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+<text x="340" y="195" text-anchor="middle" font-family="Georgia, serif" font-size="128" font-weight="700" fill="#E8E8E8" letter-spacing="-4" style="fill:rgb(232, 232, 232);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:Georgia, serif;font-size:128px;font-weight:700;text-anchor:middle;dominant-baseline:auto">⊢</text>
+
+<text x="340" y="268" text-anchor="middle" font-family="'Arial', sans-serif" font-size="38" font-weight="300" fill="#E8E8E8" letter-spacing="18" style="fill:rgb(232, 232, 232);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Arial&quot;, sans-serif;font-size:38px;font-weight:300;text-anchor:middle;dominant-baseline:auto">FAULTLINE</text>
+
+<text x="340" y="308" text-anchor="middle" font-family="'Arial', sans-serif" font-size="13" font-weight="400" fill="#666666" letter-spacing="4" style="fill:rgb(102, 102, 102);stroke:none;color:rgb(251, 251, 254);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Arial&quot;, sans-serif;font-size:13px;font-weight:400;text-anchor:middle;dominant-baseline:auto">WRITE-VALIDATED MEMORY</text>
+
+<line x1="240" y1="326" x2="440" y2="326" stroke="#333333" stroke-width="0.5" style="fill:rgb(0, 0, 0);stroke:rgb(51, 51, 51);color:rgb(251, 251, 254);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:18px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+</svg>
