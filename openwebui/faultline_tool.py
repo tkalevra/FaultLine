@@ -204,7 +204,7 @@ def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
     return model, url
 
 
-async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_header: Optional[str] = None, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_header: Optional[str] = None, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None, user_uuid: Optional[str] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
@@ -291,16 +291,23 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
         if auth_header:
             headers["Authorization"] = auth_header
 
+        # Use backend LLM if configured, else OpenWebUI with user UUID
+        final_url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else url
+        request_data = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 400,
+            "thinking": {"type": "disabled"},
+        }
+        # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
+        if not valves.BACKEND_LLM_URL and user_uuid:
+            request_data["chat_id"] = user_uuid
+
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
-                url,
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": 400,
-                    "thinking": {"type": "disabled"},
-                },
+                final_url,
+                json=request_data,
                 headers=headers,
             )
             response.raise_for_status()
@@ -651,6 +658,7 @@ class Filter:
         LLM_URL: str = ""  # Empty = OpenWebUI internal endpoint (host.docker.internal:3000). Set explicitly for non-Docker or custom LLM endpoints.
         LLM_MODEL: str = ""  # Model for triple extraction and retraction parsing. Empty = use the model selected by the user in OpenWebUI.
         LLM_API_KEY: str = ""  # Bearer token for LLM endpoint. Required when LLM_URL points to OpenWebUI internal endpoint or any authenticated API.
+        BACKEND_LLM_URL: str = ""  # Direct backend LLM endpoint (e.g., http://ollama:11434/v1/chat/completions). If set, extraction calls use this instead of OpenWebUI.
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
@@ -887,7 +895,7 @@ class Filter:
         tl = text.lower().replace("'", "'").replace("'", "'")
         return any(sig in tl for sig in _RETRACTION_SIGNALS)
 
-    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None) -> dict:
+    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
         try:
             messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
             for msg in (context or [])[-2:]:
@@ -900,12 +908,23 @@ class Filter:
             headers = {}
             if auth_header:
                 headers["Authorization"] = auth_header
+
+            # Use backend LLM if configured, else OpenWebUI with user UUID (dBug-016 fix)
+            final_url = self.valves.BACKEND_LLM_URL if self.valves.BACKEND_LLM_URL else url
+            request_data = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 100,
+                "thinking": {"type": "disabled"},
+            }
+            if not self.valves.BACKEND_LLM_URL and user_uuid:
+                request_data["chat_id"] = user_uuid
+
             async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
                 resp = await client.post(
-                    url,
-                    json={"model": model, "messages": messages,
-                          "temperature": 0.0, "max_tokens": 100,
-                          "thinking": {"type": "disabled"}},
+                    final_url,
+                    json=request_data,
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -1235,7 +1254,8 @@ class Filter:
                     body.get("messages", []),
                     model=llm_model,
                     url=llm_url,
-                    auth_header=llm_auth
+                    auth_header=llm_auth,
+                    user_uuid=user_id,
                 )
                 if retraction and retraction.get("subject"):
                     result = await self._fire_retract(
@@ -1402,6 +1422,7 @@ class Filter:
                         context=body.get("messages", []),
                         typed_entities=typed_entities if typed_entities else None,
                         memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                        user_uuid=user_id,
                     )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
