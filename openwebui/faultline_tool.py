@@ -99,6 +99,7 @@ RELATIONSHIP RULES:
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
 - POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
+- BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, des), you MUST also emit (des, child_of, user). If you emit (user, spouse, mars), you MUST also emit (mars, spouse, user). If you emit (des, sibling_of, cyrus), you MUST also emit (cyrus, sibling_of, des). Example: "I have a son named Des, my husband Mars" → (user, parent_of, des) + (des, child_of, user) + (user, spouse, mars) + (mars, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.

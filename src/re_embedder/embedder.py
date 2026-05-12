@@ -407,6 +407,7 @@ def expire_staged_facts(db_conn, qdrant_url: str) -> int:
                     )
                 db_conn.commit()
                 expired += 1
+                log.info(f"re_embedder.expired staged_id={staged_id} user_id={user_id}")
             except Exception as e:
                 db_conn.rollback()
                 log.error(f"re_embedder.expire_failed staged_id={staged_id}: {e}")
