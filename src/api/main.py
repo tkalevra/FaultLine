@@ -1147,9 +1147,9 @@ def _validate_bidirectional_relationships(
     keep the higher-confidence version and supersede the lower.
 
     Returns:
-      - "keep": no conflict, proceed
-      - "supersede_existing": existing inverse fact superseded (new is higher conf)
-      - "supersede_new": new fact should be skipped (existing is higher conf)
+      - "keep": no inverse rel_type — proceed normally
+      - "create_inverse": no inverse fact found — auto-create needed
+      - "supersede_new": existing inverse has higher confidence — skip new fact
     """
     rt_lower = rel_type.lower().strip() if rel_type else ""
     if not db_conn:
@@ -1213,8 +1213,15 @@ def _validate_bidirectional_relationships(
     except Exception as e:
         log.warning("ingest.bidirectional_validation_failed", error=str(e),
                     subject=subject, rel_type=rt_lower, obj=obj)
+        return "keep"  # DB error — skip auto-create for safety
 
-    return "keep"
+    # Inverse rel_type exists but no inverse fact found — signal auto-creation
+    log.info(
+        "ingest.bidirectional_inverse_needed",
+        fact=f"{subject} {rt_lower} {obj}",
+        inverse_rel=inverse,
+    )
+    return "create_inverse"
 
 
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
@@ -1863,7 +1870,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
 
 
-    facts, committed, staged = [], 0, 0
+    facts, committed, staged, ingested = [], 0, 0, 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         try:
@@ -1925,7 +1932,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 reason="raw UUID in edge subject or object — likely resolution leak")
                     continue
 
-                # Capture raw scalar value before entity resolution
+                # Capture raw values before entity resolution
+                _raw_subject = edge.subject
                 _raw_object = edge.object
 
                 # Rel_types that ALWAYS have scalar (string) objects, never UUID references
@@ -2514,7 +2522,21 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     bidir_decision = _validate_bidirectional_relationships(
                         db, req.user_id, _subj, _rel, _obj, _conf,
                     )
-                    if bidir_decision == "supersede_new":
+                    if bidir_decision == "create_inverse":
+                        # Auto-create missing inverse fact with same metadata
+                        _meta = _get_rel_type_metadata(db, _rel)
+                        _inv_rel = _meta.get("inverse_rel_type") if _meta else None
+                        if _inv_rel:
+                            _bidir_rows.append((
+                                _uid, _obj, _subj, _inv_rel, f"auto-created inverse of {_src}",
+                                False, _fclass, _conf, _eng
+                            ))
+                            log.info("ingest.bidirectional_inverse_created",
+                                     rel_type=_rel, inverse=_inv_rel,
+                                     subject=_subj, object=_obj, confidence=_conf)
+                        _bidir_rows.append(row)
+                        continue
+                    elif bidir_decision == "supersede_new":
                         log.info("ingest.bidirectional_superseded",
                                  rel_type=_rel, subject=_subj, object=_obj,
                                  confidence=_conf)
