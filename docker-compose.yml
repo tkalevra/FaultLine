@@ -1,0 +1,54 @@
+services:
+
+  faultline:
+    build:
+      context: .
+      network: host
+    ports:
+      - "8001:8000"
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
+      QWEN_API_URL: ${QWEN_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: faultline-test
+      REEMBED_INTERVAL: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - faultline-test
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-faultline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
+      POSTGRES_DB: ${POSTGRES_DB:-faultline}
+    volumes:
+      - pg-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - faultline-test
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6334:6333"
+    volumes:
+      - qdrant-test-data:/qdrant/storage
+    networks:
+      - faultline-test
+
+volumes:
+  pg-test-data:
+  qdrant-test-data:
+
+networks:
+  faultline-test:
+    driver: bridge
