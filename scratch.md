@@ -25,6 +25,106 @@ Code goes directly into source files. This file stays lean.
 
 ---
 
+## 🔴 BUG DISCOVERED: dBug-011 Incomplete Bidirectional Relationships (2026-05-12)
+
+**Root Cause:** `/query` returns facts correctly (46-47 facts retrieved), but **bidirectional inverse relationships are incomplete**. 
+
+**Evidence from pre-prod logs (2026-05-12 02:31:58 - 02:32:14):**
+
+Query: "tell me about my family"
+- `/query` returns HTTP 200 with 46 facts
+- Filter receives and displays: `user -parent_of-> des` ✓, `user -parent_of-> cyrus` ✓, **BUT NO `user -parent_of-> gabby`**
+- Filter DOES show: `gabby -child_of-> user` ✓ (inverse direction present)
+- Gabby's age IS included: `gabby -age-> 10` ✓
+- **Filter's family summary only lists:** "spouse=Mars, children=Des, Cyrus" — **Gabby missing from parent summary**
+
+**The Problem:** Only ONE direction of the bidirectional relationship was created:
+- `gabby -child_of-> user` exists ✓
+- `user -parent_of-> gabby` does NOT exist ✗
+
+This breaks semantic completeness. Parent-child relationships should be bidirectional — if Gabby is a child_of user, then user must be parent_of Gabby.
+
+**Why This Happens:** The LLM extraction in `openwebui/faultline_tool.py` likely generates edges one-direction only. The ingest pipeline's `_validate_bidirectional_relationships()` in `src/api/main.py` (line ~2590) should auto-create missing inverse relationships, but it only handles CONFLICTS (choosing between conflicting directions). It does NOT create missing inverses from scratch.
+
+**Status:** NOT a storage failure (facts ARE stored), but an **extraction completeness bug** — missing inverse relationship creation during ingest.
+
+**Investigation Required:**
+
+**A. Extraction Prompt Analysis**
+
+Current `_TRIPLE_SYSTEM_PROMPT` (lines 96-99, `openwebui/faultline_tool.py`):
+```
+RELATIONSHIP RULES:
+- parent_of: subject IS the parent. child_of: subject IS the child.
+- NEVER emit child_of with the speaker as subject. Use parent_of instead.
+- Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
+```
+
+**PROBLEM:** This defines what parent_of/child_of mean, but **does NOT instruct the LLM to emit both directions**. When text says "I have three children: Des, Cyrus, Gabby," the LLM extracts:
+- `user -parent_of-> des` ✓
+- `user -parent_of-> cyrus` ✓
+- `user -parent_of-> gabby` ← Extraction incomplete or fails here
+
+No inverse `gabby -child_of-> user` is generated.
+
+**B. Ingest Pipeline Gap**
+
+`_validate_bidirectional_relationships()` in `src/api/main.py` (line ~2590) currently:
+- ✓ Detects conflicts between bidirectional directions (e.g., both parent_of AND child_of exist)
+- ✓ Keeps higher-confidence version, supersedes lower
+- ✗ Does NOT create missing inverses
+
+For Gabby: only `gabby -child_of-> user` exists (created from somewhere), but no `user -parent_of-> gabby` inverse.
+
+**Next Steps (for dev team):**
+
+1. **Query database to confirm root cause:**
+   ```bash
+   psql -U faultline -d faultline -h 192.168.40.10 \
+     -c "SELECT * FROM facts WHERE user_id='[user-uuid]' AND rel_type IN ('parent_of', 'child_of') AND (subject_id LIKE '%gabby%' OR object_id LIKE '%gabby%')"
+   ```
+   Expected findings:
+   - If only `gabby -child_of-> user` exists: LLM extraction was incomplete
+   - If both exist: query dedup issue (already fixed in v1.0.7, but double-check `pg_keys` logic)
+
+2. **Option A: Update LLM Prompt** (safer)
+   - Modify `_TRIPLE_SYSTEM_PROMPT` to explicitly state:
+     > "For bidirectional relationships (parent_of/child_of, spouse, sibling_of), emit BOTH directions as separate facts. Example: 'I have a son named Des' → emit (user, parent_of, des) AND (des, child_of, user)."
+   - Pros: Keeps query results complete at source; no pipeline gaps
+   - Cons: May increase extracted fact count slightly
+
+3. **Option B: Auto-Create Missing Inverses in Ingest** (more robust)
+   - Update `_validate_bidirectional_relationships()` to also CREATE missing inverses:
+     ```python
+     # After conflict handling, check for missing inverses:
+     for rel_type in _REL_TYPE_META_CACHED:
+         if rel_type.get('inverse_rel_type'):
+             # If (A, rel_type, B) exists but (B, inverse, A) missing → CREATE it
+     ```
+   - Pros: Handles extraction gaps gracefully; scales to all bidirectional rel_types
+   - Cons: Pipeline logic more complex; need to avoid duplicate auto-creation
+
+4. **Recommendation:** Combine both:
+   - Fix prompt to emit both directions (prevents future gaps)
+   - Add missing-inverse creation in ingest (resilient to extraction failures)
+
+---
+
+## ✓ VALIDATION: dBug-009/010/011 Status — 2026-05-15
+
+**dBug-009 (Health/ephemeral facts not persisting): FIXED ✓**
+NOVEL & EPHEMERAL REL_TYPES section in `_TRIPLE_SYSTEM_PROMPT`. Pre-prod validated: `has_injury`, `currently_at`, `is_resting` flow through pipeline.
+
+**dBug-010 (Novel rel_types not staged): FIXED ✓**
+Line 2378 now includes `"unknown"` in status check. Pre-prod validated: staged_facts has Class C rows.
+
+**dBug-011 (/query returns empty): PRIMARY RESOLVED ✓**
+`/query` returns 46 facts (was 0). Gabby present via `child_of`. Remaining secondary issues (display-name duplicates, bidirectional stale data) are cosmetic/preexisting. Bug can be closed.
+
+**All bugs through dBug-011 validated. No blocking issues.**
+
+---
+
 ## ✓ INVESTIGATION & FIX: dprompt-69 Pre-Prod Validation (dBug-010 Root Cause) — 2026-05-15
 
 **Finding:** dprompt-69 extraction works ✓, but novel rel_types silently dropped from ingest pipeline due to routing bug (dBug-010).
@@ -122,8 +222,10 @@ Code goes directly into source files. This file stays lean.
 
 | Bug | Status |
 |-----|--------|
-| dBug-report-001 — 007 | Fixed |
-| dBug-report-008 | Fixed (dprompt-66) — pre-prod validated ✓ |
+| dBug-report-001 — 008 | Fixed |
+| dBug-report-009 | Fixed (dprompt-69 prompt) — validated ✓ |
+| dBug-report-010 | Fixed (b6b5d67) — validated ✓ |
+| dBug-report-011 | Resolved — /query returns 46 facts, can close ✓ |
 
 ### Dev repo
 
