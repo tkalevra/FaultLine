@@ -61,20 +61,9 @@ _UUID_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Fact class taxonomy — determines write path at ingest time
-_CLASS_A_REL_TYPES = frozenset({
-    "pref_name", "also_known_as", "same_as",
-    "parent_of", "child_of", "spouse", "sibling_of",
-    "born_on", "born_in", "has_gender", "nationality",
-    "instance_of", "subclass_of", "age", "height", "weight",
-})
-
-_CLASS_B_REL_TYPES = frozenset({
-    "lives_at", "lives_in", "works_for", "occupation",
-    "educated_at", "owns", "likes", "dislikes", "prefers",
-    "friend_of", "knows", "met", "located_in",
-    "related_to", "has_pet", "part_of", "created_by",
-})
+# Fact class taxonomy replaced by metadata-driven queries (dprompt-73b).
+# rel_types.fact_class column is authoritative — see _get_rel_type_metadata().
+# Graph + Hierarchy traversal systems (dprompt-27) — still hardcoded, out of scope.
 
 # ── dprompt-27: Graph + Hierarchy traversal systems ────────────────────────
 # Two orthogonal traversal systems (dprompt-26 architecture):
@@ -101,12 +90,9 @@ _VALID_CATEGORIES = frozenset({
     "physical", "temporal", "location", "work", "family", "pets", "identity"
 })
 
-# Temporal event types routed to events table instead of facts
-_TEMPORAL_REL_TYPES = frozenset({
-    "born_on", "born_in",
-    "anniversary_on", "met_on", "married_on",
-    "appointment_on",
-})
+# Temporal event routing replaced by metadata-driven queries (dprompt-73b).
+# rel_types.storage_target column is authoritative — see _get_rel_type_metadata().
+# _EVENT_RECURRENCE_DEFAULTS kept for calendar semantics of events table.
 
 _EVENT_RECURRENCE_DEFAULTS = {
     "born_on": "yearly",
@@ -117,35 +103,9 @@ _EVENT_RECURRENCE_DEFAULTS = {
     "appointment_on": "once",
 }
 
-# Class C = anything not in A or B, engine_generated types,
-# novel types, or confidence < 0.6
-
-def _classify_fact(
-    rel_type: str,
-    confidence: float,
-    engine_generated: bool = False,
-    is_correction: bool = False,
-) -> str:
-    """
-    Classify a fact as A, B, or C based on rel_type, confidence, and provenance.
-
-    Class A: Identity/structural facts — write-through to PostgreSQL immediately.
-    Class B: Behavioral/contextual facts — staged, promote on confirmation.
-    Class C: Ephemeral/novel facts — staged, expire after 30 days.
-
-    Corrections from the user are always promoted to Class A regardless of rel_type.
-    Engine-generated (novel) types are always Class C regardless of rel_type.
-    """
-    if is_correction:
-        return "A"
-    if engine_generated or confidence < 0.6:
-        return "C"
-    rt = rel_type.lower().strip()
-    if rt in _CLASS_A_REL_TYPES:
-        return "A"
-    if rt in _CLASS_B_REL_TYPES:
-        return "B"
-    return "C"
+# Fact classification replaced by metadata-driven queries (dprompt-73b).
+# rel_types.fact_class column is authoritative — queried at ingest time.
+# Correction/engine_generated/confidence < 0.6 logic preserved inline in ingest loop.
 
 def _infer_category(rel_type: str) -> str | None:
     """
@@ -1015,38 +975,125 @@ def _hierarchy_expand(
 
 # ── dprompt-65: Metadata-driven — queries rel_types table instead of hardcoded ─
 # Module-level metadata cache, populated lazily and refreshed on cache miss.
-_REL_TYPE_METADATA_CACHE: dict[str, dict] = {}
+# ── dprompt-73b: Unified metadata cache (replaces per-query lookup) ──────────
+# Single cache for all rel_types (known + novel). Loaded at startup via
+# _refresh_rel_type_cache(), refreshed when re-embedder approves novel types.
+# Eliminates hardcoded frozensets — routing and classification are metadata-driven.
+
+_REL_TYPE_CACHE: dict[str, dict] = {}
+
+# Emergency fallback metadata: mirrors old hardcoded frozensets for when
+# the DB is unavailable (tests, cold start). The DB rel_types table is
+# authoritative when reachable. dprompt-73b.
+_FALLBACK_METADATA: dict[str, dict] = {
+    # Class A — identity/structural (was _CLASS_A_REL_TYPES)
+    "pref_name":     {"storage_target": "facts", "fact_class": "A", "correction_behavior": "hard_delete"},
+    "also_known_as": {"storage_target": "facts", "fact_class": "A", "correction_behavior": "hard_delete"},
+    "same_as":       {"storage_target": "facts", "fact_class": "A"},
+    "parent_of":     {"storage_target": "facts", "fact_class": "A"},
+    "child_of":      {"storage_target": "facts", "fact_class": "A"},
+    "spouse":        {"storage_target": "facts", "fact_class": "A"},
+    "sibling_of":    {"storage_target": "facts", "fact_class": "A"},
+    "born_on":       {"storage_target": "facts", "fact_class": "A", "correction_behavior": "immutable"},
+    "born_in":       {"storage_target": "facts", "fact_class": "A", "correction_behavior": "immutable"},
+    "has_gender":    {"storage_target": "facts", "fact_class": "A"},
+    "nationality":   {"storage_target": "facts", "fact_class": "A"},
+    "instance_of":   {"storage_target": "facts", "fact_class": "A"},
+    "subclass_of":   {"storage_target": "facts", "fact_class": "A"},
+    "age":           {"storage_target": "facts", "fact_class": "A"},
+    "height":        {"storage_target": "facts", "fact_class": "A"},
+    "weight":        {"storage_target": "facts", "fact_class": "A"},
+    # Class B — behavioral/contextual (was _CLASS_B_REL_TYPES)
+    "lives_at":      {"storage_target": "facts", "fact_class": "B"},
+    "lives_in":      {"storage_target": "facts", "fact_class": "B"},
+    "works_for":     {"storage_target": "facts", "fact_class": "B"},
+    "occupation":    {"storage_target": "facts", "fact_class": "B"},
+    "educated_at":   {"storage_target": "facts", "fact_class": "B"},
+    "owns":          {"storage_target": "facts", "fact_class": "B"},
+    "likes":         {"storage_target": "facts", "fact_class": "B"},
+    "dislikes":      {"storage_target": "facts", "fact_class": "B"},
+    "prefers":       {"storage_target": "facts", "fact_class": "B"},
+    "friend_of":     {"storage_target": "facts", "fact_class": "B"},
+    "knows":         {"storage_target": "facts", "fact_class": "B"},
+    "met":           {"storage_target": "facts", "fact_class": "B"},
+    "located_in":    {"storage_target": "facts", "fact_class": "B"},
+    "related_to":    {"storage_target": "facts", "fact_class": "B"},
+    "has_pet":       {"storage_target": "facts", "fact_class": "B"},
+    "part_of":       {"storage_target": "facts", "fact_class": "B"},
+    "created_by":    {"storage_target": "facts", "fact_class": "B"},
+    # Temporal events — was _TEMPORAL_REL_TYPES
+    "anniversary_on": {"storage_target": "events", "fact_class": "C"},
+    "met_on":         {"storage_target": "events", "fact_class": "C"},
+    "married_on":     {"storage_target": "events", "fact_class": "C"},
+    "appointment_on": {"storage_target": "events", "fact_class": "C"},
+}
 
 
-def _get_rel_type_metadata(db_conn, rel_type: str) -> dict:
-    """Return validation metadata for a rel_type from the database.
-    Cached at module level; cache miss queries DB once per rel_type per process.
-    Returns defaults (all false) if DB unavailable or rel_type not found.
+def _refresh_rel_type_cache():
+    """Load ALL rel_types from database into unified cache.
+    Called at startup and when re-embedder approves novel rel_types.
+    Uses psycopg2 directly (not SQLAlchemy) — consistent with the rest of main.py.
+    """
+    global _REL_TYPE_CACHE
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn:
+        log.warning("rel_type_cache.no_dsn")
+        return
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rel_type, storage_target, fact_class, "
+                    "is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel, "
+                    "correction_behavior "
+                    "FROM rel_types"
+                )
+                _REL_TYPE_CACHE.clear()
+                for row in cur.fetchall():
+                    _REL_TYPE_CACHE[row[0].lower()] = {
+                        "storage_target": row[1] if row[1] else "facts",
+                        "fact_class": row[2] if row[2] else "C",
+                        "is_symmetric": row[3] if row[3] else False,
+                        "inverse_rel_type": row[4],
+                        "is_leaf_only": row[5] if row[5] else False,
+                        "is_hierarchy_rel": row[6] if row[6] else False,
+                        "correction_behavior": row[7] if row[7] else "supersede",
+                    }
+        log.info("rel_type_cache.refreshed", count=len(_REL_TYPE_CACHE))
+    except Exception as e:
+        log.warning("rel_type_cache.refresh_failed", error=str(e))
+
+
+def _get_rel_type_metadata(rel_type: str) -> dict:
+    """Return validation + routing metadata for a rel_type from the unified cache.
+    No db_conn needed — cache is startup-loaded. Handles novel rel_types gracefully.
+
+    Returns dict with: storage_target, fact_class, is_symmetric,
+    inverse_rel_type, is_leaf_only, is_hierarchy_rel.
     """
     rt = rel_type.lower().strip() if rel_type else ""
     if not rt:
         return {}
-    if rt in _REL_TYPE_METADATA_CACHE:
-        return _REL_TYPE_METADATA_CACHE[rt]
-    defaults = {"is_symmetric": False, "inverse_rel_type": None,
-                "is_leaf_only": False, "is_hierarchy_rel": False}
-    if not db_conn:
-        return defaults
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                "SELECT is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel "
-                "FROM rel_types WHERE rel_type = %s", (rt,))
-            row = cur.fetchone()
-            if row:
-                meta = {"is_symmetric": row[0], "inverse_rel_type": row[1],
-                        "is_leaf_only": row[2], "is_hierarchy_rel": row[3]}
-                _REL_TYPE_METADATA_CACHE[rt] = meta
-                return meta
-    except Exception:
-        pass
-    _REL_TYPE_METADATA_CACHE[rt] = defaults
-    return defaults
+    if not _REL_TYPE_CACHE:
+        _refresh_rel_type_cache()
+    if rt in _REL_TYPE_CACHE:
+        return _REL_TYPE_CACHE[rt]
+    # Fallback: when DB unavailable (tests, cold start), use hardcoded seed
+    # for known rel_types. This mirrors the old frozensets but only as emergency.
+    _fb = _FALLBACK_METADATA.get(rt)
+    if _fb:
+        log.info("rel_type_cache.fallback_hit", rel_type=rt)
+        return dict(_fb)
+    # Novel/unregistered rel_type — safe defaults
+    return {
+        "storage_target": "facts",
+        "fact_class": "C",
+        "is_symmetric": False,
+        "inverse_rel_type": None,
+        "is_leaf_only": False,
+        "is_hierarchy_rel": False,
+        "correction_behavior": "supersede",
+    }
 
 
 def _detect_semantic_conflicts(
@@ -1070,7 +1117,7 @@ def _detect_semantic_conflicts(
     rt_lower = rel_type.lower().strip() if rel_type else ""
     obj_id = str(obj).lower().strip() if obj else ""
 
-    meta = _get_rel_type_metadata(db_conn, rt_lower)
+    meta = _get_rel_type_metadata(rt_lower)
 
     # Only check leaf-only relationship types against hierarchy objects
     if not meta.get("is_leaf_only"):
@@ -1147,15 +1194,15 @@ def _validate_bidirectional_relationships(
     keep the higher-confidence version and supersede the lower.
 
     Returns:
-      - "keep": no conflict, proceed
-      - "supersede_existing": existing inverse fact superseded (new is higher conf)
-      - "supersede_new": new fact should be skipped (existing is higher conf)
+      - "keep": no inverse rel_type — proceed normally
+      - "create_inverse": no inverse fact found — auto-create needed
+      - "supersede_new": existing inverse has higher confidence — skip new fact
     """
     rt_lower = rel_type.lower().strip() if rel_type else ""
     if not db_conn:
         return "keep"
 
-    meta = _get_rel_type_metadata(db_conn, rt_lower)
+    meta = _get_rel_type_metadata(rt_lower)
     inverse = meta.get("inverse_rel_type") if meta else None
     if not inverse:
         return "keep"
@@ -1213,8 +1260,15 @@ def _validate_bidirectional_relationships(
     except Exception as e:
         log.warning("ingest.bidirectional_validation_failed", error=str(e),
                     subject=subject, rel_type=rt_lower, obj=obj)
+        return "keep"  # DB error — skip auto-create for safety
 
-    return "keep"
+    # Inverse rel_type exists but no inverse fact found — signal auto-creation
+    log.info(
+        "ingest.bidirectional_inverse_needed",
+        fact=f"{subject} {rt_lower} {obj}",
+        inverse_rel=inverse,
+    )
+    return "create_inverse"
 
 
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
@@ -1322,6 +1376,7 @@ async def lifespan(app: FastAPI):
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         _ensure_schema(dsn)  # apply pending migrations before reading the schema
+        _refresh_rel_type_cache()  # dprompt-73b: load unified metadata cache at startup
         _cleanup_entity_aliases_startup(dsn)  # remove corrupted string entity_ids from entity_aliases
         _normalize_entity_ids_startup(dsn)  # normalize string entity_ids to UUIDs
         _load_taxonomies(dsn)  # load entity_taxonomies cache for ingest/query
@@ -1433,17 +1488,109 @@ def add_rel_type(req: RelTypeRequest):
         log.error("ontology.add_rel_type_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+def _build_extract_context(user_id: str) -> dict:
+    """
+    Build fresh context from database for GLiNER2 extraction (dBug-018).
+    Queries entity_aliases, rel_types, and user facts on each call.
+    dprompt-79 constraint: DB-sourced, no caching, no hardcoding.
+    Returns dict with context fields or empty dict on failure.
+    """
+    context = {}
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn or user_id == "anonymous":
+        return context
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # Query 1: Known entities for this user (top 20 preferred names)
+                cur.execute("""
+                    SELECT ea.alias, e.entity_type, ea.entity_id
+                    FROM entity_aliases ea
+                    JOIN entities e ON ea.entity_id = e.id AND ea.user_id = e.user_id
+                    WHERE ea.user_id = %s AND ea.is_preferred = true
+                    LIMIT 20
+                """, (user_id,))
+                known_entities = [
+                    {"name": row[0], "type": row[1] or "Unknown", "uuid": row[2]}
+                    for row in cur.fetchall()
+                ]
+                if known_entities:
+                    context["known_entities"] = known_entities
+
+                # Query 2: Medical rel_types with head/tail constraints
+                cur.execute("""
+                    SELECT rel_type, head_types, tail_types
+                    FROM rel_types
+                    WHERE head_types IS NOT NULL AND tail_types IS NOT NULL
+                    LIMIT 30
+                """)
+                ontology_hints = []
+                for row in cur.fetchall():
+                    rt, heads, tails = row[0], row[1] or [], row[2] or []
+                    if heads and tails:
+                        ontology_hints.append(
+                            f"{rt} → {','.join(h for h in heads if h != 'ANY')}"
+                            f"→{','.join(t for t in tails if t != 'ANY')}"
+                        )
+                if ontology_hints:
+                    context["ontology_hints"] = ontology_hints[:15]
+
+                # Query 3: User facts for profile
+                cur.execute("""
+                    SELECT rel_type, subject_id, object_id FROM facts
+                    WHERE user_id = %s AND rel_type IN
+                    ('parent_of','spouse','lives_at','has_pet','works_for','also_known_as','pref_name')
+                    LIMIT 10
+                """, (user_id,))
+                profile_parts = []
+                for row in cur.fetchall():
+                    rel, subj, obj = row[0], row[1], row[2]
+                    if rel in ("parent_of", "spouse", "has_pet"):
+                        profile_parts.append(f"{rel}={obj}")
+                    elif rel == "lives_at":
+                        profile_parts.append(f"location={obj}")
+                    elif rel in ("also_known_as", "pref_name"):
+                        profile_parts.append(f"name={obj}")
+                if profile_parts:
+                    context["user_profile"] = f"User: {user_id}. {'; '.join(profile_parts[:8])}."
+
+                # Query 4: Body parts taxonomy (dprompt-81)
+                cur.execute("""
+                    SELECT ea.alias FROM entity_aliases ea
+                    JOIN entity_taxonomies et ON et.taxonomy_name = 'body_parts'
+                    WHERE ea.user_id = 'anonymous'
+                    LIMIT 20
+                """)
+                bp_rows = cur.fetchall()
+                if bp_rows:
+                    body_parts = [row[0] for row in bp_rows]
+                    context.setdefault("ontology_hints", []).append(
+                        f"body_parts: {','.join(body_parts[:12])}"
+                    )
+    except Exception as e:
+        log.warning("extract.context_build_failed", error=str(e))
+    return context
+
+
 @app.post("/extract")
 def extract(req: IngestRequest, model=Depends(get_gliner_model)):
     """
-    Run GLiNER2 entity extraction only. Returns typed entities for use
-    by the filter before calling Qwen for relationship classification.
-    Post-processes to resolve first-person references (e.g., null objects
-    for child_of relations where user is the implied parent).
+    Run GLiNER2 entity extraction with optional context enrichment (dBug-018).
+    When user_id is provided, builds fresh context from database (entity registry,
+    ontology hints, user profile) to enrich GLiNER2's schema for better entity
+    disambiguation.  Post-processes null subjects/objects with ontology-informed
+    resolution instead of hardcoded rules.
     """
     if model is None:
         return {"entities": []}
     try:
+        # Build fresh context from DB if user_id provided (dprompt-79: no caching)
+        ctx = {}
+        if req.user_id and req.user_id != "anonymous" and not req.context:
+            ctx = _build_extract_context(req.user_id)
+        elif req.context:
+            ctx = req.context.model_dump() if hasattr(req.context, 'model_dump') else req.context
+
         constraint = _get_constraint()
         schema = {
             "facts": [
@@ -1454,6 +1601,28 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
                 "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The entity type of the object.",
             ]
         }
+
+        # Enrich schema descriptions with context (dBug-018 Phase A)
+        if ctx:
+            entity_names = ", ".join(
+                [e["name"] for e in ctx.get("known_entities", [])]
+            ) if ctx.get("known_entities") else ""
+            ontology_info = "; ".join(
+                ctx.get("ontology_hints", [])
+            ) if ctx.get("ontology_hints") else ""
+
+            schema["facts"][0] = (
+                "subject::str::The full proper name. " +
+                (f"Known entities: {entity_names}. " if entity_names else "") +
+                (f"{ctx.get('user_profile', '')} " if ctx.get("user_profile") else "") +
+                "Resolve 'I'/'my' to 'user' if subject is null. Never a pronoun."
+            )
+            schema["facts"][2] = (
+                f"rel_type::[{constraint}]::str::The relationship type. " +
+                (f"Context hints: {ontology_info}. " if ontology_info else "") +
+                "Choose the most specific matching type."
+            )
+
         result = model.extract_json(req.text, schema)
         resolved_entities = []
         for entity in result.get("facts", []):
@@ -1472,6 +1641,22 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
                 entity["subject"] = "user"
                 entity["subject_type"] = "Person"
                 log.info("extract.null_object_resolved", subject=entity["object"], rel_type="parent_of")
+            # Ontology-driven resolution: if object is null, check body parts in text (dBug-018 Phase B)
+            elif entity.get("object") is None and entity.get("rel_type") and ctx.get("ontology_hints"):
+                text_lower = req.text.lower()
+                for hint in ctx.get("ontology_hints", []):
+                    if hint.startswith("body_parts:"):
+                        parts = hint.replace("body_parts:", "").split(",")
+                        for bp in parts:
+                            bp = bp.strip()
+                            if bp and bp in text_lower:
+                                entity["object"] = bp
+                                entity["object_type"] = "Object"
+                                log.info("extract.object_resolved_body_part",
+                                        rel_type=entity["rel_type"], body_part=bp)
+                                break
+                        if entity.get("object"):
+                            break
             resolved_entities.append(entity)
         return {"entities": resolved_entities}
     except Exception as e:
@@ -1755,8 +1940,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # Only Person-type entities should have alias resolution applied
             _entity_types: dict[str, str] = {}
             for fact in result.get("facts", []):
-                subj = fact.get("subject", "").lower().strip()
-                obj = fact.get("object", "").lower().strip()
+                subj = (fact.get("subject") or "").lower().strip()
+                obj = (fact.get("object") or "").lower().strip()
                 if subj and fact.get("subject_type"):
                     _entity_types[subj] = fact["subject_type"].lower()
                 if obj and fact.get("object_type"):
@@ -1863,7 +2048,7 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
 
 
-    facts, committed, staged = [], 0, 0
+    facts, committed, staged, ingested = [], 0, 0, 0
     if edges:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         try:
@@ -1925,7 +2110,8 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 reason="raw UUID in edge subject or object — likely resolution leak")
                     continue
 
-                # Capture raw scalar value before entity resolution
+                # Capture raw values before entity resolution
+                _raw_subject = edge.subject
                 _raw_object = edge.object
 
                 # Rel_types that ALWAYS have scalar (string) objects, never UUID references
@@ -2327,10 +2513,13 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     0.8 if edge.fact_provenance == "user_stated" else 0.6
                 )
 
-                # Temporal event routing: if rel_type is time-based, insert into
-                # events table and skip facts/staged_facts routing entirely.
+                # Metadata-driven routing (dprompt-73b): query storage_target
+                # from rel_types table instead of hardcoded frozensets.
                 rt_lower = edge.rel_type.lower().strip()
-                if rt_lower in _TEMPORAL_REL_TYPES:
+                route_meta = _get_rel_type_metadata(rt_lower)
+                storage_target = route_meta.get("storage_target", "facts")
+
+                if storage_target == "events":
                     with db.cursor() as cur:
                         cur.execute(
                             "INSERT INTO events"
@@ -2358,14 +2547,17 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                              subject=_raw_subject.lower().strip(),
                              occurs_on=_raw_object.lower().strip())
                     ingested += 1
-                    continue  # skip facts/staged_facts routing
+                    # No continue — events also flow through fact classification below
 
-                fact_class = _classify_fact(
-                    edge.rel_type,
-                    edge_confidence,
-                    engine_generated=is_engine_generated,
-                    is_correction=edge.is_correction,
-                )
+                # Metadata-driven fact classification (dprompt-73b):
+                # query fact_class from rel_types table instead of hardcoded frozensets.
+                fact_class = route_meta.get("fact_class", "C")
+                if edge.is_correction:
+                    fact_class = "A"
+                elif edge_confidence < 0.6:
+                    fact_class = "C"
+                # Fact class assigned above from metadata query (dprompt-73b).
+                # is_engine_generated already set correctly by original logic above.
 
                 facts.append(FactResult(
                     subject=fact_subject,
@@ -2375,10 +2567,12 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     fact_class=fact_class,
                     provenance=edge.fact_provenance,
                 ))
-                if status in ("valid", "conflict"):
+                if status in ("valid", "conflict", "unknown"):
                     # Conflict facts: the WGM gate already inserted the new fact and marked
                     # old facts as contradicted. We still need rows populated for downstream
                     # processing (entity alias sync, Qdrant sync, preference propagation).
+                    # Unknown status (novel rel_types): WGM returned "unknown", recorded in ontology_evaluations.
+                    # Route to Class C staging for re-embedder async evaluation.
                     # Use the is_pref value computed earlier (which already accounts for
                     # pref_name semantics, explicit flags, and cross-batch preference objects).
                     rows.append((
@@ -2512,7 +2706,21 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     bidir_decision = _validate_bidirectional_relationships(
                         db, req.user_id, _subj, _rel, _obj, _conf,
                     )
-                    if bidir_decision == "supersede_new":
+                    if bidir_decision == "create_inverse":
+                        # Auto-create missing inverse fact with same metadata
+                        _meta = _get_rel_type_metadata(_rel)
+                        _inv_rel = _meta.get("inverse_rel_type") if _meta else None
+                        if _inv_rel:
+                            _bidir_rows.append((
+                                _uid, _obj, _subj, _inv_rel, f"auto-created inverse of {_src}",
+                                False, _fclass, _conf, _eng
+                            ))
+                            log.info("ingest.bidirectional_inverse_created",
+                                     rel_type=_rel, inverse=_inv_rel,
+                                     subject=_subj, object=_obj, confidence=_conf)
+                        _bidir_rows.append(row)
+                        continue
+                    elif bidir_decision == "supersede_new":
                         log.info("ingest.bidirectional_superseded",
                                  rel_type=_rel, subject=_subj, object=_obj,
                                  confidence=_conf)
@@ -2813,12 +3021,10 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         if not result:
                             continue
                         new_fact_id = result[0]
-                        cur.execute(
-                            "SELECT correction_behavior FROM rel_types WHERE rel_type = %s",
-                            (rel_type.lower(),),
-                        )
-                        cb_row = cur.fetchone()
-                        behavior = cb_row[0] if cb_row else "supersede"
+                        # Query correction_behavior from metadata cache (dprompt-73b)
+                        # Falls back to DB query if cache doesn't have it
+                        _cb_meta = _get_rel_type_metadata(rel_type.lower())
+                        behavior = _cb_meta.get("correction_behavior", "supersede")
                         _apply_correction(cur, user_id, correction_subject, correction_object,
                                           rel_type.lower(), new_fact_id, behavior)
                         if rel_type.lower() == "also_known_as":
