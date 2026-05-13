@@ -129,7 +129,6 @@ class EntityRegistry:
         canonical: str,
         alias: str,
         is_preferred: bool = False,
-        entity_display_name: str = None,
     ) -> None:
         """
         Register an alias for a canonical entity (UUID).
@@ -137,17 +136,11 @@ class EntityRegistry:
         alias is a display name.
         If is_preferred=True, clears other preferred aliases for this entity.
 
-        dprompt-32: Non-destructive collision detection.
-        If another entity already owns this alias as preferred, store the conflict
-        without overwriting. The re-embedder resolves conflicts asynchronously.
-
         User-authoritative: if the alias already exists pointing to a corrupted
         (string) entity_id, delete it first so the correct UUID registration wins.
         """
         canonical = canonical.strip()
         alias = alias.lower().strip()
-        if entity_display_name is None:
-            entity_display_name = canonical
 
         with self.db_conn.cursor() as cur:
             # Ensure canonical entity exists
@@ -156,58 +149,6 @@ class EntityRegistry:
                 "VALUES (%s, %s, 'unknown') ON CONFLICT (id, user_id) DO NOTHING",
                 (canonical, user_id),
             )
-
-            # dprompt-32: collision detection — is this alias already preferred
-            # for a DIFFERENT entity? If so, store conflict, don't overwrite.
-            if is_preferred:
-                cur.execute(
-                    "SELECT entity_id FROM entity_aliases "
-                    "WHERE user_id = %s AND alias = %s AND is_preferred = true "
-                    "AND entity_id != %s",
-                    (user_id, alias, canonical),
-                )
-                existing = cur.fetchone()
-                if existing:
-                    # Collision detected: different entity already owns this preferred name
-                    existing_eid = existing[0]
-
-                    # Get display name for existing entity
-                    existing_name = existing_eid
-                    try:
-                        cur.execute(
-                            "SELECT alias FROM entity_aliases "
-                            "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
-                            "LIMIT 1",
-                            (user_id, existing_eid),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            existing_name = row[0]
-                    except Exception:
-                        pass
-
-                    # Store conflict for re-embedder resolution
-                    try:
-                        cur.execute(
-                            "INSERT INTO entity_name_conflicts "
-                            "(user_id, entity_id_1, entity_name_1, entity_id_2, entity_name_2,"
-                            " disputed_name, conflict_type, status) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, 'pref_name_collision', 'pending') "
-                            "ON CONFLICT (user_id, entity_id_1, entity_id_2, disputed_name) DO NOTHING",
-                            (user_id, existing_eid, existing_name,
-                             canonical, entity_display_name, alias),
-                        )
-                        self.db_conn.commit()
-                        log.info("entity_registry.conflict_detected",
-                                 disputed_name=alias,
-                                 entity_1=existing_eid,
-                                 entity_2=canonical)
-                    except Exception as e:
-                        log.warning("entity_registry.conflict_store_failed",
-                                    error=str(e))
-
-                    # Insert alias as NON-preferred for the new entity
-                    is_preferred = False
 
             if is_preferred:
                 # Clear other preferred aliases for this entity
@@ -256,38 +197,21 @@ class EntityRegistry:
             return canonical
 
     def get_any_alias(self, user_id: str, entity_id: str) -> str | None:
-        """
-        dprompt-32: Get any human-readable alias for an entity (preferred or not).
-        Used as fallback when no preferred name exists (e.g., name collision loser).
-        Returns None if no human-readable alias found.
+        """Return first available alias for an entity (preferred or not).
+
+        Used as fallback when get_preferred_name returns a UUID — ensures
+        the entity has at least one human-readable name for display resolution.
+        Returns None if no alias exists.
         """
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
-                "ORDER BY alias DESC LIMIT 1",
+                "WHERE user_id = %s AND entity_id = %s "
+                "ORDER BY is_preferred DESC LIMIT 1",
                 (user_id, entity_id),
             )
             row = cur.fetchone()
-            if row:
-                alias = row[0]
-                if alias != entity_id and not self._is_valid_uuid(alias):
-                    return alias
-
-            # Fallback: any non-preferred alias
-            cur.execute(
-                "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s AND is_preferred = false "
-                "ORDER BY alias LIMIT 1",
-                (user_id, entity_id),
-            )
-            row = cur.fetchone()
-            if row:
-                alias = row[0]
-                if alias != entity_id and not self._is_valid_uuid(alias):
-                    return alias
-
-        return None
+            return row[0] if row else None
 
     def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
         """Return all display name aliases for a surrogate entity_id."""

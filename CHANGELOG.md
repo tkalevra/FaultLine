@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.9 (2026-05-13) — Context-Enriched /extract Endpoint (dBug-018)
+
+**Extraction pipeline:** `/extract` endpoint now passes database-sourced context to GLiNER2: entity registry (known entities), ontology metadata (rel_types with type constraints), and user facts. All context sourced fresh from database per request (zero hardcoding, zero stale caches).
+
+**Phase A (dprompt-80):** Entity registry enrichment — ExtractContext model, _build_extract_context() helper querying entity_aliases/rel_types/facts fresh from DB. GLiNER2 schema enriched with known entity names, user profile, ontology hints.
+
+**Phase B (dprompt-81):** Body parts taxonomy + ontology-driven post-processing — Migration 026 pre-seeds body_parts taxonomy. Post-processing uses rel_types.tail_types for entity type-aware resolution.
+
+**Fixes:** dBug-018 (context-dependent extraction: "what'd I do to my back?" now extracts subject=user, object=back instead of nulls). Implicit pronouns ("I" → user) now resolved. Body parts recognized via ontology.
+
+**Migration:** 026_body_parts_taxonomy.sql (idempotent, pre-seeds 15 body parts with deterministic UUIDs)
+
+**Constraint:** dprompt-79 — All context to GLiNER2 from database on each request. Zero hardcoding, zero stale caching. Context evolved with ontology automatically.
+
+## v1.0.8 (2026-05-15) — Bidirectional Relationship Completeness
+
+**Extraction + ingest:** Two-phase fix. Prompt mandates bidirectional emission (parent_of/child_of, spouse, sibling_of). Ingest auto-creates missing inverses with same confidence/fact_class. Graph traversal now complete in both directions.
+
+**Fixes:** dBug-012
+
 ## v1.0.7 (2026-05-14) — Query Deduplication Fix
 
 **Query path:** pg_keys dedup uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Fixes duplicate facts when same entity has multiple aliases (chris/user → single deduplicated fact).
