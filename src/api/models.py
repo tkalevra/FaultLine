@@ -7,13 +7,17 @@ class EdgeInput(BaseModel):
     subject: str
     object: str
     rel_type: str
-    subject_type: Optional[str] = None
-    object_type: Optional[str] = None
     is_preferred_label: bool = False
     is_correction: bool = False
     fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
     subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
+
+
+class ExtractContext(BaseModel):
+    known_entities: list[dict] | None = None  # [{"name":"chris","type":"Person","uuid":"..."},...]
+    ontology_hints: list[str] | None = None    # ["has_injury → Person,body_part", ...]
+    user_profile: str | None = None            # "User: chris. Family: spouse=mars..."
 
 
 class IngestRequest(BaseModel):
@@ -22,6 +26,7 @@ class IngestRequest(BaseModel):
     edges: list[EdgeInput] | None = None
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
     user_id: Optional[str] = "anonymous"
+    context: ExtractContext | None = None  # Optional context enrichment for /extract (dBug-018)
 
 
 class QueryRequest(BaseModel):

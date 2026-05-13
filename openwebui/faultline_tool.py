@@ -39,11 +39,31 @@ _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
 )
 
-_IS_PURE_QUESTION = re.compile(
-    r'^\s*(what|who|where|when|how|why|is|are|do|does|can|could|'
-    r'tell|show|list|give|find|get|remind|do you know|have you)\b',
-    re.IGNORECASE
-)
+# Semantic intent classification (dprompt-75b / dBug-014): replaces brittle
+# _IS_PURE_QUESTION regex. Distinguishes pure factual questions from personal-
+# context questions by analyzing grammatical person. If a question uses first-
+# person language ("I", "my", "me", etc.), it's personal context — don't skip
+# extraction. Pure third-person/general questions can safely skip.
+
+def _should_skip_extraction(text: str) -> bool:
+    """Return True if extraction can be skipped (pure factual question).
+    Return False if text contains personal context worth extracting.
+
+    Semantic approach: grammatical person is the signal. First-person questions
+    are about the user's own history/state/context — must extract. Third-person
+    or impersonal questions are about world knowledge — can skip.
+    """
+    tl = text.lower().strip()
+    # Only consider skipping question-form messages
+    if not tl.endswith('?'):
+        return False
+    # First-person pronouns indicate personal context — never skip
+    for raw_token in tl.split():
+        token = raw_token.strip('.,!?;:\'"()[]{}')
+        if token in ('i', 'my', 'me', 'we', 'our', 'us', 'myself', 'ourselves'):
+            return False
+    # No personal context detected — safe to skip extraction for this question
+    return True
 
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
@@ -99,6 +119,7 @@ RELATIONSHIP RULES:
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
 - POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
+- BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, des), you MUST also emit (des, child_of, user). If you emit (user, spouse, mars), you MUST also emit (mars, spouse, user). If you emit (des, sibling_of, cyrus), you MUST also emit (cyrus, sibling_of, des). Example: "I have a son named Des, my husband Mars" → (user, parent_of, des) + (des, child_of, user) + (user, spouse, mars) + (mars, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
 - also_known_as: nickname or alternate name.
@@ -119,6 +140,8 @@ Hierarchy chains across domains (extract EVERY link in the chain):
 - Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
 - Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
 - Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
+
+HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Fraggle, a morkie" → extract fraggle instance_of morkie AND user has_pet fraggle, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
 
 Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
@@ -181,7 +204,7 @@ def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
     return model, url
 
 
-async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_header: Optional[str] = None, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None) -> list[dict]:
+async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_header: Optional[str] = None, context: list[dict] = None, typed_entities: list[dict] = None, memory_facts: list[dict] = None, user_uuid: Optional[str] = None) -> list[dict]:
     """
     Send text to the Qwen model and parse the returned JSON triple array.
     Context (prior messages) provides conversation history for resolution.
@@ -268,16 +291,23 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
         if auth_header:
             headers["Authorization"] = auth_header
 
+        # Use backend LLM if configured, else OpenWebUI with user UUID
+        final_url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else url
+        request_data = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 400,
+            "thinking": {"type": "disabled"},
+        }
+        # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
+        if not valves.BACKEND_LLM_URL and user_uuid:
+            request_data["chat_id"] = user_uuid
+
         async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
             response = await client.post(
-                url,
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": 400,
-                    "thinking": {"type": "disabled"},
-                },
+                final_url,
+                json=request_data,
                 headers=headers,
             )
             response.raise_for_status()
@@ -628,6 +658,7 @@ class Filter:
         LLM_URL: str = ""  # Empty = OpenWebUI internal endpoint (host.docker.internal:3000). Set explicitly for non-Docker or custom LLM endpoints.
         LLM_MODEL: str = ""  # Model for triple extraction and retraction parsing. Empty = use the model selected by the user in OpenWebUI.
         LLM_API_KEY: str = ""  # Bearer token for LLM endpoint. Required when LLM_URL points to OpenWebUI internal endpoint or any authenticated API.
+        BACKEND_LLM_URL: str = ""  # Direct backend LLM endpoint (e.g., http://ollama:11434/v1/chat/completions). If set, extraction calls use this instead of OpenWebUI.
         QWEN_TIMEOUT: int = 10
         DEFAULT_SOURCE: str = "openwebui"
         ENABLE_DEBUG: bool = False
@@ -864,7 +895,7 @@ class Filter:
         tl = text.lower().replace("'", "'").replace("'", "'")
         return any(sig in tl for sig in _RETRACTION_SIGNALS)
 
-    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None) -> dict:
+    async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
         try:
             messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
             for msg in (context or [])[-2:]:
@@ -877,12 +908,23 @@ class Filter:
             headers = {}
             if auth_header:
                 headers["Authorization"] = auth_header
+
+            # Use backend LLM if configured, else OpenWebUI with user UUID (dBug-016 fix)
+            final_url = self.valves.BACKEND_LLM_URL if self.valves.BACKEND_LLM_URL else url
+            request_data = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 100,
+                "thinking": {"type": "disabled"},
+            }
+            if not self.valves.BACKEND_LLM_URL and user_uuid:
+                request_data["chat_id"] = user_uuid
+
             async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
                 resp = await client.post(
-                    url,
-                    json={"model": model, "messages": messages,
-                          "temperature": 0.0, "max_tokens": 100,
-                          "thinking": {"type": "disabled"}},
+                    final_url,
+                    json=request_data,
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -1173,6 +1215,8 @@ class Filter:
             # OpenWebUI may fire the inlet multiple times for the same message (streaming
             # chunks, system-message re-evaluation). Without this, each call triggers a new
             # memory injection → another inlet call → infinite recursive loop.
+            # User UUID also injected as chat_id in extraction LLM requests to prevent
+            # OpenWebUI's NoneType crash on missing chat_id (dBug-016 / openwebui#24550).
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
             _text_hash = hash(text)
             _last = _DEDUP_TRACKER.get(user_id)
@@ -1212,7 +1256,8 @@ class Filter:
                     body.get("messages", []),
                     model=llm_model,
                     url=llm_url,
-                    auth_header=llm_auth
+                    auth_header=llm_auth,
+                    user_uuid=user_id,
                 )
                 if retraction and retraction.get("subject"):
                     result = await self._fire_retract(
@@ -1358,7 +1403,7 @@ class Filter:
                 _is_attribute_question = any(pat in clean_text.lower() for pat in _ATTRIBUTE_REQUESTS)
 
                 _skip_rewrite = (
-                    bool(_IS_PURE_QUESTION.match(clean_text))
+                    _should_skip_extraction(clean_text)
                     and not _has_self_id
                     and not _has_preference_signal
                     and not _is_attribute_question
@@ -1370,6 +1415,9 @@ class Filter:
                         print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
                 else:
                     typed_entities = await self._fetch_entities(clean_text, user_id)
+                    # user_uuid injected as chat_id to prevent OpenWebUI NoneType crash
+                    # (dBug-016 / openwebui#24550). Extraction calls fixed; main chat still
+                    # blocked awaiting upstream OpenWebUI fix.
                     raw_triples = await rewrite_to_triples(
                         clean_text,
                         self.valves,
@@ -1379,6 +1427,7 @@ class Filter:
                         context=body.get("messages", []),
                         typed_entities=typed_entities if typed_entities else None,
                         memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                        user_uuid=user_id,
                     )
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] raw_triples={raw_triples}")
