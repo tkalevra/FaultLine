@@ -3065,6 +3065,79 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                           entities=[EntityResult(entity=r["entity"], label=r["type"], canonical_id=r["canonical_id"]) for r in resolved],
                           facts=facts)
 
+def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[dict]:
+    """
+    Fetch hierarchy facts (instance_of, subclass_of, member_of, part_of)
+    for entities found via graph traversal. Ensures type/classification
+    information is available alongside relationship facts (dBug-019).
+
+    Queries both facts and staged_facts tables. Returns deduplicated
+    list of fact dicts matching the same structure as _fetch_user_facts.
+    """
+    results = []
+    if not entity_ids:
+        return results
+    try:
+        hier_rels = list(_REL_TYPE_HIERARCHY)
+        with db_conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(entity_ids))
+            params = [user_id] + list(entity_ids) + hier_rels
+            # Query facts table
+            cur.execute(
+                f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
+                f"  confirmed_count, fact_class FROM facts "
+                f"WHERE user_id = %s AND subject_id IN ({placeholders})"
+                f"  AND rel_type = ANY(%s) AND superseded_at IS NULL"
+                f"  AND hard_delete_flag = false"
+                f"  AND (valid_until IS NULL OR valid_until > now())",
+                params,
+            )
+            seen = set()
+            for r in cur.fetchall():
+                key = (r[0], r[1], r[2])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "subject": r[0], "object": r[1], "rel_type": r[2],
+                        "provenance": r[3],
+                        "confidence": float(r[4]) if r[4] else 1.0,
+                        "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                        "fact_state": "long_term",
+                        "fact_class": r[6] if r[6] else "A",
+                        "staged_confirmations": r[5] if r[5] else 0,
+                        "promoted_at": None,
+                        "expires_at": None,
+                    })
+            # Query staged_facts table with same params
+            cur.execute(
+                f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
+                f"  confirmed_count, fact_class, promoted_at, expires_at FROM staged_facts "
+                f"WHERE user_id = %s AND subject_id IN ({placeholders})"
+                f"  AND rel_type = ANY(%s) AND expires_at > now()"
+                f"  AND promoted_at IS NULL",
+                params,
+            )
+            for r in cur.fetchall():
+                key = (r[0], r[1], r[2])
+                if key not in seen:
+                    seen.add(key)
+                    promoted = r[7].isoformat() if r[7] else None
+                    expires = r[8].isoformat() if r[8] else None
+                    results.append({
+                        "subject": r[0], "object": r[1], "rel_type": r[2],
+                        "provenance": r[3],
+                        "confidence": float(r[4]) if r[4] else 0.0,
+                        "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                        "fact_state": "staged",
+                        "fact_class": r[6] if r[6] else "B",
+                        "staged_confirmations": r[5] if r[5] else 0,
+                        "promoted_at": promoted,
+                        "expires_at": expires,
+                    })
+    except Exception as e:
+        log.warning("query.fetch_hierarchy_facts_failed", error=str(e))
+    return results
+
 @app.post("/query")
 def query(request: QueryRequest):
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -3610,6 +3683,27 @@ def query(request: QueryRequest):
                              enriched_entities=len(_enriched),
                              new_hierarchy_facts=sum(1 for f in direct_facts if f.get("rel_type") in _REL_TYPE_HIERARCHY),
                              total_facts=len(direct_facts))
+
+                # dBug-019: fetch hierarchy facts for graph-connected entities
+                # Graph traversal finds connected entities (pets, family) but doesn't
+                # return their type/classification facts. This ensures instance_of,
+                # subclass_of, member_of, part_of are included for complete context.
+                _graph_entity_ids = set(_connected)
+                if _graph_entity_ids:
+                    _hier_facts = _fetch_hierarchy_facts(db, user_id, _graph_entity_ids)
+                    if _hier_facts:
+                        seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
+                        _added = 0
+                        for _hf in _hier_facts:
+                            _key = (_hf["subject"], _hf["object"], _hf["rel_type"])
+                            if _key not in seen:
+                                direct_facts.append(_hf)
+                                seen.add(_key)
+                                _added += 1
+                        log.info("query.hierarchy_facts_fetched",
+                                 graph_entities=len(_graph_entity_ids),
+                                 hierarchy_facts_added=_added,
+                                 total_facts=len(direct_facts))
 
             entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
             attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
