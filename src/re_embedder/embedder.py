@@ -407,6 +407,7 @@ def expire_staged_facts(db_conn, qdrant_url: str) -> int:
                     )
                 db_conn.commit()
                 expired += 1
+                log.info(f"re_embedder.expired staged_id={staged_id} user_id={user_id}")
             except Exception as e:
                 db_conn.rollback()
                 log.error(f"re_embedder.expire_failed staged_id={staged_id}: {e}")
@@ -697,6 +698,16 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     stats["approved"] += 1
                     log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} {reason}")
 
+                    # Refresh unified metadata cache so the newly approved rel_type
+                    # is immediately available to the ingest pipeline without waiting
+                    # for next container restart (dprompt-76b / dBug-015).
+                    try:
+                        from src.api.main import _refresh_rel_type_cache
+                        _refresh_rel_type_cache()
+                        log.info(f"re_embedder.cache_refresh trigger=ontology_approved rel_type={candidate_rel}")
+                    except Exception as _cache_err:
+                        log.warning(f"re_embedder.cache_refresh_failed rel_type={candidate_rel}: {_cache_err}")
+
                 elif decision == "mapped" and best_fit:
                     # Rewrite staged_facts using this rel_type to use best_fit instead
                     cur.execute(
@@ -754,199 +765,6 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
-
-
-def resolve_name_conflicts(db_conn, qwen_api_url: str) -> int:
-    """
-    dprompt-32: Evaluate and resolve pending entity name conflicts.
-    For each conflict, uses LLM context to decide which entity gets the preferred name
-    and assigns a fallback alias to the loser. Non-destructive — all names preserved.
-
-    Returns count of conflicts resolved.
-    """
-    resolved = 0
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, user_id, entity_id_1, entity_name_1,"
-                "       entity_id_2, entity_name_2, disputed_name"
-                " FROM entity_name_conflicts"
-                " WHERE status = 'pending'"
-                " ORDER BY created_at"
-                " LIMIT 10"
-            )
-            conflicts = cur.fetchall()
-
-        if not conflicts:
-            return 0
-
-        log.info(f"re_embedder.conflict_resolution_start count={len(conflicts)}")
-
-        for cid, user_id, eid1, name1, eid2, name2, disputed in conflicts:
-            try:
-                # Gather context: facts for both entities
-                facts1 = _get_entity_context(db_conn, user_id, eid1)
-                facts2 = _get_entity_context(db_conn, user_id, eid2)
-
-                # LLM resolution
-                resolution = _llm_resolve_conflict(
-                    qwen_api_url,
-                    entity1_name=name1,
-                    entity1_facts=facts1,
-                    entity2_name=name2,
-                    entity2_facts=facts2,
-                    disputed_name=disputed,
-                )
-
-                winner_eid = resolution.get("winner_eid")
-                fallback = resolution.get("fallback", "")
-                reason = resolution.get("reason", "")
-
-                if not winner_eid:
-                    # LLM couldn't decide — skip, leave pending for next cycle
-                    log.warning(f"re_embedder.conflict_no_decision conflict_id={cid}")
-                    continue
-
-                loser_eid = eid1 if winner_eid == eid2 else eid2
-
-                # Update aliases: winner keeps preferred, loser gets fallback
-                with db_conn.cursor() as cur:
-                    # Winner: ensure preferred
-                    cur.execute(
-                        "UPDATE entity_aliases SET is_preferred = true, updated_at = now()"
-                        " WHERE user_id = %s AND entity_id = %s AND alias = %s",
-                        (user_id, winner_eid, disputed),
-                    )
-
-                    # Loser: add fallback alias (non-preferred)
-                    if fallback and fallback.strip():
-                        cur.execute(
-                            "INSERT INTO entity_aliases (user_id, entity_id, alias, is_preferred)"
-                            " VALUES (%s, %s, %s, true)"
-                            " ON CONFLICT (user_id, alias) DO UPDATE SET"
-                            " entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred",
-                            (user_id, loser_eid, fallback.lower().strip()),
-                        )
-
-                    # Mark conflict resolved
-                    cur.execute(
-                        "UPDATE entity_name_conflicts"
-                        " SET status = 'resolved', resolution_method = 're_embedder',"
-                        "     resolution_detail = %s, resolved_at = now()"
-                        " WHERE id = %s",
-                        (json.dumps(resolution), cid),
-                    )
-
-                db_conn.commit()
-                resolved += 1
-                log.info(
-                    f"re_embedder.conflict_resolved conflict_id={cid}"
-                    f" disputed={disputed} winner={winner_eid} loser={loser_eid} fallback={fallback}"
-                )
-
-            except Exception as e:
-                db_conn.rollback()
-                log.error(f"re_embedder.conflict_resolve_failed conflict_id={cid}: {e}")
-
-        if resolved:
-            log.info(f"re_embedder.conflict_resolution_complete resolved={resolved}")
-
-    except Exception as e:
-        log.error(f"re_embedder.conflict_resolution_error: {e}")
-
-    return resolved
-
-
-def _get_entity_context(db_conn, user_id: str, entity_id: str) -> str:
-    """Get a short context string describing an entity for LLM resolution."""
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                "SELECT rel_type, object_id FROM facts"
-                " WHERE user_id = %s AND subject_id = %s AND superseded_at IS NULL"
-                " ORDER BY id DESC LIMIT 10",
-                (user_id, entity_id),
-            )
-            facts = cur.fetchall()
-
-        if not facts:
-            return f"Entity {entity_id} (no facts)"
-
-        lines = []
-        for rel_type, obj in facts:
-            lines.append(f"  - {rel_type}: {obj}")
-
-        return "\n".join(lines)
-
-    except Exception:
-        return f"Entity {entity_id}"
-
-
-def _llm_resolve_conflict(
-    qwen_api_url: str,
-    entity1_name: str,
-    entity1_facts: str,
-    entity2_name: str,
-    entity2_facts: str,
-    disputed_name: str,
-) -> dict:
-    """
-    Use LLM to intelligently decide which entity should own the disputed preferred name.
-    Returns: {"winner_eid": "...", "reason": "...", "fallback": "..."}
-    Falls back to frequency heuristics if LLM unavailable.
-    """
-    prompt = f"""Two entities in a personal knowledge graph claim the same preferred name: "{disputed_name}"
-
-Entity 1 ({entity1_name}):
-{entity1_facts}
-
-Entity 2 ({entity2_name}):
-{entity2_facts}
-
-Which entity should own the preferred name "{disputed_name}" and why?
-Consider: ages (children vs adults), roles (parent vs child), occupations, relationship to user.
-
-Respond with ONLY valid JSON:
-{{"winner": "Entity 1" or "Entity 2", "reason": "brief explanation", "fallback": "unique alternative name for the loser"}}
-
-Example: {{"winner": "Entity 1", "reason": "Entity 2 is a child, parent keeps nicknames", "fallback": "carol"}}
-"""
-
-    try:
-        resp = httpx.post(
-            qwen_api_url,
-            json={
-                "model": os.getenv("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 150,
-                "thinking": {"type": "disabled"},
-            },
-            timeout=15.0,
-        )
-        if resp.status_code == 200:
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Extract JSON from response
-            if "{" in raw and "}" in raw:
-                start = raw.index("{")
-                end = raw.rindex("}") + 1
-                raw = raw[start:end]
-            result = json.loads(raw)
-            winner_label = result.get("winner", "").lower()
-            return {
-                "winner_eid": entity1_name if "entity 1" in winner_label else entity2_name,
-                "reason": result.get("reason", ""),
-                "fallback": result.get("fallback", ""),
-            }
-    except Exception as e:
-        log.warning(f"re_embedder.llm_conflict_resolver_failed: {e}")
-
-    # Fallback: keep existing owner (entity 1), give entity 2 a generic fallback
-    return {
-        "winner_eid": entity1_name,
-        "reason": "LLM unavailable; keeping existing assignment",
-        "fallback": "",
-    }
 
 
 def main():
@@ -1045,11 +863,6 @@ def main():
                         f"rejected={ontology_stats['rejected']} "
                         f"errors={ontology_stats['errors']}"
                     )
-
-                # Resolve name conflicts (dprompt-32)
-                n_resolved = resolve_name_conflicts(db, qwen_api_url)
-                if n_resolved:
-                    log.info(f"re_embedder.conflicts_resolved resolved={n_resolved}")
 
                 # Expire stale Class C staged facts
                 n_expired = expire_staged_facts(db, qdrant_url)

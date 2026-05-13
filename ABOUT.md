@@ -1,84 +1,11 @@
 # FaultLine
 
-## v1.0.7 (2026-05-14) — Query Deduplication Fix
-
-**Query path:** `/query` pg_keys dedup now uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Same-entity facts with different aliases (chris/user) no longer create duplicates. Family queries return correct child count consistently.
-
-**Fixes:** dBug-report-008 (duplicate parent_of facts from alias variation)
-
----
-
-## v1.0.6 (2026-05-13) — Metadata-Driven Validation Framework
-
-**Architecture:** Validation rules moved from code to database. `rel_types` table now stores validation properties (`is_symmetric`, `inverse_rel_type`, `is_leaf_only`, `is_hierarchy_rel`). `_get_rel_type_metadata()` queries metadata at runtime. Hardcoded validation constants eliminated.
-
-**Result:** New rel_types created by LLM self-describe their constraints. System scales without new dprompts for each edge case. Zero technical debt.
-
-**Migration:** 022_rel_types_metadata.sql — idempotent schema expansion + metadata pre-population.
-
----
-
-## v1.0.5 (2026-05-13) — Bidirectional Relationship Validation
-
-**Ingest pipeline:** Added `_validate_bidirectional_relationships()` — prevents impossible bidirectional relationships (`child_of` + `parent_of` for same entity pair). Keeps higher-confidence version, supersedes lower. Checks both `facts` and `staged_facts`.
-
-**Fixes:** dBug-report-006 (bidirectional impossibilities, staged fact validation gaps)
-
----
-
-## v1.0.4 (2026-05-12) — Query Deduplication & Alias Metadata
-
-**Query path:** `/query` now deduplicates facts by `(subject_uuid, rel_type, object_uuid)` and attaches `_aliases` metadata with all entity names and `is_preferred` flag. Eliminates duplicate facts from alias redundancy.
-
-**Effect:** Single "spouse Mars" fact instead of duplicate per alias. Filter gets clean deduplicated results with full alias context.
-
-**Fixes:** dBug-report-005 (alias redundancy in query results)
-
----
-
-## v1.0.3 (2026-05-12) — Semantic Conflict Detection
-
-**Ingest pipeline:** Added `_detect_semantic_conflicts()` — auto-supersedes ownership/relationship facts when the object entity is defined as a type/category/component via hierarchy relationships (instance_of, subclass_of, part_of, member_of).
-
-**Principle:** If `X instance_of Y`, Y is a TYPE, not a separate entity — don't allow `owns`/`has_pet`/`works_for` on it. Graph self-heals through semantic validation.
-
-**Fixes:** dBug-report-003/004 (type/ownership conflict cleanup)
-
----
-
-## v1.0.2 (2026-05-12) — Hierarchy Extraction Enhancement
-
-**Filter prompt:** Hierarchy relationships (`instance_of`, `subclass_of`, `member_of`, `part_of`) moved to primary extraction list with 6 multi-domain examples (taxonomic, organizational, infrastructure, hardware, geographical, software).
-
-**Result:** LLM now extracts complete hierarchy chains across all domains. Previously `part_of` had 0 facts, `subclass_of` had 0 — now extracted with Class A/B confidence.
-
-**Fixes:** dBug-report-002 (Hierarchical Entity Relationships Missing)
-
----
-
-## v1.0.1 (2026-05-12) — Filter Simplification
-
-**Architecture:** Filter now implements backend-first approach
-- Removed three-tier relevance gating logic from Filter
-- Simplified to: identity rels always pass + confidence threshold gating only
-- Filter trusts backend /query ranking (Class A > B > C + confidence) as authoritative
-- No entity-type gating, no concept filtering, no tier fallback logic
-
-**Result:** Category queries now return complete facts
-- "tell me about our pets" → returns has_pet facts ✓
-- "tell me about my family" → returns spouse + children + pets ✓
-- No UUID leaks in responses ✓
-
-**Fixes:** dBug-report-001 (Tier 2 Identity Fallback Blocks Tier 3 after Concept Filter)
-**See:** docs/ARCHITECTURE_QUERY_DESIGN.md for design principle
-
----
-
 A write-validated knowledge graph pipeline that extracts entities and relationships from natural language, validates them against an ontology, and persists them to PostgreSQL with Qdrant vector indexing for semantic memory recall.
 
 ## Features
 
 - **LLM-First Extraction** — Filter LLM extracts typed edges from conversation text with GLiNER2 entity typing
+- **Context-Enriched /extract** — GLiNER2 receives fresh database context (entity registry, ontology metadata, user facts) enabling resolution of implicit pronouns and context-dependent entities
 - **Ontology Validation** — WGM (Write-Gate-Model) validates every edge against a live ontology with type constraints and conflict detection
 - **Fact Classification** — Facts classified as Identity/Structural (Class A), Behavioral/Contextual (Class B), or Ephemeral/Novel (Class C) with appropriate lifecycle management
 - **Graph + Hierarchy Traversal** — Two orthogonal query systems: connectivity graph (who am I connected to?) and composition hierarchy (what are they?)
@@ -345,4 +272,5 @@ FaultLine/
 ```
 
 ## License
-MIT — see [LICENSE](LICENSE) for full terms
+
+[License information]
