@@ -22,6 +22,23 @@ _REALTIME_SIGNALS: frozenset[str] = frozenset({
     "right now", "live", "stock", "price", "score",
 })
 
+# Identity/preference query detection (dBug-022). Used to gate whether
+# preferred-name directives are injected into the memory block. Preferences
+# are always used internally for canonical identity; exposing them to the
+# LLM is gated on the user directly asking about their identity.
+_IDENTITY_QUERIES: frozenset[str] = frozenset({
+    "what is my name", "what's my name", "whats my name",
+    "who am i", "who i am",
+    "how should people call me", "how should you call me",
+    "what do you call me", "what should i be called",
+    "my preferred name", "my alternate name",
+    "what names do i have", "do i have a nickname",
+    "what do i go by", "what should i go by",
+    "who should i introduce myself as",
+    "tell me about my identity", "tell me about my name",
+    "what is my preferred identity",
+})
+
 
 _RETRACTION_SIGNALS: frozenset[str] = frozenset({
     "forget", "delete", "remove", "retract", "erase",
@@ -200,7 +217,15 @@ def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
     # NO RECURSIVE MATCHING
     """
     model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "default")
-    url = valves.LLM_URL if valves.LLM_URL else "http://host.docker.internal:3000/api/chat/completions"
+
+    # Standard setup: use OpenWebUI's internal endpoint
+    # Custom setup: use explicitly configured LLM_URL
+    if valves.LLM_URL:
+        url = valves.LLM_URL
+    else:
+        # Default to OpenWebUI's internal LLM endpoint
+        url = "http://host.docker.internal:3000/api/chat/completions"
+
     return model, url
 
 
@@ -274,16 +299,17 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
         if typed_entities:
             entity_lines = "\n".join(
                 f"- {e.get('subject')} (type: {e.get('subject_type', 'unknown')})"
-                f" {e.get('rel_type')} {e.get('object')} (type: {e.get('object_type', 'unknown')})"
+                f" -- {e.get('object')} (type: {e.get('object_type', 'unknown')})"
                 for e in typed_entities
                 if e.get("subject") and e.get("object")
             )
             user_content = (
                 f"{text}\n\n"
-                f"GLiNER2 has pre-classified these entities from the text:\n{entity_lines}\n"
-                f"Use these entity types to guide relationship selection. "
+                f"Entities detected in text (types pre-classified):\n{entity_lines}\n"
+                f"Use these entity TYPES to constrain subject/object type matching. "
+                f"Determine the specific relationship from the user's text, not from this list. "
                 f"A Person cannot be owned. An Animal cannot be a spouse. "
-                f"Respect these types strictly."
+                f"Respect these type constraints strictly."
             )
         messages.append({"role": "user", "content": user_content})
 
@@ -292,7 +318,21 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
             headers["Authorization"] = auth_header
 
         # Use backend LLM if configured, else OpenWebUI with user UUID
-        final_url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else url
+        # Special handling: "default" or empty string means use standard OpenWebUI endpoint
+        backend_url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else None
+        if backend_url and backend_url.lower() in ("default", "standard", "auto"):
+            backend_url = None  # Reset to standard
+
+        final_url = backend_url if backend_url else url
+
+        # Validate URL has protocol prefix (dBug-022 robustness)
+        if final_url and not (final_url.startswith("http://") or final_url.startswith("https://")):
+            raise ValueError(
+                f"LLM URL MISSING PROTOCOL PREFIX. Must start with 'http://' or 'https://'. "
+                f"Got: '{final_url}'\n"
+                f"Fix: Set BACKEND_LLM_URL to 'http://...' or leave it EMPTY for standard OpenWebUI"
+            )
+
         request_data = {
             "model": model,
             "messages": messages,
@@ -316,6 +356,13 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
             if not isinstance(triples, list):
                 return []
             return triples
+    except ValueError as e:
+        # Configuration error: always print (not debug-only) to be visible to user
+        print(f"\n{'='*80}")
+        print(f"[FaultLine] CONFIGURATION ERROR - Fact extraction disabled:")
+        print(f"{e}")
+        print(f"{'='*80}\n")
+        return []
     except httpx.HTTPStatusError as e:
         if valves.ENABLE_DEBUG:
             print(f"[FaultLine] rewrite_to_triples HTTP error: {e.response.status_code}")
@@ -654,21 +701,63 @@ class Filter:
 
     class Valves(BaseModel):
         FAULTLINE_URL: str = "http://localhost:8001"
+        """FaultLine backend API endpoint. Default: http://localhost:8001
+        Docker: Use http://faultline:8000 (service name in docker-compose).
+        Kubernetes/Remote: Use full URL http://hostname:port"""
+
         FAULTLINE_TIMEOUT: int = 30
-        LLM_URL: str = ""  # Empty = OpenWebUI internal endpoint (host.docker.internal:3000). Set explicitly for non-Docker or custom LLM endpoints.
-        LLM_MODEL: str = ""  # Model for triple extraction and retraction parsing. Empty = use the model selected by the user in OpenWebUI.
-        LLM_API_KEY: str = ""  # Bearer token for LLM endpoint. Required when LLM_URL points to OpenWebUI internal endpoint or any authenticated API.
-        BACKEND_LLM_URL: str = ""  # Direct backend LLM endpoint (e.g., http://ollama:11434/v1/chat/completions). If set, extraction calls use this instead of OpenWebUI.
+        """Timeout (seconds) for FaultLine backend API calls. Default: 30 seconds"""
+
+        LLM_URL: str = ""
+        """LEAVE EMPTY FOR STANDARD SETUP. OpenWebUI uses http://host.docker.internal:3000/api/chat/completions internally.
+        Only set this if using a CUSTOM LLM endpoint (e.g., local Ollama at http://ollama:11434/v1/chat/completions).
+        MUST include http:// or https:// protocol prefix if set."""
+
+        LLM_MODEL: str = ""
+        """LEAVE EMPTY FOR STANDARD SETUP. Will use the model you selected in OpenWebUI's chat interface.
+        Only override if you want a SPECIFIC model for fact extraction (e.g., 'qwen/qwen3.5-9b')."""
+
+        LLM_API_KEY: str = ""
+        """REQUIRED ONLY IF using custom LLM_URL with authentication (e.g., OpenAI API key).
+        For standard OpenWebUI setup: LEAVE EMPTY"""
+
+        BACKEND_LLM_URL: str = ""
+        """LEAVE EMPTY FOR STANDARD SETUP. OpenWebUI's internal LLM is used automatically.
+        ONLY set if you need to use a dedicated backend LLM service (bypassing OpenWebUI).
+        REQUIRED FORMAT if set: Must include http:// or https:// protocol prefix.
+        Examples: http://ollama:11434/v1/chat/completions or http://localhost:8000/v1/chat/completions
+        WARNING: Incorrect format will silently break fact extraction. Validation catches this early."""
+
         QWEN_TIMEOUT: int = 10
+        """Timeout (seconds) for LLM extraction calls. Default: 10 seconds. Increase if extractions timeout."""
+
         DEFAULT_SOURCE: str = "openwebui"
+        """Where facts originate. Default: 'openwebui'. Change only for specialized integrations."""
+
         ENABLE_DEBUG: bool = False
+        """Enable detailed logging to diagnose issues. Set to True if facts aren't being extracted/injected.
+        Logs appear in: docker logs open-webui"""
+
         ENABLED: bool = True
+        """Master switch. Set to False to completely disable FaultLine Filter."""
+
         INGEST_ENABLED: bool = True
+        """Enable fact extraction and storage. Set to False to disable learning new facts."""
+
         QUERY_ENABLED: bool = True
+        """Enable memory recall injection. Set to False to disable fact-based context injection."""
+
         RETRACTION_ENABLED: bool = True
+        """Enable user-driven fact removal ('forget', 'delete', etc.). Set to False to lock facts."""
+
         MAX_MEMORY_SENTENCES: int = 20
+        """Maximum sentences in injected memory block. Reduce if hitting token limits."""
+
         MAX_CONTEXT_TURNS: int = 3
+        """Prior conversation turns passed to LLM for extraction context. Default: 3"""
+
         MIN_INJECT_CONFIDENCE: float = 0.5
+        """Minimum confidence threshold for injecting facts into memory. Range: 0.0–1.0. Default: 0.5"""
 
     def __init__(self):
         self.valves = self.Valves()
@@ -758,6 +847,56 @@ class Filter:
         except Exception:
             pass
         return []
+
+    async def _rewrite_via_faultline(
+        self,
+        text: str,
+        user_id: str,
+        messages: list[dict],
+        typed_entities: Optional[list[dict]],
+        memory_facts: Optional[list[dict]],
+    ) -> list[dict]:
+        """
+        Call FaultLine's /extract/rewrite endpoint for LLM-based triple extraction.
+
+        ARCHITECTURAL BENEFIT: Filter only calls FaultLine:8001 (in our control).
+        No dependency on OpenWebUI's internal endpoints. FaultLine manages LLM config.
+
+        If FaultLine is unreachable or errors, returns [] gracefully.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT + 5) as client:
+                resp = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/extract/rewrite",
+                    json={
+                        "text": text,
+                        "user_id": user_id,
+                        "messages": messages,
+                        "typed_entities": typed_entities,
+                        "memory_facts": memory_facts,
+                    },
+                    timeout=self.valves.QWEN_TIMEOUT + 5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("triples", [])
+                else:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine] /extract/rewrite HTTP {resp.status_code}: {resp.text}")
+                    return []
+        except httpx.ConnectError as e:
+            print(f"\n{'='*80}")
+            print(f"[FaultLine] CONFIGURATION ERROR - Cannot reach FaultLine backend:")
+            print(f"URL: {self.valves.FAULTLINE_URL}/extract/rewrite")
+            print(f"Error: {e}")
+            print(f"\nFix: If FaultLine is running in Docker, use service name:")
+            print(f"  Set FAULTLINE_URL to: http://faultline:8000 (not localhost:8001)")
+            print(f"{'='*80}\n")
+            return []
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine] /extract/rewrite error: {type(e).__name__}: {e}")
+            return []
 
     def _is_realtime_query(self, text: str) -> bool:
         tl = text.lower()
@@ -959,6 +1098,7 @@ class Filter:
         entity_attributes: dict,
         is_realtime: bool = False,
         locations: Optional[list[str]] = None,
+        expose_preferences: bool = False,
     ) -> str:
         identity_display = preferred_names.get("user")
         identity = canonical_identity or identity_display
@@ -1181,9 +1321,20 @@ class Filter:
                     if attr_parts:
                         lines.append(f"{display_name} is {', '.join(attr_parts)}")
 
-        # Append preferred name directives after facts (they're lower priority)
-        if _name_directives:
+        # Append preferred name directives only when user directly asked about
+        # their identity or preferences (dBug-022). Preferences are always used
+        # internally for canonical identity resolution; exposing them to the LLM
+        # is gated on query intent.
+        if expose_preferences and _name_directives:
+            lines.append(
+                "User has directly asked about their identity. These are their "
+                "preferred name directives:"
+            )
             lines.extend(_name_directives)
+            lines.append(
+                "Respect these preferences when responding. The preferred name "
+                "takes priority over alternate names."
+            )
 
         # Apply sentence limit
         limited = lines[:self.valves.MAX_MEMORY_SENTENCES]
@@ -1300,8 +1451,9 @@ class Filter:
             if not will_ingest and not will_query:
                 return body
 
-            # Initialize memory variables for potential use by rewrite_to_triples
+            # Initialize memory variables for use by FaultLine /extract/rewrite
             facts, preferred_names, canonical_identity, entity_attributes = [], {}, None, {}
+            raw_facts_for_extraction = []  # Always initialize; set during /query if successful
 
             # Run /query first (with caching) so memory facts can aid pronoun resolution during ingest
             if will_query:
@@ -1362,8 +1514,17 @@ class Filter:
                                     print(f"[FaultLine Filter]   fact: {f.get('subject')} -{f.get('rel_type')}-> {f.get('object')}")
 
                 except httpx.ConnectError as e:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] /query connection error: {e}")
+                    # Connection error: provide diagnostic guidance
+                    url = f"{self.valves.FAULTLINE_URL}/query"
+                    print(f"\n{'='*80}")
+                    print(f"[FaultLine] CONFIGURATION ERROR - Cannot reach FaultLine backend:")
+                    print(f"URL: {url}")
+                    print(f"Error: {e}")
+                    print(f"\nFix: If FaultLine is running in Docker, use service name:")
+                    print(f"  Set FAULTLINE_URL to: http://faultline:8000 (not localhost:8001)")
+                    print(f"\nIf running locally outside Docker:")
+                    print(f"  Set FAULTLINE_URL to: http://localhost:8001")
+                    print(f"{'='*80}\n")
                 except httpx.TimeoutException as e:
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] /query timeout: {e}")
@@ -1413,34 +1574,13 @@ class Filter:
                     raw_triples = []
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
-                else:
-                    typed_entities = await self._fetch_entities(clean_text, user_id)
-                    # user_uuid injected as chat_id to prevent OpenWebUI NoneType crash
-                    # (dBug-016 / openwebui#24550). Extraction calls fixed; main chat still
-                    # blocked awaiting upstream OpenWebUI fix.
-                    raw_triples = await rewrite_to_triples(
-                        clean_text,
-                        self.valves,
-                        model=llm_model,
-                        url=llm_url,
-                        auth_header=llm_auth,
-                        context=body.get("messages", []),
-                        typed_entities=typed_entities if typed_entities else None,
-                        memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
-                        user_uuid=user_id,
-                    )
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] raw_triples={raw_triples}")
-
-                # Augment: always run regex extraction for preference and correction
-                # signals even when the LLM returned triples. The LLM prompt is
-                # imperfect and can miss explicit preferences ("I prefer to be called X").
-                # Regex-extracted pref_name and correction edges are definitive and
-                # take priority over any LLM-inferred edges.
-                # Use compound extractor (src/extraction/compound.py) for robust
-                # chained-text extraction. Falls back to local _extract_basic_facts
-                # if the module isn't available (e.g., in a different deployment).
+                # /ingest endpoint now owns the entire pipeline (extract → validate → classify → commit)
+                # Filter is dumb — just send text. /ingest handles LLM extraction, WGM validation, etc.
+                # This eliminates brittleness: all ontological logic in one place (backend), not Filter.
+                raw_triples = []
                 basic_edges = []
+
+                # Still extract corrections via regex (explicit user signals supersede LLM inference)
                 if not _skip_rewrite:
                     try:
                         from src.extraction.compound import extract_compound_facts
@@ -1449,13 +1589,9 @@ class Filter:
                         basic_edges = _extract_basic_facts(clean_text)
                     except Exception:
                         basic_edges = _extract_basic_facts(clean_text)
+
+                # Filter only augments with corrections (explicit user signals)
                 if basic_edges:
-                    # Only keep correction edges from regex.
-                    # The LLM handles preferences (pref_name) correctly — regex
-                    # augment for pref_name produces false positives when the
-                    # text contains third-person preferences ("who prefers X",
-                    # "she prefers Y"). Corrections are unambiguous and safe to
-                    # add regardless of context.
                     _augment_edges = [
                         e for e in basic_edges
                         if e.get("is_correction")
@@ -1511,21 +1647,12 @@ class Filter:
                         f"user→also_known_as edge(s): no first-person self-ID or preference signal in text"
                     )
 
-                # Only call ingest when there are edges to commit or the text contains
-                # a self-ID pattern that GLiNER2 should process server-side.
-                # Skipping for query-like text (0 edges, no self-ID) prevents an unnecessary
-                # GLiNER2 crash on texts with no extractable entities.
-                if edges or _has_self_id:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] firing ingest edges={len(edges)}")
-                    # Make it await instead of fire-and-forget
-                    await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
-                else:
-                    # No typed edges extracted but text passed the ingest gate.
-                    # Raw text already cached to Qdrant at inlet start via upfront store_context call.
-                    # Nothing further to do — structured ingest will be attempted only if edges exist.
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] no edges extracted; raw text already cached")
+                # ALWAYS call ingest when will_ingest=True. /ingest owns the extraction pipeline.
+                # Filter is dumb — backend is smart. Don't gate on local edge extraction.
+                # Raw text already cached to Qdrant (line 1542). Backend extracts via LLM.
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] firing ingest (local edges={len(edges)})")
+                await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
@@ -1590,9 +1717,16 @@ class Filter:
                     # Update conversation context for next turn
                     _update_conversation_context(user_id, facts, preferred_names)
 
+                    # Detect whether user is directly asking about identity/preferences.
+                    # Injects name directives only when the question warrants it (dBug-022).
+                    _query_asks_about_identity = any(
+                        sig in text.lower() for sig in _IDENTITY_QUERIES
+                    )
                     memory_block = self._build_memory_block(
                         text, facts, preferred_names, canonical_identity, entity_attributes,
-                        is_realtime=_is_realtime, locations=sorted(list(locations)) if locations else None
+                        is_realtime=_is_realtime,
+                        locations=sorted(list(locations)) if locations else None,
+                        expose_preferences=_query_asks_about_identity,
                     )
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
