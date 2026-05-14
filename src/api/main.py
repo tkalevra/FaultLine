@@ -3080,17 +3080,18 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
     try:
         hier_rels = list(_REL_TYPE_HIERARCHY)
         with db_conn.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(entity_ids))
-            params = [user_id] + list(entity_ids) + hier_rels
+            entity_placeholders = ",".join(["%s"] * len(entity_ids))
+            rel_placeholders = ",".join(["%s"] * len(hier_rels))
+            params_f = [user_id] + list(entity_ids) + hier_rels
             # Query facts table
             cur.execute(
                 f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
                 f"  confirmed_count, fact_class FROM facts "
-                f"WHERE user_id = %s AND subject_id IN ({placeholders})"
-                f"  AND rel_type = ANY(%s) AND superseded_at IS NULL"
+                f"WHERE user_id = %s AND subject_id IN ({entity_placeholders})"
+                f"  AND rel_type IN ({rel_placeholders}) AND superseded_at IS NULL"
                 f"  AND hard_delete_flag = false"
                 f"  AND (valid_until IS NULL OR valid_until > now())",
-                params,
+                params_f,
             )
             seen = set()
             for r in cur.fetchall():
@@ -3112,10 +3113,10 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
             cur.execute(
                 f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
                 f"  confirmed_count, fact_class, promoted_at, expires_at FROM staged_facts "
-                f"WHERE user_id = %s AND subject_id IN ({placeholders})"
-                f"  AND rel_type = ANY(%s) AND expires_at > now()"
+                f"WHERE user_id = %s AND subject_id IN ({entity_placeholders})"
+                f"  AND rel_type IN ({rel_placeholders}) AND expires_at > now()"
                 f"  AND promoted_at IS NULL",
-                params,
+                params_f,
             )
             for r in cur.fetchall():
                 key = (r[0], r[1], r[2])
@@ -3166,7 +3167,7 @@ def query(request: QueryRequest):
         Attaches fact_state metadata so the Filter can distinguish
         long-term (authoritative) from staged (provisional) facts.
         Returns list of {subject, object, rel_type, provenance, confidence,
-                          category, fact_state, fact_class,
+                          category, fact_state, fact_class, is_preferred_label,
                           staged_confirmations, promoted_at, expires_at} dicts.
         """
         results = []
@@ -3207,7 +3208,7 @@ def query(request: QueryRequest):
                 # --- Query 1: facts table (long-term) ---
                 f_query = (
                     f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
-                    f"  confirmed_count, fact_class FROM facts "
+                    f"  confirmed_count, fact_class, is_preferred_label FROM facts "
                     f"WHERE {f_where}"
                 )
                 cur.execute(f_query, f_params)
@@ -3223,6 +3224,7 @@ def query(request: QueryRequest):
                             "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
                             "fact_state": "long_term",
                             "fact_class": r[6] if r[6] else "A",
+                            "is_preferred_label": bool(r[7]) if r[7] is not None else False,
                             "staged_confirmations": r[5] if r[5] else 0,
                             "promoted_at": None,
                             "expires_at": None,
@@ -3248,6 +3250,7 @@ def query(request: QueryRequest):
                             "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
                             "fact_state": "staged",
                             "fact_class": r[6] if r[6] else "B",
+                            "is_preferred_label": False,
                             "staged_confirmations": r[5] if r[5] else 0,
                             "promoted_at": promoted,
                             "expires_at": expires,
