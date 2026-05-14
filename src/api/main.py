@@ -12,7 +12,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, StoreContextRequest, StoreContextResponse
+from .models import EdgeInput, EntityResult, FactResult, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse
 
 log = structlog.get_logger()
 
@@ -1663,6 +1663,101 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
         log.error("extract.gliner2_failed", error=str(e))
         return {"entities": []}
 
+
+@app.post("/extract/rewrite", response_model=dict)
+async def extract_rewrite(req: RewriteRequest) -> dict:
+    """
+    LLM-based triple extraction. Replaces OpenWebUI Filter direct LLM calls.
+
+    FaultLine is the SINGLE ENTRY POINT (8001). Filter no longer calls OpenWebUI:3000.
+    This eliminates brittleness on OpenWebUI internal API changes.
+
+    FaultLine internally:
+    - Reads QWEN_API_URL, WGM_LLM_MODEL from environment (configured once, not per-request)
+    - Calls the configured LLM backend (Qwen, Ollama, OpenAI, etc.)
+    - Returns extracted triples
+
+    Filter only needs to know: http://faultline:8001/extract/rewrite
+    """
+    try:
+        import json
+        import os
+
+        qwen_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+        llm_model = os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b")
+
+        # Build system prompt for triple extraction
+        system_prompt = """You are a fact extraction assistant. Extract relationships (triples) from text.
+Return a JSON array of triples: [{"subject": "X", "object": "Y", "rel_type": "relationship"}]
+Relationship types: also_known_as, pref_name, parent_of, child_of, spouse, sibling_of,
+friend_of, knows, works_for, lives_in, born_in, has_pet, likes, dislikes, and others.
+Always resolve pronouns to actual names when possible."""
+
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add conversation context if provided
+        if req.messages:
+            for msg in req.messages[-3:]:  # Last 3 turns for context
+                if msg.get("role") in ("user", "assistant"):
+                    messages.append(msg)
+
+        # Add user text
+        user_content = req.text
+        if req.typed_entities:
+            entity_lines = "\n".join(
+                f"- {e.get('subject')} ({e.get('subject_type', 'unknown')}) "
+                f"-- {e.get('object')} ({e.get('object_type', 'unknown')})"
+                for e in req.typed_entities
+                if e.get("subject") and e.get("object")
+            )
+            if entity_lines:
+                user_content += f"\n\nDetected entities:\n{entity_lines}"
+
+        messages.append({"role": "user", "content": user_content})
+
+        # Call LLM
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                qwen_url,
+                json={
+                    "model": llm_model,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "max_tokens": 400,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+
+        try:
+            triples = json.loads(content)
+            if not isinstance(triples, list):
+                triples = []
+        except json.JSONDecodeError:
+            # LLM returned non-JSON; try to extract JSON block
+            import re
+            match = re.search(r'\[.*\]', content, re.DOTALL)
+            triples = json.loads(match.group()) if match else []
+
+        log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
+        return {
+            "status": "success",
+            "triples": triples,
+            "error": None,
+        }
+
+    except Exception as e:
+        log.error("extract.rewrite_failed", error=str(e), user_id=req.user_id)
+        return {
+            "status": "error",
+            "triples": [],
+            "error": str(e),
+        }
+
+
 def _delete_from_qdrant(fact_ids: list[int], collection: str, qdrant_url: str) -> None:
     try:
         resp = httpx.delete(
@@ -1904,41 +1999,100 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
 
 
 @app.post("/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
-    inferred_relations = []
-    if model is not None and not req.edges:
-        try:
-            constraint = _get_constraint()
-            schema = {
-                "facts": [
-                    "subject::str::The full proper name of the first entity in the relationship. Never a pronoun.",
-                    "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the subject entity.",
-                    "object::str::The full proper name of the second entity in the relationship. Never a pronoun.",
-                    "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The semantic type of the object entity.",
-                    f"rel_type::[{constraint}]::str::The relationship type from subject to object. For 'X is a Y' where X is a named entity (person, place, thing), use instance_of. For 'X is a type of Y' where both are categories or classes, use subclass_of. Use pref_name for preferred display names, also_known_as for alternate names.",
-                ]
-            }
-            result = model.extract_json(req.text, schema)
-            # Post-process: resolve null subjects to "user" (first-person)
-            for fact in result.get("facts", []):
-                if fact.get("subject") is None and fact.get("object") is not None and fact.get("rel_type"):
-                    fact["subject"] = "user"
-                    fact["subject_type"] = "Person"
-            raw_inferred = [
-                EdgeInput(
-                    subject=fact["subject"].lower().strip(),
-                    object=fact["object"].lower().strip(),
-                    rel_type=fact["rel_type"].lower().strip(),
-                    subject_type=fact.get("subject_type"),
-                    object_type=fact.get("object_type")
-                )
-                for fact in result.get("facts", [])
-                if fact.get("subject") and fact.get("object") and fact.get("rel_type")
-            ]
+async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
+    """
+    Ingest endpoint orchestrates the FULL write-validated knowledge graph pipeline:
 
-            # Build entity type map from GLiNER2 output for use in alias resolution
-            # Only Person-type entities should have alias resolution applied
-            _entity_types: dict[str, str] = {}
+    If no edges provided (raw text input):
+      1. Call /extract for GLiNER2 entity typing (preflight)
+      2. Call /extract/rewrite for LLM triple extraction (semantic inference)
+      3. Validate through WGMValidationGate (ontological mapping)
+      4. Classify as A/B/C
+      5. Commit to PostgreSQL
+
+    If edges provided (pre-extracted):
+      - Skip to validation (useful for external extractors)
+
+    CRITICAL: This endpoint owns the entire pipeline. Filter is dumb — it just sends text here.
+    """
+    inferred_relations = []
+
+    # If raw text provided and no edges, extract via LLM rewrite
+    if not req.edges and req.text:
+        try:
+            import json
+
+            # Call /extract/rewrite to get LLM-inferred triples
+            qwen_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+            llm_model = os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b")
+
+            # Get typed entities first via GLiNER2
+            typed_entities = []
+            if model is not None:
+                try:
+                    constraint = _get_constraint()
+                    schema = {
+                        "facts": [
+                            "subject::str::Entity name",
+                            "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::Entity type",
+                            "object::str::Entity name",
+                            "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::Entity type",
+                            f"rel_type::[{constraint}]::str::Relationship type",
+                        ]
+                    }
+                    result = model.extract_json(req.text, schema)
+                    typed_entities = [
+                        {
+                            "subject": fact.get("subject", ""),
+                            "subject_type": fact.get("subject_type"),
+                            "object": fact.get("object", ""),
+                            "object_type": fact.get("object_type"),
+                        }
+                        for fact in result.get("facts", [])
+                        if fact.get("subject") and fact.get("object")
+                    ]
+                except Exception as e:
+                    log.warning("ingest.gliner2_failed", error=str(e))
+
+            # Call /extract/rewrite for LLM-based triple extraction
+            faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8000")
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{faultline_url}/extract/rewrite",
+                    json={
+                        "text": req.text,
+                        "user_id": req.user_id,
+                        "typed_entities": typed_entities if typed_entities else None,
+                        "memory_facts": None,
+                    },
+                    timeout=30,
+                )
+
+            if response.status_code == 200:
+                rewrite_data = response.json()
+                raw_inferred = [
+                    EdgeInput(
+                        subject=t.get("subject", "").lower().strip(),
+                        object=t.get("object", "").lower().strip(),
+                        rel_type=t.get("rel_type", "").lower().strip(),
+                        subject_type=t.get("subject_type"),
+                        object_type=t.get("object_type"),
+                    )
+                    for t in rewrite_data.get("triples", [])
+                    if t.get("subject") and t.get("object") and t.get("rel_type")
+                ]
+            else:
+                raw_inferred = []
+                log.warning("ingest.rewrite_failed", status=response.status_code)
+
+        except Exception as e:
+            raw_inferred = []
+            log.error("ingest.extraction_failed", error=str(e))
+
+        # Build entity type map from GLiNER2 output for use in alias resolution
+        # Only Person-type entities should have alias resolution applied
+        _entity_types: dict[str, str] = {}
+        if 'result' in locals():
             for fact in result.get("facts", []):
                 subj = (fact.get("subject") or "").lower().strip()
                 obj = (fact.get("object") or "").lower().strip()
@@ -1947,25 +2101,23 @@ def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if obj and fact.get("object_type"):
                     _entity_types[obj] = fact["object_type"].lower()
 
-            # Build a set of parent_of pairs from this batch for directionality validation
-            batch_parent_of = {
-                (e.object, e.subject)  # (child, parent) — flipped for lookup
-                for e in raw_inferred
-                if e.rel_type == "parent_of"
-            }
+        # Build a set of parent_of pairs from this batch for directionality validation
+        batch_parent_of = {
+            (e.object, e.subject)  # (child, parent) — flipped for lookup
+            for e in raw_inferred
+            if e.rel_type == "parent_of"
+        }
 
-            inferred_relations = []
-            for edge in raw_inferred:
-                if edge.rel_type == "child_of":
-                    # Only allow child_of(X, Y) if parent_of(Y, X) exists in this batch
-                    # i.e. (subject=X, object=Y) requires (X, Y) in batch_parent_of
-                    if (edge.subject, edge.object) not in batch_parent_of:
-                        log.warning("ingest.child_of_rejected_no_parent",
-                                    subject=edge.subject, object=edge.object)
-                        continue
-                inferred_relations.append(edge)
-        except Exception as e:
-            log.error("ingest.gliner2_failed", error=str(e))
+        inferred_relations = []
+        for edge in raw_inferred:
+            if edge.rel_type == "child_of":
+                # Only allow child_of(X, Y) if parent_of(Y, X) exists in this batch
+                # i.e. (subject=X, object=Y) requires (X, Y) in batch_parent_of
+                if (edge.subject, edge.object) not in batch_parent_of:
+                    log.warning("ingest.child_of_rejected_no_parent",
+                                subject=edge.subject, object=edge.object)
+                    continue
+            inferred_relations.append(edge)
 
     resolution = resolve_entities({"entities": []},
                                   context={"known_types": ["Person", "Organization", "Location"]})
