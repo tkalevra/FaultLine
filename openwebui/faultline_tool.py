@@ -1168,8 +1168,11 @@ class Filter:
                 continue
             if any(kw in preferred.lower() for kw in ("st ", "street", "ave", "road", "dr ", "lane")):
                 continue
+            # If canonical is a UUID, use the preferred display name instead
+            # to prevent UUID leakage to the LLM (dBug-024 edge case).
+            _display_canonical = preferred if _UUID_RE.match(canonical) else canonical
             _name_directives.append(
-                f"Always call {canonical.title() if len(canonical) > 2 else preferred.title()} by '{preferred.title()}'."
+                f"Always call {_display_canonical.title() if len(_display_canonical) > 2 else preferred.title()} by '{preferred.title()}'."
             )
 
         if facts:
