@@ -1666,6 +1666,20 @@ EXTRACT COMPREHENSIVELY:
 2. Entity types: instance_of (classify EVERY entity mentioned - person, location, organization, address, city, street, etc.)
 3. Hierarchies: For locations/addresses, extract nested containment (street→city→province→country)
 4. Identity: same_as (pronouns/collectives → known entity), pref_name, also_known_as
+
+   NAME LISTS → PREF_NAME + RELATIONSHIP: When text lists names belonging to a group,
+   extract BOTH the relationship AND pref_name for each name:
+   "My children are Gabby, Cyrus, and Des" →
+     (user, parent_of, gabby), (gabby, child_of, user),
+     (user, parent_of, cyrus), (cyrus, child_of, user),
+     (user, parent_of, des), (des, child_of, user),
+     (gabby, pref_name, gabby), (cyrus, pref_name, cyrus), (des, pref_name, des)
+   "My pets are Max and Luna" →
+     (user, has_pet, max), (max, instance_of, animal),
+     (user, has_pet, luna), (luna, instance_of, animal),
+     (max, pref_name, max), (luna, pref_name, luna)
+   RULE: For each name in a list after "are"/"is", emit BOTH the relationship AND pref_name.
+
 5. Attributes: age, occupation, nationality, etc. (as rel_type when object is a value)
 
 CRITICAL: Extract facts about EVERY entity in the text, not just the subject. For "I live at <address>, <city>, <state>":
@@ -1679,17 +1693,27 @@ CRITICAL: Extract facts about EVERY entity in the text, not just the subject. Fo
 
 FIRST-PERSON RULE: For first-person statements, ALWAYS use 'user' as the subject — never 'I', 'me', 'my', or 'we'.
 
+THIRD-PERSON PRONOUN RESOLUTION: When text contains "it", "they", "he", "she", "him", "her", "his", "them":
+- Look at prior conversation context to identify the most recently mentioned entity.
+- Replace the pronoun with THAT entity's name in the extracted triples.
+- "It" typically refers to the most recent non-person object, animal, or device mentioned.
+- "He"/"she"/"they" refer to the most recent person mentioned.
+- If no entity can be confidently resolved from context, do NOT guess — omit facts with unresolved pronouns.
+- NEVER use the pronoun literally as a subject or object in extracted triples.
+
 Include a one-line definition for each fact explaining whether it's relational (horizontal connection) or hierarchy (vertical classification).
 
 Return ONLY valid JSON array. No markdown, no explanations."""
 
         messages = [{"role": "system", "content": system_prompt}]
 
-        # Add conversation context if provided
+        # Add conversation context if provided.
+        # Take all user/assistant messages (up to 6) for pronoun resolution.
+        # The Filter may pack system hints between turns; we only want the dialogue.
         if req.messages:
-            for msg in req.messages[-3:]:  # Last 3 turns for context
-                if msg.get("role") in ("user", "assistant"):
-                    messages.append(msg)
+            _context_msgs = [m for m in req.messages if m.get("role") in ("user", "assistant")]
+            for msg in _context_msgs[-6:]:  # Up to 6 turns for context
+                messages.append(msg)
 
         # Add user text
         user_content = req.text
@@ -2011,6 +2035,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # normalizer and the req.edges normalizer below (dBug-023).
     _FIRST_PERSON_PRONOUNS = {"i", "me", "my", "myself", "we", "us", "our", "ourselves"}
 
+    # dprompt-086: Third-person pronouns must be resolved by the LLM from conversation
+    # context. If the LLM emits them literally, skip them — we cannot guess the referent.
+    _THIRD_PERSON_PRONOUNS = {"it", "he", "she", "him", "her", "his", "they", "them", "hers", "its"}
+
     # If raw text provided and no edges, extract via LLM rewrite
     if not req.edges and req.text:
         try:
@@ -2068,10 +2096,75 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Safety net — the /extract/rewrite prompt instructs the LLM to use "user",
                 # but LLMs may still output "I"/"me"/"my". Without this, registry.resolve()
                 # creates an orphaned UUID for the literal pronoun string (dBug-023).
+                # dprompt-23: First-person pronoun normalization (dBug-023)
                 for t in rewrite_data.get("triples", []):
                     subj = (t.get("subject") or "").lower().strip()
                     if subj in _FIRST_PERSON_PRONOUNS:
                         t["subject"] = "user"
+
+                # dprompt-086: Remove triples with unresolved third-person pronouns.
+                # The prompt instructs the LLM to resolve "it"/"he"/"she" from context;
+                # if the LLM emits them literally, we cannot guess the referent.
+                _triples_all = rewrite_data.get("triples", [])
+                _before = len(_triples_all)
+                _triples_all[:] = [
+                    t for t in _triples_all
+                    if (t.get("subject") or "").lower().strip() not in _THIRD_PERSON_PRONOUNS
+                ]
+                if len(_triples_all) < _before:
+                    log.warning("ingest.third_person_pronoun_dropped",
+                                count=(_before - len(_triples_all)),
+                                text_snippet=req.text[:80])
+
+                # dprompt-086: Comprehensive pref_name injection — for every entity
+                # mentioned by the LLM, ensure a pref_name anchor exists (dBug-024).
+                # The prompt instructs the LLM to emit pref_name for every entity,
+                # but LLMs may skip them. This safety net catches any missed entity
+                # regardless of relationship type.
+                _triples = rewrite_data.get("triples", [])
+                # Entity names that are type/classification labels or pronouns, not real entities
+                _ENTITY_TYPE_LABELS = {
+                    "person", "animal", "organization", "location", "object",
+                    "concept", "city", "state", "country", "address", "street",
+                    "province", "postal_code", "unknown", "entity",
+                    "computer", "server", "device", "laptop", "desktop",
+                    "phone", "tablet", "router", "switch", "printer",
+                    "ip_address", "hostname", "fqdn", "domain_name", "subnet",
+                }
+                # Pronouns that should never become entity names
+                _PRONOUN_STOPWORDS = _FIRST_PERSON_PRONOUNS | _THIRD_PERSON_PRONOUNS
+                # Collect every unique entity name across all triples (subjects + objects)
+                _all_entity_names = set()
+                for t in _triples:
+                    for _key in ("subject", "object"):
+                        _v = (t.get(_key) or "").lower().strip()
+                        if not _v:
+                            continue
+                        if _v == "user":
+                            continue
+                        if _UUID_PATTERN.match(_v):
+                            continue
+                        if _v in _ENTITY_TYPE_LABELS:
+                            continue
+                        if _v in _PRONOUN_STOPWORDS:
+                            continue
+                        _all_entity_names.add(_v)
+                # Collect entities that already have a pref_name triple
+                _existing_pref = {
+                    (t.get("subject") or "").lower().strip()
+                    for t in _triples
+                    if (t.get("rel_type") or "").lower().strip() == "pref_name"
+                }
+                # Inject missing pref_name anchors
+                for _name in sorted(_all_entity_names - _existing_pref):
+                    _triples.append({
+                        "subject": _name,
+                        "object": _name,
+                        "rel_type": "pref_name",
+                        "definition": "identity: entity name anchor"
+                    })
+                    log.info("ingest.pref_name_injected",
+                             entity=_name, reason="entity mentioned but missing pref_name")
                 raw_inferred = [
                     EdgeInput(
                         subject=t.get("subject", "").lower().strip(),
@@ -2137,6 +2230,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         subj = (edge.subject or "").lower().strip()
         if subj in _FIRST_PERSON_PRONOUNS:
             edge.subject = "user"
+        # dprompt-086: Skip edges with unresolved third-person pronouns.
+        if subj in _THIRD_PERSON_PRONOUNS:
+            log.warning("ingest.edges_third_person_pronoun_skipped",
+                        pronoun=subj, text_snippet=req.text[:80])
+            continue
         key = (edge.subject, edge.object, edge.rel_type)
         edges_dict[key] = edge
 
@@ -2244,7 +2342,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
 
             for edge in edges:
-                if edge.subject == edge.object: continue
+                # Skip truly self-referential facts (entity knows itself, etc.)
+                # but allow identity facts where subject == object is the norm
+                # e.g., (gabby, pref_name, gabby) — the entity IS its name.
+                if edge.subject == edge.object:
+                    if edge.rel_type.lower() not in ("pref_name", "also_known_as"):
+                        continue
 
                 # Age fact validation: reject non-numeric age objects (GLiNER2 false positives)
                 if edge.rel_type.lower() == "age":
@@ -3221,6 +3324,16 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.info("ingest.pref_name_correction_aliases_updated",
                                      entity=correction_subject,
                                      corrected_name=_corrected_obj_display)
+                            # dprompt-086: Trigger name conflict re-evaluation when user-stated
+                            # pref_name arrives. The re_embedder.resolve_name_conflicts() function
+                            # (planned, not yet implemented) would be called here with:
+                            #   (user_id, correction_subject, _corrected_obj_display)
+                            # to disambiguate which entity should hold the preferred name and
+                            # resolve pending disputes in entity_name_conflicts table.
+                            log.info("ingest.name_conflict_resolver_trigger_point",
+                                     entity=correction_subject,
+                                     new_pref_name=_corrected_obj_display,
+                                     note="resolver not yet implemented — entity_aliases updated inline")
 
                     db.commit()
         finally: db.close()

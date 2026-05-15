@@ -12,6 +12,7 @@ class EdgeInput(BaseModel):
     fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
     subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
+    definition: Optional[str] = None  # semantic definition of rel_type, LLM-generated at extraction time (dprompt-85)
 
 
 class ExtractContext(BaseModel):
@@ -91,3 +92,21 @@ class StoreContextRequest(BaseModel):
 class StoreContextResponse(BaseModel):
     status: str  # "stored" or "error"
     point_id: str  # Qdrant point UUID
+
+
+class RewriteRequest(BaseModel):
+    """Request for LLM-based fact extraction (triple rewriting).
+    Called by OpenWebUI Filter instead of hitting OpenWebUI's LLM directly.
+    FaultLine controls which LLM to use and manages all LLM configuration."""
+    text: str
+    user_id: Optional[str] = "anonymous"
+    messages: list[dict] | None = None  # Prior conversation context
+    typed_entities: list[dict] | None = None  # Pre-extracted entities from GLiNER2
+    memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution
+
+
+class RewriteResponse(BaseModel):
+    """LLM-extracted triples (facts) from input text."""
+    status: str  # "success" or "error"
+    triples: list[EdgeInput] = []  # Extracted facts with types
+    error: Optional[str] = None
