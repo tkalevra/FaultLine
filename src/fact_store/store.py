@@ -9,14 +9,18 @@ class FactStoreManager:
         """
         Insert edges into facts.
         connections: list of (user_id, subject_id, object_id, rel_type, provenance) or
-                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label).
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label) or
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition).
         Returns count of rows attempted. Rolls back and re-raises on psycopg2.Error.
         """
         count = 0
         try:
             with self.db_conn.cursor() as cur:
                 for row in connections:
-                    if len(row) == 6:
+                    definition = ""
+                    if len(row) >= 7:
+                        user_id, sub, obj, rel, prov, is_preferred, definition = row
+                    elif len(row) == 6:
                         user_id, sub, obj, rel, prov, is_preferred = row
                     else:
                         user_id, sub, obj, rel, prov = row
@@ -24,14 +28,15 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, source_weight, is_preferred_label)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, source_weight, is_preferred_label, rel_type_definition)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
-                        "   updated_at      = now()",
-                        (user_id, sub, obj, rel, prov, confidence, source_weight, is_preferred),
+                        "   updated_at      = now(),"
+                        "   rel_type_definition = EXCLUDED.rel_type_definition",
+                        (user_id, sub, obj, rel, prov, confidence, source_weight, is_preferred, definition),
                     )
                     count += 1
             self.db_conn.commit()
