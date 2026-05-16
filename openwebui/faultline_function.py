@@ -1578,85 +1578,12 @@ class Filter:
                     raw_triples = []
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
-                # /ingest endpoint now owns the entire pipeline (extract → validate → classify → commit)
-                # Filter is dumb — just send text. /ingest handles LLM extraction, WGM validation, etc.
-                # This eliminates brittleness: all ontological logic in one place (backend), not Filter.
-                raw_triples = []
-                basic_edges = []
-
-                # Still extract corrections via regex (explicit user signals supersede LLM inference)
-                if not _skip_rewrite:
-                    try:
-                        from src.extraction.compound import extract_compound_facts
-                        basic_edges = extract_compound_facts(clean_text)
-                    except ImportError:
-                        basic_edges = _extract_basic_facts(clean_text)
-                    except Exception:
-                        basic_edges = _extract_basic_facts(clean_text)
-
-                # Filter only augments with corrections (explicit user signals)
-                if basic_edges:
-                    _augment_edges = [
-                        e for e in basic_edges
-                        if e.get("is_correction")
-                    ]
-                    # Merge: existing triples + augment edges (dedup by key)
-                    _existing_keys = {(e.get("subject"), e.get("object"), e.get("rel_type"))
-                                      for e in raw_triples if e.get("subject") and e.get("object")}
-                    for aug in _augment_edges:
-                        _key = (aug["subject"], aug["object"], aug["rel_type"])
-                        if _key not in _existing_keys:
-                            raw_triples.append(aug)
-                            _existing_keys.add(_key)
-                    if self.valves.ENABLE_DEBUG and _augment_edges:
-                        print(f"[FaultLine Filter] regex augment added {len(_augment_edges)} correction edge(s) "
-                              f"to LLM output")
-                    # Full fallback: if LLM returned nothing at all, use ALL basic edges
-                    if not raw_triples:
-                        raw_triples = basic_edges
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] regex full fallback extracted {len(raw_triples)} basic fact(s)")
-
-                _PRONOUNS = {"i", "me", "my", "we", "us", "our", "he", "she", "it", "they", "them"}
-                edges = [
-                    {
-                        "subject": e["subject"],
-                        "object": e["object"],
-                        "rel_type": e["rel_type"],
-                        "is_preferred_label": e.get("is_preferred_label", False),
-                        "is_correction": e.get("is_correction", False),
-                    }
-                    for e in raw_triples
-                    if (e.get("rel_type") == "pref_name" or not e.get("low_confidence", False))
-                    and e.get("subject") and e.get("object") and e.get("rel_type")
-                    and e.get("subject", "").lower() not in _PRONOUNS
-                    and e.get("object", "").lower() not in _PRONOUNS
-                ]
-
-                # Guard: "user → also_known_as" edges require first-person self-ID or preference signal
-                # to prevent false positives (e.g., "her name is Marla" → "user also_known_as marla").
-                # But "user → pref_name" edges are always allowed — extraction itself is the intent signal.
-                before = len(edges)
-                edges = [
-                    e for e in edges
-                    if not (
-                        e["subject"].lower() == "user"
-                        and e["rel_type"].lower() == "also_known_as"
-                        and not (_has_self_id or _has_preference_signal)
-                    )
-                ]
-                if self.valves.ENABLE_DEBUG and len(edges) < before:
-                    print(
-                        f"[FaultLine Filter] dropped {before - len(edges)} "
-                        f"user→also_known_as edge(s): no first-person self-ID or preference signal in text"
-                    )
-
-                # ALWAYS call ingest when will_ingest=True. /ingest owns the extraction pipeline.
-                # Filter is dumb — backend is smart. Don't gate on local edge extraction.
-                # Raw text already cached to Qdrant (line 1542). Backend extracts via LLM.
+                # /ingest endpoint owns the entire pipeline (extract → validate → classify → commit)
+                # Filter is dumb — send ONLY raw text, NO edges. /ingest will call /extract/rewrite for full LLM extraction.
+                # This ensures parent_of, bidirectional relationships, and all complex patterns are extracted properly.
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] firing ingest (local edges={len(edges)})")
-                await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=edges)
+                    print(f"[FaultLine Filter] firing ingest with raw text (no pre-extracted edges)")
+                await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=None)
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):
