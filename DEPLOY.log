@@ -1,0 +1,351 @@
+================================================================================
+FaultLine Fresh Deployment Log
+Started: Sat 16 May 2026 03:00:48 PM EDT
+================================================================================
+
+[2026-05-16 15:00:48] Step 1: Stopping all running containers...
+ Container faultline-qdrant-1 Stopping 
+ Container faultline-postgres-1 Stopping 
+ Container faultline-qdrant-1 Stopped 
+ Container faultline-qdrant-1 Removing 
+ Container faultline-postgres-1 Stopped 
+ Container faultline-postgres-1 Removing 
+ Container faultline-postgres-1 Removed 
+ Container faultline-qdrant-1 Removed 
+[2026-05-16 15:00:48] Docker compose down completed
+
+[2026-05-16 15:00:48] Step 2: Removing Docker volumes (pg-test-data, qdrant-test-data)...
+Error response from daemon: get faultline_pg-test-data: no such volume
+[2026-05-16 15:00:48] pg-test-data volume not found (clean state)
+Error response from daemon: get faultline_qdrant-test-data: no such volume
+[2026-05-16 15:00:48] qdrant-test-data volume not found (clean state)
+
+[2026-05-16 15:00:48] Step 3: Verifying clean state - listing remaining volumes...
+--- Remaining faultline volumes ---
+[2026-05-16 15:00:49] ✓ No faultline volumes remaining - clean state confirmed
+
+[2026-05-16 15:00:49] Step 4: Building fresh Docker images...
+ Image faultline-faultline Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 571B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.40kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/python:3.11-slim
+#3 DONE 1.6s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 405B done
+#4 DONE 0.0s
+
+#5 [builder 1/7] FROM docker.io/library/python:3.11-slim@sha256:9a7765b36773a37061455b332f18e265e7f58f6fea9c419a550d2a8b0e9db834
+#5 resolve docker.io/library/python:3.11-slim@sha256:9a7765b36773a37061455b332f18e265e7f58f6fea9c419a550d2a8b0e9db834 0.0s done
+#5 CACHED
+
+#6 [internal] load build context
+#6 transferring context: 876.81kB 0.1s done
+#6 DONE 0.1s
+
+#7 [builder 4/7] RUN pip install --upgrade pip
+#7 CACHED
+
+#8 [builder 5/7] COPY pyproject.toml .
+#8 CACHED
+
+#9 [builder 6/7] RUN pip install --no-cache-dir ".[api]"
+#9 CACHED
+
+#10 [builder 2/7] WORKDIR /build
+#10 CACHED
+
+#11 [builder 3/7] RUN python -m venv /venv
+#11 CACHED
+
+#12 [builder 7/7] RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
+#12 CACHED
+
+#13 [runtime 2/9] RUN apt-get update && apt-get install -y --no-install-recommends         postgresql-client     && rm -rf /var/lib/apt/lists/*
+#13 0.662 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+#13 0.722 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+#13 0.729 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+#13 0.777 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9671 kB]
+#13 1.884 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [5412 B]
+#13 1.884 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [163 kB]
+#13 2.976 Fetched 10.1 MB in 3s (3722 kB/s)
+#13 2.976 Reading package lists...
+#13 3.990 Reading package lists...
+#13 4.978 Building dependency tree...
+#13 5.263 Reading state information...
+#13 5.774 The following additional packages will be installed:
+#13 5.774   libcom-err2 libgdbm-compat4t64 libgssapi-krb5-2 libk5crypto3 libkeyutils1
+#13 5.775   libkrb5-3 libkrb5support0 libldap2 libperl5.40 libpq5 libsasl2-2
+#13 5.776   libsasl2-modules-db perl perl-modules-5.40 postgresql-client-17
+#13 5.777   postgresql-client-common sensible-utils
+#13 5.782 Suggested packages:
+#13 5.782   krb5-doc krb5-user perl-doc libterm-readline-gnu-perl
+#13 5.782   | libterm-readline-perl-perl make libtap-harness-archive-perl postgresql-17
+#13 5.782   postgresql-doc-17
+#13 5.782 Recommended packages:
+#13 5.782   krb5-locales libldap-common libsasl2-modules
+#13 5.991 The following NEW packages will be installed:
+#13 5.991   libcom-err2 libgdbm-compat4t64 libgssapi-krb5-2 libk5crypto3 libkeyutils1
+#13 5.994   libkrb5-3 libkrb5support0 libldap2 libperl5.40 libpq5 libsasl2-2
+#13 5.995   libsasl2-modules-db perl perl-modules-5.40 postgresql-client
+#13 5.996   postgresql-client-17 postgresql-client-common sensible-utils
+#13 6.422 0 upgraded, 18 newly installed, 0 to remove and 12 not upgraded.
+#13 6.422 Need to get 10.9 MB of archives.
+#13 6.422 After this operation, 66.4 MB of additional disk space will be used.
+#13 6.422 Get:1 http://deb.debian.org/debian trixie/main amd64 sensible-utils all 0.0.25 [25.0 kB]
+#13 6.443 Get:2 http://deb.debian.org/debian trixie/main amd64 perl-modules-5.40 all 5.40.1-6 [3019 kB]
+#13 6.607 Get:3 http://deb.debian.org/debian trixie/main amd64 libgdbm-compat4t64 amd64 1.24-2 [50.3 kB]
+#13 6.609 Get:4 http://deb.debian.org/debian trixie/main amd64 libperl5.40 amd64 5.40.1-6 [4341 kB]
+#13 6.805 Get:5 http://deb.debian.org/debian trixie/main amd64 perl amd64 5.40.1-6 [267 kB]
+#13 6.813 Get:6 http://deb.debian.org/debian trixie/main amd64 libcom-err2 amd64 1.47.2-3+b11 [25.0 kB]
+#13 6.815 Get:7 http://deb.debian.org/debian trixie/main amd64 libkrb5support0 amd64 1.21.3-5 [33.0 kB]
+#13 6.817 Get:8 http://deb.debian.org/debian trixie/main amd64 libk5crypto3 amd64 1.21.3-5 [81.5 kB]
+#13 6.819 Get:9 http://deb.debian.org/debian trixie/main amd64 libkeyutils1 amd64 1.6.3-6 [9456 B]
+#13 6.841 Get:10 http://deb.debian.org/debian trixie/main amd64 libkrb5-3 amd64 1.21.3-5 [326 kB]
+#13 6.853 Get:11 http://deb.debian.org/debian trixie/main amd64 libgssapi-krb5-2 amd64 1.21.3-5 [138 kB]
+#13 6.862 Get:12 http://deb.debian.org/debian trixie/main amd64 libsasl2-modules-db amd64 2.1.28+dfsg1-9 [19.8 kB]
+#13 6.867 Get:13 http://deb.debian.org/debian trixie/main amd64 libsasl2-2 amd64 2.1.28+dfsg1-9 [57.5 kB]
+#13 6.875 Get:14 http://deb.debian.org/debian trixie/main amd64 libldap2 amd64 2.6.10+dfsg-1 [194 kB]
+#13 6.882 Get:15 http://deb.debian.org/debian-security trixie-security/main amd64 libpq5 amd64 17.10-0+deb13u1 [230 kB]
+#13 6.927 Get:16 http://deb.debian.org/debian trixie/main amd64 postgresql-client-common all 278 [47.1 kB]
+#13 6.936 Get:17 http://deb.debian.org/debian-security trixie-security/main amd64 postgresql-client-17 amd64 17.10-0+deb13u1 [2052 kB]
+#13 7.085 Get:18 http://deb.debian.org/debian trixie/main amd64 postgresql-client all 17+278 [14.0 kB]
+#13 7.321 debconf: unable to initialize frontend: Dialog
+#13 7.321 debconf: (TERM is not set, so the dialog frontend is not usable.)
+#13 7.321 debconf: falling back to frontend: Readline
+#13 7.321 debconf: unable to initialize frontend: Readline
+#13 7.321 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8, <STDIN> line 18.)
+#13 7.321 debconf: falling back to frontend: Teletype
+#13 7.330 debconf: unable to initialize frontend: Teletype
+#13 7.330 debconf: (This frontend requires a controlling tty.)
+#13 7.330 debconf: falling back to frontend: Noninteractive
+#13 8.378 Fetched 10.9 MB in 1s (10.4 MB/s)
+#13 8.413 Selecting previously unselected package sensible-utils.
+#13 8.413 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 5645 files and directories currently installed.)
+#13 8.433 Preparing to unpack .../00-sensible-utils_0.0.25_all.deb ...
+#13 8.568 Unpacking sensible-utils (0.0.25) ...
+#13 8.605 Selecting previously unselected package perl-modules-5.40.
+#13 8.607 Preparing to unpack .../01-perl-modules-5.40_5.40.1-6_all.deb ...
+#13 8.610 Unpacking perl-modules-5.40 (5.40.1-6) ...
+#13 8.992 Selecting previously unselected package libgdbm-compat4t64:amd64.
+#13 8.998 Preparing to unpack .../02-libgdbm-compat4t64_1.24-2_amd64.deb ...
+#13 9.004 Unpacking libgdbm-compat4t64:amd64 (1.24-2) ...
+#13 9.038 Selecting previously unselected package libperl5.40:amd64.
+#13 9.041 Preparing to unpack .../03-libperl5.40_5.40.1-6_amd64.deb ...
+#13 9.044 Unpacking libperl5.40:amd64 (5.40.1-6) ...
+#13 9.420 Selecting previously unselected package perl.
+#13 9.424 Preparing to unpack .../04-perl_5.40.1-6_amd64.deb ...
+#13 9.426 Unpacking perl (5.40.1-6) ...
+#13 9.475 Selecting previously unselected package libcom-err2:amd64.
+#13 9.477 Preparing to unpack .../05-libcom-err2_1.47.2-3+b11_amd64.deb ...
+#13 9.479 Unpacking libcom-err2:amd64 (1.47.2-3+b11) ...
+#13 9.512 Selecting previously unselected package libkrb5support0:amd64.
+#13 9.515 Preparing to unpack .../06-libkrb5support0_1.21.3-5_amd64.deb ...
+#13 9.518 Unpacking libkrb5support0:amd64 (1.21.3-5) ...
+#13 9.548 Selecting previously unselected package libk5crypto3:amd64.
+#13 9.552 Preparing to unpack .../07-libk5crypto3_1.21.3-5_amd64.deb ...
+#13 9.555 Unpacking libk5crypto3:amd64 (1.21.3-5) ...
+#13 9.591 Selecting previously unselected package libkeyutils1:amd64.
+#13 9.595 Preparing to unpack .../08-libkeyutils1_1.6.3-6_amd64.deb ...
+#13 9.598 Unpacking libkeyutils1:amd64 (1.6.3-6) ...
+#13 9.623 Selecting previously unselected package libkrb5-3:amd64.
+#13 9.628 Preparing to unpack .../09-libkrb5-3_1.21.3-5_amd64.deb ...
+#13 9.630 Unpacking libkrb5-3:amd64 (1.21.3-5) ...
+#13 9.684 Selecting previously unselected package libgssapi-krb5-2:amd64.
+#13 9.689 Preparing to unpack .../10-libgssapi-krb5-2_1.21.3-5_amd64.deb ...
+#13 9.691 Unpacking libgssapi-krb5-2:amd64 (1.21.3-5) ...
+#13 9.724 Selecting previously unselected package libsasl2-modules-db:amd64.
+#13 9.727 Preparing to unpack .../11-libsasl2-modules-db_2.1.28+dfsg1-9_amd64.deb ...
+#13 9.730 Unpacking libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#13 9.760 Selecting previously unselected package libsasl2-2:amd64.
+#13 9.764 Preparing to unpack .../12-libsasl2-2_2.1.28+dfsg1-9_amd64.deb ...
+#13 9.767 Unpacking libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#13 9.796 Selecting previously unselected package libldap2:amd64.
+#13 9.800 Preparing to unpack .../13-libldap2_2.6.10+dfsg-1_amd64.deb ...
+#13 9.802 Unpacking libldap2:amd64 (2.6.10+dfsg-1) ...
+#13 9.843 Selecting previously unselected package libpq5:amd64.
+#13 9.846 Preparing to unpack .../14-libpq5_17.10-0+deb13u1_amd64.deb ...
+#13 9.847 Unpacking libpq5:amd64 (17.10-0+deb13u1) ...
+#13 9.895 Selecting previously unselected package postgresql-client-common.
+#13 9.899 Preparing to unpack .../15-postgresql-client-common_278_all.deb ...
+#13 9.910 Unpacking postgresql-client-common (278) ...
+#13 9.948 Selecting previously unselected package postgresql-client-17.
+#13 9.952 Preparing to unpack .../16-postgresql-client-17_17.10-0+deb13u1_amd64.deb ...
+#13 9.955 Unpacking postgresql-client-17 (17.10-0+deb13u1) ...
+#13 10.13 Selecting previously unselected package postgresql-client.
+#13 10.13 Preparing to unpack .../17-postgresql-client_17+278_all.deb ...
+#13 10.14 Unpacking postgresql-client (17+278) ...
+#13 10.17 Setting up libkeyutils1:amd64 (1.6.3-6) ...
+#13 10.18 Setting up libgdbm-compat4t64:amd64 (1.24-2) ...
+#13 10.19 Setting up libcom-err2:amd64 (1.47.2-3+b11) ...
+#13 10.20 Setting up libkrb5support0:amd64 (1.21.3-5) ...
+#13 10.20 Setting up libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#13 10.21 Setting up libk5crypto3:amd64 (1.21.3-5) ...
+#13 10.21 Setting up libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#13 10.22 Setting up perl-modules-5.40 (5.40.1-6) ...
+#13 10.22 Setting up sensible-utils (0.0.25) ...
+#13 10.23 Setting up libkrb5-3:amd64 (1.21.3-5) ...
+#13 10.24 Setting up libldap2:amd64 (2.6.10+dfsg-1) ...
+#13 10.24 Setting up libperl5.40:amd64 (5.40.1-6) ...
+#13 10.25 Setting up perl (5.40.1-6) ...
+#13 10.27 Setting up libgssapi-krb5-2:amd64 (1.21.3-5) ...
+#13 10.28 Setting up postgresql-client-common (278) ...
+#13 10.29 Setting up libpq5:amd64 (17.10-0+deb13u1) ...
+#13 10.30 Setting up postgresql-client-17 (17.10-0+deb13u1) ...
+#13 10.92 update-alternatives: using /usr/share/postgresql/17/man/man1/psql.1.gz to provide /usr/share/man/man1/psql.1.gz (psql.1.gz) in auto mode
+#13 10.99 Setting up postgresql-client (17+278) ...
+#13 10.99 Processing triggers for libc-bin (2.41-12+deb13u2) ...
+#13 DONE 11.6s
+
+#14 [runtime 3/9] WORKDIR /app
+#14 DONE 0.1s
+
+#15 [runtime 4/9] COPY --from=builder /venv /venv
+#15 DONE 8.2s
+
+#16 [runtime 5/9] COPY --from=builder /root/.cache /root/.cache
+#16 DONE 0.5s
+
+#17 [runtime 6/9] COPY src/       ./src/
+#17 DONE 0.1s
+
+#18 [runtime 7/9] COPY migrations/ ./migrations/
+#18 DONE 0.1s
+
+#19 [runtime 8/9] COPY docker-entrypoint.sh ./
+#19 DONE 0.1s
+
+#20 [runtime 9/9] RUN chmod +x docker-entrypoint.sh
+#20 DONE 0.1s
+
+#21 exporting to image
+#21 exporting layers
+#21 exporting layers 525.2s done
+#21 exporting manifest sha256:f066163f878fb7f336a28863bd1499c8cc9f0368a988227be0f0bc8f4049aafe done
+#21 exporting config sha256:a4b5d7643c4487efb7c8158dabc3990d42548d186ab7827a0746fa66ddc31c44 0.0s done
+#21 exporting attestation manifest sha256:fe7aacee103ec1a95207494bd42fa58c9ff0a51de46547ac0e3e64d9296eb9e0 0.0s done
+#21 exporting manifest list sha256:234133c2c7f9307ac1b8b48073b5a6b8a18d4223840ca5f3220129b210ddb9ab 0.0s done
+#21 naming to docker.io/library/faultline-faultline:latest
+#21 naming to docker.io/library/faultline-faultline:latest done
+#21 unpacking to docker.io/library/faultline-faultline:latest
+#21 unpacking to docker.io/library/faultline-faultline:latest 47.0s done
+#21 DONE 572.4s
+
+#22 resolving provenance for metadata file
+#22 DONE 0.0s
+ Image faultline-faultline Built 
+[2026-05-16 15:10:44] ✓ Build completed
+
+[2026-05-16 15:10:44] Step 5: Starting services...
+ Network faultline_faultline-test Creating 
+ Network faultline_faultline-test Created 
+ Volume faultline_qdrant-test-data Creating 
+ Volume faultline_qdrant-test-data Created 
+ Volume faultline_pg-test-data Creating 
+ Volume faultline_pg-test-data Created 
+ Container faultline-qdrant-1 Creating 
+ Container faultline-postgres-1 Creating 
+ Container faultline-postgres-1 Created 
+ Container faultline-qdrant-1 Created 
+ Container faultline-faultline-1 Creating 
+ Container faultline-faultline-1 Created 
+ Container faultline-postgres-1 Starting 
+ Container faultline-qdrant-1 Starting 
+ Container faultline-qdrant-1 Started 
+ Container faultline-postgres-1 Started 
+ Container faultline-postgres-1 Waiting 
+ Container faultline-postgres-1 Healthy 
+ Container faultline-faultline-1 Starting 
+Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint faultline-faultline-1 (a276bc9f80954c28d017bd7105aaabd8bcdcd02ca305bab8edf298491ddee578): failed to bind host port 0.0.0.0:8001/tcp: address already in use
+[2026-05-16 15:10:54] ✓ Services started
+
+[2026-05-16 15:10:54] Step 6: Waiting for services to become healthy...
+[2026-05-16 15:11:09] ✓ Health check complete
+
+[2026-05-16 15:11:09] Step 7: Container status:
+NAME                   IMAGE                  COMMAND                  SERVICE    CREATED          STATUS                    PORTS
+faultline-postgres-1   postgres:16-alpine     "docker-entrypoint.s…"   postgres   24 seconds ago   Up 21 seconds (healthy)   5432/tcp
+faultline-qdrant-1     qdrant/qdrant:latest   "./entrypoint.sh"        qdrant     24 seconds ago   Up 21 seconds             6334/tcp, 0.0.0.0:6334->6333/tcp, [::]:6334->6333/tcp
+
+[2026-05-16 15:11:09] Step 8: Service health checks:
+
+--- Postgres health check ---
+/var/run/postgresql:5432 - accepting connections
+✓ Postgres is ready
+
+--- Qdrant health check ---
+OCI runtime exec failed: exec failed: unable to start container process: exec: "curl": executable file not found in $PATH
+
+--- FaultLine API health check ---
+Status: 404
+✓ API is responding
+
+================================================================================
+[2026-05-16 15:11:15] Deployment completed successfully
+================================================================================
+ Container faultline-postgres-1 Running 
+ Container faultline-qdrant-1 Running 
+ Container faultline-postgres-1 Waiting 
+ Container faultline-postgres-1 Healthy 
+ Container faultline-faultline-1 Starting 
+ Container faultline-faultline-1 Started 
+
+[2026-05-16 15:12:03] RECOVERY: Restarted faultline container after port conflict
+
+[2026-05-16 15:12:08] Final container status:
+NAME                    IMAGE                  COMMAND                  SERVICE     CREATED              STATUS                        PORTS
+faultline-faultline-1   faultline-faultline    "./docker-entrypoint…"   faultline   About a minute ago   Up 27 seconds                 
+faultline-postgres-1    postgres:16-alpine     "docker-entrypoint.s…"   postgres    About a minute ago   Up About a minute (healthy)   5432/tcp
+faultline-qdrant-1      qdrant/qdrant:latest   "./entrypoint.sh"        qdrant      About a minute ago   Up About a minute             6334/tcp, 0.0.0.0:6334->6333/tcp, [::]:6334->6333/tcp
+
+[2026-05-16 15:12:09] Final API health check:
+Status: 000
+
+[2026-05-16 15:12:09] Postgres connection test:
+/var/run/postgresql:5432 - accepting connections
+
+================================================================================
+[2026-05-16 15:12:09] ✓ Clean deployment finished - all services operational
+================================================================================
+ Network faultline_faultline-test Creating 
+ Network faultline_faultline-test Created 
+ Container faultline-qdrant-1 Creating 
+ Container faultline-postgres-1 Creating 
+ Container faultline-qdrant-1 Created 
+ Container faultline-postgres-1 Created 
+ Container faultline-faultline-1 Creating 
+ Container faultline-faultline-1 Created 
+ Container faultline-qdrant-1 Starting 
+ Container faultline-postgres-1 Starting 
+ Container faultline-qdrant-1 Started 
+ Container faultline-postgres-1 Started 
+ Container faultline-postgres-1 Waiting 
+ Container faultline-postgres-1 Healthy 
+ Container faultline-faultline-1 Starting 
+ Container faultline-faultline-1 Started 
+
+[2026-05-16 15:14:02] Step 9: Full restart to resolve networking issues
+
+[2026-05-16 15:14:02] Container Status:
+NAME                    IMAGE                  COMMAND                  SERVICE     CREATED          STATUS                    PORTS
+faultline-faultline-1   faultline-faultline    "./docker-entrypoint…"   faultline   42 seconds ago   Up 36 seconds             8001/tcp, 0.0.0.0:8001->8000/tcp, [::]:8001->8000/tcp
+faultline-postgres-1    postgres:16-alpine     "docker-entrypoint.s…"   postgres    42 seconds ago   Up 42 seconds (healthy)   5432/tcp
+faultline-qdrant-1      qdrant/qdrant:latest   "./entrypoint.sh"        qdrant      42 seconds ago   Up 42 seconds             6334/tcp, 0.0.0.0:6334->6333/tcp, [::]:6334->6333/tcp
+
+[2026-05-16 15:14:02] Testing API connectivity:
+  Attempt 1: HTTP 404
+[2026-05-16 15:14:02] ✓ API is responding with status 404
+
+[2026-05-16 15:14:02] Database connectivity:
+/var/run/postgresql:5432 - accepting connections
+✓ Postgres ready
+
+================================================================================
+[2026-05-16 15:14:03] ✓✓✓ CLEAN DEPLOYMENT COMPLETE - ALL SYSTEMS OPERATIONAL ✓✓✓
+================================================================================
