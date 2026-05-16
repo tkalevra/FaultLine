@@ -243,7 +243,7 @@ services:
 
 ### OpenWebUI Integration
 
-FaultLine integrates with OpenWebUI as a **Filter** (`openwebui/faultline_tool.py`). The filter intercepts conversations for fact extraction and memory injection. Deploy the filter file to your OpenWebUI instance's filter directory.
+FaultLine integrates with OpenWebUI as a **Filter** (`openwebui/faultline_filter.py`). The filter intercepts conversations for fact extraction and memory injection. Deploy the filter file to your OpenWebUI instance's filter directory.
 
 ## Development
 
