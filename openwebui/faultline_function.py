@@ -1260,13 +1260,14 @@ class Filter:
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
                 rel = f.get("rel_type", "")
+                label = f.get("definition", rel).lower() if f.get("definition") else rel
 
                 if identity and subj in _user_anchors:
-                    lines.append(f"{rel}: {obj}")
+                    lines.append(f"{label}: {obj}")
                 elif identity and obj in _user_anchors:
-                    lines.append(f"{_dn(subj)} ← {rel}")
+                    lines.append(f"{_dn(subj)} ← {label}")
                 else:
-                    lines.append(f"{_dn(subj)} → {rel} → {_dn(obj)}")
+                    lines.append(f"{_dn(subj)} → {label} → {_dn(obj)}")
 
             # Display attributes for all entities mentioned in facts
             if entity_attributes:
