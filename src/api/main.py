@@ -1864,6 +1864,146 @@ def apply_archive_filter(db, query_lower: str, user_id: str,
         log.error("archive_filter.failed", error=str(e), user_id=user_id)
         raise
 
+
+# ── dBug-027 & dBug-026: Metadata-driven validation and entity filtering ──
+
+def _validate_rel_type_constraints(fact_dict: dict, rel_type_meta: dict, db) -> tuple[bool, str]:
+    """
+    Validate fact against rel_type metadata constraints (dprompt-97).
+
+    Uses rel_types metadata to enforce:
+    - head_types: subject entity_type must be in this list
+    - tail_types: object value type must be in this list (SCALAR or entity type)
+    - is_leaf_only: object cannot have children in hierarchy
+    - pref_name specifically: object must be name-like (1-2 capital words)
+
+    Returns (is_valid, reason) tuple.
+    """
+    if not rel_type_meta:
+        return True, "no_metadata"
+
+    subject_type = fact_dict.get("subject_type", "unknown")
+    tail_types = rel_type_meta.get("tail_types", [])
+    rel_type = fact_dict.get("rel_type", "").lower()
+    obj = fact_dict.get("object", "")
+
+    # Constraint: If rel_type is scalar (tail_types={'SCALAR'}), object must be string value
+    if tail_types and (tail_types == ["SCALAR"] or set(tail_types) == {"SCALAR"}):
+        if isinstance(obj, str):
+            # pref_name specifically: must be actual name pattern (1-2 capital words)
+            if rel_type == "pref_name":
+                words = obj.split()
+                is_name_like = (
+                    len(words) <= 2 and
+                    all(w and w[0].isupper() for w in words if w)
+                )
+                if not is_name_like:
+                    return False, f"pref_name must be name-like (1-2 capital words), not '{obj}'"
+
+    # Constraint: head_types validation — subject entity_type must be allowed
+    head_types = rel_type_meta.get("head_types", [])
+    if head_types and "ANY" not in head_types:
+        if subject_type and subject_type not in head_types:
+            return False, f"subject_type '{subject_type}' not in {head_types} for rel_type '{rel_type}'"
+
+    # Constraint: is_leaf_only — object cannot have children in hierarchy
+    if rel_type_meta.get("is_leaf_only"):
+        obj_id = fact_dict.get("object_id")
+        if obj_id:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM facts WHERE subject_id = %s AND is_hierarchy_rel = true",
+                        (obj_id,)
+                    )
+                    if cur.fetchone()[0] > 0:
+                        return False, f"object {obj_id} has hierarchy children, cannot be leaf-only"
+            except Exception as e:
+                log.warning("validate_rel_type.leaf_check_failed", error=str(e))
+
+    return True, "ok"
+
+
+def _filter_extracted_entities(entities: list) -> list:
+    """
+    Filter GLiNER2 extracted entities to only valid named entity types (dprompt-97).
+
+    Rejects:
+    - Stop words (the, a, and, prefers, called, someone, married, spouse, etc.)
+    - Rel_types used as entity names (spouse, married_person, other_person)
+    - Low-confidence extractions (< 0.6)
+    - Single-letter noise
+
+    Keeps:
+    - Person, Organization, Location, Object, Event types
+    """
+    if not entities:
+        return []
+
+    VALID_ENTITY_TYPES = {"Person", "Organization", "Location", "Object", "Event", "Animal"}
+    REJECT_TYPES = {"Concept", "unknown", "Unknown"}
+
+    # English stop words + rel_types + attribute descriptors (comprehensive, no recursive matching)
+    STOP_WORDS = {
+        # Grammar
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "can",
+        # Pronouns
+        "i", "me", "my", "we", "our", "he", "she", "it", "they", "them", "his", "her", "hers", "its", "their",
+        # Common words
+        "what", "which", "who", "when", "where", "why", "how", "and", "or", "but",
+        "not", "no", "yes", "if", "as", "of", "to", "for", "from", "in", "on", "at", "by", "with",
+        "about", "into", "through", "during", "before", "after", "above", "below", "up", "down", "out", "off", "over", "under",
+        "again", "further", "then", "once", "just", "only", "very", "too", "so", "such", "same", "now", "here", "there",
+        "this", "that", "these", "those", "more", "most", "all", "both", "each", "every", "few", "some",
+        # Rel_types that should NOT be entities
+        "spouse", "parent", "child", "sibling", "friend", "couple", "married", "married_person",
+        "born", "died", "lived", "worked", "studied", "taught", "owned",
+        # Attribute descriptors
+        "tall", "short", "old", "young", "big", "small", "engineer", "doctor", "teacher", "worker",
+        "person", "people", "member", "group", "family", "household", "company", "organization", "institution",
+        # Preference markers
+        "prefers", "prefer", "preferred", "preference", "likes", "like", "dislikes", "dislike", "loves", "love", "hates", "hate",
+        # Generic markers
+        "someone", "something", "anything", "everything", "nothing", "yet", "still", "already",
+        "either", "neither", "own", "other", "another", "next", "last", "first", "second", "previous", "recent", "following",
+        # Additional stop words
+        "list", "instantly", "updated", "should", "called", "wifes", "she",
+    }
+
+    filtered = []
+    for entity in entities:
+        entity_type = entity.get("type", "unknown")
+        entity_name = entity.get("text", "").lower().strip()
+        confidence = entity.get("confidence", 0.0)
+
+        # Reject: invalid/reject type
+        if entity_type in REJECT_TYPES:
+            continue
+
+        # Reject: not a valid entity type
+        if entity_type not in VALID_ENTITY_TYPES:
+            continue
+
+        # Reject: stop word or rel_type used as entity
+        if entity_name in STOP_WORDS:
+            continue
+
+        # Reject: low confidence
+        if confidence < 0.6:
+            continue
+
+        # Reject: single letter (noise)
+        if len(entity_name) < 2:
+            continue
+
+        # Accept: valid named entity
+        filtered.append(entity)
+
+    return filtered
+
+
 app = FastAPI(title="FaultLine WGM", lifespan=lifespan)
 
 @app.get("/health")
@@ -1924,20 +2064,32 @@ def add_rel_type(req: RelTypeRequest):
                 existing = cur.fetchone()
                 if existing and existing[0] == "user":
                     pass  # user-asserted types can be updated by users
+                # Metadata-driven rel_type registration (dprompt-97)
+                # Users can specify head_types, tail_types, is_symmetric, inverse_rel_type, is_hierarchy_rel
                 cur.execute(
                     "INSERT INTO rel_types"
                     " (rel_type, label, wikidata_pid, engine_generated, confidence, source,"
-                    "  correction_behavior)"
-                    " VALUES (%s, %s, %s, false, 1.0, 'user', %s)"
+                    "  correction_behavior, head_types, tail_types, is_symmetric, inverse_rel_type, is_hierarchy_rel)"
+                    " VALUES (%s, %s, %s, false, 1.0, 'user', %s, %s, %s, %s, %s, %s)"
                     " ON CONFLICT (rel_type) DO UPDATE SET"
                     "   label = EXCLUDED.label,"
                     "   source = 'user',"
-                    "   correction_behavior = EXCLUDED.correction_behavior",
+                    "   correction_behavior = EXCLUDED.correction_behavior,"
+                    "   head_types = COALESCE(EXCLUDED.head_types, rel_types.head_types),"
+                    "   tail_types = COALESCE(EXCLUDED.tail_types, rel_types.tail_types),"
+                    "   is_symmetric = COALESCE(EXCLUDED.is_symmetric, rel_types.is_symmetric),"
+                    "   inverse_rel_type = COALESCE(EXCLUDED.inverse_rel_type, rel_types.inverse_rel_type),"
+                    "   is_hierarchy_rel = COALESCE(EXCLUDED.is_hierarchy_rel, rel_types.is_hierarchy_rel)",
                     (
                         req.rel_type.lower(),
                         req.label,
                         req.wikidata_pid,
                         req.correction_behavior,
+                        req.head_types,
+                        req.tail_types,
+                        req.is_symmetric,
+                        req.inverse_rel_type,
+                        req.is_hierarchy_rel,
                     ),
                 )
                 db.commit()
@@ -2075,8 +2227,14 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
         result = model.extract_json(req.text, schema)
+
+        # dBug-026: Filter extracted entities to only valid named entity types (dprompt-97)
+        # Removes stop words, rel_types, low-confidence extractions
+        raw_entities = result.get("facts", [])
+        filtered_entities = _filter_extracted_entities(raw_entities)
+
         resolved_entities = []
-        for entity in result.get("facts", []):
+        for entity in filtered_entities:
             # Post-process: if subject is null, the user is the implied subject
             if entity.get("subject") is None and entity.get("object") is not None and entity.get("rel_type"):
                 entity["subject"] = "user"
@@ -2094,6 +2252,12 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
                 log.info("extract.null_object_resolved", subject=entity["object"], rel_type="parent_of")
             # Ontology-driven resolution removed (dprompt-86). Taxonomy seeding eliminated.
             resolved_entities.append(entity)
+
+        if len(filtered_entities) < len(raw_entities):
+            log.info("extract.entities_filtered",
+                     raw_count=len(raw_entities), filtered_count=len(filtered_entities),
+                     rejected=len(raw_entities) - len(filtered_entities))
+
         return {"entities": resolved_entities}
     except Exception as e:
         log.error("extract.gliner2_failed", error=str(e))
@@ -2128,10 +2292,22 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
         # determines the relationship from text and typed_entity context.
         system_prompt = """Extract ALL relationships and facts from text. Return ONLY a JSON array. Each triple must have subject, object, rel_type, and definition.
 
-Example format:
+Example format (with optional rel_type metadata for novel relationships):
 [{"subject":"alice","object":"bob","rel_type":"parent_of","definition":"relational: parent-child connection"},
 {"subject":"alice","object":"person","rel_type":"instance_of","definition":"hierarchy: entity classification"},
 {"subject":"156 Cedar Street","object":"location","rel_type":"instance_of","definition":"hierarchy: physical address is a location"}]
+
+REL_TYPE METADATA (when extracting novel relationships, include these hints for the system to learn):
+- For NOVEL rel_types: add optional fields to help the system understand:
+  - head_types: subject entity types that can have this rel_type (e.g., ["Person"], ["Person", "Organization"])
+  - tail_types: object entity types or SCALAR if value is a string (e.g., ["Person"], ["SCALAR"], ["Location"])
+  - is_symmetric: true if bidirectional (friend_of, knows, same_as), false if directional (parent_of, works_for)
+  - inverse_rel_type: if directional, what's the reverse? (parent_of → child_of)
+  - is_hierarchy_rel: true for classification (instance_of, subclass_of), false for relational (spouse, works_for)
+
+Example with metadata:
+{"subject":"alice","object":"bob","rel_type":"mentors","definition":"relational: mentor-mentee","head_types":["Person"],"tail_types":["Person"],"is_symmetric":false}
+{"subject":"alice","object":"bobsled_team","rel_type":"member_of","definition":"hierarchy: group membership","head_types":["Person","Organization"],"tail_types":["Concept","Organization"],"is_hierarchy_rel":true}
 
 EXTRACT COMPREHENSIVELY:
 1. Direct relationships: parent_of, child_of, spouse, sibling_of, has_pet, works_for, lives_in, lives_at, located_in, born_in, educated_at, knows, friend_of, etc.
@@ -3142,6 +3318,20 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # ROUTE PATH 1: SCALAR
                 if classification_3d["storage"] == "scalar":
+                    # dBug-027: Validate pref_name must be name-like (not descriptive phrases)
+                    if edge.rel_type.lower() == "pref_name":
+                        words = _raw_object.split()
+                        is_name_like = (
+                            len(words) <= 2 and
+                            all(w and w[0].isupper() for w in words if w)
+                        )
+                        if not is_name_like:
+                            log.warning("ingest.pref_name_rejected_not_name_like",
+                                        subject=canonical_subject,
+                                        object=_raw_object,
+                                        reason="pref_name must be 1-2 capital words, not descriptive phrase")
+                            continue
+
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
                     # Only store if value is meaningful
                     if edge.rel_type.lower() == "age":
@@ -3291,6 +3481,28 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         object=canonical_object,
                                         reason=validation.get("reason", ""))
                             continue
+
+                # dBug-027: Validate rel_type constraints from metadata (dprompt-97)
+                # Only check after WGMValidationGate passes; skip for scalars (handled separately)
+                if status == "valid" and classification_3d.get("storage") != "scalar":
+                    rel_type_meta = _REL_TYPE_META.get(canonical_rel_type.lower(), {})
+                    is_constraint_valid, constraint_reason = _validate_rel_type_constraints(
+                        {
+                            "rel_type": canonical_rel_type.lower(),
+                            "subject_type": edge.subject_type,
+                            "object": canonical_object,
+                            "object_id": canonical_object if _UUID_PATTERN.match(canonical_object) else None,
+                        },
+                        rel_type_meta,
+                        db
+                    )
+                    if not is_constraint_valid:
+                        log.warning("ingest.rel_type_constraint_rejected",
+                                    rel_type=canonical_rel_type,
+                                    subject=fact_subject,
+                                    object=canonical_object,
+                                    reason=constraint_reason)
+                        continue
 
                 is_engine_generated = False  # default
 
@@ -4851,12 +5063,16 @@ def query(request: QueryRequest):
             merged_facts.extend(events_resolved)
         log.info("query.embed_fail_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
         # Populate preferred_names with all entities in merged facts
+        # CRITICAL: Use _subject_id/_object_id (UUIDs) as keys, not display names (dprompt-61)
+        # After _resolve_display_names(), f["subject"]/f["object"] are already display names
         if registry:
             for f in merged_facts:
-                if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
-                    preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
-                if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
-                    preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
+                subject_uuid = f.get("_subject_id", f["subject"])
+                object_uuid = f.get("_object_id", f["object"])
+                if subject_uuid not in preferred_names and subject_uuid != user_entity_id_for_query:
+                    preferred_names[subject_uuid] = f["subject"]  # Already-resolved display name
+                if object_uuid not in preferred_names and object_uuid != user_entity_id_for_query:
+                    preferred_names[object_uuid] = f["object"]  # Already-resolved display name
 
         entity_types = _build_entity_types(preferred_names)
 
