@@ -73,7 +73,7 @@
 **Architecture:** Backend-first query design. Filter no longer implements three-tier gating — it trusts backend /query ranking (Class A > B > C + confidence).
 
 **Changes:**
-- Removed Tier 1/2/3 relevance gating logic from Filter (`openwebui/faultline_tool.py`)
+- Removed Tier 1/2/3 relevance gating logic from Filter (`openwebui/faultline_filter.py`)
 - Removed `entity_types` parameter passing (Filter no longer re-gates on entity type)
 - Removed Concept/unknown entity filtering from Filter
 - Simplified `_filter_relevant_facts()` to: identity rels always pass + confidence threshold
