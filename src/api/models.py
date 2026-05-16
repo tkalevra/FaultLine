@@ -66,6 +66,12 @@ class RelTypeRequest(BaseModel):
     object_role: str = "entity"
     correction_behavior: str = "supersede"
     wikidata_pid: Optional[str] = None
+    # Metadata for classification routing (dprompt-97)
+    head_types: Optional[list[str]] = None  # subject entity types (e.g., ['Person', 'Organization'])
+    tail_types: Optional[list[str]] = None  # object entity/value types (e.g., ['SCALAR'], ['Person'])
+    is_symmetric: Optional[bool] = None     # bidirectional (spouse, knows, same_as)
+    inverse_rel_type: Optional[str] = None  # reverse relationship (parent_of ↔ child_of)
+    is_hierarchy_rel: Optional[bool] = None # classification/taxonomy (instance_of, subclass_of)
 
 
 class RetractRequest(BaseModel):

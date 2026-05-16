@@ -687,16 +687,37 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
             # ── Apply decision ──────────────────────────────────────────
             with db_conn.cursor() as cur:
                 if decision == "approved":
-                    # Register the new rel_type
+                    # Register the new rel_type with inferred metadata (dprompt-97)
                     label = candidate_rel.replace('_', ' ').title()
+
+                    # Infer metadata from candidate's subject and object types
+                    head_types = None
+                    tail_types = None
+                    is_hierarchy = False
+                    is_symmetric = False
+
+                    if subj_type and subj_type != "unknown":
+                        head_types = [subj_type]
+                    if obj_type and obj_type != "unknown":
+                        tail_types = [obj_type]
+
+                    # Heuristic: if rel_type suggests classification/taxonomy, mark as hierarchy
+                    if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
+                        is_hierarchy = True
+                    # Heuristic: if suggests symmetry
+                    if any(keyword in candidate_rel.lower() for keyword in ("friend", "knows", "same", "peer", "mutual", "colleague")):
+                        is_symmetric = True
+
                     cur.execute(
-                        "INSERT INTO rel_types (rel_type, label, engine_generated, confidence, source)"
-                        " VALUES (%s, %s, true, 0.7, 're_embedder')"
+                        "INSERT INTO rel_types"
+                        " (rel_type, label, engine_generated, confidence, source,"
+                        "  head_types, tail_types, is_hierarchy_rel, is_symmetric)"
+                        " VALUES (%s, %s, true, 0.7, 're_embedder', %s, %s, %s, %s)"
                         " ON CONFLICT (rel_type) DO NOTHING",
-                        (candidate_rel, label),
+                        (candidate_rel, label, head_types, tail_types, is_hierarchy, is_symmetric),
                     )
                     stats["approved"] += 1
-                    log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} {reason}")
+                    log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} head_types={head_types} tail_types={tail_types} is_hierarchy={is_hierarchy} {reason}")
 
                     # Refresh unified metadata cache so the newly approved rel_type
                     # is immediately available to the ingest pipeline without waiting
