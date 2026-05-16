@@ -423,36 +423,57 @@ def assign_class_and_confidence(
     is_user_stated: bool,
     ontology_created: bool = False,
     hierarchy_created: bool = False,
+    rel_type: str = None,
+    confidence: float = None,
 ) -> tuple:
     """
-    Assign Class (A | B | C) and confidence based on source + metadata creation.
+    Assign Class (A | B | C) and confidence based on rel_type metadata + reassessed confidence.
 
-    Class A (user-stated):           1.0 (always authoritative)
-    Class B (llm, ontology exists):  0.8
-    Class B (llm, ontology+hier created): 0.6 (1.0 - 0.2 - 0.2)
-    Class C (novel/staged):          0.4
+    Metadata-driven: rel_types table defines fact_class (A | B | C) for each rel_type.
+    Confidence from _assess_statement_directness() determines routing:
+    - confidence >= 0.9 → Class A (user-stated, direct commitment)
+    - confidence 0.7-0.9 → Class B (clear but inferred, staged)
+    - confidence < 0.7 → Class C (speculative, staged with expiry)
+
+    Penalties for in-flow metadata creation apply to final confidence.
+
+    Class A (identity/structural):   committed immediately to facts table
+    Class B (behavioral/contextual): staged, promoted when confirmed_count >= 3
+    Class C (novel/ephemeral):       staged with 30-day expiry
 
     Returns: (class_letter, confidence_score)
     """
     if is_user_stated:
         return ("A", 1.0)
 
-    # LLM-inferred fact
-    confidence = 1.0
+    # Use passed confidence (from _assess_statement_directness) or default to 1.0
+    current_confidence = confidence if confidence is not None else 1.0
 
-    # Penalty: metadata created in-flow
-    if ontology_created:
-        confidence -= 0.2
-    if hierarchy_created:
-        confidence -= 0.2
-
-    # Assign class based on final confidence
-    if confidence >= 0.8:
-        return ("B", confidence)
-    elif confidence == 0.6:
-        return ("B", confidence)
+    # LLM-inferred fact: consult metadata for defined fact_class
+    if rel_type:
+        rel_type_lower = rel_type.lower()
+        metadata = _REL_TYPE_CACHE.get(rel_type_lower) or _FALLBACK_METADATA.get(rel_type_lower)
+        if metadata:
+            defined_class = metadata.get("fact_class", "C")
+        else:
+            defined_class = "C"
     else:
-        return ("C", confidence)
+        defined_class = "C"
+
+    # Apply penalties for in-flow metadata creation (dprompt-98)
+    # CRITICAL: Skip penalties if confidence >= 0.9 (indicates user-stated directness from _assess_statement_directness)
+    # High-confidence facts are authoritative and should not be penalized for ontology creation.
+    if current_confidence < 0.9:
+        if ontology_created:
+            current_confidence -= 0.2
+        if hierarchy_created:
+            current_confidence -= 0.2
+
+    # Clamp confidence to [0.0, 1.0]
+    current_confidence = max(0.0, min(1.0, current_confidence))
+
+    # Return defined class + final confidence
+    return (defined_class, current_confidence)
 
 
 def enforce_directionality(
@@ -1895,10 +1916,10 @@ def _validate_rel_type_constraints(fact_dict: dict, rel_type_meta: dict, db) -> 
                 words = obj.split()
                 is_name_like = (
                     len(words) <= 2 and
-                    all(w and w[0].isupper() for w in words if w)
+                    all(len(w) > 0 for w in words)
                 )
                 if not is_name_like:
-                    return False, f"pref_name must be name-like (1-2 capital words), not '{obj}'"
+                    return False, f"pref_name must be 1-2 words, not '{obj}'"
 
     # Constraint: head_types validation — subject entity_type must be allowed
     head_types = rel_type_meta.get("head_types", [])
@@ -2385,7 +2406,7 @@ Return ONLY valid JSON array. No markdown, no explanations."""
                     "model": llm_model,
                     "messages": messages,
                     "temperature": 0.0,
-                    "max_tokens": 400,
+                    "max_tokens": 1200,
                 },
                 timeout=30,
             )
@@ -2404,6 +2425,12 @@ Return ONLY valid JSON array. No markdown, no explanations."""
             match = re.search(r'\[.*\]', content, re.DOTALL)
             triples = json.loads(match.group()) if match else []
 
+        # Validation: each triple must have subject, object, rel_type fields
+        valid_triples = [
+            t for t in (triples if isinstance(triples, list) else [])
+            if isinstance(t, dict) and t.get("subject") and t.get("object") and t.get("rel_type")
+        ]
+        triples = valid_triples
         log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
         return {
             "status": "success",
@@ -2660,6 +2687,94 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
         return 0
 
 
+def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -> float:
+    """
+    Reassess triple confidence based on how explicitly the user stated it in req_text.
+
+    Returns adjusted confidence [0.0, 1.0]:
+    - 0.95: Direct self-statement (my wife is X, I have Y children, call me Z)
+    - 0.75: Inferred but clear (Marla's daughter, his cousin)
+    - 0.50: Contextual/speculative (maybe, probably, think, might)
+    - original: Default if no pattern match or not an identity/structural rel_type
+
+    SAFE: No crash on None/empty text, malformed edges, or unknown rel_types.
+    """
+    # Identity/structural rel_types that benefit from directness analysis
+    IDENTITY_STRUCTURAL = {
+        'pref_name', 'also_known_as', 'spouse', 'parent_of', 'child_of',
+        'sibling_of', 'age', 'height', 'weight', 'born_on', 'born_in',
+        'has_gender', 'nationality'
+    }
+
+    try:
+        # Safety: skip if no text or rel_type not identity/structural
+        if not req_text or not isinstance(req_text, str):
+            return edge.confidence if hasattr(edge, 'confidence') else 0.8
+
+        rel_type_lower = (edge.rel_type or "").lower()
+        if rel_type_lower not in IDENTITY_STRUCTURAL:
+            return edge.confidence if hasattr(edge, 'confidence') else 0.8
+
+        text_lower = req_text.lower()
+        subject = (edge.subject or "").lower()
+        object_val = (edge.object or "").lower()
+
+        # Empty subject/object → no match possible
+        if not subject or not object_val:
+            return edge.confidence if hasattr(edge, 'confidence') else 0.8
+
+        # ─── DIRECT SELF-STATEMENT (0.95) ───
+        # Pattern: "my [rel_type] is [object]"
+        if f"my {rel_type_lower}" in text_lower and object_val in text_lower:
+            return 0.95
+
+        # Pattern: "my name is [object]", "call me [object]", "i am [object]"
+        if rel_type_lower in ('pref_name', 'also_known_as'):
+            if any(pat in text_lower for pat in (f"my name is {object_val}", f"call me {object_val}", f"i am {object_val}", f"i'm {object_val}")):
+                return 0.95
+
+        # Pattern: "married to [object]" or "spouse is [object]"
+        if rel_type_lower == 'spouse':
+            if any(pat in text_lower for pat in (f"married to {object_val}", f"spouse is {object_val}", f"wife is {object_val}", f"husband is {object_val}")):
+                return 0.95
+
+        # Pattern: "i have [number] [children/kids/daughters/sons]" + object mentioned nearby
+        if rel_type_lower in ('parent_of', 'child_of'):
+            if 'i have' in text_lower and any(kw in text_lower for kw in ('children', 'kids', 'daughters', 'sons')):
+                # Check if object appears within 100 chars of "i have"
+                i_have_pos = text_lower.find('i have')
+                if i_have_pos != -1:
+                    window = text_lower[i_have_pos:i_have_pos+100]
+                    if object_val in window:
+                        return 0.95
+
+        # ─── INFERRED BUT CLEAR (0.75) ───
+        # Pattern: "[name]'s [rel_type]" (e.g., "marla's daughter")
+        if f"{subject}'s" in text_lower and object_val in text_lower:
+            return 0.75
+
+        # Pattern: possessive pronouns (his, her, their) + rel_type
+        if any(poss in text_lower for poss in ('his ', 'her ', 'their ')):
+            if object_val in text_lower:
+                return 0.75
+
+        # ─── SPECULATIVE (0.50) ───
+        # If text contains hedge words and this rel_type is mentioned, lower confidence
+        hedge_words = ('maybe', 'probably', 'might', 'could', 'think', 'guess', 'appear', 'seem', 'possibly', 'perhaps')
+        if any(hw in text_lower for hw in hedge_words):
+            # Check if the object is mentioned in a speculative context
+            if object_val in text_lower:
+                return 0.50
+
+        # ─── DEFAULT: Keep extraction confidence ───
+        return edge.confidence if hasattr(edge, 'confidence') else 0.8
+
+    except Exception as e:
+        # Non-destructive: on any error, keep extraction confidence
+        log.warning("assess_statement_directness.exception", error=str(e), rel_type=edge.rel_type if hasattr(edge, 'rel_type') else None)
+        return edge.confidence if hasattr(edge, 'confidence') else 0.8
+
+
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -2749,6 +2864,22 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     subj = (t.get("subject") or "").lower().strip()
                     if subj in _FIRST_PERSON_PRONOUNS:
                         t["subject"] = "user"
+
+                # dprompt-98: Normalize inverse symmetric rel_types back to canonical form.
+                # LLM may output "spouse_of" thinking it's an inverse, but spouse is symmetric.
+                # Query metadata to check is_symmetric flag; convert inverted form to canonical.
+                for t in rewrite_data.get("triples", []):
+                    rel_type_lower = (t.get("rel_type") or "").lower().strip()
+                    # If rel_type ends with _of, check if the base rel_type is symmetric
+                    if rel_type_lower.endswith("_of"):
+                        base_rel = rel_type_lower[:-3]  # Remove _of suffix
+                        base_meta = _REL_TYPE_META.get(base_rel.lower(), {})
+                        # If base is symmetric, use canonical form (no _of)
+                        if base_meta.get("is_symmetric"):
+                            t["rel_type"] = base_rel
+                            log.info("ingest.rel_type_normalized",
+                                     original=rel_type_lower, normalized=base_rel,
+                                     reason="symmetric rel_type has _of suffix removed")
 
                 # dprompt-086: Remove triples with unresolved third-person pronouns.
                 # The prompt instructs the LLM to resolve "it"/"he"/"she" from context;
@@ -3256,11 +3387,20 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 ontology_created = False
                 hierarchy_created = False
 
+                # Reassess confidence based on how explicitly user stated this fact in req.text
+                adjusted_confidence = _assess_statement_directness(edge, req.text, _REL_TYPE_META)
+                if adjusted_confidence != (edge.confidence if hasattr(edge, 'confidence') else 0.8):
+                    log.info("ingest.confidence_reassess", rel_type=edge.rel_type.lower(),
+                             old_confidence=edge.confidence if hasattr(edge, 'confidence') else 0.8,
+                             new_confidence=adjusted_confidence, subject=edge.subject, object=edge.object)
+
                 fact_class, confidence = assign_class_and_confidence(
                     classification_3d,
                     is_user_stated,
                     ontology_created,
                     hierarchy_created,
+                    rel_type=edge.rel_type,
+                    confidence=adjusted_confidence,
                 )
 
                 log.info(
@@ -3323,13 +3463,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         words = _raw_object.split()
                         is_name_like = (
                             len(words) <= 2 and
-                            all(w and w[0].isupper() for w in words if w)
+                            all(len(w) > 0 for w in words)
                         )
                         if not is_name_like:
                             log.warning("ingest.pref_name_rejected_not_name_like",
                                         subject=canonical_subject,
                                         object=_raw_object,
-                                        reason="pref_name must be 1-2 capital words, not descriptive phrase")
+                                        reason="pref_name must be 1-2 words, not descriptive phrase")
                             continue
 
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
@@ -4241,7 +4381,8 @@ def query(request: QueryRequest):
                            "hard_delete_flag = false",
                            "(valid_until IS NULL OR valid_until > now())"]
                 s_conds = ["user_id = %s", "expires_at > now()",
-                           "promoted_at IS NULL"]
+                           "promoted_at IS NULL",
+                           "(fact_class = 'A' OR fact_class = 'B')"]
 
                 if rel_types:
                     ph = ",".join(["%s"] * len(rel_types))
