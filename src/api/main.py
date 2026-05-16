@@ -268,18 +268,218 @@ def _build_rel_type_constraint(dsn: str) -> str:
         return ""
 
 def _build_rel_type_meta(dsn: str) -> dict:
-    """Load rel_types metadata (including category) from DB."""
+    """Load rel_types metadata (category + tail_types + storage_target + fact_class + is_symmetric + inverse_rel_type + is_hierarchy_rel) from DB."""
     try:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT rel_type, category FROM rel_types WHERE category IS NOT NULL")
+                cur.execute("""
+                    SELECT rel_type, category, tail_types, storage_target, fact_class,
+                           is_symmetric, inverse_rel_type, is_hierarchy_rel
+                    FROM rel_types
+                """)
                 meta = {}
-                for rel_type, category in cur.fetchall():
-                    meta[rel_type] = {"category": category}
+                for row in cur.fetchall():
+                    rel_type, category, tail_types, storage_target, fact_class, is_symmetric, inverse_rel_type, is_hierarchy_rel = row
+                    meta[rel_type] = {
+                        "category": category,
+                        "tail_types": tail_types or [],
+                        "storage_target": storage_target,
+                        "fact_class": fact_class,
+                        "is_symmetric": is_symmetric or False,
+                        "inverse_rel_type": inverse_rel_type,
+                        "is_hierarchy_rel": is_hierarchy_rel or False,
+                    }
         return meta
     except Exception as e:
         log.warning("startup.rel_type_meta_builder_failed", error=str(e))
         return {}
+
+def classify_fact_3d(
+    rel_type: str,
+    object_value: str,
+    registry,
+    user_id: str,
+) -> dict:
+    """
+    Classify fact along three dimensions: STORAGE × CLASS × DIRECTION
+
+    All determinations use rel_types metadata (deterministic on create).
+    Heuristics only for unknown rel_types (rare, engine-generated).
+
+    Returns:
+        {
+            "storage": "scalar" | "relational" | "hierarchical",
+            "direction": "asymmetric" | "symmetric" | "hierarchical" | None,
+            "is_symmetric": bool,
+            "inverse_rel_type": str | None,
+            "is_hierarchy_rel": bool,
+            "reason": str,
+        }
+    """
+    rt_lower = rel_type.lower()
+    stripped = object_value.strip()
+
+    if not stripped:
+        return {
+            "storage": None,
+            "direction": None,
+            "reason": "empty value",
+        }
+
+    # L0: ONTOLOGY CONSTRAINT (METADATA-FIRST)
+    rel_meta = _REL_TYPE_META.get(rt_lower)
+
+    if rel_meta:  # Known rel_type
+        tail_types = rel_meta.get("tail_types", [])
+        is_hierarchy = rel_meta.get("is_hierarchy_rel", False)
+        is_symmetric = rel_meta.get("is_symmetric", False)
+        inverse_rel = rel_meta.get("inverse_rel_type")
+
+        # Determine storage path
+        if "SCALAR" in tail_types:
+            storage = "scalar"
+            direction = None
+        elif is_hierarchy:
+            storage = "hierarchical"
+            direction = "hierarchical"
+        else:
+            storage = "relational"
+            direction = "symmetric" if is_symmetric else "asymmetric"
+
+        return {
+            "storage": storage,
+            "direction": direction,
+            "is_symmetric": is_symmetric,
+            "inverse_rel_type": inverse_rel,
+            "is_hierarchy_rel": is_hierarchy,
+            "reason": f"ontology: {rt_lower} in rel_types (deterministic)",
+        }
+
+    # L1–L5: VALUE HEURISTICS (FALLBACK FOR UNKNOWN REL_TYPES)
+    import re
+    stripped_lower = stripped.lower()
+
+    # L1: Numeric patterns
+    if re.match(r'^-?\d+$', stripped):
+        return {
+            "storage": "scalar",
+            "direction": None,
+            "reason": "heuristic: integer pattern (unknown rel_type)",
+        }
+
+    # L2: Date patterns
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', stripped):
+        return {
+            "storage": "scalar",
+            "direction": None,
+            "reason": "heuristic: date pattern (unknown rel_type)",
+        }
+
+    # L3: UUID pattern (use existing _UUID_PATTERN if available)
+    try:
+        if _UUID_PATTERN.match(stripped):
+            return {
+                "storage": "relational",
+                "direction": "asymmetric",
+                "reason": "heuristic: UUID pattern (unknown rel_type)",
+            }
+    except NameError:
+        pass
+
+    # L4: Entity alias lookup
+    try:
+        with registry.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT entity_id FROM entity_aliases WHERE alias = %s AND user_id = %s LIMIT 1",
+                (stripped_lower, user_id)
+            )
+            if cur.fetchone():
+                return {
+                    "storage": "relational",
+                    "direction": "asymmetric",
+                    "reason": "heuristic: entity alias lookup (unknown rel_type)",
+                }
+    except Exception:
+        pass
+
+    # L5: Email/URL/phone
+    if re.match(r'^[a-zA-Z0-9._%+-]+@', stripped):
+        return {
+            "storage": "scalar",
+            "direction": None,
+            "reason": "heuristic: email pattern (unknown rel_type)",
+        }
+
+    # FALLBACK
+    return {
+        "storage": None,
+        "direction": None,
+        "reason": "no pattern match, unknown rel_type",
+    }
+
+
+def assign_class_and_confidence(
+    classification_3d: dict,
+    is_user_stated: bool,
+    ontology_created: bool = False,
+    hierarchy_created: bool = False,
+) -> tuple:
+    """
+    Assign Class (A | B | C) and confidence based on source + metadata creation.
+
+    Class A (user-stated):           1.0 (always authoritative)
+    Class B (llm, ontology exists):  0.8
+    Class B (llm, ontology+hier created): 0.6 (1.0 - 0.2 - 0.2)
+    Class C (novel/staged):          0.4
+
+    Returns: (class_letter, confidence_score)
+    """
+    if is_user_stated:
+        return ("A", 1.0)
+
+    # LLM-inferred fact
+    confidence = 1.0
+
+    # Penalty: metadata created in-flow
+    if ontology_created:
+        confidence -= 0.2
+    if hierarchy_created:
+        confidence -= 0.2
+
+    # Assign class based on final confidence
+    if confidence >= 0.8:
+        return ("B", confidence)
+    elif confidence == 0.6:
+        return ("B", confidence)
+    else:
+        return ("C", confidence)
+
+
+def enforce_directionality(
+    subject: str,
+    object: str,
+    rel_type: str,
+    is_symmetric: bool,
+    inverse_rel_type: str = None,
+) -> tuple:
+    """
+    Enforce rel_type directionality rules. Correct asymmetric rels to canonical direction.
+
+    Examples:
+    - User says "Des is parent of me" → invert to "I am parent of Des" (parent_of canonical)
+    - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
+
+    Returns: (corrected_subject, corrected_object, corrected_rel_type)
+    """
+    # Symmetric rels: no direction correction needed
+    if is_symmetric:
+        return (subject, object, rel_type)
+
+    # Asymmetric rels: accept as-is and let conflict detection handle duplicates
+    # (Canonical direction rules per rel_type would go here)
+
+    return (subject, object, rel_type)
+
 
 def _commit_staged(
     db_conn,
@@ -608,49 +808,7 @@ def _ensure_schema(dsn: str) -> None:
 # ── Entity Taxonomies (dprompt-20) ───────────────────────────────────────────
 # Data-driven grouping system — replaces brittle hardcoded extraction patterns.
 
-_TAXONOMY_CACHE: list[dict] = []
-
-
-def _load_taxonomies(dsn: str) -> list[dict]:
-    """Load all entity taxonomies from DB. Called at startup."""
-    global _TAXONOMY_CACHE
-    try:
-        with psycopg2.connect(dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_name = 'entity_taxonomies'
-                    )
-                """)
-                if not cur.fetchone()[0]:
-                    return []
-                cur.execute(
-                    "SELECT taxonomy_name, description, member_entity_types,"
-                    " rel_types_defining_group, has_transitivity, transitive_rel_types,"
-                    " is_hierarchical, parent_rel_type, source"
-                    " FROM entity_taxonomies ORDER BY taxonomy_name"
-                )
-                taxonomies = [
-                    {
-                        "taxonomy_name": row[0],
-                        "description": row[1],
-                        "member_entity_types": row[2] or [],
-                        "rel_types_defining_group": row[3] or [],
-                        "has_transitivity": row[4],
-                        "transitive_rel_types": row[5] or [],
-                        "is_hierarchical": row[6],
-                        "parent_rel_type": row[7],
-                        "source": row[8],
-                    }
-                    for row in cur.fetchall()
-                ]
-                _TAXONOMY_CACHE = taxonomies
-                log.info("startup.taxonomies_loaded", count=len(taxonomies))
-                return taxonomies
-    except Exception as e:
-        log.warning("startup.taxonomies_load_failed", error=str(e))
-        return []
+_TAXONOMY_CACHE: dict = {}
 
 
 def _apply_taxonomy_rules(
@@ -673,13 +831,13 @@ def _apply_taxonomy_rules(
         user_id_row, subject, obj, rel_type, source, is_pref, fact_class, confidence, is_engine = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
         rt_lower = rel_type.lower().strip() if rel_type else ""
 
-        for tax in taxonomies:
-            def_rels = [r.lower() for r in tax.get("rel_types_defining_group", [])]
+        for tax_name, tax in taxonomies.items():
+            def_rels = [r.lower() for r in tax.get("rel_types_defining_group", []) if r is not None]
             if rt_lower in def_rels:
                 log.info(
                     "taxonomy.match",
                     rel_type=rt_lower,
-                    taxonomy=tax["taxonomy_name"],
+                    taxonomy=tax_name,
                     subject=subject,
                     object=obj,
                 )
@@ -713,11 +871,7 @@ def _fetch_transitive_members(
     transitive members — direct relations PLUS entities reachable via
     transitive_rel_types from direct members.
     """
-    tax = None
-    for t in _TAXONOMY_CACHE:
-        if t["taxonomy_name"] == taxonomy_name:
-            tax = t
-            break
+    tax = _TAXONOMY_CACHE.get(taxonomy_name)
     if not tax or not tax.get("has_transitivity"):
         return set()
 
@@ -1369,7 +1523,6 @@ async def lifespan(app: FastAPI):
         _refresh_rel_type_cache()  # dprompt-73b: load unified metadata cache at startup
         _cleanup_entity_aliases_startup(dsn)  # remove corrupted string entity_ids from entity_aliases
         _normalize_entity_ids_startup(dsn)  # normalize string entity_ids to UUIDs
-        _load_taxonomies(dsn)  # load entity_taxonomies cache for ingest/query
         _rel_type_registry = RelTypeRegistry(dsn)
         try:
             _rel_type_registry.get_valid_types()
@@ -1388,9 +1541,328 @@ async def lifespan(app: FastAPI):
         log.info("startup.gliner2_ready")
     except Exception as e:
         log.error("startup.gliner2_failed", error=str(e))
+
+    # dprompt-91: Load taxonomy cache for archive filtering
+    log.info("startup.taxonomy_cache_loading")
+    try:
+        _db_for_cache = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        _load_taxonomy_cache(_db_for_cache)
+        _db_for_cache.close()
+    except Exception as e:
+        log.error("startup.taxonomy_cache_init_failed", error=str(e))
+
     yield
     _gliner2_model = None
     _rel_type_registry = None
+
+# ═══════════════════════════════════════════════════════════════════════
+# dprompt-91: Archive Filtering — Module-Level Functions & Caching
+# ═══════════════════════════════════════════════════════════════════════
+
+# Historical keyword set for temporal query detection
+_HISTORICAL_KEYWORDS = {
+    "used to", "did i", "where was", "where was i", "my old",
+    "previously", "before", "when did", "in the past", "back then",
+    "used to live", "used to work", "my previous", "former", "earlier",
+}
+
+# Taxonomy cache: loaded at startup, reused across requests
+_TAXONOMY_CACHE = {}
+
+def _parse_postgres_array(arr) -> list:
+    """Parse PostgreSQL ARRAY value. Handles both Python lists and string representations.
+    PostgreSQL arrays come as '{item1,item2}' strings when no adapter is registered.
+    Also handles psycopg2 list/array objects.
+    """
+    # Already a native Python list
+    if isinstance(arr, list):
+        return arr
+
+    # None or empty
+    if arr is None:
+        return []
+
+    # String representation '{item1,item2,item3}'
+    if isinstance(arr, str):
+        arr = arr.strip()
+        if arr.startswith('{') and arr.endswith('}'):
+            arr = arr[1:-1]  # Remove braces
+        if not arr:
+            return []
+        return [item.strip() for item in arr.split(',')]
+
+    # Fallback: try to convert to string and parse
+    try:
+        arr_str = str(arr).strip()
+        if arr_str.startswith('{') and arr_str.endswith('}'):
+            arr_str = arr_str[1:-1]
+            if not arr_str:
+                return []
+            return [item.strip() for item in arr_str.split(',')]
+    except Exception:
+        pass
+
+    # Last resort: empty list
+    return []
+
+def _load_taxonomy_cache(db) -> None:
+    """Load entity_taxonomies into module-level cache at startup.
+    Non-fatal if fails; system continues with empty cache (hard fail on usage).
+    """
+    global _TAXONOMY_CACHE
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT taxonomy_name, member_entity_types, rel_types_defining_group, "
+                "description, is_hierarchical, parent_rel_type "
+                "FROM entity_taxonomies"
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                try:
+                    taxonomy_name = row[0]
+                    try:
+                        member_types = _parse_postgres_array(row[1])
+                    except Exception as e:
+                        log.warning("startup.taxonomy_parse_member_types_failed",
+                                   taxonomy=taxonomy_name, input=row[1], error=str(e))
+                        member_types = []
+
+                    try:
+                        rel_types = _parse_postgres_array(row[2])
+                    except Exception as e:
+                        log.warning("startup.taxonomy_parse_rel_types_failed",
+                                   taxonomy=taxonomy_name, input=row[2], error=str(e))
+                        rel_types = []
+
+                    desc = row[3]
+                    is_hier = row[4]
+                    parent_rel = row[5]
+
+                    _TAXONOMY_CACHE[taxonomy_name] = {
+                        "member_entity_types": member_types,
+                        "rel_types_defining_group": rel_types,
+                        "description": desc,
+                        "is_hierarchical": is_hier,
+                        "parent_rel_type": parent_rel,
+                    }
+                except Exception as e:
+                    import traceback
+                    log.warning("startup.taxonomy_row_parse_failed",
+                               taxonomy=row[0] if row else "unknown",
+                               error=str(e),
+                               traceback=traceback.format_exc())
+                    continue
+
+            log.info("startup.taxonomy_cache_loaded", count=len(_TAXONOMY_CACHE))
+    except Exception as e:
+        log.error("startup.taxonomy_cache_failed", error=str(e))
+
+def detect_historical(query_lower: str) -> tuple[bool, float]:
+    """Detect if query asks about archived (historical) facts.
+    Returns (is_historical, confidence) where confidence = count of keyword matches.
+    """
+    confidence = 0.0
+    for keyword in _HISTORICAL_KEYWORDS:
+        if keyword in query_lower:
+            confidence += 1.0
+
+    is_historical = confidence > 0
+    log.info("query.temporality_detection", is_historical=is_historical,
+             confidence=confidence, query_lower=query_lower[:80])
+    return (is_historical, confidence)
+
+def determine_scope_multi_factor(db, user_id: str, facts: list[dict]) -> set[str]:
+    """
+    Determine scope (which taxonomies apply) using multi-factor analysis.
+
+    Factors:
+    1. rel_types in facts → match to entity_taxonomies.rel_types_defining_group
+    2. entity_types of subjects/objects → validate against member_entity_types
+
+    Returns: set of detected taxonomy_names
+    HARD FAIL if query fails (upstream ingest problem if no taxonomies exist)
+    """
+    if not _TAXONOMY_CACHE:
+        log.error("query.scope_determination.no_taxonomies",
+                 reason="cache_empty",
+                 user_id=user_id)
+        raise RuntimeError("Taxonomy cache is empty — upstream ingest failure")
+
+    detected_taxonomies = set()
+    rel_types_in_facts = {f.get("rel_type") for f in facts if f.get("rel_type")}
+
+    # Factor 1: Match rel_types to taxonomies
+    for rel_type in rel_types_in_facts:
+        if not rel_type:
+            continue
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT taxonomy_name FROM entity_taxonomies "
+                    "WHERE %s = ANY(rel_types_defining_group)",
+                    (rel_type,)
+                )
+                for row in cur.fetchall():
+                    detected_taxonomies.add(row[0])
+        except Exception as e:
+            log.warning("query.scope_rel_type_match_failed", rel_type=rel_type, error=str(e))
+
+    log.info("determine_scope.multi_factor",
+             rel_types=list(rel_types_in_facts),
+             detected_taxonomies=list(detected_taxonomies),
+             user_id=user_id)
+
+    return detected_taxonomies
+
+def format_fact_for_injection(fact: dict, db, registry) -> str | None:
+    """
+    Convert raw fact to plain English prose for LLM injection.
+    HARD CONSTRAINT: Facts for LLM must be human-readable, not machine-readable tuples.
+
+    Example inputs:
+    - {"subject_id": "uuid", "rel_type": "works_for", "object_id": "uuid"}
+    - {"subject_id": "uuid", "rel_type": "age", "object_value": 45}
+
+    Example outputs:
+    - "Chris works for Acme Inc."
+    - "Des is 16 years old"
+    """
+    try:
+        subject_id = fact.get("subject_id")
+        rel_type = fact.get("rel_type")
+        object_id = fact.get("object_id")
+        object_value = fact.get("object_value")
+
+        # Resolve subject display name
+        subject_name = None
+        if registry and subject_id:
+            subject_name = registry.get_preferred_name("", subject_id)
+        subject_name = subject_name or (subject_id[:8] if subject_id else "Unknown")
+
+        # Get rel_type description from database
+        rel_description = rel_type
+        if db and rel_type:
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT description FROM rel_types WHERE rel_type = %s",
+                        (rel_type,)
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        rel_description = row[0]
+            except Exception:
+                pass  # Fall back to rel_type name
+
+        # Resolve object (UUID or scalar value)
+        if object_value is not None:
+            # Scalar fact
+            object_repr = str(object_value)
+        elif object_id:
+            # Relationship fact
+            object_name = None
+            if registry:
+                object_name = registry.get_preferred_name("", object_id)
+            object_repr = object_name or object_id[:8]
+        else:
+            return None
+
+        # Format as natural English
+        if subject_name and rel_description and object_repr:
+            return f"{subject_name} {rel_description} {object_repr}."
+
+        return None
+    except Exception as e:
+        log.warning("format_fact_for_injection_failed", fact_id=fact.get("id"), error=str(e))
+        return None
+
+def apply_archive_filter(db, query_lower: str, user_id: str,
+                        facts: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Apply archive filtering to facts using multi-factor scope + temporality.
+
+    Returns (filtered_facts, metadata) where metadata contains:
+    {
+        "detected_taxonomies": [str],
+        "is_historical": bool,
+        "fact_count_before": int,
+        "fact_count_after": int,
+    }
+
+    HARD FAIL if scope determination or archive filter fails.
+    """
+    try:
+        # Phase 1: Detect temporality
+        is_historical, temporal_confidence = detect_historical(query_lower)
+
+        # Phase 2: Determine scope (multi-factor)
+        detected_taxonomies = determine_scope_multi_factor(db, user_id, facts)
+
+        # Phase 3: Filter facts by scope + temporality
+        filtered = []
+
+        # Identity & scalar rel_types always pass scope filter (they're not taxonomy-scoped)
+        _IDENTITY_SCALAR_RELS = {
+            'pref_name', 'also_known_as', 'age', 'height', 'weight', 'born_on',
+            'occupation', 'nationality', 'has_gender', 'born_in', 'instance_of',
+            'subclass_of'
+        }
+
+        for fact in facts:
+            rel_type = fact.get("rel_type")
+
+            if detected_taxonomies and rel_type not in _IDENTITY_SCALAR_RELS:
+                rel_in_taxonomy = False
+                for taxonomy_name in detected_taxonomies:
+                    if taxonomy_name in _TAXONOMY_CACHE:
+                        rel_types_for_tax = _TAXONOMY_CACHE[taxonomy_name].get("rel_types_defining_group", [])
+                        if rel_type in rel_types_for_tax:
+                            rel_in_taxonomy = True
+                            break
+                if not rel_in_taxonomy:
+                    continue
+
+            archived_at = fact.get("archived_at")
+            valid_until = fact.get("valid_until")
+
+            if is_historical:
+                if archived_at is None and valid_until is None:
+                    continue
+            else:
+                if archived_at is not None or valid_until is not None:
+                    continue
+
+            filtered.append(fact)
+
+        metadata = {
+            "detected_taxonomies": list(detected_taxonomies),
+            "is_historical": is_historical,
+            "fact_count_before": len(facts),
+            "fact_count_after": len(filtered),
+        }
+
+        log.info("archive_filter.temporal_scope",
+                 scope="historical" if is_historical else "current",
+                 count_before=len(facts),
+                 count_after=len(filtered))
+
+        if detected_taxonomies:
+            log.info("archive_filter.scope_gate",
+                     scope_type="targeted",
+                     taxonomies=list(detected_taxonomies),
+                     count_before=len(facts),
+                     count_after=len(filtered))
+        else:
+            log.info("archive_filter.scope_gate",
+                     scope_type="open",
+                     taxonomies=[])
+
+        return (filtered, metadata)
+
+    except Exception as e:
+        log.error("archive_filter.failed", error=str(e), user_id=user_id)
+        raise
 
 app = FastAPI(title="FaultLine WGM", lifespan=lifespan)
 
@@ -2012,62 +2484,6 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
         return 0
 
 
-# ── dprompt-088: Edge validation helpers ──────────────────────────────────
-
-def _get_rejection_reason(name: str) -> str:
-    """Return why EntityRegistry.validate_entity_name() would reject a name."""
-    from src.entity_registry.registry import (
-        _THIRD_PERSON_PRONOUNS,
-        _ENTITY_TYPE_LABELS,
-        _VALIDATION_STOPWORDS,
-    )
-    name_lower = name.lower().strip()
-    if not name_lower or len(name_lower) < 2:
-        return "too_short"
-    if re.match(r'^\d+$', name_lower):
-        return "numbers_only"
-    if name_lower in _THIRD_PERSON_PRONOUNS:
-        return "pronoun"
-    if name_lower in _ENTITY_TYPE_LABELS:
-        return "type_label"
-    if name_lower in _VALIDATION_STOPWORDS:
-        return "stopword"
-    return "unknown"
-
-
-def _commit_rejected_edge_to_qdrant(
-    db, user_id: str,
-    subject_name: str, rel_type: str, object_name: str,
-    reason: str,
-) -> int | None:
-    """Store rejected edge to staged_facts for re-embedder evaluation (Class C)."""
-    try:
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT INTO staged_facts"
-                " (user_id, subject_id, object_id, rel_type, fact_class,"
-                "  provenance, confidence, first_seen_at, expires_at)"
-                " VALUES (%s, %s, %s, %s, 'C', %s, 0.4, NOW(), NOW() + INTERVAL '30 days')"
-                " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
-                " DO UPDATE SET"
-                "   confirmed_count = staged_facts.confirmed_count + 1,"
-                "   last_seen_at    = NOW(),"
-                "   confidence      = 0.4"
-                " RETURNING id",
-                (user_id, subject_name, object_name, rel_type,
-                 f'validation_rejection:{reason}'),
-            )
-            row = cur.fetchone()
-            db.commit()
-            return row[0] if row else None
-    except Exception as e:
-        db.rollback()
-        log.warning("ingest.rejected_edge_commit_failed",
-                    subject=subject_name, rel_type=rel_type,
-                    object=object_name, error=str(e))
-        return None
-
-
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -2442,39 +2858,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Resolve all entity names to canonical form via registry
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
-                # User corrections can use type labels as subjects
-                is_user_correction = getattr(edge, 'is_correction', False) or edge.fact_provenance == "user_stated"
-                canonical_subject = registry.resolve(req.user_id, edge.subject, allow_type_labels=is_user_correction)
-
-                # dprompt-087: If resolve() returns None, the entity name is garbage
-                # (pronoun, type label, stopword). Skip the entire edge gracefully.
-                if canonical_subject is None:
-                    _reason = _get_rejection_reason(edge.subject)
-                    log.info("ingest.subject_rejected",
-                             original=edge.subject, reason=_reason, rel_type=edge.rel_type)
-                    _commit_rejected_edge_to_qdrant(
-                        db, req.user_id, edge.subject, edge.rel_type,
-                        edge.object, _reason)
-                    continue
+                canonical_subject = registry.resolve(req.user_id, edge.subject)
+                log.info("ingest.subject_resolved_at_extraction",
+                       input=edge.subject, output=canonical_subject, user_id=req.user_id)
 
                 # For scalar rel_types, object is a string value (not an entity reference)
                 # Skip resolution and keep the raw string value
                 if edge.rel_type.lower() in _SCALAR_OBJECT_RELS:
                     canonical_object = edge.object.lower().strip()
+                    log.info("ingest.object_kept_as_scalar",
+                           rel_type=edge.rel_type, object=canonical_object)
                 else:
                     # For relationship rel_types, resolve object to UUID
-                    # User corrections can use type labels (e.g., instance_of(Aurora, computer))
-                    is_user_correction = getattr(edge, 'is_correction', False) or edge.fact_provenance == "user_stated"
-                    canonical_object = registry.resolve(req.user_id, edge.object, allow_type_labels=is_user_correction)
-                    # dprompt-087: Reject edge if object entity is garbage
-                    if canonical_object is None:
-                        _reason = _get_rejection_reason(edge.object)
-                        log.info("ingest.object_rejected",
-                                 original=edge.object, reason=_reason, rel_type=edge.rel_type)
-                        _commit_rejected_edge_to_qdrant(
-                            db, req.user_id, edge.subject, edge.rel_type,
-                            edge.object, _reason)
-                        continue
+                    canonical_object = registry.resolve(req.user_id, edge.object)
+                    log.info("ingest.object_resolved_at_extraction",
+                           input=edge.object, output=canonical_object, user_id=req.user_id)
 
                 # Record display name mapping for alias sync (Bug #3 fix)
                 # Only record for relationship facts where canonical_object is a UUID
@@ -2578,8 +2976,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Similarly for object, but only for rel_types where user can be an object.
                 # Skip also_known_as and pref_name because those edges must preserve the alias as object.
+                # CRITICAL: Also skip scalar rel_types — scalar objects are STRING values (age, height, etc.)
+                # and must NEVER be converted to UUIDs (CLAUDE.md constraint: "Scalar rel_types have STRING objects").
+                # dBug-036A: Normalizing scalar values to UUID breaks conflict detection for user corrections.
                 if (canonical_object in _user_aliases and canonical_object != user_entity_id and
-                    edge.rel_type.lower() not in ("also_known_as", "pref_name")):
+                    edge.rel_type.lower() not in ("also_known_as", "pref_name") and
+                    edge.rel_type.lower() not in _SCALAR_OBJECT_RELS):
                     log.info("ingest.object_normalized_to_user_id",
                              original=canonical_object, user_id=user_entity_id)
                     canonical_object = user_entity_id
@@ -2654,22 +3056,92 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if fact_subject == canonical_object:
                     continue
 
-                # Dynamically classify scalar vs relationship (replaces hardcoded _SCALAR_REL_TYPES)
-                classification = classify_fact_type(
+                # PHASE 1: 3D Classification (metadata-first, deterministic routing)
+                classification_3d = classify_fact_3d(
                     edge.rel_type.lower(), _raw_object.lower().strip(), registry, req.user_id)
 
-                # Three-tier confidence logging (never reject, WGM gate enforces downstream)
-                conf = classification.get("confidence", 0.5)
-                if 0.60 <= conf < 0.80:
-                    log.info("ingest.classifier_low_confidence",
-                             rel_type=edge.rel_type.lower(), object=_raw_object,
-                             type=classification["type"], confidence=conf, reason=classification["reason"])
-                elif conf < 0.60:
-                    log.warning("ingest.classifier_uncertain",
-                                rel_type=edge.rel_type.lower(), object=_raw_object,
-                                type=classification["type"], confidence=conf, reason=classification["reason"])
+                # Unknown rel_types (storage=None) are handled as Class C
+                # They flow through ontology_evaluations for async re_embedder evaluation
+                if not classification_3d["storage"]:
+                    # Force to Class C staging for re_embedder evaluation
+                    classification_3d["storage"] = "unknown_staging"
+                    log.info(
+                        "ingest.unknown_rel_type_staged",
+                        rel_type=edge.rel_type.lower(),
+                        object_value=_raw_object,
+                        reason=classification_3d["reason"],
+                    )
 
-                if classification["type"] == "scalar":
+                # PHASE 2: Assign Class and Confidence
+                # Check if user-stated (from is_correction flag, or fact_provenance)
+                is_user_stated = edge.is_correction or (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated")
+
+                # Check if metadata was created in-flow (TODO: detect from extraction context)
+                ontology_created = False
+                hierarchy_created = False
+
+                fact_class, confidence = assign_class_and_confidence(
+                    classification_3d,
+                    is_user_stated,
+                    ontology_created,
+                    hierarchy_created,
+                )
+
+                log.info(
+                    "ingest.fact_classified",
+                    rel_type=edge.rel_type.lower(),
+                    storage=classification_3d["storage"],
+                    fact_class=fact_class,
+                    confidence=confidence,
+                    is_user_stated=is_user_stated,
+                )
+
+                # ROUTE PATH 0: UNKNOWN REL_TYPES (stage as Class C for re_embedder evaluation)
+                if classification_3d["storage"] == "unknown_staging":
+                    # Force Class C, confidence 0.4 for unknown rel_types
+                    fact_class = "C"
+                    confidence = 0.4
+
+                    # Record for ontology evaluation
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "INSERT INTO ontology_evaluations"
+                                " (user_id, candidate_rel_type, candidate_subject_type,"
+                                "  candidate_object_type, first_text_snippet,"
+                                "  extraction_confidence, extraction_method,"
+                                "  sample_subject_id, sample_object,"
+                                "  occurrence_count, last_seen_at)"
+                                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
+                                " ON CONFLICT (user_id, candidate_rel_type, sample_subject_id, sample_object)"
+                                " DO UPDATE SET"
+                                "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
+                                "   last_seen_at = now()",
+                                (req.user_id, edge.rel_type.lower(),
+                                 edge.subject_type, edge.object_type,
+                                 req.text[:500], 0.5, 'ingest',
+                                 canonical_subject, _raw_object),
+                            )
+                        db.commit()
+                    except Exception as _e:
+                        log.warning("ingest.ontology_eval_insert_failed",
+                                   rel_type=edge.rel_type.lower(), error=str(_e))
+
+                    # Stage as Class C relational fact (re_embedder will evaluate)
+                    rows.append((
+                        req.user_id, canonical_subject, _raw_object,
+                        edge.rel_type.lower(), req.source, False,
+                        "C", confidence, True,
+                        getattr(edge, 'definition', '') or ''
+                    ))
+                    log.info("ingest.unknown_rel_type_queued_for_evaluation",
+                             rel_type=edge.rel_type.lower(),
+                             subject=canonical_subject,
+                             object=_raw_object)
+                    continue
+
+                # ROUTE PATH 1: SCALAR
+                if classification_3d["storage"] == "scalar":
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
                     # Only store if value is meaningful
                     if edge.rel_type.lower() == "age":
@@ -2777,6 +3249,15 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.scalar_failed", error=str(_e))
                     continue  # Scalar facts stored in entity_attributes only, don't process as relationship
 
+                # PHASE 3: Enforce Directionality (asymmetric/symmetric/hierarchical)
+                canonical_subject, canonical_object, canonical_rel_type = enforce_directionality(
+                    canonical_subject,
+                    canonical_object,
+                    edge.rel_type.lower(),
+                    classification_3d.get("is_symmetric", False),
+                    classification_3d.get("inverse_rel_type"),
+                )
+
                 # User corrections about themselves are axiomatically valid.
                 # The gate exists to filter inferred/external data — not to override
                 # explicit user intent. Bypass validation entirely for user self-corrections.
@@ -2784,7 +3265,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     status = "valid"
                 else:
                     validation = gate.validate_edge(
-                        fact_subject, canonical_object, edge.rel_type,
+                        fact_subject, canonical_object, canonical_rel_type,
                         user_id=req.user_id,
                         subject_type=edge.subject_type,
                         object_type=edge.object_type,
@@ -2856,33 +3337,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     0.8 if edge.fact_provenance == "user_stated" else 0.6
                 )
 
-                # dprompt-087: Novel entities (unknown type) get confidence=0.7.
-                # This routes them to Class C (staged_facts + Qdrant, 30-day TTL)
-                # instead of polluting the facts table with unvalidated entities.
-                if not edge.is_correction and edge_confidence > 0.7:
-                    try:
-                        with db.cursor() as _cur:
-                            _cur.execute(
-                                "SELECT entity_type FROM entities "
-                                "WHERE user_id = %s AND id = %s AND entity_type = 'unknown'",
-                                (req.user_id, canonical_subject),
-                            )
-                            if _cur.fetchone():
-                                edge_confidence = 0.7
-                            elif not _UUID_PATTERN.match(str(canonical_object)):
-                                # Object is a display name (scalar) — skip entity check
-                                pass
-                            else:
-                                _cur.execute(
-                                    "SELECT entity_type FROM entities "
-                                    "WHERE user_id = %s AND id = %s AND entity_type = 'unknown'",
-                                    (req.user_id, canonical_object),
-                                )
-                                if _cur.fetchone():
-                                    edge_confidence = 0.7
-                    except Exception:
-                        pass  # Best-effort; keep existing confidence if DB query fails
-
                 # Metadata-driven routing (dprompt-73b): query storage_target
                 # from rel_types table instead of hardcoded frozensets.
                 rt_lower = edge.rel_type.lower().strip()
@@ -2919,25 +3373,14 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     ingested += 1
                     # No continue — events also flow through fact classification below
 
-                # Metadata-driven fact classification (dprompt-73b):
-                # query fact_class from rel_types table instead of hardcoded frozensets.
-                fact_class = route_meta.get("fact_class", "C")
-                if edge.is_correction:
-                    fact_class = "A"
-                elif edge_confidence < 0.6:
-                    fact_class = "C"
-
-                # dprompt-087: Novel entities (confidence lowered to 0.7) → Class C.
-                # Prevents unvalidated garbage from polluting PostgreSQL facts table.
-                if edge_confidence == 0.7 and fact_class == "A":
-                    fact_class = "C"
-                # Fact class assigned above from metadata query (dprompt-73b).
+                # Use fact_class from 3D model (Phase 2) — already computed above
+                # Skip old fact_class assignment to preserve 3D routing determinism
                 # is_engine_generated already set correctly by original logic above.
 
                 facts.append(FactResult(
                     subject=fact_subject,
                     object=canonical_object,
-                    rel_type=edge.rel_type,
+                    rel_type=canonical_rel_type,
                     status=status,
                     fact_class=fact_class,
                     provenance=edge.fact_provenance,
@@ -2952,70 +3395,73 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # pref_name semantics, explicit flags, and cross-batch preference objects).
                     rows.append((
                         req.user_id, fact_subject, canonical_object,
-                        edge.rel_type, req.source, is_pref,
-                        fact_class, edge_confidence, is_engine_generated,
+                        canonical_rel_type, req.source, is_pref,
+                        fact_class, confidence, is_engine_generated,
                         getattr(edge, 'definition', '') or ''
                     ))
 
             # Apply taxonomy rules to annotate facts with grouping context
             if rows:
+                # DEBUG: Log rows before taxonomy processing
+                for i, row in enumerate(rows[:3]):  # Log first 3 rows
+                    log.info("ingest.rows_before_taxonomy",
+                           row_idx=i, user_id=row[0], subject=row[1], obj=row[2],
+                           rel_type=row[3], fact_class=row[6])
                 rows = _apply_taxonomy_rules(rows, req.user_id, db)
 
             if rows:
-                # Rel_types that ALWAYS have scalar (string) objects, never UUID references
-                _SCALAR_OBJECT_RELS = {
-                    'pref_name', 'also_known_as',  # identity: display names (strings)
-                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
-                    'occupation', 'nationality',  # descriptive: single-word or phrase
-                }
+                # CRITICAL: Filter out scalar rel_types from rows — they MUST ONLY be stored in entity_attributes
+                # Metadata-driven: check rel_types.tail_types={SCALAR} to determine storage path
+                # Scalar facts routed via Phase 1 classification should never reach rows.append(), but add guard here
+                # to prevent accidental double-storage in facts table (dprompt-96 Phase 4 routing guarantee)
+                def is_scalar_rel_type(rt_lower: str) -> bool:
+                    """Check if rel_type has SCALAR storage via metadata."""
+                    if not rt_lower:
+                        return False
+                    rt_meta = _REL_TYPE_META.get(rt_lower, {})
+                    tail_types = rt_meta.get("tail_types", [])
+                    return "SCALAR" in tail_types
+
+                scalar_count_filtered = 0
+                rows_before = len(rows)
+                rows = [row for row in rows if not is_scalar_rel_type(row[3].lower() if row[3] else '')]
+                scalar_count_filtered = rows_before - len(rows)
+                if scalar_count_filtered > 0:
+                    log.warning("ingest.scalar_rels_filtered_from_rows",
+                               count=scalar_count_filtered,
+                               reason="scalar_rels (tail_types=SCALAR) stored in entity_attributes, not facts")
 
                 # Filter rows to ensure entity_ids are valid (UUIDs or user_id itself)
                 # Validates that only user_id and UUID v5 surrogates appear in facts
                 # (prevents arbitrary string entity_ids from contaminating DB)
                 validated_rows = []
-                # dprompt-088: Collect rejected rows for Class C routing
-                _rejected_rows: list[tuple] = []
                 for row in rows:
                     user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
                     definition = row[9] if len(row) > 9 else ''
                     rt_lower = rel_type.lower() if rel_type else ''
 
                     # If subject is a string (not UUID), try to resolve it
-                    _subject_original = row[1]  # keep original for logging
                     if subject and not _UUID_PATTERN.match(subject) and subject != user_id:
                         try:
                             subject = registry.resolve(user_id, subject)
-                            if subject is None:
-                                _reason = _get_rejection_reason(_subject_original)
-                                log.info("ingest.subject_rejected",
-                                         original=_subject_original, reason=_reason, rel_type=rel_type)
-                            else:
-                                log.info("ingest.subject_valid",
-                                         original=_subject_original, canonical_uuid=subject, rel_type=rel_type)
+                            log.info("ingest.subject_resolved_during_validation",
+                                   original=row[1], resolved=subject, rel_type=rel_type)
                         except Exception as _e:
                             log.error("ingest.subject_resolution_failed_validation",
-                                    original=_subject_original, error=str(_e), rel_type=rel_type)
-                            _rejected_rows.append((user_id, _subject_original, rel_type, _object_original or obj))
+                                    original=row[1], error=str(_e), rel_type=rel_type)
                             continue
 
                     # If object is a string, only resolve if rel_type expects UUID objects
                     # Skip resolution for rel_types in _SCALAR_OBJECT_RELS (pref_name, age, etc.)
-                    _object_original = row[2]  # keep original for logging
                     if obj and not _UUID_PATTERN.match(obj) and obj != user_id:
                         if rt_lower not in _SCALAR_OBJECT_RELS:
                             try:
                                 obj = registry.resolve(user_id, obj)
-                                if obj is None:
-                                    _reason = _get_rejection_reason(_object_original)
-                                    log.info("ingest.object_rejected",
-                                             original=_object_original, reason=_reason, rel_type=rel_type)
-                                else:
-                                    log.info("ingest.object_valid",
-                                             original=_object_original, canonical_uuid=obj, rel_type=rel_type)
+                                log.info("ingest.object_resolved_during_validation",
+                                       original=row[2], resolved=obj, rel_type=rel_type)
                             except Exception as _e:
                                 log.error("ingest.object_resolution_failed_validation",
-                                        original=_object_original, error=str(_e), rel_type=rel_type)
-                                _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original))
+                                        original=row[2], error=str(_e), rel_type=rel_type)
                                 continue
 
                     # Now validate: subject must be UUID or user_id
@@ -3027,8 +3473,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.error("ingest.invalid_subject_id",
                                   subject=subject, rel_type=rel_type, user_id=user_id,
                                   reason="subject_id must be UUID or user_id")
-                        _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
-                        continue  # Route to Class C (handled after loop)
+                        continue  # Skip this fact
 
                     # Object validation depends on rel_type:
                     # - For scalar rel_types: object can be ANY string (value)
@@ -3039,7 +3484,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_object_scalar",
                                       obj=obj, rel_type=rel_type, user_id=user_id,
                                       reason="object value cannot be empty for scalar rel_type")
-                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
                             continue
                         # CRITICAL: pref_name and also_known_as must NEVER have UUID objects
                         # A UUID as a display name is meaningless and breaks display resolution
@@ -3047,7 +3491,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_identity_rel_uuid_object",
                                       rel_type=rel_type, object=obj, subject=subject,
                                       reason=f"{rel_type} object must be a display name string, not a UUID")
-                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
                             continue
                     else:
                         # Relationship rel_type: object must be UUID or user_id
@@ -3059,29 +3502,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_object_id",
                                       obj=obj, rel_type=rel_type, user_id=user_id,
                                       reason="object_id must be UUID or user_id for relationship rel_type")
-                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
-                            continue  # Route to Class C (handled after loop)
+                            continue  # Skip this fact
 
                     # Update row with resolved subject/object if they changed
                     updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated, definition)
                     validated_rows.append(updated_row)
 
                 rows = validated_rows
-
-                # dprompt-088: Route rejected rows to Class C (staged_facts + Qdrant)
-                if _rejected_rows:
-                    _routed_count = 0
-                    for _uid, _subj_name, _rel, _obj_name in _rejected_rows:
-                        _reason = _get_rejection_reason(_subj_name)
-                        _fid = _commit_rejected_edge_to_qdrant(
-                            db, _uid, str(_subj_name), _rel, str(_obj_name), _reason,
-                        )
-                        if _fid:
-                            _routed_count += 1
-                    log.info("ingest.rejected_edges_routed_to_class_c",
-                             rejected_count=len(_rejected_rows),
-                             routed_to_qdrant=_routed_count,
-                             confidence=0.4)
 
                 # ── dprompt-59: Semantic conflict detection ──────────────────
                 # Before committing, check each fact against existing graph structure.
@@ -3961,56 +4388,105 @@ def query(request: QueryRequest):
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         registry = EntityRegistry(db)
 
-        # Find ALL user entity UUIDs with identity facts (dprompt-88c fix)
-        # dBug-031: Prioritize the user_id itself, then Person entities by confidence
-        user_entity_ids_for_query = []
+        # ═══════════════════════════════════════════════════════════════════════
+        # dprompt-93: Semantic Query Resolution Framework
+        # Three-step identity resolution: Self Anchor → Hierarchy → Ontology
+        # ═══════════════════════════════════════════════════════════════════════
+
+        # Step 1: Self Anchor — Check if user_id itself has identity facts
+        candidate_entities = []
         with db.cursor() as cur:
-            # First: check if user_id itself has identity facts (is the canonical user)
             cur.execute(
-                "SELECT DISTINCT subject_id "
-                "FROM facts "
-                "WHERE user_id = %s AND subject_id = %s "
-                "AND rel_type IN ('pref_name', 'also_known_as') "
-                "AND superseded_at IS NULL",
+                "SELECT f.subject_id, e.entity_type, f.confidence, f.created_at "
+                "FROM facts f "
+                "JOIN entities e ON e.id = f.subject_id "
+                "WHERE f.user_id = %s AND f.subject_id = %s "
+                "AND f.rel_type IN ('pref_name', 'also_known_as') "
+                "AND f.superseded_at IS NULL "
+                "ORDER BY f.confidence DESC, f.created_at DESC "
+                "LIMIT 1",
                 (user_id, user_id)
             )
-            direct_user_match = [row[0] for row in cur.fetchall()]
+            row = cur.fetchone()
+            if row:
+                candidate_entities.append((row[0], row[1], row[2], row[3], "self_anchor"))
+                log.info("query.identity_self_anchor_found", entity_id=row[0][:8], entity_type=row[1])
 
-            if direct_user_match:
-                user_entity_ids_for_query = direct_user_match
-            else:
-                # Fallback: Find other Person entities with identity facts, prioritize by confidence
+        # Step 2: Hierarchy — If Self Anchor not found, query all identity candidates with types
+        if not candidate_entities:
+            with db.cursor() as cur:
                 cur.execute(
-                    "SELECT f.subject_id "
+                    "SELECT f.subject_id, e.entity_type, f.confidence, f.created_at "
                     "FROM facts f "
                     "JOIN entities e ON e.id = f.subject_id "
                     "WHERE f.user_id = %s AND f.rel_type IN ('pref_name', 'also_known_as') "
                     "AND f.superseded_at IS NULL "
-                    "AND e.entity_type = 'Person' "
                     "ORDER BY f.confidence DESC, f.created_at DESC",
                     (user_id,)
                 )
-                seen = set()
-                for row in cur.fetchall():
-                    if row[0] not in seen:
-                        user_entity_ids_for_query.append(row[0])
-                        seen.add(row[0])
+                candidate_entities = [(row[0], row[1], row[2], row[3], "hierarchy") for row in cur.fetchall()]
 
-        # If no identity facts found, fall back to registry
-        if not user_entity_ids_for_query:
+        # Keep full list of identity entities for downstream fact fetching (dprompt-88d)
+        user_entity_ids_for_query = [ent[0] for ent in candidate_entities]
+
+        # Step 3: Ontology — Score candidates by semantic type and instance_of chains
+        # Query which entity_types appear in "user-centric" taxonomies (family, household, work)
+        semantic_user_types = set()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT UNNEST(member_entity_types) as entity_type "
+                "FROM entity_taxonomies "
+                "WHERE taxonomy_name IN ('family', 'household', 'work')"
+            )
+            semantic_user_types = {row[0] for row in cur.fetchall()}
+            log.info("query.semantic_user_types_loaded", types=list(semantic_user_types))
+
+        # Score candidates: prefer those in "user-centric" taxonomies
+        scored_candidates = []
+        for entity_id, entity_type, confidence, created_at, source in candidate_entities:
+            score = 0.0
+
+            # Bonus: entity_type in semantic user taxonomies
+            if entity_type in semantic_user_types:
+                score += 2.0
+
+            # Bonus: confidence score
+            score += confidence
+
+            # Preserve created_at for deterministic tie-breaking (dprompt-93 robustness)
+            scored_candidates.append((entity_id, entity_type, score, created_at, source))
+            log.info("query.identity_candidate_scored", entity_id=entity_id[:8], entity_type=entity_type, score=score, source=source)
+
+        # Pick highest-scoring candidate as canonical identity for context
+        # Deterministic tie-breaking: score DESC, then created_at DESC (most recent wins)
+        user_entity_id_for_query = None
+        if scored_candidates:
+            scored_candidates.sort(key=lambda x: (-x[2], -x[3].timestamp() if hasattr(x[3], 'timestamp') else 0), reverse=False)
+            user_entity_id_for_query = scored_candidates[0][0]
+            log.info("query.identity_resolved", entity_id=user_entity_id_for_query[:8], entity_type=scored_candidates[0][1], score=scored_candidates[0][2], method="semantic_scoring")
+
+        # Fallback: if no identity facts found, create/resolve user entity
+        # Defensive: validate fallback produces a valid UUID before using
+        if not user_entity_id_for_query:
             fallback_id = registry.resolve(user_id, "user")
             if not fallback_id:
                 from src.entity_registry.registry import _make_surrogate
                 fallback_id = _make_surrogate(user_id, user_id)
-            user_entity_ids_for_query = [fallback_id] if fallback_id else []
+            # Validate fallback_id is non-empty UUID (dprompt-93 robustness)
+            if fallback_id and isinstance(fallback_id, str) and len(fallback_id) > 0:
+                user_entity_id_for_query = fallback_id
+                user_entity_ids_for_query = [fallback_id]
+                log.info("query.identity_fallback_registry", entity_id=fallback_id[:8])
+            else:
+                log.warning("query.identity_fallback_failed", fallback_id=fallback_id)
 
-        # Pick the first identity entity as canonical (but will fetch from all)
-        user_entity_id_for_query = user_entity_ids_for_query[0] if user_entity_ids_for_query else None
+        # Get canonical identity display name
+        canonical_identity = None
+        if user_entity_id_for_query:
+            canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_query)
+            if not canonical_identity or _UUID_PATTERN.match(canonical_identity):
+                canonical_identity = user_id
 
-        canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_query)
-        if not canonical_identity or _UUID_PATTERN.match(canonical_identity):
-            canonical_identity = user_id
-        # Debug: log user identity setup (dprompt-88c)
         log.info("query.user_identity", owui_user_id=user_id, entity_id=user_entity_id_for_query[:8] if user_entity_id_for_query else "none", canonical=canonical_identity)
     except Exception as _e:
         log.warning("query.db_init_failed", error=str(_e))
@@ -4162,6 +4638,22 @@ def query(request: QueryRequest):
 
             entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
             attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
+
+            # dBug-035: Log spouse facts at this point (after graph traversal)
+            spouse_in_direct = [f for f in direct_facts if f.get("rel_type") == "spouse"]
+            if spouse_in_direct:
+                log.info("query.dBug035_spouse_after_graph_traversal",
+                         count=len(spouse_in_direct),
+                         spouse_facts=[{
+                             "subject": f.get("subject", "?")[:8],
+                             "object": f.get("object", "?")[:8],
+                             "confidence": f.get("confidence"),
+                             "fact_state": f.get("fact_state"),
+                         } for f in spouse_in_direct])
+            else:
+                log.warning("query.dBug035_spouse_missing_after_graph_traversal",
+                           direct_facts_total=len(direct_facts))
+
             if direct_facts:
                 log.info("query.graph_traversal", identity=canonical_identity, hits=len(direct_facts))
                 # Don't return early — merge with Qdrant results below
@@ -4369,14 +4861,37 @@ def query(request: QueryRequest):
         entity_types = _build_entity_types(preferred_names)
 
         # Debug: log what facts are being returned (dprompt-88)
+        # dBug-035: Enhanced logging to trace spouse fact through pipeline
         rel_types_returned = {}
+        spouse_facts = []
         for f in merged_facts:
             rt = f.get("rel_type", "unknown")
             rel_types_returned[rt] = rel_types_returned.get(rt, 0) + 1
+            if rt == "spouse":
+                spouse_facts.append({
+                    "subject": f.get("subject", "?")[:8],
+                    "object": f.get("object", "?")[:8],
+                    "confidence": f.get("confidence"),
+                    "fact_state": f.get("fact_state"),
+                    "fact_class": f.get("fact_class"),
+                })
         log.info("query.facts_summary",
                  total=len(merged_facts),
                  rel_types=dict(sorted(rel_types_returned.items())),
+                 spouse_count=len(spouse_facts),
+                 spouse_facts=spouse_facts,
                  query=request.text[:100])
+
+        # dprompt-91: Apply archive filtering (multi-factor scope + temporality)
+        try:
+            filtered_facts, archive_metadata = apply_archive_filter(
+                db, query_lower, user_id, merged_facts
+            )
+            log.info("query.archive_filtering_applied", **archive_metadata)
+            merged_facts = filtered_facts
+        except Exception as e:
+            log.error("query.archive_filter_failed", error=str(e))
+            raise  # HARD FAIL: archive filter failure is non-recoverable
 
         return {
             "status": "ok",
@@ -4422,6 +4937,18 @@ def query(request: QueryRequest):
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
             entity_types_404 = _build_entity_types(preferred_names)
+
+            # dprompt-91: Apply archive filtering (404 case)
+            try:
+                filtered_facts, archive_metadata = apply_archive_filter(
+                    db, query_lower, user_id, merged_facts
+                )
+                log.info("query.404.archive_filtering_applied", **archive_metadata)
+                merged_facts = filtered_facts
+            except Exception as e:
+                log.error("query.404.archive_filter_failed", error=str(e))
+                raise
+
             return {
                     "status": "ok",
                     "facts": merged_facts,
@@ -4459,6 +4986,18 @@ def query(request: QueryRequest):
                         preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
 
             entity_types_err = _build_entity_types(preferred_names)
+
+            # dprompt-91: Apply archive filtering (error case)
+            try:
+                filtered_facts, archive_metadata = apply_archive_filter(
+                    db, query_lower, user_id, merged_facts
+                )
+                log.info("query.error.archive_filtering_applied", **archive_metadata)
+                merged_facts = filtered_facts
+            except Exception as e:
+                log.error("query.error.archive_filter_failed", error=str(e))
+                raise
+
             return {
                     "status": "ok",
                     "facts": merged_facts,
@@ -4535,7 +5074,9 @@ def query(request: QueryRequest):
         resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
         attr_added = 0
         for f in resolved_attr_facts:
-            key = (f["subject"], f["object"], f["rel_type"])
+            # dprompt-92: Use UUID keys for dedup to match other facts (baseline, qdrant)
+            # _subject_id/_object_id preserve UUIDs, same display names may vary by alias
+            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
             if key not in pg_keys:
                 merged_facts.append(f)
                 pg_keys.add(key)
@@ -4582,49 +5123,6 @@ def query(request: QueryRequest):
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
 
-        # ── dprompt-089: Class C filtering — global, not family-scoped ─────
-        # Exclude ALL facts with confidence below QUERY_MIN_CONFIDENCE (default 0.6).
-        # Class C facts (confidence < 0.6) are experimental/ephemeral and should not
-        # appear in authoritative /query responses regardless of rel_type.
-        # This is domain-agnostic — applies to family, work, location, pets, etc.
-        _MIN_CONFIDENCE = float(os.getenv("QUERY_MIN_CONFIDENCE", "0.6"))
-        _before_filter = len(merged_facts)
-        merged_facts = [
-            f for f in merged_facts
-            if float(f.get("confidence", 1.0)) >= _MIN_CONFIDENCE
-        ]
-        if len(merged_facts) < _before_filter:
-            log.info("query.class_c_filtered",
-                     dropped=(_before_filter - len(merged_facts)),
-                     threshold=_MIN_CONFIDENCE)
-
-        # ── dprompt-089: Normalize user identity to preferred name ─────────
-        # Facts may reference the user via multiple entity UUIDs (canonical user_id,
-        # "chris", "we", etc.) after graph traversal. Normalize all user-facing
-        # _subject_id/_object_id to the canonical user UUID so deduplication
-        # collapses duplicate parent_of/child_of/spouse facts.
-        if registry and user_entity_id_for_query:
-            # Only normalize the CANONICAL user identity UUID(s), not every named entity.
-            # user_entity_ids_for_query contains ALL entities with pref_name facts
-            # (children, spouse, pets). We only want the USER's own identity UUIDs.
-            _user_uuids = {user_id, user_entity_id_for_query}
-            # Also include any aliases that resolve to the canonical user entity
-            try:
-                _canonical_uuid = registry.get_canonical_for_user(user_id)
-                if _canonical_uuid:
-                    _user_uuids.add(_canonical_uuid)
-            except Exception:
-                pass
-            for _f in merged_facts:
-                _sid = _f.get("_subject_id", "")
-                _oid = _f.get("_object_id", "")
-                if _sid in _user_uuids:
-                    _f["_subject_id"] = user_entity_id_for_query
-                    _f["subject"] = "user"  # Filter's _user_anchors expects "user"
-                if _oid in _user_uuids:
-                    _f["_object_id"] = user_entity_id_for_query
-                    _f["object"] = "user"
-
         # ── dprompt-61: Deduplicate by entity UUID + attach alias metadata ──
         # Facts may have different display names for the same entity_id
         # (e.g., christopher spouse mars AND chris spouse mars). Deduplicate
@@ -4649,6 +5147,17 @@ def query(request: QueryRequest):
         merged_facts = _aliased_facts
         log.info("query.deduplicated", before=len(pg_keys), after=len(merged_facts))
         # ── end dprompt-61 ──────────────────────────────────────────────────
+
+        # dprompt-91: Apply archive filtering (main success case)
+        try:
+            filtered_facts, archive_metadata = apply_archive_filter(
+                db, query_lower, user_id, merged_facts
+            )
+            log.info("query.success.archive_filtering_applied", **archive_metadata)
+            merged_facts = filtered_facts
+        except Exception as e:
+            log.error("query.success.archive_filter_failed", error=str(e))
+            raise
 
         # Strip internal metadata before returning to Filter
         _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")

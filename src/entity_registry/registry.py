@@ -53,7 +53,9 @@ class EntityRegistry:
         If name is already a UUID, returns it unchanged.
         If name is unknown, generates a UUID v5 surrogate and registers it.
         """
+        original_name = name
         name = name.lower().strip()
+        log.info("entity_registry.resolve_start", original_name=original_name, normalized_name=name, user_id=user_id)
         if not name:
             raise ValueError("Entity name cannot be empty")
 
@@ -62,6 +64,7 @@ class EntityRegistry:
         # If not (e.g., test user strings), derive a deterministic UUID surrogate.
         if name == "user":
             entity_id = user_id if self._is_valid_uuid(user_id) else _make_surrogate(user_id, user_id)
+            log.info("entity_registry.resolve_user_special_case", entity_id=entity_id)
             # Ensure the user entity exists
             with self.db_conn.cursor() as cur:
                 cur.execute(
@@ -71,6 +74,7 @@ class EntityRegistry:
                     (entity_id, user_id),
                 )
             self.db_conn.commit()
+            log.info("entity_registry.resolve_returning_user", return_value=entity_id)
             return entity_id
 
         with self.db_conn.cursor() as cur:
@@ -81,12 +85,15 @@ class EntityRegistry:
                 (user_id, name),
             )
             row = cur.fetchone()
+            log.info("entity_registry.alias_query_executed", name=name, user_id=user_id, found=row is not None)
             if row:
                 entity_id = row[0]
+                log.info("entity_registry.alias_query_result", name=name, user_id=user_id, entity_id=entity_id, uuid_count=entity_id.count('-') if entity_id else 0)
                 # Validate that entity_id is a UUID (not a corrupted string)
                 # Corrupted entries should be skipped and treated as unknown
                 if entity_id and (entity_id.count('-') == 4 or entity_id == 'user'):
                     log.info("entity_registry.resolve_alias_found", alias=name, entity_id=entity_id)
+                    log.info("entity_registry.resolve_returning_alias", name=name, return_value=entity_id)
                     return entity_id
                 # If entity_id is a string (corrupted), fall through to generate a proper UUID
 
@@ -96,13 +103,23 @@ class EntityRegistry:
                 (user_id, name),
             )
             row = cur.fetchone()
+            log.info("entity_registry.uuid_query_executed", name=name, user_id=user_id, found=row is not None)
             if row:
-                log.info("entity_registry.resolve_uuid_found", name=name)
-                return row[0]
+                entity_id = row[0]
+                # Validate that entity_id is actually a UUID (not corrupted string)
+                # Corrupted entries (display name strings in id column) must be skipped
+                if entity_id and (entity_id.count('-') == 4 or entity_id == 'user'):
+                    log.info("entity_registry.resolve_uuid_found", name=name)
+                    log.info("entity_registry.resolve_returning_uuid", name=name, return_value=entity_id)
+                    return entity_id
+                else:
+                    # Corrupted: entity_id is a string, not a UUID - fall through to generate proper UUID
+                    log.warning("entity_registry.corrupted_string_entity_id_in_entities",
+                               entity_id=entity_id, name=name, user_id=user_id)
 
             # Unknown — generate UUID v5 surrogate and register
             surrogate = _make_surrogate(user_id, name)
-            log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate)
+            log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate, surrogate_has_dashes=surrogate.count('-'))
             try:
                 cur.execute(
                     "INSERT INTO entities (id, user_id, entity_type) "
@@ -118,6 +135,7 @@ class EntityRegistry:
                 )
                 self.db_conn.commit()
                 log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
+                log.info("entity_registry.resolve_returning", name=name, return_value=surrogate, is_uuid=surrogate.count('-') == 4)
                 return surrogate
             except Exception as e:
                 log.error("entity_registry.resolve_registration_failed", name=name, error=str(e))
