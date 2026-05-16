@@ -242,9 +242,81 @@ class WGMValidationGate:
             )
             return None
 
+    # ── dprompt-90: Semantic Supersession on User Corrections ─────────
+    # When user corrects a fact (e.g., "Aurora is a computer"), archive conflicting facts
+    # This ensures corrections are authoritative at write-time, not post-hoc filtering
+
+    _CONFLICTING_REL_PAIRS = {
+        # (new_rel_type, conflicting_rel_type) pairs that trigger archival
+        ("instance_of", "has_pet"),
+        ("instance_of", "owns"),
+        ("instance_of", "likes"),
+        ("instance_of", "dislikes"),
+        ("instance_of", "prefers"),
+        ("subclass_of", "has_pet"),
+        ("subclass_of", "owns"),
+    }
+
+    def _is_user_correction(self, edge_dict: dict) -> bool:
+        """Check if edge is marked as user correction (high confidence or explicit flag)."""
+        # Explicit flag
+        if edge_dict.get("is_correction"):
+            return True
+        # High confidence (1.0 or 0.9+) implies user-stated
+        confidence = edge_dict.get("confidence", 0.5)
+        return confidence >= 0.9
+
+    def _find_conflicting_relationships(self, user_id: str, subject_id: str, new_rel_type: str) -> list[str]:
+        """Find rel_types that conflict with the new relationship type for this subject."""
+        conflicting = []
+        for new_rt, conflict_rt in self._CONFLICTING_REL_PAIRS:
+            if new_rel_type.lower() == new_rt:
+                conflicting.append(conflict_rt)
+        return conflicting
+
+    def _supersede_conflicting_facts(self, user_id: str, subject_id: str,
+                                     conflicting_rel_types: list[str], reason: str) -> int:
+        """Archive facts with conflicting rel_types for this subject. Returns count archived."""
+        if not conflicting_rel_types:
+            return 0
+
+        archived_count = 0
+        try:
+            with self.db_conn.cursor() as cur:
+                for conflict_rt in conflicting_rel_types:
+                    cur.execute(
+                        "UPDATE facts SET archived_at = NOW() "
+                        "WHERE user_id = %s AND subject_id = %s AND rel_type = %s "
+                        "AND archived_at IS NULL",
+                        (user_id, subject_id, conflict_rt),
+                    )
+                    archived_count += cur.rowcount
+            self.db_conn.commit()
+
+            if archived_count > 0:
+                log.info(
+                    "wgm.semantic_supersession",
+                    user_id=user_id,
+                    subject_id=subject_id,
+                    archived_rel_types=conflicting_rel_types,
+                    archived_count=archived_count,
+                    reason=reason,
+                )
+        except Exception as e:
+            log.error(
+                "wgm.semantic_supersession_failed",
+                user_id=user_id,
+                subject_id=subject_id,
+                error=str(e),
+            )
+
+        return archived_count
+
+    # ── end dprompt-90 ──────────────────────────────────────────────────
+
     def validate_edge(self, subject_id, object_id, rel_type: str,
                       user_id=None, provenance=None, subject_type: str = None,
-                      object_type: str = None) -> dict:
+                      object_type: str = None, **edge_kwargs) -> dict:
         """
         Validate an incoming edge against the ontology and existing DB state.
         If registry is provided, uses it; otherwise falls back to SEED_ONTOLOGY.
@@ -255,6 +327,16 @@ class WGMValidationGate:
         different object): inserts the new fact, penalizes all superseded facts via
         mark_contradicted, and returns a conflict dict with the penalty details.
         """
+        # dprompt-90: Semantic supersession on user corrections
+        # If this is a correction, archive conflicting facts before validation
+        if user_id and self._is_user_correction(edge_kwargs):
+            conflicting_rels = self._find_conflicting_relationships(user_id, subject_id, rel_type)
+            if conflicting_rels:
+                self._supersede_conflicting_facts(
+                    user_id, subject_id, conflicting_rels,
+                    reason=f"user_correction:{rel_type.lower()}"
+                )
+
         rt = rel_type.lower().strip()
 
         # Check against registry or SEED_ONTOLOGY
