@@ -1,0 +1,89 @@
+================================================================================
+FAULTLINE PRODUCTION DEPLOYMENT MANIFEST
+dprompt-97: Robust Extraction Validation & LLM Metadata Capture
+Date: 2026-05-16
+================================================================================
+
+FEATURES DEPLOYED:
+1. dBug-027: Metadata-driven pref_name validation (name-like only, no descriptors)
+2. dBug-026: Entity extraction filtering (stop words, rel_types removal)
+3. Wikidata ontology strengthening (tail_types, head_types, is_symmetric metadata)
+4. LLM-driven rel_type metadata capture for natural system growth
+
+================================================================================
+PRODUCTION FILES COPIED TO ../FaultLine/
+================================================================================
+
+1. MIGRATIONS (Database Schema)
+   ├─ migrations/030_strengthen_rel_types_wikidata_ontology.sql (286 lines)
+   │  └─ Populates rel_types metadata: tail_types, head_types, is_symmetric, 
+   │     inverse_rel_type, is_hierarchy_rel for complete Wikidata ontology
+
+2. API LAYER (FastAPI Backend)
+   ├─ src/api/main.py (+189 lines changes)
+   │  ├─ _validate_rel_type_constraints() - Metadata-driven rel_type validation
+   │  ├─ _filter_extracted_entities() - GLiNER2 output filtering (stop words, rel_types)
+   │  ├─ pref_name scalar path validation - Rejects descriptive phrases
+   │  ├─ Enhanced /extract/rewrite system prompt - Asks LLM for rel_type metadata
+   │  └─ /ontology/rel_types endpoint - Accepts & stores metadata fields
+   │
+   ├─ src/api/models.py (+9 lines)
+   │  └─ RelTypeRequest extended with optional metadata fields:
+   │     head_types, tail_types, is_symmetric, inverse_rel_type, is_hierarchy_rel
+
+3. BACKGROUND WORKER (re-embedder)
+   ├─ src/re_embedder/embedder.py (+35 lines changes)
+   │  ├─ evaluate_ontology_candidates() enhanced to:
+   │  │  ├─ Infer head_types from sample subject type
+   │  │  ├─ Infer tail_types from sample object type
+   │  │  ├─ Heuristic is_hierarchy detection (instance_of, subclass_of, etc.)
+   │  │  └─ Heuristic is_symmetric detection (friend, knows, peer, etc.)
+   │  └─ Auto-approved novel rel_types now capture metadata
+
+4. OPENWEBUI FILTER LAYER (Memory Injection)
+   ├─ openwebui/faultline_function.py (unchanged - already had definition field fix)
+   │  └─ Uses rel_type definition field for English prose injection
+
+================================================================================
+EXCLUDED FROM PRODUCTION (as requested):
+================================================================================
+✗ CLAUDE.md - Project instructions (NOT included)
+✗ .claude/settings.local.json - Local development settings
+✗ Temporary notes & documentation
+✗ Python cache files (__pycache__)
+
+================================================================================
+SECURITY VERIFICATION:
+================================================================================
+✓ No hardcoded API keys
+✓ No bearer tokens
+✓ No passwords
+✓ No local secrets
+✓ All environment variables referenced via os.getenv()
+
+================================================================================
+DEPLOYMENT CHECKLIST:
+================================================================================
+To complete production deployment:
+
+1. [ ] Pull latest from FaultLine/ (production git)
+2. [ ] Apply migration 030 to production database:
+       PGPASSWORD=faultline psql -h <prod-db> -U faultline -d faultline \
+         < migrations/030_strengthen_rel_types_wikidata_ontology.sql
+3. [ ] Rebuild production container with code changes
+4. [ ] Verify metadata-driven routing in logs:
+       docker logs faultline | grep "ingest.fact_classified.*storage"
+5. [ ] Test family relationships: "tell me about my family"
+       Expected: Proper English prose (Your spouse is Mars)
+6. [ ] Monitor for validation rejections:
+       docker logs faultline | grep "pref_name_rejected\|entities_filtered"
+
+================================================================================
+FILES SUMMARY:
+================================================================================
+Total files copied: 5
+Total lines added: 229
+Total bytes: 8,693
+
+Deployment ready for production build and testing.
+================================================================================
