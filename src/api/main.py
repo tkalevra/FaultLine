@@ -2012,6 +2012,62 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
         return 0
 
 
+# ── dprompt-088: Edge validation helpers ──────────────────────────────────
+
+def _get_rejection_reason(name: str) -> str:
+    """Return why EntityRegistry.validate_entity_name() would reject a name."""
+    from src.entity_registry.registry import (
+        _THIRD_PERSON_PRONOUNS,
+        _ENTITY_TYPE_LABELS,
+        _VALIDATION_STOPWORDS,
+    )
+    name_lower = name.lower().strip()
+    if not name_lower or len(name_lower) < 2:
+        return "too_short"
+    if re.match(r'^\d+$', name_lower):
+        return "numbers_only"
+    if name_lower in _THIRD_PERSON_PRONOUNS:
+        return "pronoun"
+    if name_lower in _ENTITY_TYPE_LABELS:
+        return "type_label"
+    if name_lower in _VALIDATION_STOPWORDS:
+        return "stopword"
+    return "unknown"
+
+
+def _commit_rejected_edge_to_qdrant(
+    db, user_id: str,
+    subject_name: str, rel_type: str, object_name: str,
+    reason: str,
+) -> int | None:
+    """Store rejected edge to staged_facts for re-embedder evaluation (Class C)."""
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO staged_facts"
+                " (user_id, subject_id, object_id, rel_type, fact_class,"
+                "  provenance, confidence, first_seen_at, expires_at)"
+                " VALUES (%s, %s, %s, %s, 'C', %s, 0.4, NOW(), NOW() + INTERVAL '30 days')"
+                " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
+                " DO UPDATE SET"
+                "   confirmed_count = staged_facts.confirmed_count + 1,"
+                "   last_seen_at    = NOW(),"
+                "   confidence      = 0.4"
+                " RETURNING id",
+                (user_id, subject_name, object_name, rel_type,
+                 f'validation_rejection:{reason}'),
+            )
+            row = cur.fetchone()
+            db.commit()
+            return row[0] if row else None
+    except Exception as e:
+        db.rollback()
+        log.warning("ingest.rejected_edge_commit_failed",
+                    subject=subject_name, rel_type=rel_type,
+                    object=object_name, error=str(e))
+        return None
+
+
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -2386,7 +2442,20 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Resolve all entity names to canonical form via registry
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
-                canonical_subject = registry.resolve(req.user_id, edge.subject)
+                # User corrections can use type labels as subjects
+                is_user_correction = getattr(edge, 'is_correction', False) or edge.fact_provenance == "user_stated"
+                canonical_subject = registry.resolve(req.user_id, edge.subject, allow_type_labels=is_user_correction)
+
+                # dprompt-087: If resolve() returns None, the entity name is garbage
+                # (pronoun, type label, stopword). Skip the entire edge gracefully.
+                if canonical_subject is None:
+                    _reason = _get_rejection_reason(edge.subject)
+                    log.info("ingest.subject_rejected",
+                             original=edge.subject, reason=_reason, rel_type=edge.rel_type)
+                    _commit_rejected_edge_to_qdrant(
+                        db, req.user_id, edge.subject, edge.rel_type,
+                        edge.object, _reason)
+                    continue
 
                 # For scalar rel_types, object is a string value (not an entity reference)
                 # Skip resolution and keep the raw string value
@@ -2394,7 +2463,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     canonical_object = edge.object.lower().strip()
                 else:
                     # For relationship rel_types, resolve object to UUID
-                    canonical_object = registry.resolve(req.user_id, edge.object)
+                    # User corrections can use type labels (e.g., instance_of(Aurora, computer))
+                    is_user_correction = getattr(edge, 'is_correction', False) or edge.fact_provenance == "user_stated"
+                    canonical_object = registry.resolve(req.user_id, edge.object, allow_type_labels=is_user_correction)
+                    # dprompt-087: Reject edge if object entity is garbage
+                    if canonical_object is None:
+                        _reason = _get_rejection_reason(edge.object)
+                        log.info("ingest.object_rejected",
+                                 original=edge.object, reason=_reason, rel_type=edge.rel_type)
+                        _commit_rejected_edge_to_qdrant(
+                            db, req.user_id, edge.subject, edge.rel_type,
+                            edge.object, _reason)
+                        continue
 
                 # Record display name mapping for alias sync (Bug #3 fix)
                 # Only record for relationship facts where canonical_object is a UUID
@@ -2776,6 +2856,33 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     0.8 if edge.fact_provenance == "user_stated" else 0.6
                 )
 
+                # dprompt-087: Novel entities (unknown type) get confidence=0.7.
+                # This routes them to Class C (staged_facts + Qdrant, 30-day TTL)
+                # instead of polluting the facts table with unvalidated entities.
+                if not edge.is_correction and edge_confidence > 0.7:
+                    try:
+                        with db.cursor() as _cur:
+                            _cur.execute(
+                                "SELECT entity_type FROM entities "
+                                "WHERE user_id = %s AND id = %s AND entity_type = 'unknown'",
+                                (req.user_id, canonical_subject),
+                            )
+                            if _cur.fetchone():
+                                edge_confidence = 0.7
+                            elif not _UUID_PATTERN.match(str(canonical_object)):
+                                # Object is a display name (scalar) — skip entity check
+                                pass
+                            else:
+                                _cur.execute(
+                                    "SELECT entity_type FROM entities "
+                                    "WHERE user_id = %s AND id = %s AND entity_type = 'unknown'",
+                                    (req.user_id, canonical_object),
+                                )
+                                if _cur.fetchone():
+                                    edge_confidence = 0.7
+                    except Exception:
+                        pass  # Best-effort; keep existing confidence if DB query fails
+
                 # Metadata-driven routing (dprompt-73b): query storage_target
                 # from rel_types table instead of hardcoded frozensets.
                 rt_lower = edge.rel_type.lower().strip()
@@ -2819,6 +2926,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     fact_class = "A"
                 elif edge_confidence < 0.6:
                     fact_class = "C"
+
+                # dprompt-087: Novel entities (confidence lowered to 0.7) → Class C.
+                # Prevents unvalidated garbage from polluting PostgreSQL facts table.
+                if edge_confidence == 0.7 and fact_class == "A":
+                    fact_class = "C"
                 # Fact class assigned above from metadata query (dprompt-73b).
                 # is_engine_generated already set correctly by original logic above.
 
@@ -2861,33 +2973,49 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Validates that only user_id and UUID v5 surrogates appear in facts
                 # (prevents arbitrary string entity_ids from contaminating DB)
                 validated_rows = []
+                # dprompt-088: Collect rejected rows for Class C routing
+                _rejected_rows: list[tuple] = []
                 for row in rows:
                     user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
                     definition = row[9] if len(row) > 9 else ''
                     rt_lower = rel_type.lower() if rel_type else ''
 
                     # If subject is a string (not UUID), try to resolve it
+                    _subject_original = row[1]  # keep original for logging
                     if subject and not _UUID_PATTERN.match(subject) and subject != user_id:
                         try:
                             subject = registry.resolve(user_id, subject)
-                            log.info("ingest.subject_resolved_during_validation",
-                                   original=row[1], resolved=subject, rel_type=rel_type)
+                            if subject is None:
+                                _reason = _get_rejection_reason(_subject_original)
+                                log.info("ingest.subject_rejected",
+                                         original=_subject_original, reason=_reason, rel_type=rel_type)
+                            else:
+                                log.info("ingest.subject_valid",
+                                         original=_subject_original, canonical_uuid=subject, rel_type=rel_type)
                         except Exception as _e:
                             log.error("ingest.subject_resolution_failed_validation",
-                                    original=row[1], error=str(_e), rel_type=rel_type)
+                                    original=_subject_original, error=str(_e), rel_type=rel_type)
+                            _rejected_rows.append((user_id, _subject_original, rel_type, _object_original or obj))
                             continue
 
                     # If object is a string, only resolve if rel_type expects UUID objects
                     # Skip resolution for rel_types in _SCALAR_OBJECT_RELS (pref_name, age, etc.)
+                    _object_original = row[2]  # keep original for logging
                     if obj and not _UUID_PATTERN.match(obj) and obj != user_id:
                         if rt_lower not in _SCALAR_OBJECT_RELS:
                             try:
                                 obj = registry.resolve(user_id, obj)
-                                log.info("ingest.object_resolved_during_validation",
-                                       original=row[2], resolved=obj, rel_type=rel_type)
+                                if obj is None:
+                                    _reason = _get_rejection_reason(_object_original)
+                                    log.info("ingest.object_rejected",
+                                             original=_object_original, reason=_reason, rel_type=rel_type)
+                                else:
+                                    log.info("ingest.object_valid",
+                                             original=_object_original, canonical_uuid=obj, rel_type=rel_type)
                             except Exception as _e:
                                 log.error("ingest.object_resolution_failed_validation",
-                                        original=row[2], error=str(_e), rel_type=rel_type)
+                                        original=_object_original, error=str(_e), rel_type=rel_type)
+                                _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original))
                                 continue
 
                     # Now validate: subject must be UUID or user_id
@@ -2899,7 +3027,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.error("ingest.invalid_subject_id",
                                   subject=subject, rel_type=rel_type, user_id=user_id,
                                   reason="subject_id must be UUID or user_id")
-                        continue  # Skip this fact
+                        _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
+                        continue  # Route to Class C (handled after loop)
 
                     # Object validation depends on rel_type:
                     # - For scalar rel_types: object can be ANY string (value)
@@ -2910,6 +3039,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_object_scalar",
                                       obj=obj, rel_type=rel_type, user_id=user_id,
                                       reason="object value cannot be empty for scalar rel_type")
+                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
                             continue
                         # CRITICAL: pref_name and also_known_as must NEVER have UUID objects
                         # A UUID as a display name is meaningless and breaks display resolution
@@ -2917,6 +3047,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_identity_rel_uuid_object",
                                       rel_type=rel_type, object=obj, subject=subject,
                                       reason=f"{rel_type} object must be a display name string, not a UUID")
+                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
                             continue
                     else:
                         # Relationship rel_type: object must be UUID or user_id
@@ -2928,13 +3059,29 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.error("ingest.invalid_object_id",
                                       obj=obj, rel_type=rel_type, user_id=user_id,
                                       reason="object_id must be UUID or user_id for relationship rel_type")
-                            continue  # Skip this fact
+                            _rejected_rows.append((user_id, _subject_original or subject, rel_type, _object_original or obj))
+                            continue  # Route to Class C (handled after loop)
 
                     # Update row with resolved subject/object if they changed
                     updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated, definition)
                     validated_rows.append(updated_row)
 
                 rows = validated_rows
+
+                # dprompt-088: Route rejected rows to Class C (staged_facts + Qdrant)
+                if _rejected_rows:
+                    _routed_count = 0
+                    for _uid, _subj_name, _rel, _obj_name in _rejected_rows:
+                        _reason = _get_rejection_reason(_subj_name)
+                        _fid = _commit_rejected_edge_to_qdrant(
+                            db, _uid, str(_subj_name), _rel, str(_obj_name), _reason,
+                        )
+                        if _fid:
+                            _routed_count += 1
+                    log.info("ingest.rejected_edges_routed_to_class_c",
+                             rejected_count=len(_rejected_rows),
+                             routed_to_qdrant=_routed_count,
+                             confidence=0.4)
 
                 # ── dprompt-59: Semantic conflict detection ──────────────────
                 # Before committing, check each fact against existing graph structure.
@@ -3815,16 +3962,39 @@ def query(request: QueryRequest):
         registry = EntityRegistry(db)
 
         # Find ALL user entity UUIDs with identity facts (dprompt-88c fix)
-        # Multiple Person entities may exist with pref_name/also_known_as
+        # dBug-031: Prioritize the user_id itself, then Person entities by confidence
         user_entity_ids_for_query = []
         with db.cursor() as cur:
+            # First: check if user_id itself has identity facts (is the canonical user)
             cur.execute(
-                "SELECT DISTINCT subject_id FROM facts "
-                "WHERE user_id = %s AND rel_type IN ('pref_name', 'also_known_as') "
+                "SELECT DISTINCT subject_id "
+                "FROM facts "
+                "WHERE user_id = %s AND subject_id = %s "
+                "AND rel_type IN ('pref_name', 'also_known_as') "
                 "AND superseded_at IS NULL",
-                (user_id,)
+                (user_id, user_id)
             )
-            user_entity_ids_for_query = [row[0] for row in cur.fetchall()]
+            direct_user_match = [row[0] for row in cur.fetchall()]
+
+            if direct_user_match:
+                user_entity_ids_for_query = direct_user_match
+            else:
+                # Fallback: Find other Person entities with identity facts, prioritize by confidence
+                cur.execute(
+                    "SELECT f.subject_id "
+                    "FROM facts f "
+                    "JOIN entities e ON e.id = f.subject_id "
+                    "WHERE f.user_id = %s AND f.rel_type IN ('pref_name', 'also_known_as') "
+                    "AND f.superseded_at IS NULL "
+                    "AND e.entity_type = 'Person' "
+                    "ORDER BY f.confidence DESC, f.created_at DESC",
+                    (user_id,)
+                )
+                seen = set()
+                for row in cur.fetchall():
+                    if row[0] not in seen:
+                        user_entity_ids_for_query.append(row[0])
+                        seen.add(row[0])
 
         # If no identity facts found, fall back to registry
         if not user_entity_ids_for_query:
@@ -4411,6 +4581,49 @@ def query(request: QueryRequest):
                         preferred_names[val] = val
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
+
+        # ── dprompt-089: Class C filtering — global, not family-scoped ─────
+        # Exclude ALL facts with confidence below QUERY_MIN_CONFIDENCE (default 0.6).
+        # Class C facts (confidence < 0.6) are experimental/ephemeral and should not
+        # appear in authoritative /query responses regardless of rel_type.
+        # This is domain-agnostic — applies to family, work, location, pets, etc.
+        _MIN_CONFIDENCE = float(os.getenv("QUERY_MIN_CONFIDENCE", "0.6"))
+        _before_filter = len(merged_facts)
+        merged_facts = [
+            f for f in merged_facts
+            if float(f.get("confidence", 1.0)) >= _MIN_CONFIDENCE
+        ]
+        if len(merged_facts) < _before_filter:
+            log.info("query.class_c_filtered",
+                     dropped=(_before_filter - len(merged_facts)),
+                     threshold=_MIN_CONFIDENCE)
+
+        # ── dprompt-089: Normalize user identity to preferred name ─────────
+        # Facts may reference the user via multiple entity UUIDs (canonical user_id,
+        # "chris", "we", etc.) after graph traversal. Normalize all user-facing
+        # _subject_id/_object_id to the canonical user UUID so deduplication
+        # collapses duplicate parent_of/child_of/spouse facts.
+        if registry and user_entity_id_for_query:
+            # Only normalize the CANONICAL user identity UUID(s), not every named entity.
+            # user_entity_ids_for_query contains ALL entities with pref_name facts
+            # (children, spouse, pets). We only want the USER's own identity UUIDs.
+            _user_uuids = {user_id, user_entity_id_for_query}
+            # Also include any aliases that resolve to the canonical user entity
+            try:
+                _canonical_uuid = registry.get_canonical_for_user(user_id)
+                if _canonical_uuid:
+                    _user_uuids.add(_canonical_uuid)
+            except Exception:
+                pass
+            for _f in merged_facts:
+                _sid = _f.get("_subject_id", "")
+                _oid = _f.get("_object_id", "")
+                if _sid in _user_uuids:
+                    _f["_subject_id"] = user_entity_id_for_query
+                    _f["subject"] = "user"  # Filter's _user_anchors expects "user"
+                if _oid in _user_uuids:
+                    _f["_object_id"] = user_entity_id_for_query
+                    _f["object"] = "user"
 
         # ── dprompt-61: Deduplicate by entity UUID + attach alias metadata ──
         # Facts may have different display names for the same entity_id
