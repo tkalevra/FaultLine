@@ -2344,62 +2344,85 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
         # determines the relationship from text and typed_entity context.
         system_prompt = """Extract ALL relationships and facts from text. Return ONLY a JSON array. Each triple must have subject, object, rel_type, and definition.
 
-Example format (with optional rel_type metadata for novel relationships):
-[{"subject":"alice","object":"bob","rel_type":"parent_of","definition":"relational: parent-child connection"},
-{"subject":"alice","object":"person","rel_type":"instance_of","definition":"hierarchy: entity classification"},
-{"subject":"156 Cedar Street","object":"location","rel_type":"instance_of","definition":"hierarchy: physical address is a location"}]
+CATEGORY-FIRST EXTRACTION (priority order: FAMILY → TEMPORAL → LOCATION → WORK → IDENTITY):
 
-REL_TYPE METADATA (when extracting novel relationships, include these hints for the system to learn):
-- For NOVEL rel_types: add optional fields to help the system understand:
-  - head_types: subject entity types that can have this rel_type (e.g., ["Person"], ["Person", "Organization"])
-  - tail_types: object entity types or SCALAR if value is a string (e.g., ["Person"], ["SCALAR"], ["Location"])
-  - is_symmetric: true if bidirectional (friend_of, knows, same_as), false if directional (parent_of, works_for)
-  - inverse_rel_type: if directional, what's the reverse? (parent_of → child_of)
-  - is_hierarchy_rel: true for classification (instance_of, subclass_of), false for relational (spouse, works_for)
+═══ FAMILY DOMAIN (highest priority) ═══
+NAME LISTS WITH ATTRIBUTES: When text lists family members (children, siblings, pets), extract relationship + pref_name + attributes:
+  "I have two kids: alice (age 12) and bob (age 10)" →
+    (user, parent_of, alice), (alice, pref_name, alice), (alice, age, "12"),
+    (user, parent_of, bob), (bob, pref_name, bob), (bob, age, "10")
 
-Example with metadata:
+  "My children are charlie, diana, and eve" →
+    (user, parent_of, charlie), (charlie, pref_name, charlie),
+    (user, parent_of, diana), (diana, pref_name, diana),
+    (user, parent_of, eve), (eve, pref_name, eve)
+
+  "My spouse is frank" → (user, spouse, frank), (frank, pref_name, frank)
+  "My siblings: grace and henry" → (user, sibling_of, grace), (user, sibling_of, henry), etc.
+
+ATTRIBUTE PATTERNS (age, height, weight, occupation, nationality):
+  "alice is 12 years old" → (alice, age, "12")
+  "bob works as an engineer" → (bob, occupation, "engineer")
+  "diana was born in 1995" → (diana, born_on, "1995")
+  RULE: Numeric attributes extract as SCALAR values (rel_type="age", object="12", NOT object as UUID)
+
+═══ TEMPORAL DOMAIN ═══
+DATE/TIME PATTERNS:
+  "I need weather tomorrow in Toronto" → capture (tomorrow, instance_of, date), (user, interested_in_date, tomorrow), (toronto, instance_of, location)
+  "Next week I have a meeting" → (next_week, instance_of, timeframe), (user, has_event, meeting), (meeting, scheduled_for, next_week)
+  "Born on 2000-05-15" → (user, born_on, "2000-05-15")
+  RULE: Temporal references are often ClassC (speculative) pending confirmation.
+
+═══ LOCATION DOMAIN ═══
+LOCATION HIERARCHIES:
+  "I live in Toronto, Ontario, Canada" →
+    (user, lives_in, toronto), (toronto, instance_of, city),
+    (toronto, located_in, ontario), (ontario, instance_of, province),
+    (ontario, located_in, canada), (canada, instance_of, country)
+
+  "156 Cedar Street, Kitchener, Ontario" →
+    (user, lives_at, "156 cedar street"), (156 cedar street, instance_of, address),
+    (156 cedar street, located_in, kitchener), (kitchener, instance_of, city), etc.
+
+═══ WORK DOMAIN ═══
+ORGANIZATION HIERARCHIES:
+  "I work for Acme Inc. in Engineering" →
+    (user, works_for, acme_inc), (acme_inc, instance_of, organization),
+    (user, works_in, engineering), (engineering, instance_of, department),
+    (engineering, part_of, acme_inc)
+
+═══ IDENTITY DOMAIN ═══
+NAMES & ALIASES: pref_name, also_known_as, same_as
+  "My name is alice, but call me al" → (user, pref_name, "alice"), (user, also_known_as, "al")
+  "Alice = Al" → (alice, same_as, al)
+
+─────────────────────────────────────────────────
+
+REL_TYPE METADATA (for novel relationships):
 {"subject":"alice","object":"bob","rel_type":"mentors","definition":"relational: mentor-mentee","head_types":["Person"],"tail_types":["Person"],"is_symmetric":false}
-{"subject":"alice","object":"bobsled_team","rel_type":"member_of","definition":"hierarchy: group membership","head_types":["Person","Organization"],"tail_types":["Concept","Organization"],"is_hierarchy_rel":true}
 
 EXTRACT COMPREHENSIVELY:
 1. Direct relationships: parent_of, child_of, spouse, sibling_of, has_pet, works_for, lives_in, lives_at, located_in, born_in, educated_at, knows, friend_of, etc.
-2. Entity types: instance_of (classify EVERY entity mentioned - person, location, organization, address, city, street, etc.)
-3. Hierarchies: For locations/addresses, extract nested containment (street→city→province→country)
-4. Identity: same_as (pronouns/collectives → known entity), pref_name, also_known_as
+2. Entity types: instance_of (classify EVERY entity mentioned)
+3. Hierarchies: location chains (street→city→province→country), org chains (dept→company)
+4. Identity: same_as, pref_name, also_known_as
+5. Attributes: age, occupation, nationality, height, weight (as SCALAR values)
 
-   NAME LISTS → PREF_NAME + RELATIONSHIP: When text lists names belonging to a group,
-   extract BOTH the relationship AND pref_name for each name:
-   "My children are Gabby, Cyrus, and Des" →
-     (user, parent_of, gabby), (gabby, child_of, user),
-     (user, parent_of, cyrus), (cyrus, child_of, user),
-     (user, parent_of, des), (des, child_of, user),
-     (gabby, pref_name, gabby), (cyrus, pref_name, cyrus), (des, pref_name, des)
-   "My pets are Max and Luna" →
-     (user, has_pet, max), (max, instance_of, animal),
-     (user, has_pet, luna), (luna, instance_of, animal),
-     (max, pref_name, max), (luna, pref_name, luna)
-   RULE: For each name in a list after "are"/"is", emit BOTH the relationship AND pref_name.
+CRITICAL: Extract facts about EVERY entity in text, not just subject. For "I live at 156 Cedar, Kitchener, Ontario":
+- (user, lives_at, "156 cedar")
+- ("156 cedar", instance_of, address)
+- ("156 cedar", located_in, kitchener)
+- (kitchener, instance_of, city)
+- (kitchener, located_in, ontario)
+- (ontario, instance_of, province)
 
-5. Attributes: age, occupation, nationality, etc. (as rel_type when object is a value)
+FIRST-PERSON RULE: For first-person statements, ALWAYS use 'user' as subject — never 'I', 'me', 'my', 'we'.
 
-CRITICAL: Extract facts about EVERY entity in the text, not just the subject. For "I live at <address>, <city>, <state>":
-- (user, lives_at, <address>)
-- (<address>, instance_of, location)
-- (<address>, located_in, <city>)
-- (<city>, instance_of, city)
-- (<city>, located_in, <state>)
-- (<state>, instance_of, state)
-- (<state>, located_in, <country>)
-
-FIRST-PERSON RULE: For first-person statements, ALWAYS use 'user' as the subject — never 'I', 'me', 'my', or 'we'.
-
-THIRD-PERSON PRONOUN RESOLUTION: When text contains "it", "they", "he", "she", "him", "her", "his", "them":
+THIRD-PERSON PRONOUN RESOLUTION: When text contains pronouns (it, they, he, she, him, her, his, them):
 - Look at prior conversation context to identify the most recently mentioned entity.
-- Replace the pronoun with THAT entity's name in the extracted triples.
-- "It" typically refers to the most recent non-person object, animal, or device mentioned.
-- "He"/"she"/"they" refer to the most recent person mentioned.
+- Replace pronoun with THAT entity's name in extracted triples.
 - If no entity can be confidently resolved from context, do NOT guess — omit facts with unresolved pronouns.
-- NEVER use the pronoun literally as a subject or object in extracted triples.
+- NEVER use pronoun literally as subject or object.
 
 Include a one-line definition for each fact explaining whether it's relational (horizontal connection) or hierarchy (vertical classification).
 
