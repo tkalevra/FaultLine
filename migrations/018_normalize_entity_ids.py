@@ -51,7 +51,7 @@ def normalize_entity_ids():
         print("\n1. Scanning facts table for string entity_ids...")
         cur.execute("""
             SELECT DISTINCT user_id, subject_id FROM facts
-            WHERE subject_id NOT LIKE '%-%-%-%-%'
+            WHERE subject_id NOT LIKE '%-%-%-%-'
             ORDER BY user_id, subject_id
         """)
         string_subjects = cur.fetchall()
@@ -59,7 +59,7 @@ def normalize_entity_ids():
 
         cur.execute("""
             SELECT DISTINCT user_id, object_id FROM facts
-            WHERE object_id NOT LIKE '%-%-%-%-%'
+            WHERE object_id NOT LIKE '%-%-%-%-'
             ORDER BY user_id, object_id
         """)
         string_objects = cur.fetchall()
@@ -69,7 +69,7 @@ def normalize_entity_ids():
         print("\n2. Scanning staged_facts table for string entity_ids...")
         cur.execute("""
             SELECT DISTINCT user_id, subject_id FROM staged_facts
-            WHERE subject_id NOT LIKE '%-%-%-%-%'
+            WHERE subject_id NOT LIKE '%-%-%-%-'
             ORDER BY user_id, subject_id
         """)
         staged_subjects = cur.fetchall()
@@ -77,7 +77,7 @@ def normalize_entity_ids():
 
         cur.execute("""
             SELECT DISTINCT user_id, object_id FROM staged_facts
-            WHERE object_id NOT LIKE '%-%-%-%-%'
+            WHERE object_id NOT LIKE '%-%-%-%-'
             ORDER BY user_id, object_id
         """)
         staged_objects = cur.fetchall()
@@ -176,13 +176,13 @@ def normalize_entity_ids():
         print(f"\n8. Verifying normalization...")
         cur.execute("""
             SELECT COUNT(*) FROM facts
-            WHERE subject_id NOT LIKE '%-%-%-%-%' OR object_id NOT LIKE '%-%-%-%-%'
+            WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
         """)
         remaining_facts = cur.fetchone()[0]
 
         cur.execute("""
             SELECT COUNT(*) FROM staged_facts
-            WHERE subject_id NOT LIKE '%-%-%-%-%' OR object_id NOT LIKE '%-%-%-%-%'
+            WHERE subject_id NOT LIKE '%-%-%-%-' OR object_id NOT LIKE '%-%-%-%-'
         """)
         remaining_staged = cur.fetchone()[0]
 
