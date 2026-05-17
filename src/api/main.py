@@ -51,6 +51,29 @@ _IDENTITY_STOPWORDS = {
     "goes", "known", "likes", "like", "want", "wants",
 }
 
+# dBug-026: Entity name validation blocklist
+# Stop words, grammar tokens, numbers that should never be entities
+ENTITY_NAME_BLOCKLIST = {
+    # Articles & pronouns
+    'a', 'an', 'the', 'my', 'your', 'his', 'her', 'its', 'their', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+    # Common verbs
+    'is', 'was', 'are', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+    'go', 'goes', 'going', 'went', 'say', 'said', 'name', 'named', 'call', 'called',
+    # Family/relationship words
+    'spouse', 'family', 'kids', 'children', 'child', 'son', 'sons', 'daughter', 'daughters',
+    'parent', 'mother', 'father', 'brother', 'sister', 'cousin', 'aunt', 'uncle', 'grandparent',
+    # Attributes/descriptors
+    'age', 'male', 'female', 'old', 'young', 'person', 'people',
+    # Common quantifiers
+    'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+    # Connectors/conjunctions
+    'and', 'or', 'but', 'also', 'still', 'which', 'what', 'who', 'where', 'when', 'why', 'how',
+    # Temporal
+    'year', 'month', 'day', 'time', 'date',
+    # Verbs related to description
+    'prefer', 'prefers', 'list',
+}
+
 # _SCALAR_REL_TYPES removed — replaced by classify_fact_type() which uses
 # value-driven heuristics + DB-driven ontology hints (rel_types.tail_types).
 
@@ -2733,6 +2756,54 @@ def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -
         return edge.confidence if hasattr(edge, 'confidence') else 0.8
 
 
+def _is_valid_entity_name(name: str) -> tuple[bool, str]:
+    """
+    dBug-026: Validate entity name. Returns (is_valid, reason).
+
+    Rejects:
+    - Empty or None
+    - Single character
+    - Pure numeric (ages, years, etc.)
+    - In blocklist (stop words, grammar tokens)
+    - >50% numeric (mostly numbers)
+    - >3 words (likely phrases, not entity names)
+
+    Returns:
+        (True, "") if valid
+        (False, reason) if invalid
+    """
+    if not name or not isinstance(name, str):
+        return False, "entity_name_invalid_empty"
+
+    name_lower = name.lower().strip()
+
+    if not name_lower:
+        return False, "entity_name_invalid_empty"
+
+    if len(name_lower) == 1:
+        return False, "entity_name_invalid_single_char"
+
+    # Check if pure numeric
+    if name_lower.replace('.', '').replace('-', '').isdigit():
+        return False, "entity_name_invalid_pure_numeric"
+
+    # Check blocklist
+    if name_lower in ENTITY_NAME_BLOCKLIST:
+        return False, "entity_name_invalid_blocklist"
+
+    # Check >50% numeric
+    numeric_chars = sum(1 for c in name_lower if c.isdigit())
+    if numeric_chars / len(name_lower) > 0.5:
+        return False, "entity_name_invalid_mostly_numeric"
+
+    # Check >3 words (split on space/dash/comma)
+    words = [w for w in (name_lower.replace('-', ' ').replace(',', ' ').split()) if w]
+    if len(words) > 3:
+        return False, "entity_name_invalid_too_many_words"
+
+    return True, ""
+
+
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -3109,6 +3180,37 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 rel_type=edge.rel_type,
                                 reason="raw UUID in edge subject or object — likely resolution leak")
                     continue
+
+                # dBug-026: Entity name validation gate (before entity resolution)
+                # Validate subject (unless it's user anchor like "user" or the user's canonical ID)
+                rel_type_lower = edge.rel_type.lower()
+                if edge.subject.lower() not in ("user", user_entity_id.lower() if isinstance(user_entity_id, str) else ""):
+                    is_valid, reason = _is_valid_entity_name(edge.subject)
+                    if not is_valid:
+                        log.warning(
+                            "ingest.entity_name_rejected",
+                            reason=reason,
+                            subject=edge.subject,
+                            rel_type=rel_type_lower,
+                        )
+                        continue
+
+                # Validate object (unless rel_type is scalar, then object is string value, not entity name)
+                _SCALAR_REL_TYPES_LOCAL = {
+                    'pref_name', 'also_known_as',  # identity: display names (strings)
+                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
+                    'occupation', 'nationality',  # descriptive: single-word or phrase
+                }
+                if edge.object and rel_type_lower not in _SCALAR_REL_TYPES_LOCAL:
+                    is_valid, reason = _is_valid_entity_name(edge.object)
+                    if not is_valid:
+                        log.warning(
+                            "ingest.entity_name_rejected",
+                            reason=reason,
+                            object=edge.object,
+                            rel_type=rel_type_lower,
+                        )
+                        continue
 
                 # Capture raw values before entity resolution
                 _raw_subject = edge.subject
