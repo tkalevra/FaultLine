@@ -1300,17 +1300,16 @@ class Filter:
 
                     seen_entities.add(entity_id)
 
-                    # Get display name from mapping (UUID → preferred name)
-                    # CRITICAL: Never display raw UUIDs. Fall back to pref_name from attrs, then skip if missing.
+                    # Get display name — never show raw UUID (dBug-039)
                     display_name = uuid_to_display.get(entity_id)
                     if not display_name:
-                        # Try to get pref_name from the attributes themselves
+                        # Fall back to pref_name from attributes
                         pref_name_attr = attrs.get("pref_name")
                         if isinstance(pref_name_attr, dict):
                             display_name = pref_name_attr.get("value")
                         else:
                             display_name = pref_name_attr
-                        # If still no display name, skip this entity entirely (don't show UUID)
+                        # Skip entity if no display name available (never show UUID)
                         if not display_name:
                             continue
 
