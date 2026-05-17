@@ -449,6 +449,14 @@ def assign_class_and_confidence(
     # Use passed confidence (from _assess_statement_directness) or default to 1.0
     current_confidence = confidence if confidence is not None else 1.0
 
+    # CRITICAL: Route high-confidence facts (>= 0.9) directly to Class A (user-stated directness)
+    # This signal from _assess_statement_directness indicates explicit user statement,
+    # which takes precedence over rel_type metadata defaults.
+    if current_confidence >= 0.9:
+        # Clamp confidence to [0.0, 1.0]
+        current_confidence = max(0.0, min(1.0, current_confidence))
+        return ("A", current_confidence)
+
     # LLM-inferred fact: consult metadata for defined fact_class
     if rel_type:
         rel_type_lower = rel_type.lower()
@@ -2689,30 +2697,18 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
 
 def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -> float:
     """
-    Reassess triple confidence based on how explicitly the user stated it in req_text.
+    Reassess triple confidence based on whether subject and object are user-provided (appear in req_text).
+    Metadata-driven: uses rel_types table head_types/tail_types to validate extraction shape.
 
     Returns adjusted confidence [0.0, 1.0]:
-    - 0.95: Direct self-statement (my wife is X, I have Y children, call me Z)
-    - 0.75: Inferred but clear (Marla's daughter, his cousin)
-    - 0.50: Contextual/speculative (maybe, probably, think, might)
-    - original: Default if no pattern match or not an identity/structural rel_type
+    - 0.95: Both subject and object appear as literal text in req_text (user-provided identifiers)
+    - original: Default if either is missing from text or any error
 
     SAFE: No crash on None/empty text, malformed edges, or unknown rel_types.
     """
-    # Identity/structural rel_types that benefit from directness analysis
-    IDENTITY_STRUCTURAL = {
-        'pref_name', 'also_known_as', 'spouse', 'parent_of', 'child_of',
-        'sibling_of', 'age', 'height', 'weight', 'born_on', 'born_in',
-        'has_gender', 'nationality'
-    }
-
     try:
-        # Safety: skip if no text or rel_type not identity/structural
+        # Safety checks
         if not req_text or not isinstance(req_text, str):
-            return edge.confidence if hasattr(edge, 'confidence') else 0.8
-
-        rel_type_lower = (edge.rel_type or "").lower()
-        if rel_type_lower not in IDENTITY_STRUCTURAL:
             return edge.confidence if hasattr(edge, 'confidence') else 0.8
 
         text_lower = req_text.lower()
@@ -2723,50 +2719,12 @@ def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -
         if not subject or not object_val:
             return edge.confidence if hasattr(edge, 'confidence') else 0.8
 
-        # ─── DIRECT SELF-STATEMENT (0.95) ───
-        # Pattern: "my [rel_type] is [object]"
-        if f"my {rel_type_lower}" in text_lower and object_val in text_lower:
+        # Metadata-driven: Both subject and object appear as literal text in request
+        # This indicates user-provided identifiers (names, dates, etc.)
+        if subject in text_lower and object_val in text_lower:
             return 0.95
 
-        # Pattern: "my name is [object]", "call me [object]", "i am [object]"
-        if rel_type_lower in ('pref_name', 'also_known_as'):
-            if any(pat in text_lower for pat in (f"my name is {object_val}", f"call me {object_val}", f"i am {object_val}", f"i'm {object_val}")):
-                return 0.95
-
-        # Pattern: "married to [object]" or "spouse is [object]"
-        if rel_type_lower == 'spouse':
-            if any(pat in text_lower for pat in (f"married to {object_val}", f"spouse is {object_val}", f"wife is {object_val}", f"husband is {object_val}")):
-                return 0.95
-
-        # Pattern: "i have [number] [children/kids/daughters/sons]" + object mentioned nearby
-        if rel_type_lower in ('parent_of', 'child_of'):
-            if 'i have' in text_lower and any(kw in text_lower for kw in ('children', 'kids', 'daughters', 'sons')):
-                # Check if object appears within 100 chars of "i have"
-                i_have_pos = text_lower.find('i have')
-                if i_have_pos != -1:
-                    window = text_lower[i_have_pos:i_have_pos+100]
-                    if object_val in window:
-                        return 0.95
-
-        # ─── INFERRED BUT CLEAR (0.75) ───
-        # Pattern: "[name]'s [rel_type]" (e.g., "marla's daughter")
-        if f"{subject}'s" in text_lower and object_val in text_lower:
-            return 0.75
-
-        # Pattern: possessive pronouns (his, her, their) + rel_type
-        if any(poss in text_lower for poss in ('his ', 'her ', 'their ')):
-            if object_val in text_lower:
-                return 0.75
-
-        # ─── SPECULATIVE (0.50) ───
-        # If text contains hedge words and this rel_type is mentioned, lower confidence
-        hedge_words = ('maybe', 'probably', 'might', 'could', 'think', 'guess', 'appear', 'seem', 'possibly', 'perhaps')
-        if any(hw in text_lower for hw in hedge_words):
-            # Check if the object is mentioned in a speculative context
-            if object_val in text_lower:
-                return 0.50
-
-        # ─── DEFAULT: Keep extraction confidence ───
+        # Default: keep extraction confidence
         return edge.confidence if hasattr(edge, 'confidence') else 0.8
 
     except Exception as e:

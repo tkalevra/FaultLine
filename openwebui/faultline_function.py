@@ -675,7 +675,7 @@ def _update_conversation_context(user_id: str, facts: list[dict], preferred_name
     # # NO RECURSIVE MATCHING — context built from pre-extracted facts/preferred_names only
 
 
-_UUID_ANYWHERE_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+_UUID_ANYWHERE_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 
 def _redact_uuids_from_body(body: dict) -> None:
@@ -1301,7 +1301,18 @@ class Filter:
                     seen_entities.add(entity_id)
 
                     # Get display name from mapping (UUID → preferred name)
-                    display_name = uuid_to_display.get(entity_id, entity_id.title())
+                    # CRITICAL: Never display raw UUIDs. Fall back to pref_name from attrs, then skip if missing.
+                    display_name = uuid_to_display.get(entity_id)
+                    if not display_name:
+                        # Try to get pref_name from the attributes themselves
+                        pref_name_attr = attrs.get("pref_name")
+                        if isinstance(pref_name_attr, dict):
+                            display_name = pref_name_attr.get("value")
+                        else:
+                            display_name = pref_name_attr
+                        # If still no display name, skip this entity entirely (don't show UUID)
+                        if not display_name:
+                            continue
 
                     # Format attributes
                     attr_parts = []
