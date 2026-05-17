@@ -600,6 +600,107 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     return stats
 
 
+def _infer_tail_types(obj_type: str, sample_object: str, candidate_rel: str) -> list[str] | None:
+    """
+    dprompt-104: Infer tail_types for novel rel_type based on candidate_object_type and sample_object pattern.
+
+    Returns:
+        ['SCALAR'] if object is a scalar value (string, number, date, etc.)
+        [EntityType] if object is an entity (Person, Location, etc.)
+        None if inference inconclusive (let default handle it)
+
+    Logic (in priority order):
+    1. If obj_type is an entity type → [obj_type]
+    2. If sample_object matches scalar patterns → ['SCALAR']
+    3. If rel_type suggests scalar → ['SCALAR']
+    4. Else: None (use relational default)
+    """
+    import re
+
+    # L1: If candidate_object_type is provided and is entity type → relational
+    if obj_type and obj_type not in ('unknown', 'Unknown', ''):
+        return [obj_type]
+
+    # L2: Check sample_object for scalar patterns
+    if sample_object:
+        sample_lower = sample_object.lower().strip()
+
+        # Integer: age, count, year, etc.
+        if re.match(r'^-?\d+$', sample_object):
+            return ['SCALAR']
+
+        # Float: height, weight, temperature, percentage, etc.
+        if re.match(r'^-?\d+\.\d+$', sample_object):
+            return ['SCALAR']
+
+        # Percentage: 85%, 0.5%
+        if re.match(r'^-?\d+(\.\d+)?%$', sample_object):
+            return ['SCALAR']
+
+        # ISO date: 2026-05-17
+        if re.match(r'^\d{4}-\d{2}-\d{2}', sample_object):
+            return ['SCALAR']
+
+        # Slash date: 05/17/2026 or 17-05-2026
+        if re.match(r'^\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}$', sample_object):
+            return ['SCALAR']
+
+        # Measurement with unit: 175cm, 85kg, 5ft, 32°C
+        if re.match(
+            r'^\d+(\.\d+)?\s*'
+            r'(cm|mm|m|km|ft|inch|inches|mile|miles|kg|lbs?|pounds?|g|oz|°[CF]|%|mph|kph)',
+            sample_lower
+        ):
+            return ['SCALAR']
+
+        # Height format: 5'10" or 5'10
+        if re.match(r"^\d+['\"]?\s*\d*\s*[\"]?$", sample_object):
+            return ['SCALAR']
+
+        # Email: user@domain.com
+        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', sample_object):
+            return ['SCALAR']
+
+        # URL: http(s)://, www., ftp://
+        if sample_lower.startswith(('http://', 'https://', 'www.', 'ftp://')):
+            return ['SCALAR']
+
+        # Phone: +1-555-1234, (555) 123-4567, 555-1234
+        if re.match(r'^\+?[\d\s\-\(\)\.]{7,}$', sample_object):
+            return ['SCALAR']
+
+        # IPv4: 192.168.1.1
+        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', sample_object):
+            return ['SCALAR']
+
+        # MAC address: 00:1A:2B:3C:4D:5E
+        if re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', sample_object):
+            return ['SCALAR']
+
+        # Currency: $100, £50, €75, ¥1000
+        if re.match(r'^[\$£€¥]\d+(\.\d{2})?$', sample_object):
+            return ['SCALAR']
+
+        # UUID: 00000000-0000-0000-0000-000000000000
+        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', sample_lower):
+            return None  # UUIDs are relational, but shouldn't appear as sample_object values
+
+    # L3: Check rel_type name for scalar hints
+    rel_lower = candidate_rel.lower() if candidate_rel else ""
+    _SCALAR_REL_TYPE_KEYWORDS = {
+        'age', 'height', 'weight', 'phone', 'email', 'address', 'zip', 'postal',
+        'url', 'website', 'link', 'hostname', 'fqdn', 'ip', 'port', 'mac',
+        'price', 'cost', 'salary', 'date', 'time', 'timestamp', 'birth',
+        'temperature', 'pressure', 'speed', 'distance', 'area', 'volume',
+        'percentage', 'score', 'rating', 'description', 'comment', 'note'
+    }
+    if any(kw in rel_lower for kw in _SCALAR_REL_TYPE_KEYWORDS):
+        return ['SCALAR']
+
+    # L4: Inconclusive — return None and let existing logic handle it
+    return None
+
+
 def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     """
     dprompt-17: Evaluate novel rel_type candidates from ontology_evaluations.
@@ -690,7 +791,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     # Register the new rel_type with inferred metadata (dprompt-97)
                     label = candidate_rel.replace('_', ' ').title()
 
-                    # Infer metadata from candidate's subject and object types
+                    # Infer metadata from candidate's subject and object types + patterns
                     head_types = None
                     tail_types = None
                     is_hierarchy = False
@@ -698,8 +799,19 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
 
                     if subj_type and subj_type != "unknown":
                         head_types = [subj_type]
+
+                    # dprompt-104: Infer tail_types from object type or sample_object pattern
+                    # If obj_type not provided or is "unknown", try to infer from sample_object
                     if obj_type and obj_type != "unknown":
                         tail_types = [obj_type]
+                    else:
+                        # Infer from sample_object pattern (scalar vs relational)
+                        inferred = _infer_tail_types(obj_type, obj, candidate_rel)
+                        if inferred:
+                            tail_types = inferred
+                            log.info(f"re_embedder.ontology_inferred_tail_types "
+                                   f"rel_type={candidate_rel} tail_types={tail_types} "
+                                   f"inference_from={'pattern' if inferred == ['SCALAR'] else 'object_type'}")
 
                     # Heuristic: if rel_type suggests classification/taxonomy, mark as hierarchy
                     if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
@@ -712,7 +824,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "INSERT INTO rel_types"
                         " (rel_type, label, engine_generated, confidence, source,"
                         "  head_types, tail_types, is_hierarchy_rel, is_symmetric)"
-                        " VALUES (%s, %s, true, 0.7, 're_embedder', %s, %s, %s, %s)"
+                        " VALUES (%s, %s, true, 0.7, 'engine', %s, %s, %s, %s)"
                         " ON CONFLICT (rel_type) DO NOTHING",
                         (candidate_rel, label, head_types, tail_types, is_hierarchy, is_symmetric),
                     )

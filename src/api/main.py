@@ -208,6 +208,52 @@ def _coerce_scalar(value: str) -> tuple:
     # Fall back to text
     return (value, None, None, None)
 
+def _is_scalar_rel_type(rel_type: str, meta_registry: dict = None, db = None) -> bool:
+    """
+    Check if rel_type has SCALAR storage via metadata (not hardcoded list).
+
+    Queries rel_types table tail_types column to determine storage path.
+    Replaces hardcoded _SCALAR_OBJECT_RELS and _SCALAR_REL_TYPES_LOCAL lists.
+
+    Replaces all uses of hardcoded lists with metadata queries.
+    """
+    if not rel_type:
+        return False
+
+    rt_lower = rel_type.lower()
+
+    # L1: Query metadata registry (loaded at startup, fastest)
+    if meta_registry:
+        rt_meta = meta_registry.get(rt_lower, {})
+        tail_types = rt_meta.get("tail_types", [])
+        if "SCALAR" in tail_types:
+            return True
+        # If found in metadata but NOT scalar, we have definitive answer
+        if rt_meta:
+            return False
+
+    # L2: Query DB directly if metadata registry not available (fallback)
+    if db:
+        try:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT tail_types FROM rel_types WHERE rel_type = %s",
+                    (rt_lower,)
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    tail_types = row[0] if isinstance(row[0], (list, tuple)) else [row[0]]
+                    return "SCALAR" in tail_types
+        except Exception:
+            pass
+
+    # L3: Final fallback to hardcoded list (safety net, documentation of known scalars)
+    _KNOWN_SCALAR_REL_TYPES = {
+        'age', 'height', 'weight', 'born_on', 'pref_name', 'also_known_as',
+        'occupation', 'nationality', 'phone', 'email', 'address'
+    }
+    return rt_lower in _KNOWN_SCALAR_REL_TYPES
+
 def _detect_preference_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(signal in text_lower for signal in _PREFERENCE_SIGNALS)
@@ -303,15 +349,32 @@ def _build_rel_type_meta(dsn: str) -> dict:
                 meta = {}
                 for row in cur.fetchall():
                     rel_type, category, tail_types, storage_target, fact_class, is_symmetric, inverse_rel_type, is_hierarchy_rel = row
-                    meta[rel_type] = {
+                    # Ensure tail_types is a list
+                    if tail_types is None:
+                        tt = []
+                    elif isinstance(tail_types, (list, tuple)):
+                        tt = list(tail_types)
+                    else:
+                        # Handle string representation or other cases
+                        tt = [tail_types] if tail_types else []
+
+                    meta[rel_type.lower()] = {
                         "category": category,
-                        "tail_types": tail_types or [],
+                        "tail_types": tt,
                         "storage_target": storage_target,
                         "fact_class": fact_class,
                         "is_symmetric": is_symmetric or False,
                         "inverse_rel_type": inverse_rel_type,
                         "is_hierarchy_rel": is_hierarchy_rel or False,
                     }
+
+                # Log sample entries for debugging
+                if "age" in meta:
+                    log.info("startup.rel_type_meta_loaded_sample",
+                             age_tail_types=meta["age"].get("tail_types"),
+                             age_is_hierarchy=meta["age"].get("is_hierarchy_rel"))
+
+        log.info("startup.rel_type_meta_loaded", count=len(meta))
         return meta
     except Exception as e:
         log.warning("startup.rel_type_meta_builder_failed", error=str(e))
@@ -352,11 +415,39 @@ def classify_fact_3d(
     # L0: ONTOLOGY CONSTRAINT (METADATA-FIRST)
     rel_meta = _REL_TYPE_META.get(rt_lower)
 
+    # DEBUG: Log metadata lookup
+    if rt_lower in ("age", "height", "weight"):
+        log.info("DEBUG:classify_fact_3d_call",
+                 rel_type=rt_lower,
+                 found_in_meta=bool(rel_meta),
+                 meta_size=len(_REL_TYPE_META))
+        if rel_meta:
+            log.info("DEBUG:classify_fact_3d_metadata",
+                     rel_type=rt_lower,
+                     tail_types=rel_meta.get("tail_types"),
+                     is_hierarchy=rel_meta.get("is_hierarchy_rel"))
+
     if rel_meta:  # Known rel_type
         tail_types = rel_meta.get("tail_types", [])
         is_hierarchy = rel_meta.get("is_hierarchy_rel", False)
         is_symmetric = rel_meta.get("is_symmetric", False)
         inverse_rel = rel_meta.get("inverse_rel_type")
+
+        # Debug: log what we found in metadata
+        if rt_lower in ("age", "height", "weight"):  # Scalar rel_types for debugging
+            log.info(
+                "classify_fact_3d.metadata_lookup",
+                rel_type=rt_lower,
+                tail_types=tail_types,
+                tail_types_type=str(type(tail_types)),
+                is_hierarchy=is_hierarchy,
+            )
+
+        # Normalize tail_types to list (handle both list and string cases)
+        if isinstance(tail_types, str):
+            tail_types = [tail_types]
+        elif not isinstance(tail_types, (list, tuple)):
+            tail_types = list(tail_types) if tail_types else []
 
         # Determine storage path
         if "SCALAR" in tail_types:
@@ -3173,6 +3264,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 log.warning("ingest.user_aliases_load_failed", error=str(_e))
 
             for edge in edges:
+                # DEBUG: Trace all edge processing
+                if edge.rel_type.lower() in ("age", "height", "weight"):
+                    log.info("DEBUG:ingest_loop",
+                             rel_type=edge.rel_type.lower(),
+                             subject=edge.subject,
+                             object=edge.object)
+
                 # Skip truly self-referential facts (entity knows itself, etc.)
                 # but allow identity facts where subject == object is the norm
                 # e.g., (gabby, pref_name, gabby) — the entity IS its name.
@@ -3189,10 +3287,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     reason="age object must be numeric")
                         continue
                     if edge.subject.lower() == "user":
-                        if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
-                            log.warning("ingest.age_rejected_wrong_subject",
-                                        subject=edge.subject, object=edge.object, text=req.text[:100])
-                            continue
+                        # For corrections, bypass subject validation — user is authoritative
+                        if not req.is_correction:
+                            if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
+                                log.warning("ingest.age_rejected_wrong_subject",
+                                            subject=edge.subject, object=edge.object, text=req.text[:100])
+                                continue
+                        # Else: is_correction=True, accept age fact with subject="user" unconditionally
 
                 # UUID guard: reject raw edge values that are UUIDs
                 # (canonical_ids may be UUIDs when entities exist without display names, which is fine)
@@ -3205,46 +3306,41 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     continue
 
                 # dBug-026: Entity name validation gate (before entity resolution)
+                # dBug-041: Bypass validation for user corrections (high-confidence facts)
                 # Validate subject (unless it's user anchor like "user" or the user's canonical ID)
                 rel_type_lower = edge.rel_type.lower()
                 if edge.subject.lower() not in ("user", user_entity_id.lower() if isinstance(user_entity_id, str) else ""):
-                    is_valid, reason = _is_valid_entity_name(edge.subject)
-                    if not is_valid:
-                        log.warning(
-                            "ingest.entity_name_rejected",
-                            reason=reason,
-                            subject=edge.subject,
-                            rel_type=rel_type_lower,
-                        )
-                        continue
+                    # Skip validation for corrections — treat as authoritative user input
+                    if not req.is_correction:
+                        is_valid, reason = _is_valid_entity_name(edge.subject)
+                        if not is_valid:
+                            log.warning(
+                                "ingest.entity_name_rejected",
+                                reason=reason,
+                                subject=edge.subject,
+                                rel_type=rel_type_lower,
+                            )
+                            continue
 
                 # Validate object (unless rel_type is scalar, then object is string value, not entity name)
-                _SCALAR_REL_TYPES_LOCAL = {
-                    'pref_name', 'also_known_as',  # identity: display names (strings)
-                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
-                    'occupation', 'nationality',  # descriptive: single-word or phrase
-                }
-                if edge.object and rel_type_lower not in _SCALAR_REL_TYPES_LOCAL:
-                    is_valid, reason = _is_valid_entity_name(edge.object)
-                    if not is_valid:
-                        log.warning(
-                            "ingest.entity_name_rejected",
-                            reason=reason,
-                            object=edge.object,
-                            rel_type=rel_type_lower,
-                        )
-                        continue
+                # dBug-041: Bypass validation for corrections
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                if edge.object and not _is_scalar_rel_type(rel_type_lower, _REL_TYPE_META, db):
+                    # Skip validation for corrections
+                    if not req.is_correction:
+                        is_valid, reason = _is_valid_entity_name(edge.object)
+                        if not is_valid:
+                            log.warning(
+                                "ingest.entity_name_rejected",
+                                reason=reason,
+                                object=edge.object,
+                                rel_type=rel_type_lower,
+                            )
+                            continue
 
                 # Capture raw values before entity resolution
                 _raw_subject = edge.subject
                 _raw_object = edge.object
-
-                # Rel_types that ALWAYS have scalar (string) objects, never UUID references
-                _SCALAR_OBJECT_RELS = {
-                    'pref_name', 'also_known_as',  # identity: display names (strings)
-                    'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
-                    'occupation', 'nationality',  # descriptive: single-word or phrase
-                }
 
                 # Resolve all entity names to canonical form via registry
                 # This ensures aliases (mars, chris) never appear as subject/object in facts
@@ -3254,7 +3350,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # For scalar rel_types, object is a string value (not an entity reference)
                 # Skip resolution and keep the raw string value
-                if edge.rel_type.lower() in _SCALAR_OBJECT_RELS:
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                if _is_scalar_rel_type(edge.rel_type.lower(), _REL_TYPE_META, db):
                     canonical_object = edge.object.lower().strip()
                     log.info("ingest.object_kept_as_scalar",
                            rel_type=edge.rel_type, object=canonical_object)
@@ -3266,7 +3363,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Record display name mapping for alias sync (Bug #3 fix)
                 # Only record for relationship facts where canonical_object is a UUID
-                if edge.rel_type.lower() not in _SCALAR_OBJECT_RELS:
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                if not _is_scalar_rel_type(edge.rel_type.lower(), _REL_TYPE_META, db):
                     _canonical_to_display[canonical_object] = edge.object.lower()
 
                 # Persist entity types to entities table if provided (only if currently unknown)
@@ -3284,7 +3382,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     entity_id=canonical_subject, entity_type=edge.subject_type, error=str(_e))
 
                 # Only update entity types for relationship facts (not scalar values)
-                if edge.object_type and edge.rel_type.lower() not in _SCALAR_OBJECT_RELS and canonical_object not in (user_entity_id, canonical_subject):
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                if edge.object_type and not _is_scalar_rel_type(edge.rel_type.lower(), _REL_TYPE_META, db) and canonical_object not in (user_entity_id, canonical_subject):
                     try:
                         with db.cursor() as _cur:
                             _cur.execute(
@@ -3369,9 +3468,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # CRITICAL: Also skip scalar rel_types — scalar objects are STRING values (age, height, etc.)
                 # and must NEVER be converted to UUIDs (CLAUDE.md constraint: "Scalar rel_types have STRING objects").
                 # dBug-036A: Normalizing scalar values to UUID breaks conflict detection for user corrections.
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
                 if (canonical_object in _user_aliases and canonical_object != user_entity_id and
                     edge.rel_type.lower() not in ("also_known_as", "pref_name") and
-                    edge.rel_type.lower() not in _SCALAR_OBJECT_RELS):
+                    not _is_scalar_rel_type(edge.rel_type.lower(), _REL_TYPE_META, db)):
                     log.info("ingest.object_normalized_to_user_id",
                              original=canonical_object, user_id=user_entity_id)
                     canonical_object = user_entity_id
@@ -3447,8 +3547,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     continue
 
                 # PHASE 1: 3D Classification (metadata-first, deterministic routing)
+                # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                log.info("ingest.before_classify_fact_3d",
+                         rel_type=edge.rel_type.lower(),
+                         object_value=_raw_object[:20],
+                         is_scalar_rels=_is_scalar_rel_type(edge.rel_type.lower(), _REL_TYPE_META, db))
                 classification_3d = classify_fact_3d(
                     edge.rel_type.lower(), _raw_object.lower().strip(), registry, req.user_id)
+                log.info("ingest.after_classify_fact_3d",
+                         rel_type=edge.rel_type.lower(),
+                         storage=classification_3d.get("storage"),
+                         reason=classification_3d.get("reason"))
 
                 # Unknown rel_types (storage=None) are handled as Class C
                 # They flow through ontology_evaluations for async re_embedder evaluation
@@ -3462,9 +3571,14 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         reason=classification_3d["reason"],
                     )
 
+                # Check if we're taking the scalar path
+                if classification_3d["storage"] == "scalar":
+                    log.info("ingest.taking_scalar_path", rel_type=edge.rel_type.lower(), object=_raw_object)
+
                 # PHASE 2: Assign Class and Confidence
                 # Check if user-stated (from is_correction flag, or fact_provenance)
-                is_user_stated = edge.is_correction or (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated")
+                # dBug-041: Treat correction flag at request level OR edge level as user-stated (Class A)
+                is_user_stated = req.is_correction or edge.is_correction or (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated")
 
                 # Check if metadata was created in-flow (TODO: detect from extraction context)
                 ontology_created = False
@@ -3887,9 +4001,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             continue
 
                     # If object is a string, only resolve if rel_type expects UUID objects
-                    # Skip resolution for rel_types in _SCALAR_OBJECT_RELS (pref_name, age, etc.)
+                    # Skip resolution for scalar rel_types (pref_name, age, etc.)
+                    # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
                     if obj and not _UUID_PATTERN.match(obj) and obj != user_id:
-                        if rt_lower not in _SCALAR_OBJECT_RELS:
+                        if not _is_scalar_rel_type(rt_lower, _REL_TYPE_META, db):
                             try:
                                 obj = registry.resolve(user_id, obj)
                                 log.info("ingest.object_resolved_during_validation",
@@ -3913,7 +4028,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # Object validation depends on rel_type:
                     # - For scalar rel_types: object can be ANY string (value)
                     # - For relationship rel_types: object must be UUID or user_id
-                    if rt_lower in _SCALAR_OBJECT_RELS:
+                    # Metadata-driven: uses _is_scalar_rel_type() instead of hardcoded list
+                    if _is_scalar_rel_type(rt_lower, _REL_TYPE_META, db):
                         # Scalar rel_type: object can be any non-empty string
                         if not obj or not obj.strip():
                             log.error("ingest.invalid_object_scalar",
