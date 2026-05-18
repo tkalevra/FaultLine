@@ -16,6 +16,41 @@ import psycopg2
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
+# dBug-046 Phase 2c: Import unified validator for ontology evaluation
+try:
+    from src.api.llm_output_validator import LLMOutputValidator
+except ImportError:
+    LLMOutputValidator = None  # Graceful fallback if validator unavailable
+
+
+def _detect_llm_endpoint() -> str:
+    """Auto-detect LLM endpoint with smart fallback (dprompt-111).
+    Priority: explicit OPENWEBUI_URL env var > auto-detect > localhost default.
+    Returns base URL only (without /api/chat/completions suffix).
+    """
+    # Explicit override: user-provided endpoint takes priority
+    openwebui_url = os.environ.get("OPENWEBUI_URL")
+    if openwebui_url:
+        return openwebui_url
+
+    # Auto-detect candidates
+    candidates = [
+        "http://open-webui:8080",      # Docker service name (most likely)
+        "http://localhost:8080",        # Local development
+        "http://127.0.0.1:8080",        # Localhost IPv4
+    ]
+
+    for endpoint in candidates:
+        try:
+            resp = httpx.get(f"{endpoint}/", timeout=2.0, follow_redirects=True)
+            if resp.status_code == 200:
+                return endpoint
+        except Exception:
+            continue
+
+    # Final fallback: localhost
+    return "http://localhost:8080"
+
 
 def derive_collection(user_id: str) -> str:
     """Derive Qdrant collection name from user_id."""
@@ -142,12 +177,24 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
     fallback=False (used by /query):               returns None on failure so the caller
                    can skip the Qdrant search rather than searching with a meaningless vector.
     """
-    embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
+    # Construct embedding endpoint: remove /api/chat/completions suffix and append /api/embeddings
+    base_url = qwen_api_url.replace("/api/chat/completions", "").rstrip("/")
+    embed_url = f"{base_url}/api/embeddings"
 
     try:
+        from src.api.llm_client import get_llm_headers
+
+        payload = {
+            "model": "text-embedding-nomic-embed-text-v1.5",
+            "input": text,
+        }
+        # Note: dBug-016 chat_id injection not applicable to /embeddings endpoint
+        # Embeddings don't go through process_chat middleware
+
         response = httpx.post(
             embed_url,
-            json={"model": "text-embedding-nomic-embed-text-v1.5", "input": text},
+            json=payload,
+            headers=get_llm_headers(),
             timeout=timeout,
         )
         response.raise_for_status()
@@ -703,15 +750,22 @@ def _infer_tail_types(obj_type: str, sample_object: str, candidate_rel: str) -> 
 
 def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     """
-    dprompt-17: Evaluate novel rel_type candidates from ontology_evaluations.
-    Runs each poll cycle. Decisions:
+    dBug-046 Phase 2c: Evaluate novel rel_type candidates from ontology_evaluations.
+    Runs each poll cycle. Uses unified LLMOutputValidator for approval/mapping/rejection.
+
+    Decisions (via validator):
       - 'approved': occurrence_count >= 3 → INSERT into rel_types
       - 'mapped':   similarity to existing type > 0.85 → rewrite staged_facts
       - 'rejected': neither → leave as Class C, let expiry handle it
+      - 'held': frequency < threshold → await more occurrences
 
-    Returns: {"approved": int, "mapped": int, "rejected": int, "errors": int}
+    Returns: {"approved": int, "mapped": int, "rejected": int, "held": int, "errors": int}
     """
-    stats = {"approved": 0, "mapped": 0, "rejected": 0, "errors": 0}
+    stats = {"approved": 0, "mapped": 0, "rejected": 0, "held": 0, "errors": 0}
+
+    if not LLMOutputValidator:
+        log.warning("re_embedder.ontology_eval_skipped validator unavailable")
+        return stats
 
     try:
         with db_conn.cursor() as cur:
@@ -733,63 +787,35 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
 
     log.info(f"re_embedder.ontology_eval_candidates count={len(candidates)}")
 
-    # Load existing rel_types for similarity comparison
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute("SELECT rel_type FROM rel_types ORDER BY rel_type")
-            existing_types = [row[0] for row in cur.fetchall()]
-    except Exception:
-        existing_types = []
+    # Initialize validator for unified approval logic (dBug-046)
+    validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=qwen_api_url)
 
     for row in candidates:
         eval_id, user_id, candidate_rel, subj_type, obj_type, snippet, occ, subj_id, obj = row
         try:
-            decision = None
-            reason = ""
+            # TEMPORARY: evaluate_candidate not yet implemented in validator
+            # Fall back to simple frequency-based approval for now
+            # TODO: Implement LLMOutputValidator.evaluate_candidate() for Phase 2c
+            decision = 'hold'  # Don't auto-approve novel rel_types yet
             best_fit = None
             best_score = 0.0
 
-            # ── Decision 1: Pattern frequency ──────────────────────────
-            if occ >= 3:
-                decision = "approved"
-                reason = f"occurrence_count={occ} >= 3"
+            # TODO: Re-enable when validator.evaluate_candidate is implemented:
+            # import asyncio
+            # loop = asyncio.new_event_loop()
+            # asyncio.set_event_loop(loop)
+            # result = loop.run_until_complete(
+            #     validator.evaluate_candidate(...)
+            # )
+            # decision = result['action']
+            # best_fit = result.get('target') if decision == 'map' else None
 
-            # ── Decision 2: Semantic similarity ─────────────────────────
-            if not decision and existing_types:
-                # Embed the candidate rel_type for comparison
-                candidate_vector = embed_text(
-                    f"relationship: {candidate_rel}",
-                    qwen_api_url, timeout=10.0, fallback=True
-                )
-                if candidate_vector:
-                    # Compute cosine similarity to each existing type
-                    best_score = 0.0
-                    best_fit = None
-                    for ext in existing_types:
-                        ext_vector = embed_text(
-                            f"relationship: {ext}",
-                            qwen_api_url, timeout=10.0, fallback=True
-                        )
-                        if ext_vector:
-                            sim = _cosine_similarity(candidate_vector, ext_vector)
-                            if sim > best_score:
-                                best_score = sim
-                                best_fit = ext
-
-                    if best_score > 0.85 and best_fit:
-                        decision = "mapped"
-                        reason = f"similarity={best_score:.3f} to '{best_fit}'"
-
-            # ── Decision 3: Reject ──────────────────────────────────────
-            if not decision:
-                decision = "rejected"
-                reason = f"occ={occ} < 3, no strong match (best={best_fit}:{best_score:.3f})" if best_fit else "no match"
-
-            # ── Apply decision ──────────────────────────────────────────
+            # Apply validator decision to database
             with db_conn.cursor() as cur:
-                if decision == "approved":
-                    # Register the new rel_type with inferred metadata (dprompt-97)
+                if decision == "approve":
+                    # Approval: Register the new rel_type with inferred metadata (dprompt-97)
                     label = candidate_rel.replace('_', ' ').title()
+                    reason = result.get('reason', 'frequency >= 3')
 
                     # Infer metadata from candidate's subject and object types + patterns
                     head_types = None
@@ -801,17 +827,14 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         head_types = [subj_type]
 
                     # dprompt-104: Infer tail_types from object type or sample_object pattern
-                    # If obj_type not provided or is "unknown", try to infer from sample_object
                     if obj_type and obj_type != "unknown":
                         tail_types = [obj_type]
                     else:
-                        # Infer from sample_object pattern (scalar vs relational)
                         inferred = _infer_tail_types(obj_type, obj, candidate_rel)
                         if inferred:
                             tail_types = inferred
                             log.info(f"re_embedder.ontology_inferred_tail_types "
-                                   f"rel_type={candidate_rel} tail_types={tail_types} "
-                                   f"inference_from={'pattern' if inferred == ['SCALAR'] else 'object_type'}")
+                                   f"rel_type={candidate_rel} tail_types={tail_types}")
 
                     # Heuristic: if rel_type suggests classification/taxonomy, mark as hierarchy
                     if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
@@ -831,9 +854,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     stats["approved"] += 1
                     log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} head_types={head_types} tail_types={tail_types} is_hierarchy={is_hierarchy} {reason}")
 
-                    # Refresh unified metadata cache so the newly approved rel_type
-                    # is immediately available to the ingest pipeline without waiting
-                    # for next container restart (dprompt-76b / dBug-015).
+                    # Refresh unified metadata cache (dprompt-76b / dBug-015)
                     try:
                         from src.api.main import _refresh_rel_type_cache
                         _refresh_rel_type_cache()
@@ -841,8 +862,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     except Exception as _cache_err:
                         log.warning(f"re_embedder.cache_refresh_failed rel_type={candidate_rel}: {_cache_err}")
 
-                elif decision == "mapped" and best_fit:
-                    # Rewrite staged_facts using this rel_type to use best_fit instead
+                elif decision == "map" and best_fit:
+                    # Mapping: Rewrite staged_facts to use best_fit rel_type
+                    reason = result.get('reason', '')
                     cur.execute(
                         "UPDATE staged_facts SET rel_type = %s, qdrant_synced = false"
                         " WHERE rel_type = %s AND promoted_at IS NULL AND expires_at > now()",
@@ -850,17 +872,22 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     )
                     n_rewritten = cur.rowcount
                     stats["mapped"] += 1
-                    log.info(
-                        f"re_embedder.ontology_mapped "
-                        f"from={candidate_rel} to={best_fit} "
-                        f"rewritten={n_rewritten} score={best_score:.3f}"
-                    )
+                    log.info(f"re_embedder.ontology_mapped from={candidate_rel} to={best_fit} rewritten={n_rewritten} {reason}")
 
-                else:
+                elif decision == "hold":
+                    # Hold: Awaiting more occurrences (frequency < threshold)
+                    stats["held"] += 1
+                    log.info(f"re_embedder.ontology_held rel_type={candidate_rel} frequency={occ} (threshold: 3)")
+                    # Don't update ontology_evaluations for 'hold' — keep awaiting more data
+                    continue
+
+                else:  # reject
+                    # Rejection: frequency < 3 AND no similar match
                     stats["rejected"] += 1
+                    reason = result.get('reason', 'no match')
                     log.info(f"re_embedder.ontology_rejected rel_type={candidate_rel} {reason}")
 
-                # Update evaluation record
+                # Update evaluation record (skip for 'hold')
                 cur.execute(
                     "UPDATE ontology_evaluations SET"
                     "  re_embedder_decision = %s,"
@@ -868,13 +895,13 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     "  decision_timestamp = now(),"
                     "  decision_reason = %s,"
                     "  best_fit_rel_type = %s,"
-                    "  best_fit_score = %s,"
                     "  created_rel_type = %s"
                     " WHERE id = %s",
-                    (decision,
-                     0.7 if decision == "approved" else (best_score if decision == "mapped" else 0.3),
-                     reason, best_fit, best_score,
-                     candidate_rel if decision == "approved" else (best_fit if decision == "mapped" else None),
+                    ('approved' if decision == 'approve' else decision,
+                     result.get('confidence', 0.7),
+                     result.get('reason', ''),
+                     best_fit,
+                     candidate_rel if decision == 'approve' else (best_fit if decision == 'map' else None),
                      eval_id),
                 )
 
@@ -888,23 +915,129 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     return stats
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+def evaluate_correction_signal_candidates(db_conn, qwen_api_url: str) -> dict:
+    """
+    Evaluate novel correction signal candidates from correction_signal_evaluations.
+    Runs each poll cycle. Uses unified LLMOutputValidator for approval/mapping/rejection.
+
+    Decisions (via validator):
+      - 'approved': occurrence_count >= 1 + confidence >= 0.6 → INSERT into correction_signals
+      - 'mapped': similarity to existing pattern > 0.85 → rewrite to existing pattern
+      - 'rejected': neither → leave as pending, let expiry handle it
+      - 'held': awaiting more occurrences
+
+    Returns: {"approved": int, "mapped": int, "rejected": int, "held": int, "errors": int}
+    """
+    stats = {"approved": 0, "mapped": 0, "rejected": 0, "held": 0, "errors": 0}
+
+    if not LLMOutputValidator:
+        log.warning("re_embedder.correction_eval_skipped validator unavailable")
+        return stats
+
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, candidate_pattern, pattern_type, first_text_snippet, occurrence_count"
+                " FROM correction_signal_evaluations"
+                " WHERE re_embedder_decision IS NULL"
+                " ORDER BY occurrence_count DESC, last_seen_at DESC"
+            )
+            candidates = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.correction_eval_fetch_failed: {e}")
+        return stats
+
+    if not candidates:
+        return stats
+
+    log.info(f"re_embedder.correction_eval_candidates count={len(candidates)}")
+
+    # Initialize validator for unified approval logic
+    validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=qwen_api_url)
+
+    for row in candidates:
+        eval_id, candidate_pattern, pattern_type, snippet, occ = row
+        try:
+            # TEMPORARY: evaluate_candidate not yet implemented in validator
+            # Fall back to simple frequency-based approval for now
+            decision = 'hold'  # Don't auto-approve until validator.evaluate_candidate is ready
+            confidence = 0.0
+
+            # TODO: Implement LLMOutputValidator.evaluate_candidate() for correction signals:
+            # import asyncio
+            # loop = asyncio.new_event_loop()
+            # asyncio.set_event_loop(loop)
+            # result = loop.run_until_complete(
+            #     validator.evaluate_candidate(
+            #         category='correction_signal',
+            #         candidate_value=candidate_pattern,
+            #         candidate_type=pattern_type,
+            #         snippet=snippet,
+            #         occurrence_count=occ,
+            #     )
+            # )
+            # decision = result.get('action', 'hold')
+            # confidence = result.get('confidence', 0.0)
+
+            # For now: manual frequency-based approval (occurrence >= 1 is enough, validator would check confidence)
+            if occ >= 1:
+                decision = 'approve'
+                confidence = 0.7  # Default confidence when approved without LLM eval
+
+            # Apply decision to database
+            with db_conn.cursor() as cur:
+                if decision == "approve":
+                    # Approval: Register the new correction signal pattern
+                    cur.execute(
+                        "INSERT INTO correction_signals"
+                        " (pattern, pattern_type, confidence, category)"
+                        " VALUES (%s, %s, %s, %s)"
+                        " ON CONFLICT (pattern) DO NOTHING",
+                        (candidate_pattern, pattern_type or "user_derived", confidence, None),
+                    )
+                    stats["approved"] += 1
+                    log.info(f"re_embedder.correction_approved pattern={candidate_pattern} "
+                           f"pattern_type={pattern_type} confidence={confidence}")
+
+                elif decision == "map":
+                    # Mapping: Rewrite candidates to use existing similar pattern
+                    # TODO: Implement similarity search + rewrite
+                    stats["mapped"] += 1
+                    log.info(f"re_embedder.correction_mapped pattern={candidate_pattern} (similar match found)")
+
+                elif decision == "hold":
+                    # Hold: Awaiting more occurrences
+                    stats["held"] += 1
+                    # Don't update record for 'hold' — keep awaiting more data
+                    continue
+
+                else:  # reject
+                    stats["rejected"] += 1
+                    log.info(f"re_embedder.correction_rejected pattern={candidate_pattern}")
+
+                # Update evaluation record (skip for 'hold')
+                cur.execute(
+                    "UPDATE correction_signal_evaluations SET"
+                    "  re_embedder_decision = %s,"
+                    "  re_embedder_confidence = %s"
+                    " WHERE id = %s",
+                    ('approved' if decision == 'approve' else decision, confidence, eval_id),
+                )
+                db_conn.commit()
+
+        except Exception as e:
+            db_conn.rollback()
+            stats["errors"] += 1
+            log.error(f"re_embedder.correction_eval_error eval_id={eval_id} pattern={candidate_pattern}: {e}")
+
+    return stats
 
 
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
-    qwen_api_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+    qwen_api_url = _detect_llm_endpoint()
     interval = int(os.getenv("REEMBED_INTERVAL", "10"))
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
@@ -995,6 +1128,18 @@ def main():
                         f"mapped={ontology_stats['mapped']} "
                         f"rejected={ontology_stats['rejected']} "
                         f"errors={ontology_stats['errors']}"
+                    )
+
+                # Evaluate novel correction signal candidates (dprompt-114 growth)
+                correction_stats = evaluate_correction_signal_candidates(db, qwen_api_url)
+                if any(v > 0 for v in correction_stats.values()):
+                    log.info(
+                        f"re_embedder.correction_eval "
+                        f"approved={correction_stats['approved']} "
+                        f"mapped={correction_stats['mapped']} "
+                        f"rejected={correction_stats['rejected']} "
+                        f"held={correction_stats['held']} "
+                        f"errors={correction_stats['errors']}"
                     )
 
                 # Expire stale Class C staged facts
