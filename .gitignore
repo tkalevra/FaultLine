@@ -32,3 +32,4 @@ Thumbs.db
 .env.local
 secrets.json
 .aider*
+.claude/settings.local.json
