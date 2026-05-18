@@ -12,10 +12,76 @@ import re
 import time as _time
 from collections import defaultdict
 from typing import Callable, Optional
+import sys
 
 import httpx
 from pydantic import BaseModel
 
+# Add src directory to path for imports (dBug-046 Phase 2b)
+try:
+    sys.path.insert(0, '/home/chris/Documents/013-GIT/FaultLine-dev')
+    from src.api.llm_output_validator import LLMOutputValidator
+except ImportError:
+    LLMOutputValidator = None  # Graceful fallback if validator unavailable
+
+
+# Auto-detect OpenWebUI endpoint at module import time (dprompt-111)
+def _detect_openwebui_endpoint() -> Optional[str]:
+    """Auto-detect OpenWebUI endpoint. Tries common addresses in order of likelihood."""
+    candidates = [
+        "http://open-webui:8080",      # Docker service name (most likely)
+        "http://localhost:8080",        # Local development
+        "http://127.0.0.1:8080",        # Localhost IPv4
+        os.environ.get("OPENWEBUI_URL"), # Explicit env var override
+    ]
+
+    for endpoint in candidates:
+        if not endpoint:
+            continue
+        try:
+            # Quick health check via /api/models
+            resp = httpx.get(f"{endpoint}/api/models", timeout=2.0, follow_redirects=True)
+            if resp.status_code == 200:
+                return endpoint
+        except Exception:
+            continue
+
+    return None
+
+
+_OPENWEBUI_ENDPOINT = _detect_openwebui_endpoint()
+
+
+def _detect_faultline_endpoint() -> Optional[str]:
+    """Auto-detect FaultLine backend endpoint. Tries common addresses in order of likelihood."""
+    candidates = [
+        "http://faultline:8000",           # Docker service name (most likely)
+        "http://localhost:8001",            # Local development
+        "http://127.0.0.1:8001",            # Localhost IPv4
+        "http://192.168.1.10:8001",        # Production IP
+        os.environ.get("FAULTLINE_URL"),   # Explicit env var override
+    ]
+
+    for endpoint in candidates:
+        if not endpoint:
+            continue
+        try:
+            # Quick health check via /correction-signals endpoint
+            resp = httpx.get(f"{endpoint}/correction-signals", timeout=2.0, follow_redirects=True)
+            if resp.status_code == 200:
+                return endpoint
+        except Exception:
+            continue
+
+    return None
+
+
+# FaultLine backend URL — auto-detect at module load time, with env var override
+_FAULTLINE_URL = os.getenv("FAULTLINE_URL") or _detect_faultline_endpoint() or "http://localhost:8001"
+
+# Correction signals cache with TTL (lazy load at runtime, not at startup)
+_CORRECTION_SIGNALS_CACHE_WITH_TTL: tuple = (0, [])
+_CORRECTION_SIGNALS_TTL: int = 60  # refresh every 60 seconds
 
 _REALTIME_SIGNALS: frozenset[str] = frozenset({
     "weather", "forecast", "temperature", "news", "today", "current",
@@ -40,13 +106,10 @@ _IDENTITY_QUERIES: frozenset[str] = frozenset({
 })
 
 
-_RETRACTION_SIGNALS: frozenset[str] = frozenset({
-    "forget", "delete", "remove", "retract", "erase",
-    "that's wrong", "thats wrong", "that was wrong", "not true",
-    "that's not right", "thats not right", "incorrect", "no longer",
-    "remove from memory", "forget that", "don't remember",
-    "that information is wrong", "that info is wrong",
-})
+# Retraction signals cache with TTL (lazy load at runtime, not at startup)
+# Format: {signal_text: {"category": str, "priority": int, "false_positive_rate": float}}
+_RETRACTION_SIGNALS_CACHE_WITH_TTL: tuple = (0, {})
+_RETRACTION_SIGNALS_TTL: int = 60  # refresh every 60 seconds
 
 _IDENTITY_RE = re.compile(
     r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
@@ -61,6 +124,100 @@ _UUID_RE = re.compile(
 # context questions by analyzing grammatical person. If a question uses first-
 # person language ("I", "my", "me", etc.), it's personal context — don't skip
 # extraction. Pure third-person/general questions can safely skip.
+
+def _get_correction_signals_cached() -> list[dict]:
+    """Get correction signals with TTL-based caching (lazy load at runtime).
+
+    Loads from backend on first call or when TTL expires.
+    No startup dependency — backend doesn't need to be ready at module load.
+    Gracefully degrades to empty list on error.
+
+    Returns: List of {pattern, type, priority, confidence, category} dicts.
+    """
+    global _CORRECTION_SIGNALS_CACHE_WITH_TTL
+    import time
+    import sys
+
+    cache_timestamp, cached_data = _CORRECTION_SIGNALS_CACHE_WITH_TTL
+    now = time.time()
+
+    # Return cached if still valid (TTL not expired)
+    if cache_timestamp > 0 and (now - cache_timestamp) < _CORRECTION_SIGNALS_TTL:
+        return cached_data
+
+    # Cache expired or empty — try to load from backend
+    if not _FAULTLINE_URL:
+        _CORRECTION_SIGNALS_CACHE_WITH_TTL = (now, [])
+        print(f"[FaultLine Filter] _get_correction_signals_cached: FAULTLINE_URL not set", file=sys.stderr)
+        return []
+
+    try:
+        url = f"{_FAULTLINE_URL}/correction-signals"
+        print(f"[FaultLine Filter] _get_correction_signals_cached: loading from {url}", file=sys.stderr)
+        resp = httpx.get(url, timeout=5.0)
+        if resp.status_code == 200:
+            cached_data = resp.json()
+            print(f"[FaultLine Filter] _get_correction_signals_cached: loaded {len(cached_data)} patterns", file=sys.stderr)
+        else:
+            print(f"[FaultLine Filter] _get_correction_signals_cached: HTTP {resp.status_code}", file=sys.stderr)
+            cached_data = []
+        _CORRECTION_SIGNALS_CACHE_WITH_TTL = (now, cached_data)
+    except Exception as e:
+        # Graceful fallback — cache empty on error, retry next time TTL expires
+        print(f"[FaultLine Filter] _get_correction_signals_cached: exception={type(e).__name__}: {e}", file=sys.stderr)
+        _CORRECTION_SIGNALS_CACHE_WITH_TTL = (now, [])
+        cached_data = []
+
+    return cached_data
+
+
+async def _detect_implicit_correction(text: str, faultline_url: str, user_id: str, debug: bool = False) -> tuple[bool, Optional[dict]]:
+    """Detect implicit correction via LLM pattern extraction (dprompt-114).
+
+    Calls backend to LLM-extract correction pattern from text.
+    Backend queries correction_signals table + creates new patterns with confidence.
+
+    Args:
+        text: User message
+        faultline_url: Backend URL for pattern evaluation
+        user_id: User ID for logging
+        debug: Whether to log debug info
+
+    Returns:
+        (is_correction: bool, pattern_result: dict or None)
+        pattern_result: {"pattern": str, "type": str, "confidence": float, "is_new": bool}
+    """
+    if not text or not faultline_url:
+        return False, None
+
+    try:
+        resp = httpx.post(
+            f"{faultline_url}/evaluate-correction-pattern",
+            json={"text": text, "user_id": user_id},
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            return False, None
+
+        result = resp.json()
+        pattern = result.get("pattern")
+        confidence = result.get("confidence", 0.0)
+
+        if not pattern or confidence < 0.6:
+            return False, None
+
+        if debug:
+            import sys
+            print(f"[FaultLine Filter] correction_pattern: pattern={pattern} type={result.get('type')} confidence={confidence} is_new={result.get('is_new')}", file=sys.stderr)
+
+        return True, result
+
+    except Exception as e:
+        if debug:
+            import sys
+            print(f"[FaultLine Filter] correction_pattern_error: {e}", file=sys.stderr)
+        return False, None
+
 
 def _should_skip_extraction(text: str) -> bool:
     """Return True if extraction can be skipped (pure factual question).
@@ -82,6 +239,12 @@ def _should_skip_extraction(text: str) -> bool:
     # No personal context detected — safe to skip extraction for this question
     return True
 
+# Correction signals cache — dynamic TTL-based refresh (dprompt-114)
+# Format: [{pattern: str, type: str, priority: int, confidence: float}, ...]
+# Structure: (timestamp, cache_data)
+_CORRECTION_SIGNALS_CACHE_WITH_TTL: tuple = (0, [])
+_CORRECTION_SIGNALS_TTL: int = 60  # seconds — refresh every minute
+
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
 _SESSION_MEMORY_TTL: int = 30  # seconds
@@ -93,31 +256,345 @@ _SESSION_MEMORY_TTL: int = 30  # seconds
 # Key: user_id, Value: (last_text_hash, last_processed_at_timestamp)
 _DEDUP_TRACKER: dict[str, tuple[int, float]] = {}
 _DEDUP_WINDOW: float = 5.0  # seconds — ignore duplicate text within this window
+_INLET_CALL_COUNTER: int = 0  # Module-level counter to detect if state persists across calls
 
 # Conversation context — per-user pronoun/entity tracking across turns
 _CONVERSATION_CONTEXT: dict[str, dict] = {}
 _CONVERSATION_MAX_ENTITIES: int = 10  # prune entity mentions beyond this
 
+
+# ============================================================================
+# Retraction Detection & Scope Extraction (dprompt-107)
+# ============================================================================
+
+def _get_retraction_signals_cached() -> dict:
+    """Get retraction signals with TTL-based caching (lazy load at runtime).
+
+    Loads from DB on first call or when TTL expires.
+    No startup dependency — database doesn't need to be ready at module load.
+    Gracefully degrades to empty dict on error.
+
+    Returns: {signal_text: {"category": str, "priority": int}}
+    """
+    global _RETRACTION_SIGNALS_CACHE_WITH_TTL
+    import time
+
+    cache_timestamp, cached_data = _RETRACTION_SIGNALS_CACHE_WITH_TTL
+    now = time.time()
+
+    # Return cached if still valid (TTL not expired)
+    if cache_timestamp > 0 and (now - cache_timestamp) < _RETRACTION_SIGNALS_TTL:
+        return cached_data
+
+    # Cache expired or empty — try to load from DB
+    db_url = os.getenv("POSTGRES_DSN")
+    if not db_url:
+        _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
+        return {}
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT signal, signal_category, priority
+                   FROM retraction_signals
+                   WHERE language = 'en'
+                   ORDER BY priority DESC"""
+            )
+            cached_data = {}
+            for signal, category, priority in cur.fetchall():
+                cached_data[signal.lower()] = {
+                    "category": category,
+                    "priority": priority,
+                }
+            conn.close()
+            _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, cached_data)
+    except Exception as e:
+        # Graceful fallback — cache empty on error, retry next time TTL expires
+        _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
+
+    return cached_data
+
+
+def _detect_retraction_pattern(text: str, signals_cache: dict) -> tuple[bool, Optional[str]]:
+    """Detect retraction intent via pattern matching (no LLM).
+
+    Returns: (is_retraction: bool, signal_category: 'explicit'|'implicit_negation'|'correction'|None)
+    """
+    text_lower = text.lower().replace("'", "'").replace("'", "'")
+
+    # Find highest-priority matching signal
+    matched_signal = None
+    highest_priority = -1
+
+    for signal, meta in signals_cache.items():
+        if signal in text_lower:
+            priority = meta["priority"]
+            if priority > highest_priority:
+                highest_priority = priority
+                matched_signal = (signal, meta["category"])
+
+    if matched_signal:
+        return (True, matched_signal[1])
+    return (False, None)
+
+
+async def _resolve_rel_type(rel_type: str, db_url: Optional[str] = None) -> str:
+    """
+    Resolve LLM rel_type output against rel_types table metadata.
+
+    If LLM returns a rel_type that exists in rel_types, use it.
+    If not, check if it's an inverse form and return the canonical rel_type.
+    Falls back to LLM output if DB unavailable.
+
+    Metadata-driven: uses rel_types.inverse_rel_type, not hardcoded mappings.
+    """
+    if not rel_type or not db_url:
+        return rel_type
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+        with conn.cursor() as cur:
+            # Check if this rel_type exists in the table
+            cur.execute(
+                "SELECT rel_type FROM rel_types WHERE rel_type = %s LIMIT 1",
+                (rel_type.lower(),)
+            )
+            if cur.fetchone():
+                conn.close()
+                return rel_type.lower()
+
+            # Check if this is an inverse form
+            # Example: LLM returns "child_of", we look for rel_type where inverse_rel_type = "child_of"
+            cur.execute(
+                "SELECT rel_type FROM rel_types WHERE inverse_rel_type = %s LIMIT 1",
+                (rel_type.lower(),)
+            )
+            row = cur.fetchone()
+            if row:
+                canonical = row[0]
+                conn.close()
+                return canonical
+
+        conn.close()
+    except Exception as e:
+        # Graceful fallback to LLM output
+        pass
+
+    return rel_type
+
+
+async def _call_extract_rewrite(
+    text: str,
+    faultline_url: str,
+    user_id: str,
+    timeout: float = 10.0,
+    debug: bool = False,
+) -> tuple[list[dict], float]:
+    """
+    Call /extract/rewrite to get LLM-extracted triples and confidence signal (dprompt-113).
+
+    Args:
+        text: User message
+        faultline_url: FaultLine API base URL
+        user_id: User UUID (for context)
+        timeout: Request timeout (seconds)
+        debug: Enable debug logging
+
+    Returns:
+        (triples, confidence_signal) where:
+        - triples: list of {subject, object, rel_type, confidence, subject_type, object_type} dicts
+        - confidence_signal: float [0.0, 1.0] = average confidence of extracted triples
+
+    On error: returns ([], 0.0) — graceful degradation
+    """
+    if debug:
+        print(f"[FaultLine Filter] _call_extract_rewrite START url={faultline_url[:40]}... text_len={len(text)}")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{faultline_url}/extract/rewrite",
+                json={
+                    "text": text,
+                    "user_id": user_id,
+                    "typed_entities": None,
+                    "memory_facts": None,
+                },
+                timeout=timeout,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                triples = data.get("triples", [])
+
+                # Compute confidence signal = average of all triple confidences
+                if triples:
+                    confidences = [t.get("confidence", 0.5) for t in triples]
+                    confidence_signal = sum(confidences) / len(confidences)
+                else:
+                    confidence_signal = 0.0
+
+                if debug:
+                    print(f"[FaultLine Filter] extract_rewrite triple_count={len(triples)} confidence_signal={confidence_signal:.2f}")
+
+                return triples, confidence_signal
+            else:
+                if debug:
+                    print(f"[FaultLine Filter] extract_rewrite failed status={response.status_code}")
+                return [], 0.0
+
+    except Exception as e:
+        if debug:
+            print(f"[FaultLine Filter] extract_rewrite error: {type(e).__name__}: {str(e) or 'empty message'}")
+        return [], 0.0
+
+
+def _compute_correction_confidence(
+    llm_confidence: float,
+    pattern_match: bool,
+) -> float:
+    """
+    Combine LLM confidence signal + pattern match to compute correction confidence (dprompt-113).
+
+    Formula:
+    - LLM confidence > 0.75 + pattern match → 0.95 (very high)
+    - LLM confidence > 0.75 alone → 0.85 (high)
+    - LLM confidence > 0.65 + pattern match → 0.75 (moderate-high)
+    - Pattern match alone → 0.65 (moderate)
+    - Neither → 0.0 (no signal)
+
+    Args:
+        llm_confidence: Average confidence from extracted triples (0.0-1.0)
+        pattern_match: Whether text matched correction signal pattern (bool)
+
+    Returns:
+        float [0.0, 1.0] = combined correction confidence
+    """
+    if llm_confidence >= 0.75 and pattern_match:
+        return 0.95  # Strong signal from both LLM and pattern
+    elif llm_confidence >= 0.75:
+        return 0.85  # Strong LLM signal alone
+    elif llm_confidence >= 0.65 and pattern_match:
+        return 0.75  # Moderate LLM + pattern match
+    elif pattern_match:
+        return 0.65  # Pattern match alone
+    else:
+        return 0.0  # No signal
+
+
+def _extract_categorical_scope(text: str, db_url: Optional[str] = None) -> dict:
+    """Extract scope of retraction: granular (individual fact) or categorical (entire group).
+
+    Returns:
+    {
+        "scope_level": "granular" | "categorical" | None,
+        "category": "pets" | "family" | "work" | "location" | None,
+        "rel_types": [...],  # rel_types defining the group
+        "entity_types": [...],  # entity types in the group
+        "subject": str | None,  # for granular: which entity
+        "rel_type": str | None,  # for granular: which relationship
+        "old_value": str | None  # for granular: what value
+    }
+    """
+    if not db_url:
+        return {"scope_level": None}
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+
+        text_lower = text.lower()
+
+        # Check for categorical patterns (don't have any X, no X, forget all my X)
+        categorical_patterns = {
+            "pets": ["pet", "dog", "cat", "animal"],
+            "family": ["family", "child", "parent", "sibling", "spouse"],
+            "work": ["work", "job", "employer", "project", "occupation"],
+            "location": ["address", "live", "location", "city", "country"],
+        }
+
+        for category, keywords in categorical_patterns.items():
+            for keyword in keywords:
+                if keyword in text_lower and any(
+                    phrase in text_lower
+                    for phrase in ["don't have any", "don't have a", "no ", "forget all", "delete all"]
+                ):
+                    # Query entity_taxonomies for this category
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT rel_types_defining_group, member_entity_types
+                               FROM entity_taxonomies
+                               WHERE taxonomy_name = %s""",
+                            (category,)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            conn.close()
+                            return {
+                                "scope_level": "categorical",
+                                "category": category,
+                                "rel_types": row[0] or [],
+                                "entity_types": row[1] or [],
+                                "subject": None,
+                                "rel_type": None,
+                                "old_value": None,
+                            }
+
+        conn.close()
+    except Exception as e:
+        print(f"[FaultLine] extract_categorical_scope_failed: {e}")
+
+    # Default: granular scope (individual fact)
+    # Extract from context or return empty (backend will handle via LLM if needed)
+    return {
+        "scope_level": "granular",
+        "category": None,
+        "rel_types": [],
+        "entity_types": [],
+        "subject": None,
+        "rel_type": None,
+        "old_value": None,
+    }
+
+
 _RETRACTION_PROMPT = """\
-You are a retraction extractor for a personal knowledge graph.
-The user wants to remove or correct a stored fact.
-Output ONLY a raw JSON object. No markdown, no explanation.
+You are a retraction intent detector for a personal knowledge graph.
+RETRACTION = user wants to REMOVE or DENY a fact about themselves.
 
-Fields:
-- "subject": the entity the fact is about. If the user means themselves, use "user".
-- "rel_type": snake_case relationship type (e.g. lives_at, works_for, also_known_as, has_pet, owns, spouse, occupation). Omit if unknown.
-- "old_value": the specific incorrect/outdated value. Omit if unknown or if user wants all facts of that type removed.
+DETECT RETRACTIONS:
+- Negations: "X is not Y", "I don't have X", "I'm not X", "Bob is not my son"
+- Explicit removal: "forget", "delete", "remove", "erase"
+- Corrections: "actually", "I was wrong", "that's incorrect"
+- Categorical denial: "I have no pets", "I don't work", "no family"
 
-Common rel_types: lives_at, lives_in, works_for, occupation, also_known_as, pref_name, has_pet, owns, spouse, likes, dislikes, located_in, age, height, weight.
+SCOPE LEVELS:
+1. GRANULAR: ONE fact — "Bob is not my son" (remove parent_of(user, bob))
+2. CATEGORICAL: ALL facts in group — "I have no pets" (remove ALL has_pet facts)
+3. RELATIONAL: ALL facts of type — "delete all my work" (remove works_for + occupation + educated_at)
 
-Examples:
-"forget that I live at my old address" → {"subject": "user", "rel_type": "lives_at"}
-"delete my work information" → {"subject": "user", "rel_type": "works_for"}
-"that info about my family member is wrong" → {"subject": "family_member_name"}
-"remove the fact about my pet" → {"subject": "pet_name", "rel_type": "has_pet"}
-"forget all that" → {}
+Output ONLY valid JSON. No markdown.
 
-Output: {} if nothing specific can be extracted."""
+{"is_retraction": bool, "scope_level": "granular"|"categorical"|"relational"|null, "subject": str|null, "rel_type": str|null, "category": str|null, "old_value": str|null, "confidence": float}
+
+DECISION TREE:
+- If user negates (not, don't, never, no): is_retraction = TRUE
+- If user says forget/delete/remove: is_retraction = TRUE
+- If user corrects (actually, I was wrong): is_retraction = TRUE
+- If user just asks/states (not negating): is_retraction = FALSE
+
+Examples (ALL true):
+"Bob is not my son" → {"is_retraction": true, "scope_level": "granular", "subject": "bob", "rel_type": "parent_of", "category": null, "confidence": 1.0} [NOTE: User denies parenthood → parent_of fact, subject=child]
+"I have no pets" → {"is_retraction": true, "scope_level": "categorical", "subject": null, "rel_type": null, "category": "pets", "confidence": 1.0}
+"I don't work" → {"is_retraction": true, "scope_level": "categorical", "subject": null, "rel_type": null, "category": "work", "confidence": 1.0}
+"forget Bob" → {"is_retraction": true, "scope_level": "granular", "subject": "bob", "rel_type": null, "category": null, "confidence": 1.0}
+
+Examples (ALL false):
+"Tell me about my family" → {"is_retraction": false, "scope_level": null, "subject": null, "rel_type": null, "category": null, "confidence": 0.0}
+"Bob is my son" → {"is_retraction": false, "scope_level": null, "subject": null, "rel_type": null, "category": null, "confidence": 0.0}
+
+Output: {...}"""
 
 
 _TRIPLE_SYSTEM_PROMPT = """\
@@ -210,21 +687,21 @@ If nothing to extract: []"""
 
 
 def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
-    """
-    Resolve the LLM model and endpoint to use for extraction calls.
-    Valve override takes priority; falls back to user's selected model and
-    OpenWebUI's internal endpoint.
+    """Resolve LLM config from valves with auto-detected endpoint fallback.
+    Priority: BACKEND_LLM_URL valve > LLM_URL valve > auto-detected OpenWebUI > hardcoded fallback.
+    No hardcoding except as absolute final fallback.
     # NO RECURSIVE MATCHING
     """
-    model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "default")
+    model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "")
+    url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else valves.LLM_URL
 
-    # Standard setup: use OpenWebUI's internal endpoint
-    # Custom setup: use explicitly configured LLM_URL
-    if valves.LLM_URL:
-        url = valves.LLM_URL
-    else:
-        # Default to OpenWebUI's internal LLM endpoint
-        url = "http://host.docker.internal:3000/api/chat/completions"
+    # Fall back to auto-detected endpoint (detected at module import time)
+    if not url:
+        url = _OPENWEBUI_ENDPOINT
+
+    # Final fallback: hardcoded localhost (only if detection completely failed)
+    if not url:
+        url = "http://localhost:8080"
 
     return model, url
 
@@ -295,23 +772,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 family_hint = f"Known family relationships: {', '.join(family_members)}. When asked about attributes of named family members, extract them with the family member's name as subject."
                 messages.append({"role": "system", "content": family_hint})
 
-        user_content = text
-        if typed_entities:
-            entity_lines = "\n".join(
-                f"- {e.get('subject')} (type: {e.get('subject_type', 'unknown')})"
-                f" -- {e.get('object')} (type: {e.get('object_type', 'unknown')})"
-                for e in typed_entities
-                if e.get("subject") and e.get("object")
-            )
-            user_content = (
-                f"{text}\n\n"
-                f"Entities detected in text (types pre-classified):\n{entity_lines}\n"
-                f"Use these entity TYPES to constrain subject/object type matching. "
-                f"Determine the specific relationship from the user's text, not from this list. "
-                f"A Person cannot be owned. An Animal cannot be a spouse. "
-                f"Respect these type constraints strictly."
-            )
-        messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "user", "content": text})
 
         headers = {}
         if auth_header:
@@ -700,18 +1161,19 @@ class Filter:
     """
 
     class Valves(BaseModel):
-        FAULTLINE_URL: str = "http://localhost:8001"
+        FAULTLINE_URL: str = _FAULTLINE_URL  # Auto-detected at module load time (dprompt-111 + 115 fix)
         """FaultLine backend API endpoint. Default: http://localhost:8001
         Docker: Use http://faultline:8000 (service name in docker-compose).
         Kubernetes/Remote: Use full URL http://hostname:port"""
 
-        FAULTLINE_TIMEOUT: int = 30
-        """Timeout (seconds) for FaultLine backend API calls. Default: 30 seconds"""
+        FAULTLINE_TIMEOUT: int = 90
+        """Timeout (seconds) for FaultLine backend API calls. Default: 90 seconds (unified gate LLM call to slow aurora)"""
 
         LLM_URL: str = ""
-        """LEAVE EMPTY FOR STANDARD SETUP. OpenWebUI uses http://host.docker.internal:3000/api/chat/completions internally.
-        Only set this if using a CUSTOM LLM endpoint (e.g., local Ollama at http://ollama:11434/v1/chat/completions).
-        MUST include http:// or https:// protocol prefix if set."""
+        """LEAVE EMPTY FOR STANDARD SETUP. Filter calls OpenWebUI LLM at /api/chat/completions endpoint.
+        Only set this if using a CUSTOM LLM endpoint (must be BASE URL only, no /api/chat/completions suffix).
+        EXAMPLES: https://example.com or http://ollama:11434
+        Code will append /api/chat/completions automatically. MUST include http:// or https:// prefix."""
 
         LLM_MODEL: str = ""
         """LEAVE EMPTY FOR STANDARD SETUP. Will use the model you selected in OpenWebUI's chat interface.
@@ -719,14 +1181,14 @@ class Filter:
 
         LLM_API_KEY: str = ""
         """REQUIRED ONLY IF using custom LLM_URL with authentication (e.g., OpenAI API key).
-        For standard OpenWebUI setup: LEAVE EMPTY"""
+        For standard OpenWebUI setup: LEAVE EMPTY. Bearer token automatically prepended to requests."""
 
         BACKEND_LLM_URL: str = ""
-        """LEAVE EMPTY FOR STANDARD SETUP. OpenWebUI's internal LLM is used automatically.
-        ONLY set if you need to use a dedicated backend LLM service (bypassing OpenWebUI).
-        REQUIRED FORMAT if set: Must include http:// or https:// protocol prefix.
-        Examples: http://ollama:11434/v1/chat/completions or http://localhost:8000/v1/chat/completions
-        WARNING: Incorrect format will silently break fact extraction. Validation catches this early."""
+        """LEAVE EMPTY FOR STANDARD SETUP. Filter calls OpenWebUI LLM directly (preferred).
+        Only set if you need a DEDICATED backend LLM service (bypassing OpenWebUI).
+        FORMAT if set: BASE URL ONLY (no /api/chat/completions suffix). Code will append it automatically.
+        EXAMPLES: http://ollama:11434 or http://localhost:11434 (NOT http://ollama:11434/v1/chat/completions)
+        MUST include http:// or https:// prefix. Incorrect format will break fact extraction."""
 
         QWEN_TIMEOUT: int = 10
         """Timeout (seconds) for LLM extraction calls. Default: 10 seconds. Increase if extractions timeout."""
@@ -761,6 +1223,11 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        # All caches now lazy-loaded at runtime:
+        # - Retraction signals via _get_retraction_signals_cached()
+        # - Correction signals via _get_correction_signals_cached()
+        # No startup dependencies on DB/backend being ready.
+        self.db_url = os.getenv("POSTGRES_DSN")
 
     def _last_message(self, messages: list, role: str) -> Optional[str]:
         for m in reversed(messages):
@@ -777,6 +1244,7 @@ class Filter:
         source: str,
         user_id: str = "anonymous",
         edges: Optional[list[dict]] = None,
+        is_correction: bool = False,
     ) -> dict:
         try:
             payload = {
@@ -784,6 +1252,7 @@ class Filter:
                 "source": source,
                 "user_id": user_id,
                 "known_types": ["Person", "Organization", "Location", "Event", "Concept"],
+                "is_correction": is_correction,
             }
             if edges:
                 payload["edges"] = edges
@@ -848,6 +1317,92 @@ class Filter:
             pass
         return []
 
+    async def _extract_triples_via_openwebui(
+        self,
+        text: str,
+        user_id: str,
+        model: str,
+        url: str,
+        auth_header: Optional[str] = None,
+        user_uuid: Optional[str] = None,
+    ) -> list[dict]:
+        """Call OpenWebUI LLM directly for triple extraction. Portable, reliable, no external dependencies."""
+        try:
+            # Strip /api/chat/completions if already in URL (valve may include full endpoint)
+            if url.endswith("/api/chat/completions"):
+                url = url[:-len("/api/chat/completions")]
+
+            _EXTRACTION_PROMPT = """Extract ALL relationships and facts from text as JSON array of triples.
+Each triple: {"subject": string, "object": string, "rel_type": string, "definition": string}
+
+PRIORITY: FAMILY → TEMPORAL → LOCATION → WORK → IDENTITY
+
+FAMILY: parent_of, child_of, spouse, sibling_of, has_pet, pref_name, age, occupation
+TEMPORAL: born_on, born_in, instance_of (date/timeframe)
+LOCATION: lives_in, lives_at, located_in, instance_of (location)
+WORK: works_for, works_in, educated_at, part_of (organization)
+IDENTITY: same_as, also_known_as, pref_name
+
+RULES:
+- Extract attribute facts: (subject, age, "12"), (subject, occupation, "engineer")
+- Extract relationships: (subject, parent_of, object), (object, pref_name, name_string)
+- For lists with attributes: extract each item + relationship + attributes
+- Scalar values (age, height) as strings: "12", not objects
+
+Return valid JSON only. If no facts, return [].
+"""
+            messages = [
+                {"role": "system", "content": _EXTRACTION_PROMPT},
+                {"role": "user", "content": text},
+            ]
+
+            headers = {}
+            if self.valves.LLM_API_KEY:
+                headers["Authorization"] = f"Bearer {self.valves.LLM_API_KEY}"
+
+            request_data = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 1200,
+                "thinking": {"type": "disabled"},
+            }
+            # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
+            if user_uuid:
+                request_data["chat_id"] = user_uuid
+
+            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{url}/api/chat/completions",
+                    json=request_data,
+                    headers=headers,
+                    timeout=self.valves.QWEN_TIMEOUT,
+                )
+                resp.raise_for_status()
+
+            result = resp.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            if not content:
+                return []
+
+            try:
+                triples = json.loads(content)
+                if not isinstance(triples, list):
+                    return []
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] extraction.semantic triples={len(triples)}")
+                return triples
+            except json.JSONDecodeError:
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] extraction LLM response not valid JSON: {content[:100]}")
+                return []
+
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] _extract_triples_via_openwebui failed: {type(e).__name__}: {e}")
+            return []
+
     async def _rewrite_via_faultline(
         self,
         text: str,
@@ -857,46 +1412,23 @@ class Filter:
         memory_facts: Optional[list[dict]],
     ) -> list[dict]:
         """
-        Call FaultLine's /extract/rewrite endpoint for LLM-based triple extraction.
-
-        ARCHITECTURAL BENEFIT: Filter only calls FaultLine:8001 (in our control).
-        No dependency on OpenWebUI's internal endpoints. FaultLine manages LLM config.
-
-        If FaultLine is unreachable or errors, returns [] gracefully.
+        LLM-based triple extraction via OpenWebUI.
+        Delegates to _extract_triples_via_openwebui() which calls OpenWebUI /api/chat/completions directly.
         """
-        try:
-            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT + 5) as client:
-                resp = await client.post(
-                    f"{self.valves.FAULTLINE_URL}/extract/rewrite",
-                    json={
-                        "text": text,
-                        "user_id": user_id,
-                        "messages": messages,
-                        "typed_entities": typed_entities,
-                        "memory_facts": memory_facts,
-                    },
-                    timeout=self.valves.QWEN_TIMEOUT + 5,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("triples", [])
-                else:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine] /extract/rewrite HTTP {resp.status_code}: {resp.text}")
-                    return []
-        except httpx.ConnectError as e:
-            print(f"\n{'='*80}")
-            print(f"[FaultLine] CONFIGURATION ERROR - Cannot reach FaultLine backend:")
-            print(f"URL: {self.valves.FAULTLINE_URL}/extract/rewrite")
-            print(f"Error: {e}")
-            print(f"\nFix: If FaultLine is running in Docker, use service name:")
-            print(f"  Set FAULTLINE_URL to: http://faultline:8000 (not localhost:8001)")
-            print(f"{'='*80}\n")
-            return []
-        except Exception as e:
+        model, url = self._resolve_llm_config()
+        if not model or not url:
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine] /extract/rewrite error: {type(e).__name__}: {e}")
+                print(f"[FaultLine] LLM config unavailable for triple extraction")
             return []
+
+        return await self._extract_triples_via_openwebui(
+            text=text,
+            user_id=user_id,
+            model=model,
+            url=url,
+            auth_header=f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None,
+            user_uuid=user_id,
+        )
 
     def _is_realtime_query(self, text: str) -> bool:
         tl = text.lower()
@@ -1030,56 +1562,161 @@ class Filter:
             directive += f" Additional context: {'; '.join(context_parts)}."
         return directive
 
-    def _detect_retraction_intent(self, text: str) -> bool:
-        tl = text.lower().replace("'", "'").replace("'", "'")
-        return any(sig in tl for sig in _RETRACTION_SIGNALS)
+    async def _detect_retraction_intent(self, text: str, user_id: str) -> tuple[bool, dict]:
+        """Retraction detection: LLM semantic (primary) + pattern fallback (dprompt-108).
+
+        Returns: (should_retract: bool, scope_dict with method indicator)
+        """
+        # Layer 1: LLM Semantic Detection (PRIMARY) — respects user authority
+        if self.valves.RETRACTION_ENABLED:
+            try:
+                llm_model, llm_url = _resolve_llm_config(self.valves, {})
+                auth_header = f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None
+
+                retraction = await self._extract_retraction(
+                    text,
+                    context=[],  # No context needed for retraction detection
+                    model=llm_model,
+                    url=llm_url,
+                    auth_header=auth_header,
+                    user_uuid=user_id,
+                )
+
+                if retraction and retraction.get("is_retraction"):
+                    confidence = retraction.get("confidence", 0.0)
+                    rel_type = retraction.get("rel_type")
+
+                    # Resolve rel_type via metadata-driven lookup (dprompt-108)
+                    # Queries rel_types table to handle inverse relationships generically
+                    if rel_type:
+                        rel_type = await _resolve_rel_type(rel_type, self.db_url)
+
+                    scope = {
+                        "scope_level": retraction.get("scope_level"),
+                        "subject": retraction.get("subject"),
+                        "rel_type": rel_type,
+                        "category": retraction.get("category"),
+                        "old_value": retraction.get("old_value"),
+                        "confidence": confidence,
+                        "method": "semantic",
+                    }
+
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] retraction.semantic method=semantic level={scope['scope_level']} category={scope.get('category')} confidence={confidence}")
+
+                    return (True, scope)
+            except Exception as e:
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] semantic_retraction_fallback: {e}")
+                # Fall through to pattern matching
+
+        # Layer 2: Pattern Matching (FALLBACK - only if LLM failed)
+        is_retraction, signal_category = _detect_retraction_pattern(text, _get_retraction_signals_cached())
+        if is_retraction:
+            scope = _extract_categorical_scope(text, self.db_url)
+            scope["method"] = "pattern"
+
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] retraction.pattern method=pattern level={scope.get('scope_level')} category={signal_category}")
+
+            return (True, scope)
+
+        return (False, {})
 
     async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
+        """Call OpenWebUI LLM directly for retraction semantic detection. Reliable, portable, no external dependencies."""
         try:
-            messages = [{"role": "system", "content": _RETRACTION_PROMPT}]
-            for msg in (context or [])[-2:]:
-                if msg.get("role") in ("user", "assistant") and msg.get("content"):
-                    c = msg.get("content", "")
-                    if isinstance(c, list):
-                        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-                    messages.append({"role": msg["role"], "content": str(c)[:400]})
-            messages.append({"role": "user", "content": text})
-            headers = {}
-            if auth_header:
-                headers["Authorization"] = auth_header
+            # Strip /api/chat/completions if already in URL (valve may include full endpoint)
+            if url.endswith("/api/chat/completions"):
+                url = url[:-len("/api/chat/completions")]
 
-            # Use backend LLM if configured, else OpenWebUI with user UUID (dBug-016 fix)
-            final_url = self.valves.BACKEND_LLM_URL if self.valves.BACKEND_LLM_URL else url
+            _RETRACTION_PROMPT = """You are a retraction/correction detection system.
+Analyze the user's message for retraction intent: explicitly removing, forgetting, correcting, or negating a previously stated fact.
+
+RESPOND WITH VALID JSON ONLY (no markdown, no extra text):
+{
+  "is_retraction": boolean,
+  "scope_level": "granular" | "categorical" | "relational" | null,
+  "subject": string or null,
+  "rel_type": string or null,
+  "category": string or null,
+  "old_value": string or null,
+  "confidence": float between 0 and 1
+}
+
+SCOPE LEVELS:
+- granular: Retracting a specific fact about a person (e.g., "Robert is not my son")
+- categorical: Retracting all facts in a domain (e.g., "I don't have any pets")
+- relational: Retracting all facts with someone (e.g., "I'm not married to Sarah anymore")
+
+RULES: If is_retraction=false, set all other fields to null. For categorical, populate category (domain: family, pets, work, location, health, etc). For granular, populate subject and optionally rel_type. For relational, populate subject and rel_type.
+"""
+            messages = [
+                {"role": "system", "content": _RETRACTION_PROMPT},
+                {"role": "user", "content": text},
+            ]
+
+            headers = {}
+            if self.valves.LLM_API_KEY:
+                headers["Authorization"] = f"Bearer {self.valves.LLM_API_KEY}"
+
             request_data = {
                 "model": model,
                 "messages": messages,
                 "temperature": 0.0,
-                "max_tokens": 100,
+                "max_tokens": 200,
                 "thinking": {"type": "disabled"},
             }
-            if not self.valves.BACKEND_LLM_URL and user_uuid:
+            # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
+            if user_uuid:
                 request_data["chat_id"] = user_uuid
 
             async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
                 resp = await client.post(
-                    final_url,
+                    f"{url}/api/chat/completions",
                     json=request_data,
                     headers=headers,
+                    timeout=self.valves.QWEN_TIMEOUT,
                 )
                 resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"].strip()
-                return json.loads(content) if content else {}
-        except Exception:
+
+            result = resp.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            if not content:
+                return {}
+
+            try:
+                retraction = json.loads(content)
+                if not isinstance(retraction, dict):
+                    return {}
+
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] retraction.semantic method=semantic level={retraction.get('scope_level')} category={retraction.get('category')} confidence={retraction.get('confidence')}")
+
+                return retraction
+            except json.JSONDecodeError:
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] retraction LLM response not valid JSON: {content[:100]}")
+                return {}
+
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] _extract_retraction failed: {type(e).__name__}: {e}")
             return {}
 
-    async def _fire_retract(self, user_id: str, subject: str, rel_type: Optional[str] = None,
-                           old_value: Optional[str] = None) -> dict:
+    async def _fire_retract(self, user_id: str, subject: Optional[str] = None, rel_type: Optional[str] = None,
+                           old_value: Optional[str] = None, scope: Optional[dict] = None) -> dict:
         try:
-            payload = {"user_id": user_id, "subject": subject}
+            payload = {"user_id": user_id}
+            if subject:
+                payload["subject"] = subject
             if rel_type:
                 payload["rel_type"] = rel_type
             if old_value:
                 payload["old_value"] = old_value
+            if scope:
+                payload["scope"] = scope
             async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
                 resp = await client.post(f"{self.valves.FAULTLINE_URL}/retract", json=payload)
                 resp.raise_for_status()
@@ -1088,6 +1725,70 @@ class Filter:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] _fire_retract error: {e}")
             return {"status": "error", "detail": str(e)}
+
+    async def _validate_and_store_signal(self, signal_text: str, confidence: float) -> bool:
+        """
+        dBug-046 Phase 2b: Validate and store detected retraction signals using LLMOutputValidator.
+
+        Enables auto-growth of retraction_signals table from detected patterns.
+        If confidence is high enough, stores signal for future pattern matching.
+
+        Args:
+            signal_text: The detected signal text (e.g., "forget", "I was wrong")
+            confidence: LLM confidence in the signal [0.0, 1.0]
+
+        Returns: True if signal was stored, False otherwise
+        """
+        if not LLMOutputValidator or not self.db_url:
+            return False  # Validator not available or no DB connection
+
+        try:
+            validator = LLMOutputValidator(llm_endpoint=_OPENWEBUI_ENDPOINT or "http://localhost:8080")
+
+            # Validate signal via unified validator
+            validation = await validator.validate_output(
+                output_type='retraction_signal',
+                payload={'signal': signal_text.lower()},
+                source='llm',
+                llm_confidence=confidence,
+                frequency=1
+            )
+
+            # Store signal if decision is 'direct' (high confidence)
+            if validation.storage_decision == 'direct' and validation.confidence >= 0.8:
+                try:
+                    import psycopg2
+                    db = psycopg2.connect(self.db_url)
+                    with db.cursor() as cur:
+                        # Insert signal if not already present
+                        cur.execute(
+                            """INSERT INTO retraction_signals (signal, signal_category, language, frequency, avg_confidence, evaluation_status)
+                               VALUES (%s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (signal) DO UPDATE SET
+                                   frequency = retraction_signals.frequency + 1,
+                                   avg_confidence = (retraction_signals.avg_confidence + %s) / 2,
+                                   last_seen_at = now(),
+                                   evaluation_status = 'auto_approved'
+                            """,
+                            (signal_text.lower(), 'semantic', 'en', 1, confidence, confidence)
+                        )
+                    db.commit()
+                    db.close()
+
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] signal_stored: signal={signal_text} confidence={validation.confidence:.2f}")
+                    return True
+                except Exception as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] signal_store_failed: {e}")
+            else:
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] signal_not_stored: decision={validation.storage_decision} confidence={validation.confidence:.2f} (threshold 0.8)")
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] signal_validation_failed: {e}")
+
+        return False
 
     def _build_memory_block(
         self,
@@ -1367,7 +2068,9 @@ class Filter:
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable] = None,
     ) -> dict:
-        print(f"[FaultLine Filter] inlet CALLED enabled={self.valves.ENABLED} debug={self.valves.ENABLE_DEBUG}")
+        global _INLET_CALL_COUNTER
+        _INLET_CALL_COUNTER += 1
+        print(f"[FaultLine Filter] inlet CALLED enabled={self.valves.ENABLED} debug={self.valves.ENABLE_DEBUG} call_count={_INLET_CALL_COUNTER} dedup_entries={len(_DEDUP_TRACKER)}")
         if not self.valves.ENABLED:
             return body
 
@@ -1409,45 +2112,6 @@ class Filter:
 
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] user_id=[redacted] text='{text[:80]}'")
-
-            # Resolve LLM config once for all extraction operations
-            llm_model, llm_url = _resolve_llm_config(self.valves, body)
-            llm_auth = f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None
-
-            # Retraction detection — check before normal ingest
-            if self.valves.RETRACTION_ENABLED and self._detect_retraction_intent(text):
-                retraction = await self._extract_retraction(
-                    text,
-                    body.get("messages", []),
-                    model=llm_model,
-                    url=llm_url,
-                    auth_header=llm_auth,
-                    user_uuid=user_id,
-                )
-                if retraction and retraction.get("subject"):
-                    result = await self._fire_retract(
-                        user_id,
-                        retraction["subject"],
-                        retraction.get("rel_type"),
-                        retraction.get("old_value"),
-                    )
-                    if result.get("status") == "ok":
-                        n = result.get("retracted", 0)
-                        mode = result.get("mode", "supersede")
-                        action = "removed" if mode == "hard_delete" else "archived"
-                        note = result.get("note", "")
-                        confirmation = (
-                            f"[Memory] {n} fact(s) {action}"
-                            + (f" for {retraction['subject']}" if retraction['subject'] != 'user' else "")
-                            + (f" ({retraction.get('rel_type', '')})" if retraction.get('rel_type') else "")
-                            + ("." if not note else f". Note: {note}")
-                            + " Do not reference these facts in your response."
-                        )
-                        body["messages"].append({"role": "system", "content": confirmation})
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] retraction: {result}")
-                        _redact_uuids_from_body(body)
-                        return body
 
             _THIRD_PERSON_PREF_SIGNALS: frozenset[str] = frozenset({
                 "call her", "call him", "call them",
@@ -1588,12 +2252,15 @@ class Filter:
                     raw_triples = []
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
-                # /ingest endpoint owns the entire pipeline (extract → validate → classify → commit)
-                # Filter is dumb — send ONLY raw text, NO edges. /ingest will call /extract/rewrite for full LLM extraction.
-                # This ensures parent_of, bidirectional relationships, and all complex patterns are extracted properly.
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] firing ingest with raw text (no pre-extracted edges)")
-                await self._fire_ingest(clean_text, self.valves.DEFAULT_SOURCE, user_id, edges=None)
+                # dprompt-115: SIMPLIFIED FILTER (DUMB) — call /ingest once with raw text
+                # Backend handles detection (retraction vs correction vs normal) in unified gate
+                print(f"[FaultLine Filter] /ingest: text='{clean_text[:80]}' source={self.valves.DEFAULT_SOURCE} user_id={user_id}")
+
+                await self._fire_ingest(
+                    clean_text,
+                    self.valves.DEFAULT_SOURCE,
+                    user_id,
+                )
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):

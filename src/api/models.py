@@ -28,6 +28,7 @@ class IngestRequest(BaseModel):
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
     user_id: Optional[str] = "anonymous"
     context: ExtractContext | None = None  # Optional context enrichment for /extract (dBug-018)
+    is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
 
 
 class QueryRequest(BaseModel):
@@ -76,9 +77,10 @@ class RelTypeRequest(BaseModel):
 
 class RetractRequest(BaseModel):
     user_id: str
-    subject: str
+    subject: Optional[str] = None
     rel_type: Optional[str] = None
     old_value: Optional[str] = None
+    scope: Optional[dict] = None
 
 
 class RetractResponse(BaseModel):
@@ -86,6 +88,7 @@ class RetractResponse(BaseModel):
     retracted: int
     mode: str
     note: Optional[str] = None
+    scope_level: Optional[str] = None
 
 
 class StoreContextRequest(BaseModel):
