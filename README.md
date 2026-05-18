@@ -1,42 +1,6 @@
-![FaultLine](docs/faultline_logo.svg)
-
 ## Design Principles (Plain English)
 
-FaultLine is built to **play nicely with every layer it touches**. Nothing is forced, hacked, or "almost compatible".
-## How FaultLine Compares
-
-Most AI memory systems trust the LLM to write whatever it extracts. FaultLine doesn't — every fact passes a validation gate before it touches storage. It's the only system in the field that treats the model as an untrusted writer by design.
-
-|Project|Open Source|Self-Host|Write Gate|Knowledge Graph|Short → Long Term|Per-User|Temporal|OpenWebUI|
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-|**FaultLine**|✅ MIT|✅|✅|✅|✅ A→B→C pipeline|✅|✅|✅|
-|Graphiti (Zep)|✅ Apache|✅|❌|✅|❌|⚠️|✅|❌|
-|Zep Cloud|❌|❌|❌|✅|❌|✅|✅|❌|
-|Mem0|⚠️ open-core|⚠️|❌|⚠️ paid|❌|✅|⚠️|❌|
-|Letta / MemGPT|✅ Apache|✅|❌|❌|⚠️ agent-managed|✅|❌|❌|
-|Cognee|✅ Apache|✅|❌|✅|❌|⚠️|⚠️|❌|
-|EverMind / EverOS|✅ Apache|✅|❌|✅|⚠️ expiry only|⚠️|✅|❌|
-|LangMem|✅ MIT|✅|❌|❌|❌|⚠️|❌|❌|
-|LlamaIndex Memory|✅ MIT|✅|❌|⚠️|❌|⚠️|❌|❌|
-|LightRAG|✅ MIT|✅|❌|✅|❌|❌|❌|❌|
-|SuperLocalMemory|✅ Apache|✅|❌|❌|❌|❌|❌|❌|
-|OMEGA|✅ Apache|✅|❌|❌|❌|❌|❌|❌|
-|Memary|✅ MIT|✅|❌|✅ Neo4j|❌|❌|❌|❌|
-|Motorhead|✅ MIT|✅|❌|❌|❌|⚠️|❌|❌|
-|CrewAI Memory|✅ MIT|✅|❌|❌|❌|❌|❌|❌|
-|Hermes Agent|✅ Apache|✅|❌|⚠️|⚠️ episodic|❌|❌|❌|
-|Hindsight|❌|❌|❌|⚠️|❌|✅|⚠️|❌|
-|Supermemory|❌|⚠️ enterprise|❌|⚠️|❌|✅|❌|❌|
-|Cloudflare Agent Memory|❌|❌|❌|❌|❌|✅|❌|❌|
-|Microsoft MAF|✅ MIT|⚠️ Azure|❌|❌|❌|⚠️|❌|❌|
-
-> ✅ Full  ·  ⚠️ Partial or paywalled  ·  ❌ Not supported
-
-**Short → Long Term** refers to staged fact promotion: facts move from ephemeral (Class C) through behavioral (Class B) to permanent storage (Class A) based on confirmation, rather than writing everything to long-term storage immediately or never at all.
-
-FaultLine is the only entry with a validated promotion pipeline — unconfirmed facts expire, confirmed facts persist, and nothing is written unsupervised at any stage.
-
----
+FaultLine is built to **play nicely with every layer it touches**. Nothing is forced, hacked, or “almost compatible”.
 
 ### 1. Developer‑compliant by design
 
@@ -74,10 +38,10 @@ If any component is swapped, upgraded, or audited, FaultLine remains predictable
 - No embeddings are cross‑user
 - Queries are always scoped by `user_id`
 
-This is not just privacy‑friendly — it's **correct**.
+This is not just privacy‑friendly — it’s **correct**.
 
-> "The assistant remembers me" does not mean  
-> "The system remembers everyone"
+> “The assistant remembers me” does not mean  
+> “The system remembers everyone”
 
 ---
 
@@ -86,25 +50,15 @@ This is not just privacy‑friendly — it's **correct**.
 FaultLine models memory the way people do it:
 
 - **Short‑term memory**  
-  What's being talked about right now (the current conversation)
+  What’s being talked about right now (the current conversation)
 
 - **Long‑term memory**  
   Verified facts that persist across conversations
 
 - **Fast recall**  
-  "This seems related" hints used to surface helpful context
+  “This seems related” hints used to surface helpful context
 
 Nothing automatically becomes long‑term memory.  
-It must pass validation first.
-
----
-
-## Why This Improves Answers (Concrete Example)
-
-### Without FaultLine (typical AI behavior)
-
-User:  
-> "What's the weather like tomorrow?"hing automatically becomes long‑term memory.  
 It must pass validation first.
 
 ---
@@ -125,6 +79,7 @@ Why this happens:
 - It was never stored as a real fact
 
 ---
+
 ### With FaultLine
 
 User:  
@@ -140,6 +95,7 @@ Assistant:
 **No guessing. No asking again. No hallucination.**
 
 ---
+
 ## Why This Is Different From Vector‑Only Memory
 
 Most “memory systems” today:
@@ -156,7 +112,10 @@ FaultLine:
 > Facts decide what memory *is true*
 
 ---
+
 ## Extremely Simple Mental Model
+
+(See Mermaid diagram in project docs)
 
 Flow in plain words:
 1. User says something
@@ -166,6 +125,7 @@ Flow in plain words:
 5. Related memories are recalled to improve answers
 
 ---
+
 ## Why This Matters
 
 FaultLine doesn’t try to be clever — it tries to be **correct**.  
@@ -175,13 +135,3 @@ The result is an assistant that feels more human:
 - It remembers what matters
 - It forgets what doesn’t
 - It doesn’t ask the same questions over and over
-
----
-### Novel concepts drawn from
-|#|Novel Aspect|Status in the Wild|Reference|
-|---|---|---|---|
-|1|**Write Gate**|Theorized in research, never shipped in production|[arxiv 2603.15994](https://arxiv.org/abs/2603.15994)|
-|2|**Fact Lifecycle**|Benchmarks confirm most systems fail on selective forgetting — no production system implements classified promotion|[arxiv 2603.07670](https://arxiv.org/abs/2603.07670)|
-|3|**Self-Building Ontology**|Open research problem; all existing approaches require static schemas|[arxiv 2604.20795](https://arxiv.org/abs/2604.20795)|
-|4|**Mnemonic Sovereignty**|Framed as a normative goal in 2026 security literature — no deployed system implements it end-to-end|[arxiv 2604.16548](https://arxiv.org/abs/2604.16548)|
-|5|**Metadata-Driven Validation**|Memory governance decoupled from evolution identified as an unsolved problem|[arxiv 2603.11768](https://arxiv.org/abs/2603.11768)|

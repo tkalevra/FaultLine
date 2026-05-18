@@ -6,8 +6,38 @@ import httpx
 import psycopg2
 import logging
 from src.fact_store.store import FactStoreManager
+from src.api.llm_output_validator import LLMOutputValidator
 
 log = logging.getLogger(__name__)
+
+
+def _detect_llm_endpoint() -> str:
+    """Auto-detect LLM endpoint with smart fallback (dprompt-111).
+    Priority: explicit OPENWEBUI_URL env var > auto-detect > localhost default.
+    Returns base URL only (without /api/chat/completions suffix).
+    """
+    # Explicit override: user-provided endpoint takes priority
+    openwebui_url = os.environ.get("OPENWEBUI_URL")
+    if openwebui_url:
+        return openwebui_url
+
+    # Auto-detect candidates
+    candidates = [
+        "http://open-webui:8080",      # Docker service name (most likely)
+        "http://localhost:8080",        # Local development
+        "http://127.0.0.1:8080",        # Localhost IPv4
+    ]
+
+    for endpoint in candidates:
+        try:
+            resp = httpx.get(f"{endpoint}/", timeout=2.0, follow_redirects=True)
+            if resp.status_code == 200:
+                return endpoint
+        except Exception:
+            continue
+
+    # Final fallback: localhost
+    return "http://localhost:8080"
 
 
 class RelTypeRegistry:
@@ -114,9 +144,16 @@ _UUID_RE = re.compile(
 )
 
 class WGMValidationGate:
-    def __init__(self, db_conn, registry: RelTypeRegistry = None):
+    def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None):
         self.db_conn = db_conn
         self.registry = registry
+        # Initialize unified LLM output validator (dBug-046 Phase 2a)
+        # If not provided, create instance with auto-detected LLM endpoint
+        if validator is None:
+            llm_endpoint = _detect_llm_endpoint()
+            self.validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=llm_endpoint)
+        else:
+            self.validator = validator
         # Load ontology at startup (includes type constraints)
         self._ontology = registry.get_ontology() if registry else {
             rt: {"head_types": None, "tail_types": None}
@@ -372,8 +409,47 @@ class WGMValidationGate:
                 "committed": 0,
             }
 
+        # dBug-046 Phase 2a: Compute unified confidence score via LLMOutputValidator
+        # This allows the ingest layer to make storage routing decisions (direct vs staged)
+        # based on a consistent confidence algorithm across all output types
+        try:
+            import asyncio
+            edge_confidence = edge_kwargs.get("confidence", 0.8)
+            is_user_correction = self._is_user_correction(edge_kwargs)
+
+            # For async validator in sync context, create a task if event loop exists
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If loop is already running, we can't use run_until_complete
+                    # Fall back to using edge_confidence directly
+                    unified_confidence = 1.0 if is_user_correction else edge_confidence
+                else:
+                    validation = loop.run_until_complete(
+                        self.validator.validate_output(
+                            output_type='fact',
+                            payload={
+                                'subject_id': subject_id,
+                                'object_id': object_id,
+                                'rel_type': rt,
+                                'subject_type': subject_type,
+                                'object_type': object_type,
+                            },
+                            source='user' if is_user_correction else 'llm',
+                            llm_confidence=edge_confidence,
+                            frequency=1
+                        )
+                    )
+                    unified_confidence = validation.confidence
+            except RuntimeError:
+                # No event loop, use edge_confidence directly
+                unified_confidence = 1.0 if is_user_correction else edge_confidence
+        except Exception as e:
+            log.warning(f"wgm.validator_confidence_failed: {e}")
+            unified_confidence = edge_kwargs.get("confidence", 0.8)
+
         if user_id is None:
-            return {"status": "valid"}
+            return {"status": "valid", "unified_confidence": unified_confidence}
 
         # Check for symmetric duplicates: if A→B exists and rel_type is symmetric,
         # do not insert B→A again (it's implicitly the same fact in both directions)
@@ -385,7 +461,7 @@ class WGMValidationGate:
                     (user_id, subject_id, object_id, rt),
                 )
                 if cur.fetchone():
-                    return {"status": "valid", "note": "duplicate_exact"}
+                    return {"status": "valid", "note": "duplicate_exact", "unified_confidence": unified_confidence}
 
                 cur.execute(
                     "SELECT id FROM facts"
@@ -393,7 +469,7 @@ class WGMValidationGate:
                     (user_id, object_id, subject_id, rt),
                 )
                 if cur.fetchone():
-                    return {"status": "valid", "note": "symmetric_duplicate"}
+                    return {"status": "valid", "note": "symmetric_duplicate", "unified_confidence": unified_confidence}
 
         with self.db_conn.cursor() as cur:
             cur.execute(
@@ -403,7 +479,7 @@ class WGMValidationGate:
             )
             old_rows = cur.fetchall()
             if not old_rows:
-                return {"status": "valid"}
+                return {"status": "valid", "unified_confidence": unified_confidence}
 
             cur.execute(
                 "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"
@@ -438,6 +514,7 @@ class WGMValidationGate:
             "new_fact_id": new_id,
             "superseded_fact_id": first_old_id,
             "old_confidence_after_penalty": max(first_old_confidence - 0.5, 0.0),
+            "unified_confidence": unified_confidence,
         }
 
     def _auto_approve_novel_type(self, rel_type: str) -> bool:
@@ -468,34 +545,40 @@ class WGMValidationGate:
 
     def _try_approve_novel_type(self, rel_type: str) -> bool:
         """
-        Call Qwen to validate a novel rel_type. If Qwen is unavailable or fails,
+        Call LLM to validate a novel rel_type. If unavailable or fails,
         auto-approves the type so facts are not silently dropped.
         If approved with confidence >= 0.7, inserts into rel_types and returns True.
         Otherwise, inserts into pending_types and returns False.
         """
-        qwen_url = os.getenv("QWEN_API_URL")
+        qwen_url = _detect_llm_endpoint()
         if not qwen_url:
             return self._auto_approve_novel_type(rel_type)
 
         try:
+            from src.api.llm_client import get_llm_headers, build_llm_payload
+
+            payload = build_llm_payload(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
+                    },
+                    {
+                        "role": "user",
+                        "content": f'Is \'{rel_type}\' a valid relationship type for a personal knowledge graph? Consider Wikidata properties as reference. Respond with exactly: {{"valid": true/false, "label": "human readable label", "wikidata_pid": "Pxxx or null", "confidence": 0.0-1.0, "reason": "one sentence"}}'
+                    }
+                ],
+                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                user_id=getattr(self, '_user_id', None),  # dBug-016: inject user_id as chat_id
+                temperature=0.0,
+                max_tokens=200,
+                thinking={"type": "disabled"},
+            )
+
             response = httpx.post(
                 qwen_url,
-                json={
-                    "model": os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
-                        },
-                        {
-                            "role": "user",
-                            "content": f'Is \'{rel_type}\' a valid relationship type for a personal knowledge graph? Consider Wikidata properties as reference. Respond with exactly: {{"valid": true/false, "label": "human readable label", "wikidata_pid": "Pxxx or null", "confidence": 0.0-1.0, "reason": "one sentence"}}'
-                        }
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 200,
-                    "thinking": {"type": "disabled"},
-                },
+                json=payload,
+                headers=get_llm_headers(),
                 timeout=10.0,
             )
             response.raise_for_status()
