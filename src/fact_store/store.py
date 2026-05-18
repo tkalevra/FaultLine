@@ -5,14 +5,18 @@ class FactStoreManager:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def commit(self, connections: list[tuple], confidence: float = 1.0, source_weight: float = 1.0) -> int:
+    def commit(self, connections: list[tuple], confidence: float = 1.0, source_weight: float = 1.0, unified_confidence: float = None) -> int:
         """
         Insert edges into facts.
         connections: list of (user_id, subject_id, object_id, rel_type, provenance) or
                      (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label) or
                      (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition).
+        unified_confidence: blended confidence from LLMOutputValidator (frequency + llm_confidence).
+                           Defaults to confidence if not provided.
         Returns count of rows attempted. Rolls back and re-raises on psycopg2.Error.
         """
+        if unified_confidence is None:
+            unified_confidence = confidence
         count = 0
         try:
             with self.db_conn.cursor() as cur:
@@ -28,15 +32,16 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, source_weight, is_preferred_label, rel_type_definition)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, unified_confidence, source_weight, is_preferred_label, rel_type_definition)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now(),"
+                        "   unified_confidence = EXCLUDED.unified_confidence,"
                         "   rel_type_definition = EXCLUDED.rel_type_definition",
-                        (user_id, sub, obj, rel, prov, confidence, source_weight, is_preferred, definition),
+                        (user_id, sub, obj, rel, prov, confidence, unified_confidence, source_weight, is_preferred, definition),
                     )
                     count += 1
             self.db_conn.commit()

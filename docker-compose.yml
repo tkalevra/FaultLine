@@ -7,11 +7,15 @@ services:
     ports:
       - "8001:8000"
     environment:
+      OPENWEBUI_URL: ${OPENWEBUI_URL:-https://example.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      FAULTLINE_URL: ${FAULTLINE_URL:-http://192.168.1.10:8001}
+      FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-550e8400-e29b-41d4-a716-446655440000}
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
-      QWEN_API_URL: ${QWEN_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
       REEMBED_INTERVAL: 5
+      DB_POOL_SIZE: 50
     depends_on:
       postgres:
         condition: service_healthy
