@@ -13,6 +13,8 @@ class EdgeInput(BaseModel):
     subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     definition: Optional[str] = None  # semantic definition of rel_type, LLM-generated at extraction time (dprompt-85)
+    temporal_context: Optional[str] = None  # dBug-055: Text qualifier ("in 4 days", "next Tuesday", etc.)
+    temporal_context_resolved_at: Optional[str] = None  # ISO 8601 timestamp when temporal expression resolves
 
 
 class ExtractContext(BaseModel):

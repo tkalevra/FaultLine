@@ -1,0 +1,113 @@
+version: "3.8"
+
+# FaultLine WGM — Portainer Stack (WITHOUT Qdrant)
+#
+# This compose file assumes you already have Qdrant running in a separate stack.
+# It will connect to your existing Qdrant instance via the shared network.
+#
+# IMPORTANT: This compose file references a PRE-BUILT Docker image.
+# Before deploying this stack in Portainer, build the image on your Docker host:
+#
+#   cd /path/to/FaultLine
+#   docker build -t faultline-wgm:latest .
+#
+# PREREQUISITES:
+#   ✓ Qdrant already running (e.g., in rag-ai-qdrant stack)
+#   ✓ Qdrant network name: rag-ai-qdrant_default
+#   ✓ Qdrant hostname: qdrant
+#   ✓ Qdrant port: 6333
+#
+# DEPLOYMENT OPTIONS:
+#   Option 1: Web Editor (Portainer UI)
+#     → Stacks → Add Stack → Web Editor → Paste this file → Deploy
+#
+#   Option 2: Git Repository (recommended for version control)
+#     → Stacks → Add Stack → Git Repository
+#     → Repository URL, Branch, Compose path: docker-compose-portainer-withoutqdrant.yml
+#
+# REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
+#   OPENWEBUI_URL             - LLM endpoint base URL, e.g. https://example.com
+#   LLM_API_KEY               - Bearer token for OpenWebUI authentication
+#   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection
+#   FAULTLINE_URL             - FaultLine backend endpoint, e.g. http://192.168.1.10:8001
+#   POSTGRES_PASSWORD         - Database password for 'faultline' user
+#
+# NOTE: OpenWebUI Filter requires FAULTLINE_URL to be set in Portainer Function Valve settings
+# (FaultLine Filter → Configuration → FAULTLINE_URL = http://192.168.1.10:8001)
+
+services:
+
+  faultline:
+    image: faultline-wgm:latest
+    container_name: faultline
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
+      OPENWEBUI_URL: ${OPENWEBUI_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID}
+      FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: faultline-test
+      REEMBED_INTERVAL: 5
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-50}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - openweb_ui_default
+      - rag-ai-qdrant_default
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: faultline-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
+      POSTGRES_DB: faultline_test
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - openweb_ui_default
+
+volumes:
+  pg-data:
+    name: faultline-pg-data
+
+networks:
+  # Reference to existing OpenWebUI network (for LLM communication)
+  openweb_ui_default:
+    external: true
+    name: openweb_ui_default
+
+  # Reference to existing Qdrant network
+  rag-ai-qdrant_default:
+    external: true
+    name: rag-ai-qdrant_default
