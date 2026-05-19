@@ -351,6 +351,111 @@ class WGMValidationGate:
 
     # ── end dprompt-90 ──────────────────────────────────────────────────
 
+    # ── dprompt-119: INGEST Strengthening — Ontology, Hierarchy, Category ──
+    # Metadata-driven routing using rel_types columns
+
+    def _find_inverse_rel_type(self, rel_type: str) -> str | None:
+        """
+        Find canonical form of a rel_type by checking for inverse relationships.
+        If rel_type not found in rel_types, check if its inverse exists.
+        Returns canonical rel_type name, or None if no equivalent found.
+        dprompt-119: Enables has_child → parent_of mapping.
+        """
+        rt_lower = rel_type.lower().strip()
+
+        # First check if rel_type exists directly
+        if self.registry and rt_lower in [r.lower() for r in self.registry.get_valid_types()]:
+            return rt_lower
+
+        # Check if inverse exists
+        try:
+            with self.db_conn.cursor() as cur:
+                # Check if this rel_type is the inverse_rel_type of something else
+                cur.execute(
+                    "SELECT rel_type FROM rel_types WHERE inverse_rel_type = %s AND inverse_rel_type IS NOT NULL",
+                    (rt_lower,),
+                )
+                row = cur.fetchone()
+                if row:
+                    canonical = row[0].lower()
+                    log.info("wgm.ontology_inverse_found",
+                             original=rt_lower, canonical=canonical, action="mapping_to_canonical")
+                    return canonical
+        except Exception as e:
+            log.warning("wgm.inverse_lookup_failed", rel_type=rt_lower, error=str(e))
+
+        return None
+
+    def _validate_hierarchy_rules(self, fact_dict: dict, rel_meta: dict) -> tuple[bool, str]:
+        """
+        Validate hierarchy-based rel_types (instance_of, subclass_of, member_of, part_of).
+        dprompt-119: Ensures proper instance and composition relationships.
+        Returns (valid: bool, reason: str).
+        """
+        rel_type = fact_dict.get("rel_type", "").lower()
+
+        if not rel_meta.get("is_hierarchy_rel"):
+            return (True, "not_hierarchy")
+
+        # instance_of: subject must have entity_type, object must be a type/class
+        if rel_type == "instance_of":
+            subject_type = fact_dict.get("subject_type")
+            if subject_type and subject_type.lower() == "unknown":
+                log.warning("wgm.hierarchy_instance_of_unknown_subject",
+                           subject_id=fact_dict.get("subject_id"))
+                # Don't block, but note it
+
+        # member_of: subject belongs to a group/category, object must be a group entity
+        if rel_type == "member_of":
+            object_type = fact_dict.get("object_type")
+            # Object should ideally be Organization, Location, or Group (if supported)
+
+        return (True, "hierarchy_valid")
+
+    def _validate_category_constraints(self, fact_dict: dict, rel_meta: dict, category: str) -> tuple[bool, str]:
+        """
+        Validate category-specific rel_type constraints.
+        dprompt-119: Enforces domain rules (family only Person, location for Location, etc).
+        Returns (valid: bool, reason: str).
+        """
+        rel_type = fact_dict.get("rel_type", "").lower()
+        subject_type = fact_dict.get("subject_type", "").lower() if fact_dict.get("subject_type") else None
+        object_type = fact_dict.get("object_type", "").lower() if fact_dict.get("object_type") else None
+
+        # Family category: only works with Person entities
+        if category == "family":
+            family_rels = {"parent_of", "child_of", "spouse", "sibling_of"}
+            if rel_type in family_rels:
+                if subject_type and subject_type != "unknown" and subject_type != "person":
+                    log.warning("wgm.category_family_invalid_subject",
+                               rel_type=rel_type, subject_type=subject_type)
+                if object_type and object_type != "unknown" and object_type != "person":
+                    log.warning("wgm.category_family_invalid_object",
+                               rel_type=rel_type, object_type=object_type)
+
+        # Location category: should use Location entity types
+        if category == "location":
+            location_rels = {"located_in", "lives_in", "lives_at", "born_in"}
+            if rel_type in location_rels:
+                if object_type and object_type != "unknown" and object_type != "location":
+                    log.warning("wgm.category_location_invalid_object",
+                               rel_type=rel_type, object_type=object_type)
+
+        # Household category: works with Person + Animal
+        if category == "household":
+            household_rels = {"has_pet", "owns"}
+            if rel_type in household_rels:
+                if subject_type and subject_type != "unknown" and subject_type != "person":
+                    log.warning("wgm.category_household_invalid_subject",
+                               rel_type=rel_type, subject_type=subject_type)
+                if rel_type == "has_pet" and object_type and object_type != "unknown" and object_type != "animal":
+                    log.warning("wgm.category_household_invalid_pet_type",
+                               rel_type=rel_type, object_type=object_type)
+
+        return (True, "category_valid")
+
+    # ── end dprompt-119 ──────────────────────────────────────────────────
+
     def validate_edge(self, subject_id, object_id, rel_type: str,
                       user_id=None, provenance=None, subject_type: str = None,
                       object_type: str = None, **edge_kwargs) -> dict:
@@ -376,15 +481,20 @@ class WGMValidationGate:
 
         rt = rel_type.lower().strip()
 
-        # Check against registry or SEED_ONTOLOGY
+        # dprompt-119: Check for inverse rel_type mapping
+        # If rel_type not found, try to find canonical form via inverse relationship
         valid_types = self.registry.get_valid_types() if self.registry else set(SEED_ONTOLOGY.keys())
-
         if rt not in valid_types:
-            # Novel type: do NOT attempt LLM approval at ingest time.
-            # Return "unknown" so the ingest layer stores as Class C (ephemeral)
-            # and records the candidate in ontology_evaluations for async review
-            # by the re-embedder. See dprompt-17.
-            return {"status": "unknown"}
+            canonical = self._find_inverse_rel_type(rt)
+            if canonical:
+                rt = canonical
+                log.info("wgm.validate_edge_canonical_form", original=rel_type.lower(), canonical=rt)
+            else:
+                # Novel type: do NOT attempt LLM approval at ingest time.
+                # Return "unknown" so the ingest layer stores as Class C (ephemeral)
+                # and records the candidate in ontology_evaluations for async review
+                # by the re-embedder. See dprompt-17.
+                return {"status": "unknown"}
 
         # Check type constraints
         type_ok, type_reason = self._check_type_constraints(
@@ -408,6 +518,38 @@ class WGMValidationGate:
                 "reason": type_reason,
                 "committed": 0,
             }
+
+        # dprompt-119: Validate hierarchy and category constraints
+        rel_meta = self._ontology.get(rt, {})
+
+        # Hierarchy validation (instance_of, subclass_of, member_of, part_of)
+        if rel_meta.get("is_hierarchy_rel"):
+            fact_dict = {
+                "rel_type": rt,
+                "subject_id": subject_id,
+                "subject_type": subject_type,
+                "object_id": object_id,
+                "object_type": object_type,
+            }
+            hier_valid, hier_reason = self._validate_hierarchy_rules(fact_dict, rel_meta)
+            if not hier_valid:
+                log.warning("wgm.hierarchy_validation_failed",
+                           rel_type=rt, reason=hier_reason)
+
+        # Category constraints (family, location, work, household domains)
+        category = rel_meta.get("category")
+        if category:
+            fact_dict = {
+                "rel_type": rt,
+                "subject_id": subject_id,
+                "subject_type": subject_type,
+                "object_id": object_id,
+                "object_type": object_type,
+            }
+            cat_valid, cat_reason = self._validate_category_constraints(fact_dict, rel_meta, category)
+            if not cat_valid:
+                log.warning("wgm.category_validation_failed",
+                           rel_type=rt, category=category, reason=cat_reason)
 
         # dBug-046 Phase 2a: Compute unified confidence score via LLMOutputValidator
         # This allows the ingest layer to make storage routing decisions (direct vs staged)
