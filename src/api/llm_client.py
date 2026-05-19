@@ -34,6 +34,10 @@ def build_llm_payload(
     in process_chat middleware. Injecting user_id as chat_id avoids the upstream
     OpenWebUI bug when calling /api/chat/completions from FaultLine modules.
 
+    dprompt-120: Omit stream parameter (workaround for LM Studio bug #599).
+    LM Studio 0.4.13 appears to ignore explicit stream=false, streaming with
+    default behavior. Omitting the parameter entirely allows non-streaming by default.
+
     Args:
         messages: List of message dicts with role/content
         model: Model name string
