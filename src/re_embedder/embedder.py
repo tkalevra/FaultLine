@@ -1033,6 +1033,188 @@ def evaluate_correction_signal_candidates(db_conn, qwen_api_url: str) -> dict:
     return stats
 
 
+def update_scalar_distributions(db_conn) -> dict:
+    """
+    Scalar distribution learning: Update rel_types.value_distribution after facts are confirmed.
+
+    For each scalar rel_type with confirmed facts, calculate observed distribution
+    (mean, stddev, range, outliers) and persist to database.
+    Used for pattern recognition and sequence analysis (dBug-055 Phase 4).
+    Does NOT enforce validation or anomaly penalties.
+
+    Returns: {"updated": int, "errors": int}
+    """
+    stats = {"updated": 0, "errors": 0}
+
+    try:
+        with db_conn.cursor() as cur:
+            # Find numeric rel_types: those with tail_types=['SCALAR'] (from rel_types metadata)
+            cur.execute(
+                """
+                SELECT rel_type FROM rel_types
+                WHERE tail_types = ARRAY['SCALAR']::TEXT[]
+                ORDER BY rel_type
+                """
+            )
+            scalar_rel_types = [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        log.error(f"re_embedder.update_distribution_fetch_failed: {e}")
+        return stats
+
+    # For each scalar rel_type, calculate distribution from entity_attributes
+    for rel_type in scalar_rel_types:
+        try:
+            with db_conn.cursor() as cur:
+                # Fetch numeric values from entity_attributes for this scalar rel_type
+                # Use value_int first (ages, counts), fall back to value_float
+                cur.execute(
+                    """
+                    SELECT COALESCE(value_int, value_float) FROM entity_attributes
+                    WHERE attribute = %s AND (value_int IS NOT NULL OR value_float IS NOT NULL)
+                    ORDER BY COALESCE(value_int, value_float)
+                    """,
+                    (rel_type,)
+                )
+                values = [row[0] for row in cur.fetchall()]
+
+            if len(values) < 2:
+                # Not enough data to calculate distribution
+                continue
+
+            # Calculate statistics
+            mean = sum(values) / len(values)
+            variance = sum((x - mean) ** 2 for x in values) / len(values)
+            stddev = variance ** 0.5
+            min_val = min(values)
+            max_val = max(values)
+
+            # Identify outliers (> 2 stddev)
+            outliers = [v for v in values if abs(v - mean) > 2 * stddev]
+
+            distribution = {
+                "type": "numeric",
+                "mean": round(mean, 2),
+                "stddev": round(stddev, 2),
+                "min": min_val,
+                "max": max_val,
+                "outliers": sorted(list(set(outliers))),  # Unique, sorted
+                "confirmed_count": len(values),
+                "last_updated": None,  # Will be set by DB
+            }
+
+            # Update rel_types with new distribution
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE rel_types
+                    SET value_distribution = %s
+                    WHERE rel_type = %s
+                    """,
+                    (
+                        json.dumps(distribution),
+                        rel_type,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    stats["updated"] += 1
+                    log.info(
+                        f"re_embedder.distribution_updated "
+                        f"rel_type={rel_type} mean={mean:.2f} "
+                        f"stddev={stddev:.2f} count={len(values)} "
+                        f"outliers={len(outliers)}"
+                    )
+
+            db_conn.commit()
+
+        except Exception as e:
+            db_conn.rollback()
+            stats["errors"] += 1
+            log.error(f"re_embedder.update_distribution_error rel_type={rel_type}: {e}")
+
+    return stats
+
+
+def evaluate_correction_sequences(db_conn) -> dict:
+    """
+    Analyze entity_attributes_history to learn correction patterns.
+    For each scalar attribute with 2+ correction entries, calculate:
+    - direction (ascending/descending/oscillating)
+    - avg_delta (average change per correction)
+    - correction_count and frequency
+    Extends value_distribution JSONB with correction_patterns metadata.
+    Does NOT enforce anything — learning only (dBug-055 Phase 4).
+    """
+    stats = {"analyzed": 0, "updated": 0, "errors": 0}
+    try:
+        with db_conn.cursor() as cur:
+            # Find attributes with correction history (≥2 rows)
+            cur.execute("""
+                SELECT attribute, COUNT(*) as correction_count,
+                       MIN(recorded_at) as first_at, MAX(recorded_at) as last_at,
+                       ARRAY_AGG(COALESCE(value_int, value_float) ORDER BY recorded_at ASC) AS value_sequence
+                FROM entity_attributes_history
+                WHERE value_int IS NOT NULL OR value_float IS NOT NULL
+                GROUP BY attribute
+                HAVING COUNT(*) >= 2
+            """)
+            rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.correction_sequences_fetch_failed: {e}")
+        return stats
+
+    for attribute, correction_count, first_at, last_at, value_sequence in rows:
+        try:
+            values = [v for v in value_sequence if v is not None]
+            if len(values) < 2:
+                continue
+
+            stats["analyzed"] += 1
+
+            # Calculate direction and delta
+            deltas = [values[i+1] - values[i] for i in range(len(values)-1)]
+            avg_delta = sum(deltas) / len(deltas)
+            positive = sum(1 for d in deltas if d > 0)
+            negative = sum(1 for d in deltas if d < 0)
+            if positive > negative:
+                direction = "ascending"
+            elif negative > positive:
+                direction = "descending"
+            else:
+                direction = "oscillating"
+
+            # Frequency: corrections per day
+            span_days = max((last_at - first_at).total_seconds() / 86400, 0.001)
+            freq = correction_count / span_days
+
+            correction_meta = {
+                "direction": direction,
+                "avg_delta": round(avg_delta, 3),
+                "correction_count": correction_count,
+                "correction_frequency_per_day": round(freq, 4),
+                "last_sequence": values[-5:] if len(values) >= 5 else values
+            }
+
+            # Merge into existing value_distribution JSONB
+            with db_conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE rel_types
+                    SET value_distribution = COALESCE(value_distribution, '{}'::jsonb)
+                        || jsonb_build_object('correction_patterns', %s::jsonb)
+                    WHERE rel_type = %s
+                """, (json.dumps(correction_meta), attribute))
+                if cur.rowcount > 0:
+                    stats["updated"] += 1
+
+            db_conn.commit()
+
+        except Exception as e:
+            db_conn.rollback()
+            stats["errors"] += 1
+            log.error(f"re_embedder.correction_sequence_error attribute={attribute}: {e}")
+
+    return stats
+
+
 def main():
     """Main poll loop."""
     postgres_dsn = os.getenv("POSTGRES_DSN")
@@ -1118,6 +1300,22 @@ def main():
                 n_promoted = promote_staged_facts(db, qdrant_url)
                 if n_promoted:
                     log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
+
+                # Update scalar distributions for pattern learning (dBug-055 Phase 4)
+                dist_stats = update_scalar_distributions(db)
+                if dist_stats["updated"] > 0:
+                    log.info(
+                        f"re_embedder.distribution_update_complete "
+                        f"updated={dist_stats['updated']} errors={dist_stats['errors']}"
+                    )
+
+                # Evaluate correction sequences for pattern learning (dBug-055 Phase 4)
+                seq_stats = evaluate_correction_sequences(db)
+                if seq_stats["analyzed"] > 0:
+                    log.info(
+                        f"re_embedder.correction_sequences "
+                        f"analyzed={seq_stats['analyzed']} updated={seq_stats['updated']} errors={seq_stats['errors']}"
+                    )
 
                 # Evaluate novel ontology candidates (dprompt-17)
                 ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)

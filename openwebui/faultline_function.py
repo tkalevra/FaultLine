@@ -55,11 +55,11 @@ _OPENWEBUI_ENDPOINT = _detect_openwebui_endpoint()
 def _detect_faultline_endpoint() -> Optional[str]:
     """Auto-detect FaultLine backend endpoint. Tries common addresses in order of likelihood."""
     candidates = [
-        "http://faultline:8000",           # Docker service name (most likely)
+        os.environ.get("FAULTLINE_URL"),   # Explicit env var override (check first)
+        "http://faultline:8000",            # Docker service name (same network, most reliable)
         "http://localhost:8001",            # Local development
         "http://127.0.0.1:8001",            # Localhost IPv4
-        "http://192.168.1.10:8001",        # Production IP
-        os.environ.get("FAULTLINE_URL"),   # Explicit env var override
+        "http://192.168.1.10:8001",        # Production IP (fallback)
     ]
 
     for endpoint in candidates:
