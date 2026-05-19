@@ -31,6 +31,7 @@ class IngestRequest(BaseModel):
     user_id: Optional[str] = "anonymous"
     context: ExtractContext | None = None  # Optional context enrichment for /extract (dBug-018)
     is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
+    idempotency_key: Optional[str] = None  # Phase 2: Deduplicate retried requests via idempotency cache
 
 
 class QueryRequest(BaseModel):

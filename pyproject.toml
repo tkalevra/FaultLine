@@ -12,6 +12,7 @@ dependencies = [
     "psycopg2-binary",
     "httpx",
     "structlog",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]

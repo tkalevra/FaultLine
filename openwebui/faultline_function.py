@@ -79,6 +79,18 @@ def _detect_faultline_endpoint() -> Optional[str]:
 # FaultLine backend URL — auto-detect at module load time, with env var override
 _FAULTLINE_URL = os.getenv("FAULTLINE_URL") or _detect_faultline_endpoint() or "http://localhost:8001"
 
+# Persistent HTTP client for pooled connections (avoid socket churn from new client per request)
+_http_client: httpx.AsyncClient = None
+
+async def _initialize_http_client():
+    """Initialize persistent HTTP client for reuse across requests."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+        )
+
 # Correction signals cache with TTL (lazy load at runtime, not at startup)
 _CORRECTION_SIGNALS_CACHE_WITH_TTL: tuple = (0, [])
 _CORRECTION_SIGNALS_TTL: int = 60  # refresh every 60 seconds
@@ -1247,6 +1259,7 @@ class Filter:
         is_correction: bool = False,
     ) -> dict:
         try:
+            await _initialize_http_client()  # Ensure persistent client is initialized
             payload = {
                 "text": text,
                 "source": source,
@@ -1257,19 +1270,19 @@ class Filter:
             if edges:
                 payload["edges"] = edges
 
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                response = await client.post(
-                    f"{self.valves.FAULTLINE_URL}/ingest",
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
-                # Bust session cache on successful ingest so next /query fetches fresh data
-                if data.get("status") not in ("error", None):
-                    _SESSION_MEMORY_CACHE.pop(user_id, None)
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] cache busted for user_id=[redacted]")
-                return data
+            response = await _http_client.post(
+                f"{self.valves.FAULTLINE_URL}/ingest",
+                json=payload,
+                timeout=self.valves.FAULTLINE_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            # Bust session cache on successful ingest so next /query fetches fresh data
+            if data.get("status") not in ("error", None):
+                _SESSION_MEMORY_CACHE.pop(user_id, None)
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] cache busted for user_id=[redacted]")
+            return data
         except httpx.ConnectError as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] ingest connection error: {e}")
@@ -1290,16 +1303,17 @@ class Filter:
         dropped from natural conversation.
         """
         try:
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                await client.post(
-                    f"{self.valves.FAULTLINE_URL}/store_context",
-                    json={
-                        "text": text,
-                        "user_id": user_id,
-                        "source": self.valves.DEFAULT_SOURCE,
-                        "context_type": "unstructured",
-                    },
-                )
+            await _initialize_http_client()  # Ensure persistent client is initialized
+            await _http_client.post(
+                f"{self.valves.FAULTLINE_URL}/store_context",
+                json={
+                    "text": text,
+                    "user_id": user_id,
+                    "source": self.valves.DEFAULT_SOURCE,
+                    "context_type": "unstructured",
+                },
+                timeout=self.valves.FAULTLINE_TIMEOUT,
+            )
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] store_context error: {e}")
@@ -2150,13 +2164,14 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
                         resp = None
+                        await _initialize_http_client()  # Ensure persistent client is initialized
                         for _attempt in range(2):
                             try:
-                                async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
-                                    resp = await client.post(
-                                        f"{self.valves.FAULTLINE_URL}/query",
-                                        json={"text": text, "user_id": user_id, "top_k": 5},
-                                    )
+                                resp = await _http_client.post(
+                                    f"{self.valves.FAULTLINE_URL}/query",
+                                    json={"text": text, "user_id": user_id, "top_k": 5},
+                                    timeout=self.valves.FAULTLINE_TIMEOUT,
+                                )
                                 break
                             except httpx.ReadError:
                                 if _attempt == 0:
