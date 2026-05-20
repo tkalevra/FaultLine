@@ -1,71 +1,71 @@
 graph TD
-    A["Extracted Triple<br/>(subject: Des<br/>rel_type: age<br/>object: 12)"] -->|Filter Inlet| B{Retraction Signal?}
+    A["Incoming Fact<br/>(Subject: Des<br/>Relationship: age<br/>Value: 12)"] -->|Check First| B{Is This a<br/>Retraction?}
 
-    B -->|YES| C["RETRACTION PATH<br/>(LLM extracted retraction)"]
-    C --> D["DELETE or SUPERSEDE<br/>from facts table<br/>Mark superseded_at<br/>Archive old data"]
-    D --> E["Confirmation<br/>SHORT-CIRCUIT<br/>(Skip rest of ingest)"]
+    B -->|Yes| C["Retraction Path<br/>(Remove/archive fact)"]
+    C --> D["Remove or Archive<br/>Old fact from database<br/>Preserve history"]
+    D --> E["Done<br/>(Skip rest)"]
 
-    B -->|NO| F{Word Count >= 3<br/>or Self-ID Pattern?}
-    F -->|NO| G["SKIP INGEST<br/>(will_ingest = False)<br/>Message too short"]
-    F -->|YES| H["INGEST ENABLED"]
+    B -->|No| F{Enough<br/>Information?}
+    F -->|No| G["Stop<br/>(Message too short)"]
+    F -->|Yes| H["Continue"]
 
-    H --> I{Correction?<br/>is_correction=true}
+    H --> I{User Correction?<br/>Does user explicitly<br/>say different?}
 
-    I -->|YES| J["CORRECTION INGEST<br/>(User overrides LLM)<br/>Mark Class A immediately<br/>confidence = 1.0"]
+    I -->|Yes| J["High Priority<br/>(User's input<br/>overrides everything)<br/>Trust level: 100%"]
 
-    I -->|NO| K["NORMAL INGEST"]
+    I -->|No| K["Normal Path"]
 
-    J --> L["WGM VALIDATION GATE"]
+    J --> L["Validation Check"]
     K --> L
 
-    L --> M["CHECK ONTOLOGY<br/>(Does rel_type exist?)<br/>(Are types known?)"]
+    L --> M["Step 1: Learn Relationship<br/>Does the system<br/>already know this<br/>relationship type?"]
 
-    M -->|Rel_Type Unknown| N["LAYER 1: Create rel_type<br/>Engine learns new relationship<br/>Stores metadata:<br/>- category<br/>- is_symmetric<br/>- inverse_rel_type<br/>- head_types, tail_types"]
+    M -->|No| N["New Pattern Detected<br/>System records:<br/>- What kind of relationship<br/>- Direction (one-way/both)<br/>- Allowed types<br/>Example: age connects<br/>to numbers only"]
 
-    M -->|Rel_Type Known| O["Use Existing rel_type<br/>metadata from DB"]
+    M -->|Yes| O["Use Existing Rules<br/>Already know how<br/>this relationship works"]
 
-    N --> P["CHECK ENTITY TYPES<br/>(Do entities exist?)<br/>(Are they classified?)"]
+    N --> P["Step 2: Learn Entity Type<br/>What type of thing<br/>is this entity?"]
     O --> P
 
-    P -->|Type Unknown| Q["LAYER 2: Create entity_type<br/>Engine classifies entities<br/>Example: Des instance_of Person<br/>Stores via instance_of rel_type"]
+    P -->|Type Unknown| Q["Classify Entity<br/>Example: Des is a Person<br/>System records this"]
 
-    P -->|Type Known| R["Use Existing Types"]
+    P -->|Type Known| R["Use Existing Type"]
 
-    Q --> S["DETECT CONFLICTS<br/>(Semantic validation)<br/>Example: Can't own a Type<br/>Can't have Type as parent"]
+    Q --> S["Check for Conflicts<br/>(Does this make sense?)<br/>Example: Can't say<br/>John is a person AND<br/>John is a company"]
     R --> S
 
-    S -->|CONFLICT| T["AUTO-SUPERSEDE<br/>Lower confidence fact<br/>Keep user fact"]
+    S -->|Conflict Found| T["Keep the trusted fact<br/>Remove the conflicting one"]
 
-    S -->|NO CONFLICT| U["VALIDATE BIDIRECTIONAL<br/>(Example: parent_of + child_of<br/>prevent both for same pair)"]
+    S -->|No Conflict| U["Check Consistency<br/>If a relationship is<br/>bidirectional, make sure<br/>both directions match"]
 
     T --> U
 
-    U -->|VALID| V{Determine Storage Path}
+    U -->|Consistent| V{Where to Store?}
 
-    V -->|SCALAR<br/>age, height, name| W["LAYER 3: SCALAR PATH<br/>entity_attributes table<br/>Key: user_id, entity_id, attr<br/>Value: 12"]
+    V -->|Simple Value<br/>age, name, height| W["Store as Attribute<br/>(One value per entity)<br/>Des.age = 12"]
 
-    V -->|HIERARCHY<br/>instance_of, subclass_of| X["LAYER 3: HIERARCHY PATH<br/>facts table<br/>Defines classifications<br/>Des instance_of person"]
+    V -->|Classification<br/>instance_of, subclass_of| X["Store as Classification<br/>(Type hierarchy)<br/>Des is-a Person<br/>Person is-a Organism"]
 
-    V -->|RELATIONAL<br/>spouse, parent_of| Y["LAYER 3: RELATIONAL PATH<br/>facts table<br/>Connectivity/relationships<br/>user spouse marla"]
+    V -->|Relationship<br/>spouse, parent_of| Y["Store as Relationship<br/>(Connections)<br/>Des connects-to User<br/>as parent_of"]
 
-    W --> Z{Classify Confidence}
+    W --> Z{Assess Trust Level}
     X --> Z
     Y --> Z
 
-    Z -->|User-stated<br/>confidence >= 0.95| AA["CLASS A<br/>Immediate Trust<br/>confidence: 1.0<br/>COMMIT IMMEDIATELY<br/>INSERT INTO facts<br/>(not staged)"]
+    Z -->|User Stated<br/>High confidence| AA["Trusted (100%)<br/>Save to database<br/>immediately"]
 
-    Z -->|LLM-inferred<br/>ontology exists<br/>no new types| AB["CLASS B<br/>Behavioral<br/>confidence: 0.8<br/>STAGE for review<br/>PROMOTE after 3 confirmations"]
+    Z -->|LLM Inferred<br/>from known patterns| AB["Probable (80%)<br/>Hold for review<br/>Save if user<br/>confirms 3 times"]
 
-    Z -->|Novel pattern<br/>new types created<br/>confidence < 0.6| AC["CLASS C<br/>Ephemeral<br/>confidence: 0.4<br/>STAGE for evaluation<br/>Re-embedder decides fate<br/>EXPIRE after 30 days"]
+    Z -->|New Pattern<br/>Uncertain| AC["Experimental (40%)<br/>Hold for system<br/>to evaluate<br/>Auto-delete<br/>if unused 30 days"]
 
-    AA --> AD["COMMIT FACTS<br/>(INSERT INTO facts)<br/>Example: Des, age, 12<br/>confidence: 1.0"]
-    AB --> AE["STAGE FACTS<br/>(INSERT INTO staged_facts)<br/>Awaiting confirmations<br/>or re-embedder evaluation"]
+    AA --> AD["Write to Database<br/>(Permanent fact)"]
+    AB --> AE["Write to Staging<br/>(Waiting for confirmation)"]
     AC --> AE
 
-    AD --> AF["RE-EMBEDDER SYNC<br/>(Background process)<br/>1. Embed fact text<br/>2. Sync to Qdrant<br/>3. Manage hierarchy chains<br/>4. Evaluate novel rel_types<br/>5. Promote Class B facts"]
+    AD --> AF["Background Sync<br/>(Index in search)<br/>Process confirmations<br/>Evaluate new patterns)"]
     AE --> AF
 
-    AF --> AG["COMPLETE<br/>Fact stored and indexed<br/>Ready for RECALL"]
+    AF --> AG["Complete<br/>Fact ready for<br/>retrieval"]
 
     style A fill:#e1f5ff
     style E fill:#c8e6c9
