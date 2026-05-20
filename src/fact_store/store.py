@@ -8,9 +8,11 @@ class FactStoreManager:
     def commit(self, connections: list[tuple], confidence: float = 1.0, source_weight: float = 1.0, unified_confidence: float = None) -> int:
         """
         Insert edges into facts.
-        connections: list of (user_id, subject_id, object_id, rel_type, provenance) or
-                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label) or
-                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition).
+        connections: list of tuples with varying length:
+                     (user_id, subject_id, object_id, rel_type, provenance) - 5 elements
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label) - 6 elements
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition) - 7 elements
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition, storage_type, is_hierarchy_rel, taxonomies) - 10 elements
         unified_confidence: blended confidence from LLMOutputValidator (frequency + llm_confidence).
                            Defaults to confidence if not provided.
         Returns count of rows attempted. Rolls back and re-raises on psycopg2.Error.
@@ -22,7 +24,13 @@ class FactStoreManager:
             with self.db_conn.cursor() as cur:
                 for row in connections:
                     definition = ""
-                    if len(row) >= 7:
+                    storage_type = None
+                    is_hierarchy_rel = False
+                    taxonomies = []
+
+                    if len(row) >= 10:
+                        user_id, sub, obj, rel, prov, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies = row[:10]
+                    elif len(row) >= 7:
                         user_id, sub, obj, rel, prov, is_preferred, definition = row
                     elif len(row) == 6:
                         user_id, sub, obj, rel, prov, is_preferred = row
@@ -32,16 +40,18 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, unified_confidence, source_weight, is_preferred_label, rel_type_definition)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, unified_confidence, source_weight, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now(),"
                         "   unified_confidence = EXCLUDED.unified_confidence,"
-                        "   rel_type_definition = EXCLUDED.rel_type_definition",
-                        (user_id, sub, obj, rel, prov, confidence, unified_confidence, source_weight, is_preferred, definition),
+                        "   rel_type_definition = EXCLUDED.rel_type_definition,"
+                        "   storage_type = COALESCE(EXCLUDED.storage_type, facts.storage_type),"
+                        "   taxonomies = COALESCE(EXCLUDED.taxonomies, facts.taxonomies)",
+                        (user_id, sub, obj, rel, prov, confidence, unified_confidence, source_weight, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies),
                     )
                     count += 1
             self.db_conn.commit()

@@ -72,6 +72,16 @@ class IdempotencyManager:
             return False
 
         try:
+            # Convert Pydantic models to dicts for JSON serialization
+            # IngestResponse contains FactResult objects which need .model_dump()
+            if isinstance(response, dict) and "facts" in response:
+                response = dict(response)
+                if isinstance(response["facts"], list):
+                    response["facts"] = [
+                        f.model_dump() if hasattr(f, "model_dump") else f
+                        for f in response["facts"]
+                    ]
+
             self.client.setex(
                 f"idempotent:{idempotency_key}",
                 self.ttl,
