@@ -14,7 +14,7 @@ services:
     environment:
       OPENWEBUI_URL: ${OPENWEBUI_URL:-http://open-webui:8080}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      FAULTLINE_URL: ${FAULTLINE_URL:-http://192.168.1.10:8001}
+      FAULTLINE_URL: ${FAULTLINE_URL:-http://localhost:8001}
       FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-00000000-0000-0000-0000-000000000000}
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
       QDRANT_URL: http://qdrant:6333
