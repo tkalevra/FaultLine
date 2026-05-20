@@ -26,14 +26,30 @@ version: "3.8"
 #     → Repository URL, Branch, Compose path: docker-compose-portainer-withoutqdrant.yml
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
-#   OPENWEBUI_URL             - LLM endpoint base URL, e.g. https://example.com
-#   LLM_API_KEY               - Bearer token for OpenWebUI authentication
+#   OPENWEBUI_URL             - LLM endpoint URL (internal: http://192.168.1.10:3000)
+#   LLM_API_KEY               - Bearer token for OpenWebUI authentication (sk-...)
 #   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection
-#   FAULTLINE_URL             - FaultLine backend endpoint, e.g. http://192.168.1.10:8001
+#   FAULTLINE_URL             - FaultLine backend endpoint (http://192.168.1.10:8001)
 #   POSTGRES_PASSWORD         - Database password for 'faultline' user
+#   WGM_LLM_MODEL             - Extraction model name (qwen/qwen3.5-9b for full reasoning)
+#   CATEGORY_LLM_MODEL        - Category inference model (qwen2.5-coder-1.5b-instruct for speed)
+#
+# REQUIRED FOR OPENWEBUI FILTER (set as environment variables in OpenWebUI container):
+#   REDIS_URL                 - Redis connection URL for inlet dedup (redis://faultline-redis:6379/0)
+#                               This MUST be set for the FaultLine Filter to work properly.
+#                               If not set, deduplication will fail and duplicate embeddings will cascade.
+#
+# CRITICAL: Model names must match exactly what LM Studio reports in /v1/models endpoint.
+# HTTP 400 errors indicate model name mismatch (e.g., qwen-qwen3.5-9b vs qwen/qwen3.5-9b).
 #
 # NOTE: OpenWebUI Filter requires FAULTLINE_URL to be set in Portainer Function Valve settings
 # (FaultLine Filter → Configuration → FAULTLINE_URL = http://192.168.1.10:8001)
+#
+# KNOWN ISSUE: If extraction requests fail repeatedly (ingest.extraction_failed errors),
+# check FaultLine logs for traceback. Common causes:
+# - Model name mismatch between WGM_LLM_MODEL env var and available models on LM Studio
+# - Bearer token (LLM_API_KEY) invalid or missing
+# - OpenWebUI endpoint unreachable or returning 401/400 errors
 
 services:
 
@@ -51,10 +67,11 @@ services:
       FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
+      REDIS_URL: redis://redis:6379/0
       REEMBED_INTERVAL: 5
       WGM_LLM_MODEL: ${WGM_LLM_MODEL}
       CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL}
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-50}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-15}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
@@ -65,6 +82,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     logging:
       driver: json-file
       options:
@@ -82,6 +101,8 @@ services:
       POSTGRES_USER: faultline
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
       POSTGRES_DB: faultline_test
+      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -89,6 +110,20 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - openweb_ui_default
+
+  redis:
+    image: redis:7-alpine
+    container_name: faultline-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
     logging:
       driver: json-file
       options:

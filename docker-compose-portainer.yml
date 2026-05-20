@@ -22,6 +22,11 @@ version: "3.8"
 #   LLM_API_KEY               - Bearer token for OpenWebUI authentication
 #   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection (prevents OpenWebUI NoneType crash)
 #   POSTGRES_PASSWORD         - Database password for 'faultline' user (optional, defaults to 'faultline')
+#
+# REQUIRED FOR OPENWEBUI FILTER (set as environment variables in OpenWebUI container):
+#   REDIS_URL                 - Redis connection URL for inlet dedup (redis://faultline-redis:6379/0)
+#                               This MUST be set for the FaultLine Filter to work properly.
+#                               If not set, deduplication will fail and duplicate embeddings will cascade.
 
 services:
 
@@ -38,7 +43,9 @@ services:
       FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
+      REDIS_URL: redis://redis:6379/0
       REEMBED_INTERVAL: 5
+      DB_POOL_SIZE: 15
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
@@ -50,6 +57,8 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
+        condition: service_started
+      redis:
         condition: service_started
     logging:
       driver: json-file
@@ -67,6 +76,8 @@ services:
       POSTGRES_USER: faultline
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
       POSTGRES_DB: faultline_test
+      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -96,6 +107,20 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - faultline-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: faultline-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
     logging:
       driver: json-file
       options:
