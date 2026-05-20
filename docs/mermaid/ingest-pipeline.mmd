@@ -1,0 +1,80 @@
+graph TD
+    A["Extracted Triple<br/>(subject: Des<br/>rel_type: age<br/>object: 12)"] -->|Filter Inlet| B{Retraction Signal?}
+
+    B -->|YES| C["RETRACTION PATH<br/>(LLM extracted retraction)"]
+    C --> D["DELETE or SUPERSEDE<br/>from facts table<br/>Mark superseded_at<br/>Archive old data"]
+    D --> E["Confirmation<br/>SHORT-CIRCUIT<br/>(Skip rest of ingest)"]
+
+    B -->|NO| F{Word Count >= 3<br/>or Self-ID Pattern?}
+    F -->|NO| G["SKIP INGEST<br/>(will_ingest = False)<br/>Message too short"]
+    F -->|YES| H["INGEST ENABLED"]
+
+    H --> I{Correction?<br/>is_correction=true}
+
+    I -->|YES| J["CORRECTION INGEST<br/>(User overrides LLM)<br/>Mark Class A immediately<br/>confidence = 1.0"]
+
+    I -->|NO| K["NORMAL INGEST"]
+
+    J --> L["WGM VALIDATION GATE"]
+    K --> L
+
+    L --> M["CHECK ONTOLOGY<br/>(Does rel_type exist?)<br/>(Are types known?)"]
+
+    M -->|Rel_Type Unknown| N["LAYER 1: Create rel_type<br/>Engine learns new relationship<br/>Stores metadata:<br/>- category<br/>- is_symmetric<br/>- inverse_rel_type<br/>- head_types, tail_types"]
+
+    M -->|Rel_Type Known| O["Use Existing rel_type<br/>metadata from DB"]
+
+    N --> P["CHECK ENTITY TYPES<br/>(Do entities exist?)<br/>(Are they classified?)"]
+    O --> P
+
+    P -->|Type Unknown| Q["LAYER 2: Create entity_type<br/>Engine classifies entities<br/>Example: Des instance_of Person<br/>Stores via instance_of rel_type"]
+
+    P -->|Type Known| R["Use Existing Types"]
+
+    Q --> S["DETECT CONFLICTS<br/>(Semantic validation)<br/>Example: Can't own a Type<br/>Can't have Type as parent"]
+    R --> S
+
+    S -->|CONFLICT| T["AUTO-SUPERSEDE<br/>Lower confidence fact<br/>Keep user fact"]
+
+    S -->|NO CONFLICT| U["VALIDATE BIDIRECTIONAL<br/>(Example: parent_of + child_of<br/>prevent both for same pair)"]
+
+    T --> U
+
+    U -->|VALID| V{Determine Storage Path}
+
+    V -->|SCALAR<br/>age, height, name| W["LAYER 3: SCALAR PATH<br/>entity_attributes table<br/>Key: user_id, entity_id, attr<br/>Value: 12"]
+
+    V -->|HIERARCHY<br/>instance_of, subclass_of| X["LAYER 3: HIERARCHY PATH<br/>facts table<br/>Defines classifications<br/>Des instance_of person"]
+
+    V -->|RELATIONAL<br/>spouse, parent_of| Y["LAYER 3: RELATIONAL PATH<br/>facts table<br/>Connectivity/relationships<br/>user spouse marla"]
+
+    W --> Z{Classify Confidence}
+    X --> Z
+    Y --> Z
+
+    Z -->|User-stated<br/>confidence >= 0.95| AA["CLASS A<br/>Immediate Trust<br/>confidence: 1.0<br/>COMMIT IMMEDIATELY<br/>INSERT INTO facts<br/>(not staged)"]
+
+    Z -->|LLM-inferred<br/>ontology exists<br/>no new types| AB["CLASS B<br/>Behavioral<br/>confidence: 0.8<br/>STAGE for review<br/>PROMOTE after 3 confirmations"]
+
+    Z -->|Novel pattern<br/>new types created<br/>confidence < 0.6| AC["CLASS C<br/>Ephemeral<br/>confidence: 0.4<br/>STAGE for evaluation<br/>Re-embedder decides fate<br/>EXPIRE after 30 days"]
+
+    AA --> AD["COMMIT FACTS<br/>(INSERT INTO facts)<br/>Example: Des, age, 12<br/>confidence: 1.0"]
+    AB --> AE["STAGE FACTS<br/>(INSERT INTO staged_facts)<br/>Awaiting confirmations<br/>or re-embedder evaluation"]
+    AC --> AE
+
+    AD --> AF["RE-EMBEDDER SYNC<br/>(Background process)<br/>1. Embed fact text<br/>2. Sync to Qdrant<br/>3. Manage hierarchy chains<br/>4. Evaluate novel rel_types<br/>5. Promote Class B facts"]
+    AE --> AF
+
+    AF --> AG["COMPLETE<br/>Fact stored and indexed<br/>Ready for RECALL"]
+
+    style A fill:#e1f5ff
+    style E fill:#c8e6c9
+    style N fill:#f3e5f5
+    style Q fill:#f3e5f5
+    style W fill:#fff9c4
+    style X fill:#fff9c4
+    style Y fill:#fff9c4
+    style AA fill:#c8e6c9
+    style AB fill:#ffffcc
+    style AC fill:#e0e0e0
+    style AG fill:#c8e6c9

@@ -1,0 +1,48 @@
+graph TD
+    A["User Query<br/>(Example: Tell me about my family)"] -->|Filter Inlet| B["QUERY ENABLED?<br/>(Default: YES)"]
+
+    B -->|NO| C["SKIP<br/>(No memory injection<br/>LLM responds without context)"]
+    B -->|YES| D["CALL /query ENDPOINT"]
+
+    D --> E["FETCH FROM POSTGRESQL<br/>(4 parallel sources)"]
+
+    E --> F["BASELINE FACTS<br/>(SELECT * FROM facts<br/>WHERE user_id = ?<br/>AND superseded_at IS NULL)"]
+
+    E --> G["GRAPH TRAVERSAL<br/>(_graph_traverse: single-hop)<br/>spouse, parent_of, works_for<br/>(Example: user spouse marla)"]
+
+    E --> H["HIERARCHY EXPANSION<br/>(_hierarchy_expand: upward chains)<br/>instance_of, subclass_of<br/>(Example: Des instance_of person)"]
+
+    E --> I["ENTITY ATTRIBUTES<br/>(SELECT * FROM entity_attributes)<br/>Convert scalars to facts<br/>(Example: age=12)"]
+
+    F --> J["VECTOR SEARCH<br/>(Qdrant: cosine similarity)<br/>Model: nomic-embed-text<br/>score_threshold: 0.3, limit: 10"]
+    G --> J
+    H --> J
+    I --> J
+
+    J --> K["DEDUPLICATION<br/>(Group by: subject_uuid,<br/>rel_type, object_uuid)<br/>Keep: highest confidence"]
+
+    K --> L["FILTER BY SCOPE<br/>(Query taxonomy match?)<br/>family: Person + Animal entities<br/>work: Person + Organization"]
+
+    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: marla_uuid to Marla<br/>Example: des_uuid to Des"]
+
+    M --> N["ATTACH METADATA<br/>(_aliases: all names)<br/>entity_types: person, animal<br/>fact_class: A/B/C"]
+
+    N --> O["FORMAT AS PROSE<br/>(Natural language injection)<br/>NOT raw tuples or UUIDs"]
+
+    O --> P["Example Formatted Facts:<br/>- You are the parent of Des<br/>(Class A, confidence 1.0)<br/>- Marla is your spouse<br/>(Class A, confidence 1.0)<br/>- Des is 12 years old<br/>(Class A, confidence 1.0)<br/>- You have a pet named Fraggle<br/>(Class B, pending confirmation)"]
+
+    P --> Q["INJECT INTO CONTEXT<br/>(System message added before<br/>last user message)"]
+
+    Q --> R["FaultLine Memory Header<br/>(Facts in readable prose)<br/>Metadata shown to LLM<br/>(Class, confidence, expiry)"]
+
+    R --> S["LLM PROCESSES<br/>(Qwen receives augmented context)<br/>Can reference: Your son Des<br/>Your spouse Marla, etc"]
+
+    S --> T["LLM RESPONSE<br/>(Generated with memory context)<br/>References facts naturally<br/>Example: Des is 12, right?"]
+
+    T --> U["RETURN TO USER<br/>(Memory-augmented response)<br/>Facts flow into conversation"]
+
+    style A fill:#e1f5ff
+    style P fill:#fff9c4
+    style R fill:#f3e5f5
+    style T fill:#c8e6c9
+    style U fill:#c8e6c9
