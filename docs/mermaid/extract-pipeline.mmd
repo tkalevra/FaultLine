@@ -1,37 +1,37 @@
 graph TD
-    A["User Message<br/>(Example: My son Des is 12<br/>Actually, he's 14)"] -->|Filter Inlet| B["DETECT CORRECTIONS<br/>(Regex: actually, wrong,<br/>I meant, corrected to)"]
+    A["User Message<br/>(e.g., My son Des is 12<br/>Actually he's 14)"] -->|Step 1| B["Check for Corrections<br/>(Look for: actually, wrong,<br/>corrected to, meant to say)"]
 
-    B -->|Correction Found| C["LLM EXTRACT CORRECTION<br/>(What's being corrected?<br/>Old value: 12<br/>New value: 14<br/>Subject: Des, Rel: age)"]
+    B -->|Found| C["LLM Extracts Correction<br/>(What changed?)<br/>Old: age=12<br/>New: age=14<br/>Who: Des"]
 
-    C --> D["MARK AS CORRECTION<br/>(is_correction=true<br/>Will bypass staging)"]
+    C --> D["Flag as User Correction<br/>(Will skip validation staging,<br/>goes straight to database)"]
 
-    B -->|No Correction| E["DETECT RETRACTION<br/>(Regex: forget, delete,<br/>wrong, no longer, not true)"]
+    B -->|Not Found| E["Check for Retractions<br/>(Look for: forget, delete,<br/>no longer true, not true)"]
 
-    E -->|Retraction Found| F["LLM EXTRACT RETRACTION<br/>(What fact is wrong?<br/>Subject: Des<br/>Rel: age<br/>Action: DELETE or SUPERSEDE)"]
+    E -->|Found| F["LLM Extracts Retraction<br/>(What's being removed?)<br/>Subject: Des<br/>Fact: age<br/>Action: delete or archive)"]
 
-    F --> G["MARK AS RETRACTION<br/>(is_retraction=true<br/>Skip to retraction path)"]
+    F --> G["Flag as Retraction<br/>(Skip normal storage,<br/>route to removal path)"]
 
-    E -->|No Retraction| H["NORMAL EXTRACTION<br/>(Standard LLM triple inference)"]
+    E -->|Not Found| H["Normal Extraction<br/>(Extract new facts<br/>from conversation)"]
 
-    H --> I["LLM EXTRACTS TRIPLES<br/>(Qwen identifies:)<br/>subject_type: Person<br/>rel_type: age<br/>object_type: SCALAR<br/>confidence: 0.95"]
+    H --> I["LLM Identifies Fact Elements<br/>Entity: Des (type: Person)<br/>Relationship: age<br/>Value: 12 (type: Number)<br/>Confidence: 95%"]
 
-    I --> J{Is rel_type<br/>Known in DB?}
+    I --> J{Is This Relationship<br/>Already Defined?}
 
-    J -->|YES| K["Use Existing Metadata<br/>(is_symmetric, is_hierarchy,<br/>tail_types, head_types)"]
+    J -->|Yes, in Database| K["Load Relationship Rules<br/>(Is it bidirectional?<br/>Does it have constraints?)<br/>Use established pattern"]
 
-    J -->|NO| L["NOVEL REL_TYPE<br/>(Engine marks for evaluation)<br/>Will be staged as Class C<br/>Re-embedder evaluates later)"]
+    J -->|No, New Pattern| L["Mark as New Pattern<br/>(Will be evaluated later)<br/>Store with low confidence<br/>until approved)"]
 
-    K --> M["VALIDATE TRIPLE<br/>(Check: head_type matches?<br/>tail_type matches?<br/>directionality correct?)"]
+    K --> M["Validate Against Rules<br/>(Does entity type fit?<br/>Does value type fit?<br/>Is direction correct?)"]
 
     L --> M
 
-    M -->|MISMATCH| N["CONFIDENCE PENALTY<br/>(Mark confidence lower)<br/>Or flag for correction"]
+    M -->|Failed| N["Lower Confidence Score<br/>(Flag as uncertain,<br/>may need manual review)"]
 
-    M -->|MATCH| O["TRIPLE READY<br/>(subject, rel_type, object<br/>with types and metadata)"]
+    M -->|Passed| O["Fact Ready to Store<br/>(All elements validated<br/>ready for database)"]
 
     N --> O
 
-    O --> P["RETURN TO INGEST<br/>(with is_correction flag<br/>with is_retraction flag<br/>with rel_type metadata)"]
+    O --> P["Send to Storage Pipeline<br/>(Include: correction flag,<br/>retraction flag, validation<br/>results, confidence score)"]
 
     style A fill:#e1f5ff
     style D fill:#fff9c4
