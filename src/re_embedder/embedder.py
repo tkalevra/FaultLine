@@ -9,15 +9,94 @@ import json
 import logging
 import os
 import time
+from typing import Optional
 
 import httpx
 import psycopg2
+import redis
 from src.api.llm_client import get_llm_headers
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
+# Marker for internal FaultLine prompts (dprompt-128) — prevents context bloat if looped back
+_FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
+
 _http_client_sync: httpx.Client = None
+
+
+class EmbeddingCache:
+    """Redis-backed cache for rel_type embeddings (GROWS WITH SYSTEM).
+
+    Caches embeddings of rel_type name strings to avoid re-embedding during
+    ontology evaluation. Survives restarts, scales horizontally.
+    """
+
+    def __init__(self, redis_url: Optional[str] = None):
+        """Initialize Redis connection for embedding cache.
+
+        Args:
+            redis_url: Redis connection URL (defaults to REDIS_URL env var)
+        """
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.ttl = int(os.getenv("EMBEDDING_CACHE_TTL", "86400"))  # 1 day default
+        self.prefix = "embedding:relationship:"
+        self.client = None
+
+        try:
+            self.client = redis.from_url(self.redis_url, decode_responses=True)
+            self.client.ping()
+            log.info(f"embedding_cache.redis_connected url={self.redis_url[:30]} ttl_seconds={self.ttl}")
+        except Exception as e:
+            log.warning(f"embedding_cache.redis_connection_failed error={str(e)}")
+            self.client = None
+
+    def get(self, text: str) -> Optional[list]:
+        """Retrieve cached embedding (returns None on miss or error)."""
+        if not self.client:
+            return None
+        try:
+            key = f"{self.prefix}{text}"
+            cached = self.client.get(key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            log.warning("embedding_cache.get_error", error=str(e), key=text[:40])
+        return None
+
+    def set(self, text: str, vector: list) -> bool:
+        """Cache an embedding with TTL (returns success flag)."""
+        if not self.client:
+            return False
+        try:
+            key = f"{self.prefix}{text}"
+            self.client.setex(key, self.ttl, json.dumps(vector))
+            return True
+        except Exception as e:
+            log.warning("embedding_cache.set_error", error=str(e), key=text[:40])
+            return False
+
+    def clear_pattern(self, pattern: str) -> int:
+        """Clear all keys matching pattern (e.g., 'embedding:relationship:*')."""
+        if not self.client:
+            return 0
+        try:
+            # Use SCAN to avoid blocking on large keyspaces
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = self.client.scan(cursor, match=pattern, count=1000)
+                if keys:
+                    deleted += self.client.delete(*keys)
+                if cursor == 0:
+                    break
+            return deleted
+        except Exception as e:
+            log.warning("embedding_cache.clear_error", error=str(e), pattern=pattern)
+            return 0
+
+
+_embedding_cache = EmbeddingCache()
 
 
 def derive_collection(user_id: str) -> str:
@@ -640,6 +719,81 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     return stats
 
 
+def _query_llm_for_rel_type_metadata(candidate_rel: str, subj_type: str, obj_type: str,
+                                      snippet: str, qwen_api_url: str) -> dict:
+    """
+    dprompt-126: Phase 2 — Query LLM for natural language metadata during ontology evaluation.
+
+    When a novel rel_type reaches occurrence_count >= 3, query the LLM to generate:
+    - natural_language: human-readable description
+    - is_symmetric: whether the relationship is bidirectional
+    - inverse_rel_type: the opposite relationship (if asymmetric)
+    - category: classification (family, work, behavioral, etc.)
+    - fact_class: confidence → A/B/C assignment
+    - confidence: 0.0-1.0 assessment
+    - examples: sample usages for extraction prompt
+
+    Returns dict with llm_* fields or empty dict on failure (non-blocking).
+    """
+    try:
+        # Mark prompt with FaultLine prefix to prevent context bloat if it loops back (dprompt-128)
+        prompt = f"""{_FAULTLINE_INTERNAL_PREFIX} You are an ontology expert analyzing a relationship pattern from conversation data.
+
+Pattern: {candidate_rel}
+Subject Type: {subj_type or 'unknown'}
+Object Type: {obj_type or 'unknown'}
+Sample: "{snippet}"
+
+Respond with ONLY valid JSON (no markdown, no extra text):
+{{
+  "natural_language": "X {candidate_rel.replace('_', ' ')} Y (e.g., 'X and Y are friends')",
+  "is_symmetric": boolean,
+  "inverse_rel_type": "opposite rel_type or null",
+  "category": "family|work|location|identity|temporal|behavioral|physical|social",
+  "fact_class": "A|B|C",
+  "confidence": 0.0-1.0,
+  "examples": [{{"subject": "Person1", "object": "Person2"}}]
+}}"""
+
+        headers = get_llm_headers()
+        payload = {
+            "model": os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 300,
+        }
+
+        response = _http_client_sync.post(
+            qwen_api_url,
+            json=payload,
+            headers=headers,
+            timeout=30.0,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+
+        # Parse JSON response
+        import re
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            metadata = json.loads(match.group())
+            return {
+                "llm_natural_language": metadata.get("natural_language", ""),
+                "llm_is_symmetric": metadata.get("is_symmetric", False),
+                "llm_inverse_rel_type": metadata.get("inverse_rel_type"),
+                "llm_category": metadata.get("category", "other"),
+                "llm_fact_class": metadata.get("fact_class", "B"),
+                "llm_confidence": float(metadata.get("confidence", 0.6)),
+                "llm_metadata_json": json.dumps(metadata),
+            }
+    except Exception as e:
+        log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} error={str(e)}")
+
+    return {}
+
+
 def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     """
     dprompt-17: Evaluate novel rel_type candidates from ontology_evaluations.
@@ -695,20 +849,33 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
 
             # ── Decision 2: Semantic similarity ─────────────────────────
             if not decision and existing_types:
-                # Embed the candidate rel_type for comparison
-                candidate_vector = embed_text(
-                    f"relationship: {candidate_rel}",
-                    qwen_api_url, timeout=10.0, fallback=True
-                )
+                # dprompt-121: Use embedding cache to avoid re-embedding same types
+                candidate_text = f"relationship: {candidate_rel}"
+                candidate_vector = _embedding_cache.get(candidate_text)
+                if not candidate_vector:
+                    candidate_vector = embed_text(
+                        candidate_text,
+                        qwen_api_url, timeout=10.0, fallback=True
+                    )
+                    if candidate_vector:
+                        _embedding_cache.set(candidate_text, candidate_vector)
+
                 if candidate_vector:
                     # Compute cosine similarity to each existing type
                     best_score = 0.0
                     best_fit = None
                     for ext in existing_types:
-                        ext_vector = embed_text(
-                            f"relationship: {ext}",
-                            qwen_api_url, timeout=10.0, fallback=True
-                        )
+                        ext_text = f"relationship: {ext}"
+                        # dprompt-121: Check cache first
+                        ext_vector = _embedding_cache.get(ext_text)
+                        if not ext_vector:
+                            ext_vector = embed_text(
+                                ext_text,
+                                qwen_api_url, timeout=10.0, fallback=True
+                            )
+                            if ext_vector:
+                                _embedding_cache.set(ext_text, ext_vector)
+
                         if ext_vector:
                             sim = _cosine_similarity(candidate_vector, ext_vector)
                             if sim > best_score:
@@ -727,14 +894,22 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
             # ── Apply decision ──────────────────────────────────────────
             with db_conn.cursor() as cur:
                 if decision == "approved":
-                    # Register the new rel_type with inferred metadata (dprompt-97)
-                    label = candidate_rel.replace('_', ' ').title()
+                    # dprompt-126: Phase 2 — Query LLM for natural language metadata
+                    llm_metadata = _query_llm_for_rel_type_metadata(
+                        candidate_rel, subj_type, obj_type, snippet, qwen_api_url
+                    )
 
-                    # Infer metadata from candidate's subject and object types
+                    # Register the new rel_type with full metadata
+                    label = llm_metadata.get("llm_natural_language", "").split(" is ")[0].title() if llm_metadata.get("llm_natural_language") else candidate_rel.replace('_', ' ').title()
+                    natural_language = llm_metadata.get("llm_natural_language", "")
+                    is_symmetric = llm_metadata.get("llm_is_symmetric", False)
+                    inverse_rel_type = llm_metadata.get("llm_inverse_rel_type")
+                    category = llm_metadata.get("llm_category", "other")
+
+                    # Infer metadata from candidate's subject and object types (fallback)
                     head_types = None
                     tail_types = None
                     is_hierarchy = False
-                    is_symmetric = False
 
                     if subj_type and subj_type != "unknown":
                         head_types = [subj_type]
@@ -744,20 +919,21 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     # Heuristic: if rel_type suggests classification/taxonomy, mark as hierarchy
                     if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
                         is_hierarchy = True
-                    # Heuristic: if suggests symmetry
-                    if any(keyword in candidate_rel.lower() for keyword in ("friend", "knows", "same", "peer", "mutual", "colleague")):
-                        is_symmetric = True
 
                     cur.execute(
                         "INSERT INTO rel_types"
-                        " (rel_type, label, engine_generated, confidence, source,"
-                        "  head_types, tail_types, is_hierarchy_rel, is_symmetric)"
-                        " VALUES (%s, %s, true, 0.7, 'engine', %s, %s, %s, %s)"
-                        " ON CONFLICT (rel_type) DO NOTHING",
-                        (candidate_rel, label, head_types, tail_types, is_hierarchy, is_symmetric),
+                        " (rel_type, label, natural_language, engine_generated, confidence, source,"
+                        "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category)"
+                        " VALUES (%s, %s, %s, true, %s, 'llm_evaluated', %s, %s, %s, %s, %s, %s)"
+                        " ON CONFLICT (rel_type) DO UPDATE SET"
+                        "  natural_language = EXCLUDED.natural_language,"
+                        "  is_symmetric = EXCLUDED.is_symmetric,"
+                        "  inverse_rel_type = EXCLUDED.inverse_rel_type,"
+                        "  category = EXCLUDED.category",
+                        (candidate_rel, label, natural_language, 0.8, head_types, tail_types, is_hierarchy, is_symmetric, inverse_rel_type, category),
                     )
                     stats["approved"] += 1
-                    log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} head_types={head_types} tail_types={tail_types} is_hierarchy={is_hierarchy} {reason}")
+                    log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} category={category} is_symmetric={is_symmetric} natural_language={natural_language[:50]} {reason}")
 
                     # Refresh unified metadata cache so the newly approved rel_type
                     # is immediately available to the ingest pipeline without waiting
@@ -788,23 +964,50 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     stats["rejected"] += 1
                     log.info(f"re_embedder.ontology_rejected rel_type={candidate_rel} {reason}")
 
-                # Update evaluation record
-                cur.execute(
-                    "UPDATE ontology_evaluations SET"
-                    "  re_embedder_decision = %s,"
-                    "  re_embedder_confidence = %s,"
-                    "  decision_timestamp = now(),"
-                    "  decision_reason = %s,"
-                    "  best_fit_rel_type = %s,"
-                    "  best_fit_score = %s,"
-                    "  created_rel_type = %s"
-                    " WHERE id = %s",
-                    (decision,
-                     0.7 if decision == "approved" else (best_score if decision == "mapped" else 0.3),
-                     reason, best_fit, best_score,
-                     candidate_rel if decision == "approved" else (best_fit if decision == "mapped" else None),
-                     eval_id),
-                )
+                # Update evaluation record (including LLM metadata if approved)
+                if decision == "approved":
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET"
+                        "  re_embedder_decision = %s,"
+                        "  re_embedder_confidence = %s,"
+                        "  decision_timestamp = now(),"
+                        "  decision_reason = %s,"
+                        "  created_rel_type = %s,"
+                        "  llm_natural_language = %s,"
+                        "  llm_is_symmetric = %s,"
+                        "  llm_inverse_rel_type = %s,"
+                        "  llm_category = %s,"
+                        "  llm_fact_class = %s,"
+                        "  llm_confidence = %s,"
+                        "  llm_metadata_json = %s"
+                        " WHERE id = %s",
+                        (decision, 0.8, reason, candidate_rel,
+                         llm_metadata.get("llm_natural_language", ""),
+                         llm_metadata.get("llm_is_symmetric", False),
+                         llm_metadata.get("llm_inverse_rel_type"),
+                         llm_metadata.get("llm_category", "other"),
+                         llm_metadata.get("llm_fact_class", "B"),
+                         llm_metadata.get("llm_confidence", 0.6),
+                         llm_metadata.get("llm_metadata_json", "{}"),
+                         eval_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET"
+                        "  re_embedder_decision = %s,"
+                        "  re_embedder_confidence = %s,"
+                        "  decision_timestamp = now(),"
+                        "  decision_reason = %s,"
+                        "  best_fit_rel_type = %s,"
+                        "  best_fit_score = %s,"
+                        "  created_rel_type = %s"
+                        " WHERE id = %s",
+                        (decision,
+                         best_score if decision == "mapped" else 0.3,
+                         reason, best_fit, best_score,
+                         best_fit if decision == "mapped" else None,
+                         eval_id),
+                    )
 
             db_conn.commit()
 
@@ -828,6 +1031,69 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def has_pending_ontology_work(db_conn) -> bool:
+    """Check if there are unevaluated ontology candidates (fast query).
+
+    dprompt-121: Event-driven guard to skip evaluation if no pending work.
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM ontology_evaluations "
+                "WHERE re_embedder_decision IS NULL LIMIT 1"
+            )
+            count = cur.fetchone()[0]
+            return count > 0
+    except Exception as e:
+        log.warning("re_embedder.pending_ontology_check_failed", error=str(e))
+        return False
+
+
+def has_pending_name_conflicts(db_conn) -> bool:
+    """Check if there are unresolved name conflicts (fast query).
+
+    dprompt-121: Event-driven guard to skip conflict resolution if no pending work.
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM entity_name_conflicts "
+                "WHERE status='pending' LIMIT 1"
+            )
+            count = cur.fetchone()[0]
+            return count > 0
+    except Exception as e:
+        log.warning("re_embedder.pending_conflicts_check_failed", error=str(e))
+        return False
+
+
+def detect_embedding_model_change() -> None:
+    """Auto-detect if embedding model version changed; clear cache if so.
+
+    dprompt-121: On startup, compare model version to stored version.
+    If mismatch, clear embedding cache (v1.5→v2.0 embeddings incomparable).
+    """
+    if not _embedding_cache.client:
+        return
+
+    embedding_model_version = os.getenv("EMBEDDING_MODEL_VERSION", "nomic-v1.5")
+    try:
+        stored_version = _embedding_cache.client.get("_embedding_model_version")
+        if stored_version and stored_version != embedding_model_version:
+            log.warning(
+                "embedding_cache.model_version_changed",
+                old=stored_version,
+                new=embedding_model_version,
+            )
+            deleted = _embedding_cache.clear_pattern(f"{_embedding_cache.prefix}*")
+            log.info("embedding_cache.cleared_model_change", entries_deleted=deleted)
+
+        # Store current model version
+        _embedding_cache.client.set("_embedding_model_version", embedding_model_version)
+    except Exception as e:
+        log.warning("embedding_cache.model_detection_failed", error=str(e))
+
+
 def main():
     """Main poll loop."""
     global _http_client_sync
@@ -835,7 +1101,7 @@ def main():
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     qwen_api_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
-    interval = int(os.getenv("REEMBED_INTERVAL", "10"))
+    interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
     if not postgres_dsn:
@@ -845,6 +1111,9 @@ def main():
     # Initialize persistent HTTP client for pooled connections
     _http_client_sync = httpx.Client(timeout=httpx.Timeout(30.0), limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
     log.info(f"re_embedder.http_client_initialized")
+
+    # dprompt-121: Detect if embedding model changed (auto-clear cache if so)
+    detect_embedding_model_change()
 
     log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold}")
 
@@ -919,16 +1188,19 @@ def main():
                 if n_promoted:
                     log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
 
-                # Evaluate novel ontology candidates (dprompt-17)
-                ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
-                if any(v > 0 for v in ontology_stats.values()):
-                    log.info(
-                        f"re_embedder.ontology_eval "
-                        f"approved={ontology_stats['approved']} "
-                        f"mapped={ontology_stats['mapped']} "
-                        f"rejected={ontology_stats['rejected']} "
-                        f"errors={ontology_stats['errors']}"
-                    )
+                # dprompt-121: Event-driven ontology evaluation (skip if no pending work)
+                if has_pending_ontology_work(db):
+                    ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
+                    if any(v > 0 for v in ontology_stats.values()):
+                        log.info(
+                            f"re_embedder.ontology_eval "
+                            f"approved={ontology_stats['approved']} "
+                            f"mapped={ontology_stats['mapped']} "
+                            f"rejected={ontology_stats['rejected']} "
+                            f"errors={ontology_stats['errors']}"
+                        )
+                else:
+                    log.debug("re_embedder.no_pending_ontology_work")
 
                 # Expire stale Class C staged facts
                 n_expired = expire_staged_facts(db, qdrant_url)

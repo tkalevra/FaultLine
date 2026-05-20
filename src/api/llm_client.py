@@ -1,7 +1,11 @@
 """Centralized LLM endpoint authentication, configuration, and request building."""
 
 import os
+import httpx
+import structlog
 from typing import Optional, Any
+
+log = structlog.get_logger(__name__)
 
 
 def get_llm_headers() -> dict:
@@ -25,6 +29,7 @@ def build_llm_payload(
     temperature: float = 0.0,
     max_tokens: int = 200,
     thinking: Optional[dict] = None,
+    stream: bool = False,
     **kwargs
 ) -> dict:
     """
@@ -34,9 +39,11 @@ def build_llm_payload(
     in process_chat middleware. Injecting user_id as chat_id avoids the upstream
     OpenWebUI bug when calling /api/chat/completions from FaultLine modules.
 
-    dprompt-120: Omit stream parameter (workaround for LM Studio bug #599).
-    LM Studio 0.4.13 appears to ignore explicit stream=false, streaming with
-    default behavior. Omitting the parameter entirely allows non-streaming by default.
+    dprompt-121: FaultLine internal LLM calls (extraction, WGM, etc.) default to
+    stream=false. Some OpenAI-compatible implementations incorrectly default to
+    streaming when stream is omitted (see unslothai/unsloth#5047), causing
+    response.json() to hang on SSE format responses. Explicit stream=false ensures
+    non-streaming JSON responses across all backends.
 
     Args:
         messages: List of message dicts with role/content
@@ -45,6 +52,7 @@ def build_llm_payload(
         temperature: LLM temperature (default 0.0 for deterministic)
         max_tokens: Max output tokens
         thinking: Thinking config dict (e.g. {"type": "disabled"})
+        stream: Whether to stream response (default False for internal calls)
         **kwargs: Additional fields to merge into payload
 
     Returns:
@@ -55,6 +63,7 @@ def build_llm_payload(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": stream,
     }
 
     # dBug-016 fix: inject chat_id to prevent OpenWebUI process_chat NoneType crash
@@ -68,7 +77,63 @@ def build_llm_payload(
     if thinking:
         payload["thinking"] = thinking
 
-    # Merge any additional fields
+    # Merge any additional fields, but NEVER allow kwargs to override stream
+    # (stream=false is CRITICAL and must not be overridden by callers)
+    kwargs.pop("stream", None)
     payload.update(kwargs)
 
     return payload
+
+
+def call_llm(
+    url: str,
+    payload: dict,
+    timeout: float = 30.0,
+    debug_stats: Optional[bool] = None
+) -> dict:
+    """
+    Make LLM API call with automatic LM Studio stats logging.
+
+    Calls LLM endpoint via httpx and logs LM Studio backend metrics if available
+    (time_to_first_token_seconds, tokens_per_second, etc.). Controlled by
+    DEBUG_LM_STUDIO_STATS environment variable valve.
+
+    Args:
+        url: LLM endpoint URL (e.g., OpenWebUI or LM Studio)
+        payload: Request payload (from build_llm_payload or custom)
+        timeout: Request timeout in seconds
+        debug_stats: Override DEBUG_LM_STUDIO_STATS env var for this call
+
+    Returns:
+        LLM response dict (OpenAI-compatible format)
+
+    Raises:
+        httpx.RequestError: On network/timeout errors
+        ValueError: On non-200 response
+    """
+    debug_enabled = debug_stats is not None and debug_stats
+    if debug_stats is None:
+        debug_enabled = os.environ.get("DEBUG_LM_STUDIO_STATS", "").lower() in ("true", "1", "yes")
+
+    headers = get_llm_headers()
+    headers["Content-Type"] = "application/json"
+
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+    # Log LM Studio stats if available and enabled
+    if debug_enabled and isinstance(data, dict):
+        stats = data.get("stats")
+        if stats and isinstance(stats, dict):
+            log.info(
+                "lm_studio.stats",
+                time_to_first_token_ms=round(stats.get("time_to_first_token_seconds", 0) * 1000),
+                tokens_per_second=round(stats.get("tokens_per_second", 0), 2),
+                total_output_tokens=stats.get("total_output_tokens"),
+                input_tokens=stats.get("input_tokens"),
+                model=payload.get("model", "unknown"),
+            )
+
+    return data

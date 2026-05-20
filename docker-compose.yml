@@ -1,3 +1,8 @@
+# Standard FaultLine deployment
+# Usage: docker-compose up -d
+# For production with Portainer, see docker-compose-portainer.yml
+# For Portainer without Qdrant, see docker-compose-portainer-withoutqdrant.yml
+
 services:
 
   faultline:
