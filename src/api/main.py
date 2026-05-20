@@ -72,28 +72,158 @@ _UUID_PATTERN = re.compile(
 
 # Fact class taxonomy replaced by metadata-driven queries (dprompt-73b).
 # rel_types.fact_class column is authoritative — see _get_rel_type_metadata().
-# Graph + Hierarchy traversal systems (dprompt-27) — still hardcoded, out of scope.
-
-# ── dprompt-27: Graph + Hierarchy traversal systems ────────────────────────
+# ── dprompt-27: Graph + Hierarchy traversal systems (dprompt-122: DB-driven) ─────────────
 # Two orthogonal traversal systems (dprompt-26 architecture):
-#   GRAPH:     connectivity — who am I connected to?
-#   HIERARCHY: composition + classification — what are they, what do they belong to?
+#   GRAPH:     connectivity — who am I connected to? (is_hierarchy_rel=false)
+#   HIERARCHY: composition + classification — what are they, what do they belong to? (is_hierarchy_rel=true)
+# Both derived from _REL_TYPE_META at runtime — NO HARDCODED LISTS.
 
-_REL_TYPE_GRAPH = frozenset({
-    # Direct connection to user / between entities
-    "spouse", "parent_of", "child_of", "sibling_of",
-    "has_pet", "knows", "friend_of", "met",
-    "works_for", "lives_at", "lives_in", "located_in",
-    "owns", "educated_at", "member_of",
-    # Self-referential (identity anchors)
-    "pref_name", "also_known_as", "same_as",
-    "age", "height", "weight", "born_on", "nationality",
-    "has_gender", "occupation",
-})
+def _get_graph_rels() -> frozenset:
+    """
+    Return all graph relationship types (is_hierarchy_rel=false).
+    Queries DB directly to include novel rel_types approved by re_embedder.
+    Falls back to cache if DB unreachable.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT rel_type FROM rel_types WHERE is_hierarchy_rel = false OR is_hierarchy_rel IS NULL"
+                    )
+                    return frozenset(row[0] for row in cur.fetchall())
+        except Exception as e:
+            log.warning("graph_rels.db_query_failed", error=str(e), using_fallback=True)
+    # Fallback to startup cache if DB unavailable
+    if _REL_TYPE_META:
+        return frozenset(
+            rt for rt, meta in _REL_TYPE_META.items()
+            if not meta.get("is_hierarchy_rel", False)
+        )
+    return frozenset()
 
-_REL_TYPE_HIERARCHY = frozenset({
-    "instance_of", "subclass_of", "part_of", "is_a", "member_of",
-})
+def _get_hierarchy_rels() -> frozenset:
+    """
+    Return all hierarchy relationship types (is_hierarchy_rel=true).
+    Queries DB directly to include novel rel_types approved by re_embedder.
+    Falls back to cache if DB unreachable.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT rel_type FROM rel_types WHERE is_hierarchy_rel = true"
+                    )
+                    return frozenset(row[0] for row in cur.fetchall())
+        except Exception as e:
+            log.warning("hierarchy_rels.db_query_failed", error=str(e), using_fallback=True)
+    # Fallback to startup cache if DB unavailable
+    if _REL_TYPE_META:
+        return frozenset(
+            rt for rt, meta in _REL_TYPE_META.items()
+            if meta.get("is_hierarchy_rel", False)
+        )
+    return frozenset()
+
+# dprompt-125: Rel-type alias cache (alias → canonical)
+# Loaded at startup, queries DB at runtime for fresh aliases from re_embedder
+_REL_TYPE_ALIASES: dict = {}
+
+def _load_rel_type_aliases() -> dict:
+    """
+    Load rel_type_aliases from database (alias → canonical mapping).
+    Called at startup and refreshed periodically by re_embedder.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT alias, canonical_rel_type FROM rel_type_aliases WHERE canonical_rel_type IN (SELECT rel_type FROM rel_types)"
+                    )
+                    return {row[0].lower(): row[1].lower() for row in cur.fetchall()}
+        except Exception as e:
+            log.warning("rel_type_aliases.load_failed", error=str(e))
+    return {}
+
+def _get_canonical_rel_type(rel_type_alias: str) -> str:
+    """
+    Normalize LLM rel_type variations to canonical form via database aliases.
+    Queries DB first (fresh), falls back to startup cache.
+    Returns canonical rel_type or original if no alias found.
+    dprompt-125: DB-driven, no hardcoded mappings.
+    """
+    if not rel_type_alias:
+        return rel_type_alias
+
+    alias_lower = rel_type_alias.lower().strip()
+
+    # Try DB query first (includes newly-learned aliases from re_embedder)
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s",
+                        (alias_lower,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row[0].lower()
+        except Exception:
+            pass  # Fall through to cache
+
+    # Fall back to startup cache
+    return _REL_TYPE_ALIASES.get(alias_lower, rel_type_alias)
+
+
+def _get_canonical_rel_type_with_directionality(rel_type_alias: str) -> tuple[str, bool]:
+    """
+    Normalize LLM rel_type variations to canonical form and preserve directionality.
+
+    dprompt-126: Phase 1 — Alias directionality preservation
+
+    Returns:
+        (canonical_rel_type, requires_inversion)
+        - canonical_rel_type: canonical form from rel_types table
+        - requires_inversion: True if subject/object need to be swapped to match canonical direction
+
+    Examples:
+        "son_of" → ("parent_of", True) — swap child/parent to parent/child
+        "has_child" → ("parent_of", False) — already same direction
+        "spouse_of" → ("spouse", False) — symmetric, direction doesn't matter
+    """
+    if not rel_type_alias:
+        return rel_type_alias, False
+
+    alias_lower = rel_type_alias.lower().strip()
+
+    # Try DB query first (fresh data from re_embedder)
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT canonical_rel_type, requires_inversion
+                           FROM rel_type_aliases
+                           WHERE alias = %s""",
+                        (alias_lower,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row[0].lower(), row[1] or False
+        except Exception as e:
+            log.warning("directionality.db_query_failed", alias=alias_lower, error=str(e))
+
+    # Fall back: canonical from cache, no inversion (safe default)
+    canonical = _REL_TYPE_ALIASES.get(alias_lower, rel_type_alias)
+    return canonical, False
 
 _VALID_CATEGORIES = frozenset({
     "physical", "temporal", "location", "work", "family", "pets", "identity"
@@ -137,6 +267,32 @@ def _infer_category(rel_type: str) -> str | None:
     if any(k in rt for k in ("name","alias","known","called","pref")):
         return "identity"
     return None
+
+def _get_rel_type_category(rel_type: str) -> str | None:
+    """
+    Get category for rel_type: DB → cache → keyword inference.
+    Queries DB directly to include novel rel_types approved by re_embedder.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT category FROM rel_types WHERE rel_type = %s",
+                        (rel_type.lower(),)
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        return row[0]
+        except Exception as e:
+            log.warning("rel_type_category.db_query_failed", rel_type=rel_type, error=str(e))
+    # Fallback to cache
+    meta = _REL_TYPE_META.get(rel_type.lower(), {})
+    if meta.get("category"):
+        return meta["category"]
+    # Final fallback: keyword inference
+    return _infer_category(rel_type)
 
 def _assign_category_via_llm(rel_type: str, qwen_api_url: str) -> Optional[str]:
     """
@@ -457,8 +613,9 @@ def assign_class_and_confidence(
     if is_user_stated:
         return ("A", 1.0)
 
-    # Use passed confidence (from _assess_statement_directness) or default to 1.0
-    current_confidence = confidence if confidence is not None else 1.0
+    # Use passed confidence (from _assess_statement_directness) or default to 0.4 (Class C)
+    # LLM extractions without explicit confidence are speculative, not authoritative.
+    current_confidence = confidence if confidence is not None else 0.4
 
     # LLM-inferred fact: consult metadata for defined fact_class
     if rel_type:
@@ -521,7 +678,7 @@ def _commit_staged(
 ) -> int:
     """
     Insert or update rows in staged_facts.
-    rows: list of (user_id, subject_id, object_id, rel_type, provenance, [definition])
+    rows: list of (user_id, subject_id, object_id, rel_type, provenance, [definition], [storage_type], [is_hierarchy_rel], [taxonomies])
     On conflict, increments confirmed_count and refreshes last_seen_at and expires_at.
     Returns count of rows attempted.
     """
@@ -531,11 +688,15 @@ def _commit_staged(
             for row in rows:
                 user_id, subject, obj, rel_type, prov = row[0], row[1], row[2], row[3], row[4]
                 definition = row[5] if len(row) > 5 else ''
+                storage_type = row[6] if len(row) > 6 else None
+                is_hierarchy_rel = row[7] if len(row) > 7 else False
+                taxonomies = row[8] if len(row) > 8 else []
+
                 cur.execute(
                     "INSERT INTO staged_facts"
                     " (user_id, subject_id, object_id, rel_type, fact_class,"
-                    "  provenance, confidence, expires_at, rel_type_definition)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, now() + interval '30 days', %s)"
+                    "  provenance, confidence, expires_at, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, now() + interval '30 days', %s, %s, %s, %s)"
                     " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
                     " DO UPDATE SET"
                     "   confirmed_count = staged_facts.confirmed_count + 1,"
@@ -543,8 +704,10 @@ def _commit_staged(
                     "   expires_at      = now() + interval '30 days',"
                     "   confidence      = GREATEST(staged_facts.confidence, EXCLUDED.confidence),"
                     "   qdrant_synced   = false,"
-                    "   rel_type_definition = EXCLUDED.rel_type_definition",
-                    (user_id, subject, obj, rel_type, fact_class, prov, confidence, definition),
+                    "   rel_type_definition = EXCLUDED.rel_type_definition,"
+                    "   storage_type = COALESCE(EXCLUDED.storage_type, staged_facts.storage_type),"
+                    "   taxonomies = COALESCE(EXCLUDED.taxonomies, staged_facts.taxonomies)",
+                    (user_id, subject, obj, rel_type, fact_class, prov, confidence, definition, storage_type, is_hierarchy_rel, taxonomies),
                 )
                 count += 1
         db_conn.commit()
@@ -878,19 +1041,116 @@ def _apply_taxonomy_rules(
     return rows
 
 
-def _llm_suggest_taxonomy(
-    subject: str,
-    rel_type: str,
-    obj: str,
-    qwen_api_url: str,
+def _llm_discover_taxonomy_from_facts(
     db_conn,
+    user_id: str,
+    facts: list[dict],
+    llm_url: str,
 ) -> dict | None:
     """
-    Ask the LLM whether a novel rel_type defines a group membership taxonomy.
-    Returns a dict for INSERT into entity_taxonomies, or None.
-    Deferred enhancement — returns None for now.
+    Analyze fetched facts to discover what taxonomy they might define.
+    Returns dict for INSERT into entity_taxonomies, or None if discovery fails.
+
+    Sends to LLM:
+    1. Examples of existing taxonomies (structure + rel_types)
+    2. The facts that were fetched (rel_types, count)
+    3. Request: "What taxonomy group do these rel_types define?"
+
+    LLM returns: {taxonomy_name, description, rel_types_defining_group, ...}
     """
-    return None
+    if not facts or not llm_url:
+        return None
+
+    try:
+        # Fetch existing taxonomies as examples for LLM context
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT taxonomy_name, description, rel_types_defining_group "
+                "FROM entity_taxonomies LIMIT 5"
+            )
+            examples = cur.fetchall()
+
+        if not examples:
+            log.info("taxonomy.discover_skipped", reason="no_existing_taxonomies_to_use_as_context")
+            return None
+
+        # Analyze facts: collect rel_types
+        rel_types_in_facts = [f.get("rel_type") for f in facts if f.get("rel_type")]
+        rel_type_counts = {}
+        for rt in rel_types_in_facts:
+            rel_type_counts[rt] = rel_type_counts.get(rt, 0) + 1
+
+        # Build context for LLM
+        examples_text = "\n".join([
+            f"- {name}: {desc or '(no description)'} defines members via {rels}"
+            for name, desc, rels in examples
+        ])
+
+        rel_types_text = ", ".join([f"{rt} ({cnt})" for rt, cnt in sorted(rel_type_counts.items(), key=lambda x: -x[1])])
+
+        prompt = f"""Analyze the following facts' rel_types and suggest if they define a new taxonomy group.
+
+Existing taxonomy examples (structure):
+{examples_text}
+
+Facts analyzed contain these rel_types (frequency):
+{rel_types_text}
+
+Do these rel_types define a natural grouping (taxonomy)?
+- Examples: family (parent_of, spouse, has_child), work (works_for, has_colleague), location (lives_at, born_in)
+
+If YES, respond ONLY with JSON (no markdown):
+{{"taxonomy_name": "name", "description": "brief description", "rel_types_defining_group": ["rel1", "rel2"]}}
+
+If NO, respond ONLY with:
+{{"taxonomy_name": null}}"""
+
+        headers = get_llm_headers(user_id)
+        payload = build_llm_payload(prompt, system="You are an ontology expert.", max_tokens=256)
+
+        resp = requests.post(f"{llm_url}/api/chat/completions", json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+
+        result = resp.json()
+        if not result.get("choices"):
+            return None
+
+        content = result["choices"][0].get("message", {}).get("content", "").strip()
+        if not content:
+            return None
+
+        # Parse JSON response
+        import json
+        parsed = json.loads(content)
+        if not parsed.get("taxonomy_name"):
+            log.info("taxonomy.discover_llm_declined", rel_types=list(rel_type_counts.keys()))
+            return None
+
+        # Validate taxonomy_name
+        tax_name = parsed.get("taxonomy_name", "").lower().strip()
+        if not tax_name or len(tax_name) > 64 or not all(c.isalnum() or c == '_' for c in tax_name):
+            log.warning("taxonomy.discover_invalid_name", name=tax_name)
+            return None
+
+        taxonomy_def = {
+            "taxonomy_name": tax_name,
+            "description": parsed.get("description", ""),
+            "member_entity_types": "{}",  # Will be populated as facts are classified
+            "rel_types_defining_group": parsed.get("rel_types_defining_group", []),
+            "has_transitivity": False,
+            "transitive_rel_types": "{}",
+            "is_hierarchical": False,
+            "parent_rel_type": None,
+            "source": "llm_learned",
+        }
+
+        log.info("taxonomy.discovered_by_llm", taxonomy_name=tax_name,
+                 defining_rels=taxonomy_def["rel_types_defining_group"])
+        return taxonomy_def
+
+    except Exception as e:
+        log.warning("taxonomy.discover_failed", error=str(e))
+        return None
 
 
 def _fetch_transitive_members(
@@ -973,7 +1233,7 @@ def _graph_traverse(
     user_id: str,
     entity_id: str,
     max_hops: int = 1,
-    graph_rel_types: frozenset = _REL_TYPE_GRAPH,
+    graph_rel_types: frozenset = None,
 ) -> set[str]:
     """
     Single-hop graph traversal — find all entities directly connected to entity_id
@@ -981,6 +1241,8 @@ def _graph_traverse(
 
     Returns set of connected entity UUIDs (does NOT include the starting entity).
     """
+    if graph_rel_types is None:
+        graph_rel_types = _get_graph_rels()
     connected: set[str] = set()
     graph_rels = list(graph_rel_types)
     try:
@@ -1045,7 +1307,7 @@ def _hierarchy_expand(
 
     Returns set of entity UUIDs in the chain (includes the starting entity).
     """
-    hier_rels = list(_REL_TYPE_HIERARCHY)
+    hier_rels = list(_get_hierarchy_rels())
     chain: set[str] = {entity_id}
 
     try:
@@ -1241,8 +1503,9 @@ def _refresh_rel_type_cache():
 
 
 def _get_rel_type_metadata(rel_type: str) -> dict:
-    """Return validation + routing metadata for a rel_type from the unified cache.
-    No db_conn needed — cache is startup-loaded. Handles novel rel_types gracefully.
+    """Return validation + routing metadata for a rel_type.
+    Queries DB directly to include novel rel_types approved by re_embedder.
+    Falls back to cache, then hardcoded defaults.
 
     Returns dict with: storage_target, fact_class, is_symmetric,
     inverse_rel_type, is_leaf_only, is_hierarchy_rel.
@@ -1250,16 +1513,44 @@ def _get_rel_type_metadata(rel_type: str) -> dict:
     rt = rel_type.lower().strip() if rel_type else ""
     if not rt:
         return {}
-    if not _REL_TYPE_CACHE:
-        _refresh_rel_type_cache()
-    if rt in _REL_TYPE_CACHE:
+
+    # Check cache first (faster)
+    if _REL_TYPE_CACHE and rt in _REL_TYPE_CACHE:
         return _REL_TYPE_CACHE[rt]
-    # Fallback: when DB unavailable (tests, cold start), use hardcoded seed
-    # for known rel_types. This mirrors the old frozensets but only as emergency.
+
+    # Query DB directly — includes novel rel_types approved by re_embedder
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT storage_target, fact_class, is_symmetric, inverse_rel_type, "
+                        "is_leaf_only, is_hierarchy_rel, correction_behavior FROM rel_types WHERE rel_type = %s",
+                        (rt,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        metadata = {
+                            "storage_target": row[0],
+                            "fact_class": row[1],
+                            "is_symmetric": row[2] or False,
+                            "inverse_rel_type": row[3],
+                            "is_leaf_only": row[4] or False,
+                            "is_hierarchy_rel": row[5] or False,
+                            "correction_behavior": row[6] or "supersede",
+                        }
+                        # Cache it for next time
+                        _REL_TYPE_CACHE[rt] = metadata
+                        return metadata
+        except Exception as e:
+            log.warning("rel_type_metadata.db_query_failed", rel_type=rt, error=str(e))
+
+    # Fallback: hardcoded seed for known rel_types (mirrors old frozensets)
     _fb = _FALLBACK_METADATA.get(rt)
     if _fb:
-        log.info("rel_type_cache.fallback_hit", rel_type=rt)
         return dict(_fb)
+
     # Novel/unregistered rel_type — safe defaults
     return {
         "storage_target": "facts",
@@ -1461,7 +1752,8 @@ def _get_llm_url() -> str:
     if openwebui_url:
         if not openwebui_url.startswith("http"):
             openwebui_url = f"https://{openwebui_url}"
-        endpoint = f"{openwebui_url}/api/chat/completions"
+        # OpenWebUI uses OpenAI-compatible /v1/chat/completions endpoint (not /api)
+        endpoint = f"{openwebui_url}/v1/chat/completions"
         log.info("llm_endpoint.openwebui_detected", url=endpoint)
         return endpoint
 
@@ -1475,6 +1767,71 @@ def _get_llm_url() -> str:
     fallback = "http://localhost:11434/v1/chat/completions"
     log.warning("llm_endpoint.hardcoded_fallback", url=fallback)
     return fallback
+
+
+def _get_llm_url_fallbacks() -> list[str]:
+    """Return list of LLM endpoint URLs to try in order (fallback chain).
+
+    Supports multiple access paths to OpenWebUI:
+    - Host address: 192.168.1.10:3000
+    - Reverse proxy: example.com
+    - Docker internal IP: 172.16.9.2:3000
+    - Container reference: open-webui:3000
+
+    Tries each in priority order until one succeeds (for resilience).
+    """
+    urls = []
+
+    # Primary: configured OPENWEBUI_URL
+    openwebui_base = os.environ.get("OPENWEBUI_URL", "").strip()
+    if openwebui_base:
+        if not openwebui_base.startswith("http"):
+            openwebui_base = f"https://{openwebui_base}"
+        urls.append(f"{openwebui_base}/api/chat/completions")
+
+    # Secondary: Try container name (open-webui:3000) for Docker networking
+    # Extract port if provided in base URL
+    if openwebui_base:
+        # Parse port from URL if available
+        import re
+        port_match = re.search(r':(\d+)(?:/|$)', openwebui_base)
+        port = port_match.group(1) if port_match else "3000"
+        urls.append(f"http://open-webui:{port}/api/chat/completions")
+    else:
+        urls.append("http://open-webui:3000/api/chat/completions")
+
+    # Tertiary: Try Docker internal IP (172.16.9.2:3000)
+    if openwebui_base:
+        port_match = re.search(r':(\d+)(?:/|$)', openwebui_base)
+        port = port_match.group(1) if port_match else "3000"
+        urls.append(f"http://172.16.9.2:{port}/api/chat/completions")
+    else:
+        urls.append("http://172.16.9.2:3000/api/chat/completions")
+
+    # Quaternary: Try reverse proxy if configured
+    reverse_proxy = os.environ.get("OPENWEBUI_REVERSE_PROXY", "").strip()
+    if reverse_proxy:
+        if not reverse_proxy.startswith("http"):
+            reverse_proxy = f"https://{reverse_proxy}"
+        urls.append(f"{reverse_proxy}/api/chat/completions")
+
+    # Quinary: QWEN_API_URL direct fallback
+    qwen_url = os.environ.get("QWEN_API_URL")
+    if qwen_url:
+        urls.append(qwen_url)
+
+    # Finally: Hardcoded localhost fallback
+    urls.append("http://localhost:11434/v1/chat/completions")
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+
+    return unique_urls
 
 def _configured_llm_url() -> str:
     """Return the cached LLM URL (set at startup)."""
@@ -1614,6 +1971,14 @@ async def lifespan(app: FastAPI):
                      constraint_len=len(_rel_type_constraint))
         except Exception as e:
             log.error("startup.rel_type_registry_failed", error=str(e))
+
+        # dprompt-125: Load rel_type aliases for LLM variation normalization
+        global _REL_TYPE_ALIASES
+        try:
+            _REL_TYPE_ALIASES = _load_rel_type_aliases()
+            log.info("startup.rel_type_aliases_loaded", alias_count=len(_REL_TYPE_ALIASES))
+        except Exception as e:
+            log.warning("startup.rel_type_aliases_failed", error=str(e))
 
     log.info("startup.gliner2_loading")
     try:
@@ -2013,9 +2378,15 @@ def _validate_rel_type_constraints(fact_dict: dict, rel_type_meta: dict, db) -> 
     return True, "ok"
 
 
-def _filter_extracted_entities(entities: list) -> list:
+def _filter_extracted_entities(
+    entities: list,
+    hierarchy_entity_types: list = None
+) -> list:
     """
     Filter GLiNER2 extracted entities to only valid named entity types (dprompt-97).
+
+    dprompt-129: If hierarchy_entity_types provided, filter to only those types.
+    Otherwise, use default VALID_ENTITY_TYPES (backward compat).
 
     Rejects:
     - Stop words (the, a, and, prefers, called, someone, married, spouse, etc.)
@@ -2024,12 +2395,17 @@ def _filter_extracted_entities(entities: list) -> list:
     - Single-letter noise
 
     Keeps:
-    - Person, Organization, Location, Object, Event types
+    - Person, Organization, Location, Object, Event, Animal types (or hierarchy-specified types)
     """
     if not entities:
         return []
 
-    VALID_ENTITY_TYPES = {"Person", "Organization", "Location", "Object", "Event", "Animal"}
+    # dprompt-129: Use hierarchy_entity_types if provided, else default
+    if hierarchy_entity_types:
+        VALID_ENTITY_TYPES = set(hierarchy_entity_types)
+    else:
+        VALID_ENTITY_TYPES = {"Person", "Organization", "Location", "Object", "Event", "Animal"}
+
     REJECT_TYPES = {"Concept", "unknown", "Unknown"}
 
     # English stop words + rel_types + attribute descriptors (comprehensive, no recursive matching)
@@ -2131,6 +2507,38 @@ def health():
     }
     _health_cache_ts = _now
     return _health_cache
+
+
+@app.post("/admin/cache/clear-embeddings")
+async def clear_embedding_cache_endpoint(api_key: str):
+    """Emergency endpoint to clear embedding cache (requires admin key).
+
+    dprompt-121: Use ONLY if rel_types were renamed/deleted or embedding model was upgraded.
+    Cache will auto-repopulate on next eval cycle.
+
+    Args:
+        api_key: Must match ADMIN_API_KEY environment variable
+
+    Returns:
+        Status and count of entries deleted
+    """
+    admin_key = os.getenv("ADMIN_API_KEY")
+    if not admin_key or api_key != admin_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
+
+    # Import here to avoid circular dependency
+    try:
+        from src.re_embedder.embedder import _embedding_cache
+        if _embedding_cache and _embedding_cache.client:
+            deleted = _embedding_cache.clear_pattern(f"{_embedding_cache.prefix}*")
+            log.info("admin.embedding_cache_cleared", entries_deleted=deleted)
+            return {"status": "cleared", "entries_deleted": deleted}
+        else:
+            return {"status": "cache_unavailable"}
+    except Exception as e:
+        log.error("admin.embedding_cache_clear_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Cache clear failed: {str(e)}")
+
 
 @app.post("/ontology/rel_types")
 def add_rel_type(req: RelTypeRequest):
@@ -2264,6 +2672,258 @@ def _build_extract_context(user_id: str) -> dict:
     return context
 
 
+def _infer_hierarchy_from_signals(
+    extracted_entities: list,
+    extracted_rel_types: list,
+    user_id: str,
+    hierarchy_id_param: str,
+    db
+) -> dict:
+    """
+    dprompt-129: Layered hierarchy inference (fast path optimization).
+
+    Tries entity_types first (easiest), falls back to rel_types (harder),
+    combines both if needed. Returns on first unique match (fast path).
+
+    Returns: {"hierarchy_id": uuid, "entity_types": [...], "confidence": 0.95, "layer": "entity_types"}
+    or None (no match, backward compat)
+    """
+    # PRIORITY 0: Explicit hierarchy_id param always wins
+    if hierarchy_id_param:
+        try:
+            with db.cursor() as cur:
+                cur.execute("""
+                    SELECT id, entity_types
+                    FROM entity_taxonomies
+                    WHERE user_id = %s AND id = %s::uuid
+                """, (user_id, hierarchy_id_param))
+                row = cur.fetchone()
+            if row:
+                return {
+                    "hierarchy_id": str(row[0]),
+                    "entity_types": row[1] or [],
+                    "confidence": 1.0,
+                    "layer": "explicit_param",
+                }
+        except Exception as e:
+            log.warning("ingest.explicit_hierarchy_lookup_failed",
+                       hierarchy_id=hierarchy_id_param, error=str(e))
+        return None  # Explicit param provided but not found
+
+    # LAYER 1 (EASIEST): Match entity_types only
+    detected_entity_types = {e.get("type") for e in extracted_entities if e.get("type")}
+    if detected_entity_types:
+        matching_hierarchies = _find_hierarchies_by_entity_types(
+            detected_entity_types, user_id, db
+        )
+        if len(matching_hierarchies) == 1:
+            # UNIQUE match on Layer 1 — fast path
+            best = matching_hierarchies[0]
+            log.info("ingest.hierarchy_inferred", layer="entity_types",
+                    hierarchy_id=best[0], entity_types=detected_entity_types)
+            return {
+                "hierarchy_id": str(best[0]),
+                "entity_types": best[1] or [],
+                "confidence": 0.95,
+                "layer": "entity_types",
+            }
+        elif len(matching_hierarchies) > 1:
+            log.info("ingest.hierarchy_ambiguous", layer="entity_types",
+                    detected_types=detected_entity_types, num_matches=len(matching_hierarchies))
+
+    # LAYER 2 (HARDER): Match rel_types only
+    detected_rel_types = set(extracted_rel_types) if extracted_rel_types else set()
+    if detected_rel_types:
+        try:
+            matching_hierarchies = _find_hierarchies_by_rel_types(
+                detected_rel_types, user_id, db
+            )
+            if len(matching_hierarchies) == 1:
+                # UNIQUE match on Layer 2
+                best = matching_hierarchies[0]
+                log.info("ingest.hierarchy_inferred", layer="rel_types",
+                        hierarchy_id=best[0], rel_types=detected_rel_types)
+                return {
+                    "hierarchy_id": str(best[0]),
+                    "entity_types": best[1] or [],
+                    "confidence": 0.85,
+                    "layer": "rel_types",
+                }
+            elif len(matching_hierarchies) > 1:
+                log.info("ingest.hierarchy_ambiguous", layer="rel_types",
+                        detected_rel_types=detected_rel_types, num_matches=len(matching_hierarchies))
+        except Exception as e:
+            log.warning("ingest.rel_type_hierarchy_lookup_failed", error=str(e))
+
+    # LAYER 3 (COMBINE): Both signals together
+    if detected_entity_types and detected_rel_types:
+        try:
+            matching_hierarchies = _find_hierarchies_by_both(
+                detected_entity_types, detected_rel_types, user_id, db
+            )
+            if matching_hierarchies:
+                best = matching_hierarchies[0]  # Top-scored match
+                log.info("ingest.hierarchy_inferred", layer="both_signals",
+                        hierarchy_id=best[0])
+                return {
+                    "hierarchy_id": str(best[0]),
+                    "entity_types": best[1] or [],
+                    "confidence": 0.8,
+                    "layer": "both_entity_types_and_rel_types",
+                }
+        except Exception as e:
+            log.warning("ingest.combined_hierarchy_lookup_failed", error=str(e))
+
+    # FALLBACK: No match on any layer (backward compat)
+    log.info("ingest.no_hierarchy_inferred",
+            detected_entity_types=detected_entity_types,
+            detected_rel_types=detected_rel_types)
+    return None
+
+
+def _find_hierarchies_by_entity_types(detected_types: set, user_id: str, db) -> list:
+    """Layer 1: Find hierarchies whose entity_types overlap with detected types."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT id, entity_types
+                FROM entity_taxonomies
+                WHERE user_id = %s
+                ORDER BY ARRAY_LENGTH(entity_types, 1) DESC
+                LIMIT 10
+            """, (user_id,))
+            rows = cur.fetchall()
+
+        matches = []
+        for row in rows:
+            hierarchy_types = set(row[1]) if row[1] else set()
+            overlap = len(detected_types & hierarchy_types)
+            if overlap > 0:
+                matches.append((row[0], row[1], overlap))
+
+        # Sort by overlap score descending
+        matches.sort(key=lambda x: x[2], reverse=True)
+        return matches
+    except Exception as e:
+        log.warning("find_hierarchies_by_entity_types_failed", error=str(e))
+        return []
+
+
+def _find_hierarchies_by_rel_types(detected_rel_types: set, user_id: str, db) -> list:
+    """Layer 2: Find hierarchies whose rel_types overlap with detected rel_types."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT et.id, et.entity_types
+                FROM entity_taxonomies et
+                WHERE et.user_id = %s
+                ORDER BY et.created_at DESC
+                LIMIT 10
+            """, (user_id,))
+            rows = cur.fetchall()
+
+        return [(row[0], row[1]) for row in rows if row]
+    except Exception as e:
+        log.warning("find_hierarchies_by_rel_types_failed", error=str(e))
+        return []
+
+
+def _find_hierarchies_by_both(
+    detected_entity_types: set,
+    detected_rel_types: set,
+    user_id: str,
+    db
+) -> list:
+    """Layer 3: Find hierarchies matching BOTH entity_types AND rel_types."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT et.id, et.entity_types
+                FROM entity_taxonomies et
+                WHERE et.user_id = %s
+                ORDER BY ARRAY_LENGTH(et.entity_types, 1) DESC
+                LIMIT 10
+            """, (user_id,))
+            rows = cur.fetchall()
+
+        matches = []
+        for row in rows:
+            hierarchy_types = set(row[1]) if row[1] else set()
+            entity_overlap = len(detected_entity_types & hierarchy_types)
+            if entity_overlap > 0:
+                matches.append((row[0], row[1], entity_overlap))
+
+        # Sort by combined score
+        matches.sort(key=lambda x: x[2], reverse=True)
+        return matches
+    except Exception as e:
+        log.warning("find_hierarchies_by_both_failed", error=str(e))
+        return []
+
+
+def _validate_triple_against_metadata(triple: dict, db) -> dict:
+    """
+    dprompt-129: Validate triple against rel_types metadata.
+
+    Checks head_types/tail_types constraints. Records validation error
+    but does NOT force low confidence — ingest logic decides confidence
+    based on whether it's user-stated (direct user correction bypasses
+    type constraints). Novel rel_types pass through (Class C).
+    """
+    rel_type = (triple.get("rel_type") or "").lower().strip()
+    subject_type = (triple.get("subject_type") or "").upper().strip()
+    object_type = (triple.get("object_type") or "").upper().strip()
+
+    if not rel_type:
+        return triple  # No rel_type, can't validate
+
+    try:
+        with db.cursor() as cur:
+            cur.execute("""
+                SELECT head_types, tail_types
+                FROM rel_types WHERE rel_type = %s
+            """, (rel_type,))
+            row = cur.fetchone()
+
+        if not row:
+            # Novel rel_type: pass through (Class C, WGM gate evaluates)
+            return triple
+
+        head_types = row[0] or []  # JSON array
+        tail_types = row[1] or []  # JSON array
+
+        # If rel_type has NO constraints, passes all types
+        if not head_types and not tail_types:
+            return triple
+
+        # Validate: subject_type in head_types AND object_type in tail_types
+        valid = True
+        if head_types and subject_type not in head_types:
+            valid = False
+        if tail_types and object_type not in tail_types:
+            valid = False
+
+        if not valid:
+            # Validation error: Record it but don't force low confidence.
+            # Ingest logic will decide confidence based on is_correction flag
+            # (user-stated facts override type constraints).
+            # This allows corrections like "update my IP to 192.168.1.1" to be
+            # treated as high-confidence user-driven updates, not low-confidence errors.
+            triple["validation_error"] = (
+                f"Type mismatch: ({subject_type}, {rel_type}, {object_type}) "
+                f"not in metadata (expected {head_types}, {tail_types})"
+            )
+            log.info("extract.triple_validation_warning",
+                    triple=triple, error=triple["validation_error"],
+                    note="Type mismatch recorded but confidence not forced low — ingest decides based on user-stated flag")
+
+        return triple
+    except Exception as e:
+        log.warning("validate_triple_against_metadata_failed",
+                   rel_type=rel_type, error=str(e))
+        return triple
+
+
 @app.post("/extract")
 def extract(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -2376,9 +3036,14 @@ EXTRACT RULES:
 1. Identity: pref_name, also_known_as, same_as (pronouns → entities)
 2. Entity types: instance_of for EVERY entity (person, location, organization, object, animal, concept, etc.)
 3. Hierarchies: For locations, extract nested containment (street→city→state→country)
-4. Lists with relationships: "My children are Gabby, Des" → (user, parent_of, gabby), (user, parent_of, des), plus pref_name for each
-5. All relationships mentioned (family, work, location, ownership, knowledge, etc.)
-6. Attributes as rel_types: age, occupation, nationality (when object is a scalar value)
+4. Family kinship (CRITICAL):
+   - "My children are Gabby, Des" → (user, parent_of, gabby), (user, parent_of, des)
+   - "My son's name is X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a DIFFERENT entity from user
+   - "My daughter is named X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a child, NOT an alias of user
+   - "My spouse/wife/husband is X" → (user, spouse, x), THEN (x, pref_name, x) — X is a separate entity
+5. Lists with relationships: Extract all names separately with parent_of or spouse relationships
+6. All relationships mentioned (family, work, location, ownership, knowledge, etc.)
+7. Attributes as rel_types: age, occupation, nationality (when object is a scalar value)
 
 FIRST-PERSON RULE: Use 'user' for "I"/"me"/"my"/"we" statements — NEVER the pronoun literally.
 
@@ -2390,8 +3055,9 @@ RELATIONSHIP TYPES (from knowledge graph):
     if db_connection:
         try:
             with db_connection.cursor() as cur:
+                # dprompt-126: Phase 3a — Include natural_language descriptions
                 cur.execute("""
-                    SELECT category, rel_type, is_symmetric, inverse_rel_type, tail_types
+                    SELECT category, rel_type, is_symmetric, inverse_rel_type, tail_types, natural_language
                     FROM rel_types
                     WHERE category IS NOT NULL
                     ORDER BY category, rel_type
@@ -2410,27 +3076,38 @@ RELATIONSHIP TYPES (from knowledge graph):
                         "rel_type": row[1],
                         "is_symmetric": row[2],
                         "inverse": row[3],
-                        "tail_types": row[4]
+                        "tail_types": row[4],
+                        "natural_language": row[5]
                     })
 
-            # Build category examples
+            # Build category examples with natural language context
             for cat in sorted(by_category.keys()):
                 base_prompt += f"\n{cat.title()}:\n"
                 for ex in by_category[cat]:
                     rt = ex["rel_type"]
                     sym = " (symmetric)" if ex["is_symmetric"] else ""
                     inv = f" ↔ {ex['inverse']}" if ex["inverse"] else ""
-                    base_prompt += f"  - {rt}{sym}{inv}\n"
+                    nl = ex.get("natural_language", "")
+
+                    # Format: "  - rel_type: natural language description (metadata)"
+                    if nl:
+                        base_prompt += f'  - {rt}: "{nl}" {sym}{inv}\n'
+                    else:
+                        base_prompt += f"  - {rt}{sym}{inv}\n"
 
         except Exception as e:
             log.warning("extract_prompt.db_query_failed", error=str(e))
             # Fallback to minimal core examples
             base_prompt += """
 Core:
-  - pref_name, also_known_as, same_as (identity)
-  - instance_of (entity type classification)
-  - parent_of ↔ child_of, spouse (family)
-  - works_for, located_in, has_pet (relationships)
+  - pref_name: entity's preferred name (identity)
+  - also_known_as: entity's alias (identity)
+  - instance_of: "X is an instance of Y" (entity type classification)
+  - parent_of: "X is the parent of Y" (family, asymmetric ↔ child_of)
+  - spouse: "X and Y are spouses" (family, symmetric)
+  - works_for: "X works for Y" (work, asymmetric)
+  - located_in: "X is located in Y" (location)
+  - has_pet: "X has a pet Y" (ownership)
 """
     else:
         # DB unavailable - use minimal core examples
@@ -2513,8 +3190,8 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
 
         messages.append({"role": "user", "content": user_content})
 
-        # Call LLM using persistent pooled client
-        # dprompt-120: Use centralized payload builder (no stream parameter)
+        # Call LLM using persistent pooled client with fallback chain
+        # dprompt-129: Try multiple endpoints (host IP, container name, Docker IP, reverse proxy)
         from src.api.llm_client import build_llm_payload
         payload = build_llm_payload(
             messages=messages,
@@ -2524,13 +3201,47 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             max_tokens=1200,
             thinking={"type": "disabled"},
         )
-        response = await _http_client.post(
-            qwen_url,
-            json=payload,
-            headers=get_llm_headers(),
-            timeout=120,
-        )
-        response.raise_for_status()
+
+        # Try fallback chain of LLM endpoints
+        llm_urls = _get_llm_url_fallbacks()
+        response = None
+        last_error = None
+        primary_url_failed = False
+
+        for attempt, llm_url in enumerate(llm_urls, 1):
+            try:
+                log.info("extract_rewrite.llm_attempt", attempt=attempt, url=llm_url, total_attempts=len(llm_urls))
+                response = await _http_client.post(
+                    llm_url,
+                    json=payload,
+                    headers=get_llm_headers(),
+                    timeout=120,
+                )
+                response.raise_for_status()
+                log.info("extract_rewrite.llm_success", attempt=attempt, url=llm_url)
+                break  # Success, exit loop
+            except Exception as e:
+                last_error = e
+                # Log primary URL failure prominently (from .env OPENWEBUI_URL)
+                if attempt == 1:
+                    primary_url = os.environ.get("OPENWEBUI_URL", "")
+                    if primary_url and primary_url in llm_url:
+                        log.error("extract_rewrite.primary_url_failed",
+                                 configured_url=primary_url,
+                                 error=str(e),
+                                 message="Primary OPENWEBUI_URL from .env is unreachable. Check configuration.")
+                        primary_url_failed = True
+
+                log.warning("extract_rewrite.llm_attempt_failed", attempt=attempt, url=llm_url, error=str(e))
+                if attempt == len(llm_urls):
+                    # All attempts exhausted
+                    error_msg = f"All {len(llm_urls)} LLM endpoints failed. Last error: {str(last_error)}"
+                    if primary_url_failed:
+                        error_msg += f"\n[PRIMARY FAILURE] Check OPENWEBUI_URL={os.environ.get('OPENWEBUI_URL', 'not set')} in .env"
+                    raise Exception(error_msg)
+
+        if response is None:
+            raise Exception(f"LLM endpoint unreachable. Last error: {str(last_error)}")
 
         result = response.json()
         content = result["choices"][0]["message"]["content"].strip()
@@ -2551,6 +3262,38 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             if isinstance(t, dict) and t.get("subject") and t.get("object") and t.get("rel_type")
         ]
         triples = valid_triples
+
+        # dprompt-129: Validate triples against rel_types metadata (head_types/tail_types)
+        # This gates novel rel_types and marks type mismatches as low-confidence
+        try:
+            import psycopg2
+            db = psycopg2.connect(os.getenv("POSTGRES_DSN"))
+            triples = [_validate_triple_against_metadata(t, db) for t in triples]
+            db.close()
+        except Exception as e:
+            log.warning("extract.validation_skipped", error=str(e))
+            # Continue without validation if DB unavailable (fallback to WGM gate)
+
+        # dprompt-126: Phase 1 — Normalize rel_type aliases with directionality preservation
+        for triple in triples:
+            rel_type_raw = (triple.get("rel_type") or "").lower().strip()
+            if rel_type_raw:
+                canonical, requires_inversion = _get_canonical_rel_type_with_directionality(rel_type_raw)
+
+                if canonical and canonical != rel_type_raw:
+                    triple["rel_type"] = canonical
+
+                    # Apply inversion if this alias maps to a different direction
+                    if requires_inversion:
+                        original_subject = triple["subject"]
+                        original_object = triple["object"]
+                        triple["subject"] = original_object
+                        triple["object"] = original_subject
+                        log.info("extract.rel_type_inverted",
+                                 original_rel_type=rel_type_raw, canonical=canonical,
+                                 subject_before=original_subject, subject_after=original_object,
+                                 user_id=req.user_id)
+
         log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
         return {
             "status": "success",
@@ -3028,6 +3771,19 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                          original=rel_type_lower, normalized=base_rel,
                                          reason="symmetric rel_type has _of suffix removed")
 
+                    # dprompt-125: Normalize LLM rel_type variations to canonical via DB aliases.
+                    # Query rel_type_aliases table (seeded with Wikidata, extended by re_embedder).
+                    # Prevents novel rel_types from being dropped as Class C.
+                    for t in rewrite_data.get("triples", []):
+                        rel_type_original = (t.get("rel_type") or "").lower().strip()
+                        if rel_type_original:
+                            canonical = _get_canonical_rel_type(rel_type_original)
+                            if canonical != rel_type_original and canonical:
+                                t["rel_type"] = canonical
+                                log.info("ingest.rel_type_aliased",
+                                         original=rel_type_original, canonical=canonical,
+                                         reason="rel_type_aliases lookup")
+
                     # dprompt-086: Remove triples with unresolved third-person pronouns.
                     # The prompt instructs the LLM to resolve "it"/"he"/"she" from context;
                     # if the LLM emits them literally, we cannot guess the referent.
@@ -3207,28 +3963,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 is_correction=False,
             )
 
-    # dprompt-45: Detect negated pref_name corrections in text patterns.
-    # "My name is X, not Y" or "Call me X, not Y" → supersede the Y fact.
-    # Searches for "not <Word>" where <Word> matches a pref_name edge object.
-    _negation_pattern = re.compile(r'\bnot\s+([a-z]+)', re.IGNORECASE)
-    _negated_names = {m.lower() for m in _negation_pattern.findall(req.text)}
-    if _negated_names:
-        for key, edge in list(edges_dict.items()):
-            if (edge.rel_type.lower() in ("pref_name", "also_known_as")
-                    and edge.object.lower() in _negated_names):
-                # Mark the negated name as a correction — it should supersede the old fact
-                corrected_edge = EdgeInput(
-                    subject=edge.subject,
-                    object=edge.object,
-                    rel_type=edge.rel_type,
-                    is_preferred_label=edge.is_preferred_label,
-                    is_correction=True,
-                    subject_type=edge.subject_type,
-                    object_type=edge.object_type,
-                )
-                edges_dict[key] = corrected_edge
-                log.info("ingest.negated_name_correction_detected",
-                         negated_name=edge.object, rel_type=edge.rel_type)
+    # dprompt-129: Correction detection via LLM is_correction metadata (filter.py),
+    # not hardcoded regex patterns. The filter already marks corrections semantically.
+    # is_correction flag is propagated through IngestRequest → edges_dict.
+    # No regex-based "not X" pattern detection here (was dprompt-45, removed for universality).
 
     edges = list(edges_dict.values())
 
@@ -3701,7 +4439,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             )
                         db.commit()
                         _scalar_category = (
-                            _REL_TYPE_META.get(edge.rel_type.lower(), {}).get("category")
+                            _get_rel_type_category(edge.rel_type)
                             or _infer_category(edge.rel_type.lower())
                         )
                         with db.cursor() as _cur:
@@ -3902,7 +4640,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         req.user_id, fact_subject, canonical_object,
                         canonical_rel_type, req.source, is_pref,
                         fact_class, confidence, is_engine_generated,
-                        getattr(edge, 'definition', '') or ''
+                        getattr(edge, 'definition', '') or '',
+                        classification_3d.get("storage", "unknown_staging"),
+                        classification_3d.get("is_hierarchy_rel", False),
+                        classification_3d.get("taxonomies", [])
                     ))
 
             # Apply taxonomy rules to annotate facts with grouping context
@@ -4087,14 +4828,26 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 class_b_rows = []
                 class_c_rows = []
 
-                for user_id, subject, obj, rel_type, source, is_preferred, fact_class, _, is_engine_generated, definition in rows:
-                    defn = definition or ''
+                for row in rows:
+                    user_id = row[0]
+                    subject = row[1]
+                    obj = row[2]
+                    rel_type = row[3]
+                    source = row[4]
+                    is_preferred = row[5]
+                    fact_class = row[6]
+                    is_engine_generated = row[8]
+                    defn = row[9] or ''
+                    storage_type = row[10] if len(row) > 10 else "unknown_staging"
+                    is_hierarchy_rel = row[11] if len(row) > 11 else False
+                    taxonomies = row[12] if len(row) > 12 else []
+
                     if fact_class == "A":
-                        class_a_rows.append((user_id, subject, obj, rel_type, source, is_preferred, defn))
+                        class_a_rows.append((user_id, subject, obj, rel_type, source, is_preferred, defn, storage_type, is_hierarchy_rel, taxonomies))
                     elif fact_class == "B":
-                        class_b_rows.append((user_id, subject, obj, rel_type, source, defn))
+                        class_b_rows.append((user_id, subject, obj, rel_type, source, defn, storage_type, is_hierarchy_rel, taxonomies))
                     else:
-                        class_c_rows.append((user_id, subject, obj, rel_type, source, defn))
+                        class_c_rows.append((user_id, subject, obj, rel_type, source, defn, storage_type, is_hierarchy_rel, taxonomies))
 
                 committed = 0
                 staged = 0
@@ -4221,8 +4974,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # Build set of preferred objects from pref_name rows in this batch
                 # e.g. christopher → chris → pref_name means "chris" is preferred
                 batch_preferred_objects = {
-                    obj.lower() for _, subject, obj, rel_type, _, is_preferred, _defn in resolved_rows
-                    if rel_type.lower() == "pref_name" and is_preferred
+                    row[2].lower() for row in resolved_rows
+                    if row[3].lower() == "pref_name" and row[5]
                 }
 
                 with db.cursor() as cur:
@@ -4458,7 +5211,7 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
     if not entity_ids:
         return results
     try:
-        hier_rels = list(_REL_TYPE_HIERARCHY)
+        hier_rels = list(_get_hierarchy_rels())
         with db_conn.cursor() as cur:
             entity_placeholders = ",".join(["%s"] * len(entity_ids))
             rel_placeholders = ",".join(["%s"] * len(hier_rels))
@@ -4482,7 +5235,7 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
                         "subject": r[0], "object": r[1], "rel_type": r[2],
                         "provenance": r[3],
                         "confidence": float(r[4]) if r[4] else 1.0,
-                        "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                        "category": _get_rel_type_category(r[2]),
                         "fact_state": "long_term",
                         "fact_class": r[6] if r[6] else "A",
                         "staged_confirmations": r[5] if r[5] else 0,
@@ -4508,7 +5261,7 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
                         "subject": r[0], "object": r[1], "rel_type": r[2],
                         "provenance": r[3],
                         "confidence": float(r[4]) if r[4] else 0.0,
-                        "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                        "category": _get_rel_type_category(r[2]),
                         "fact_state": "staged",
                         "fact_class": r[6] if r[6] else "B",
                         "staged_confirmations": r[5] if r[5] else 0,
@@ -4539,6 +5292,7 @@ def query(request: QueryRequest):
         user_id: str,
         entity_id: str = None,
         rel_types: tuple[str, ...] = None,
+        taxonomies: set[str] = None,
     ) -> list[dict]:
         """
         Fetch facts from BOTH facts and staged_facts tables.
@@ -4546,6 +5300,10 @@ def query(request: QueryRequest):
         issues with psycopg2 shared params across multiple SELECTs.
         Attaches fact_state metadata so the Filter can distinguish
         long-term (authoritative) from staged (provisional) facts.
+
+        taxonomies: Optional set of taxonomy names to filter by (e.g., {'family', 'work'}).
+                   When provided, only returns facts whose taxonomies overlap with this set.
+
         Returns list of {subject, object, rel_type, provenance, confidence,
                           category, fact_state, fact_class, is_preferred_label,
                           staged_confirmations, promoted_at, expires_at} dicts.
@@ -4570,6 +5328,10 @@ def query(request: QueryRequest):
                     f_conds.append("(subject_id = %s OR object_id = %s)")
                     s_conds.append("(subject_id = %s OR object_id = %s)")
 
+                if taxonomies:
+                    f_conds.append("taxonomies && %s::text[]")
+                    s_conds.append("taxonomies && %s::text[]")
+
                 f_where = " AND ".join(f_conds)
                 s_where = " AND ".join(s_conds)
 
@@ -4585,6 +5347,10 @@ def query(request: QueryRequest):
                 if entity_id:
                     f_params.extend([entity_id, entity_id])
                     s_params.extend([entity_id, entity_id])
+
+                if taxonomies:
+                    f_params.append(list(taxonomies))
+                    s_params.append(list(taxonomies))
 
                 # --- Query 1: facts table (long-term) ---
                 f_query = (
@@ -4604,7 +5370,7 @@ def query(request: QueryRequest):
                             "subject": r[0], "object": r[1], "rel_type": r[2],
                             "provenance": r[3],
                             "confidence": float(r[4]) if r[4] else 1.0,
-                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                            "category": _get_rel_type_category(r[2]),
                             "fact_state": "long_term",
                             "fact_class": r[6] if r[6] else "A",
                             "is_preferred_label": bool(r[7]) if r[7] is not None else False,
@@ -4631,7 +5397,7 @@ def query(request: QueryRequest):
                             "subject": r[0], "object": r[1], "rel_type": r[2],
                             "provenance": r[3],
                             "confidence": float(r[4]) if r[4] else 0.0,
-                            "category": _REL_TYPE_META.get(r[2], {}).get("category") or _infer_category(r[2]),
+                            "category": _get_rel_type_category(r[2]),
                             "fact_state": "staged",
                             "fact_class": r[6] if r[6] else "B",
                             "is_preferred_label": False,
@@ -5025,42 +5791,71 @@ def query(request: QueryRequest):
         user_entity_id_for_query = None
         canonical_identity = None
 
-    query_lower = request.text.lower()
     direct_facts = []
-
-    # dprompt-47: detect query intent by keyword → map to taxonomy group
-    _TAXONOMY_KEYWORDS = {
-        "family": {"my family", "my children", "my kids", "my wife", "my husband",
-                    "my spouse", "my son", "my daughter", "my parents", "my sibling",
-                    "my brother", "my sister", "my mother", "my father", "tell me about my family"},
-        "household": {"my pets", "my animals", "my household", "tell me about my pets",
-                       "who lives with me", "my home"},
-        "work": {"my job", "my work", "my boss", "my coworkers", "my colleagues",
-                  "who do i work with", "my employer", "my office"},
-        "location": {"where do i live", "my address", "my city", "my country",
-                      "my location", "where am i", "my neighbourhood"},
-        "computer_system": {"my computer", "my laptop", "my server", "my device",
-                             "my system", "my machine", "my workstation"},
-    }
-    _detected_taxonomy = None
-    for _tax_name, _keywords in _TAXONOMY_KEYWORDS.items():
-        if any(_kw in query_lower for _kw in _keywords):
-            _detected_taxonomy = _tax_name
-            log.info("query.taxonomy_detected", taxonomy=_tax_name, query=query_lower[:80])
-            break
+    detected_taxonomies = None
 
     # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
     # dprompt-88d: fetch from ALL user identity entities, not just the first one
+    # SOLUTION-CLASSIFY-FORWARD: Use pre-computed taxonomies for scope filtering
+    # Taxonomy detection: (1) query entity_taxonomies, (2) if none found, LLM discovers and creates new taxonomy
     if db and registry and canonical_identity:
-        direct_facts = []
+        # Fetch baseline facts without taxonomy filtering
         for eid in user_entity_ids_for_query:
             direct_facts.extend(_fetch_user_facts(db, user_id, entity_id=eid))
+
+        # Detect scope from fact rel_types using DB metadata
+        if direct_facts:
+            try:
+                detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
+                if detected_taxonomies:
+                    log.info("query.scope_detected_from_facts", taxonomies=list(detected_taxonomies),
+                             fact_count=len(direct_facts))
+                else:
+                    # Fallback: LLM discovers what taxonomy these facts might define
+                    log.info("query.no_taxonomy_detected_attempting_discovery", fact_count=len(direct_facts))
+                    discovered = _llm_discover_taxonomy_from_facts(db, user_id, direct_facts, qwen_api_url)
+                    if discovered:
+                        # Create the taxonomy in DB
+                        try:
+                            with db.cursor() as cur:
+                                cur.execute(
+                                    "INSERT INTO entity_taxonomies "
+                                    "(taxonomy_name, description, member_entity_types, rel_types_defining_group, "
+                                    "has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, source) "
+                                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                    (
+                                        discovered["taxonomy_name"],
+                                        discovered.get("description", ""),
+                                        discovered.get("member_entity_types", "{}"),
+                                        discovered.get("rel_types_defining_group", []),
+                                        discovered.get("has_transitivity", False),
+                                        discovered.get("transitive_rel_types", "{}"),
+                                        discovered.get("is_hierarchical", False),
+                                        discovered.get("parent_rel_type"),
+                                        discovered.get("source", "llm_learned"),
+                                    ),
+                                )
+                            db.commit()
+                            # Reload taxonomy cache
+                            _load_taxonomy_cache(db)
+                            # Re-detect with the new taxonomy
+                            detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
+                            log.info("query.taxonomy_created_and_detected",
+                                     taxonomy_name=discovered["taxonomy_name"],
+                                     taxonomies_detected=list(detected_taxonomies or []))
+                        except Exception as e:
+                            log.warning("query.taxonomy_creation_failed", error=str(e))
+            except Exception as e:
+                log.warning("query.scope_detection_failed", error=str(e))
+                detected_taxonomies = None
+
         # Debug: log what facts fetched for user (dprompt-88b)
         user_rels = {}
         for f in direct_facts:
             rt = f.get("rel_type", "unknown")
             user_rels[rt] = user_rels.get(rt, 0) + 1
-        log.info("query.initial_user_facts", count=len(direct_facts), rel_types=dict(sorted(user_rels.items())))
+        log.info("query.initial_user_facts", count=len(direct_facts), rel_types=dict(sorted(user_rels.items())),
+                 detected_taxonomies=list(detected_taxonomies or []))
 
     if direct_facts or (db and registry and canonical_identity):
         try:
@@ -5142,7 +5937,7 @@ def query(request: QueryRequest):
                                     seen.add(_key)
                     log.info("query.hierarchy_expanded",
                              enriched_entities=len(_enriched),
-                             new_hierarchy_facts=sum(1 for f in direct_facts if f.get("rel_type") in _REL_TYPE_HIERARCHY),
+                             new_hierarchy_facts=sum(1 for f in direct_facts if f.get("rel_type") in _get_hierarchy_rels()),
                              total_facts=len(direct_facts))
 
                 # dBug-019: fetch hierarchy facts for graph-connected entities
@@ -5333,7 +6128,7 @@ def query(request: QueryRequest):
                                 "rel_type": row[2],
                                 "provenance": row[3],
                                 "confidence": float(row[4]) if row[4] else 0.0,
-                                "category": _REL_TYPE_META.get(row[2], {}).get("category")
+                                "category": _get_rel_type_category(row[2])
                                             or _infer_category(row[2])
                             }
                             if fact not in direct_facts:
@@ -5548,7 +6343,7 @@ def query(request: QueryRequest):
                 "rel_type": h["payload"].get("rel_type"),
                 "provenance": h["payload"].get("provenance"),
                 "confidence": h["payload"].get("confidence", 1.0),
-                "category": _REL_TYPE_META.get(h["payload"].get("rel_type"), {}).get("category"),
+                "category": _get_rel_type_category(h["payload"].get("rel_type") or ""),
                 "fact_state": (
                     "long_term" if h["payload"].get("fact_class") in ("A", None)
                     else "staged" if h["payload"].get("fact_class") == "B"
