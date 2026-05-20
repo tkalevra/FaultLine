@@ -2018,8 +2018,10 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 if f.get("rel_type") == "also_known_as":
                     subj = f.get("subject", "")
                     alias = f.get("object", "")
+                    is_pref = f.get("is_preferred_label", False)
                     if subj and alias and subj != identity:
-                        nickname_map[subj] = alias
+                        if is_pref or subj not in nickname_map:
+                            nickname_map[subj] = alias
                 # Collect all entity IDs mentioned in facts for attribute display
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
