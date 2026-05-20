@@ -1,4 +1,6 @@
 ![FaultLine](docs/faultline_logo.svg)
+> Every AI memory system trusts the LLM to write correctly. FaultLine doesn't.
+> Backed by [arxiv 2603.15994](https://arxiv.org/abs/2603.15994).
 
 # FaultLine
 
