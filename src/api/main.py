@@ -5354,8 +5354,10 @@ def query(request: QueryRequest):
 
                 # --- Query 1: facts table (long-term) ---
                 f_query = (
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
-                    f"  confirmed_count, fact_class, is_preferred_label, rel_type_definition FROM facts "
+                    f"SELECT f.subject_id, f.object_id, f.rel_type, f.provenance, f.confidence,"
+                    f"  f.confirmed_count, f.fact_class, f.is_preferred_label, r.natural_language "
+                    f"FROM facts f "
+                    f"LEFT JOIN rel_types r ON f.rel_type = r.rel_type "
                     f"WHERE {f_where}"
                 )
                 # Debug: log query params for troubleshooting (dprompt-88c)
@@ -5382,8 +5384,10 @@ def query(request: QueryRequest):
 
                 # --- Query 2: staged_facts table (provisional) ---
                 s_query = (
-                    f"SELECT subject_id, object_id, rel_type, provenance, confidence,"
-                    f"  confirmed_count, fact_class, promoted_at, expires_at, rel_type_definition FROM staged_facts "
+                    f"SELECT s.subject_id, s.object_id, s.rel_type, s.provenance, s.confidence,"
+                    f"  s.confirmed_count, s.fact_class, s.promoted_at, s.expires_at, r.natural_language "
+                    f"FROM staged_facts s "
+                    f"LEFT JOIN rel_types r ON s.rel_type = r.rel_type "
                     f"WHERE {s_where}"
                 )
                 cur.execute(s_query, s_params)
