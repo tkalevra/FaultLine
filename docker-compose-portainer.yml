@@ -18,7 +18,7 @@ version: "3.8"
 #     → Repository URL, Branch, Compose path: docker-compose-portainer.yml
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
-#   OPENWEBUI_URL             - LLM endpoint base URL, e.g. https://example.com or http://192.168.1.x:8080
+#   OPENWEBUI_URL             - LLM endpoint base URL, e.g. https://your-domain.com or http://192.168.1.x:8080
 #   LLM_API_KEY               - Bearer token for OpenWebUI authentication
 #   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection (prevents OpenWebUI NoneType crash)
 #   POSTGRES_PASSWORD         - Database password for 'faultline' user (optional, defaults to 'faultline')
