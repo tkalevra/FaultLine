@@ -95,18 +95,32 @@ def _initialize_redis_client(redis_url: str = None):
     if _redis_client is not None:
         return
 
-    # DEBUG: Log what we received from valve
-    print(f"[FaultLine Filter DEBUG] _initialize_redis_client called with redis_url={redis_url!r} (type: {type(redis_url).__name__})")
-    if not redis_url:
-        print(f"[FaultLine Filter DEBUG] redis_url is falsy, using hardcoded fallback localhost:6379/0")
-        redis_url = "redis://localhost:6379/0"
-    try:
-        _redis_client = redis.from_url(redis_url, decode_responses=True)
-        _redis_client.ping()
-        print(f"[FaultLine Filter] Redis client initialized for inlet dedup: {redis_url[:30]}")
-    except Exception as e:
-        print(f"[FaultLine Filter] Redis connection failed: {e}, falling back to no dedup")
-        _redis_client = None
+    # Try configured URL first, then fall back to container DNS names (openweb_ui_default network)
+    urls_to_try = []
+    if redis_url:
+        urls_to_try.append(redis_url)
+    # Fallback chain for Docker Compose networks (dBug-INLET-DEDUP fix)
+    urls_to_try.extend([
+        "redis://redis:6379/0",             # Docker Compose service name (primary)
+        "redis://faultline-redis:6379/0",  # Alternate Docker Compose service name
+        os.environ.get("REDIS_URL"),        # Environment variable override
+        "redis://localhost:6379/0",         # Localhost (last resort)
+    ])
+
+    for attempt_url in urls_to_try:
+        if not attempt_url:
+            continue
+        try:
+            test_client = redis.from_url(attempt_url, decode_responses=True)
+            test_client.ping()
+            _redis_client = test_client
+            print(f"[FaultLine Filter] Redis initialized via {attempt_url}")
+            return
+        except Exception as e:
+            print(f"[FaultLine Filter DEBUG] Redis connection failed for {attempt_url}: {e}", file=sys.stderr)
+
+    print(f"[FaultLine Filter] WARNING: All Redis URLs failed, dedup disabled (dBug-INLET-DEDUP)", file=sys.stderr)
+    _redis_client = None
 
 # Persistent HTTP client for pooled connections (avoid socket churn from new client per request)
 _http_client: httpx.AsyncClient = None
@@ -295,10 +309,34 @@ _SESSION_MEMORY_TTL: int = 30  # seconds
 # system message injection triggers, etc.). Without dedup, each call produces another
 # memory injection, which triggers another filter call — a recursive loop.
 # Dedup implemented via Redis SET NX EX (dprompt-127) — atomic, TTL-guaranteed, survives reloads.
+# Fallback: if Redis unavailable, uses in-memory LRU cache with timestamp-based expiry.
 # Key pattern: dedup:inlet:{user_id}:{hash(text)}, Value: "1", Expires: 5 seconds
-# Fallback: if Redis unavailable, no dedup (redundant processing, not breaking).
 _DEDUP_WINDOW: float = 5.0  # seconds — Redis EX timeout for key expiration
 _INLET_CALL_COUNTER: int = 0  # Module-level counter to detect if state persists across calls
+_FALLBACK_DEDUP_CACHE: dict = {}  # In-memory dedup cache if Redis unavailable: {key: timestamp}
+
+def _check_dedup_fallback(dedup_key: str, window: float) -> bool:
+    """Check dedup via in-memory cache (fallback when Redis unavailable).
+    Returns True if this is a new message (should process), False if duplicate (should skip).
+    Cleans up expired entries as it goes.
+    """
+    import time
+    now = time.time()
+
+    # Clean up expired entries
+    expired = [k for k, ts in _FALLBACK_DEDUP_CACHE.items() if (now - ts) >= window]
+    for k in expired:
+        del _FALLBACK_DEDUP_CACHE[k]
+
+    # Check if key exists and is not expired
+    if dedup_key in _FALLBACK_DEDUP_CACHE:
+        ts = _FALLBACK_DEDUP_CACHE[dedup_key]
+        if (now - ts) < window:
+            return False  # Duplicate — skip processing
+
+    # Record this key as processed
+    _FALLBACK_DEDUP_CACHE[dedup_key] = now
+    return True  # New message — process it
 
 # Conversation context — per-user pronoun/entity tracking across turns
 _CONVERSATION_CONTEXT: dict[str, dict] = {}
@@ -824,10 +862,10 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
 
                 return f"{prose} {metadata}"
 
-            _PREF_RELS = {"spouse", "parent_of", "child_of", "also_known_as", "pref_name", "sibling_of"}
-            _priority = [f for f in memory_facts if f.get("rel_type") in _PREF_RELS]
-            _other = [f for f in memory_facts if f.get("rel_type") not in _PREF_RELS]
-            memory_facts = (_priority + _other)[:10]
+            # NOTE: Backend ranking is authoritative. No filter-side prioritization.
+            # Backend /query already returns facts ranked by class (A > B > C) + confidence.
+            # Injecting in returned order respects that ranking.
+            memory_facts = memory_facts[:10]
             entity_lines = []
             family_members = []
             for f in memory_facts:
@@ -1926,7 +1964,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
 
         # CONVERSATIONAL MODE (from is_realtime=False or fallthrough)
         lines = [
-            "⊢ FaultLine Memory — reference context. Use facts below only when directly relevant to the current request. Do not volunteer, list, or recite facts unless the user's message explicitly requires them."
+            "⊢ FaultLine Memory (from long-term knowledge graph):",
         ]
 
         if identity:
@@ -1935,21 +1973,19 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 f"You are the assistant. The user is '{display}'. Speak TO the user using 'you/your'. Never speak AS the user, adopt their perspective, or use first-person pronouns on their behalf."
             )
 
-        # Collect entities that appear as subjects or objects in identity/family
-        # facts. Only these are real people/pets/characters that need name
-        # directives. Fact-value strings like "systems analyst" or "156 cedar st s"
-        # never appear in identity/family edges — they're excluded.
+        # BRITTLE: Hardcoded rel_type lists. Should query rel_types table metadata instead.
+        # TODO (dprompt-127): Replace with metadata query:
+        #   SELECT rel_type FROM rel_types WHERE is_identity_rel = TRUE OR is_family_rel = TRUE
+        # For now, these are identity and family rel_types that always produce name directives.
         _named_entities: set[str] = {identity, "user"} if identity else {"user"}
-        _FAMILY_RELS = {"parent_of", "child_of", "spouse", "sibling_of"}
-        _IDENTITY_RELS = {"also_known_as", "pref_name"}
+        _IDENTITY_REL_TYPES = {"also_known_as", "pref_name", "same_as"}
 
-        # Build preferred name directives after identity/family facts.
-        # Only emit directives for entities that were explicitly named or related.
+        # Build preferred name directives. Only emit for entities that appear in identity rel_types.
         _name_directives = []
         if facts:
             for f in facts:
                 rel = f.get("rel_type", "")
-                if rel in _FAMILY_RELS or rel in _IDENTITY_RELS:
+                if rel in _IDENTITY_REL_TYPES:
                     _named_entities.add(f.get("subject", ""))
                     _named_entities.add(f.get("object", ""))
         for canonical, preferred in preferred_names.items():
@@ -2189,30 +2225,46 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             # Deduplication: skip if this exact text was already processed within the window.
             # OpenWebUI may fire the inlet multiple times for the same message (streaming
             # chunks, system-message re-evaluation). Without this, each call triggers a new
-            # memory injection → another inlet call → infinite recursive loop.
+            # memory injection → another inlet call → infinite recursive loop (dBug-INLET-DEDUP).
             # User UUID also injected as chat_id in extraction LLM requests to prevent
             # OpenWebUI's NoneType crash on missing chat_id (dBug-016 / openwebui#24550).
             user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
             # Redis-based dedup (dprompt-127): SET NX EX pattern — atomic, TTL-guaranteed
-            # Key: dedup:inlet:{user_id}:{hash(text)}, Value: "1", Expires: 5s
-            # DEBUG: Log valve value before passing
-            print(f"[FaultLine Filter DEBUG] inlet() self.valves.REDIS_URL = {self.valves.REDIS_URL!r}")
+            # Fallback: in-memory cache with timestamp expiry (dBug-INLET-DEDUP fix)
+            # Key: dedup:inlet:{user_id}:{hash(text)}
             _initialize_redis_client(self.valves.REDIS_URL)  # Lazy init if needed, use configured URL
+            dedup_key = f"dedup:inlet:{user_id}:{hashlib.sha256(text.encode()).hexdigest()}"
+            dedup_hit = False
+
             if _redis_client:
                 try:
-                    dedup_key = f"dedup:inlet:{user_id}:{hashlib.sha256(text.encode()).hexdigest()}"
                     if not _redis_client.set(dedup_key, "1", nx=True, ex=int(_DEDUP_WINDOW)):
-                        # Redis SET with NX returned False → key already exists → duplicate
+                        dedup_hit = True
                         if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] inlet dedup HIT: user={user_id} text_hash={dedup_key[-16:]}")
-                        return body
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] inlet dedup MISS (new message): user={user_id} text_hash={dedup_key[-16:]}")
+                            print(f"[FaultLine Filter] inlet dedup HIT (Redis): text_hash={dedup_key[-16:]}")
                 except Exception as e:
-                    # Redis error → fall through, process anyway (graceful degradation)
+                    # Redis error — fall back to in-memory dedup
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] inlet dedup error: {e}, falling back to no dedup")
+                        print(f"[FaultLine Filter] Redis dedup failed: {e}, using fallback", file=sys.stderr)
+                    if not _check_dedup_fallback(dedup_key, _DEDUP_WINDOW):
+                        dedup_hit = True
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] inlet dedup HIT (fallback): text_hash={dedup_key[-16:]}")
+            else:
+                # Redis not available — use in-memory fallback
+                if not _check_dedup_fallback(dedup_key, _DEDUP_WINDOW):
+                    dedup_hit = True
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] inlet dedup HIT (fallback): text_hash={dedup_key[-16:]}")
+
+            if dedup_hit:
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] Skipping duplicate message (dedup window {_DEDUP_WINDOW}s)")
+                return body
+
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] inlet dedup MISS (new message): text_hash={dedup_key[-16:]}")
 
             # Skip internal FaultLine prompts — marked to prevent recursive cascade (dprompt-128 surgical fix)
             # When filter generates internal prompts (retraction detection, etc.), they're prefixed with

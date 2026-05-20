@@ -87,7 +87,7 @@ class Function:
     class Valves(BaseModel):
         """Configuration valves for FaultLine integration."""
 
-        FAULTLINE_URL: str = "http://faultline:8001"
+        FAULTLINE_URL: str = "http://faultline:8000"
         FAULTLINE_TIMEOUT: int = 20
         QWEN_URL: str = os.getenv("QWEN_URL", "http://localhost:11434/v1/chat/completions")
         QWEN_MODEL: str = "qwen/qwen3.5-9b"
@@ -153,11 +153,41 @@ class Function:
 
         await self._emit(__event_emitter__, "Extracting triples...")
 
-        # Rewrite text to clean triples via Qwen — overrides any model-supplied edges
-        raw_triples = await rewrite_to_triples(text, self.valves)
+        # Rewrite text to clean triples via backend endpoint (dprompt-128)
+        # Call /extract/rewrite which handles LLM extraction + directionality + metadata
+        user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/extract/rewrite",
+                    json={"text": text, "user_id": user_id},
+                    timeout=self.valves.FAULTLINE_TIMEOUT,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            raw_triples = data.get("edges", [])
+        except httpx.ConnectError as e:
+            await self._emit(
+                __event_emitter__,
+                f"[FaultLine] Connection failed to backend: {str(e)}"
+            )
+            return f"[FaultLine] Cannot reach backend at {self.valves.FAULTLINE_URL}"
+        except httpx.TimeoutException as e:
+            await self._emit(
+                __event_emitter__,
+                f"[FaultLine] Backend timeout: {str(e)}"
+            )
+            return f"[FaultLine] Backend timeout (increase FAULTLINE_TIMEOUT if needed)"
+        except Exception as e:
+            await self._emit(
+                __event_emitter__,
+                f"[FaultLine] Extraction failed: {str(e)}"
+            )
+            return f"[FaultLine] Extraction failed: {str(e)}"
 
         if self.valves.ENABLE_DEBUG:
-            print(f"[FaultLine] raw_triples: {json.dumps(raw_triples, indent=2)}")
+            print(f"[FaultLine] raw_triples from /extract/rewrite: {json.dumps(raw_triples, indent=2)}")
 
         # Strip low-confidence edges
         confident = [e for e in raw_triples if not e.get("low_confidence", False)]
@@ -196,7 +226,7 @@ class Function:
             )
 
         source = source or self.valves.DEFAULT_SOURCE
-        user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+        # user_id already extracted in extraction section above
 
         payload = {
             "text": text,

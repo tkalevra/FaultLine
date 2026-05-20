@@ -10,6 +10,9 @@ from src.api.llm_output_validator import LLMOutputValidator
 
 log = logging.getLogger(__name__)
 
+# Marker for internal FaultLine prompts (dprompt-128) — prevents context bloat if looped back
+_FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
+
 
 def _detect_llm_endpoint() -> str:
     """Auto-detect LLM endpoint with smart fallback (dprompt-111).
@@ -496,7 +499,22 @@ class WGMValidationGate:
                 # by the re-embedder. See dprompt-17.
                 return {"status": "unknown"}
 
-        # Check type constraints
+        # CONFIDENCE-GATED BYPASS LOGIC (dprompt-124):
+        # High-confidence facts (>= 0.95) bypass validation gates entirely.
+        # User-stated facts (confidence 1.0) and clear extractions (0.95+) are
+        # trusted and skip type constraints, hierarchy, and category validation.
+        raw_confidence = edge_kwargs.get("confidence", 0.8)
+        is_user_correction = self._is_user_correction(edge_kwargs)
+        if raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9):
+            log.info("wgm.confidence_bypass_early",
+                     rel_type=rt, confidence=raw_confidence,
+                     is_user_correction=is_user_correction,
+                     reason="skip_type_constraints_hierarchy_category")
+            # Return immediately with placeholder unified_confidence
+            # (will be computed properly in ingest layer if needed)
+            return {"status": "valid", "unified_confidence": raw_confidence}
+
+        # Check type constraints (only for confidence < 0.95)
         type_ok, type_reason = self._check_type_constraints(
             rt, subject_id, object_id,
             subject_type=subject_type,
@@ -703,7 +721,7 @@ class WGMValidationGate:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
+                        "content": f"{_FAULTLINE_INTERNAL_PREFIX} You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
                     },
                     {
                         "role": "user",
