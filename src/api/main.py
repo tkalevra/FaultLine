@@ -6003,6 +6003,7 @@ def query(request: QueryRequest):
         "do", "does", "did", "please", "tell", "me", "about"
     }
 
+    query_lower = request.text.lower()
     has_attribute_signal = any(sig in query_lower for sig in _ATTRIBUTE_SIGNALS)
     log.info("query.entity_resolution.start", has_attribute_signal=has_attribute_signal, query_lower=query_lower)
 
