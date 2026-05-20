@@ -1,0 +1,40 @@
+graph TD
+    A["User Message<br/>(Example: My son Des is 12<br/>Actually, he's 14)"] -->|Filter Inlet| B["DETECT CORRECTIONS<br/>(Regex: actually, wrong,<br/>I meant, corrected to)"]
+
+    B -->|Correction Found| C["LLM EXTRACT CORRECTION<br/>(What's being corrected?<br/>Old value: 12<br/>New value: 14<br/>Subject: Des, Rel: age)"]
+
+    C --> D["MARK AS CORRECTION<br/>(is_correction=true<br/>Will bypass staging)"]
+
+    B -->|No Correction| E["DETECT RETRACTION<br/>(Regex: forget, delete,<br/>wrong, no longer, not true)"]
+
+    E -->|Retraction Found| F["LLM EXTRACT RETRACTION<br/>(What fact is wrong?<br/>Subject: Des<br/>Rel: age<br/>Action: DELETE or SUPERSEDE)"]
+
+    F --> G["MARK AS RETRACTION<br/>(is_retraction=true<br/>Skip to retraction path)"]
+
+    E -->|No Retraction| H["NORMAL EXTRACTION<br/>(Standard LLM triple inference)"]
+
+    H --> I["LLM EXTRACTS TRIPLES<br/>(Qwen identifies:)<br/>subject_type: Person<br/>rel_type: age<br/>object_type: SCALAR<br/>confidence: 0.95"]
+
+    I --> J{Is rel_type<br/>Known in DB?}
+
+    J -->|YES| K["Use Existing Metadata<br/>(is_symmetric, is_hierarchy,<br/>tail_types, head_types)"]
+
+    J -->|NO| L["NOVEL REL_TYPE<br/>(Engine marks for evaluation)<br/>Will be staged as Class C<br/>Re-embedder evaluates later)"]
+
+    K --> M["VALIDATE TRIPLE<br/>(Check: head_type matches?<br/>tail_type matches?<br/>directionality correct?)"]
+
+    L --> M
+
+    M -->|MISMATCH| N["CONFIDENCE PENALTY<br/>(Mark confidence lower)<br/>Or flag for correction"]
+
+    M -->|MATCH| O["TRIPLE READY<br/>(subject, rel_type, object<br/>with types and metadata)"]
+
+    N --> O
+
+    O --> P["RETURN TO INGEST<br/>(with is_correction flag<br/>with is_retraction flag<br/>with rel_type metadata)"]
+
+    style A fill:#e1f5ff
+    style D fill:#fff9c4
+    style G fill:#ffcdd2
+    style L fill:#f3e5f5
+    style O fill:#c8e6c9
