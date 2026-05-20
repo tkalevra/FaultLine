@@ -15,7 +15,10 @@ services:
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
       REDIS_URL: redis://redis:6379/0
-      REEMBED_INTERVAL: 5
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-60}
+      EMBEDDING_CACHE_TTL: ${EMBEDDING_CACHE_TTL:-86400}
+      EMBEDDING_MODEL_VERSION: ${EMBEDDING_MODEL_VERSION:-nomic-v1.5}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       DB_POOL_SIZE: 15
     depends_on:
       postgres:
