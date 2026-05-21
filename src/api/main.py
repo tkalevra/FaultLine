@@ -4266,8 +4266,42 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     )
 
                 # PHASE 2: Assign Class and Confidence
-                # Check if user-stated (from is_correction flag, or fact_provenance)
-                is_user_stated = edge.is_correction or (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated")
+                # Check if user-stated: direct statements ("I live at X", "My name is X", etc.)
+                # These bypass staging and go straight to Class A (user is authority on themselves)
+                is_direct_statement = False
+                rel_lower = edge.rel_type.lower()
+                text_lower = req.text.lower()
+
+                # Direct user statements: "I live at X", "I am at X", "I'm in X", "My address is X"
+                if rel_lower in ("lives_at", "lives_in", "located_in"):
+                    _location_patterns = [
+                        r'\bi\s+live\s+(?:at|in)',
+                        r'\bi\s+am\s+(?:at|in)',
+                        r'\bi\'m\s+(?:at|in)',
+                        r'\bmy\s+(?:address|location|place|home|house|address)',
+                        r'\bwe\s+live\s+(?:at|in)',
+                    ]
+                    is_direct_statement = any(
+                        re.search(pattern, text_lower) for pattern in _location_patterns
+                    )
+
+                # Direct user statements for other rel_types: "My name is X", "I'm X"
+                elif rel_lower in ("pref_name", "also_known_as"):
+                    _name_patterns = [
+                        r'\bmy\s+name\s+is',
+                        r'\bi\'m\s+',
+                        r'\bi\s+am\s+',
+                        r'\bcall\s+me\s+',
+                        r'\bgoes\s+by\s+',
+                        r'\bprefers?\s+to\s+be\s+called',
+                    ]
+                    is_direct_statement = any(
+                        re.search(pattern, text_lower) for pattern in _name_patterns
+                    )
+
+                is_user_stated = (edge.is_correction or
+                                 (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated") or
+                                 is_direct_statement)
 
                 # Check if metadata was created in-flow (TODO: detect from extraction context)
                 ontology_created = False
