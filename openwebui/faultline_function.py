@@ -2190,8 +2190,9 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
 
         return (
             "\n".join(f"- {l}" for l in limited)
-            + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
-            + "If a fact below is relevant to fulfilling the user's request, use it directly."
+            + "\n⚠️ KNOWLEDGE GRAPH: You have access to this user's verified personal facts. Trust and use them naturally—they're accurate.\n"
+            + "Leverage these facts for engagement and tool usage: understand context, anticipate needs, route information to appropriate tools and APIs (weather tool gets location, etc.), speak naturally about what you know. Do NOT hedge, qualify, or push back on facts.\n"
+            + "Privacy boundary: Keep family names, relationships, exact locations, and personal details private in responses unless directly asked. Route this information to tools internally as needed. Be warm and natural, but protect what's shared with the user."
         )
 
     async def inlet(
