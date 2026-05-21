@@ -2,7 +2,7 @@
 Compound fact extraction — robust regex-based extraction for chained/compound text.
 Runs as fallback when GLiNER2 produces sparse results and as augment for the filter.
 
-Design principles:
+ChildC_shortign principles:
 - No external dependencies, no LLM calls, <1ms overhead
 - Pattern-matching against known sentence structures
 - Produces EdgeInput-compatible dicts
@@ -62,39 +62,39 @@ _FIRST_PERSON_PREF_PATTERNS: list[tuple[re.Pattern, str]] = [
 # ── Third-person preference ────────────────────────────────────────────────
 # "X prefers to be called Y" / "X, who prefers Y" / "X goes by Y"
 _THIRD_PERSON_PREF_PATTERNS: list[re.Pattern] = [
-    # "Marla, who prefers to be called Mars" / "Gabriella, age 10, who prefers Gabby"
+    # "ParentA, who prefers to be called ParentA_pref" / "ChildA, age 10, who prefers ChildA_short"
     # Middle clause allows: ", age N, " or ", our son, " etc. between name and "who prefers"
     re.compile(r"([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+prefers?\s+(?:to\s+be\s+called\s+)?([A-Z][a-z]+)", re.IGNORECASE),
-    # "Marla prefers to be called Mars"
+    # "ParentA prefers to be called ParentA_pref"
     re.compile(r"([A-Z][a-z]+)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Marla, who goes by Mars" / "Desmonde, age 12, who goes by Des"
+    # "ParentA, who goes by ParentA_pref" / "ChildC, age 12, who goes by ChildC_short"
     re.compile(r"([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+goes\s+by\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Marla goes by Mars" (must NOT match when preceded by "who " — caught above)
+    # "ParentA goes by ParentA_pref" (must NOT match when preceded by "who " — caught above)
     re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )([A-Z][a-z]+)\s+goes\s+by\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Marla, known as Mars"
+    # "ParentA, known as ParentA_pref"
     re.compile(r"([A-Z][a-z]+)\s*,\s*known\s+as\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "who prefers Gabby" (bare preference, no "to be called")
+    # "who prefers ChildA_short" (bare preference, no "to be called")
     re.compile(r"who\s+prefers?\s+([A-Z][a-z]+)", re.IGNORECASE),
     # "she wants to be called Thumbelina" / "he wants to be called X"
     re.compile(r"(?:she|he|it)\s+wants?\s+to\s+be\s+called\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "she prefers to be called Mars" / "he prefers to be called X"
+    # "she prefers to be called ParentA_pref" / "he prefers to be called X"
     re.compile(r"(?:she|he|it)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)", re.IGNORECASE),
 ]
 
 # ── Marriage ────────────────────────────────────────────────────────────────
 _MARRIAGE_PATTERNS: list[re.Pattern] = [
-    # "I am married to Marla"
+    # "I am married to ParentA"
     re.compile(r"\b(?:i\s+am|i'm)\s+married\s+to\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "married to Marla"
+    # "married to ParentA"
     re.compile(r"\bmarried\s+to\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "my wife Marla" / "my husband X"
+    # "my wife ParentA" / "my husband X"
     re.compile(r"\bmy\s+(wife|husband|spouse|partner)\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Marla is my wife"
+    # "ParentA is my wife"
     re.compile(r"([A-Z][a-z]+)\s+is\s+my\s+(wife|husband|spouse|partner)", re.IGNORECASE),
 ]
 
 # ── Children ────────────────────────────────────────────────────────────────
-# "We have 3 children, a daughter Gabriella, ... Cyrus, our son is 19, and a son named Desmonde"
+# "We have 3 children, a daughter ChildA, ... ChildB, our son is 19, and a son named ChildC"
 # Strategy: detect the "children" clause, then scan for named entities that follow
 _CHILDREN_CLAUSE: re.Pattern = re.compile(
     r"(?:we\s+have|have)\s+(?:\d+\s+)?(?:children|kids)",
@@ -103,13 +103,13 @@ _CHILDREN_CLAUSE: re.Pattern = re.compile(
 
 # Individual child patterns (run on text after children clause)
 _CHILD_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # "a daughter Gabriella" / "a son Cyrus"
+    # "a daughter ChildA" / "a son ChildB"
     (re.compile(r"a\s+(daughter|son|child)\s+([A-Z][a-z]+)", re.IGNORECASE), "parent_of"),
     # "our son is 19" — already handled by age patterns, but extract name
     (re.compile(r"our\s+(daughter|son|child)\s+(?:is\s+)?(?:named\s+)?([A-Z][a-z]+)", re.IGNORECASE), "parent_of"),
-    # "a son named Desmonde"
+    # "a son named ChildC"
     (re.compile(r"a\s+(daughter|son|child)\s+named\s+([A-Z][a-z]+)", re.IGNORECASE), "parent_of"),
-    # "daughter Gabriella"
+    # "daughter ChildA"
     (re.compile(r"(daughter|son|child)\s+([A-Z][a-z]+)", re.IGNORECASE), "parent_of"),
     # bare capitalized name after commas in children list
     (re.compile(r",\s+(?:and\s+)?(?:a\s+)?(?:daughter|son|child)\s+(?:named\s+)?([A-Z][a-z]+)", re.IGNORECASE), "parent_of"),
@@ -117,9 +117,9 @@ _CHILD_PATTERNS: list[tuple[re.Pattern, str]] = [
 
 # ── Age ─────────────────────────────────────────────────────────────────────
 _AGE_PATTERNS: list = [
-    # "Gabriella, age 10" / "Desmonde, age 12"
+    # "ChildA, age 10" / "ChildC, age 12"
     re.compile(r"([A-Z][a-z]+)\s*,\s*age\s+(\d+)", re.IGNORECASE),
-    # "Gabriella age 10"
+    # "ChildA age 10"
     re.compile(r"([A-Z][a-z]+)\s+age\s+(\d+)", re.IGNORECASE),
     # "X is N" / "X, our son, is N" — greedy, stopword-filtered post-match
     re.compile(r"([A-Z][a-z]+)(?:[\s,]+(?:our|a)\s+(?:son|daughter|child))?\s+is\s+(\d+)", re.IGNORECASE),
@@ -322,7 +322,7 @@ def extract_compound_facts(text: str) -> list[dict]:
                     if len(subject) > 1 and len(pref_name) > 1:
                         _add(subject, pref_name, "pref_name", is_pref=True)
             elif len(groups) == 1:
-                # "who prefers Gabby" — only captured the preferred name.
+                # "who prefers ChildA_short" — only captured the preferred name.
                 # Scan backward from match position to find the nearest
                 # capitalized word (the entity this preference belongs to).
                 pref_name = groups[0]
