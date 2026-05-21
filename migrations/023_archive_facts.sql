@@ -2,7 +2,7 @@
 -- Allows non-destructive supersession: user corrections archive old facts
 -- Historical queries still work via include_archived parameter
 
-ALTER TABLE facts ADD COLUMN archived_at TIMESTAMP NULL DEFAULT NULL;
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP NULL DEFAULT NULL;
 
 -- Index for default query behavior (archived_at IS NULL)
 CREATE INDEX IF NOT EXISTS idx_facts_active

@@ -29,10 +29,12 @@ CREATE TABLE IF NOT EXISTS retraction_outcomes (
     extracted_old_value TEXT,
     actually_retracted BOOLEAN,
     was_correct BOOLEAN,
-    created_at TIMESTAMP DEFAULT now(),
-    INDEX idx_outcomes_user (user_id),
-    INDEX idx_outcomes_was_correct (was_correct)
+    created_at TIMESTAMP DEFAULT now()
 );
+
+-- Create indexes separately (PostgreSQL syntax, idempotent)
+CREATE INDEX IF NOT EXISTS idx_outcomes_user ON retraction_outcomes(user_id);
+CREATE INDEX IF NOT EXISTS idx_outcomes_was_correct ON retraction_outcomes(was_correct);
 
 -- Seed initial retraction signals
 INSERT INTO retraction_signals (signal, signal_category, priority, language) VALUES
