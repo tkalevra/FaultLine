@@ -1650,21 +1650,36 @@ Return valid JSON only. If no facts, return [].
     ) -> Optional[str]:
         """
         Build a tool-agnostic realtime directive from known facts.
+        Prefers most specific location using located_in hierarchy.
         Returns None if no location found — caller falls through to
         conversational mode.
         """
-        location = None
+        locations = []
         _user_anchors = {identity, "user"} if identity else {"user"}
         for rt in ("lives_at", "lives_in"):
             for f in facts:
                 if (f.get("rel_type") == rt
                         and f.get("subject") in _user_anchors):
                     loc = (f.get("object") or "").strip()
-                    if loc:
-                        location = loc
-                        break
-            if location:
-                break
+                    if loc and loc not in locations:
+                        locations.append(loc)
+
+        if not locations:
+            return None
+
+        # Prefer most specific: find which location has other locations inside it
+        # via located_in relationships (e.g., kitchener is located_in ontario)
+        # So ontario has kitchener inside it, making kitchener more specific.
+        contained_locs = set()
+        for f in facts:
+            if f.get("rel_type") == "located_in":
+                obj = (f.get("object") or "").strip()
+                if obj in locations:
+                    # This fact shows something is located_in obj, so obj is less specific
+                    contained_locs.add(obj)
+
+        # Use first location not in contained_locs (most specific), else use first
+        location = next((l for l in locations if l not in contained_locs), locations[0])
 
         if not location:
             return None
@@ -1955,8 +1970,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 return (
                     "⊢ FaultLine Memory — treat these as established ground truth for this response.\n"
                     + "\n".join(f"- {l}" for l in lines)
-                    + "\nOnly reference what the facts explicitly say. Do not invent details not present.\n"
-                    + "If a fact below is relevant to fulfilling the user's request, act on it directly and immediately."
+                    + "\n⚠️ KNOWLEDGE GRAPH: Trust and use these facts naturally—they're accurate. Extract what's contextually relevant for this task and route to tools/APIs (weather query → city/state only, not street address). Keep full personal details private in responses unless directly asked. Act naturally and immediately."
                 )
             else:
                 # No location found - fall through to conversational mode
