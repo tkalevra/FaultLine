@@ -1,178 +1,192 @@
-![FaultLine](docs/faultline_logo.svg)
-> Every AI memory system trusts the LLM to write correctly. FaultLine doesn't.
-> Backed by [arxiv 2603.15994](https://arxiv.org/abs/2603.15994).
+<p align="center">
+  <img src="docs/faultline_logo.svg" alt="FaultLine Logo" />
+</p>
 
 # FaultLine
 
-Write-validated knowledge graph pipeline for OpenWebUI. Extracts facts from conversations, validates them against your ontology, stores them in PostgreSQL, and injects them back for context-aware responses.
+**FaultLine is a self-correcting memory system for LLM applications.**
 
-**In plain terms:** A fact-checking system that remembers what users tell you, prevents contradictions, and uses those facts to give better responses.
+Most AI memory systems degrade over time — accumulating stale, incorrect, and conflicting information.
+
+FaultLine does the opposite.
+
+It enforces a controlled write path, builds structured knowledge from interaction, and continuously converges toward higher-quality memory through validation, reinforcement, correction, and decay.
 
 ---
 
-## Quick Start (5 minutes)
+## Why FaultLine Exists
 
-### Prerequisites
-- Docker and Docker Compose
-- ~1GB available memory for containers
+LLM memory systems fail in production for predictable reasons:
 
-### 1. Start the backend
+- They trust the model to write correct data  
+- They store everything without validation  
+- They accumulate stale or contradictory facts  
+- They have no mechanism for correction or decay  
+
+Over time, this leads to:
+
+- retrieval noise  
+- conflicting context  
+- degraded agent performance  
+
+**FaultLine solves this by treating the LLM as an untrusted writer.**
+
+Memory is not stored by default — it is evaluated, structured, and earned.
+
+---
+
+## What It Does
+
+FaultLine transforms raw interaction into structured, governed memory:
+
+- Extracts entities and relationships from conversations  
+- Infers missing structure (hierarchies, causality, relationships)  
+- Validates all writes against a dynamic ontology  
+- Builds a continuously evolving knowledge graph  
+- Promotes high-confidence knowledge to long-term memory  
+- Removes unused or unreinforced knowledge automatically  
+- Allows real-time correction of facts and structure  
+
+---
+
+## Core Mechanics
+
+### Write Validation
+No information is persisted without passing a validation gate.
+
+### Memory Promotion (C → B → A)
+Facts move through a lifecycle:
+
+- **Class C** — Candidate (ephemeral, low confidence)  
+- **Class B** — Confirmed (reinforced through interaction)  
+- **Class A** — Canonical (user-confirmed truth)  
+
+### Reinforcement
+Frequently referenced knowledge strengthens and persists.
+
+### Decay
+Unused or unreinforced knowledge expires automatically.
+
+### Structural Inference
+FaultLine builds missing relationships:
+- hierarchy (family → members → pets → animals)
+- causality
+- relational links
+
+### Live Correction
+Users can modify the graph through natural interaction:
+
+"my name isn’t Todd, it’s Bradly"  
+"my pets are not part of my family"
+
+FaultLine updates:
+- facts  
+- relationships  
+- graph structure  
+
+All changes are non-destructive and auditable.
+
+---
+
+## How It’s Different
+
+| Traditional Systems | FaultLine |
+|-------------------|----------|
+| Trust model output blindly | Treat model as untrusted writer |
+| Store everything | Validate before persistence |
+| Accumulate noise over time | Decay unused knowledge |
+| Static or no schema | Self-evolving ontology |
+| Hard to correct | Interactive correction |
+| Requires cleanup | Self-maintaining |
+
+---
+
+## System Model
+
+Agent Runtime (OpenWebUI / LangChain / etc.)  
+↓  
+FaultLine (extract → validate → infer → promote → decay)  
+↓  
+PostgreSQL (graph) + Qdrant (semantic)
+
+FaultLine sits beneath your application.
+
+- Your agent writes → FaultLine decides what becomes memory  
+- Your agent reads → FaultLine returns structured knowledge  
+
+---
+
+## Retrieval Model
+
+FaultLine uses multi-path retrieval:
+
+- Graph traversal (relationships, hierarchy)  
+- Semantic similarity (Qdrant)  
+- Confidence-weighted facts (A/B/C classes)  
+
+This ensures:
+
+- weak signals remain visible  
+- strong knowledge dominates  
+- incorrect structure can be corrected through use  
+
+---
+
+## Design Philosophy
+
+### Memory must be earned
+Inference alone is not enough — knowledge must be used and reinforced.
+
+### Memory must adapt
+Facts, relationships, and structure must be correctable through interaction.
+
+### Memory must decay
+Unverified or unused knowledge should not persist indefinitely.
+
+---
+
+## Positioning
+
+FaultLine is not:
+
+- a vector database  
+- a RAG system  
+- an agent framework  
+
+It is:
+
+→ a governed memory layer that ensures long-term memory remains usable
+
+Use it with:
+- OpenWebUI  
+- LangChain  
+- custom agents  
+
+---
+
+## Quick Start
 
 ```bash
-docker-compose up -d
-```
+git clone https://github.com/your-org/FaultLine.git
+cd FaultLine
 
-This starts:
-- FaultLine backend (port 8001)
-- PostgreSQL database
-- Qdrant vector search
-- Redis cache
+cp .env.example .env
+# edit .env
 
-### 2. Verify it's running
-
-```bash
-curl http://localhost:8001/health
-```
-
-Expected: `{"status":"ok"}`
-
-### 3. Connect to OpenWebUI
-
-**In OpenWebUI Settings:**
-1. Go to Settings > Functions
-2. Create new Filter from `openwebui/faultline_tool.py`
-3. Set valve: `FAULTLINE_URL` to `http://faultline:8001`
-4. Enable the filter and save
-
-### 4. Test it
-
-```
-User:   My name is Chris, I work as a systems analyst
-System: [stores fact]
-
-User:   What's my job?
-System: You're a systems analyst.
+docker compose up -d
 ```
 
 ---
 
-## How It Works
+## Development Status
 
-**Pipeline:**
-
-1. **Extract** - LLM identifies facts (names, relationships, attributes)
-2. **Validate** - WGM gate checks against ontology, prevents contradictions
-3. **Store** - Facts route to PostgreSQL as Class A/B/C based on confidence
-4. **Recall** - Next turn, relevant facts injected as conversation context
-
-**Result:** Accurate context that's always available, never stale, never contradictory.
-
----
-
-## Configuration
-
-### Required Environment Variables
-
-```bash
-POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
-QDRANT_URL=http://qdrant:6333
-OPENWEBUI_URL=http://open-webui:8080
-```
-
-### Optional Settings
-
-```bash
-REEMBED_INTERVAL=60              # Background re-embedding frequency (seconds)
-RATE_LIMIT_PER_MIN=100           # API rate limit
-DB_POOL_SIZE=15                  # PostgreSQL connection pool size
-EMBEDDING_CACHE_TTL=86400        # Cache duration (seconds)
-```
-
-See `.env.example` for complete reference.
-
----
-
-## Documentation
-
-- **[About](ABOUT.md)** - Design principles and philosophy
-- **[Architecture](docs/ARCHITECTURE.md)** - System design and data model
-- **[Deployment](DEPLOYMENT.md)** - Production configuration
-- **[Changelog](CHANGELOG.md)** - Version history
-
----
-
-## API Endpoints
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/health` | GET | Service status |
-| `/ingest` | POST | Store extracted facts |
-| `/query` | POST | Retrieve relevant facts |
-| `/retract` | POST | Remove/correct facts |
-
----
-
-## Fact Storage
-
-Facts route to three storage types automatically:
-
-| Type | Use Case | Example |
-|------|----------|---------|
-| **Scalar** | Single values | age=42, name="Chris" |
-| **Relational** | Relationships between entities | spouse, parent_of, works_for |
-| **Hierarchical** | Classification and taxonomy | instance_of, subclass_of |
-
-Routing is **metadata-driven**: each relation type has built-in rules determining where and how it's stored.
-
----
-
-## Testing
-
-Run the test suite:
-
-```bash
-pytest tests/ --ignore=tests/evaluation --ignore=tests/preprocessing
-```
-
-Run integration test with a real OpenWebUI instance:
-
-```bash
-bash /tmp/TESTS/comprehensive_family_pipeline_test.sh
-```
-
----
-
-## Key Features
-
-- **Write-validated facts** - Every fact passes ontology gates before storage
-- **Per-user isolation** - Memory is never shared across users
-- **Staged promotion** - Facts move from ephemeral → behavioral → permanent based on confirmation
-- **Semantic conflict detection** - Auto-resolves contradictions
-- **Metadata-driven** - New relation types self-describe their constraints
-- **OpenWebUI native** - Uses official inlet filters, no hacks
-
----
-
-## Production Deployment
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for production setup with Portainer, SSL, and scaling guidance.
-
----
-
-## Support
-
-- Issues: See `BUGS/` directory
-- Architecture questions: Read `docs/ARCHITECTURE.md`
-- Configuration help: Check `.env.example`
+- Core architecture implemented ✅  
+- Self-correcting lifecycle ✅  
+- Dynamic ontology ✅  
+- Production-scale validation → in progress  
 
 ---
 
 ## License
 
-MIT License - See LICENSE file for details
-
----
-
-## What's New
-
-See [CHANGELOG.md](CHANGELOG.md) for recent updates and features.
+Licensed under the MIT License — see [LICENSE](LICENSE)
