@@ -1,4 +1,4 @@
-# dBug-024: Child Name Correction Not Extracted — "Son" vs "Bob"
+# dBug-024: Child Name Correction Not Extracted — "Son" vs "charlie"
 
 **Severity:** High — user corrections are silently dropped, stale data returned
 
@@ -6,40 +6,40 @@
 
 **Date Reported:** 2026-05-15
 
-**User Context:** user_id=`10d7d879-63cd-4f31-92ce-f2c9edb760ab`
+**User Context:** John, user_id=`10d7d879-63cd-4f31-92ce-f2c9edb760ab`
 
 ## Problem Summary
 
 User attempts to correct child's name via natural language:
 ```
-User: "My chilrens names are Alice, Bob, and Carol"
+User: "My chilrens names are bob, charlie, and alice"
 ```
 
 System still returns old fact in memory injection:
 ```
-- family: spouse=Jane, children=Son
+- family: spouse=emma, children=Son
 ```
 
 Database state shows entity `55c13545-3f9a-5798-8827-c35e7c9cfa70` has:
-- `pref_name = "boy"` (confidence 1.0, created 2026-05-15 02:33:08)
-- Alias "entity_name" in entity_aliases (is_preferred=false)
-- NO `pref_name = "entity_name"` fact exists
+- `pref_name = "son"` (confidence 1.0, created 2026-05-15 02:33:08)
+- Alias "charlie" in entity_aliases (is_preferred=false)
+- NO `pref_name = "charlie"` fact exists
 
 ## Root Cause
 
 Entity alias conflict + extraction failure:
 
-1. **Initial extraction** (2026-05-15 02:33:08): System extracted `pref_name("entity", "boy")` with confidence 1.0
-2. **Name conflict resolution** (async): Re-embedder registered "entity_name" as non-preferred alias during conflict detection
-3. **User correction attempt** (2026-05-15 11:52:36): User sends name list: "Alice, Bob, and Carol"
-4. **Extraction failure** (2026-05-15 11:52:41): `/extract/rewrite` produced 6 triples, but NONE were `pref_name("55c13545", "entity_name")`
+1. **Initial extraction** (2026-05-15 02:33:08): System extracted `pref_name("entity", "son")` with confidence 1.0
+2. **Name conflict resolution** (async): Re-embedder registered "charlie" as non-preferred alias during conflict detection
+3. **User correction attempt** (2026-05-15 11:52:36): User sends name list: "bob, charlie, and alice"
+4. **Extraction failure** (2026-05-15 11:52:41): `/extract/rewrite` produced 6 triples, but NONE were `pref_name("55c13545", "charlie")`
 5. **Stale data returned**: `/query` injects old memory with "children=Son" (from original pref_name fact)
 
 ## Evidence
 
 ### OpenWebUI logs (11:52:36–11:52:42)
 ```
-[FaultLine Filter] user_id=[redacted] text='My chilrens names are Alice, Bob, and Carol'
+[FaultLine Filter] user_id=[redacted] text='My chilrens names are bob, charlie, and alice'
 [FaultLine Filter] calling /query url=http://192.168.1.10:8001/query
 [FaultLine Filter] /query status=200
 [FaultLine Filter] filtered: 43/43 facts
@@ -47,20 +47,20 @@ Entity alias conflict + extraction failure:
 
 At 11:52:36, Filter receives user's message, calls `/query`, gets back old family facts.
 
-FaultLine logs show `/extract/rewrite` returned `triple_count=6` at 11:52:41, but DB shows no `pref_name = "entity_name"` fact created.
+FaultLine logs show `/extract/rewrite` returned `triple_count=6` at 11:52:41, but DB shows no `pref_name = "charlie"` fact created.
 
 ### Database state
 ```sql
 SELECT entity_id, alias, is_preferred FROM entity_aliases 
-WHERE alias IN ('son', 'entity_name') AND entity_id = '55c13545-3f9a-5798-8827-c35e7c9cfa70';
+WHERE alias IN ('son', 'charlie') AND entity_id = '55c13545-3f9a-5798-8827-c35e7c9cfa70';
 ```
 
 Result:
 ```
             entity_id              | alias | is_preferred 
 --------------------------------------+-------+----------
- 55c13545-3f9a-5798-8827-c35e7c9cfa70 | entity_name | f
- 55c13545-3f9a-5798-8827-c35e7c9cfa70 | boy   | t
+ 55c13545-3f9a-5798-8827-c35e7c9cfa70 | charlie | f
+ 55c13545-3f9a-5798-8827-c35e7c9cfa70 | son   | t
 ```
 
 Facts table:
@@ -69,7 +69,7 @@ SELECT subject_id, rel_type, object_id, confidence FROM facts
 WHERE subject_id = '55c13545-3f9a-5798-8827-c35e7c9cfa70' AND rel_type = 'pref_name';
 ```
 
-Result: Only `("55c13545...", "pref_name", "boy", 1.0)` — no "entity_name" fact.
+Result: Only `("55c13545...", "pref_name", "son", 1.0)` — no "charlie" fact.
 
 ## Classification
 
@@ -80,7 +80,7 @@ Result: Only `("55c13545...", "pref_name", "boy", 1.0)` — no "entity_name" fac
 "My children's names are <name1>, <name2>, and <name3>"
 ```
 
-**Expected behavior:** Extract `(child_entity_uuid, pref_name, "entity_name")` with high confidence (user-stated).
+**Expected behavior:** Extract `(child_entity_uuid, pref_name, "charlie")` with high confidence (user-stated).
 
 **Actual behavior:** Extraction produces only relationship/type facts, no pref_name update.
 
@@ -109,22 +109,25 @@ Result: Only `("55c13545...", "pref_name", "boy", 1.0)` — no "entity_name" fac
 - Elevate confidence or force classification
 
 **Option C: Retraction first**
-- User explicitly says "Not 'son' — his name is 'entity_name'"
+- User explicitly says "Not 'son' — his name is 'charlie'"
 - System processes as retraction + new fact
 - Simpler but requires user to be aware of the system's state
 
 ## Test Case (Verification)
 
 ```bash
-curl -X POST http://localhost:8001/query \
+curl -X POST http://docker-host.helpalicekpro.ca/api/chat/completions \
+  -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "text": "My childrens names are Alice, Bob, and Carol",
-    "user_id": "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    "model": "qwen/qwen3.5-9b",
+    "messages": [
+      {"role": "user", "content": "My childrens names are bob, charlie, and alice"}
+    ]
   }'
 ```
 
-**Expected:** After ingest, `/query` returns `pref_name=entity_name` for entity `55c13545`, and subsequent "tell me about my family" responses use "Bob" instead of "Son".
+**Expected:** After ingest, `/query` returns `pref_name=charlie` for entity `55c13545`, and subsequent "tell me about my family" responses use "charlie" instead of "Son".
 
 **Current:** `/query` still returns `pref_name=son`.
 

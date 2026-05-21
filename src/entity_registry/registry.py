@@ -117,6 +117,19 @@ class EntityRegistry:
                     log.warning("entity_registry.corrupted_string_entity_id_in_entities",
                                entity_id=entity_id, name=name, user_id=user_id)
 
+            # HARD CONSTRAINT: Reject rel_type names from being registered as entities
+            # Check if this name is a known rel_type (prevents parent_of, instance_of, etc. from becoming entities)
+            cur.execute(
+                "SELECT rel_type FROM rel_types WHERE LOWER(rel_type) = %s",
+                (name,),
+            )
+            rel_type_row = cur.fetchone()
+            if rel_type_row:
+                log.error("entity_registry.rel_type_as_entity_rejected",
+                         name=name, rel_type=rel_type_row[0], user_id=user_id,
+                         message="HARD CONSTRAINT: rel_type names cannot be registered as entities")
+                raise ValueError(f"Cannot register rel_type '{name}' as an entity (HARD CONSTRAINT)")
+
             # Unknown — generate UUID v5 surrogate and register
             surrogate = _make_surrogate(user_id, name)
             log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate, surrogate_has_dashes=surrogate.count('-'))
