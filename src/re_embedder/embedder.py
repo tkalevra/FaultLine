@@ -1019,6 +1019,87 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     return stats
 
 
+def evaluate_correction_signal_candidates(db_conn, qwen_api_url: str) -> dict:
+    """
+    dprompt-128-P3: Evaluate correction signal candidates from correction_signal_evaluations.
+    Runs each poll cycle. Decisions:
+      - 'approved': occurrence_count >= 3 → INSERT into correction_signals
+      - 'rejected': occurrence_count < 3 → leave as candidate for future evaluation
+
+    Returns: {"approved": int, "rejected": int, "errors": int}
+    """
+    stats = {"approved": 0, "rejected": 0, "errors": 0}
+
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, candidate_pattern, pattern_type,"
+                "       first_text_snippet, occurrence_count"
+                " FROM correction_signal_evaluations"
+                " WHERE re_embedder_decision IS NULL"
+                " ORDER BY occurrence_count DESC, last_seen_at DESC"
+            )
+            candidates = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.correction_eval_fetch_failed: {e}")
+        return stats
+
+    if not candidates:
+        return stats
+
+    log.info(f"re_embedder.correction_eval_candidates count={len(candidates)}")
+
+    for row in candidates:
+        eval_id, user_id, candidate_pattern, pattern_type, snippet, occ = row
+        try:
+            decision = None
+            reason = ""
+
+            # ── Decision 1: Pattern frequency ──────────────────────────
+            # Threshold: occurrence_count >= 3 means pattern is real and recurring
+            if occ >= 3:
+                decision = "approved"
+                reason = f"occurrence_count={occ} >= 3"
+
+                # Insert into correction_signals table
+                with db_conn.cursor() as cur:
+                    # Generate label from pattern type
+                    label = f"{pattern_type.title()} Pattern"
+                    cur.execute("""
+                        INSERT INTO correction_signals
+                        (pattern, pattern_type, priority, confidence, category, example_usage)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (pattern) DO UPDATE SET
+                          occurrence_count = correction_signals.occurrence_count + 1,
+                          updated_at = NOW()
+                    """, (candidate_pattern, pattern_type, 2, 0.7, user_id, snippet))
+                    log.info(f"re_embedder.correction_signal_approved pattern={candidate_pattern[:50]} type={pattern_type}")
+
+            # ── Decision 2: Reject (wait for more occurrences) ──────────
+            if not decision:
+                decision = "rejected"
+                reason = f"occurrence_count={occ} < 3, waiting for more evidence"
+
+            # ── Apply decision ──────────────────────────────────────────
+            with db_conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE correction_signal_evaluations SET
+                      re_embedder_decision = %s,
+                      re_embedder_confidence = %s
+                    WHERE id = %s
+                """, (decision, 0.7 if decision == "approved" else 0.3, eval_id))
+
+            stats[decision] += 1
+            db_conn.commit()
+
+        except Exception as e:
+            db_conn.rollback()
+            stats["errors"] += 1
+            log.error(f"re_embedder.correction_eval_error eval_id={eval_id} pattern={candidate_pattern[:50]}: {e}")
+
+    return stats
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
     if not a or not b or len(a) != len(b):
@@ -1201,6 +1282,17 @@ def main():
                         )
                 else:
                     log.debug("re_embedder.no_pending_ontology_work")
+
+                # dprompt-128-P3: Evaluate correction signal candidates
+                # Patterns that occur >= 3 times are auto-approved to correction_signals
+                correction_stats = evaluate_correction_signal_candidates(db, qwen_api_url)
+                if any(v > 0 for v in correction_stats.values()):
+                    log.info(
+                        f"re_embedder.correction_eval "
+                        f"approved={correction_stats['approved']} "
+                        f"rejected={correction_stats['rejected']} "
+                        f"errors={correction_stats['errors']}"
+                    )
 
                 # Expire stale Class C staged facts
                 n_expired = expire_staged_facts(db, qdrant_url)
