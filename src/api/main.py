@@ -435,18 +435,18 @@ def _build_rel_type_constraint(dsn: str) -> str:
         return ""
 
 def _build_rel_type_meta(dsn: str) -> dict:
-    """Load rel_types metadata (category + tail_types + storage_target + fact_class + is_symmetric + inverse_rel_type + is_hierarchy_rel) from DB."""
+    """Load rel_types metadata (category + tail_types + storage_target + fact_class + is_symmetric + inverse_rel_type + is_hierarchy_rel + correction_behavior) from DB."""
     try:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT rel_type, category, tail_types, storage_target, fact_class,
-                           is_symmetric, inverse_rel_type, is_hierarchy_rel
+                           is_symmetric, inverse_rel_type, is_hierarchy_rel, correction_behavior
                     FROM rel_types
                 """)
                 meta = {}
                 for row in cur.fetchall():
-                    rel_type, category, tail_types, storage_target, fact_class, is_symmetric, inverse_rel_type, is_hierarchy_rel = row
+                    rel_type, category, tail_types, storage_target, fact_class, is_symmetric, inverse_rel_type, is_hierarchy_rel, correction_behavior = row
                     meta[rel_type] = {
                         "category": category,
                         "tail_types": tail_types or [],
@@ -455,6 +455,7 @@ def _build_rel_type_meta(dsn: str) -> dict:
                         "is_symmetric": is_symmetric or False,
                         "inverse_rel_type": inverse_rel_type,
                         "is_hierarchy_rel": is_hierarchy_rel or False,
+                        "correction_behavior": correction_behavior or "supersede",
                     }
         return meta
     except Exception as e:
@@ -3294,6 +3295,10 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                                  subject_before=original_subject, subject_after=original_object,
                                  user_id=req.user_id)
 
+        # Mark all extracted triples as user_stated since they come directly from user input
+        for triple in triples:
+            triple["fact_provenance"] = "user_stated"
+
         log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
         return {
             "status": "success",
@@ -3554,90 +3559,13 @@ def _apply_correction(cur, user_id: str, old_value: str, new_value: str,
 
 def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -> float:
     """
-    Reassess triple confidence based on how explicitly the user stated it in req_text.
+    Return extraction confidence unchanged. Fact classification is now determined by
+    rel_type metadata (fact_class from rel_types table), not pattern matching on request text.
 
-    Returns adjusted confidence [0.0, 1.0]:
-    - 0.95: Direct self-statement (my wife is X, I have Y children, call me Z)
-    - 0.75: Inferred but clear (Marla's daughter, his cousin)
-    - 0.50: Contextual/speculative (maybe, probably, think, might)
-    - original: Default if no pattern match or not an identity/structural rel_type
-
-    SAFE: No crash on None/empty text, malformed edges, or unknown rel_types.
+    This respects the metadata-driven architecture: all directionality/classification
+    determinations come from the database, never from hardcoded patterns or heuristics.
     """
-    # Identity/structural rel_types that benefit from directness analysis
-    IDENTITY_STRUCTURAL = {
-        'pref_name', 'also_known_as', 'spouse', 'parent_of', 'child_of',
-        'sibling_of', 'age', 'height', 'weight', 'born_on', 'born_in',
-        'has_gender', 'nationality'
-    }
-
-    try:
-        # Safety: skip if no text or rel_type not identity/structural
-        if not req_text or not isinstance(req_text, str):
-            return edge.confidence if hasattr(edge, 'confidence') else 0.8
-
-        rel_type_lower = (edge.rel_type or "").lower()
-        if rel_type_lower not in IDENTITY_STRUCTURAL:
-            return edge.confidence if hasattr(edge, 'confidence') else 0.8
-
-        text_lower = req_text.lower()
-        subject = (edge.subject or "").lower()
-        object_val = (edge.object or "").lower()
-
-        # Empty subject/object → no match possible
-        if not subject or not object_val:
-            return edge.confidence if hasattr(edge, 'confidence') else 0.8
-
-        # ─── DIRECT SELF-STATEMENT (0.95) ───
-        # Pattern: "my [rel_type] is [object]"
-        if f"my {rel_type_lower}" in text_lower and object_val in text_lower:
-            return 0.95
-
-        # Pattern: "my name is [object]", "call me [object]", "i am [object]"
-        if rel_type_lower in ('pref_name', 'also_known_as'):
-            if any(pat in text_lower for pat in (f"my name is {object_val}", f"call me {object_val}", f"i am {object_val}", f"i'm {object_val}")):
-                return 0.95
-
-        # Pattern: "married to [object]" or "spouse is [object]"
-        if rel_type_lower == 'spouse':
-            if any(pat in text_lower for pat in (f"married to {object_val}", f"spouse is {object_val}", f"wife is {object_val}", f"husband is {object_val}")):
-                return 0.95
-
-        # Pattern: "i have [number] [children/kids/daughters/sons]" + object mentioned nearby
-        if rel_type_lower in ('parent_of', 'child_of'):
-            if 'i have' in text_lower and any(kw in text_lower for kw in ('children', 'kids', 'daughters', 'sons')):
-                # Check if object appears within 100 chars of "i have"
-                i_have_pos = text_lower.find('i have')
-                if i_have_pos != -1:
-                    window = text_lower[i_have_pos:i_have_pos+100]
-                    if object_val in window:
-                        return 0.95
-
-        # ─── INFERRED BUT CLEAR (0.75) ───
-        # Pattern: "[name]'s [rel_type]" (e.g., "marla's daughter")
-        if f"{subject}'s" in text_lower and object_val in text_lower:
-            return 0.75
-
-        # Pattern: possessive pronouns (his, her, their) + rel_type
-        if any(poss in text_lower for poss in ('his ', 'her ', 'their ')):
-            if object_val in text_lower:
-                return 0.75
-
-        # ─── SPECULATIVE (0.50) ───
-        # If text contains hedge words and this rel_type is mentioned, lower confidence
-        hedge_words = ('maybe', 'probably', 'might', 'could', 'think', 'guess', 'appear', 'seem', 'possibly', 'perhaps')
-        if any(hw in text_lower for hw in hedge_words):
-            # Check if the object is mentioned in a speculative context
-            if object_val in text_lower:
-                return 0.50
-
-        # ─── DEFAULT: Keep extraction confidence ───
-        return edge.confidence if hasattr(edge, 'confidence') else 0.8
-
-    except Exception as e:
-        # Non-destructive: on any error, keep extraction confidence
-        log.warning("assess_statement_directness.exception", error=str(e), rel_type=edge.rel_type if hasattr(edge, 'rel_type') else None)
-        return edge.confidence if hasattr(edge, 'confidence') else 0.8
+    return edge.confidence if hasattr(edge, 'confidence') else 0.8
 
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -3855,6 +3783,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             subject_type=t.get("subject_type"),
                             object_type=t.get("object_type"),
                             definition=t.get("definition"),
+                            fact_provenance=t.get("fact_provenance", "llm_inferred"),  # Preserve from extraction
                         )
                         for t in rewrite_data.get("triples", [])
                         if t.get("subject") and t.get("object") and t.get("rel_type")
@@ -4266,42 +4195,19 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     )
 
                 # PHASE 2: Assign Class and Confidence
-                # Check if user-stated: direct statements ("I live at X", "My name is X", etc.)
-                # These bypass staging and go straight to Class A (user is authority on themselves)
+                # Check if user-stated: fact_provenance from extraction or is_correction
+                # Rel_type metadata (fact_class from rel_types table) determines Class A/B/C routing.
                 is_direct_statement = False
                 rel_lower = edge.rel_type.lower()
-                text_lower = req.text.lower()
-
-                # Direct user statements: "I live at X", "I am at X", "I'm in X", "My address is X"
-                if rel_lower in ("lives_at", "lives_in", "located_in"):
-                    _location_patterns = [
-                        r'\bi\s+live\s+(?:at|in)',
-                        r'\bi\s+am\s+(?:at|in)',
-                        r'\bi\'m\s+(?:at|in)',
-                        r'\bmy\s+(?:address|location|place|home|house|address)',
-                        r'\bwe\s+live\s+(?:at|in)',
-                    ]
-                    is_direct_statement = any(
-                        re.search(pattern, text_lower) for pattern in _location_patterns
-                    )
-
-                # Direct user statements for other rel_types: "My name is X", "I'm X"
-                elif rel_lower in ("pref_name", "also_known_as"):
-                    _name_patterns = [
-                        r'\bmy\s+name\s+is',
-                        r'\bi\'m\s+',
-                        r'\bi\s+am\s+',
-                        r'\bcall\s+me\s+',
-                        r'\bgoes\s+by\s+',
-                        r'\bprefers?\s+to\s+be\s+called',
-                    ]
-                    is_direct_statement = any(
-                        re.search(pattern, text_lower) for pattern in _name_patterns
-                    )
 
                 is_user_stated = (edge.is_correction or
-                                 (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated") or
-                                 is_direct_statement)
+                                 (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated"))
+
+                log.info("ingest.fact_provenance_check",
+                       rel_type=edge.rel_type.lower(),
+                       has_attr=hasattr(edge, 'fact_provenance'),
+                       fact_provenance=getattr(edge, 'fact_provenance', 'MISSING'),
+                       is_user_stated=is_user_stated)
 
                 # Check if metadata was created in-flow (TODO: detect from extraction context)
                 ontology_created = False
@@ -4889,6 +4795,48 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     committed += manager.commit(class_a_rows)
                     log.info("ingest.class_a_committed", count=len(class_a_rows))
 
+                    # Apply correction_behavior supersession for Class A facts
+                    # When a Class A user-stated fact is inserted, supersede contradictory existing facts
+                    try:
+                        with db.cursor() as cur:
+                            for user_id, subject, obj, rel_type, source, is_preferred, defn, storage_type, is_hierarchy_rel, taxonomies in class_a_rows:
+                                rel_type_lower = (rel_type or "").lower()
+
+                                # Query metadata for correction_behavior
+                                metadata = _REL_TYPE_META.get(rel_type_lower, {})
+                                behavior = metadata.get("correction_behavior", "supersede")
+
+                                log.info("ingest.class_a_supersession_check",
+                                       rel_type=rel_type_lower, subject=subject[:8], obj=obj[:8],
+                                       behavior=behavior, has_metadata=bool(metadata))
+
+                                # Only apply supersession if behavior is "supersede" (not "hard_delete", "immutable", etc.)
+                                if behavior != "supersede":
+                                    log.info("ingest.class_a_supersession_skipped",
+                                           rel_type=rel_type_lower, reason=f"behavior={behavior}")
+                                    continue
+
+                                # Supersede existing facts with same user, subject, rel_type (but different object or already existing)
+                                # This handles: "I live at X" superseding old "I live at Y" facts
+                                cur.execute(
+                                    "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+                                    "WHERE user_id = %s AND subject_id = %s AND rel_type = %s "
+                                    "AND object_id != %s AND superseded_at IS NULL",
+                                    (user_id, subject, rel_type_lower, obj),
+                                )
+                                superseded_count = cur.rowcount
+                                log.info("ingest.class_a_supersession_result",
+                                       rel_type=rel_type_lower, subject=subject[:8], new_obj=obj[:8],
+                                       superseded_count=superseded_count)
+                                if superseded_count > 0:
+                                    log.info("ingest.class_a_superseded_contradictory",
+                                           rel_type=rel_type_lower, subject=subject[:8], new_object=obj[:8],
+                                           superseded_count=superseded_count, user_id=req.user_id)
+                        db.commit()
+                    except Exception as _supersede_err:
+                        log.warning("ingest.class_a_supersession_failed", error=str(_supersede_err))
+                        # Don't fail ingest if supersession fails — it's an optimization
+
                     # Trigger immediate Qdrant sync for Class A facts (don't wait for 10s re_embedder poll)
                     # This ensures attribute queries immediately after ingest get results from both PostgreSQL and Qdrant
                     try:
@@ -5345,26 +5293,26 @@ def query(request: QueryRequest):
         results = []
         try:
             with db_conn.cursor() as cur:
-                # --- Build base conditions ---
-                f_conds = ["user_id = %s", "superseded_at IS NULL",
-                           "hard_delete_flag = false",
-                           "(valid_until IS NULL OR valid_until > now())"]
-                s_conds = ["user_id = %s", "expires_at > now()",
-                           "promoted_at IS NULL",
-                           "(fact_class = 'A' OR fact_class = 'B')"]
+                # --- Build base conditions (all qualified with table alias for JOIN safety) ---
+                f_conds = ["f.user_id = %s", "f.superseded_at IS NULL",
+                           "f.hard_delete_flag = false",
+                           "(f.valid_until IS NULL OR f.valid_until > now())"]
+                s_conds = ["s.user_id = %s", "s.expires_at > now()",
+                           "s.promoted_at IS NULL",
+                           "(s.fact_class = 'A' OR s.fact_class = 'B')"]
 
                 if rel_types:
                     ph = ",".join(["%s"] * len(rel_types))
-                    f_conds.append(f"rel_type IN ({ph})")
-                    s_conds.append(f"rel_type IN ({ph})")
+                    f_conds.append(f"f.rel_type IN ({ph})")
+                    s_conds.append(f"s.rel_type IN ({ph})")
 
                 if entity_id:
-                    f_conds.append("(subject_id = %s OR object_id = %s)")
-                    s_conds.append("(subject_id = %s OR object_id = %s)")
+                    f_conds.append("(f.subject_id = %s OR f.object_id = %s)")
+                    s_conds.append("(s.subject_id = %s OR s.object_id = %s)")
 
                 if taxonomies:
-                    f_conds.append("taxonomies && %s::text[]")
-                    s_conds.append("taxonomies && %s::text[]")
+                    f_conds.append("f.taxonomies && %s::text[]")
+                    s_conds.append("s.taxonomies && %s::text[]")
 
                 f_where = " AND ".join(f_conds)
                 s_where = " AND ".join(s_conds)
