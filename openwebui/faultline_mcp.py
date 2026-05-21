@@ -56,10 +56,10 @@ RELATIONSHIP RULES (strictly enforced):
 12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
     emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
     NEVER use a nickname or name as the age value.
-    If the sentence contains both an age AND a nickname (e.g. "Desmonde age 12, goes by Des"),
+    If the sentence contains both an age AND a nickname (e.g. "ChildC age 12, goes by ChildC_short"),
     emit TWO separate triples:
-    {"subject":"desmonde","object":"12","rel_type":"age"}
-    {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
+    {"subject":"child_c","object":"12","rel_type":"age"}
+    {"subject":"child_c","object":"des","rel_type":"also_known_as"}
 13. For height patterns ("X is 6ft tall", "X height 6’", "X stands 6 feet", "X is 6’ tall"):
     emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
     Normalize units to feet/inches format. Use ' for feet, \" for inches.

@@ -656,7 +656,7 @@ def enforce_directionality(
     Enforce rel_type directionality rules. Correct asymmetric rels to canonical direction.
 
     Examples:
-    - User says "Des is parent of me" → invert to "I am parent of Des" (parent_of canonical)
+    - User says "ChildC_short is parent of me" → invert to "I am parent of ChildC_short" (parent_of canonical)
     - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
@@ -1775,7 +1775,7 @@ def _get_llm_url_fallbacks() -> list[str]:
 
     Supports multiple access paths to OpenWebUI:
     - Host address: 192.168.1.10:3000
-    - Reverse proxy: example.com
+    - Reverse proxy: <YOUR_DOMAIN>
     - Docker internal IP: 172.16.9.2:3000
     - Container reference: open-webui:3000
 
@@ -2181,7 +2181,7 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
 
     Example outputs:
     - "Chris works for Acme Inc."
-    - "Des is 16 years old"
+    - "ChildC_short is 16 years old"
     """
     try:
         subject_id = fact.get("subject_id")
@@ -3038,7 +3038,7 @@ EXTRACT RULES:
 2. Entity types: instance_of for EVERY entity (person, location, organization, object, animal, concept, etc.)
 3. Hierarchies: For locations, extract nested containment (street→city→state→country)
 4. Family kinship (CRITICAL):
-   - "My children are Gabby, Des" → (user, parent_of, gabby), (user, parent_of, des)
+   - "My children are Gabby, ChildC_short" → (user, parent_of, gabby), (user, parent_of, des)
    - "My son's name is X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a DIFFERENT entity from user
    - "My daughter is named X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a child, NOT an alias of user
    - "My spouse/wife/husband is X" → (user, spouse, x), THEN (x, pref_name, x) — X is a separate entity
@@ -3872,7 +3872,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
     # Guard: if another named entity is mentioned with a preference signal
-    # (e.g., "Desmonde prefers Des"), skip auto-synthesis for the user.
+    # (e.g., "ChildC prefers ChildC_short"), skip auto-synthesis for the user.
     # The LLM already extracted the correct entity assignment.
     _third_party_pref = re.compile(
         r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
@@ -4339,7 +4339,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                         if match:
                             relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                            entity_name = match.group(2).lower()  # Des, Sophia, Spot, etc.
+                            entity_name = match.group(2).lower()  # ChildC_short, Sophia, Spot, etc.
 
                             # Resolve the mentioned entity to its canonical ID
                             resolved_entity = registry.resolve(req.user_id, entity_name)
