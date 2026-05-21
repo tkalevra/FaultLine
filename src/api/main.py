@@ -162,7 +162,7 @@ def _get_canonical_rel_type(rel_type_alias: str) -> str:
 
     alias_lower = rel_type_alias.lower().strip()
 
-    # Try DB query first (includes newly-learned aliases from re_embedder)
+    # Try DB query first (inclualice newly-learned aliases from re_embedder)
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         try:
@@ -656,7 +656,7 @@ def enforce_directionality(
     Enforce rel_type directionality rules. Correct asymmetric rels to canonical direction.
 
     Examples:
-    - User says "ChildC_short is parent of me" → invert to "I am parent of ChildC_short" (parent_of canonical)
+    - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
     - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
@@ -933,7 +933,7 @@ def _ensure_schema(dsn: str) -> None:
                     CREATE TABLE IF NOT EXISTS entity_taxonomies (
                         id BIGSERIAL PRIMARY KEY,
                         taxonomy_name VARCHAR(64) NOT NULL UNIQUE,
-                        description TEXT,
+                        alicecription TEXT,
                         member_entity_types TEXT[] NOT NULL DEFAULT '{}',
                         rel_types_defining_group TEXT[] NOT NULL DEFAULT '{}',
                         has_transitivity BOOLEAN DEFAULT false,
@@ -1057,7 +1057,7 @@ def _llm_discover_taxonomy_from_facts(
     2. The facts that were fetched (rel_types, count)
     3. Request: "What taxonomy group do these rel_types define?"
 
-    LLM returns: {taxonomy_name, description, rel_types_defining_group, ...}
+    LLM returns: {taxonomy_name, alicecription, rel_types_defining_group, ...}
     """
     if not facts or not llm_url:
         return None
@@ -1066,7 +1066,7 @@ def _llm_discover_taxonomy_from_facts(
         # Fetch existing taxonomies as examples for LLM context
         with db_conn.cursor() as cur:
             cur.execute(
-                "SELECT taxonomy_name, description, rel_types_defining_group "
+                "SELECT taxonomy_name, alicecription, rel_types_defining_group "
                 "FROM entity_taxonomies LIMIT 5"
             )
             examples = cur.fetchall()
@@ -1083,8 +1083,8 @@ def _llm_discover_taxonomy_from_facts(
 
         # Build context for LLM
         examples_text = "\n".join([
-            f"- {name}: {desc or '(no description)'} defines members via {rels}"
-            for name, desc, rels in examples
+            f"- {name}: {alicec or '(no alicecription)'} defines members via {rels}"
+            for name, alicec, rels in examples
         ])
 
         rel_types_text = ", ".join([f"{rt} ({cnt})" for rt, cnt in sorted(rel_type_counts.items(), key=lambda x: -x[1])])
@@ -1101,7 +1101,7 @@ Do these rel_types define a natural grouping (taxonomy)?
 - Examples: family (parent_of, spouse, has_child), work (works_for, has_colleague), location (lives_at, born_in)
 
 If YES, respond ONLY with JSON (no markdown):
-{{"taxonomy_name": "name", "description": "brief description", "rel_types_defining_group": ["rel1", "rel2"]}}
+{{"taxonomy_name": "name", "alicecription": "brief alicecription", "rel_types_defining_group": ["rel1", "rel2"]}}
 
 If NO, respond ONLY with:
 {{"taxonomy_name": null}}"""
@@ -1135,7 +1135,7 @@ If NO, respond ONLY with:
 
         taxonomy_def = {
             "taxonomy_name": tax_name,
-            "description": parsed.get("description", ""),
+            "alicecription": parsed.get("alicecription", ""),
             "member_entity_types": "{}",  # Will be populated as facts are classified
             "rel_types_defining_group": parsed.get("rel_types_defining_group", []),
             "has_transitivity": False,
@@ -1306,7 +1306,7 @@ def _hierarchy_expand(
     direction="up":  entity → instance_of/subclass_of → parent class (classification chain)
     direction="down": class → instance_of/subclass_of → members (class membership)
 
-    Returns set of entity UUIDs in the chain (includes the starting entity).
+    Returns set of entity UUIDs in the chain (inclualice the starting entity).
     """
     hier_rels = list(_get_hierarchy_rels())
     chain: set[str] = {entity_id}
@@ -1519,7 +1519,7 @@ def _get_rel_type_metadata(rel_type: str) -> dict:
     if _REL_TYPE_CACHE and rt in _REL_TYPE_CACHE:
         return _REL_TYPE_CACHE[rt]
 
-    # Query DB directly — includes novel rel_types approved by re_embedder
+    # Query DB directly — inclualice novel rel_types approved by re_embedder
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         try:
@@ -1775,7 +1775,7 @@ def _get_llm_url_fallbacks() -> list[str]:
 
     Supports multiple access paths to OpenWebUI:
     - Host address: 192.168.1.10:3000
-    - Reverse proxy: <YOUR_DOMAIN>
+    - Reverse proxy: docker-host.helpalicekpro.ca
     - Docker internal IP: 172.16.9.2:3000
     - Container reference: open-webui:3000
 
@@ -2069,7 +2069,7 @@ def _load_taxonomy_cache(db) -> None:
         with db.cursor() as cur:
             cur.execute(
                 "SELECT taxonomy_name, member_entity_types, rel_types_defining_group, "
-                "description, is_hierarchical, parent_rel_type "
+                "alicecription, is_hierarchical, parent_rel_type "
                 "FROM entity_taxonomies"
             )
             rows = cur.fetchall()
@@ -2090,14 +2090,14 @@ def _load_taxonomy_cache(db) -> None:
                                    taxonomy=taxonomy_name, input=row[2], error=str(e))
                         rel_types = []
 
-                    desc = row[3]
+                    alicec = row[3]
                     is_hier = row[4]
                     parent_rel = row[5]
 
                     _TAXONOMY_CACHE[taxonomy_name] = {
                         "member_entity_types": member_types,
                         "rel_types_defining_group": rel_types,
-                        "description": desc,
+                        "alicecription": alicec,
                         "is_hierarchical": is_hier,
                         "parent_rel_type": parent_rel,
                     }
@@ -2181,7 +2181,7 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
 
     Example outputs:
     - "Chris works for Acme Inc."
-    - "ChildC_short is 16 years old"
+    - "alice is 16 years old"
     """
     try:
         subject_id = fact.get("subject_id")
@@ -2195,18 +2195,18 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
             subject_name = registry.get_preferred_name("", subject_id)
         subject_name = subject_name or (subject_id[:8] if subject_id else "Unknown")
 
-        # Get rel_type description from database
-        rel_description = rel_type
+        # Get rel_type alicecription from database
+        rel_alicecription = rel_type
         if db and rel_type:
             try:
                 with db.cursor() as cur:
                     cur.execute(
-                        "SELECT description FROM rel_types WHERE rel_type = %s",
+                        "SELECT alicecription FROM rel_types WHERE rel_type = %s",
                         (rel_type,)
                     )
                     row = cur.fetchone()
                     if row and row[0]:
-                        rel_description = row[0]
+                        rel_alicecription = row[0]
             except Exception:
                 pass  # Fall back to rel_type name
 
@@ -2224,8 +2224,8 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
             return None
 
         # Format as natural English
-        if subject_name and rel_description and object_repr:
-            return f"{subject_name} {rel_description} {object_repr}."
+        if subject_name and rel_alicecription and object_repr:
+            return f"{subject_name} {rel_alicecription} {object_repr}."
 
         return None
     except Exception as e:
@@ -2409,7 +2409,7 @@ def _filter_extracted_entities(
 
     REJECT_TYPES = {"Concept", "unknown", "Unknown"}
 
-    # English stop words + rel_types + attribute descriptors (comprehensive, no recursive matching)
+    # English stop words + rel_types + attribute alicecriptors (comprehensive, no recursive matching)
     STOP_WORDS = {
         # Grammar
         "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
@@ -2426,7 +2426,7 @@ def _filter_extracted_entities(
         # Rel_types that should NOT be entities
         "spouse", "parent", "child", "sibling", "friend", "couple", "married", "married_person",
         "born", "died", "lived", "worked", "studied", "taught", "owned",
-        # Attribute descriptors
+        # Attribute alicecriptors
         "tall", "short", "old", "young", "big", "small", "engineer", "doctor", "teacher", "worker",
         "person", "people", "member", "group", "family", "household", "company", "organization", "institution",
         # Preference markers
@@ -2802,7 +2802,7 @@ def _find_hierarchies_by_entity_types(detected_types: set, user_id: str, db) -> 
             if overlap > 0:
                 matches.append((row[0], row[1], overlap))
 
-        # Sort by overlap score descending
+        # Sort by overlap score alicecending
         matches.sort(key=lambda x: x[2], reverse=True)
         return matches
     except Exception as e:
@@ -2867,7 +2867,7 @@ def _validate_triple_against_metadata(triple: dict, db) -> dict:
     dprompt-129: Validate triple against rel_types metadata.
 
     Checks head_types/tail_types constraints. Records validation error
-    but does NOT force low confidence — ingest logic decides confidence
+    but does NOT force low confidence — ingest logic decialice confidence
     based on whether it's user-stated (direct user correction bypasses
     type constraints). Novel rel_types pass through (Class C).
     """
@@ -2916,7 +2916,7 @@ def _validate_triple_against_metadata(triple: dict, db) -> dict:
             )
             log.info("extract.triple_validation_warning",
                     triple=triple, error=triple["validation_error"],
-                    note="Type mismatch recorded but confidence not forced low — ingest decides based on user-stated flag")
+                    note="Type mismatch recorded but confidence not forced low — ingest decialice based on user-stated flag")
 
         return triple
     except Exception as e:
@@ -2955,7 +2955,7 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
             ]
         }
 
-        # Enrich schema descriptions with context (dBug-018 Phase A)
+        # Enrich schema alicecriptions with context (dBug-018 Phase A)
         if ctx:
             entity_names = ", ".join(
                 [e["name"] for e in ctx.get("known_entities", [])]
@@ -3016,113 +3016,310 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
 
 def _build_extraction_prompt(db_connection=None) -> str:
     """
-    dprompt-120: Build extraction prompt dynamically from rel_types metadata.
+    dprompt-127: Pattern-based extraction prompt, metadata-driven, domain-generic.
 
-    Replaces hardcoded 4.3KB prompt with database-driven guidance.
-    Groups rel_types by category, selects 2-3 examples per category.
-    Reduces prompt bloat (~1KB vs 4.3KB) and makes extraction generic.
+    Replaces ambiguous FORMAT placeholder with THREE DISTINCT EXTRACTION PATTERNS:
+    1. Relationships (entity → entity): parent_of, spouse, works_for, etc.
+    2. Scalars (entity → value): age, height, occupation (string/number/date values)
+    3. Identity (entity → alias): pref_name, also_known_as, same_as
+
+    Dynamically loads rel_type guidance from DB using tail_types metadata.
+    NO hardcoded entity names. NO user data in prompt.
+    Works for any domain: family, work, location, computer_system, etc.
     """
-    base_prompt = """Extract ALL relationships and facts from text. Return ONLY a JSON array. Each triple must have subject, object, rel_type, and definition.
+    base_prompt = """Extract ALL relationships and facts from text. Return ONLY a JSON array of triples. Each triple must have: subject, object, rel_type, definition.
 
-FORMAT: [{"subject":"entity","object":"value","rel_type":"rel_type","definition":"short description"}]
+CRITICAL DISTINCTION — Three Extraction Patterns:
 
-REL_TYPE METADATA: For novel rel_types, optionally include:
-- head_types: subject entity types (e.g., ["Person"])
-- tail_types: object types or ["SCALAR"] for string values
-- is_symmetric: true if bidirectional (friend_of, knows), false if directional (parent_of, works_for)
-- inverse_rel_type: the reverse relationship (parent_of ↔ child_of)
-- is_hierarchy_rel: true for classification (instance_of, subclass_of), false for relational (spouse, works_for)
+PATTERN 1 — RELATIONSHIPS (entity → entity):
+  Both subject and object are ENTITY NAMES (person, organization, location, object, etc.)
+  rel_type alicecribes the RELATIONSHIP (parent_of, works_for, located_in, knows, spouse, etc.)
+  Structure: {"subject":"entity_name","object":"entity_name","rel_type":"relationship_type","definition":"..."}
+  Examples (generic):
+    - {"subject":"subject_entity","object":"object_entity","rel_type":"parent_of","definition":"subject is parent of object"}
+    - {"subject":"subject_entity","object":"object_entity","rel_type":"works_for","definition":"subject works for object"}
 
-EXTRACT RULES:
-1. Identity: pref_name, also_known_as, same_as (pronouns → entities)
-2. Entity types: instance_of for EVERY entity (person, location, organization, object, animal, concept, etc.)
-3. Hierarchies: For locations, extract nested containment (street→city→state→country)
-4. Family kinship (CRITICAL):
-   - "My children are Gabby, ChildC_short" → (user, parent_of, gabby), (user, parent_of, des)
-   - "My son's name is X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a DIFFERENT entity from user
-   - "My daughter is named X" → (user, parent_of, x), THEN (x, pref_name, x) — X is a child, NOT an alias of user
-   - "My spouse/wife/husband is X" → (user, spouse, x), THEN (x, pref_name, x) — X is a separate entity
-5. Lists with relationships: Extract all names separately with parent_of or spouse relationships
-6. All relationships mentioned (family, work, location, ownership, knowledge, etc.)
-7. Attributes as rel_types: age, occupation, nationality (when object is a scalar value)
+PATTERN 2 — SCALARS/ATTRIBUTES (entity → value):
+  Subject is ENTITY NAME
+  Object is LITERAL VALUE: string, number, date (NOT an entity name, NOT a rel_type name)
+  rel_type alicecribes the ATTRIBUTE (age, height, occupation, born_on, nationality, etc.)
+  Structure: {"subject":"entity_name","object":"value_as_string_or_number","rel_type":"attribute_type","definition":"..."}
+  Examples (generic):
+    - {"subject":"subject_entity","object":"42","rel_type":"age","definition":"subject is 42 years old"}
+    - {"subject":"subject_entity","object":"Engineer","rel_type":"occupation","definition":"subject is an Engineer"}
 
-FIRST-PERSON RULE: Use 'user' for "I"/"me"/"my"/"we" statements — NEVER the pronoun literally.
+PATTERN 3 — IDENTITY/ALIASES (entity → entity):
+  Subject is PRIMARY ENTITY NAME
+  Object is ALTERNATE NAME, NICKNAME, or ALIAS of same entity (also_known_as, pref_name, same_as)
+  rel_type is ALWAYS: pref_name, also_known_as, or same_as
+  Structure: {"subject":"entity_name","object":"alternate_name","rel_type":"identity_rel_type","definition":"..."}
+  Examples (generic):
+    - {"subject":"subject_entity","object":"alternate_name","rel_type":"also_known_as","definition":"subject is also known as alternate_name"}
+    - {"subject":"subject_entity","object":"preferred_name","rel_type":"pref_name","definition":"subject prefers to be called preferred_name"}
 
-THIRD-PERSON PRONOUNS: If "it"/"he"/"she"/"they" appears, resolve from prior context or omit the fact.
+⚠️  COMMON MISTAKE — DO NOT confuse rel_type names with entity values:
+  WRONG:  {"subject":"entity","object":"pref_name","rel_type":"pref_name"}  ← object is rel_type name!
+  RIGHT:  {"subject":"entity","object":"actual_value_here","rel_type":"pref_name"}  ← object is the actual value
 
-RELATIONSHIP TYPES (from knowledge graph):
+  If rel_type is in the list (pref_name, age, parent_of, works_for, etc.), the object field must NEVER contain that rel_type name.
+  Object is ALWAYS the actual entity name, value, or alias—never the relationship type itself.
+
+EXTRACTION RULES ORGANIZED BY PATTERN:
+
+PATTERN 1 — RELATIONSHIPS (these define connectivity between entities):
+  - Extract: parent_of, child_of, spouse, sibling_of (family connections)
+  - Extract: works_for, educated_at (professional connections)
+  - Extract: knows, friend_of, met, related_to (social connections)
+  - Extract: has_pet, owns (ownership)
+  - Extract: located_in, lives_in, lives_at (location/residence)
+  - Extract: instance_of, subclass_of, part_of, is_a, member_of (classification/hierarchy)
+  - Extract: created_by (authorship)
+  - Rules:
+    * "My son is named X" → Extract TWO triples: (user, parent_of, X) AND (X, pref_name, X's actual name)
+    * "My wife is X" → (user, spouse, X)
+    * "X works for Y" → (X, works_for, Y)
+    * Do NOT invert relationships; system handles directionality from metadata
+
+PATTERN 2 — SCALARS/ATTRIBUTES (these assign properties to entities):
+  - Extract: age, height, weight (numeric measurements)
+  - Extract: born_on, born_in (temporal/location facts)
+  - Extract: nationality, has_gender (demographics)
+  - Extract: occupation, title (role alicecriptors)
+  - Rules:
+    * Object is ALWAYS a literal value (number, date string, or text string)
+    * "X is 42" → (X, age, "42") — object is numeric string, NOT an entity
+    * "X was born in 1980" → (X, born_on, "1980") or (X, born_in, "location_name")
+
+PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
+  - Extract: pref_name (preferred display name)
+  - Extract: also_known_as (nickname, alternate name, known by)
+  - Extract: same_as (entity identity resolution across contexts)
+  - Rules:
+    * Object is an ALTERNATE NAME for the entity (another name they go by)
+    * "X is called Y" → (X, also_known_as, Y)
+    * "X's full name is Y" → (X, pref_name, Y)
+
+FIRST-PERSON RESOLUTION:
+  - "I", "me", "my", "we" → always map to "user" entity (NEVER use pronouns literally)
+  - "We have a dog" → (user, has_pet, dog_name)
+
+AMBIGUOUS PRONOUNS:
+  - If "he", "she", "it", "they" appear, resolve from prior context IF POSSIBLE
+  - Omit the fact if no prior context available (prevents hallucination)
+
+REL_TYPE METADATA (optional for novel rel_types):
+  - head_types: entity types allowed as subject (e.g., ["Person"])
+  - tail_types: object types allowed (e.g., ["Organization"], ["SCALAR"] for values)
+  - is_symmetric: true if bidirectional (spouse, friend_of), false if directional (parent_of, works_for)
+  - inverse_rel_type: reverse relationship (parent_of ↔ child_of)
+  - is_hierarchy_rel: true for classification (instance_of, subclass_of), false for relational
+
+DOMAIN-SPECIFIC REL_TYPE GUIDANCE:
 """
 
     if db_connection:
+        correction_rows = []  # Initialize before try block
+        correction_behavior_rows = []  # dprompt-064 Phase 1
         try:
             with db_connection.cursor() as cur:
-                # dprompt-126: Phase 3a — Include natural_language descriptions
+                # Query rel_types, organize by pattern (relationship, scalar, identity)
                 cur.execute("""
-                    SELECT category, rel_type, is_symmetric, inverse_rel_type, tail_types, natural_language
+                    SELECT
+                        rel_type,
+                        natural_language,
+                        tail_types,
+                        is_hierarchy_rel
                     FROM rel_types
-                    WHERE category IS NOT NULL
-                    ORDER BY category, rel_type
-                    LIMIT 30
+                    WHERE rel_type NOT IN ('pref_name', 'also_known_as', 'same_as')
+                    AND natural_language IS NOT NULL
+                    ORDER BY
+                        CASE
+                            WHEN tail_types = ARRAY['SCALAR']::TEXT[] THEN 1
+                            ELSE 0
+                        END,
+                        rel_type
+                    LIMIT 15
                 """)
-                rows = cur.fetchall()
+                rel_rows = cur.fetchall()
 
-            # Group by category, pick 2-3 per category
-            by_category = {}
-            for row in rows:
-                cat = row[0] or "other"
-                if cat not in by_category:
-                    by_category[cat] = []
-                if len(by_category[cat]) < 2:
-                    by_category[cat].append({
-                        "rel_type": row[1],
-                        "is_symmetric": row[2],
-                        "inverse": row[3],
-                        "tail_types": row[4],
-                        "natural_language": row[5]
-                    })
+                # dprompt-128-P2: Correction signal patterns (learned from correction_signals table)
+                # Query patterns with weights for correction detection (same cursor context)
+                cur.execute("""
+                    SELECT pattern, pattern_type, confidence, example_usage
+                    FROM correction_signals
+                    ORDER BY priority ASC, confidence DESC
+                    LIMIT 10
+                """)
+                correction_rows = cur.fetchall()
 
-            # Build category examples with natural language context
-            for cat in sorted(by_category.keys()):
-                base_prompt += f"\n{cat.title()}:\n"
-                for ex in by_category[cat]:
-                    rt = ex["rel_type"]
-                    sym = " (symmetric)" if ex["is_symmetric"] else ""
-                    inv = f" ↔ {ex['inverse']}" if ex["inverse"] else ""
-                    nl = ex.get("natural_language", "")
+                # dprompt-064 Phase 1: Query rel_types that support corrections
+                # Guialice LLM on which rel_types accept corrections and their semantics
+                cur.execute("""
+                    SELECT rel_type, label, correction_behavior
+                    FROM rel_types
+                    WHERE correction_behavior IS NOT NULL
+                    AND correction_behavior != 'ignore'
+                    ORDER BY correction_behavior, rel_type
+                """)
+                correction_behavior_rows = cur.fetchall()
 
-                    # Format: "  - rel_type: natural language description (metadata)"
-                    if nl:
-                        base_prompt += f'  - {rt}: "{nl}" {sym}{inv}\n'
-                    else:
-                        base_prompt += f"  - {rt}{sym}{inv}\n"
+            # Separate rel_types by pattern using metadata
+            scalar_rels = []
+            relationship_rels = []
+
+            for row in rel_rows:
+                rel_type, nl, tail_types, is_hierarchy = row
+                # tail_types is PostgreSQL array (tuple), e.g., ('SCALAR',) or ('Person',)
+                is_scalar = tail_types and len(tail_types) == 1 and tail_types[0] == 'SCALAR'
+                if is_scalar:
+                    scalar_rels.append({"rel_type": rel_type, "nl": nl})
+                else:
+                    relationship_rels.append({"rel_type": rel_type, "nl": nl})
+
+            # Pattern 2 examples (scalars first, most specific)
+            if scalar_rels:
+                base_prompt += "\nAttributes (entity → scalar value):\n"
+                for item in scalar_rels[:3]:
+                    base_prompt += f'  - {item["rel_type"]}: {item["nl"]}\n'
+
+            # Pattern 1 examples (relationships)
+            if relationship_rels:
+                base_prompt += "\nRelationships (entity → entity):\n"
+                for item in relationship_rels[:5]:
+                    base_prompt += f'  - {item["rel_type"]}: {item["nl"]}\n'
+
+            # Pattern 3: Always include identity rels
+            base_prompt += "\nIdentity (entity → alias):\n"
+            base_prompt += '  - pref_name: entity\'s preferred display name\n'
+            base_prompt += '  - also_known_as: entity\'s alternative names or nicknames\n'
+            base_prompt += '  - same_as: entity identity resolution\n'
+
+            # Add correction detection patterns if any loaded from DB
+            if correction_rows:
+                base_prompt += "\nCORRECTION DETECTION (applies to ALL triples in correction context):\n"
+                base_prompt += "When correction pattern detected: mark ALL extracted triples in that message with \"is_correction\": true.\n"
+                base_prompt += "Learned patterns (from database):\n"
+                for pattern, pattern_type, confidence, example in correction_rows:
+                    base_prompt += f'  - [{pattern_type}] "{pattern}" (confidence: {confidence:.2f})'
+                    if example:
+                        base_prompt += f' e.g. "{example}"'
+                    base_prompt += '\n'
+
+            # dprompt-064 Phase 1: Add correction-supporting rel_types from metadata
+            if correction_behavior_rows:
+                base_prompt += "\nCORRECTION-SUPPORTING REL_TYPES (metadata-driven):\n"
+                base_prompt += "Mark with is_correction=true when user corrects these rel_types:\n"
+                for rel_type, label, behavior in correction_behavior_rows:
+                    base_prompt += f'  - {rel_type} ({behavior}): {label}\n'
 
         except Exception as e:
             log.warning("extract_prompt.db_query_failed", error=str(e))
-            # Fallback to minimal core examples
+            # Fallback: minimal pattern explanation (NO hardcoded examples, NO user data)
             base_prompt += """
-Core:
-  - pref_name: entity's preferred name (identity)
-  - also_known_as: entity's alias (identity)
-  - instance_of: "X is an instance of Y" (entity type classification)
-  - parent_of: "X is the parent of Y" (family, asymmetric ↔ child_of)
-  - spouse: "X and Y are spouses" (family, symmetric)
-  - works_for: "X works for Y" (work, asymmetric)
-  - located_in: "X is located in Y" (location)
-  - has_pet: "X has a pet Y" (ownership)
+PATTERN REFERENCE (minimal fallback):
+  Attributes: age, height, weight, born_on, nationality, occupation (entity → scalar value)
+  Relationships: parent_of, spouse, works_for, located_in, has_pet, knows (entity → entity)
+  Identity: pref_name, also_known_as, same_as (entity → alternate_name)
+
+CORRECTION DETECTION (DB unavailable — use semantic cues):
+  If message signals a correction, mark triple with "is_correction": true.
+  Generic patterns: negation ("not"), reclarification ("actually"), contradiction ("wrong").
 """
     else:
-        # DB unavailable - use minimal core examples
+        # DB unavailable: use pattern explanation only (no example rel_types)
         base_prompt += """
-Core:
-  - pref_name, also_known_as, same_as (identity)
-  - instance_of (entity type classification)
-  - parent_of ↔ child_of, spouse (family)
-  - works_for, located_in, has_pet (relationships)
+PATTERN REFERENCE (DB unavailable):
+  Attributes: Objects are scalar values (numbers, strings, dates), not entities
+  Relationships: Objects are entity names, not rel_type names
+  Identity: Objects are alternate names for the entity, not rel_type names
+
+CORRECTION DETECTION (DB unavailable — use semantic cues):
+  If message signals a correction, mark triple with "is_correction": true.
+  Generic patterns: negation ("not"), reclarification ("actually"), contradiction ("wrong").
 """
 
     base_prompt += """
-Return ONLY valid JSON. No markdown, no explanations."""
+
+Return ONLY valid JSON array. No markdown, no explanations, no commentary.
+CRITICAL: Never include rel_type names in the object field."""
     return base_prompt
+
+
+def _track_correction_signal_candidate(
+    user_id: str, text: str, triple: dict, db_connection=None
+) -> None:
+    """
+    dprompt-128-P3: When LLM marks triple as is_correction=true,
+    extract concise linguistic pattern and record in correction_signal_evaluations
+    for re_embedder learning. Patterns accumulate across users so frequency >= 3
+    means the pattern is real and recurring.
+
+    Re-embedder will evaluate: frequency >= 3 → INSERT into correction_signals.
+    """
+    if not db_connection or not triple.get("is_correction"):
+        return
+
+    try:
+        rel_type = (triple.get("rel_type") or "").lower().strip()
+        if not rel_type:
+            return
+
+        text_lower = text.lower()
+        pattern_type = "unknown"
+        concise_pattern = None
+
+        # Extract concise pattern keyword/phrase (will accumulate across users)
+        if " is not " in text_lower:
+            pattern_type = "negation"
+            concise_pattern = "is not"
+        elif " isn't " in text_lower:
+            pattern_type = "negation"
+            concise_pattern = "isn't"
+        elif " not " in text_lower:
+            pattern_type = "negation"
+            concise_pattern = "not"
+        elif "actually" in text_lower:
+            pattern_type = "reclarification"
+            concise_pattern = "actually"
+        elif "wait" in text_lower:
+            pattern_type = "reclarification"
+            concise_pattern = "wait"
+        elif "sorry" in text_lower:
+            pattern_type = "reclarification"
+            concise_pattern = "sorry"
+        elif "wrong" in text_lower:
+            pattern_type = "contradiction"
+            concise_pattern = "wrong"
+        elif "mistake" in text_lower:
+            pattern_type = "contradiction"
+            concise_pattern = "mistake"
+        elif "incorrect" in text_lower:
+            pattern_type = "contradiction"
+            concise_pattern = "incorrect"
+
+        if not concise_pattern:
+            return  # No recognizable pattern extracted
+
+        with db_connection.cursor() as cur:
+            # Record as candidate for re_embedder evaluation
+            # Patterns accumulate globally across all users (not per-user scoped)
+            # Use a "global" user_id marker so all users' occurrences merge into single row
+            global_user_id = "global_pattern_candidates"
+
+            cur.execute("""
+                INSERT INTO correction_signal_evaluations
+                (user_id, candidate_pattern, pattern_type, first_text_snippet, occurrence_count)
+                VALUES (%s, %s, %s, %s, 1)
+                ON CONFLICT (user_id, candidate_pattern) DO UPDATE SET
+                  occurrence_count = correction_signal_evaluations.occurrence_count + 1,
+                  last_seen_at = NOW()
+            """, (global_user_id, concise_pattern, pattern_type, text[:500]))
+
+        log.info("extract.correction_signal_candidate_recorded",
+                 rel_type=rel_type, pattern_type=pattern_type,
+                 concise_pattern=concise_pattern, user_id=user_id)
+    except Exception as e:
+        log.warning("extract.correction_signal_tracking_failed", error=str(e))
 
 
 @app.post("/extract/rewrite", response_model=dict)
@@ -3295,9 +3492,32 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                                  subject_before=original_subject, subject_after=original_object,
                                  user_id=req.user_id)
 
-        # Mark all extracted triples as user_stated since they come directly from user input
+        # Mark extracted triples with openwebui provenance (from LLM extraction, not direct user statement)
+        # dprompt-126: Preserve validation gates for extracted facts.
+        # Only user-provided corrections (req.edges with is_correction=true) bypass validation.
+        # LLM extractions need validation alicepite coming from user's message text.
         for triple in triples:
-            triple["fact_provenance"] = "user_stated"
+            # Use 'openwebui' to indicate these are extracted facts (subject to validation)
+            # This allows validation gates to check type constraints and hierarchy membership
+            triple["fact_provenance"] = "openwebui"
+
+        # dprompt-128-P3: Track correction signal candidates for re_embedder learning
+        # When is_correction=true, record in correction_signal_evaluations for eval/approval
+        try:
+            import psycopg2
+            db = psycopg2.connect(os.getenv("POSTGRES_DSN"))
+            for triple in triples:
+                if triple.get("is_correction"):
+                    _track_correction_signal_candidate(req.user_id, req.text, triple, db)
+            db.close()
+        except Exception as e:
+            log.warning("extract.correction_signal_learning_failed", error=str(e))
+            # Non-fatal: continue even if tracking fails
+
+        # dprompt-064 Phase 1: ✅ COMPLETE
+        # Correction filtering now FULLY HANDLED by WGMValidationGate._apply_correction_semantics()
+        # Extract returns ALL triples (dumb). Ingest applies semantics via rel_types.correction_behavior (smart).
+        # Removed hardcoded negation filter — metadata-driven validation gate is authoritative.
 
         log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
         return {
@@ -3329,65 +3549,40 @@ def _delete_from_qdrant(fact_ids: list[int], collection: str, qdrant_url: str) -
     except Exception as e:
         log.warning("qdrant.cleanup_failed", error=str(e), count=len(fact_ids))
 
-def _extract_pet_descriptor(text: str, pet_name: str) -> Optional[dict]:
+def _extract_pet_alicecriptor(text: str, pet_name: str) -> Optional[dict]:
     """
-    Extract pet descriptors (breed, species, color, size) from text context.
+    Extract pet alicecriptors (breed, species, color, size) from text context.
     Pattern: "have/own a [DESCRIPTOR]+ [PET_NAME]" or "[PET_NAME] is a [DESCRIPTOR]+"
-    Returns dict with descriptor type (species/breed/color/size) and value.
+    Returns dict with alicecriptor type (species/breed/color/size) and value.
     """
     patterns = [
         # "have a [species/breed] [color]? [name]"
         (r"(?:have|own|got|has)\s+(?:a|an|my)\s+([a-z\s]+?)\s+(?:named|called|named)\s+" + re.escape(pet_name.lower()) + r"\b", "species"),
         # "[name] is a [species/breed]"
         (re.escape(pet_name.lower()) + r"\s+is\s+(?:a|an)\s+([a-z\s]+?)(?:\band\b|$)", "species"),
-        # "[name], a [descriptor]"
+        # "[name], a [alicecriptor]"
         (re.escape(pet_name.lower()) + r",\s+(?:a|an)\s+([a-z\s]+?)(?:,|named|$)", "species"),
     ]
 
     text_lower = text.lower()
-    descriptors = []
+    alicecriptors = []
 
-    for pattern, descriptor_type in patterns:
+    for pattern, alicecriptor_type in patterns:
         match = re.search(pattern, text_lower, re.IGNORECASE)
         if match:
-            raw_descriptor = match.group(1).strip().lower()
-            # Clean up descriptor: remove trailing conjunctions, articles, etc.
-            raw_descriptor = re.sub(r"\s+(and|or|named|called).*$", "", raw_descriptor)
-            raw_descriptor = raw_descriptor.strip()
-            if raw_descriptor and len(raw_descriptor) < 50:  # sanity check
-                descriptors.append({
-                    "type": descriptor_type,
-                    "value": raw_descriptor
+            raw_alicecriptor = match.group(1).strip().lower()
+            # Clean up alicecriptor: remove trailing conjunctions, articles, etc.
+            raw_alicecriptor = re.sub(r"\s+(and|or|named|called).*$", "", raw_alicecriptor)
+            raw_alicecriptor = raw_alicecriptor.strip()
+            if raw_alicecriptor and len(raw_alicecriptor) < 50:  # sanity check
+                alicecriptors.append({
+                    "type": alicecriptor_type,
+                    "value": raw_alicecriptor
                 })
 
-    return descriptors if descriptors else None
+    return alicecriptors if alicecriptors else None
 
 
-def _infer_type_from_relationship(rel_type: str, entity_position: str) -> Optional[str]:
-    """
-    Infer entity type from relationship semantics.
-    Used as fallback when GLiNER2 classification is uncertain or conflicts with context.
-    entity_position: 'subject' or 'object'
-    """
-    relationship_hints = {
-        "has_pet": {"object": "Animal"},
-        "parent_of": {"subject": "Person", "object": "Person"},
-        "child_of": {"subject": "Person", "object": "Person"},
-        "spouse": {"subject": "Person", "object": "Person"},
-        "sibling_of": {"subject": "Person", "object": "Person"},
-        "works_for": {"subject": "Person", "object": "Organization"},
-        "lives_at": {"subject": "Person", "object": "Location"},
-        "lives_in": {"subject": "Person", "object": "Location"},
-        "located_in": {"object": "Location"},
-        "born_in": {"object": "Location"},
-        "created_by": {"subject": "Person"},
-        "part_of": {"object": "Organization"},
-    }
-
-    rel_hints = relationship_hints.get(rel_type.lower())
-    if rel_hints:
-        return rel_hints.get(entity_position)
-    return None
 
 
 def classify_fact_type(
@@ -3488,14 +3683,14 @@ def classify_fact_type(
     if re.match(r'^\+?[\d\s\-\(\)\.]{7,}$', stripped):
         return {"type": "scalar", "confidence": 0.90, "reason": "phone-number pattern"}
     if word_count >= 5:
-        return {"type": "scalar", "confidence": 0.80, "reason": f"descriptive string ({word_count} words)"}
+        return {"type": "scalar", "confidence": 0.80, "reason": f"alicecriptive string ({word_count} words)"}
     _VALUE_INDICATORS = frozenset({
         "street", "road", "avenue", "lane", "drive", "boulevard",
         "court", "place", "highway", "circle", "square",
         "engineer", "doctor", "teacher", "student", "manager",
         "director", "president", "ceo", "cto", "cfo",
         "professor", "nurse", "lawyer", "artist", "writer",
-        "consultant", "analyst", "developer", "designer", "scientist",
+        "consultant", "analyst", "developer", "aliceigner", "scientist",
     })
     if any(word in stripped_lower for word in _VALUE_INDICATORS):
         return {"type": "scalar", "confidence": 0.75, "reason": "value-indicator term detected"}
@@ -3737,7 +3932,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         "person", "animal", "organization", "location", "object",
                         "concept", "city", "state", "country", "address", "street",
                         "province", "postal_code", "unknown", "entity",
-                        "computer", "server", "device", "laptop", "desktop",
+                        "computer", "server", "device", "laptop", "alicektop",
                         "phone", "tablet", "router", "switch", "printer",
                         "ip_address", "hostname", "fqdn", "domain_name", "subnet",
                     }
@@ -3784,6 +3979,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             object_type=t.get("object_type"),
                             definition=t.get("definition"),
                             fact_provenance=t.get("fact_provenance", "llm_inferred"),  # Preserve from extraction
+                            is_correction=t.get("is_correction", False),  # dprompt-128: Preserve correction flag from LLM extraction
                         )
                         for t in rewrite_data.get("triples", [])
                         if t.get("subject") and t.get("object") and t.get("rel_type")
@@ -3872,7 +4068,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
     # Guard: if another named entity is mentioned with a preference signal
-    # (e.g., "ChildC prefers ChildC_short"), skip auto-synthesis for the user.
+    # (e.g., "alicemonde prefers alice"), skip auto-synthesis for the user.
     # The LLM already extracted the correct entity assignment.
     _third_party_pref = re.compile(
         r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
@@ -3938,7 +4134,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             for edge in edges:
                 # Skip truly self-referential facts (entity knows itself, etc.)
                 # but allow identity facts where subject == object is the norm
-                # e.g., (gabby, pref_name, gabby) — the entity IS its name.
+                # e.g., (bob, pref_name, bob) — the entity IS its name.
                 if edge.subject == edge.object:
                     if edge.rel_type.lower() not in ("pref_name", "also_known_as"):
                         continue
@@ -3952,9 +4148,14 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     reason="age object must be numeric")
                         continue
                     if edge.subject.lower() == "user":
-                        if "my" not in req.text.lower() or not any(pattern.search(req.text) for pattern in _IDENTITY_PATTERNS):
-                            log.warning("ingest.age_rejected_wrong_subject",
-                                        subject=edge.subject, object=edge.object, text=req.text[:100])
+                        # dprompt-128: User's own scalar facts (age, height, etc.) only accepted if marked as correction by LLM.
+                        # LLM learns correction patterns from correction_signals DB table — trust it.
+                        is_correction = getattr(edge, "is_correction", False)
+                        if not is_correction:
+                            log.warning("ingest.scalar_for_user_rejected",
+                                        subject=edge.subject, object=edge.object,
+                                        rel_type=edge.rel_type, reason="user scalar fact requires is_correction=true",
+                                        text=req.text[:100])
                             continue
 
                 # UUID guard: reject raw edge values that are UUIDs
@@ -3975,11 +4176,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 _SCALAR_OBJECT_RELS = {
                     'pref_name', 'also_known_as',  # identity: display names (strings)
                     'age', 'height', 'weight', 'born_on',  # scalar attributes: measurements (strings)
-                    'occupation', 'nationality',  # descriptive: single-word or phrase
+                    'occupation', 'nationality',  # alicecriptive: single-word or phrase
                 }
 
                 # Resolve all entity names to canonical form via registry
-                # This ensures aliases (mars, chris) never appear as subject/object in facts
+                # This ensures aliases (emma, chris) never appear as subject/object in facts
                 canonical_subject = registry.resolve(req.user_id, edge.subject)
                 log.info("ingest.subject_resolved_at_extraction",
                        input=edge.subject, output=canonical_subject, user_id=req.user_id)
@@ -4029,16 +4230,33 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.object_type_update_failed",
                                     entity_id=canonical_object, entity_type=edge.object_type, error=str(_e))
 
-                # Relationship-aware type refinement: use relationship semantics to correct/override types
-                # Example: has_pet(we, goose) → object should always be Animal, regardless of GLiNER2 classification
+                # Metadata-driven type validation: query rel_types for constraints, don't override extraction
+                # Trust extraction's semantic understanding; validate against DB constraints instead
                 rel_type_lower = edge.rel_type.lower()
-                inferred_subject_type = _infer_type_from_relationship(rel_type_lower, "subject")
-                inferred_object_type = _infer_type_from_relationship(rel_type_lower, "object")
+                rel_meta = _get_rel_type_metadata(rel_type_lower)
+                head_types = rel_meta.get("head_types", [])
+                tail_types = rel_meta.get("tail_types", [])
 
-                # Apply inferred types: prefer relationship semantics if provided (they're more reliable for validation)
-                # If GLiNER2 type conflicts with relationship type, use relationship type
-                final_subject_type = inferred_subject_type or edge.subject_type
-                final_object_type = inferred_object_type or edge.object_type
+                # Use extraction's types as-is (trust LLM semantic understanding)
+                final_subject_type = edge.subject_type
+                final_object_type = edge.object_type
+
+                # Validate against metadata constraints (log mismatches, don't override)
+                if final_subject_type and head_types and head_types != ["ANY"]:
+                    if final_subject_type.lower() not in [t.lower() for t in head_types]:
+                        log.warning("ingest.subject_type_constraint_mismatch",
+                                   rel_type=rel_type_lower,
+                                   extracted_type=final_subject_type,
+                                   required_types=head_types,
+                                   note="Type mismatch will be caught by WGMValidationGate")
+
+                if final_object_type and tail_types and tail_types != ["ANY"]:
+                    if final_object_type.lower() not in [t.lower() for t in tail_types]:
+                        log.warning("ingest.object_type_constraint_mismatch",
+                                   rel_type=rel_type_lower,
+                                   extracted_type=final_object_type,
+                                   required_types=tail_types,
+                                   note="Type mismatch will be caught by WGMValidationGate")
 
                 if final_subject_type and canonical_subject not in (user_entity_id, canonical_object):
                     try:
@@ -4066,27 +4284,27 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.inferred_object_type_update_failed",
                                     entity_id=canonical_object, entity_type=final_object_type, error=str(_e))
 
-                # Extract and store pet descriptors for has_pet relationships
+                # Extract and store pet alicecriptors for has_pet relationships
                 # Example: "we have a cat named goose" → store species="cat" as entity_attribute
                 if rel_type_lower == "has_pet" and canonical_object and canonical_object != user_entity_id:
-                    descriptors = _extract_pet_descriptor(req.text, edge.object)
-                    if descriptors:
+                    alicecriptors = _extract_pet_alicecriptor(req.text, edge.object)
+                    if alicecriptors:
                         try:
                             with db.cursor() as _cur:
-                                for desc in descriptors:
+                                for alicec in alicecriptors:
                                     _cur.execute(
                                         "INSERT INTO entity_attributes (user_id, entity_id, attribute, value_text, sensitivity, provenance, category) "
                                         "VALUES (%s, %s, %s, %s, 'public', 'llm_inferred', 'physical') "
                                         "ON CONFLICT (user_id, entity_id, attribute) DO UPDATE SET "
                                         "value_text = EXCLUDED.value_text",
-                                        (req.user_id, canonical_object, desc["type"], desc["value"]),
+                                        (req.user_id, canonical_object, alicec["type"], alicec["value"]),
                                     )
                             db.commit()
-                            log.info("ingest.pet_descriptor_stored",
-                                     pet=canonical_object, descriptor_type=descriptors[0]["type"],
-                                     descriptor_value=descriptors[0]["value"])
+                            log.info("ingest.pet_alicecriptor_stored",
+                                     pet=canonical_object, alicecriptor_type=alicecriptors[0]["type"],
+                                     alicecriptor_value=alicecriptors[0]["value"])
                         except Exception as _e:
-                            log.warning("ingest.pet_descriptor_storage_failed",
+                            log.warning("ingest.pet_alicecriptor_storage_failed",
                                        pet=canonical_object, error=str(_e))
 
                 # Normalize user-identity aliases to the canonical user UUID
@@ -4195,13 +4413,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     )
 
                 # PHASE 2: Assign Class and Confidence
-                # Check if user-stated: fact_provenance from extraction or is_correction
-                # Rel_type metadata (fact_class from rel_types table) determines Class A/B/C routing.
+                # dprompt-126: User-stated means explicit user correction (is_correction=true).
+                # Extraction facts (openwebui provenance) go through validation gates.
+                # Only high-confidence user corrections bypass validation.
                 is_direct_statement = False
                 rel_lower = edge.rel_type.lower()
 
-                is_user_stated = (edge.is_correction or
-                                 (hasattr(edge, 'fact_provenance') and edge.fact_provenance == "user_stated"))
+                is_user_stated = edge.is_correction  # User corrections are explicitly marked
 
                 log.info("ingest.fact_provenance_check",
                        rel_type=edge.rel_type.lower(),
@@ -4215,6 +4433,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Reassess confidence based on how explicitly user stated this fact in req.text
                 adjusted_confidence = _assess_statement_directness(edge, req.text, _REL_TYPE_META)
+
                 if adjusted_confidence != (edge.confidence if hasattr(edge, 'confidence') else 0.8):
                     log.info("ingest.confidence_reassess", rel_type=edge.rel_type.lower(),
                              old_confidence=edge.confidence if hasattr(edge, 'confidence') else 0.8,
@@ -4289,7 +4508,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # ROUTE PATH 1: SCALAR
                 if classification_3d["storage"] == "scalar":
-                    # dBug-027: Validate pref_name must be name-like (not descriptive phrases)
+                    # dBug-027: Validate pref_name must be name-like (not alicecriptive phrases)
                     if edge.rel_type.lower() == "pref_name":
                         words = _raw_object.split()
                         is_name_like = (
@@ -4300,7 +4519,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.warning("ingest.pref_name_rejected_not_name_like",
                                         subject=canonical_subject,
                                         object=_raw_object,
-                                        reason="pref_name must be 1-2 words, not descriptive phrase")
+                                        reason="pref_name must be 1-2 words, not alicecriptive phrase")
                             continue
 
                     val_text, val_int, val_float, val_date = _coerce_scalar(_raw_object.lower().strip())
@@ -4339,7 +4558,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                         if match:
                             relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                            entity_name = match.group(2).lower()  # ChildC_short, Sophia, Spot, etc.
+                            entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
 
                             # Resolve the mentioned entity to its canonical ID
                             resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -4432,6 +4651,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         object_type=edge.object_type,
                     )
                     status = validation.get("status")
+
+                    # dprompt-126: Handle hierarchy membership violations
+                    # Facts violating hierarchy membership are staged for re-embedder review
+                    # User is source of truth, so violations don't reject facts, they stage them
+                    hierarchy_violation = validation.get("hierarchy_violation")
+                    if hierarchy_violation and status == "valid" and not req.edges:
+                        # Non-user-provided facts with hierarchy violations are staged for review
+                        # Re-embedder will evaluate and learn/correct classifications
+                        fact_class = "C"  # Stage for re-embedder review instead of committing
+                        log.info("ingest.hierarchy_violation_staged",
+                                rel_type=canonical_rel_type,
+                                subject_type=edge.subject_type,
+                                object_type=edge.object_type,
+                                reason=hierarchy_violation,
+                                note="Staged for re-embedder evaluation - classification mismatch")
 
                     # Handle type_mismatch: user-stated facts override type constraints.
                     # The user is authoritative about their own data. Only reject
@@ -4954,7 +5188,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     correction_map[key] = edge.is_correction
 
                 # Build set of preferred objects from pref_name rows in this batch
-                # e.g. christopher → chris → pref_name means "chris" is preferred
+                # e.g. john → chris → pref_name means "chris" is preferred
                 batch_preferred_objects = {
                     row[2].lower() for row in resolved_rows
                     if row[3].lower() == "pref_name" and row[5]
@@ -5656,7 +5890,7 @@ def query(request: QueryRequest):
     _GENERIC_SELF_REF_SIGNALS = {
         "tell me about", "what do you know", "what you know",
         "what is", "what are", "how many", "how much",
-        "list all", "show me", "describe",
+        "list all", "show me", "alicecribe",
     }
 
     # Initialize database connection and entity registry FIRST
@@ -5806,12 +6040,12 @@ def query(request: QueryRequest):
                             with db.cursor() as cur:
                                 cur.execute(
                                     "INSERT INTO entity_taxonomies "
-                                    "(taxonomy_name, description, member_entity_types, rel_types_defining_group, "
+                                    "(taxonomy_name, alicecription, member_entity_types, rel_types_defining_group, "
                                     "has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, source) "
                                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                                     (
                                         discovered["taxonomy_name"],
-                                        discovered.get("description", ""),
+                                        discovered.get("alicecription", ""),
                                         discovered.get("member_entity_types", "{}"),
                                         discovered.get("rel_types_defining_group", []),
                                         discovered.get("has_transitivity", False),
@@ -6441,7 +6675,7 @@ def query(request: QueryRequest):
 
         # ── dprompt-61: Deduplicate by entity UUID + attach alias metadata ──
         # Facts may have different display names for the same entity_id
-        # (e.g., christopher spouse mars AND chris spouse mars). Deduplicate
+        # (e.g., john spouse emma AND chris spouse emma). Deduplicate
         # using underlying UUIDs (_subject_id, _object_id) preserved by _resolve_display_names.
         _deduped: dict[tuple, dict] = {}
         for _f in merged_facts:

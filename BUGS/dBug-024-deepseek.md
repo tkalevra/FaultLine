@@ -7,38 +7,38 @@
 ## Root Cause Trace
 
 ### Symptom
-User says "My childrens names are Alice, Bob, and Carol" — system returns stale "children=Son" instead of "children=Bob".
+User says "My childrens names are bob, charlie, and alice" — system returns stale "children=Son" instead of "children=charlie".
 
 ### Flow trace
 
 ```
-User input: "My childrens names are Alice, Bob, and Carol"
+User input: "My childrens names are bob, charlie, and alice"
   │
   ├─▶ /extract/rewrite (LLM)
   │     Returns 12 triples including:
-  │     (gabby, pref_name, gabby)  ← prompt fix (DEEPSEEK-24A)
-  │     (cyrus, pref_name, cyrus)
-  │     (des, pref_name, des)
+  │     (bob, pref_name, bob)  ← prompt fix (DEEPSEEK-24A)
+  │     (charlie, pref_name, charlie)
+  │     (alice, pref_name, alice)
   │
   ├─▶ /ingest pronoun normalizer (line 2068)
-  │     Subjects gabby/cyrus/des are not pronouns → pass
+  │     Subjects bob/charlie/alice are not pronouns → pass
   │
   ├─▶ /ingest pref_name injector (line 2092)
-  │     gabby/cyrus/des already have pref_name triples → skip
+  │     bob/charlie/alice already have pref_name triples → skip
   │
   ├─▶ raw_inferred → inferred_relations → edges_dict
   │     All 12 triples pass through
   │
   ├─▶ edges loop (line 2313): `if edge.subject == edge.object: continue`
-  │     ✗ (gabby, pref_name, gabby) → subject="gabby", object="gabby" → DROPPED
-  │     ✗ (cyrus, pref_name, cyrus) → DROPPED
-  │     ✗ (des, pref_name, des) → DROPPED
+  │     ✗ (bob, pref_name, bob) → subject="bob", object="bob" → DROPPED
+  │     ✗ (charlie, pref_name, charlie) → DROPPED
+  │     ✗ (alice, pref_name, alice) → DROPPED
   │
   └─▶ Commit: 9 facts (parent_of/child_of/instance_of), 0 pref_name facts
 ```
 
 ### Why the guard exists
-Line 2313 prevents truly self-referential facts like `(gabby, knows, gabby)` — an entity can't know itself. But for identity rel_types `pref_name` and `also_known_as`, subject == object is the NORM: the entity IS its own name.
+Line 2313 prevents truly self-referential facts like `(bob, knows, bob)` — an entity can't know itself. But for identity rel_types `pref_name` and `also_known_as`, subject == object is the NORM: the entity IS its own name.
 
 ### Fix
 ```python
@@ -64,15 +64,15 @@ if edge.subject == edge.object:
 
 ### Database (post-fix)
 ```
-55c13545 | pref_name | cyrus | confidence=1.0
-55c13545 | pref_name | boy   | confidence=0.5 (superseded)
-entity_aliases: cyrus is_preferred=true, boy is_preferred=false
+55c13545 | pref_name | charlie | confidence=1.0
+55c13545 | pref_name | son   | confidence=0.5 (superseded)
+entity_aliases: charlie is_preferred=true, son is_preferred=false
 ```
 
 ### End-to-end test
 - Input: "tell me about my family"
-- Before fix: "Alice, Son, and Carol"
-- After fix: "Alice, Bob, and Carol" ✓
+- Before fix: "bob, Son, and alice"
+- After fix: "bob, charlie, and alice" ✓
 
 ## Lessons
 

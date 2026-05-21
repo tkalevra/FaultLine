@@ -5,7 +5,6 @@ A write-validated knowledge graph pipeline that extracts entities and relationsh
 ## Features
 
 - **LLM-First Extraction** — Filter LLM extracts typed edges from conversation text with GLiNER2 entity typing
-- **Context-Enriched /extract** — GLiNER2 receives fresh database context (entity registry, ontology metadata, user facts) enabling resolution of implicit pronouns and context-dependent entities
 - **Ontology Validation** — WGM (Write-Gate-Model) validates every edge against a live ontology with type constraints and conflict detection
 - **Fact Classification** — Facts classified as Identity/Structural (Class A), Behavioral/Contextual (Class B), or Ephemeral/Novel (Class C) with appropriate lifecycle management
 - **Graph + Hierarchy Traversal** — Two orthogonal query systems: connectivity graph (who am I connected to?) and composition hierarchy (what are they?)
@@ -243,7 +242,7 @@ services:
 
 ### OpenWebUI Integration
 
-FaultLine integrates with OpenWebUI as a **Filter** (`openwebui/faultline_filter.py`). The filter intercepts conversations for fact extraction and memory injection. Deploy the filter file to your OpenWebUI instance's filter directory.
+FaultLine integrates with OpenWebUI as a **Filter** (`openwebui/faultline_tool.py`). The filter intercepts conversations for fact extraction and memory injection. Deploy the filter file to your OpenWebUI instance's filter directory.
 
 ## Development
 

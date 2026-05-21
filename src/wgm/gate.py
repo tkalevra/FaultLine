@@ -68,24 +68,33 @@ class RelTypeRegistry:
         try:
             with psycopg2.connect(self.dsn) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT rel_type, head_types, tail_types FROM rel_types"
-                    )
+                    cur.execute("""
+                        SELECT rel_type, head_types, tail_types,
+                               correction_behavior, inverse_rel_type, is_symmetric,
+                               is_hierarchy_rel, category
+                        FROM rel_types
+                    """)
                     self._cache = set()
                     self._ontology = {}
                     for row in cur.fetchall():
                         rel_type = row[0]
                         self._cache.add(rel_type)
                         self._ontology[rel_type] = {
-                            "head_types": row[1],  # list or None
-                            "tail_types": row[2],  # list or None
+                            "head_types": row[1],
+                            "tail_types": row[2],
+                            "correction_behavior": row[3],  # hard_delete, supersede, immutable
+                            "inverse_rel_type": row[4],
+                            "is_symmetric": row[5],
+                            "is_hierarchy_rel": row[6],
+                            "category": row[7],
                         }
                     self._loaded_at = time.time()
-        except Exception:
+        except Exception as e:
+            log.warning(f"RelTypeRegistry refresh failed: {e}, using SEED_ONTOLOGY fallback")
             # If DB unavailable, fall back to SEED_ONTOLOGY
             self._cache = set(SEED_ONTOLOGY.keys())
             self._ontology = {
-                rt: {"head_types": None, "tail_types": None}
+                rt: SEED_ONTOLOGY[rt]
                 for rt in SEED_ONTOLOGY.keys()
             }
             self._loaded_at = time.time()
@@ -97,7 +106,7 @@ class RelTypeRegistry:
         return sorted(self.get_valid_types())
 
     def get(self, rel_type: str, default=None):
-        """Get ontology entry for a rel_type (includes head_types, tail_types, engine_generated)."""
+        """Get ontology entry for a rel_type (inclualice head_types, tail_types, engine_generated)."""
         self.get_valid_types()  # ensure cache is fresh
         return self._ontology.get(rel_type.lower(), default or {})
 
@@ -105,37 +114,38 @@ class RelTypeRegistry:
 # DEPRECATED: Kept for test compatibility. RelTypeRegistry reads from Postgres at runtime.
 # Added W3C-aligned types (instance_of, subclass_of, pref_name, same_as)
 # See migrations/006_split_is_a.sql for standards alignment details.
+# dprompt-064 Phase 1: Added correction_behavior, inverse_rel_type, is_symmetric fields
 SEED_ONTOLOGY = {
-    "is_a":           {"subject_role": "entity",     "object_role": "type"},       # P31/P279 (deprecated: use instance_of or subclass_of)
-    "instance_of":    {"subject_role": "entity",     "object_role": "type"},       # Wikidata P31 (instance of)
-    "subclass_of":    {"subject_role": "type",       "object_role": "type"},       # Wikidata P279 (subclass of)
-    "part_of":        {"subject_role": "component",  "object_role": "whole"},      # Wikidata P361 (part of)
-    "created_by":     {"subject_role": "creation",   "object_role": "creator"},    # Wikidata P170 (creator, inv)
-    "works_for":      {"subject_role": "employee",   "object_role": "employer"},   # Wikidata P108 (employer, inv)
-    "parent_of":      {"subject_role": "parent",     "object_role": "child"},      # Wikidata P40 (child)
-    "child_of":       {"subject_role": "child",      "object_role": "parent"},     # Wikidata P40 (child, inv)
-    "spouse":         {"subject_role": "partner",    "object_role": "partner"},    # Wikidata P26 (spouse, symmetric)
-    "sibling_of":     {"subject_role": "sibling",    "object_role": "sibling"},    # Wikidata P3373 (sibling, symmetric)
-    "also_known_as":  {"subject_role": "canonical",  "object_role": "alias"},      # Wikidata P742/P1449 (skos:altLabel)
-    "pref_name":      {"subject_role": "entity",     "object_role": "name"},       # preferred display name (skos:prefLabel)
-    "same_as":        {"subject_role": "entity",     "object_role": "entity"},     # owl:sameAs (symmetric, identity equiv)
-    "related_to":     {"subject_role": "entity",     "object_role": "entity"},     # Wikidata P1659 (see also)
-    "likes":          {"subject_role": "subject",    "object_role": "target"},     # domain-specific
-    "dislikes":       {"subject_role": "subject",    "object_role": "target"},     # domain-specific
-    "prefers":        {"subject_role": "subject",    "object_role": "target"},     # domain-specific
-    "owns":           {"subject_role": "owner",      "object_role": "property"},   # Wikidata P1830 (owner of, inv)
-    "located_in":     {"subject_role": "entity",     "object_role": "location"},   # Wikidata P131 (located in)
-    "educated_at":    {"subject_role": "student",    "object_role": "institution"},# Wikidata P69 (educated at)
-    "nationality":    {"subject_role": "person",     "object_role": "country"},    # Wikidata P27 (citizenship)
-    "occupation":     {"subject_role": "person",     "object_role": "profession"}, # Wikidata P106 (occupation)
-    "born_on":        {"subject_role": "person",     "object_role": "date"},       # Wikidata P569 (date of birth)
-    "age":            {"subject_role": "person",     "object_role": "value"},      # domain-specific
-    "knows":          {"subject_role": "person",     "object_role": "person"},     # Wikidata P1891 (influenced, symmetric)
-    "friend_of":      {"subject_role": "person",     "object_role": "person"},     # domain-specific (symmetric)
-    "met":            {"subject_role": "person",     "object_role": "person"},     # domain-specific (symmetric)
-    "lives_in":       {"subject_role": "person",     "object_role": "location"},   # Wikidata P551 (residence)
-    "born_in":        {"subject_role": "person",     "object_role": "location"},   # Wikidata P19 (place of birth)
-    "has_gender":     {"subject_role": "person",     "object_role": "gender"},     # Wikidata P21 (sex or gender)
+    "is_a":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
+    "instance_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
+    "subclass_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
+    "part_of":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
+    "created_by":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "works_for":      {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
+    "parent_of":      {"correction_behavior": "immutable", "inverse_rel_type": "child_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family"},
+    "child_of":       {"correction_behavior": "immutable", "inverse_rel_type": "parent_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family"},
+    "spouse":         {"correction_behavior": "supersede", "inverse_rel_type": "spouse", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
+    "sibling_of":     {"correction_behavior": "immutable", "inverse_rel_type": "sibling_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
+    "also_known_as":  {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity"},
+    "pref_name":      {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity"},
+    "same_as":        {"correction_behavior": "supersede", "inverse_rel_type": "same_as", "is_symmetric": True, "is_hierarchy_rel": False, "category": "identity"},
+    "related_to":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "likes":          {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "dislikes":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "prefers":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "owns":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "located_in":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
+    "educated_at":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
+    "nationality":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "occupation":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
+    "born_on":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "age":            {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    "knows":          {"correction_behavior": "supersede", "inverse_rel_type": "knows", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
+    "friend_of":      {"correction_behavior": "supersede", "inverse_rel_type": "friend_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
+    "met":            {"correction_behavior": "supersede", "inverse_rel_type": "met", "is_symmetric": True, "is_hierarchy_rel": False, "category": None},
+    "lives_in":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
+    "born_in":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
+    "has_gender":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
 }
 
 # Symmetric relationships: storing A→B implies B→A
@@ -157,11 +167,9 @@ class WGMValidationGate:
             self.validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=llm_endpoint)
         else:
             self.validator = validator
-        # Load ontology at startup (includes type constraints)
-        self._ontology = registry.get_ontology() if registry else {
-            rt: {"head_types": None, "tail_types": None}
-            for rt in SEED_ONTOLOGY.keys()
-        }
+        # Load ontology at startup (inclualice type constraints + correction metadata)
+        # dprompt-064 Phase 1: Now inclualice correction_behavior, inverse_rel_type, is_symmetric
+        self._ontology = registry.get_ontology() if registry else SEED_ONTOLOGY
 
     def _check_type_constraints(
         self,
@@ -352,6 +360,102 @@ class WGMValidationGate:
 
         return archived_count
 
+    # ── dprompt-064 Phase 1: Correction Semantics (Metadata-Driven) ──────
+    # Replaces hardcoded negation word list with rel_types.correction_behavior
+    # Semantics: hard_delete (pref_name, age), supersede (lives_at), immutable (born_in, parent_of)
+
+    def _apply_correction_semantics(self, edge: dict, rel_type: str, user_id: str) -> dict:
+        """
+        Apply correction semantics based on rel_type.correction_behavior metadata.
+        REPLACES dprompt-128 P4 hardcoded negation filter.
+
+        Queries rel_types.correction_behavior to determine action:
+        - hard_delete: DELETE old values, INSERT new (pref_name, also_known_as, age, height)
+        - supersede: Mark old values as superseded_at=now() (lives_at, works_for, spouse, etc)
+        - immutable: Ignore correction, reject fact (born_in, born_on, parent_of, sibling_of)
+
+        Args:
+            edge: dict with is_correction flag, confidence, subject_id, object_id
+            rel_type: lowercase rel_type
+            user_id: user UUID
+
+        Returns:
+            {"action": str, "reason": str, "superseded_count": int (optional)}
+        """
+        # Is this a correction?
+        if not self._is_user_correction(edge):
+            return {"action": "accept", "reason": "not_a_correction"}
+
+        # Query rel_types.correction_behavior
+        rel_meta = self._ontology.get(rel_type.lower(), {})
+        behavior = rel_meta.get("correction_behavior", "supersede")  # Safe default
+        subject_id = edge.get("subject_id")
+
+        if behavior == "hard_delete":
+            # pref_name, also_known_as, age, height: DELETE old value, INSERT new
+            # Action happens via ON CONFLICT DO UPDATE in ingest layer
+            return {
+                "action": "hard_delete",
+                "reason": f"correction_behavior=hard_delete",
+            }
+
+        elif behavior == "supersede":
+            # lives_at, works_for, spouse, occupation, etc: Mark old as superseded_at=now()
+            superseded_count = 0
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE facts
+                        SET superseded_at = NOW(),
+                            superseded_reason = 'user_correction'
+                        WHERE user_id = %s
+                          AND subject_id = %s
+                          AND rel_type = %s
+                          AND superseded_at IS NULL
+                    """, (user_id, subject_id, rel_type.lower()))
+                    superseded_count = cur.rowcount
+                self.db_conn.commit()
+
+                if superseded_count > 0:
+                    log.info(
+                        "wgm.correction_supersede",
+                        user_id=user_id,
+                        subject_id=subject_id,
+                        rel_type=rel_type,
+                        superseded_count=superseded_count,
+                    )
+            except Exception as e:
+                log.error(
+                    "wgm.correction_supersede_failed",
+                    user_id=user_id,
+                    subject_id=subject_id,
+                    rel_type=rel_type,
+                    error=str(e),
+                )
+                self.db_conn.rollback()
+
+            return {
+                "action": "supersede",
+                "reason": f"correction_behavior=supersede",
+                "superseded_count": superseded_count,
+            }
+
+        elif behavior == "immutable":
+            # born_in, born_on, parent_of, sibling_of: User cannot correct these
+            # Reject the correction attempt
+            return {
+                "action": "immutable",
+                "reason": f"correction_behavior=immutable — this fact is unchangeable",
+            }
+
+        # Unknown behavior: safe default is accept
+        return {
+            "action": "accept",
+            "reason": f"unknown_correction_behavior={behavior}",
+        }
+
+    # ── end dprompt-064 Phase 1 ──────────────────────────────────────────
+
     # ── end dprompt-90 ──────────────────────────────────────────────────
 
     # ── dprompt-119: INGEST Strengthening — Ontology, Hierarchy, Category ──
@@ -393,6 +497,7 @@ class WGMValidationGate:
         """
         Validate hierarchy-based rel_types (instance_of, subclass_of, member_of, part_of).
         dprompt-119: Ensures proper instance and composition relationships.
+        dprompt-126: Additional validation for instance_of to catch entity classification errors.
         Returns (valid: bool, reason: str).
         """
         rel_type = fact_dict.get("rel_type", "").lower()
@@ -401,12 +506,37 @@ class WGMValidationGate:
             return (True, "not_hierarchy")
 
         # instance_of: subject must have entity_type, object must be a type/class
+        # dprompt-126: Validate instance_of against entity_taxonomies
         if rel_type == "instance_of":
+            subject_id = fact_dict.get("subject_id")
             subject_type = fact_dict.get("subject_type")
+            object_name = fact_dict.get("object", "").lower()  # The type being claimed
+
             if subject_type and subject_type.lower() == "unknown":
                 log.warning("wgm.hierarchy_instance_of_unknown_subject",
-                           subject_id=fact_dict.get("subject_id"))
+                           subject_id=subject_id)
                 # Don't block, but note it
+
+            # dprompt-126: Query entity_taxonomies to validate claimed type
+            # If "art instance_of person", validate that this makes sense
+            if object_name and subject_type:
+                try:
+                    with self.db_conn.cursor() as cur:
+                        # Check if the object (type) is valid for this subject
+                        # E.g., "art" shouldn't be "person" unless it's a name alias
+                        cur.execute("""
+                            SELECT member_entity_types FROM entity_taxonomies
+                            WHERE %s = ANY(member_entity_types)
+                        """, (subject_type.upper(),))
+                        hierarchy_matches = cur.fetchall()
+
+                        if not hierarchy_matches:
+                            log.warning("wgm.instance_of_type_not_in_any_hierarchy",
+                                       subject_id=subject_id, subject_type=subject_type,
+                                       claimed_type=object_name)
+                except Exception as e:
+                    log.warning("wgm.instance_of_validation_error",
+                               subject_id=subject_id, error=str(e))
 
         # member_of: subject belongs to a group/category, object must be a group entity
         if rel_type == "member_of":
@@ -459,6 +589,87 @@ class WGMValidationGate:
 
     # ── end dprompt-119 ──────────────────────────────────────────────────
 
+    def _validate_hierarchy_membership(self, rel_type: str, subject_type: str, object_type: str, user_id: str = None) -> tuple[bool, str, list]:
+        """
+        dprompt-126 Layer 1 (Hierarchy Scoping): Validate entity types against hierarchy membership.
+
+        Queries entity_taxonomies to find all hierarchies that define this rel_type.
+        Checks if subject_type and object_type are in member_entity_types for ANY matching hierarchy.
+
+        Metadata-driven: No hardcoded hierarchy rules. All hierarchy definitions come from DB.
+        Growth-engine compatible: New hierarchies + rel_types automatically validated.
+
+        Returns: (valid: bool, reason: str, matching_hierarchies: list)
+        - valid: True if entity types match at least one hierarchy, False otherwise
+        - reason: explanation of what was found or violated
+        - matching_hierarchies: list of hierarchy_names that match both entity types
+        """
+        if not subject_type or not object_type or not rel_type:
+            return (True, "missing_types_skip", [])  # Can't validate without types
+
+        rt_lower = rel_type.lower().strip()
+        subject_type_upper = subject_type.upper().strip() if subject_type else None
+        object_type_upper = object_type.upper().strip() if object_type else None
+
+        try:
+            with self.db_conn.cursor() as cur:
+                # Query hierarchies that define this rel_type
+                cur.execute("""
+                    SELECT taxonomy_name, member_entity_types, rel_types_defining_group
+                    FROM entity_taxonomies
+                    WHERE rel_types_defining_group @> ARRAY[%s]
+                    ORDER BY taxonomy_name
+                """, (rt_lower,))
+
+                matching_hierarchies = []
+                violations = []
+
+                for row in cur.fetchall():
+                    hierarchy_name = row[0]
+                    member_types = row[1] or []
+                    defining_rels = row[2] or []
+
+                    # Convert member_types to uppercase for comparison
+                    member_types_upper = {t.upper() for t in member_types if t}
+
+                    # Check if both subject and object types are in this hierarchy's members
+                    subject_in_hierarchy = subject_type_upper in member_types_upper
+                    object_in_hierarchy = object_type_upper in member_types_upper
+
+                    if subject_in_hierarchy and object_in_hierarchy:
+                        # Both types match this hierarchy
+                        matching_hierarchies.append(hierarchy_name)
+                        log.info("wgm.hierarchy_membership_valid",
+                                rel_type=rt_lower, hierarchy=hierarchy_name,
+                                subject_type=subject_type_upper, object_type=object_type_upper,
+                                member_types=member_types_upper)
+                    elif subject_in_hierarchy or object_in_hierarchy:
+                        # One matches, one doesn't — partial match (violation)
+                        violations.append({
+                            "hierarchy": hierarchy_name,
+                            "reason": f"Mixed types: subject={subject_type_upper}({subject_in_hierarchy}), object={object_type_upper}({object_in_hierarchy}), hierarchy_members={list(member_types_upper)}"
+                        })
+
+                if matching_hierarchies:
+                    # Entity types match at least one hierarchy that defines this rel_type
+                    return (True, f"hierarchy_valid:{','.join(matching_hierarchies)}", matching_hierarchies)
+
+                if violations:
+                    # Partial matches found (one entity type matches, other doesn't)
+                    reason = f"partial_hierarchy_match: {'; '.join(v['reason'] for v in violations)}"
+                    log.warning("wgm.hierarchy_membership_partial",
+                               rel_type=rt_lower, violations=violations)
+                    return (False, reason, [])
+
+                # No hierarchies define this rel_type (novel or generic rel_type)
+                # This is OK — generic rel_types don't belong to a specific hierarchy
+                return (True, "no_hierarchy_defines_rel_type", [])
+
+        except Exception as e:
+            log.warning("wgm.hierarchy_membership_validation_failed",
+                       rel_type=rt_lower, error=str(e))
+            return (True, f"validation_error:{str(e)}", [])  # Graceful fallback
+
     def validate_edge(self, subject_id, object_id, rel_type: str,
                       user_id=None, provenance=None, subject_type: str = None,
                       object_type: str = None, **edge_kwargs) -> dict:
@@ -498,6 +709,23 @@ class WGMValidationGate:
                 # and records the candidate in ontology_evaluations for async review
                 # by the re-embedder. See dprompt-17.
                 return {"status": "unknown"}
+
+        # dprompt-064 Phase 1: Apply correction semantics (metadata-driven)
+        # BEFORE validation gates, check if this is an immutable fact
+        if user_id and self._is_user_correction(edge_kwargs):
+            correction_result = self._apply_correction_semantics(edge_kwargs, rt, user_id)
+            if correction_result["action"] == "immutable":
+                log.warning(
+                    "wgm.immutable_fact_correction_rejected",
+                    user_id=user_id,
+                    rel_type=rt,
+                    reason=correction_result["reason"],
+                )
+                return {
+                    "status": "immutable_fact",
+                    "reason": correction_result["reason"],
+                    "committed": 0,
+                }
 
         # CONFIDENCE-GATED BYPASS LOGIC (dprompt-124):
         # High-confidence facts (>= 0.95) bypass validation gates entirely.
@@ -569,6 +797,27 @@ class WGMValidationGate:
                 log.warning("wgm.category_validation_failed",
                            rel_type=rt, category=category, reason=cat_reason)
 
+        # dprompt-126 Layer 1: Hierarchy membership validation (metadata-driven, growable)
+        # Validate that entity types match hierarchy member_entity_types for this rel_type
+        if subject_type and object_type:
+            hier_mem_valid, hier_mem_reason, matching_hierarchies = self._validate_hierarchy_membership(
+                rt, subject_type, object_type, user_id=user_id
+            )
+            if not hier_mem_valid:
+                log.warning("wgm.hierarchy_membership_violation",
+                           rel_type=rt, subject_type=subject_type, object_type=object_type,
+                           reason=hier_mem_reason)
+                # Mark for low confidence/Class C if not user-corrected
+                # User-stated facts override this check (handled by confidence bypass above)
+                if not is_user_correction and raw_confidence < 0.95:
+                    edge_kwargs["hierarchy_violation"] = hier_mem_reason
+                    log.info("wgm.hierarchy_violation_low_confidence",
+                            rel_type=rt, reason=hier_mem_reason,
+                            note="Will be stored as Class C (staged) for review")
+            elif matching_hierarchies:
+                log.info("wgm.hierarchy_membership_confirmed",
+                        rel_type=rt, hierarchies=matching_hierarchies)
+
         # dBug-046 Phase 2a: Compute unified confidence score via LLMOutputValidator
         # This allows the ingest layer to make storage routing decisions (direct vs staged)
         # based on a consistent confidence algorithm across all output types
@@ -639,7 +888,11 @@ class WGMValidationGate:
             )
             old_rows = cur.fetchall()
             if not old_rows:
-                return {"status": "valid", "unified_confidence": unified_confidence}
+                # dprompt-126: Include hierarchy_violation if present
+                result = {"status": "valid", "unified_confidence": unified_confidence}
+                if edge_kwargs.get("hierarchy_violation"):
+                    result["hierarchy_violation"] = edge_kwargs["hierarchy_violation"]
+                return result
 
             cur.execute(
                 "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"

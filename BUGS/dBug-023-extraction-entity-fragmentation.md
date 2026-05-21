@@ -1,6 +1,6 @@
 # dBug-023: Extraction Creates Orphaned Entities (Entity Fragmentation)
 
-**Status:** FIXED — Pronoun normalization guard implemented
+**Status:** ROOT CAUSE IDENTIFIED (dprompt-88d debugging)
 
 **Severity:** HIGH — Facts created but unreachable by query pipeline
 
@@ -10,82 +10,62 @@ Relationship facts (lives_at, spouse) are stored in database but invisible to /q
 
 ### Evidence
 
-When extraction processes first-person statements like "I live at X", the LLM may output:
-- subject: "i" or "me" (literal pronoun, not "user")
-- rel_type: "lives_at"
-- object: address or location
+**Database state for user 10d7d879-63cd-4f31-92ce-f2c9edb760ab:**
 
-This causes `/ingest` to create a surrogate UUID for the literal pronoun string via `registry.resolve()`, orphaning the fact since the new entity has no identity anchors.
+Entity a91f8c22-7deb-5d6a-951f-9be50b1b1e07:
+- ✓ Has lives_at facts (54931c58, 6860bb69)
+- ✓ Has spouse fact (fb0868c4)
+- ✗ Has NO pref_name
+- ✗ Has NO also_known_as
+- ✗ Unreachable by initial_user_facts query
 
-**Query behavior:** 
+Entity 54931c58-c891-5558-af89-31804663b971 (address):
+- ✓ Has instance_of location hierarchy fact
+- ✗ Has NO pref_name (orphaned)
+- ✗ Unreachable
+
+**Query behavior:**
 ```sql
 SELECT DISTINCT subject_id FROM facts 
 WHERE rel_type IN ('pref_name', 'also_known_as') 
--- Returns entities with identity anchors only
--- Missing: any entities created from first-person pronouns (no pref_name, unreachable)
+-- Returns: 10d7d879, fbb0eca9, fb0868c4, 2e0d4a79
+-- Missing: a91f8c22 (has lives_at but no identity)
 ```
 
-**Result:** Relationship facts exist in database but never surfaced to /query because their subject entities lack identity facts.
+**Result:** initial_user_facts count=15 inclualice spouse facts but NO lives_at, because a91f8c22 never picked up in initial query.
 
 ## Root Cause
 
-1. `/extract/rewrite` LLM prompt example used "I" as subject: "For 'I live at address...': (I, lives_at, address)"
-2. LLM follows the example → outputs `{"subject": "i", ...}` despite general instructions
-3. `/ingest` had no pronoun guard → `registry.resolve("i")` creates orphan UUID v5 surrogate
-4. Entity registry assigns `entity_id`, but no `pref_name` or `also_known_as` is registered
-5. `/query` initial_user_facts query filters by `pref_name/also_known_as` → orphaned entity never included
+Extraction creates multiple Person entities during processing:
+1. 10d7d879 (OpenWebUI user_id) — gets some identity facts
+2. a91f8c22 — gets created for relationship facts, no identity anchor
+3. fbb0eca9, fb0868c4, 2e0d4a79 — other entities with pref_name
+
+When extraction sees "I live at X", it should anchor the lives_at fact to the PRIMARY identity entity (the one with pref_name="chris"). Instead, it creates a new ephemeral entity a91f8c22 and orphans it.
 
 ## Impact
 
-- Relationship facts (lives_at, spouse, works_for, etc.) created but invisible
-- User queries for "where do I live?" return incomplete results
+- "where do I live?" query returns instance_of location but not lives_at
+- lives_at facts exist in database (confirmed via psql) but never surfaced to LLM
+- dprompt-88d (fetch all identity entities) only helps if those entities have identity facts
 - Data fragmentation grows with each extraction
-- `/query` graph traversal never reaches facts anchored to orphaned entities
 
-## Solution Implemented
+## Files to Modify
 
-**Three-layer defense in `/ingest` (src/api/main.py):**
+- `openwebui/faultline_tool.py` — extraction rewrite logic (identify pronoun resolution strategy)
+- `src/api/main.py` — /extract endpoint pronoun handling
+- Possibly: entity registry integration
 
-1. **Prompt fix** (lines 1680): Added explicit rule:
-   ```
-   FIRST-PERSON RULE: For first-person statements, ALWAYS use 'user' as the subject — never 'I', 'me', 'my', or 'we'.
-   ```
+## Solution Direction
 
-2. **LLM rewrite path normalizer** (lines 2067-2074): Safety net for /extract/rewrite output:
-   ```python
-   _FIRST_PERSON_PRONOUNS = {"i", "me", "my", "myself", "we", "us", "our", "ourselves"}
-   for t in rewrite_data.get("triples", []):
-       subj = (t.get("subject") or "").lower().strip()
-       if subj in _FIRST_PERSON_PRONOUNS:
-           t["subject"] = "user"
-   ```
+When extraction processes "I live at X":
+1. Query entity_aliases for user_id, find entity with confirmed pref_name
+2. Attach lives_at to THAT entity (identity-anchored)
+3. Do NOT create new entities for pronouns without giving them identity facts
 
-3. **External edges path normalizer** (lines 2135-2141): Catches pronouns from req.edges:
-   ```python
-   for edge in (req.edges or []):
-       subj = (edge.subject or "").lower().strip()
-       if subj in _FIRST_PERSON_PRONOUNS:
-           edge.subject = "user"
-   ```
+Alternative: Filter pre-resolves pronouns and passes canonical entity UUID to /extract.
 
-All three layers ensure pronouns never create orphaned entities:
-- Layer 1: LLM should output "user"
-- Layer 2: If LLM outputs pronoun from /extract/rewrite, normalize before entity resolution
-- Layer 3: If external edge source sends pronoun, normalize before entity resolution
+## Related
 
-## Files Modified
-
-- `src/api/main.py`
-  - Lines 1680: Extraction prompt explicit first-person rule
-  - Lines 2012: `_FIRST_PERSON_PRONOUNS` definition
-  - Lines 2067-2074: LLM rewrite path normalizer
-  - Lines 2135-2141: External edges path normalizer
-
-## Verification
-
-After fix, relationship facts from first-person statements anchor to user's canonical identity entity (the one with pref_name), not an orphaned UUID.
-
-## Related Issues
-
-- dBug-022: Preferred fact exposure (privacy/agency concerns with multi-entity fragments)
-- dprompt-88d: Fetch all identity entities (workaround to include orphaned entity facts in query)
+- dBug-022: Preferred fact exposure (different issue, but related to data structure)
+- dprompt-88d: Query fetch all identity entities (symptom relief, not root fix)
