@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS correction_patterns (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX idx_correction_patterns_rel_type ON correction_patterns(rel_type);
-CREATE INDEX idx_correction_patterns_immutable ON correction_patterns(immutable) WHERE immutable = TRUE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_patterns_rel_type ON correction_patterns(rel_type);
+CREATE INDEX IF NOT EXISTS idx_correction_patterns_immutable ON correction_patterns(immutable) WHERE immutable = TRUE;
 
 -- Seed initial correction patterns (dprompt-117)
 INSERT INTO correction_patterns (rel_type, label, description, immutable, correction_class, conflicts_with, semantic_intent, extraction_hints)
