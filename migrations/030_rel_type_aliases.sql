@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS rel_type_aliases (
     FOREIGN KEY (canonical_rel_type) REFERENCES rel_types(rel_type) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_rel_type_aliases_alias ON rel_type_aliases(alias);
-CREATE INDEX idx_rel_type_aliases_canonical ON rel_type_aliases(canonical_rel_type);
+CREATE INDEX IF NOT EXISTS idx_rel_type_aliases_alias ON rel_type_aliases(alias);
+CREATE INDEX IF NOT EXISTS idx_rel_type_aliases_canonical ON rel_type_aliases(canonical_rel_type);
 
 -- Seed with Wikidata/common LLM variations (dprompt-125)
 -- Identity relations

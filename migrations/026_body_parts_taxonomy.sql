@@ -1,6 +1,9 @@
 -- Migration 026: Pre-seed body_parts taxonomy (dBug-018 Phase B)
 -- Idempotent: safe to run multiple times.
 
+-- Ensure uuid-ossp extension is available (required for uuid_generate_v5)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- Insert body_parts taxonomy if not exists
 INSERT INTO entity_taxonomies (
     taxonomy_name,
