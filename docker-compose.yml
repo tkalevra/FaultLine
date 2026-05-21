@@ -31,7 +31,7 @@ services:
       qdrant:
         condition: service_started
       redis:
-        condition: service_started
+        condition: service_healthy
     networks:
       - faultline-test
 
@@ -66,6 +66,11 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks:
       - faultline-test
 
