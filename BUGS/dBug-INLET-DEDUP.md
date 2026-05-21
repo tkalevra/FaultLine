@@ -7,13 +7,13 @@
 
 ## Problem
 
-OpenWebUI inlet filter was being invoked **76+ times** for a single user message ("Mars has a pet dog named Fraggle"). Test timed out after 45 seconds due to:
+OpenWebUI inlet filter was being invoked **76+ times** for a single user message ("emma has a pet dog named Fraggle"). Test timed out after 45 seconds due to:
 
 1. **Feedback Loop:** LLM generates response with "Detected entities:" annotation block
 2. **Mutation:** Message text changes on each pass (annotation appended)
 3. **No Dedup:** Each variant has different SHA256 hash → dedup cache always misses
 4. **Cascading:** Context grows exponentially (40+ repeated "Detected entities:" blocks in query logs)
-5. **Type Confusion:** Mars classified as Animal instead of Person due to parsing bloat
+5. **Type Confusion:** emma classified as Animal instead of Person due to parsing bloat
 
 ### Symptom Logs
 
@@ -26,7 +26,7 @@ OpenWebUI inlet filter was being invoked **76+ times** for a single user message
 
 Backend query log showing recursive annotation appending:
 ```
-query_lower='mars has a pet dog named fraggle\n\ndetected entities:\n- mars (animal) -- fraggle (animal)\n\ndetected entities:\n- mars (animal) -- fraggle (animal)\n\ndetected entities:...[REPEATS 40+ TIMES]'
+query_lower='emma has a pet dog named fraggle\n\ndetected entities:\n- emma (animal) -- fraggle (animal)\n\ndetected entities:\n- emma (animal) -- fraggle (animal)\n\ndetected entities:...[REPEATS 40+ TIMES]'
 ```
 
 Qdrant search failing with 400 Bad Request (context too large).
@@ -70,7 +70,7 @@ Strips annotation blocks **before dedup hash is computed**, ensuring:
 | Dedup hit rate | 0% (always miss) | ✅ Working |
 | Test timeout | 45s timeout | ✅ Completes |
 | Context bloat | 40+ repeated blocks | ✅ Clean |
-| Type confusion | Mars=Animal | ✅ Correct type handling |
+| Type confusion | emma=Animal | ✅ Correct type handling |
 
 **Test Execution:**
 ```
