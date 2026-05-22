@@ -5866,7 +5866,7 @@ def query(request: QueryRequest):
         for f in merged_facts:
             for field in ("subject", "object"):
                 val = f[field]
-                if not val or val in preferred_names or val == user_entity_id_for_query:
+                if not val or val in preferred_names:
                     continue
                 # Try entity_aliases first (primary)
                 resolved = registry.get_preferred_name(user_id, val)
@@ -5888,6 +5888,21 @@ def query(request: QueryRequest):
                             preferred_names[val] = val
                     else:
                         preferred_names[val] = val
+
+        # Ensure user entity is in preferred_names (dBug-user-entity-preferred-name-skipped)
+        # User's pref_name from attributes should be included so Filter can resolve user's UUID
+        if user_entity_id_for_query and user_entity_id_for_query not in preferred_names:
+            if attributes and user_entity_id_for_query in attributes:
+                user_pref_name_attr = attributes[user_entity_id_for_query].get("pref_name")
+                if user_pref_name_attr:
+                    if isinstance(user_pref_name_attr, dict):
+                        user_pref_name = user_pref_name_attr.get("value")
+                    else:
+                        user_pref_name = user_pref_name_attr
+                    if user_pref_name:
+                        preferred_names[user_entity_id_for_query] = str(user_pref_name)
+                        log.info("query._populate_preferred_names.user_pref_name_found", user_id=user_entity_id_for_query, pref_name=user_pref_name)
+
         log.info("query._populate_preferred_names.complete", preferred_names_count=len(preferred_names))
 
         return preferred_names
