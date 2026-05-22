@@ -38,6 +38,22 @@ class FactStoreManager:
                         user_id, sub, obj, rel, prov = row
                         is_preferred = False
 
+                    # dprompt-130: Populate taxonomies live from entity_taxonomies metadata
+                    # If taxonomies not provided in tuple, look them up based on rel_type
+                    # This ensures facts are tagged with their taxonomies as the system grows
+                    if not taxonomies:
+                        try:
+                            cur.execute(
+                                "SELECT array_agg(DISTINCT taxonomy_name) FROM entity_taxonomies "
+                                "WHERE rel_types_defining_group @> ARRAY[%s]",
+                                (rel,)
+                            )
+                            result = cur.fetchone()
+                            taxonomies = result[0] if result and result[0] else []
+                        except Exception:
+                            # Silently fail if lookup fails - insert will proceed with empty taxonomies
+                            taxonomies = []
+
                     cur.execute(
                         "INSERT INTO facts"
                         " (user_id, subject_id, object_id, rel_type, provenance, confidence, unified_confidence, source_weight, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies)"

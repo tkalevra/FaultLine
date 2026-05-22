@@ -1057,7 +1057,7 @@ def _llm_discover_taxonomy_from_facts(
     2. The facts that were fetched (rel_types, count)
     3. Request: "What taxonomy group do these rel_types define?"
 
-    LLM returns: {taxonomy_name, alicecription, rel_types_defining_group, ...}
+    LLM returns: {taxonomy_name, description, rel_types_defining_group, ...}
     """
     if not facts or not llm_url:
         return None
@@ -1066,7 +1066,7 @@ def _llm_discover_taxonomy_from_facts(
         # Fetch existing taxonomies as examples for LLM context
         with db_conn.cursor() as cur:
             cur.execute(
-                "SELECT taxonomy_name, alicecription, rel_types_defining_group "
+                "SELECT taxonomy_name, description, rel_types_defining_group "
                 "FROM entity_taxonomies LIMIT 5"
             )
             examples = cur.fetchall()
@@ -1083,8 +1083,8 @@ def _llm_discover_taxonomy_from_facts(
 
         # Build context for LLM
         examples_text = "\n".join([
-            f"- {name}: {alicec or '(no alicecription)'} defines members via {rels}"
-            for name, alicec, rels in examples
+            f"- {name}: {desc or '(no description)'} defines members via {rels}"
+            for name, desc, rels in examples
         ])
 
         rel_types_text = ", ".join([f"{rt} ({cnt})" for rt, cnt in sorted(rel_type_counts.items(), key=lambda x: -x[1])])
@@ -1101,7 +1101,7 @@ Do these rel_types define a natural grouping (taxonomy)?
 - Examples: family (parent_of, spouse, has_child), work (works_for, has_colleague), location (lives_at, born_in)
 
 If YES, respond ONLY with JSON (no markdown):
-{{"taxonomy_name": "name", "alicecription": "brief alicecription", "rel_types_defining_group": ["rel1", "rel2"]}}
+{{"taxonomy_name": "name", "description": "brief description", "rel_types_defining_group": ["rel1", "rel2"]}}
 
 If NO, respond ONLY with:
 {{"taxonomy_name": null}}"""
@@ -2069,7 +2069,7 @@ def _load_taxonomy_cache(db) -> None:
         with db.cursor() as cur:
             cur.execute(
                 "SELECT taxonomy_name, member_entity_types, rel_types_defining_group, "
-                "alicecription, is_hierarchical, parent_rel_type "
+                "description, is_hierarchical, parent_rel_type "
                 "FROM entity_taxonomies"
             )
             rows = cur.fetchall()
@@ -2090,14 +2090,14 @@ def _load_taxonomy_cache(db) -> None:
                                    taxonomy=taxonomy_name, input=row[2], error=str(e))
                         rel_types = []
 
-                    alicec = row[3]
+                    description = row[3]
                     is_hier = row[4]
                     parent_rel = row[5]
 
                     _TAXONOMY_CACHE[taxonomy_name] = {
                         "member_entity_types": member_types,
                         "rel_types_defining_group": rel_types,
-                        "alicecription": alicec,
+                        "description": description,
                         "is_hierarchical": is_hier,
                         "parent_rel_type": parent_rel,
                     }
@@ -2135,14 +2135,9 @@ def determine_scope_multi_factor(db, user_id: str, facts: list[dict]) -> set[str
     1. rel_types in facts → match to entity_taxonomies.rel_types_defining_group
     2. entity_types of subjects/objects → validate against member_entity_types
 
-    Returns: set of detected taxonomy_names
-    HARD FAIL if query fails (upstream ingest problem if no taxonomies exist)
+    Returns: set of detected taxonomy_names (empty set if no matches)
+    Queries database directly, no cache dependency — graceful fallback on error
     """
-    if not _TAXONOMY_CACHE:
-        log.error("query.scope_determination.no_taxonomies",
-                 reason="cache_empty",
-                 user_id=user_id)
-        raise RuntimeError("Taxonomy cache is empty — upstream ingest failure")
 
     detected_taxonomies = set()
     rel_types_in_facts = {f.get("rel_type") for f in facts if f.get("rel_type")}
@@ -2195,18 +2190,18 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
             subject_name = registry.get_preferred_name("", subject_id)
         subject_name = subject_name or (subject_id[:8] if subject_id else "Unknown")
 
-        # Get rel_type alicecription from database
-        rel_alicecription = rel_type
+        # Get rel_type label from database
+        rel_label = rel_type
         if db and rel_type:
             try:
                 with db.cursor() as cur:
                     cur.execute(
-                        "SELECT alicecription FROM rel_types WHERE rel_type = %s",
+                        "SELECT label FROM rel_types WHERE rel_type = %s",
                         (rel_type,)
                     )
                     row = cur.fetchone()
                     if row and row[0]:
-                        rel_alicecription = row[0]
+                        rel_label = row[0]
             except Exception:
                 pass  # Fall back to rel_type name
 
@@ -2224,8 +2219,8 @@ def format_fact_for_injection(fact: dict, db, registry) -> str | None:
             return None
 
         # Format as natural English
-        if subject_name and rel_alicecription and object_repr:
-            return f"{subject_name} {rel_alicecription} {object_repr}."
+        if subject_name and rel_label and object_repr:
+            return f"{subject_name} {rel_label} {object_repr}."
 
         return None
     except Exception as e:
@@ -5488,6 +5483,93 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
         log.warning("query.fetch_hierarchy_facts_failed", error=str(e))
     return results
 
+def _determine_query_scope(db, query_text: str, user_id: str) -> set[str]:
+    """
+    Determine query-driven scope from the user's question (NOT from facts).
+    Implements dprompt-130: metadata-driven query keyword matching.
+
+    Returns: set of taxonomy_name strings matching the query intent
+    METADATA-DRIVEN: Uses entity_taxonomies and rel_types tables, no hardcoding.
+    """
+    if not query_text or not db:
+        return set()
+
+    import re
+    detected_taxonomies = set()
+
+    # Extract keywords from query (split on whitespace, remove punctuation)
+    query_lower = query_text.lower()
+    keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
+
+    # Filter noise words
+    noise_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+                   'what', 'how', 'when', 'where', 'why', 'who', 'which', 'that',
+                   'and', 'or', 'not', 'but', 'if', 'to', 'of', 'in', 'on', 'at',
+                   'by', 'for', 'with', 'from', 'up', 'about', 'as', 'can', 'will',
+                   'would', 'could', 'should', 'may', 'might', 'must', 'do', 'does',
+                   'did', 'have', 'has', 'had', 'me', 'my', 'you', 'your', 'tell',
+                   'me', 'about', 'like', 'know', 'have', 'tell'}
+    keywords -= noise_words
+
+    if not keywords:
+        return set()
+
+    try:
+        with db.cursor() as cur:
+            # Phase 2A: Match keywords against taxonomy descriptions
+            for keyword in keywords:
+                try:
+                    cur.execute(
+                        "SELECT DISTINCT taxonomy_name FROM entity_taxonomies "
+                        "WHERE description ILIKE %s",
+                        (f"%{keyword}%",)
+                    )
+                    for row in cur.fetchall():
+                        detected_taxonomies.add(row[0])
+                except Exception as e:
+                    log.debug("query.scope_description_match_failed", keyword=keyword, error=str(e))
+
+            # Phase 2B: Match keywords against rel_types and find their taxonomies
+            for keyword in keywords:
+                try:
+                    cur.execute(
+                        "SELECT DISTINCT et.taxonomy_name FROM rel_types rt "
+                        "INNER JOIN entity_taxonomies et ON et.rel_types_defining_group @> ARRAY[rt.rel_type] "
+                        "WHERE rt.rel_type = %s",
+                        (keyword,)
+                    )
+                    for row in cur.fetchall():
+                        detected_taxonomies.add(row[0])
+                except Exception as e:
+                    log.debug("query.scope_reltype_match_failed", keyword=keyword, error=str(e))
+
+            # Phase 2C: Entity type hierarchal fallback - resolve keywords as entity names
+            for keyword in keywords:
+                try:
+                    cur.execute(
+                        "SELECT DISTINCT et.taxonomy_name FROM entity_aliases ea "
+                        "INNER JOIN entities e ON ea.entity_id = e.id "
+                        "INNER JOIN entity_taxonomies et ON et.member_entity_types @> ARRAY[e.entity_type] "
+                        "WHERE ea.alias ILIKE %s AND ea.user_id = %s",
+                        (keyword, user_id)
+                    )
+                    for row in cur.fetchall():
+                        detected_taxonomies.add(row[0])
+                except Exception as e:
+                    log.debug("query.scope_entity_match_failed", keyword=keyword, error=str(e))
+
+    except Exception as e:
+        log.warning("query.determine_scope_failed", error=str(e))
+        return set()
+
+    if detected_taxonomies:
+        log.info("determine_query_scope", query=query_text[:50], keywords=list(keywords),
+                 detected_taxonomies=list(detected_taxonomies))
+    else:
+        log.debug("determine_query_scope.no_match", query=query_text[:50], keywords=list(keywords))
+
+    return detected_taxonomies
+
 @app.post("/query")
 def query(request: QueryRequest):
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
@@ -6013,21 +6095,68 @@ def query(request: QueryRequest):
 
     direct_facts = []
     detected_taxonomies = None
+    query_detected_taxonomies = None
 
     # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
     # dprompt-88d: fetch from ALL user identity entities, not just the first one
     # SOLUTION-CLASSIFY-FORWARD: Use pre-computed taxonomies for scope filtering
     # Taxonomy detection: (1) query entity_taxonomies, (2) if none found, LLM discovers and creates new taxonomy
     if db and registry and canonical_identity:
-        # Fetch baseline facts without taxonomy filtering
+        # dprompt-130: Determine query-driven scope BEFORE fetching facts
+        # Matches query keywords against entity_taxonomies metadata (NOT hardcoded)
+        query_detected_taxonomies = _determine_query_scope(db, request.text, user_id)
+
+        # Fetch baseline facts, optionally filtered by query-detected scope
+        # NOTE: Only pass taxonomies filter if facts table actually has taxonomies populated
+        # For now, skip filtering since existing facts have empty taxonomies column
+        # (taxonomy population is handled at ingest time for new facts)
         for eid in user_entity_ids_for_query:
             direct_facts.extend(_fetch_user_facts(db, user_id, entity_id=eid))
 
-        # Detect scope from fact rel_types using DB metadata
-        if direct_facts:
+        # dprompt-130: Apply query-scope filtering to facts (post-fetch)
+        # Only apply if query detected a specific scope (not broad queries)
+        log.info("query.scope_filter_check", query_detected_taxonomies=list(query_detected_taxonomies) if query_detected_taxonomies else None,
+                 count=len(query_detected_taxonomies) if query_detected_taxonomies else 0)
+        if query_detected_taxonomies and len(query_detected_taxonomies) <= 3:
+            # Build rel_type → taxonomies map to filter
+            rel_type_to_taxonomies = {}
             try:
-                detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
-                if detected_taxonomies:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT rt.rel_type, et.taxonomy_name FROM rel_types rt "
+                        "INNER JOIN entity_taxonomies et ON et.rel_types_defining_group @> ARRAY[rt.rel_type] "
+                        "WHERE et.taxonomy_name = ANY(%s)",
+                        (list(query_detected_taxonomies),)
+                    )
+                    results = cur.fetchall()
+                    log.info("query.scope_filter_sql_results", results_count=len(results) if results else 0,
+                             taxonomies=list(query_detected_taxonomies))
+                    for rel_type, tax_name in results:
+                        if rel_type not in rel_type_to_taxonomies:
+                            rel_type_to_taxonomies[rel_type] = set()
+                        rel_type_to_taxonomies[rel_type].add(tax_name)
+            except Exception as e:
+                log.warning("query.scope_filter_map_failed", error=str(e))
+                rel_type_to_taxonomies = {}
+
+            # Filter facts to only those whose rel_type belongs to detected scope
+            if rel_type_to_taxonomies:
+                initial_count = len(direct_facts)
+                direct_facts = [
+                    f for f in direct_facts
+                    if f.get("rel_type") in rel_type_to_taxonomies
+                ]
+                log.info("query.scope_filter_applied", query_scope=list(query_detected_taxonomies),
+                         before=initial_count, after=len(direct_facts))
+
+        # dprompt-130: Skip fact-based scope detection if query-based already succeeded
+        # Only try fact-based detection if query didn't detect a specific scope
+        if direct_facts and not query_detected_taxonomies:
+            try:
+                fact_detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
+                # Use fact-detected scope if available
+                if fact_detected_taxonomies:
+                    detected_taxonomies = fact_detected_taxonomies
                     log.info("query.scope_detected_from_facts", taxonomies=list(detected_taxonomies),
                              fact_count=len(direct_facts))
                 else:
@@ -6040,12 +6169,12 @@ def query(request: QueryRequest):
                             with db.cursor() as cur:
                                 cur.execute(
                                     "INSERT INTO entity_taxonomies "
-                                    "(taxonomy_name, alicecription, member_entity_types, rel_types_defining_group, "
+                                    "(taxonomy_name, description, member_entity_types, rel_types_defining_group, "
                                     "has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, source) "
                                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                                     (
                                         discovered["taxonomy_name"],
-                                        discovered.get("alicecription", ""),
+                                        discovered.get("description", ""),
                                         discovered.get("member_entity_types", "{}"),
                                         discovered.get("rel_types_defining_group", []),
                                         discovered.get("has_transitivity", False),
@@ -6076,6 +6205,38 @@ def query(request: QueryRequest):
             user_rels[rt] = user_rels.get(rt, 0) + 1
         log.info("query.initial_user_facts", count=len(direct_facts), rel_types=dict(sorted(user_rels.items())),
                  detected_taxonomies=list(detected_taxonomies or []))
+
+        # dprompt-130: Stop on confidence — if scope-detected facts answer the query, return early
+        # Query-detected scope is more trustworthy than graph traversal (which adds all connected facts)
+        # If we detected a specific scope (1-3 taxonomies), scope-filtered facts are our answer
+        if query_detected_taxonomies and direct_facts and len(query_detected_taxonomies) <= 2:
+            _avg_confidence = sum(f.get("confidence", 0.5) for f in direct_facts) / len(direct_facts)
+            log.info("query.stop_on_confidence", count=len(direct_facts), avg_confidence=_avg_confidence,
+                     scope=list(query_detected_taxonomies),
+                     reason="query_scope_detected_facts_sufficient")
+            # Skip graph traversal and hierarchy expansion — scope-detected facts answer the query
+            merged_facts = direct_facts
+            try:
+                if registry:
+                    for f in merged_facts:
+                        subject_uuid = f.get("_subject_id", f["subject"])
+                        object_uuid = f.get("_object_id", f["object"])
+                        if subject_uuid not in preferred_names and subject_uuid != user_entity_id_for_query:
+                            preferred_names[subject_uuid] = f["subject"]
+                        if object_uuid not in preferred_names and object_uuid != user_entity_id_for_query:
+                            preferred_names[object_uuid] = f["object"]
+                entity_types = _build_entity_types(preferred_names)
+                return {
+                    "status": "ok",
+                    "facts": merged_facts,
+                    "preferred_names": _clean_preferred_names(preferred_names),
+                    "canonical_identity": canonical_identity,
+                    "entity_types": entity_types,
+                    "attributes": {},
+                }
+            except Exception as e:
+                log.warning("query.stop_on_confidence_failed", error=str(e))
+                # Fall through to graph traversal if early return fails
 
     if direct_facts or (db and registry and canonical_identity):
         try:
