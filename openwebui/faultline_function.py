@@ -2517,18 +2517,43 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                     # Resolve any remaining UUIDs to display names before building memory
                     facts = _resolve_display_names(facts, preferred_names, canonical_identity)
 
-                    # HARD GUARD: validate no UUIDs leaked into resolved facts
+                    # HARD GUARD: filter out facts with unresolved UUIDs
                     # CLAUDE.md constraint: "display names must never be UUIDs in user-facing output"
+                    # A UUID is "resolved" if preferred_names[uuid] != uuid. UUID→UUID fallbacks are unresolved.
                     # # NO RECURSIVE MATCHING — _UUID_RE is a static compile-once pattern
+                    resolved_facts = []
                     for _f in facts:
-                        for _field in ("subject", "object"):
-                            _val = _f.get(_field, "")
-                            if _val and _UUID_RE.match(str(_val)):
-                                _display = preferred_names.get(_val, _val)
-                                if _display != _val:
-                                    _f[_field] = _display
-                                    if self.valves.ENABLE_DEBUG:
-                                        print(f"[FaultLine Filter] uuid_guard: late-resolved {_field}={_val[:12]}→{_display}")
+                        subject = _f.get("subject", "")
+                        object_ = _f.get("object", "")
+
+                        # Check if subject is an unresolved UUID (UUID with no display name)
+                        subject_is_uuid = subject and _UUID_RE.match(str(subject))
+                        subject_unresolved = False
+                        if subject_is_uuid:
+                            resolved_subj = preferred_names.get(subject, subject)
+                            subject_unresolved = resolved_subj == subject  # UUID→UUID fallback
+
+                        # Check if object is an unresolved UUID
+                        object_is_uuid = object_ and _UUID_RE.match(str(object_))
+                        object_unresolved = False
+                        if object_is_uuid:
+                            resolved_obj = preferred_names.get(object_, object_)
+                            object_unresolved = resolved_obj == object_  # UUID→UUID fallback
+
+                        # Skip facts with unresolved UUIDs to prevent injection to LLM
+                        if subject_unresolved or object_unresolved:
+                            if self.valves.ENABLE_DEBUG:
+                                skip_reason = []
+                                if subject_unresolved:
+                                    skip_reason.append(f"subject_uuid={subject[:12]}")
+                                if object_unresolved:
+                                    skip_reason.append(f"object_uuid={object_[:12]}")
+                                print(f"[FaultLine Filter] uuid_guard: skipping fact with unresolved UUID ({', '.join(skip_reason)})")
+                            continue
+
+                        resolved_facts.append(_f)
+
+                    facts = resolved_facts
 
                     # Update conversation context for next turn
                     _update_conversation_context(user_id, facts, preferred_names)
