@@ -17,7 +17,7 @@ import hashlib
 
 import httpx
 import redis
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Add src directory to path for imports (dBug-046 Phase 2b)
 try:
@@ -767,22 +767,9 @@ If nothing to extract: []"""
 
 
 def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
-    """Resolve LLM config from valves with auto-detected endpoint fallback.
-    Priority: BACKEND_LLM_URL valve > LLM_URL valve > auto-detected OpenWebUI > hardcoded fallback.
-    No hardcoding except as absolute final fallback.
-    # NO RECURSIVE MATCHING
-    """
-    model = valves.LLM_MODEL if valves.LLM_MODEL else body.get("model", "")
-    url = valves.BACKEND_LLM_URL if valves.BACKEND_LLM_URL else valves.LLM_URL
-
-    # Fall back to auto-detected endpoint (detected at module import time)
-    if not url:
-        url = _OPENWEBUI_ENDPOINT
-
-    # Final fallback: hardcoded localhost (only if detection completely failed)
-    if not url:
-        url = "http://localhost:8080"
-
+    """Resolve LLM endpoint via auto-detected OpenWebUI. Uses dprompt-111 detection (no valve config needed)."""
+    model = body.get("model", "")
+    url = _OPENWEBUI_ENDPOINT or "http://localhost:8080"
     return model, url
 
 
@@ -798,7 +785,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
 
         if context:
             prior_turns = []
-            for msg in context[-valves.MAX_CONTEXT_TURNS:]:
+            for msg in context[-_MAX_CONTEXT_TURNS:]:
                 role = msg.get("role")
                 content = msg.get("content", "")
                 if role in ("user", "assistant") and content:
@@ -1265,6 +1252,13 @@ def _redact_uuids_from_body(body: dict) -> None:
             msg["content"] = _UUID_ANYWHERE_RE.sub("[redacted]", content)
 
 
+# Hardcoded constants (not user-configurable via valves)
+_FAULTLINE_TIMEOUT_SECS = 90  # Unified gate LLM call timeout
+_LLM_TIMEOUT_SECS = 10  # Extraction LLM timeout
+_DEFAULT_SOURCE = "openwebui"  # Fact provenance label
+_MAX_CONTEXT_TURNS = 3  # Prior turns passed to LLM for context
+
+
 class Filter:
     """
     OpenWebUI Filter for FaultLine WGM Integration.
@@ -1274,71 +1268,50 @@ class Filter:
     """
 
     class Valves(BaseModel):
-        FAULTLINE_URL: str = _FAULTLINE_URL  # Auto-detected at module load time (dprompt-111 + 115 fix)
-        """FaultLine backend API endpoint. Default: http://localhost:8001
-        Docker: Use http://faultline:8000 (service name in docker-compose).
-        Kubernetes/Remote: Use full URL http://hostname:port"""
+        FAULTLINE_URL: str = Field(
+            default=_FAULTLINE_URL,
+            description="FaultLine backend API endpoint (auto-detected). Docker: http://faultline:8000"
+        )
 
-        FAULTLINE_TIMEOUT: int = 90
-        """Timeout (seconds) for FaultLine backend API calls. Default: 90 seconds (unified gate LLM call to slow aurora)"""
+        ENABLED: bool = Field(
+            default=True,
+            description="Master switch. Set False to completely disable FaultLine Filter."
+        )
 
-        LLM_URL: str = ""
-        """LEAVE EMPTY FOR STANDARD SETUP. Filter calls OpenWebUI LLM at /api/chat/completions endpoint.
-        Only set this if using a CUSTOM LLM endpoint (must be BASE URL only, no /api/chat/completions suffix).
-        EXAMPLES: https://docker-host.helpalicekpro.ca or http://ollama:11434
-        Code will append /api/chat/completions automatically. MUST include http:// or https:// prefix."""
+        INGEST_ENABLED: bool = Field(
+            default=True,
+            description="Enable fact extraction and storage. Set False to disable learning new facts."
+        )
 
-        LLM_MODEL: str = ""
-        """LEAVE EMPTY FOR STANDARD SETUP. Will use the model you selected in OpenWebUI's chat interface.
-        Only override if you want a SPECIFIC model for fact extraction (e.g., 'qwen/qwen3.5-9b')."""
+        QUERY_ENABLED: bool = Field(
+            default=True,
+            description="Enable memory recall injection. Set False to disable fact-based context."
+        )
 
-        LLM_API_KEY: str = ""
-        """REQUIRED ONLY IF using custom LLM_URL with authentication (e.g., OpenAI API key).
-        For standard OpenWebUI setup: LEAVE EMPTY. Bearer token automatically prepended to requests."""
+        RETRACTION_ENABLED: bool = Field(
+            default=True,
+            description="Enable user-driven fact removal ('forget', 'delete', etc.). Set False to lock facts."
+        )
 
-        BACKEND_LLM_URL: str = ""
-        """LEAVE EMPTY FOR STANDARD SETUP. Filter calls OpenWebUI LLM directly (preferred).
-        Only set if you need a DEDICATED backend LLM service (bypassing OpenWebUI).
-        FORMAT if set: BASE URL ONLY (no /api/chat/completions suffix). Code will append it automatically.
-        EXAMPLES: http://ollama:11434 or http://localhost:11434 (NOT http://ollama:11434/v1/chat/completions)
-        MUST include http:// or https:// prefix. Incorrect format will break fact extraction."""
+        MAX_MEMORY_SENTENCES: int = Field(
+            default=20,
+            description="Maximum sentences in injected memory block. Reduce if hitting token limits."
+        )
 
-        QWEN_TIMEOUT: int = 10
-        """Timeout (seconds) for LLM extraction calls. Default: 10 seconds. Increase if extractions timeout."""
+        MIN_INJECT_CONFIDENCE: float = Field(
+            default=0.5,
+            description="Minimum confidence threshold for fact injection. Range: 0.0–1.0."
+        )
 
-        DEFAULT_SOURCE: str = "openwebui"
-        """Where facts originate. Default: 'openwebui'. Change only for specialized integrations."""
+        ENABLE_DEBUG: bool = Field(
+            default=False,
+            description="Enable detailed logging for debugging. Logs appear in: docker logs open-webui"
+        )
 
-        ENABLE_DEBUG: bool = False
-        """Enable detailed logging to diagnose issues. Set to True if facts aren't being extracted/injected.
-        Logs appear in: docker logs open-webui"""
-
-        ENABLED: bool = True
-        """Master switch. Set to False to completely disable FaultLine Filter."""
-
-        INGEST_ENABLED: bool = True
-        """Enable fact extraction and storage. Set to False to disable learning new facts."""
-
-        QUERY_ENABLED: bool = True
-        """Enable memory recall injection. Set to False to disable fact-based context injection."""
-
-        RETRACTION_ENABLED: bool = True
-        """Enable user-driven fact removal ('forget', 'delete', etc.). Set to False to lock facts."""
-
-        MAX_MEMORY_SENTENCES: int = 20
-        """Maximum sentences in injected memory block. Reduce if hitting token limits."""
-
-        MAX_CONTEXT_TURNS: int = 3
-        """Prior conversation turns passed to LLM for extraction context. Default: 3"""
-
-        MIN_INJECT_CONFIDENCE: float = 0.5
-        """Minimum confidence threshold for injecting facts into memory. Range: 0.0–1.0. Default: 0.5"""
-
-        REDIS_URL: str = "redis://localhost:6379/0"
-        """Redis connection URL for inlet request deduplication (dprompt-127).
-        Default: redis://localhost:6379/0
-        Set to your actual Redis hostname/IP and port (e.g., redis://192.168.1.10:6379/0 for Portainer)
-        If not set or unreachable, dedup silently falls back to no caching (duplicate requests will cascade)."""
+        DEFAULT_SOURCE: str = Field(
+            default="openwebui",
+            description="Default provenance label for facts stored via store_context."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1380,7 +1353,7 @@ class Filter:
             response = await _http_client.post(
                 f"{self.valves.FAULTLINE_URL}/ingest",
                 json=payload,
-                timeout=self.valves.FAULTLINE_TIMEOUT,
+                timeout=_FAULTLINE_TIMEOUT_SECS,
             )
             response.raise_for_status()
             data = response.json()
@@ -1419,7 +1392,7 @@ class Filter:
                     "source": self.valves.DEFAULT_SOURCE,
                     "context_type": "unstructured",
                 },
-                timeout=self.valves.FAULTLINE_TIMEOUT,
+                timeout=_FAULTLINE_TIMEOUT_SECS,
             )
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
@@ -1478,8 +1451,6 @@ Return valid JSON only. If no facts, return [].
             ]
 
             headers = {}
-            if self.valves.LLM_API_KEY:
-                headers["Authorization"] = f"Bearer {self.valves.LLM_API_KEY}"
 
             request_data = {
                 "model": model,
@@ -1547,7 +1518,7 @@ Return valid JSON only. If no facts, return [].
             user_id=user_id,
             model=model,
             url=url,
-            auth_header=f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None,
+            auth_header=None,
             user_uuid=user_id,
         )
 
@@ -1569,15 +1540,9 @@ Return valid JSON only. If no facts, return [].
         confidence = fact.get("confidence", 0.0)
         score += confidence * 0.3
 
-        # Sensitivity penalty (-0.5 for PII facts not explicitly requested)
-        _SENSITIVE_RELS = {"born_on", "lives_at", "lives_in", "height", "weight", "born_in"}
-        _SENSITIVE_TERMS = {"born", "birth", "live", "address", "height", "weight",
-                            "birthplace", "tall", "how tall", "heavy", "how heavy",
-                            "old", "age", "how old"}
-        if fact.get("rel_type") in _SENSITIVE_RELS:
-            explicitly_asked = any(term in query_lower for term in _SENSITIVE_TERMS)
-            if not explicitly_asked:
-                score -= 0.5
+        # Backend handles scope-based relevance via semantic query parsing.
+        # Filter trusts backend ranking (class A > B > C + confidence).
+        # No additional sensitivity penalties or exposure gating here.
 
         return max(0.0, min(1.0, score))
 
@@ -1592,12 +1557,13 @@ Return valid JSON only. If no facts, return [].
         Simplified relevance filtering — trusts backend /query ranking.
 
         Identity rels always pass. Everything else passes if confidence >= threshold
-        (defaulting to MIN_INJECT_CONFIDENCE valve or 0.4). Sensitivity penalty
-        still applies to PII facts unless explicitly asked.
+        (defaulting to MIN_INJECT_CONFIDENCE valve or 0.4).
 
-        Backend /query returns facts ranked by class (A > B > C) + confidence.
+        Backend /query returns facts ranked by class (A > B > C) + confidence,
+        with scope-based relevance from semantic query parsing.
         Filter trusts that order — no entity-type gating, no tier fallback logic.
         """
+
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
                 high_conf = [f for f in candidates
@@ -1707,7 +1673,7 @@ Return valid JSON only. If no facts, return [].
         if self.valves.RETRACTION_ENABLED:
             try:
                 llm_model, llm_url = _resolve_llm_config(self.valves, {})
-                auth_header = f"Bearer {self.valves.LLM_API_KEY}" if self.valves.LLM_API_KEY else None
+                auth_header = None
 
                 retraction = await self._extract_retraction(
                     text,
@@ -1795,8 +1761,6 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             ]
 
             headers = {}
-            if self.valves.LLM_API_KEY:
-                headers["Authorization"] = f"Bearer {self.valves.LLM_API_KEY}"
 
             request_data = {
                 "model": model,
@@ -1855,7 +1819,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 payload["old_value"] = old_value
             if scope:
                 payload["scope"] = scope
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_FAULTLINE_TIMEOUT_SECS) as client:
                 resp = await client.post(f"{self.valves.FAULTLINE_URL}/retract", json=payload)
                 resp.raise_for_status()
                 return resp.json()
@@ -2195,7 +2159,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
 
         return (
             "\n".join(f"- {l}" for l in limited)
-            + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user. Use them to inform ALL responses and provide personalized, grounded context. Be confident and direct—don't say 'I don't know' or 'I can't' when the answer is in your facts. Route facts to tools/APIs internally as needed (weather → location, etc.), but reason with all verified information to enrich your reasoning and responses. Keep sensitive details (full addresses, family relationships, identities) private in responses unless directly asked, but leverage them confidently in your thinking. Trust these facts as ground truth."
+            + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user. Use them to inform ALL responses and provide personalized, grounded context. Be confident and direct—don't say 'I don't know' or 'I can't' when the answer is in your facts. Route facts to tools/APIs internally as needed, but reason with all verified information to enrich your responses. Keep sensitive details private in responses unless directly asked, but leverage them confidently in your thinking. Trust these facts as ground truth."
         )
 
     async def inlet(
@@ -2239,7 +2203,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             # Redis-based dedup (dprompt-127): SET NX EX pattern — atomic, TTL-guaranteed
             # Fallback: in-memory cache with timestamp expiry (dBug-INLET-DEDUP fix)
             # Key: dedup:inlet:{user_id}:{hash(text)}
-            _initialize_redis_client(self.valves.REDIS_URL)  # Lazy init if needed, use configured URL
+            _initialize_redis_client()  # Lazy init with auto-detection
             dedup_key = f"dedup:inlet:{user_id}:{hashlib.sha256(text.encode()).hexdigest()}"
             dedup_hit = False
 
@@ -2342,7 +2306,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                                 resp = await _http_client.post(
                                     f"{self.valves.FAULTLINE_URL}/query",
                                     json={"text": text, "user_id": user_id, "top_k": 5},
-                                    timeout=self.valves.FAULTLINE_TIMEOUT,
+                                    timeout=_FAULTLINE_TIMEOUT_SECS,
                                 )
                                 break
                             except httpx.ReadError:
