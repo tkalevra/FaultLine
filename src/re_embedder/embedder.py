@@ -215,7 +215,7 @@ def resolve_display_names_for_facts(db_conn, rows: list[dict]) -> list[dict]:
     return resolved
 
 
-def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bool = True) -> list[float] | None:
+def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bool = True, embedding_url: str = None) -> list[float] | None:
     """
     Embed text using the nomic-embed-text model via the Ollama/Qwen API.
 
@@ -223,8 +223,13 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
                    the re_embedder loop keeps running.
     fallback=False (used by /query):               returns None on failure so the caller
                    can skip the Qdrant search rather than searching with a meaningless vector.
+    embedding_url: Explicit embedding endpoint (optional, overrides inferred path).
     """
-    embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
+    # Use explicit embedding URL if provided, fallback to inferring from chat URL
+    if embedding_url:
+        embed_url = embedding_url
+    else:
+        embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
 
     try:
         # Use persistent pooled client if available, fallback to httpx.post() for backward compatibility
