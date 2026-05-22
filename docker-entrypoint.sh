@@ -16,12 +16,18 @@ done
 echo "[entrypoint] Migrations complete."
 
 echo "[entrypoint] Starting re_embedder service (background)..."
-python -m src.re_embedder.embedder &
+# Export environment variables for subprocess (subshell inherits parent's env but explicit export ensures propagation)
+export POSTGRES_DSN QDRANT_URL QDRANT_COLLECTION QWEN_API_URL OPENWEBUI_URL REEMBED_INTERVAL QDRANT_SYNC_CONFIDENCE_THRESHOLD
+export PYTHONPATH=/app PYTHONUNBUFFERED=1
+
+# Launch re_embedder with redirected output to aide debugging
+python -m src.re_embedder.embedder > /tmp/re_embedder.log 2>&1 &
 REEMBED_PID=$!
 echo "[entrypoint] Re-embedder PID: $REEMBED_PID"
 sleep 2
 if ! kill -0 $REEMBED_PID 2>/dev/null; then
-    echo "[entrypoint] ERROR: Re-embedder process died immediately. Check logs above."
+    echo "[entrypoint] ERROR: Re-embedder process died immediately. Check /tmp/re_embedder.log:"
+    head -30 /tmp/re_embedder.log || echo "Log file not readable"
     exit 1
 fi
 

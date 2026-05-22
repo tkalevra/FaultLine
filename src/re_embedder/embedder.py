@@ -1220,6 +1220,14 @@ def main():
     """Main poll loop."""
     global _http_client_sync
 
+    # Log startup environment for debugging container issues
+    log.info("re_embedder.startup_environment",
+             has_postgres_dsn=bool(os.getenv("POSTGRES_DSN")),
+             has_qdrant_url=bool(os.getenv("QDRANT_URL")),
+             has_redis_url=bool(os.getenv("REDIS_URL")),
+             reembed_interval=os.getenv("REEMBED_INTERVAL", "60"),
+             pythonpath=os.getenv("PYTHONPATH", "not_set"))
+
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     # Auto-detect LLM endpoint: env var override, then Docker service names, then localhost
@@ -1228,7 +1236,8 @@ def main():
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
     if not postgres_dsn:
-        log.error("POSTGRES_DSN not configured")
+        log.error("POSTGRES_DSN not configured - re_embedder cannot start")
+        log.error("re_embedder.startup_failed reason=missing_postgres_dsn")
         return
 
     # Initialize persistent HTTP client for pooled connections
@@ -1238,7 +1247,8 @@ def main():
     # dprompt-121: Detect if embedding model changed (auto-clear cache if so)
     detect_embedding_model_change()
 
-    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold}")
+    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
+    log.info("re_embedder.entering_main_loop")
 
     while True:
         try:
