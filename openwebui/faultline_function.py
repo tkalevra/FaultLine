@@ -1565,11 +1565,23 @@ Return valid JSON only. If no facts, return [].
         """
 
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
+            _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
+                              "spouse", "parent_of", "child_of", "sibling_of"}
+
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
-                high_conf = [f for f in candidates
+                # Separate identity and non-identity facts
+                identity = [f for f in candidates if f.get("rel_type") in _IDENTITY_RELS]
+                non_identity = [f for f in candidates if f.get("rel_type") not in _IDENTITY_RELS]
+
+                # Gate only non-identity facts
+                high_conf = [f for f in non_identity
                              if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
+
                 if high_conf:
-                    return high_conf
+                    # Return identity + high-confidence non-identity
+                    return identity + high_conf
+                else:
+                    return candidates  # Fallback: all candidates
             return candidates
 
         def _garbage(name: str) -> bool:
