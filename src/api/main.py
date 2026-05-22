@@ -5893,17 +5893,16 @@ def query(request: QueryRequest):
         return preferred_names
 
     def _clean_preferred_names(pns: dict) -> dict:
-        """Remove UUIDs, empty strings, and Concept/unknown entity types.
+        """Remove empty strings, Concept/unknown entity types.
 
-        Concept entities (e.g. "pets", "family", "dog") are taxonomy labels,
-        not named entities. Excluding them prevents the Filter's Tier 1 entity
-        matching from returning only member_of/is_a facts for category queries.
-        # NO RECURSIVE MATCHING — _UUID_PATTERN is a static compile-once pattern.
+        Keep UUID→UUID mappings (entities without registered preferred names) so
+        Filter can still resolve them. Concept entities (e.g. "pets", "family", "dog")
+        are taxonomy labels, not named entities. Excluding them prevents the Filter's
+        Tier 1 entity matching from returning only member_of/is_a facts for category
+        queries. # NO RECURSIVE MATCHING — _UUID_PATTERN is a static compile-once pattern.
         """
-        cleaned = {
-            k: v for k, v in pns.items()
-            if v and not _UUID_PATTERN.match(str(v))
-        }
+        # Keep all non-empty values, including UUID→UUID fallbacks
+        cleaned = {k: v for k, v in pns.items() if v}
         if not cleaned or not db:
             return cleaned
         # dprompt-50: exclude Concept/unknown entities from name resolution
