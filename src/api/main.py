@@ -25,6 +25,7 @@ _REL_TYPE_META: dict = {}
 _http_client: httpx.AsyncClient = None
 _http_client_sync: httpx.Client = None
 _idempotency_mgr: Optional[IdempotencyManager] = None
+_EMBEDDING_API_URL: str = None
 
 # Call counters for debugging extraction performance (dprompt-120 debug)
 _EXTRACT_REWRITE_CALL_COUNT = 0
@@ -1753,8 +1754,11 @@ def _get_llm_url() -> str:
     if openwebui_url:
         if not openwebui_url.startswith("http"):
             openwebui_url = f"https://{openwebui_url}"
-        # OpenWebUI uses OpenAI-compatible /v1/chat/completions endpoint (not /api)
+        # OpenWebUI uses OpenAI-compatible /v1/chat/completions endpoint
         endpoint = f"{openwebui_url}/v1/chat/completions"
+        # Cache embedding endpoint separately (at /api/embeddings, not /v1/embeddings)
+        global _EMBEDDING_API_URL
+        _EMBEDDING_API_URL = f"{openwebui_url}/api/embeddings"
         log.info("llm_endpoint.openwebui_detected", url=endpoint)
         return endpoint
 
@@ -1932,7 +1936,7 @@ _QDRANT_TIMEOUT = int(os.environ.get("QDRANT_TIMEOUT", "10"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _gliner2_model, _rel_type_registry, _rel_type_constraint, _REL_TYPE_META, _LLM_URL, _http_client, _http_client_sync, _idempotency_mgr
+    global _gliner2_model, _rel_type_registry, _rel_type_constraint, _REL_TYPE_META, _LLM_URL, _EMBEDDING_API_URL, _http_client, _http_client_sync, _idempotency_mgr
 
     # dprompt-41: validate startup config (fail fast)
     _validate_startup_config()
@@ -5086,7 +5090,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 ensure_collection(collection, qdrant_url)
                                 for fact_id, fact_user_id, subject, obj, rel_type in fresh_facts:
                                     text = f"{subject} {rel_type} {obj}"
-                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True)
+                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
                                     if vector is None:
                                         continue
                                     row = {
@@ -5137,7 +5141,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 ensure_collection(collection, qdrant_url)
                                 for sf_id, sf_uid, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf in staged_fresh:
                                     text = f"{sf_subj} {sf_rel} {sf_obj}"
-                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True)
+                                    vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
                                     if vector is None:
                                         continue
                                     s_row = {
@@ -5836,6 +5840,58 @@ def query(request: QueryRequest):
             })
         return resolved
 
+    def _populate_preferred_names(merged_facts: list[dict], direct_facts: list[dict], baseline_facts: list[dict], qdrant_facts: list[dict], attributes: dict) -> dict:
+        """Populate preferred_names dict from merged facts using UUID-to-display-name resolution.
+
+        dprompt-61: Builds UUID→display_name mappings for the Filter to resolve UUIDs in facts.
+        Uses three sources: entity_aliases (primary), entity_attributes pref_name scalar (fallback),
+        UUID itself (last resort).
+        """
+        preferred_names = {}
+        if not registry:
+            log.warning("query._populate_preferred_names.registry_none", user_id=user_id, merged_facts_count=len(merged_facts))
+            return preferred_names
+
+        # Build set of real entity UUIDs from pre-resolution PostgreSQL facts (direct + baseline)
+        _real_entity_ids: set[str] = {user_entity_id_for_query}
+        for f in direct_facts + baseline_facts:
+            if _UUID_PATTERN.match(f.get("subject", "")):
+                _real_entity_ids.add(f["subject"])
+            if _UUID_PATTERN.match(f.get("object", "")):
+                _real_entity_ids.add(f["object"])
+
+        # Populate preferred_names for all UUID entities in merged_facts
+        # NO RECURSIVE MATCHING — checks pre-extracted values only
+        log.info("query._populate_preferred_names.start", merged_facts_count=len(merged_facts), attributes_keys=list(attributes.keys()) if attributes else [])
+        for f in merged_facts:
+            for field in ("subject", "object"):
+                val = f[field]
+                if not val or val in preferred_names or val == user_entity_id_for_query:
+                    continue
+                # Try entity_aliases first (primary)
+                resolved = registry.get_preferred_name(user_id, val)
+                if resolved and resolved != val:
+                    preferred_names[val] = resolved
+                    log.info("query._populate_preferred_names.alias_found", val=val, resolved=resolved)
+                elif _UUID_PATTERN.match(val):
+                    # UUID with no alias — check entity_attributes for pref_name scalar
+                    if attributes and val in attributes:
+                        pref_name_attr = attributes[val].get("pref_name")
+                        if isinstance(pref_name_attr, dict):
+                            pref_name_value = pref_name_attr.get("value")
+                        else:
+                            pref_name_value = pref_name_attr
+                        if pref_name_value:
+                            preferred_names[val] = str(pref_name_value)
+                            log.info("query._populate_preferred_names.pref_name_found", val=val, pref_name=pref_name_value)
+                        else:
+                            preferred_names[val] = val
+                    else:
+                        preferred_names[val] = val
+        log.info("query._populate_preferred_names.complete", preferred_names_count=len(preferred_names))
+
+        return preferred_names
+
     def _clean_preferred_names(pns: dict) -> dict:
         """Remove UUIDs, empty strings, and Concept/unknown entity types.
 
@@ -6217,14 +6273,8 @@ def query(request: QueryRequest):
             # Skip graph traversal and hierarchy expansion — scope-detected facts answer the query
             merged_facts = direct_facts
             try:
-                if registry:
-                    for f in merged_facts:
-                        subject_uuid = f.get("_subject_id", f["subject"])
-                        object_uuid = f.get("_object_id", f["object"])
-                        if subject_uuid not in preferred_names and subject_uuid != user_entity_id_for_query:
-                            preferred_names[subject_uuid] = f["subject"]
-                        if object_uuid not in preferred_names and object_uuid != user_entity_id_for_query:
-                            preferred_names[object_uuid] = f["object"]
+                # Populate preferred_names using helper (dprompt-61)
+                preferred_names = _populate_preferred_names(merged_facts, direct_facts, [], [], {})
                 entity_types = _build_entity_types(preferred_names)
                 return {
                     "status": "ok",
@@ -6535,7 +6585,7 @@ def query(request: QueryRequest):
     # Embed after graph traversal so Postgres results are returned even when the
     # embedding service is unavailable. fallback=False: skip Qdrant rather than
     # searching with a hash vector that can't match nomic-embedded stored facts.
-    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False)
+    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False, embedding_url=_EMBEDDING_API_URL)
     if vector is None:
         log.warning("query.embed_unavailable — skipping Qdrant search")
         # Resolve display names for Postgres facts before returning
@@ -6557,18 +6607,20 @@ def query(request: QueryRequest):
             events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
             merged_facts.extend(events_resolved)
         log.info("query.embed_fail_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-        # Populate preferred_names with all entities in merged facts
-        # CRITICAL: Use _subject_id/_object_id (UUIDs) as keys, not display names (dprompt-61)
-        # After _resolve_display_names(), f["subject"]/f["object"] are already display names
-        if registry:
-            for f in merged_facts:
-                subject_uuid = f.get("_subject_id", f["subject"])
-                object_uuid = f.get("_object_id", f["object"])
-                if subject_uuid not in preferred_names and subject_uuid != user_entity_id_for_query:
-                    preferred_names[subject_uuid] = f["subject"]  # Already-resolved display name
-                if object_uuid not in preferred_names and object_uuid != user_entity_id_for_query:
-                    preferred_names[object_uuid] = f["object"]  # Already-resolved display name
-
+        # Fetch attributes for preferred_names population (dprompt-61)
+        try:
+            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            pre_resolution_fact_ids = {user_entity_id_for_query} | resolved_entity_ids
+            for f in direct_facts + baseline_facts:
+                if _UUID_PATTERN.match(f.get("subject", "")):
+                    pre_resolution_fact_ids.add(f["subject"])
+                if _UUID_PATTERN.match(f.get("object", "")):
+                    pre_resolution_fact_ids.add(f["object"])
+            attributes = _fetch_attributes(_attr_db, user_id, list(pre_resolution_fact_ids), max_sensitivity="private")
+            _attr_db.close()
+        except Exception:
+            attributes = {}
+        preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
         entity_types = _build_entity_types(preferred_names)
 
         # Debug: log what facts are being returned (dprompt-88)
@@ -6639,14 +6691,8 @@ def query(request: QueryRequest):
                 events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
                 merged_facts.extend(events_resolved)
             log.info("query.404_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-            # Populate preferred_names with all entities in merged facts
-            if registry:
-                for f in merged_facts:
-                    if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
-                        preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
-                    if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
-                        preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
-
+            # Populate preferred_names (dprompt-61)
+            preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
             entity_types_404 = _build_entity_types(preferred_names)
 
             # dprompt-91: Apply archive filtering (404 case)
@@ -6688,14 +6734,8 @@ def query(request: QueryRequest):
                 events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
                 merged_facts.extend(events_resolved)
             log.info("query.error_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-            # Populate preferred_names with all entities in merged facts
-            if registry:
-                for f in merged_facts:
-                    if f["subject"] not in preferred_names and f["subject"] != user_entity_id_for_query:
-                        preferred_names[f["subject"]] = registry.get_preferred_name(user_id, f["subject"]) or f["subject"].title()
-                    if f["object"] not in preferred_names and f["object"] != user_entity_id_for_query:
-                        preferred_names[f["object"]] = registry.get_preferred_name(user_id, f["object"]) or f["object"].title()
-
+            # Populate preferred_names (dprompt-61)
+            preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
             entity_types_err = _build_entity_types(preferred_names)
 
             # dprompt-91: Apply archive filtering (error case)
@@ -6794,43 +6834,8 @@ def query(request: QueryRequest):
                 attr_added += 1
         log.info("query.attributes_merged", added=attr_added, total_after=len(merged_facts))
 
-        # Populate preferred_names only with entities that were registered as
-        # UUID surrogates (real people/places), not fact-value strings like
-        # "systems analyst" or "156 cedar st s".
-        # Build the set of real entity UUIDs from pre-resolution PostgreSQL facts.
-        # # NO RECURSIVE MATCHING — _UUID_RE used against pre-extracted values only
-        _real_entity_ids: set[str] = {user_entity_id_for_query}
-        for f in direct_facts + baseline_facts:
-            if _UUID_PATTERN.match(f.get("subject", "")):
-                _real_entity_ids.add(f["subject"])
-            if _UUID_PATTERN.match(f.get("object", "")):
-                _real_entity_ids.add(f["object"])
-        # Build mapping: UUID → display name (from entity_aliases)
-        _entity_display: dict[str, str] = {}
-        if registry:
-            for eid in _real_entity_ids:
-                display = registry.get_preferred_name(user_id, eid)
-                if display and display != eid:
-                    _entity_display[eid] = display
-
-        # Always populate preferred_names for UUID entities that appear in facts,
-        # even when no alias is registered. This ensures the Filter can resolve
-        # UUIDs to display names and won't drop facts via _garbage().
-        if registry:
-            for f in merged_facts:
-                for field in ("subject", "object"):
-                    val = f[field]
-                    if not val or val in preferred_names or val == user_entity_id_for_query:
-                        continue
-                    # Resolve: prefer alias, fall back to the value itself
-                    resolved = registry.get_preferred_name(user_id, val)
-                    if resolved and resolved != val:
-                        preferred_names[val] = resolved
-                    elif _UUID_PATTERN.match(val):
-                        # UUID with no alias — still register so Filter resolves it
-                        preferred_names[val] = val
-                    elif val in _entity_display.values():
-                        preferred_names[val] = val
+        # Populate preferred_names (dprompt-61) — use extracted attributes from above
+        preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, qdrant_facts, attributes)
 
         log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
 
@@ -6978,8 +6983,8 @@ def store_context(req: StoreContextRequest):
             log.error("store_context.collection_ensure_failed", collection=collection)
             raise HTTPException(status_code=500, detail="Collection unavailable")
 
-        # Embed the text
-        vector = embed_text(req.text, qwen_api_url, timeout=10.0, fallback=False)
+        # Embed the text (use cached embedding URL if available)
+        vector = embed_text(req.text, qwen_api_url, timeout=10.0, fallback=False, embedding_url=_EMBEDDING_API_URL)
         if vector is None:
             log.error("store_context.embed_failed", user_id=req.user_id, text_length=len(req.text))
             raise HTTPException(status_code=500, detail={"status": "error", "point_id": ""})
