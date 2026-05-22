@@ -9,7 +9,8 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --upgrade pip
 
 COPY pyproject.toml .
-RUN pip install --no-cache-dir ".[api]"
+# Install base + api dependencies (includes redis for re_embedder)
+RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 
 # Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
 RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
