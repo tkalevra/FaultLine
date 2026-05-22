@@ -25,6 +25,42 @@ _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
 _http_client_sync: httpx.Client = None
 
 
+def _detect_redis_endpoint() -> str:
+    """Auto-detect Redis endpoint (container-aware).
+
+    Priority chain:
+    1. REDIS_URL env var override
+    2. Docker service name (redis) on default port 6379
+    3. Localhost (dev fallback)
+
+    This allows the same code to work in Docker containers (service name)
+    and local dev environments (localhost).
+    """
+    # Explicit override
+    if os.getenv("REDIS_URL"):
+        return os.getenv("REDIS_URL")
+
+    # Docker service name (most likely in container)
+    candidates = [
+        "redis://redis:6379/0",           # Docker service name (most reliable)
+        "redis://localhost:6379/0",       # Local development fallback
+        "redis://127.0.0.1:6379/0",       # Localhost IPv4 fallback
+    ]
+
+    for url in candidates:
+        try:
+            test_client = redis.from_url(url, decode_responses=True, socket_timeout=2)
+            test_client.ping()
+            log.info(f"redis_detection.success url={url[:30]}")
+            return url
+        except Exception:
+            continue
+
+    # If all fail, return Docker service name (will be retried with exponential backoff)
+    log.warning("redis_detection.all_failed using_service_name=redis")
+    return "redis://redis:6379/0"
+
+
 class EmbeddingCache:
     """Redis-backed cache for rel_type embeddings (GROWS WITH SYSTEM).
 
@@ -36,9 +72,9 @@ class EmbeddingCache:
         """Initialize Redis connection for embedding cache.
 
         Args:
-            redis_url: Redis connection URL (defaults to REDIS_URL env var)
+            redis_url: Redis connection URL (auto-detects if not provided)
         """
-        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.redis_url = redis_url or _detect_redis_endpoint()
         self.ttl = int(os.getenv("EMBEDDING_CACHE_TTL", "86400"))  # 1 day default
         self.prefix = "embedding:relationship:"
         self.client = None
@@ -1186,7 +1222,8 @@ def main():
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
-    qwen_api_url = os.getenv("QWEN_API_URL", "http://localhost:11434/v1/chat/completions")
+    # Auto-detect LLM endpoint: env var override, then Docker service names, then localhost
+    qwen_api_url = os.getenv("QWEN_API_URL") or os.getenv("OPENWEBUI_URL") or "http://qwen:11434/v1/chat/completions"
     interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
