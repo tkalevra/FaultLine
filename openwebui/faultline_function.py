@@ -1565,28 +1565,29 @@ Return valid JSON only. If no facts, return [].
         """
 
         def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
-            _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as",
-                              "spouse", "parent_of", "child_of", "sibling_of"}
-
             if self.valves.MIN_INJECT_CONFIDENCE > 0:
-                # Separate identity and non-identity facts
-                identity = [f for f in candidates if f.get("rel_type") in _IDENTITY_RELS]
-                non_identity = [f for f in candidates if f.get("rel_type") not in _IDENTITY_RELS]
+                # Class A facts (identity/structural) always pass — backend classified them
+                # Class B/C facts (behavioral/contextual) gated by confidence threshold
+                class_a = [f for f in candidates if f.get("fact_class") == "A"]
+                class_bc = [f for f in candidates if f.get("fact_class") != "A"]
 
-                # Gate only non-identity facts
-                high_conf = [f for f in non_identity
+                # Gate only Class B/C facts
+                high_conf = [f for f in class_bc
                              if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
 
                 if high_conf:
-                    # Return identity + high-confidence non-identity
-                    return identity + high_conf
+                    # Return Class A + high-confidence Class B/C
+                    return class_a + high_conf
                 else:
                     return candidates  # Fallback: all candidates
             return candidates
 
         def _garbage(name: str) -> bool:
             n = (name or "").strip().lower()
-            return len(n) <= 1 or n == "x" or bool(_UUID_RE.match(n))
+            # Don't filter UUIDs — backend returns facts with UUID subjects/objects
+            # when display names aren't available. Filtering them discards valid facts.
+            # Only discard truly empty/placeholder strings.
+            return len(n) == 0 or n == "x"
 
         # Remove garbage facts first
         cleaned = [f for f in facts
@@ -1914,6 +1915,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
         is_realtime: bool = False,
         locations: Optional[list[str]] = None,
         expose_preferences: bool = False,
+        user_id: Optional[str] = None,
     ) -> str:
         identity_display = preferred_names.get("user")
         identity = canonical_identity or identity_display
@@ -1992,7 +1994,11 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             by_rel = defaultdict(list)
             mentioned_entities = set()
 
-            _user_anchors = {identity, "user"} if identity else {"user"}
+            _user_anchors = {"user"}
+            if identity:
+                _user_anchors.add(identity)
+            if user_id:
+                _user_anchors.add(user_id)
 
             for f in facts:
                 by_rel[f.get("rel_type", "")].append(f)
@@ -2012,13 +2018,44 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                     mentioned_entities.add(obj)
 
             def _dn(name: str) -> str:
-                return nickname_map.get(name, name).title()
+                """Resolve UUID or name to display name. Metadata-driven: uses preferred_names dict."""
+                if not name:
+                    return ""
+                # First check nickname_map (from also_known_as facts)
+                if name in nickname_map:
+                    return nickname_map[name].title()
+                # Then check preferred_names (UUID → display name mapping from backend)
+                if name in preferred_names:
+                    resolved = preferred_names[name]
+                    if resolved and not _UUID_RE.match(str(resolved)):
+                        return resolved.title()
+                # Fallback: return as-is (already display name or UUID)
+                return str(name).title()
 
-            # Extract family relationships
-            children_raw = [f.get("object") for f in by_rel.get("parent_of", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
-            spouses_raw = [f.get("object") for f in by_rel.get("spouse", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
-            spouses_raw += [f.get("subject") for f in by_rel.get("spouse", []) if identity and f.get("object") in _user_anchors and f.get("subject") not in spouses_raw and not bool(_UUID_RE.match(f.get("subject") or ""))]
-            siblings_raw = [f.get("object") for f in by_rel.get("sibling_of", []) if identity and f.get("subject") in _user_anchors and not bool(_UUID_RE.match(f.get("object") or ""))]
+            # Extract family relationships using category metadata (not hardcoded rel_type names)
+            family_facts = [f for f in facts if f.get("category") == "family"]
+            children_raw = []
+            spouses_raw = []
+            siblings_raw = []
+
+            for f in family_facts:
+                if not identity or f.get("subject") not in _user_anchors:
+                    continue
+                rel = f.get("rel_type", "")
+                obj = f.get("object")
+                if rel == "parent_of" and obj:
+                    children_raw.append(obj)
+                elif rel == "spouse" and obj:
+                    spouses_raw.append(obj)
+                elif rel == "sibling_of" and obj:
+                    siblings_raw.append(obj)
+
+            # Handle symmetric spouse relationships (both directions)
+            for f in family_facts:
+                if f.get("rel_type") == "spouse" and identity and f.get("object") in _user_anchors:
+                    subj = f.get("subject")
+                    if subj and subj not in spouses_raw:
+                        spouses_raw.append(subj)
 
             # Build compact family line (deduplicate — same entity may appear
             # under multiple identity anchors like "user" and "chris")
@@ -2062,26 +2099,34 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
 
             # Remove events from facts list so they don't appear twice
             facts = [f for f in facts if f.get("source") != "events_table"]
-            # Build compact fact lines
-            covered = {"parent_of", "child_of", "spouse", "sibling_of", "also_known_as", "pref_name", "age"}
+
+            # Build compact fact lines (metadata-driven: use category to determine what to skip)
+            # Skip: family facts (already formatted above), identity facts (names), temporal facts, age facts
+            _covered_categories = {"family"}
+            _covered_rel_types = {"also_known_as", "pref_name", "same_as", "age"}
+
             for f in facts:
-                if f.get("rel_type") in covered:
+                if f.get("category") in _covered_categories or f.get("rel_type") in _covered_rel_types:
                     continue
                 _s = f.get("subject", "").strip().lower()
                 _o = f.get("object", "").strip().lower()
-                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x" or bool(_UUID_RE.match(_s)) or bool(_UUID_RE.match(_o)):
+                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x":
                     continue
                 subj = f.get("subject", "")
                 obj = f.get("object", "")
                 rel = f.get("rel_type", "")
                 label = f.get("definition", rel).lower() if f.get("definition") else rel
 
+                # Format fact using resolved display names
+                subj_display = _dn(subj)
+                obj_display = _dn(obj)
+
                 if identity and subj in _user_anchors:
-                    lines.append(f"{label}: {obj}")
+                    lines.append(f"{label}: {obj_display}")
                 elif identity and obj in _user_anchors:
-                    lines.append(f"{_dn(subj)} ← {label}")
+                    lines.append(f"{subj_display} ← {label}")
                 else:
-                    lines.append(f"{_dn(subj)} → {label} → {_dn(obj)}")
+                    lines.append(f"{subj_display} → {label} → {obj_display}")
 
             # Display attributes for all entities mentioned in facts
             if entity_attributes:
@@ -2498,6 +2543,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                         is_realtime=_is_realtime,
                         locations=sorted(list(locations)) if locations else None,
                         expose_preferences=_query_asks_about_identity,
+                        user_id=user_id,
                     )
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
