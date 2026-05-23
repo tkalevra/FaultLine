@@ -42,12 +42,12 @@ if typed_entities:
 
 **Problem:** 
 - typed_entities are injected as TEXT containing pre-classified edges
-- Example: User says "I prefer to be called Chris"
-  - GLiNER2 extracts: john (Person), chris (Person)
-  - Filter injects as: "john (Person) [rel_type] chris (Person)"
+- Example: User says "I prefer to be called ${USER}"
+  - GLiNER2 extracts: john (Person), ${USER} (Person)
+  - Filter injects as: "john (Person) [rel_type] ${USER} (Person)"
   - LLM reads this as a REFERENCE edge already extracted
   - LLM gets confused: "Is this what I should match against? Should I invert it? Is this the subject or object?"
-- Result: LLM returns wrong rel_types (e.g., "met" instead of "pref_name"), backwards relationships
+- Result: LLM returns wrong rel_types (e.g., "met" instead of "pref_name"), bac${LOCATION}ards relationships
 
 ### Layer 2: Regex Augmentation Workaround
 
@@ -152,17 +152,17 @@ Librarian approach:
 
 ## Impact: Data Quality Degradation
 
-### Example: "I prefer to be called Chris"
+### Example: "I prefer to be called ${USER}"
 
 **Current flow:**
-1. User: "My name is John, I prefer to be called Chris"
-2. GLiNER2 extracts: entities (john, chris)
-3. LLM receives typed_entities context: "john (Person) [?] chris (Person)"
+1. User: "My name is John, I prefer to be called ${USER}"
+2. GLiNER2 extracts: entities (john, ${USER})
+3. LLM receives typed_entities context: "john (Person) [?] ${USER} (Person)"
 4. LLM gets confused, returns rel_type="met" (wrong)
-5. Regex sees "prefer to be called" pattern, extracts pref_name="chris"
+5. Regex sees "prefer to be called" pattern, extracts pref_name="${USER}"
 6. Regex result OVERRIDES LLM, submitted to backend
-7. Backend validates: pref_name object must be STRING ✓ (chris is lowercase)
-8. Fact committed: (user, pref_name, chris) ✓ — Correct, but only by accident
+7. Backend validates: pref_name object must be STRING ✓ (${USER} is lowercase)
+8. Fact committed: (user, pref_name, ${USER}) ✓ — Correct, but only by accident
 
 **Problem:** System worked, but only because regex caught it. LLM was broken the whole time.
 
@@ -205,11 +205,11 @@ Once LLM + ontology validation is working:
 ## Expected Flow (Post-Fix)
 
 ```
-User message: "My name is John, I prefer to be called Chris"
+User message: "My name is John, I prefer to be called ${USER}"
 ↓
 Filter inlet:
   1. Call LLM (clean prompt, NO typed_entities as text)
-  2. LLM extracts: [(user, also_known_as, john), (user, pref_name, chris)]
+  2. LLM extracts: [(user, also_known_as, john), (user, pref_name, ${USER})]
   3. Pass to /ingest
   4. NO regex augmentation
   5. NO hardcoded patterns
@@ -221,18 +221,18 @@ Backend /ingest:
      - Check head_types: SCALAR rel_type ✓
      - Check object: STRING "john" ✓
      - Commit: Class A
-  2. Validate edge 2: (user, pref_name, chris)
+  2. Validate edge 2: (user, pref_name, ${USER})
      - Check rel_types: pref_name exists ✓
      - Check head_types: SCALAR rel_type ✓
-     - Check object: STRING "chris" ✓
+     - Check object: STRING "${USER}" ✓
      - Commit: Class A
   3. WGM gate returns VALID ✓
   4. Both facts stored
   5. No garbage, no regex workarounds
 
 Filter outlet:
-  1. Retrieve facts: preferred_names = {user: "chris"}
-  2. Inject memory: "I know you prefer to be called Chris"
+  1. Retrieve facts: preferred_names = {user: "${USER}"}
+  2. Inject memory: "I know you prefer to be called ${USER}"
   3. Clean, validated knowledge graph
 ```
 
@@ -266,9 +266,9 @@ ssh docker-host -x "sudo docker logs faultline-wgm 2>&1 | grep -i 'gliNER2\|type
 ```
 
 **What to look for:**
-- What entities does GLiNER2 extract from "I prefer to be called Chris"?
-- Does it return (john, Person), (chris, Person) separately?
-- Or does it try to extract a relationship (john → chris)?
+- What entities does GLiNER2 extract from "I prefer to be called ${USER}"?
+- Does it return (john, Person), (${USER}, Person) separately?
+- Or does it try to extract a relationship (john → ${USER})?
 - Sample log output: `GLiNER2 extracted: {...}` or similar
 
 **Report back:**
@@ -291,7 +291,7 @@ curl -X POST http://localhost:8001/extract \
   -H "Authorization: Bearer $BEARER" \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "My name is John, I prefer to be called Chris",
+    "text": "My name is John, I prefer to be called ${USER}",
     "source": "test_investigation",
     "user_id": "test-user"
   }' | jq '.edges[] | {subject, object, rel_type}'
@@ -342,7 +342,7 @@ If nothing to extract: []'''
     },
     {
         'role': 'user',
-        'content': 'My name is John, I prefer to be called Chris'
+        'content': 'My name is John, I prefer to be called ${USER}'
     }
 ]
 
@@ -381,7 +381,7 @@ python /tmp/test_llm_extraction.py
 
 **Command:** Grep for typed_entities in the codebase
 ```bash
-cd /home/chris/Documents/013-GIT/FaultLine-dev
+cd /home/${USER}/Documents/013-GIT/FaultLine-dev
 grep -n "typed_entities" openwebui/faultline_tool.py | head -20
 ```
 
@@ -404,7 +404,7 @@ grep -n "typed_entities" openwebui/faultline_tool.py | head -20
 
 **Command:** Inspect the WGMValidationGate
 ```bash
-cd /home/chris/Documents/013-GIT/FaultLine-dev
+cd /home/${USER}/Documents/013-GIT/FaultLine-dev
 grep -A 50 "class WGMValidationGate" src/wgm/gate.py | head -60
 grep -n "validate\|rel_type\|head_types\|tail_types" src/api/main.py | grep -A 3 -B 3 "ingest"
 ```
@@ -428,7 +428,7 @@ grep -n "validate\|rel_type\|head_types\|tail_types" src/api/main.py | grep -A 3
 
 **Command:** Check what rel_types the prompt mentions
 ```bash
-cd /home/chris/Documents/013-GIT/FaultLine-dev
+cd /home/${USER}/Documents/013-GIT/FaultLine-dev
 sed -n '106,192p' openwebui/faultline_tool.py | grep -i 'rel_type\|pref_name\|also_known_as'
 ```
 

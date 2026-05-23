@@ -24,7 +24,7 @@ LLM-based fact extraction via `rewrite_to_triples()` has never worked in this de
 
 ### Log Pattern (every crash identical)
 ```
-[FaultLine Filter] POST http://192.168.1.10:8001/extract "HTTP/1.1 200 OK"
+[FaultLine Filter] POST http://${BACKEND_IP}:8001/extract "HTTP/1.1 200 OK"
 ERROR open_webui.main:process_chat:2013 - 'NoneType' object has no attribute 'startswith'
 POST /api/chat/completions HTTP/1.1" 400
 [FaultLine] rewrite_to_triples HTTP error: 400
@@ -33,7 +33,7 @@ POST /api/chat/completions HTTP/1.1" 400
 ```
 
 ### Successful vs Failing Endpoint Calls
-- **Successful** `/api/chat/completions` (200): all from `192.168.1.10:0` (internal OpenWebUI routing, WITH chat_id)
+- **Successful** `/api/chat/completions` (200): all from `${BACKEND_IP}:0` (internal OpenWebUI routing, WITH chat_id)
 - **Failing** `/api/chat/completions` (400): all from `172.16.9.1` (external/direct calls, WITHOUT chat_id)
 
 ### Zero Successful LLM Extractions
@@ -173,4 +173,4 @@ ssh docker-host -x "curl -s -X POST http://localhost:3000/api/chat/completions \
 - **Instance:** docker-host.helpalicekpro.ca (docker-host)
 - **Container:** open-webui (ghcr.io/open-webui/open-webui:v0.9.5)
 - **Started:** 2026-05-12T14:28:14Z
-- **FaultLine API:** http://192.168.1.10:8001
+- **FaultLine API:** http://${BACKEND_IP}:8001

@@ -56,7 +56,7 @@ User: "how old are my kids"
   - "my kids" → hierarchical (parent_of) → entity UUIDs
   - "age" → scalar attribute lookup on those UUIDs
   
-Expected: Cy is 14, bob is 10, alice is 12
+Expected: ${CHILD2} is 14, bob is 10, alice is 12
 Actual: Only relationships returned, ages missing, garbage pref_name facts
 ```
 
@@ -94,7 +94,7 @@ Currently, the code treats all extracted patterns identically and pushes them in
 
 ### Expected Facts
 ```
-cy -age-> 14
+${CHILD2} -age-> 14
 bob -age-> 10
 alice -age-> 12
 ```
@@ -117,7 +117,7 @@ alice -age-> 12
 ### Database State
 ```sql
 SELECT entity_id, attribute, value_int FROM entity_attributes 
-WHERE attribute='age' AND user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab';
+WHERE attribute='age' AND user_id='${TEST_USER_ID}';
 ```
 
 Need to check:
@@ -136,14 +136,14 @@ User: "how old are my kids"
 Filter processed: 21 facts
 Filter injected: ONLY relationship facts + pref_name garbage
 
-Missing: age facts for cy, bob, alice
+Missing: age facts for ${CHILD2}, bob, alice
 Garbage: 4 facts with pref_name as entity
 ```
 
 ### Fact List from Filter
 ```
-✓ user -parent_of-> cy
-✓ cy -child_of-> user
+✓ user -parent_of-> ${CHILD2}
+✓ ${CHILD2} -child_of-> user
 ✓ user -spouse-> emma
 ✓ emma -spouse-> user
 ✓ user -pref_name-> john
@@ -162,7 +162,7 @@ Garbage: 4 facts with pref_name as entity
 ## Impact
 
 **User Query**: "how old are my kids?"  
-**Expected Response**: Cy is 14, bob is 10, alice is 12  
+**Expected Response**: ${CHILD2} is 14, bob is 10, alice is 12  
 **Actual Response**: Filter returns family relationships only, ages missing
 
 **Severity**: Critical — Core feature broken (scalar attributes not queryable)
@@ -215,7 +215,7 @@ Causality reversed: A caused B. Ingest stores scalars in facts table → /query 
 ### Phase 1: Ensure Schema is Current (IMMEDIATE)
 1. Run migrations to completion:
    ```bash
-   cd /home/chris/Documents/013-GIT/FaultLine-dev
+   cd /home/${USER}/Documents/013-GIT/FaultLine-dev
    alembic upgrade head
    # OR if not using alembic, manually:
    psql $POSTGRES_DSN < migrations/017_fix_schema_consistency.sql
@@ -290,12 +290,12 @@ cd /path/to/faultline && alembic upgrade head
 ```sql
 -- Check if scalars are CORRECTLY stored in entity_attributes
 SELECT entity_id, attribute, value_int, value_text FROM entity_attributes 
-WHERE attribute='age' AND user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab'
+WHERE attribute='age' AND user_id='${TEST_USER_ID}'
 ORDER BY entity_id;
 
 -- Check if scalars are INCORRECTLY stored in facts (THE BUG)
 SELECT subject_id, rel_type, object_id FROM facts
-WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+WHERE user_id='${TEST_USER_ID}' 
 AND rel_type IN ('age', 'height', 'weight', 'pref_name', 'also_known_as')
 AND NOT object_id LIKE '%-%-%-%-'  -- Filter out UUIDs, keep string values
 ORDER BY rel_type, object_id;

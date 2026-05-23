@@ -83,7 +83,7 @@ Recent dprompt-91 testing shows archive filtering correctly handles:
 **Violation Details:**
 - User stated: "My wife is Marla"
 - System response: "I cannot add this because there's no record"
-- **This is backwards.** The user IS the source of truth. The absence of a database record is irrelevant.
+- **This is bac${LOCATION}ards.** The user IS the source of truth. The absence of a database record is irrelevant.
 
 **Impact:** This violates the entire value proposition of FaultLine. If the system rejects user self-reported facts, the knowledge graph becomes unreliable (controlled by database state, not user reality).
 
@@ -155,7 +155,7 @@ archive_filter.applied fact_count_before=40 fact_count_after=18 is_historical=Fa
    ```sql
    SELECT id, subject_id, rel_type, object_id, confidence, created_at 
    FROM facts 
-   WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+   WHERE user_id='${TEST_USER_ID}' 
    AND rel_type='spouse'
    ORDER BY created_at DESC;
    ```

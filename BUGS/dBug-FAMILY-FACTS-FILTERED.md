@@ -78,31 +78,31 @@ When high-confidence facts exist, ALL facts below threshold are discarded—even
 
 ### Option A: Exempt Identity Rels from Confidence Gate (Recommended)
 
-Modify `_apply_confidence_gate()` to skip identity rels:
+**IMPLEMENTED (Revised: Metadata-Driven Approach)**
+
+Modify `_apply_confidence_gate()` to skip Class A facts by using `fact_class` field from backend:
 
 ```python
 def _apply_confidence_gate(candidates: list[dict]) -> list[dict]:
-    _IDENTITY_RELS = {"also_known_as", "pref_name", "same_as", 
-                      "spouse", "parent_of", "child_of", "sibling_of"}
-    
     if self.valves.MIN_INJECT_CONFIDENCE > 0:
-        # Separate identity and non-identity facts
-        identity = [f for f in candidates if f.get("rel_type") in _IDENTITY_RELS]
-        non_identity = [f for f in candidates if f.get("rel_type") not in _IDENTITY_RELS]
-        
-        # Gate only non-identity facts
-        high_conf = [f for f in non_identity
+        # Class A facts (identity/structural) always pass — backend classified them
+        # Class B/C facts (behavioral/contextual) gated by confidence threshold
+        class_a = [f for f in candidates if f.get("fact_class") == "A"]
+        class_bc = [f for f in candidates if f.get("fact_class") != "A"]
+
+        # Gate only Class B/C facts
+        high_conf = [f for f in class_bc
                      if f.get("confidence", 0.0) >= self.valves.MIN_INJECT_CONFIDENCE]
-        
+
         if high_conf:
-            # Return identity + high-confidence non-identity
-            return identity + high_conf
+            # Return Class A + high-confidence Class B/C
+            return class_a + high_conf
         else:
             return candidates  # Fallback: all candidates
     return candidates
 ```
 
-**Rationale:** Identity rels (family, names, same_as) are structural facts. They shouldn't be gated by confidence—they're either verified or not. Non-identity rels (work, location, preferences) can be gated by confidence.
+**Rationale:** Backend classifies facts at ingest time (Class A = identity/structural). Use this metadata instead of hardcoding rel_type names. Respects HARD CONSTRAINT (CLAUDE.md): "rel_types come from DB, not hardcoded." Class A facts are authoritative by definition and always pass through.
 
 ### Option B: Lower Threshold
 

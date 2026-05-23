@@ -4,7 +4,7 @@
 **Severity:** High (Blocks fact ingestion accuracy)  
 **Reported:** 2026-05-16 21:30 UTC  
 **System:** Production (FaultLine main)  
-**Affected User:** 10d7d879-63cd-4f31-92ce-f2c9edb760ab (test user)
+**Affected User:** ${TEST_USER_ID} (test user)
 
 ---
 
@@ -17,7 +17,7 @@ Entity registry is being contaminated with **stop words, grammar tokens, and num
 Database `entity_aliases` table for test user contains 32 entries:
 
 **Valid Entities (expected):**
-- marla, emma, alicemonde, alice, diana, bob, charlie, chris, john
+- marla, emma, alicemonde, alice, diana, bob, charlie, ${USER}, john
 
 **Invalid Entries (stop words/tokens):**
 - Numbers: "10", "12", "7", "9" (ages being treated as entity names)
@@ -112,7 +112,7 @@ curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
   }'
 
 # Then query database:
-psql -c "SELECT COUNT(*) FROM entity_aliases WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' AND alias IN ('10','12','age','named','goes');"
+psql -c "SELECT COUNT(*) FROM entity_aliases WHERE user_id='${TEST_USER_ID}' AND alias IN ('10','12','age','named','goes');"
 # Expected: 5 (garbage entries exist)
 ```
 
@@ -200,7 +200,7 @@ Verify validation function rejects garbage:
 - Pure numbers: "12", "10", "7", "9"
 - Stop words: "age", "spouse", "family", "kids", "named", "goes", "called", "she", "my", "three"
 - Mostly numeric: "12 male", "10 female"
-- Verify accepts real names: "marla", "alicemonde", "alice", "diana", "bob", "charlie", "chris"
+- Verify accepts real names: "marla", "alicemonde", "alice", "diana", "bob", "charlie", "${USER}"
 
 ### Integration Test
 1. Fresh database

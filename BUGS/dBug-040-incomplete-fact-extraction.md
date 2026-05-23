@@ -14,15 +14,15 @@ User provialice comprehensive family statement but /ingest extracts **only spous
 
 ### Input
 ```
-"My name is Chris. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in Kitchener, Ontario."
+"My name is ${USER}. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in ${LOCATION}, Ontario."
 ```
 
 ### Expected Extraction
-- 2 spouse facts: (chris, spouse, marla) bidirectional
-- 6 hierarchy facts: (chris, parent_of, alice/bob/charlie) + inverse
-- 5 pref_name facts: (chris, marla, alice, bob, charlie)
+- 2 spouse facts: (${USER}, spouse, marla) bidirectional
+- 6 hierarchy facts: (${USER}, parent_of, alice/bob/charlie) + inverse
+- 5 pref_name facts: (${USER}, marla, alice, bob, charlie)
 - 3 age facts: (alice, age, 12) etc.
-- 2 location facts: (chris, lives_in, kitchener), (kitchener, located_in, ontario)
+- 2 location facts: (${USER}, lives_in, ${LOCATION}), (${LOCATION}, located_in, ontario)
 - Total: 18+ facts
 
 ### Actual Extraction
@@ -61,7 +61,7 @@ rel_type | count
 
 2. **Filter Filtering Out Facts**
    - faultline_function.py filtering valid facts as "garbage"
-   - Entity name validation rejecting alice, bob, charlie, kitchener
+   - Entity name validation rejecting alice, bob, charlie, ${LOCATION}
    - Rel_type filtering excluding parent_of, age, lives_in, pref_name
 
 3. **Ingest Validation Rejecting Facts**
@@ -94,7 +94,7 @@ rel_type | count
 2. **Check filter output**
    - Which facts are passing through filter to /ingest?
    - Which facts are being dropped at filter stage?
-   - Entity name validation: are alice, bob, charlie, kitchener passing?
+   - Entity name validation: are alice, bob, charlie, ${LOCATION} passing?
 
 3. **Check /ingest processing**
    - What facts are being classified?
@@ -111,7 +111,7 @@ rel_type | count
 ## Proposed Solutions
 
 1. **Increase LLM max_tokens** if truncation is occurring
-2. **Debug filter entity validation** to ensure alice/bob/kitchener pass validation
+2. **Debug filter entity validation** to ensure alice/bob/${LOCATION} pass validation
 3. **Add logging to /ingest** to track which facts are accepted/rejected
 4. **Verify rel_type metadata** - ensure parent_of, age, lives_in are properly configured
 
@@ -120,7 +120,7 @@ rel_type | count
 ## Test Case for Validation
 
 ```
-Input: "My name is Chris. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in Kitchener, Ontario."
+Input: "My name is ${USER}. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in ${LOCATION}, Ontario."
 
 Expected: 18+ facts created
 Actual: 2 spouse facts only

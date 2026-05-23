@@ -18,7 +18,7 @@ FaultLine's `/extract` endpoint (GLiNER2 entity extraction) crashes with `'NoneT
 
 **Steps:**
 ```bash
-curl -X POST http://192.168.1.10:8001/extract \
+curl -X POST http://${BACKEND_IP}:8001/extract \
   -H 'Content-Type: application/json' \
   -d '{"text": "what'\''d I do to my back?"}'
 ```
@@ -121,7 +121,7 @@ The GLiNER2 model correctly identifies the relationship type (`affected_body_par
 
 1. Run the exact `/extract` curl command locally and capture full stack trace
 2. Identify the exact line number in `src/api/main.py` causing the crash
-3. Trace backward to see why entity subject/object is None
+3. Trace bac${LOCATION}ard to see why entity subject/object is None
 4. Add null checks and re-test
 
 ## Solution
@@ -136,12 +136,12 @@ The GLiNER2 model correctly identifies the relationship type (`affected_body_par
 **Testing:**
 ```bash
 # Should return valid entities, not null
-curl -X POST http://192.168.1.10:8001/extract \
+curl -X POST http://${BACKEND_IP}:8001/extract \
   -H 'Content-Type: application/json' \
   -d '{"text": "what'\''d I do to my back?"}'
 
 # Should extract medical facts
-curl -X POST http://192.168.1.10:8001/ingest \
+curl -X POST http://${BACKEND_IP}:8001/ingest \
   -H 'Content-Type: application/json' \
   -d '{"text": "what'\''d I do to my back?", "user_id": "test", "source": "test", "edges": []}'
 ```

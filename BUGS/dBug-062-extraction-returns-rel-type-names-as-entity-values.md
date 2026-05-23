@@ -13,7 +13,7 @@
 The `/extract/rewrite` LLM endpoint returns malformed triples where **rel_type names are substituted for entity values**. This causes:
 
 1. Invalid facts with rel_type names as objects (e.g., `charlie pref_name pref_name`)
-2. Missing entity deduplication (no "Art" as alias for "charlie" because extraction returns `charlie pref_name pref_name`)
+2. Missing entity deduplication (no "${ENTITY}" as alias for "charlie" because extraction returns `charlie pref_name pref_name`)
 3. Scalar attributes with rel_type values instead of real values (e.g., `charlie age age` instead of `charlie age 19`)
 4. Entity creation for rel_type names as separate entities (e.g., "parent_of" becomes a child entity)
 
@@ -22,14 +22,14 @@ The `/extract/rewrite` LLM endpoint returns malformed triples where **rel_type n
 ## Evidence
 
 ### Test Case
-**Input:** "My son charlie is also known as Art, he is 19 and an Art Major at University. He enjoys art and crafts."
+**Input:** "My son charlie is also known as ${ENTITY}, he is 19 and an ${ENTITY} Major at University. He enjoys ${ENTITY} and crafts."
 
 **Expected Extractions:**
 - `charlie pref_name charlie`
-- `charlie also_known_as Art`
+- `charlie also_known_as ${ENTITY}`
 - `charlie age 19`
-- `charlie occupation Art Major`
-- `charlie likes art` (concept)
+- `charlie occupation ${ENTITY} Major`
+- `charlie likes ${ENTITY}` (concept)
 - `user parent_of charlie`
 
 **Actual Extractions (from logs):**
@@ -39,7 +39,7 @@ The `/extract/rewrite` LLM endpoint returns malformed triples where **rel_type n
   "subject": "charlie",
   "object": "pref_name",    // ❌ WRONG: rel_type name, not entity value
   "rel_type": "pref_name",
-  "definition": "charlie is also known as Art."
+  "definition": "charlie is also known as ${ENTITY}."
 }
 ```
 
@@ -67,15 +67,15 @@ And:
 From query logs, the system shows:
 ```
 entity_attrs={'55c13545-3f9a-5798-8827-c35e7c9cfa70': {
-  'pref_name': {'value': 'pref_name'},      // ❌ Should be "charlie" or "Art"
-  'also_known_as': {'value': 'art'},         // ✓ Correct
+  'pref_name': {'value': 'pref_name'},      // ❌ Should be "charlie" or "${ENTITY}"
+  'also_known_as': {'value': '${ENTITY}'},         // ✓ Correct
 }}
 ```
 
 And filter injection shows:
 ```
-[FaultLine Filter] fact: pref_name -occupation-> art major
-[FaultLine Filter] fact: pref_name -also_known_as-> art
+[FaultLine Filter] fact: pref_name -occupation-> ${ENTITY} major
+[FaultLine Filter] fact: pref_name -also_known_as-> ${ENTITY}
 ```
 
 **"pref_name" is being treated as an entity.**
@@ -113,13 +113,13 @@ If `typed_entities` are injected into the extraction prompt as examples (similar
 
 | What Should Happen | What Actually Happens |
 |---|---|
-| `charlie also_known_as art` (entity alias deduplication) | `charlie pref_name pref_name` (invalid fact, no deduplication) |
+| `charlie also_known_as ${ENTITY}` (entity alias deduplication) | `charlie pref_name pref_name` (invalid fact, no deduplication) |
 | `charlie age 19` (scalar attribute) | `charlie age age` (invalid, rejected as non-numeric) |
-| `user parent_of charlie` (relationship) | `user parent_of art` (wrong entity reference) |
+| `user parent_of charlie` (relationship) | `user parent_of ${ENTITY}` (wrong entity reference) |
 
 ### System Failures
 
-1. **Entity Deduplication Broken:** "charlie" and "Art" never merge as aliases because extraction fails to produce the `also_known_as` edge
+1. **Entity Deduplication Broken:** "charlie" and "${ENTITY}" never merge as aliases because extraction fails to produce the `also_known_as` edge
 2. **False Entity Creation:** "pref_name", "also_known_as", "parent_of" become entities in the database
 3. **Scalar Validation Failures:** Age/occupation facts rejected because values are rel_type names, not data
 4. **Memory Injection Corruption:** Filter shows entity names like "Parent_Of" and "pref_name" in family relationships
@@ -134,7 +134,7 @@ If `typed_entities` are injected into the extraction prompt as examples (similar
 
 ```bash
 # Check if rel_type names appear in system prompt
-grep -n "pref_name\|also_known_as\|parent_of" /home/chris/Documents/013-GIT/FaultLine-dev/src/api/main.py | head -50
+grep -n "pref_name\|also_known_as\|parent_of" /home/${USER}/Documents/013-GIT/FaultLine-dev/src/api/main.py | head -50
 ```
 
 **Question:** Does the prompt accidentally include rel_type names where examples should show entity names?
@@ -174,25 +174,25 @@ ssh docker-host -x "sudo docker logs faultline 2>&1" | grep gliner2
 
 **Message to test:**
 ```
-My son charlie is also known as Art. He is 19 and an Art Major. Art enjoys art and crafts.
+My son charlie is also known as ${ENTITY}. He is 19 and an ${ENTITY} Major. ${ENTITY} enjoys ${ENTITY} and crafts.
 ```
 
 **Expected behavior:**
-- Facts about "charlie" with correct attributes (age=19, occupation=Art Major)
-- "art" registered as alias for charlie
+- Facts about "charlie" with correct attributes (age=19, occupation=${ENTITY} Major)
+- "${ENTITY}" registered as alias for charlie
 - No rel_type names appearing as entities
 
 **Current behavior:**
 - Facts contain rel_type names as values (pref_name, also_known_as, age, parent_of)
-- Multiple entities created for "charlie", "art", "pref_name", "parent_of"
-- False parent_of relationships (user parent_of art, not user parent_of charlie)
+- Multiple entities created for "charlie", "${ENTITY}", "pref_name", "parent_of"
+- False parent_of relationships (user parent_of ${ENTITY}, not user parent_of charlie)
 - Query injection shows "Parent_Of" and "pref_name" as children names
 
 ---
 
 ## Related Issues
 
-- **dBug-art-false-children:** Art false entity — ROOT CAUSE appears to be this extraction bug, not just ingest ordering
+- **dBug-${ENTITY}-false-children:** ${ENTITY} false entity — ROOT CAUSE appears to be this extraction bug, not just ingest ordering
 - **dBug-021:** Hardcoded regex workarounds for extraction failures — symptom of extraction issues
 - **dprompt-126 Layer 1:** Hierarchy validation can't prevent this because false entities are created with correct types due to extraction confusion
 
@@ -215,21 +215,21 @@ The fix must ensure:
 ```bash
 # Test message
 curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
-  -H "Authorization: Bearer ***REDACTED-API-KEY***" \
+  -H "Authorization: Bearer ${BEARER_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "faultline-test",
     "messages": [
       {
         "role": "user",
-        "content": "My son charlie is also known as Art, he is 19 and an Art Major at University."
+        "content": "My son charlie is also known as ${ENTITY}, he is 19 and an ${ENTITY} Major at University."
       }
     ]
   }'
 
 # Verify facts via follow-up query
 curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
-  -H "Authorization: Bearer ***REDACTED-API-KEY***" \
+  -H "Authorization: Bearer ${BEARER_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "faultline-test",
@@ -241,7 +241,7 @@ curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
     ]
   }'
 
-# Should recall: charlie is your son, age 19, Art Major, also known as Art
+# Should recall: charlie is your son, age 19, ${ENTITY} Major, also known as ${ENTITY}
 ```
 
 ---
@@ -256,6 +256,6 @@ curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
 
 ## Notes
 
-This bug was discovered while testing the fix for dBug-art-false-children after removing hardcoded `_infer_type_from_relationship()` function. The metadata-driven type validation is now working correctly, but extraction is producing invalid triples in the first place.
+This bug was discovered while testing the fix for dBug-${ENTITY}-false-children after removing hardcoded `_infer_type_from_relationship()` function. The metadata-driven type validation is now working correctly, but extraction is producing invalid triples in the first place.
 
-The fact that `charlie` resolves correctly to UUID `55c13545-3f9a-5798-8827-c35e7c9cfa70` but gets stored with attributes like `pref_name='pref_name'` and `also_known_as='art'` shows the problem is specifically in what LLM returns for rel_type objects, not in entity resolution.
+The fact that `charlie` resolves correctly to UUID `55c13545-3f9a-5798-8827-c35e7c9cfa70` but gets stored with attributes like `pref_name='pref_name'` and `also_known_as='${ENTITY}'` shows the problem is specifically in what LLM returns for rel_type objects, not in entity resolution.

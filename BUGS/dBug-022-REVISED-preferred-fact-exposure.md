@@ -12,25 +12,25 @@
 
 System **must respect preferred facts internally** (use for identity resolution, ranking, retrieval) but **must not expose them unsolicited**.
 
-**Wrong:** Every response inclualice "Your preferred name is Chris"  
-**Right:** Use "chris" as the canonical identity, mention "john" only when user asks about names/preferences
+**Wrong:** Every response inclualice "Your preferred name is ${USER}"  
+**Right:** Use "${USER}" as the canonical identity, mention "john" only when user asks about names/preferences
 
 **Example flows:**
 
 ### Scenario A: User asks about identity (EXPOSE)
 ```
 User: "What is my name? How should people call me?"
-Facts: also_known_as=john, pref_name=chris
-Memory injection: "You have the name john (also known as chris). You prefer to be called chris."
-Response: "Your name is John, but you prefer to be called Chris."
+Facts: also_known_as=john, pref_name=${USER}
+Memory injection: "You have the name john (also known as ${USER}). You prefer to be called ${USER}."
+Response: "Your name is John, but you prefer to be called ${USER}."
 ```
 
 ### Scenario B: User talks about work (RESPECT INTERNALLY, DON'T EXPOSE)
 ```
 User: "What's my job?"
-Facts: works_for=TechCorp, pref_name=chris
+Facts: works_for=TechCorp, pref_name=${USER}
 Memory injection: "Job: works_for TechCorp"  <-- NO name directive
-Response: "You work at TechCorp." <-- System used 'chris' internally for canonical identity, but didn't announce it
+Response: "You work at TechCorp." <-- System used '${USER}' internally for canonical identity, but didn't announce it
 ```
 
 ### Scenario C: User asks something unrelated (SILENT)
@@ -78,7 +78,7 @@ Currently facts have: `confidence`, `fact_class`, `rel_type`, `subject`, `object
 fact = {
     "subject": "user",
     "rel_type": "pref_name",
-    "object": "chris",
+    "object": "${USER}",
     "confidence": 1.0,
     "fact_class": "A"
 }
@@ -87,7 +87,7 @@ fact = {
 fact = {
     "subject": "user",
     "rel_type": "pref_name",
-    "object": "chris",
+    "object": "${USER}",
     "confidence": 1.0,
     "fact_class": "A",
     "is_preferred_label": True  # <-- New flag
@@ -110,18 +110,18 @@ Response should indicate which facts are "preferred":
 {
   "facts": [
     {"subject": "user", "rel_type": "also_known_as", "object": "john"},
-    {"subject": "user", "rel_type": "pref_name", "object": "chris"}
+    {"subject": "user", "rel_type": "pref_name", "object": "${USER}"}
   ],
-  "preferred_names": {"user": "chris"}
+  "preferred_names": {"user": "${USER}"}
 }
 
 # Should be:
 {
   "facts": [
     {"subject": "user", "rel_type": "also_known_as", "object": "john", "is_preferred_label": False},
-    {"subject": "user", "rel_type": "pref_name", "object": "chris", "is_preferred_label": True}
+    {"subject": "user", "rel_type": "pref_name", "object": "${USER}", "is_preferred_label": True}
   ],
-  "preferred_names": {"user": "chris"},
+  "preferred_names": {"user": "${USER}"},
   "preferred_fact_types": ["pref_name", "is_preferred"]  # <-- Metadata about what's preferred
 }
 ```
@@ -246,7 +246,7 @@ IMPORTANT: If the user has a preferred_name marked in facts, respect it:
 | "What is my name?" | Mentions pref_name explicitly | LLM response inclualice preferred name |
 | "What's my job?" | Uses pref_name internally, doesn't mention it | Response shows job, not names |
 | "Tell me about myself" | Lists facts including preference | Both also_known_as and pref_name shown, with pref_name marked preferred |
-| "Who am I?" | Emphasizes pref_name | "You're Chris (also known as John)" |
+| "Who am I?" | Emphasizes pref_name | "You're ${USER} (also known as John)" |
 | General chat | No unsolicited preference announcements | User preferences never mentioned unless asked |
 
 ---

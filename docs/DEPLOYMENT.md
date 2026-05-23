@@ -77,10 +77,10 @@ Filter also calls:
 
 5. **Test it:**
    ```
-   User: "My name is Christopher, I prefer Chris"
+   User: "My name is ${USER}, I prefer ${USER}"
    System: [Extracts and stores facts]
    User: "What's my name?"
-   System: [Uses stored fact to respond with "Christopher, but you prefer Chris"]
+   System: [Uses stored fact to respond with "${USER}, but you prefer ${USER}"]
    ```
 
 ---
@@ -97,22 +97,22 @@ Filter also calls:
 ### LLM_URL
 **DEPRECATED** — No longer used. FaultLine calls LLM directly, not OpenWebUI.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
+**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
 
 ### LLM_MODEL
 **DEPRECATED** — No longer used. FaultLine reads WGM_LLM_MODEL from environment.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
+**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
 
 ### LLM_API_KEY
 **DEPRECATED** — No longer used. FaultLine manages LLM authentication internally.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
+**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
 
 ### BACKEND_LLM_URL
 **DEPRECATED** — No longer used. FaultLine reads QWEN_API_URL from environment.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
+**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
 
 **New approach:**
 FaultLine backend now reads LLM configuration from environment variables:
@@ -136,6 +136,181 @@ Set these in docker-compose.yml or kubernetes manifests, not in OpenWebUI valves
 **Default:** 0.5 (medium confidence)  
 **Increase to:** 0.7–0.9 for stricter, higher-quality facts  
 **Decrease to:** 0.3–0.4 for more inclusive, lower-quality facts
+
+---
+
+## Logging Levels & Troubleshooting Configuration
+
+FaultLine uses Python's standard `logging` module with `structlog` for structured output. All logging is controlled via environment variables, making it easy to adjust verbosity without code changes.
+
+### Global Log Level
+
+Set the `LOG_LEVEL` environment variable in docker-compose.yml or your deployment configuration:
+
+```yaml
+# docker-compose.yml
+services:
+  faultline:
+    environment:
+      LOG_LEVEL: INFO  # or DEBUG, WARNING, ERROR, CRITICAL
+```
+
+**Standard Levels (in order of verbosity):**
+
+| Level | Use Case | What Gets Logged |
+|-------|----------|-----------------|
+| `DEBUG` | Development, deep troubleshooting | Everything including function entry/exit, variable inspection, query plans |
+| `INFO` | Production (default) | Major milestones (extraction success, ingest completion, promotion, errors) |
+| `WARNING` | Strict deployments | Only unexpected conditions (failed retries, fallbacks, missing optional data) |
+| `ERROR` | Silent operation | Only critical failures (crashes, data loss, validation failures) |
+| `CRITICAL` | Hardened production | Only system-breaking failures (database unavailable, essential service down) |
+
+### Default Production Setting
+
+```bash
+LOG_LEVEL=INFO  # Balanced — logs important events without spam
+```
+
+### Development & Troubleshooting Setting
+
+```bash
+LOG_LEVEL=DEBUG  # Verbose — every function call, every query, every decision
+```
+
+### Filter (OpenWebUI) Logging
+
+The Filter (`openwebui/faultline_tool.py`) has its own logging control via the `ENABLE_DEBUG` valve in OpenWebUI:
+
+```
+OpenWebUI → Tools → FaultLine Filter → ENABLE_DEBUG = True
+```
+
+When enabled, Filter logs appear in OpenWebUI logs:
+```bash
+docker logs open-webui | grep "\[FaultLine\]"
+```
+
+### Backend Logging Output
+
+**All FaultLine backend logs go to:**
+```bash
+docker logs faultline  # Standard output from FastAPI/uvicorn
+```
+
+**Search for specific events:**
+```bash
+# Extraction events
+docker logs faultline | grep "extract_rewrite"
+
+# Ingest pipeline
+docker logs faultline | grep "extract_rewrite\|wgm_gate\|fact_store\|commit"
+
+# Query operations
+docker logs faultline | grep "query_user_facts"
+
+# GLiNER2 operations
+docker logs faultline | grep "gliner2"
+
+# Re-embedder operations
+docker logs faultline | grep "re_embedder"
+
+# Type validation
+docker logs faultline | grep "validate_triple\|entity_type"
+
+# Errors only
+docker logs faultline | grep "ERROR\|CRITICAL\|Exception"
+```
+
+### Key Log Patterns (Debug Mode)
+
+When `LOG_LEVEL=DEBUG`, watch for these patterns to understand pipeline flow:
+
+**Extraction Phase:**
+```
+extract_rewrite: entities_needing_types_check
+  └─ entities_to_type=5, triples_count=3
+gliner2_entity_extraction: entities_extracted=4
+  └─ entities_needed=5, entities_extracted=4 (1 miss)
+extract_rewrite: types_enriched
+  └─ entity_count=4, scalar_rel_types=12
+```
+
+**Validation Phase:**
+```
+validate_triple_against_metadata: matched_rel_type
+  └─ rel_type=has_pet, confidence=0.8
+_validate_hierarchy_membership: check_passed
+  └─ entity_type=Animal matches taxonomy member_entity_types
+```
+
+**Ingest Phase:**
+```
+fact_classification: assigned_class
+  └─ class=B, confidence=0.8, rel_type=has_pet
+FactStoreManager.commit: fact_stored
+  └─ id=uuid, rel_type=has_pet, status=committed
+```
+
+**Query Phase:**
+```
+query_user_facts: found_facts
+  └─ count=5, includes_staged=true
+_graph_traverse: traversal_result
+  └─ rel_type=spouse, hops=1, matches=1
+_hierarchy_expand: expansion_result
+  └─ rel_type=instance_of, direction=up, chain_length=3
+```
+
+**Re-Embedder Phase:**
+```
+re_embedder.promote_staged_facts: promoted
+  └─ count=2, new_facts=2
+re_embedder.evaluate_ontology_candidates: approved
+  └─ rel_type=friend_of, frequency=4
+```
+
+### Module-Specific Debugging (Advanced)
+
+To log ONLY specific modules (Python):
+
+```python
+# In src/api/main.py or src/re_embedder/embedder.py
+import logging
+logging.getLogger("src.api.main").setLevel(logging.DEBUG)
+logging.getLogger("src.wgm.gate").setLevel(logging.DEBUG)
+logging.getLogger("src.re_embedder.embedder").setLevel(logging.INFO)
+```
+
+But simpler to use environment variable (recommended):
+
+```bash
+LOG_LEVEL=DEBUG  # Global, easy to toggle
+```
+
+### Performance Impact
+
+**Log Level Performance Overhead:**
+- `ERROR`: <1% (production standard)
+- `WARNING`: <2% (slightly more checks)
+- `INFO`: ~2-5% (default balance)
+- `DEBUG`: ~5-15% (verbose, slower for high-volume)
+
+**Recommendation:**
+- **Production:** `INFO` or `WARNING` (balanced)
+- **Development:** `DEBUG` (full visibility)
+- **Incident investigation:** `DEBUG` then `INFO` after resolution
+
+### Health Check Logging
+
+The `/health` endpoint is designed to NOT spam logs. It returns status without logging for common cases:
+
+```bash
+curl http://localhost:8001/health
+# Returns: {"status": "ok", "database": "ok", "qdrant": "ok", ...}
+# Logs nothing unless a component fails
+```
+
+This keeps logs clean even in high-volume deployments.
 
 ---
 

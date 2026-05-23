@@ -152,16 +152,16 @@ By adding complex conditional logic (`is_spouse` checks + logging calls), I've:
 
 ### Option 1: Defensive Logging Wrapper
 ```python
-def _safe_log_spouse_debug(fact, event, **kwargs):
+def _safe_log_spouse_debug(fact, event, **${LOCATION}args):
     """Log spouse debugging info safely without breaking pipeline."""
     try:
         if fact.get("rel_type") == "spouse":
-            safe_kwargs = {
+            safe_${LOCATION}args = {
                 "subject": str(fact.get("subject", "?"))[:8],
                 "object": str(fact.get("object", "?"))[:8],
-                **kwargs
+                **${LOCATION}args
             }
-            log.info(f"archive_filter.dBug035_{event}", **safe_kwargs)
+            log.info(f"archive_filter.dBug035_{event}", **safe_${LOCATION}args)
     except Exception as e:
         # NEVER let logging break the pipeline
         # Silently skip if logging fails

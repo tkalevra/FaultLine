@@ -85,7 +85,7 @@ _DEDUP_TRACKER[user_id] = (_text_hash, _time.time())
 ## Reproduction Steps
 
 1. Run comprehensive_family_pipeline_test.sh
-2. First message passes (3-6s): "My name is John, I prefer to be called Chris"
+2. First message passes (3-6s): "My name is John, I prefer to be called ${USER}"
 3. Second message times out (45s): "My spouse's name is Marla, she prefers emma"
 4. Check OpenWebUI logs: inlet is called 20+ times with identical text
 

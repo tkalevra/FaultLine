@@ -24,15 +24,15 @@ Issues:
 
 ### Alias Redundancy Problem
 
-User entity has multiple aliases: `john`, `chris`, `user`
+User entity has multiple aliases: `john`, `${USER}`, `user`
 
 Database stores duplicate facts for EACH alias:
 
 ```
 john spouse emma        (conf 0.5, Class A)
-chris spouse emma              (DUPLICATE — same entity, different alias)
+${USER} spouse emma              (DUPLICATE — same entity, different alias)
 john spouse wife        (conf 1.0, Class A)
-chris spouse wife              (DUPLICATE)
+${USER} spouse wife              (DUPLICATE)
 ```
 
 Query returns both facts separately, appearing as duplicate information to user.
@@ -101,7 +101,7 @@ Your family inclualice your spouse emma and three children: alice, bob, and char
 ```
 
 **Database state (for testing):**
-- User has aliases: john, chris, user
+- User has aliases: john, ${USER}, user
 - Spouse: emma/marla (multiple facts, should be one)
 - Children: alice, bob, charlie (no bidirectional parent_of/child_of confusion)
 - Pets: Fraggle (morkie type, not separate pet — conflict detection works)

@@ -279,7 +279,7 @@ ssh docker-host -x "sudo docker logs faultline 2>&1 | grep -i '/retract\|retract
 # Verify facts still have NULL superseded_at (not being retracted)
 ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d faultline -c \
   \"SELECT rel_type, COUNT(*) FROM facts 
-   WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+   WHERE user_id='${TEST_USER_ID}' 
    AND superseded_at IS NULL 
    GROUP BY rel_type;\""
 

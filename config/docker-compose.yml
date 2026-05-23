@@ -1,0 +1,73 @@
+services:
+
+  faultline:
+    build:
+      context: .
+      network: host
+    ports:
+      - "8001:8000"
+    environment:
+      OPENWEBUI_URL: ${OPENWEBUI_URL:-http://open-webui:8080}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      FAULTLINE_URL: ${FAULTLINE_URL:-http://localhost:8001}
+      FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-00000000-0000-0000-0000-000000000000}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: faultline-test
+      REDIS_URL: redis://redis:6379/0
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-60}
+      EMBEDDING_CACHE_TTL: ${EMBEDDING_CACHE_TTL:-86400}
+      EMBEDDING_MODEL_VERSION: ${EMBEDDING_MODEL_VERSION:-nomic-v1.5}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      DB_POOL_SIZE: 15
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+    networks:
+      - faultline-test
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-faultline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
+      POSTGRES_DB: ${POSTGRES_DB:-faultline}
+      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_SHARED_BUFFERS: "256MB"
+    volumes:
+      - pg-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - faultline-test
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6334:6333"
+    volumes:
+      - qdrant-test-data:/qdrant/storage
+    networks:
+      - faultline-test
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - faultline-test
+
+volumes:
+  pg-test-data:
+  qdrant-test-data:
+
+networks:
+  faultline-test:
+    driver: bridge

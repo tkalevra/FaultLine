@@ -8,14 +8,14 @@
 
 ## Problem Statement
 
-When a user asks "What is my name?" or "tell me about my family", the system returns wrong identity. Instead of the user (john/chris), it returns "dog" as the preferred identity.
+When a user asks "What is my name?" or "tell me about my family", the system returns wrong identity. Instead of the user (john/${USER}), it returns "dog" as the preferred identity.
 
 **Observed behavior:**
 ```
 User: "tell me about my family"
 System canonical identity: "dog" (unknown-type entity)
-System response: Returns family facts scoped to "dog", not to "chris"
-Expected: Returns facts scoped to "chris" (Person entity)
+System response: Returns family facts scoped to "dog", not to "${USER}"
+Expected: Returns facts scoped to "${USER}" (Person entity)
 ```
 
 **Root cause:** In `/query` endpoint's identity resolution (lines 3821-3838 in src/api/main.py), the code queries for all entities with `pref_name`/`also_known_as` facts for the user, then picks the **first one returned by the database** without filtering by entity_type.
@@ -29,8 +29,8 @@ When an unknown/Animal entity accidentally gets a pref_name fact (e.g., "dog"), 
 ```sql
 -- Multiple entities with pref_name for same user:
 d807ffea-0140-5c9a-b312-930f964d469d | type=unknown | pref_name='dog'      ← WRONG (picked first)
-10d7d879-63cd-4f31-92ce-f2c9edb760ab | type=Person  | pref_name='chris'     ← CORRECT (should pick this)
-efc8ea62-381a-5859-b7c3-e2588c89bba6 | type=Person  | pref_name='chris'     ← Also correct
+${TEST_USER_ID} | type=Person  | pref_name='${USER}'     ← CORRECT (should pick this)
+efc8ea62-381a-5859-b7c3-e2588c89bba6 | type=Person  | pref_name='${USER}'     ← Also correct
 f119510d-8f7a-5843-8d72-bdffea35a538 | type=Person  | pref_name='john'
 ```
 
@@ -43,7 +43,7 @@ The query at line 3821-3826 returns these in database order (arbitrary), not by 
 1. **Identity is authoritative for graph traversal:** `/query` uses `canonical_identity` to fetch facts about the user
 2. **If identity is wrong, all facts are wrong:** Facts about "dog" entity are fetched instead of user facts
 3. **User sees fragmented data:** Name queries, family queries, all return wrong context
-4. **Graph traversal starts from wrong entity:** Connected entities fetched from "dog" instead of "chris"
+4. **Graph traversal starts from wrong entity:** Connected entities fetched from "dog" instead of "${USER}"
 
 ---
 
@@ -72,10 +72,10 @@ user_entity_id_for_query = user_entity_ids_for_query[0] if user_entity_ids_for_q
 ## Success Criteria
 
 - ✓ Query returns correct Person entity as canonical identity
-- ✓ "tell me about my family" returns user's pref_name (chris/john), not "dog"
+- ✓ "tell me about my family" returns user's pref_name (${USER}/john), not "dog"
 - ✓ Graph traversal fetches correct user facts (spouse, children, etc.)
 - ✓ Multiple Person entities still supported, but Person entities prioritized over others
-- ✓ Identity logs show: `query.user_identity canonical=chris` (not `canonical=dog`)
+- ✓ Identity logs show: `query.user_identity canonical=${USER}` (not `canonical=dog`)
 
 ---
 
@@ -88,14 +88,14 @@ user_entity_id_for_query = user_entity_ids_for_query[0] if user_entity_ids_for_q
 ## Test Case
 
 ```bash
-# Setup: User entity exists with pref_name='chris' (type=Person)
+# Setup: User entity exists with pref_name='${USER}' (type=Person)
 #        Unknown entity exists with pref_name='dog' (type=unknown)
 
 curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
   -H "Authorization: Bearer <token>" \
   -d '{"model": "faultline-test", "messages": [{"role": "user", "content": "tell me about my family"}]}'
 
-# Expected: Response inclualice facts scoped to "chris" Person entity
+# Expected: Response inclualice facts scoped to "${USER}" Person entity
 # Actual (bug): Response inclualice facts scoped to "dog" unknown entity
 ```
 

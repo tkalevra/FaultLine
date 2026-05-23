@@ -18,9 +18,9 @@
 ### Ingest Request Processing (02:31:10)
 
 ```
-ingest.subject_resolved_at_extraction input=user output=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+ingest.subject_resolved_at_extraction input=user output=${TEST_USER_ID}
 ingest.fact_classified         confidence=0.8 fact_class=A is_user_stated=False rel_type=also_known_as
-ingest.subject_resolved_at_extraction input=user output=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+ingest.subject_resolved_at_extraction input=user output=${TEST_USER_ID}
 ingest.object_resolved_at_extraction input=marla output=fb0868c4-12b4-587d-9a3b-ce96ca5979ca
 ingest.fact_classified         confidence=0.8 fact_class=A is_user_stated=False rel_type=spouse
 ingest.class_a_committed       count=2
@@ -33,7 +33,7 @@ ingest.class_a_committed       count=2
 ### Extract Rewrite Response (02:31:13)
 
 ```
-extract.rewrite_success        triple_count=0 user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+extract.rewrite_success        triple_count=0 user_id=${TEST_USER_ID}
 ```
 
 **LLM returned 0 triples** — no children, ages, location facts extracted.
@@ -44,16 +44,16 @@ extract.rewrite_success        triple_count=0 user_id=10d7d879-63cd-4f31-92ce-f2
 
 ### User Input
 ```
-"My name is Chris. My spouse is Marla. My children are alice (age 12), bob (age 10), 
-and charlie (age 19). I live in Kitchener, Ontario."
+"My name is ${USER}. My spouse is Marla. My children are alice (age 12), bob (age 10), 
+and charlie (age 19). I live in ${LOCATION}, Ontario."
 ```
 
 ### Expected Triples (from system prompt)
-1. Identity: (chris, pref_name, chris)
+1. Identity: (${USER}, pref_name, ${USER})
 2. Spouse: (user, spouse, marla), (marla, spouse, user) ✅ **EXTRACTED**
 3. Children: (user, parent_of, alice/bob/charlie) ❌ **NOT EXTRACTED**
 4. Ages: (alice, age, 12), (bob, age, 10), (charlie, age, 19) ❌ **NOT EXTRACTED**
-5. Location: (user, lives_in, kitchener), (kitchener, located_in, ontario) ❌ **NOT EXTRACTED**
+5. Location: (user, lives_in, ${LOCATION}), (${LOCATION}, located_in, ontario) ❌ **NOT EXTRACTED**
 
 ### Actual Triples
 - Only spouse facts created (2 facts)
@@ -91,7 +91,7 @@ Likely causes:
 
 **Query Processing (02:31:09):**
 ```
-query.taxonomy_detected query='my name is chris. my spouse is marla. my children are alice (age 1'
+query.taxonomy_detected query='my name is ${USER}. my spouse is marla. my children are alice (age 1'
 ```
 
 The query text is **TRUNCATED** to `...alice (age 1` — text is cut off mid-word!
@@ -106,11 +106,11 @@ This suggests:
 
 ## Hypothesis: Truncation Chain
 
-1. **User sends:** Full message "My name is Chris. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in Kitchener, Ontario."
+1. **User sends:** Full message "My name is ${USER}. My spouse is Marla. My children are alice (age 12), bob (age 10), and charlie (age 19). I live in ${LOCATION}, Ontario."
 
 2. **Filter processes:** Full text ✅
 
-3. **Query receives:** `'my name is chris. my spouse is marla. my children are alice (age 1'` ❌ **TRUNCATED**
+3. **Query receives:** `'my name is ${USER}. my spouse is marla. my children are alice (age 1'` ❌ **TRUNCATED**
 
 4. **/extract/rewrite receives:** Truncated text
 
@@ -169,7 +169,7 @@ This suggests:
 
 After ingest:
 - Facts table: 2 spouse facts only
-- Entities: chris, marla (spouse), plus garbage entities from query processing (kitchener, alice, bob, charlie created during query resolution, not ingest)
+- Entities: ${USER}, marla (spouse), plus garbage entities from query processing (${LOCATION}, alice, bob, charlie created during query resolution, not ingest)
 - No parent_of, child_of, age, pref_name facts for family
 
 **Conclusion:** Extraction pipeline failed, ingest received no edges, only spouse facts created from pre-existing state or fallback logic.

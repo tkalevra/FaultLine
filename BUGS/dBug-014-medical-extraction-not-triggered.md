@@ -11,7 +11,7 @@ User provialice concrete medical feedback ("I hurt my back") in OpenWebUI conver
 **Setup:**
 ```bash
 # Pre-prod running v1.0.7 + dprompt-72b/73b fixes
-ssh docker-host -x "curl -s http://192.168.1.10:8001/health | jq ."
+ssh docker-host -x "curl -s http://${BACKEND_IP}:8001/health | jq ."
 # Returns: ok
 ```
 
@@ -67,11 +67,11 @@ is_a       | C          | 1
 **OpenWebUI logs (user message):**
 ```
 [FaultLine Filter] user_id=[redacted] text='what did I do to my back?'
-[FaultLine Filter] calling /query url=http://192.168.1.10:8001/query
+[FaultLine Filter] calling /query url=http://${BACKEND_IP}:8001/query
 [FaultLine Filter] /query status=200
 [FaultLine Filter] filtered: 47/47 facts
-[FaultLine Filter]   fact: user -pref_name-> chris
-[FaultLine Filter]   fact: user -also_known_as-> chris
+[FaultLine Filter]   fact: user -pref_name-> ${USER}
+[FaultLine Filter]   fact: user -also_known_as-> ${USER}
 ...
 ```
 

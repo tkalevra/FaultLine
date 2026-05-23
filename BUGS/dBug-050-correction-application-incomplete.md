@@ -6,7 +6,7 @@
 **Discovered:** 2026-05-18  
 **Fixed:** 2026-05-18 via dprompt-115 (correction application framework) + transaction rollback protection  
 **Production Deployed:** 2026-05-18 commit 0437f1a  
-**Verification:** charlie pref_name correction (charlie → cy) persisted in database ✓
+**Verification:** charlie pref_name correction (charlie → ${CHILD2}) persisted in database ✓
 
 ---
 
@@ -168,8 +168,8 @@ def apply_scalar_correction(text: str, user_id: str, db, registry) -> bool:
         detected_rel_type = None
         text_lower = text.lower()
         for rel_type, keywords in rel_type_keywords.items():
-            for kw in keywords:
-                if kw in text_lower:
+            for ${LOCATION} in keywords:
+                if ${LOCATION} in text_lower:
                     detected_rel_type = rel_type
                     break
             if detected_rel_type:
@@ -312,7 +312,7 @@ Expected: All three updates persist independently ✅
 
 ## Current Code Location
 
-**File:** `/home/chris/Documents/013-GIT/FaultLine-dev/src/api/main.py`
+**File:** `/home/${USER}/Documents/013-GIT/FaultLine-dev/src/api/main.py`
 
 **Lines to replace:** 3661-3730 (broken extraction logic)
 

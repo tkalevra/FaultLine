@@ -191,7 +191,7 @@ ssh docker-host -x "sudo docker logs faultline 2>&1 | grep -E 'rejected|correcti
 
 # Check database for presence of corrected facts
 ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d faultline -c \
-  \"SELECT * FROM facts WHERE rel_type='age' AND user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' ORDER BY created_at DESC LIMIT 5;\""
+  \"SELECT * FROM facts WHERE rel_type='age' AND user_id='${TEST_USER_ID}' ORDER BY created_at DESC LIMIT 5;\""
 
 # Check staged_facts for pending corrections
 ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d faultline -c \

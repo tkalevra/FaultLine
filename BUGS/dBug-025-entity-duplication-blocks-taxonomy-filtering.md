@@ -10,11 +10,11 @@
 
 User query: `"Tell me about my family"`
 
-Expected response: Only Person + Animal entities (<child_name>, <child_name>, <child_name>, <spouse>, Aurora)
+Expected response: Only Person + Animal entities (<child_name>, <child_name>, <child_name>, <spouse>, ${ENTITY})
 
 Actual response: Mixed entities including:
 - Addresses (<address>) — Location type
-- Servers (aurora.<domain>, titan.<domain>) — unknown type, no filtering possible
+- Servers (${ENTITY}.<domain>, titan.<domain>) — unknown type, no filtering possible
 - Garbage entities (computer, domain_name, son, it) — type labels and pronouns mistaken for entities
 - Duplicate/orphaned string-ID entities (<child_name>, <child_name>, <child_name>) — entity_type=unknown
 
@@ -35,13 +35,13 @@ Entity: <child_name>
    └─ entity_type = unknown ✗ (can't filter by taxonomy)
    └─ alias in entity_aliases (is_preferred=false, orphaned)
 
-Similar duplication for: <child_name>, <child_name>, <spouse>, Aurora
+Similar duplication for: <child_name>, <child_name>, <spouse>, ${ENTITY}
 ```
 
 ### Garbage Entities (Misclassified)
 ```
 Unclassified (entity_type=unknown):
-- aurora.<domain> (should be Object, not entity)
+- ${ENTITY}.<domain> (should be Object, not entity)
 - titan.<domain> (should be Object, not entity)
 - "computer" (type label, not entity)
 - "domain_name" (type label, not entity)
@@ -72,7 +72,7 @@ Result:
 SELECT subject_id, rel_type, object_id FROM facts 
 WHERE user_id='<user_uuid>' 
 AND rel_type='pref_name' 
-AND object_id IN ('<child_name>', '<child_name>', '<child_name>', 'aurora');
+AND object_id IN ('<child_name>', '<child_name>', '<child_name>', '${ENTITY}');
 
 Result: Multiple facts with string object_ids instead of UUID consolidation
 ```
@@ -81,7 +81,7 @@ Result: Multiple facts with string object_ids instead of UUID consolidation
 -- Garbage entities
 SELECT id, entity_type FROM entities 
 WHERE user_id='<user_uuid>' 
-AND id IN ('computer', 'domain_name', 'it', 'son', 'aurora.<domain>');
+AND id IN ('computer', 'domain_name', 'it', 'son', '${ENTITY}.<domain>');
 
 Result: All entity_type=unknown (can't be filtered)
 ```
@@ -95,7 +95,7 @@ Result: All entity_type=unknown (can't be filtered)
 **Current filtering doesn't work because:**
 
 1. String-ID entities (<child_name>, <child_name>, <child_name>) have entity_type=unknown → not excluded
-2. Garbage entities (computer, domain_name, aurora.<domain>) have entity_type=unknown → not excluded
+2. Garbage entities (computer, domain_name, ${ENTITY}.<domain>) have entity_type=unknown → not excluded
 3. Address entities have entity_type=Location, which is correct type but still appears in results (no query-side filtering applied)
 
 Result: `/query` returns UUID-based facts (Person-typed, pass filter) + String-ID facts (unknown-typed, can't filter) + unfiltered Location facts.

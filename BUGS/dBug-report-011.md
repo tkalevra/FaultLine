@@ -3,7 +3,7 @@
 **Status**: Open  
 **Severity**: Medium  
 **Reported**: 2026-05-12  
-**Environment**: Pre-prod (192.168.1.10:8001)  
+**Environment**: Pre-prod (${BACKEND_IP}:8001)  
 **Root Cause**: Extraction completeness + ingest gap — LLM extracts only one direction of bidirectional relationships  
 
 ## Summary
@@ -47,7 +47,7 @@ Evidence:
 
 **Root cause confirmation:** Query the database:
 ```bash
-psql -U faultline -d faultline -h 192.168.1.10 \
+psql -U faultline -d faultline -h ${BACKEND_IP} \
   -c "SELECT subject_id, rel_type, object_id, confidence FROM facts \
       WHERE user_id='[user-uuid]' AND rel_type IN ('parent_of', 'child_of') \
       ORDER BY rel_type, subject_id, object_id;"
@@ -111,7 +111,7 @@ All dependencies healthy. Problem is upstream in extraction/ingest, not in retri
 
 **Step 1: Confirm database state**
 ```bash
-psql -U faultline -d faultline -h 192.168.1.10 \
+psql -U faultline -d faultline -h ${BACKEND_IP} \
   -c "SELECT subject_id, rel_type, object_id, confidence FROM facts \
       WHERE user_id='[user-uuid]' AND rel_type IN ('parent_of', 'child_of') \
       ORDER BY rel_type, subject_id, object_id;"

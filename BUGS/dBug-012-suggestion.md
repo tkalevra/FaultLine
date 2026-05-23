@@ -14,17 +14,17 @@ The knowledge graph is missing inverse relationships for bidirectional rel_types
 
 | Subject | Rel | Object | Conf | Inverse Status |
 |---------|-----|--------|------|---------------|
-| charlie | child_of | chris | 1.0 | ✓ `chris parent_of charlie` exists |
-| **bob** | child_of | chris | 1.0 | ✗ **MISSING** `chris parent_of bob` |
-| **alice** | parent_of | chris | 1.0 | ✗ **WRONG DIRECTION** — should be `alice child_of chris` |
-| chris | parent_of | alice | 0.5 | ✓ Correct direction, but low conf |
-| chris | parent_of | charlie | 1.0 | ✓ Correct |
+| charlie | child_of | ${USER} | 1.0 | ✓ `${USER} parent_of charlie` exists |
+| **bob** | child_of | ${USER} | 1.0 | ✗ **MISSING** `${USER} parent_of bob` |
+| **alice** | parent_of | ${USER} | 1.0 | ✗ **WRONG DIRECTION** — should be `alice child_of ${USER}` |
+| ${USER} | parent_of | alice | 0.5 | ✓ Correct direction, but low conf |
+| ${USER} | parent_of | charlie | 1.0 | ✓ Correct |
 
 ### spouse gap
 
 | Subject | Rel | Object | Conf | Inverse Status |
 |---------|-----|--------|------|---------------|
-| chris | spouse | emma | 1.0 | ✗ **MISSING** `emma spouse chris` (symmetric) |
+| ${USER} | spouse | emma | 1.0 | ✗ **MISSING** `emma spouse ${USER}` (symmetric) |
 
 ### sibling_of (not bidirectional but worth noting)
 
@@ -33,7 +33,7 @@ Both directions exist for charlie↔alice↔bob — sibling_of facts look comple
 ## Impact
 
 - `/query` returns bob via `child_of` traversal but NOT via `parent_of` — family walk that only uses parent_of misses her
-- alice has wrong-direction fact (`alice parent_of chris` at conf=1.0) — if ingested fresh, bidirectional validation would supersede the lower-conf version, but stale data predates the fix
+- alice has wrong-direction fact (`alice parent_of ${USER}` at conf=1.0) — if ingested fresh, bidirectional validation would supersede the lower-conf version, but stale data predates the fix
 - emma has only one spouse direction — symmetric rel_type should have both
 
 ## Root Causes
@@ -53,7 +53,7 @@ Both directions exist for charlie↔alice↔bob — sibling_of facts look comple
 **Phase B: Ingest auto-create (src/api/main.py, _validate_bidirectional_relationships):**
 Return "create_inverse" when no inverse exists, and at the call site, append an auto-created inverse row with the same confidence and fact_class.
 
-**Stale data cleanup:** Existing gaps (`bob child_of chris` → missing parent_of, `alice parent_of chris` → wrong direction, `emma spouse chris` → missing inverse) need manual DB correction or a one-time migration.
+**Stale data cleanup:** Existing gaps (`bob child_of ${USER}` → missing parent_of, `alice parent_of ${USER}` → wrong direction, `emma spouse ${USER}` → missing inverse) need manual DB correction or a one-time migration.
 
 ## References
 

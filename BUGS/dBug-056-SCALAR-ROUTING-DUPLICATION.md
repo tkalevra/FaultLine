@@ -30,7 +30,7 @@ else:
 
 ## Observed Behavior
 
-Test case: Ingest "My name is John, I prefer to be called Chris" + family data
+Test case: Ingest "My name is John, I prefer to be called ${USER}" + family data
 
 **Facts table contains:**
 ```
@@ -98,7 +98,7 @@ DELETE FROM entity_attributes;
 # Ingest via OpenWebUI API
 curl -X POST https://docker-host.helpalicekpro.ca/api/chat/completions \
   -H "Authorization: Bearer sk-..." \
-  -d '{"model":"faultline-test","messages":[{"role":"user","content":"My name is John, I prefer to be called Chris"}]}'
+  -d '{"model":"faultline-test","messages":[{"role":"user","content":"My name is John, I prefer to be called ${USER}"}]}'
 
 # Check facts table
 SELECT rel_type, COUNT(*) FROM facts GROUP BY rel_type;
