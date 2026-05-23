@@ -16,15 +16,15 @@ The system's strength is self-learning. The problem is NOT that extraction is pe
 
 When ingesting family data:
 ```
-My name is John, I prefer to be called Chris. My spouses name is Marla, she prefers emma. 
+My name is John, I prefer to be called ${USER}. My spouses name is Marla, she prefers emma. 
 We have 3 children, alicemonde(M,12) who goes by alice, diana(F,10) prefers bob, and charlie 19. 
 emma has a pet dog named Fraggle
 ```
 
-Expected entities: ~11 (John, Chris, Marla, emma, alicemonde, alice, diana, bob, charlie, Cy, Fraggle)
+Expected entities: ~11 (John, ${USER}, Marla, emma, alicemonde, alice, diana, bob, charlie, ${CHILD2}, Fraggle)
 
 **Actual entities created: 40+**, including:
-- Real names: john, chris, marla, emma, alice, alicemonde, diana, bob, charlie, cy, fraggle ✓
+- Real names: john, ${USER}, marla, emma, alice, alicemonde, diana, bob, charlie, ${CHILD2}, fraggle ✓
 - **Garbage words**: called, children, detected, entities, goes, has, my, named, person, pet, prefer, prefers, she, spouses, we, alicemonde(m,12, diana(f,10
 - **From corrections**: 10, 12, 19 (numbers as entities), actually, any, call, f, m, not, sorry, pets
 
@@ -96,11 +96,11 @@ ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d fau
 ### Step 2: Ingest Family Statement
 ```bash
 curl -s -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
-  -H "Authorization: Bearer ***REDACTED-API-KEY***" \
+  -H "Authorization: Bearer ${BEARER_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "faultline-test",
-    "messages": [{"role": "user", "content": "My name is John, I prefer to be called Chris. My spouses name is Marla, she prefers emma. We have 3 children, alicemonde(M,12) who goes by alice, diana(F,10) prefers bob, and charlie 19. emma has a pet dog named Fraggle"}],
+    "messages": [{"role": "user", "content": "My name is John, I prefer to be called ${USER}. My spouses name is Marla, she prefers emma. We have 3 children, alicemonde(M,12) who goes by alice, diana(F,10) prefers bob, and charlie 19. emma has a pet dog named Fraggle"}],
     "stream": false
   }'
 ```
@@ -143,11 +143,11 @@ entity_aliases (FINAL STATE):
 ### Real vs Fake Entity Count
 ```
 Real (intended):
- - john, chris (1 person, 2 aliases)
+ - john, ${USER} (1 person, 2 aliases)
  - marla, emma (1 person, 2 aliases)
  - alicemonde, alice (1 person, 2 aliases)
  - diana, bob (1 person, 2 aliases)
- - charlie, cy (1 person, 2 aliases)
+ - charlie, ${CHILD2} (1 person, 2 aliases)
  - fraggle (1 pet)
 Total expected: 11 aliases
 
@@ -274,7 +274,7 @@ entity_aliases (EXPECTED):
  alias       | is_preferred 
 --------------+--------------
  john  | f
- chris        | t
+ ${USER}        | t
  marla        | f
  emma         | t
  alicemonde     | f
@@ -282,7 +282,7 @@ entity_aliases (EXPECTED):
  diana    | f
  bob        | t
  charlie        | f
- cy           | t
+ ${CHILD2}           | t
  fraggle      | t
 (11 rows)  ← NOT 40+
 ```

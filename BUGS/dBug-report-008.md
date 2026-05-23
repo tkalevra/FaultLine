@@ -16,10 +16,10 @@
 ### Backend Data (Verified Clean)
 ```sql
 -- Facts table (all correct):
-chris parent_of alice (conf=1, A)
-chris parent_of charlie (conf=1, A)
-bob child_of chris (conf=1, A)
-chris spouse emma (conf=1, A)
+${USER} parent_of alice (conf=1, A)
+${USER} parent_of charlie (conf=1, A)
+bob child_of ${USER} (conf=1, A)
+${USER} spouse emma (conf=1, A)
 
 -- Entity attributes (ages):
 alice: 12, charlie: 19, bob: 10
@@ -33,17 +33,17 @@ alice: 12, charlie: 19, bob: 10
 Total facts returned: 36
 Family facts duplicated:
   user parent_of alice (conf=1.0)
-  chris parent_of alice (conf=1.0)  ← DUPLICATE, same relationship
+  ${USER} parent_of alice (conf=1.0)  ← DUPLICATE, same relationship
   user parent_of charlie (conf=1.0)
-  chris parent_of charlie (conf=1.0) ← DUPLICATE, same relationship
+  ${USER} parent_of charlie (conf=1.0) ← DUPLICATE, same relationship
   bob child_of user (conf=1.0)
-  bob child_of chris (conf=1.0)  ← DUPLICATE, same relationship
+  bob child_of ${USER} (conf=1.0)  ← DUPLICATE, same relationship
 ```
 
 ### Root Cause
 
 The `/query` endpoint is returning facts with **dual subject display names:**
-- Facts where subject is user (UUID: 3f8e6836...) displayed as both "user" and "chris"
+- Facts where subject is user (UUID: 3f8e6836...) displayed as both "user" and "${USER}"
 - Produces duplicate family relationships in response
 
 This breaks the expected behavior of **dprompt-61 deduplication** which should return ONE fact per `(subject_id, rel_type, object_id)` triple.
@@ -57,15 +57,15 @@ This breaks the expected behavior of **dprompt-61 deduplication** which should r
 **Current response inclualice:**
 ```
 user parent_of alice
-chris parent_of alice     ← Same fact, different display name
+${USER} parent_of alice     ← Same fact, different display name
 user parent_of charlie
-chris parent_of charlie   ← Same fact, different display name
+${USER} parent_of charlie   ← Same fact, different display name
 ```
 
 **Expected response:**
 ```
-chris parent_of alice     ← Single fact, normalized display
-chris parent_of charlie   ← Single fact, normalized display
+${USER} parent_of alice     ← Single fact, normalized display
+${USER} parent_of charlie   ← Single fact, normalized display
 ```
 
 ## Impact
@@ -94,7 +94,7 @@ chris parent_of charlie   ← Single fact, normalized display
 
 **Validation Method:**
 ```bash
-curl -X POST http://192.168.1.10:8001/query \
+curl -X POST http://${BACKEND_IP}:8001/query \
   -d '{"user_id":"3f8e6836-72e3-43d4-bbc5-71fc8668b070","text":"How many children do I have"}' \
   | jq '.facts | map(select(.rel_type=="parent_of")) | unique_by(.subject + .rel_type + .object) | length'
 # Expected: 2 (alice, charlie)

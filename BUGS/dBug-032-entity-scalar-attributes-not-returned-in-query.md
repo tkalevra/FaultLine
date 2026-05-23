@@ -30,8 +30,8 @@ These facts are then deduplicated against UUID-keyed facts, but because they're 
 
 **Ingest log (14:38:48) shows successful storage:**
 ```
-ingest.scalar_stored attribute=age entity=fbb0eca9-709a-5517-b645-595a75ecf866 raw_input=12 user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab value_int=12
-ingest.scalar_stored attribute=age entity=2e0d4a79-9e76-5288-adc9-2a0d5e9be7f7 raw_input=16 user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab value_int=16
+ingest.scalar_stored attribute=age entity=fbb0eca9-709a-5517-b645-595a75ecf866 raw_input=12 user_id=${TEST_USER_ID} value_int=12
+ingest.scalar_stored attribute=age entity=2e0d4a79-9e76-5288-adc9-2a0d5e9be7f7 raw_input=16 user_id=${TEST_USER_ID} value_int=16
 ingest.class_a_committed count=4
 ```
 
@@ -79,7 +79,7 @@ The problem is inconsistency in scalar attribute storage:
 
 ### Option B: Convert entity_attributes to facts in /query
 - Modify `_attributes_to_facts()` to create proper facts entries with display-name subject_id
-- Benefits: Backward compatible, no schema changes
+- Benefits: Bac${LOCATION}ard compatible, no schema changes
 - Trade-off: Conversion happens at query time (minor perf impact)
 
 ### Option C: Fix deduplication to match UUID scalars to display-name facts

@@ -10,7 +10,7 @@ Relationship facts (lives_at, spouse) are stored in database but invisible to /q
 
 ### Evidence
 
-**Database state for user 10d7d879-63cd-4f31-92ce-f2c9edb760ab:**
+**Database state for user ${TEST_USER_ID}:**
 
 Entity a91f8c22-7deb-5d6a-951f-9be50b1b1e07:
 - ✓ Has lives_at facts (54931c58, 6860bb69)
@@ -41,7 +41,7 @@ Extraction creates multiple Person entities during processing:
 2. a91f8c22 — gets created for relationship facts, no identity anchor
 3. fbb0eca9, fb0868c4, 2e0d4a79 — other entities with pref_name
 
-When extraction sees "I live at X", it should anchor the lives_at fact to the PRIMARY identity entity (the one with pref_name="chris"). Instead, it creates a new ephemeral entity a91f8c22 and orphans it.
+When extraction sees "I live at X", it should anchor the lives_at fact to the PRIMARY identity entity (the one with pref_name="${USER}"). Instead, it creates a new ephemeral entity a91f8c22 and orphans it.
 
 ## Impact
 

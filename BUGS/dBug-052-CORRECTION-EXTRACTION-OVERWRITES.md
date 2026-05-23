@@ -11,15 +11,15 @@
 
 ## Problem Statement
 
-User correction "Call charlie Cy instead" triggers extraction of **three conflicting triples**, with the last one overwriting the intended change:
+User correction "Call charlie ${CHILD2} instead" triggers extraction of **three conflicting triples**, with the last one overwriting the intended change:
 
 ```
-1. (charlie, also_known_as, cy)    ← Correct
-2. (cy, pref_name, cy)            ← Wrong: subject is alias, not entity
+1. (charlie, also_known_as, ${CHILD2})    ← Correct
+2. (${CHILD2}, pref_name, ${CHILD2})            ← Wrong: subject is alias, not entity
 3. (charlie, pref_name, charlie)      ← Overwrites: keeps old value
 ```
 
-**Result**: `pref_name` remains "charlie" instead of becoming "cy". Only the intermediate `also_known_as` persists.
+**Result**: `pref_name` remains "charlie" instead of becoming "${CHILD2}". Only the intermediate `also_known_as` persists.
 
 **Impact**: All corrections that require changing a preferred name fail silently. User feedback confirms change accepted, but database state unchanged.
 
@@ -28,21 +28,21 @@ User correction "Call charlie Cy instead" triggers extraction of **three conflic
 ## Root Cause Analysis
 
 ### Symptom Chain
-1. Filter detects correction pattern: "call charlie Cy" → `triggered pattern: "call_nickname"`
+1. Filter detects correction pattern: "call charlie ${CHILD2}" → `triggered pattern: "call_nickname"`
 2. LLM generates correction response (acknowledged to user)
 3. `/ingest` POST sent with triple set
 4. Triples ingested successfully (logs: `ingest.scalar_stored`)
 5. Database UPDATED with all three triples (confirmed via entity_attributes)
-6. **Last triple wins**: `(charlie, pref_name, charlie)` overwrites `(charlie, pref_name, cy)`
+6. **Last triple wins**: `(charlie, pref_name, charlie)` overwrites `(charlie, pref_name, ${CHILD2})`
 
 ### Log Evidence
 ```
-19:16:32 ingest.object_kept_as_scalar object=cy rel_type=also_known_as
-         ingest.scalar_stored ... cy as also_known_as ✓
+19:16:32 ingest.object_kept_as_scalar object=${CHILD2} rel_type=also_known_as
+         ingest.scalar_stored ... ${CHILD2} as also_known_as ✓
 
-19:16:33 entity_registry.alias_registered alias=cy preferred=True
-         ingest.subject_resolved_at_extraction input=cy output=55c13545... (charlie UUID)
-         ingest.scalar_stored ... cy as pref_name ✓ (but wrong subject?)
+19:16:33 entity_registry.alias_registered alias=${CHILD2} preferred=True
+         ingest.subject_resolved_at_extraction input=${CHILD2} output=55c13545... (charlie UUID)
+         ingest.scalar_stored ... ${CHILD2} as pref_name ✓ (but wrong subject?)
 
 19:16:33 ingest.subject_resolved_at_extraction input=charlie output=55c13545...
          ingest.scalar_stored ... charlie as pref_name ✓ (OVERWRITES ABOVE)
@@ -51,15 +51,15 @@ User correction "Call charlie Cy instead" triggers extraction of **three conflic
 ### Why It Happens
 The **correction extraction LLM** is generating three separate triples instead of one:
 
-1. **Primary correction**: `(charlie, also_known_as, cy)` — Add alias
-2. **Alias-as-entity**: `(cy, pref_name, cy)` — Treat alias as entity with self-preference (wrong)
+1. **Primary correction**: `(charlie, also_known_as, ${CHILD2})` — Add alias
+2. **Alias-as-entity**: `(${CHILD2}, pref_name, ${CHILD2})` — Treat alias as entity with self-preference (wrong)
 3. **Entity preservation**: `(charlie, pref_name, charlie)` — Keep original (defeats correction)
 
 The triple generation order matters because PostgreSQL's `ON CONFLICT (user_id, entity_id, attribute) DO UPDATE` processes them sequentially. The last INSERT/UPDATE wins.
 
 ### Why This Is Hard to Detect
 - No database error (all UPDATEs succeed)
-- User receives LLM confirmation ("I'll call them Cy")
+- User receives LLM confirmation ("I'll call them ${CHILD2}")
 - No log error — `ingest.scalar_stored` logs all three successfully
 - Test looks passing (LLM response received, no timeouts)
 - Only database state inspection reveals data didn't change
@@ -70,7 +70,7 @@ The triple generation order matters because PostgreSQL's `ON CONFLICT (user_id, 
 
 **All correction types that require changing preferred metadata**:
 - ✅ Temporary aliases (also_known_as) — **WORK**
-- ❌ Preferred name changes — **FAIL** (e.g., "call Cy instead of charlie")
+- ❌ Preferred name changes — **FAIL** (e.g., "call ${CHILD2} instead of charlie")
 - ❌ Correction confidence/provenance — **UNKNOWN** (untested)
 - ❓ Identity fact corrections — **UNCLEAR** (may suffer same issue)
 
@@ -84,17 +84,17 @@ The triple generation order matters because PostgreSQL's `ON CONFLICT (user_id, 
 
 ```bash
 # Via OpenWebUI
-1. Send message: "call charlie Cy instead"
-2. Confirm LLM responds: "Understood! I'll refer to charlie as Cy..."
+1. Send message: "call charlie ${CHILD2} instead"
+2. Confirm LLM responds: "Understood! I'll refer to charlie as ${CHILD2}..."
 3. Check database:
    SELECT value_text FROM entity_attributes 
    WHERE entity_id='55c13545...' AND attribute='pref_name';
-   -- Expected: 'cy'
+   -- Expected: '${CHILD2}'
    -- Actual: 'charlie' (unchanged)
 4. Check also_known_as:
    SELECT value_text FROM entity_attributes 
    WHERE entity_id='55c13545...' AND attribute='also_known_as';
-   -- Correct: 'cy' (alias added, but preferred name not changed)
+   -- Correct: '${CHILD2}' (alias added, but preferred name not changed)
 ```
 
 **Confirmed on**: 2026-05-18 19:16:32 UTC (test request #4)
@@ -112,7 +112,7 @@ The triple generation order matters because PostgreSQL's `ON CONFLICT (user_id, 
 
 **Effort**: 2–3 hours (prompt tuning + validation logic)  
 **Risk**: Low (isolated to extraction, no schema changes)  
-**Test**: Re-run test #4, verify `pref_name='cy'` in database
+**Test**: Re-run test #4, verify `pref_name='${CHILD2}'` in database
 
 ### Option B: Post-Ingest Conflict Resolution
 **Approach**: Add deduplication pass after all triples ingested, before database commit  
@@ -148,8 +148,8 @@ dprompt-117: Fix Correction Extraction Triple Generation
 
 1. Locate correction LLM prompt in openwebui/faultline_function.py (or backend)
    - Find the section that generates structured correction output
-   - Current: generates (charlie, also_known_as, cy), (cy, pref_name, cy), (charlie, pref_name, charlie)
-   - Target: generate only (charlie, pref_name, cy)
+   - Current: generates (charlie, also_known_as, ${CHILD2}), (${CHILD2}, pref_name, ${CHILD2}), (charlie, pref_name, charlie)
+   - Target: generate only (charlie, pref_name, ${CHILD2})
 
 2. Add validation to reject/consolidate conflicting triples
    - Group by (entity, attribute)
@@ -157,7 +157,7 @@ dprompt-117: Fix Correction Extraction Triple Generation
    - Log any consolidations
 
 3. Test with full pipeline:
-   - "call charlie Cy" → verify pref_name='cy' in database
+   - "call charlie ${CHILD2}" → verify pref_name='${CHILD2}' in database
    - "alicemonde is 14 not 12" → verify age=14 stored
    - All 7 test steps should show persistent database state
 
@@ -193,9 +193,9 @@ dprompt-117: Fix Correction Extraction Triple Generation
 
 ### Direct /ingest Test
 ```
-User ID: 10d7d879-63cd-4f31-92ce-f2c9edb760ab
-Correction: "Actually, I prefer to be called John, not Chris"
-Expected: pref_name changes from 'john' → 'cy' for charlie entity
+User ID: ${TEST_USER_ID}
+Correction: "Actually, I prefer to be called John, not ${USER}"
+Expected: pref_name changes from 'john' → '${CHILD2}' for charlie entity
 ```
 
 **Database State After Correction:**
@@ -205,15 +205,15 @@ SELECT attribute, value_text FROM entity_attributes
 WHERE entity_id='55c13545-3f9a-5798-8827-c35e7c9cfa70';
 
 Result:
-  pref_name  | cy        ✅ CHANGED
-  also_known_as | cy    ✅ ADDED
+  pref_name  | ${CHILD2}        ✅ CHANGED
+  also_known_as | ${CHILD2}    ✅ ADDED
 
 -- entity_aliases (authoritative preferred flag)
 SELECT alias, is_preferred FROM entity_aliases 
 WHERE entity_id='55c13545-3f9a-5798-8827-c35e7c9cfa70';
 
 Result:
-  cy     | true      ✅ PREFERRED
+  ${CHILD2}     | true      ✅ PREFERRED
   charlie  | false     ✅ FALLBACK
 ```
 

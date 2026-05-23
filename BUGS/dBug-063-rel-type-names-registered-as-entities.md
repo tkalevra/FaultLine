@@ -38,7 +38,7 @@ cur.execute("INSERT INTO entity_aliases ...")
 
 The code had no way to distinguish between:
 - `parent_of` (a relationship type that should NEVER be an entity)
-- `chris` (a person name that SHOULD be an entity)
+- `${USER}` (a person name that SHOULD be an entity)
 
 ---
 
@@ -91,8 +91,8 @@ The LLM received corrupted facts, producing incoherent responses.
 
 | What Should Happen | What Actually Happened |
 |---|---|
-| `user -parent_of-> chris` (chris is a Person entity) | `user -parent_of-> parent_of` (parent_of is a rel_type, not entity) |
-| `chris -instance_of-> person` (person is a type/class) | `chris -instance_of-> instance_of` (instance_of is a rel_type, not entity) |
+| `user -parent_of-> ${USER}` (${USER} is a Person entity) | `user -parent_of-> parent_of` (parent_of is a rel_type, not entity) |
+| `${USER} -instance_of-> person` (person is a type/class) | `${USER} -instance_of-> instance_of` (instance_of is a rel_type, not entity) |
 | Facts reference real entities | Facts reference rel_type names as if they were entities |
 
 ### System Failures
@@ -248,7 +248,7 @@ except ValueError as e:
 ### Test Case 2: Normal Entity Names Still Work
 
 ```python
-result = registry.resolve("test_user", "chris")
+result = registry.resolve("test_user", "${USER}")
 assert isinstance(result, str) and len(result) == 36  # Valid UUID
 print("✅ Normal entity names still resolve correctly")
 ```
@@ -308,7 +308,7 @@ docker restart faultline
 ## Related Issues
 
 - **dBug-062** — LLM extraction rel_type confusion (dprompt-127 fix)
-- **dBug-art-false-children** — False entity creation (upstream symptom)
+- **dBug-${ENTITY}-false-children** — False entity creation (upstream symptom)
 
 This bug is separate from dprompt-127, which fixed extraction confusion. dBug-063 fixes the **downstream entity registry validation** that should have prevented rel_types from becoming entities in the first place.
 

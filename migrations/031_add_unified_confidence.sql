@@ -1,6 +1,6 @@
 -- Migration: Add unified_confidence column to facts table
 -- Supports LLMOutputValidator unified confidence scoring (frequency + llm confidence blend)
--- Default to existing confidence value for backward compatibility
+-- Default to existing confidence value for bac${LOCATION}ard compatibility
 
 ALTER TABLE facts
   ADD COLUMN IF NOT EXISTS unified_confidence DOUBLE PRECISION DEFAULT 1.0;

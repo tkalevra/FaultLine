@@ -4,7 +4,7 @@
 **Severity:** Critical (CLAUDE.md constraint violation)  
 **Reported:** 2026-05-16 (post-testing)  
 **System:** Production (FaultLine main)  
-**Affected User:** 10d7d879-63cd-4f31-92ce-f2c9edb760ab (test user)
+**Affected User:** ${TEST_USER_ID} (test user)
 **Deployment:** Commit 3be04a5 (prod main)
 
 ---

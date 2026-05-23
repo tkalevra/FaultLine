@@ -9,24 +9,24 @@
 
 ## Broken Behavior
 
-**Query:** `/query` for user `10d7d879-63cd-4f31-92ce-f2c9edb760ab`, text "tell me about my family"
+**Query:** `/query` for user `${TEST_USER_ID}`, text "tell me about my family"
 
 **Returns 45 facts with CRITICAL ISSUES:**
 
-### Issue 1: Contradictory Facts About Aurora
+### Issue 1: Contradictory Facts About ${ENTITY}
 ```
-Fact 3:  aurora instance_of pet        ✓
-Fact 4:  aurora not_instance_of pet    ✗ (contradicts above)
+Fact 3:  ${ENTITY} instance_of pet        ✓
+Fact 4:  ${ENTITY} not_instance_of pet    ✗ (contradicts above)
 ```
-**Problem:** Both facts returned. LLM cannot resolve: is Aurora a pet or not?
+**Problem:** Both facts returned. LLM cannot resolve: is ${ENTITY} a pet or not?
 
 ### Issue 2: User Entity Identity Fragmented
 ```
 Fact 1:   user pref_name ca
-Subject references: chris, we, ca, user, d414434d-...
+Subject references: ${USER}, we, ca, user, d414434d-...
 ```
 **Problem:** 
-- Facts reference user as "chris", "we", "user", and UUID
+- Facts reference user as "${USER}", "we", "user", and UUID
 - No unified entity anchor
 - LLM sees disconnected family members
 
@@ -37,7 +37,7 @@ Fact 7: alice child_of we       ✗ (pronoun in fact)
 ```
 **Problem:** 
 - "we" appears as subject (pronoun should have been rejected by dBug-025 validation)
-- Should reference "chris" or user UUID, not "we"
+- Should reference "${USER}" or user UUID, not "we"
 
 ### Issue 4: Missing Children
 **Expected:** charlie, bob, alice (3 children)  
@@ -53,13 +53,13 @@ Fact 7: alice child_of we       ✗ (pronoun in fact)
 ## Root Causes
 
 ### 1. Contradictory Facts in PostgreSQL
-- Both `aurora instance_of pet` AND `aurora not_instance_of pet` stored
-- User correction ("Aurora is a computer") created `not_instance_of` but didn't supersede original
+- Both `${ENTITY} instance_of pet` AND `${ENTITY} not_instance_of pet` stored
+- User correction ("${ENTITY} is a computer") created `not_instance_of` but didn't supersede original
 - Both returned by query → LLM confused
 
 ### 2. User Entity Not Normalized
 - Child facts reference "we" (pronoun from failed extraction)
-- Parent facts reference "chris" (display name)
+- Parent facts reference "${USER}" (display name)
 - User identity fact references "ca" (alias)
 - Query returns all variants without consolidation
 
@@ -77,12 +77,12 @@ Fact 7: alice child_of we       ✗ (pronoun in fact)
 
 ## Data State
 
-**PostgreSQL facts for user `10d7d879-63cd-4f31-92ce-f2c9edb760ab`:**
+**PostgreSQL facts for user `${TEST_USER_ID}`:**
 ```
 Total: 45 returned by /query
 Issues:
-- aurora instance_of pet (old)
-- aurora not_instance_of pet (new correction)
+- ${ENTITY} instance_of pet (old)
+- ${ENTITY} not_instance_of pet (new correction)
 - we parent_of alice (pronoun, should be deleted)
 - alice child_of we (pronoun, should be deleted)
 - charlie/bob child relationships missing
@@ -107,16 +107,16 @@ Issues:
 ```json
 [
   {"subject": "user", "rel_type": "pref_name", "object": "ca"},
-  {"subject": "aurora", "rel_type": "instance_of", "object": "pet"},
-  {"subject": "aurora", "rel_type": "not_instance_of", "object": "pet"},  // CONFLICT
-  {"subject": "chris", "rel_type": "has_pet", "object": "aurora"},
+  {"subject": "${ENTITY}", "rel_type": "instance_of", "object": "pet"},
+  {"subject": "${ENTITY}", "rel_type": "not_instance_of", "object": "pet"},  // CONFLICT
+  {"subject": "${USER}", "rel_type": "has_pet", "object": "${ENTITY}"},
   {"subject": "we", "rel_type": "parent_of", "object": "alice"},            // PRONOUN
   {"subject": "alice", "rel_type": "child_of", "object": "we"}              // PRONOUN
 ]
 ```
 
 **Test 2: "who is my spouse"**
-- /query returns: `chris spouse emma` ✓
+- /query returns: `${USER} spouse emma` ✓
 - LLM response: "No spouse record found" ✗
 - Status: Fact available but LLM not using it
 
@@ -142,7 +142,7 @@ Issues:
    - If no: Were they deleted? When?
 
 4. **User entity identity fragmentation**
-   - Facts reference: "user", "chris", "we", "ca", UUID
+   - Facts reference: "user", "${USER}", "we", "ca", UUID
    - Should /query normalize to one representation?
    - Check: `_resolve_display_names()` logic
 
@@ -158,23 +158,23 @@ Issues:
 Run these in pre-prod to diagnose:
 
 ```sql
--- Check contradictory aurora facts
+-- Check contradictory ${ENTITY} facts
 SELECT subject_id, object_id, rel_type, confidence, superseded_at 
 FROM facts 
-WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
-AND (subject_id LIKE '%aurora%' OR object_id LIKE '%aurora%')
+WHERE user_id = '${TEST_USER_ID}' 
+AND (subject_id LIKE '%${ENTITY}%' OR object_id LIKE '%${ENTITY}%')
 ORDER BY created_at DESC;
 
 -- Check for "we" pronoun facts (should be none)
 SELECT subject_id, object_id, rel_type 
 FROM facts 
-WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+WHERE user_id = '${TEST_USER_ID}' 
 AND subject_id = 'we';
 
 -- Check children (should find charlie, bob, alice)
 SELECT subject_id, object_id, rel_type 
 FROM facts 
-WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+WHERE user_id = '${TEST_USER_ID}' 
 AND (rel_type = 'child_of' OR rel_type = 'parent_of')
 ORDER BY subject_id, object_id;
 ```

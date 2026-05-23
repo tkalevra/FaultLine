@@ -124,6 +124,58 @@ class Function:
             if e.get("subject") and e.get("object") and e.get("rel_type")
         ]
 
+    def _detect_retraction_signal(self, text: str) -> bool:
+        """
+        Detect retraction intent from user message.
+        Quick regex-based pattern matching for efficiency.
+
+        Patterns:
+        - "forget", "delete", "remove", "no longer", "not [X] anymore"
+        - "changed from", "was [X] now", "[X] not [Y]"
+        - "wrong", "incorrect", "mistake", "actually"
+        """
+        import re
+
+        text_lower = text.lower()
+
+        # Retraction signal patterns
+        patterns = [
+            r'\b(forget|delete|remove|erase)\b',
+            r'\b(no longer|not anymore|never)\b',
+            r'\b(was|changed from)\b',
+            r'\bnot\s+(my|a|an|the)\b',
+            r'\b(actually|really|i meant|i meant to say)\b',
+            r'\b(wrong|incorrect|mistake|typo)\b',
+            r'\b(not\s+\w+\s+but|instead\s+of)\b',
+        ]
+
+        for pattern in patterns:
+            if re.search(pattern, text_lower):
+                return True
+
+        return False
+
+    async def _fetch_recent_facts(
+        self, user_id: str, limit: int = 20
+    ) -> list[dict]:
+        """
+        Fetch recent facts for this user from backend for context.
+        Used by retraction extraction to resolve entities.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{self.valves.FAULTLINE_URL}/user/{user_id}/recent-facts?limit={limit}",
+                    timeout=self.valves.FAULTLINE_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("facts", [])
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine] fetch_recent_facts failed: {str(e)}")
+            return []
+
     async def store_fact(
         self,
         text: str,
@@ -166,7 +218,7 @@ class Function:
                 )
             resp.raise_for_status()
             data = resp.json()
-            raw_triples = data.get("triples", data.get("edges", []))
+            raw_edges = data.get("edges", [])
         except httpx.ConnectError as e:
             await self._emit(
                 __event_emitter__,
@@ -187,10 +239,10 @@ class Function:
             return f"[FaultLine] Extraction failed: {str(e)}"
 
         if self.valves.ENABLE_DEBUG:
-            print(f"[FaultLine] raw_triples from /extract/rewrite: {json.dumps(raw_triples, indent=2)}")
+            print(f"[FaultLine] raw_edges from /extract/rewrite: {json.dumps(raw_edges, indent=2)}")
 
-        # Strip low-confidence edges
-        confident = [e for e in raw_triples if not e.get("low_confidence", False)]
+        # Strip low-confidence edges (weight-based filtering optimization)
+        confident = [e for e in raw_edges if not e.get("low_confidence", False)]
 
         # Remove the low_confidence key — EdgeInput does not accept it
         edges = [

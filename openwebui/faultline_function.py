@@ -21,65 +21,82 @@ from pydantic import BaseModel, Field
 
 # Add src directory to path for imports (dBug-046 Phase 2b)
 try:
-    sys.path.insert(0, '/home/chris/Documents/013-GIT/FaultLine-dev')
+    sys.path.insert(0, '/home/${USER}/Documents/013-GIT/FaultLine-dev')
     from src.api.llm_output_validator import LLMOutputValidator
 except ImportError:
     LLMOutputValidator = None  # Graceful fallback if validator unavailable
 
 
-# Auto-detect OpenWebUI endpoint at module import time (dprompt-111)
-def _detect_openwebui_endpoint() -> Optional[str]:
-    """Auto-detect OpenWebUI endpoint. Tries common addresses in order of likelihood."""
+# Endpoint Detection: Container-First, Env-Override, No Hardcoded IPs (dprompt-134)
+# Pattern: Try container names first (Docker Compose), then env var, then localhost, never hardcode IPs
+
+def _detect_openwebui_llm_endpoint() -> Optional[str]:
+    """Auto-detect OpenWebUI LLM endpoint (port 3000 for API calls).
+
+    Priority:
+    1. OPENWEBUI_LLM_URL env var (explicit override)
+    2. Container DNS (http://open-webui:3000) — Docker Compose network
+    3. Localhost (http://localhost:3000) — development
+    4. None — caller will handle fallback
+
+    Note: OpenWebUI serves API on :3000, not :8080 (which is internal web server)
+    """
     candidates = [
-        "http://open-webui:8080",      # Docker service name (most likely)
-        "http://localhost:8080",        # Local development
-        "http://127.0.0.1:8080",        # Localhost IPv4
-        os.environ.get("OPENWEBUI_URL"), # Explicit env var override
+        os.environ.get("OPENWEBUI_LLM_URL"),  # Explicit override takes priority
+        "http://open-webui:3000",              # Docker Compose service name (most likely in production)
+        "http://localhost:3000",               # Local development default
+        "http://127.0.0.1:3000",               # Explicit localhost IPv4
     ]
 
     for endpoint in candidates:
         if not endpoint:
             continue
         try:
-            # Quick health check via /api/models
+            # Quick health check via /api/models (reliable indicator of LLM endpoint availability)
             resp = httpx.get(f"{endpoint}/api/models", timeout=2.0, follow_redirects=True)
             if resp.status_code == 200:
                 return endpoint
         except Exception:
-            continue
+            pass
 
     return None
 
 
-_OPENWEBUI_ENDPOINT = _detect_openwebui_endpoint()
+def _detect_faultline_backend_endpoint() -> Optional[str]:
+    """Auto-detect FaultLine backend endpoint (port 8001 for ingest/query/retract).
 
+    Priority:
+    1. FAULTLINE_URL env var (explicit override)
+    2. Container DNS (http://faultline:8001) — Docker Compose network
+    3. Localhost (http://localhost:8001) — development
+    4. None — caller will handle fallback
 
-def _detect_faultline_endpoint() -> Optional[str]:
-    """Auto-detect FaultLine backend endpoint. Tries common addresses in order of likelihood."""
+    No hardcoded IPs (e.g., no ${BACKEND_IP}). Use container names in Docker, env vars elsewhere.
+    """
     candidates = [
-        os.environ.get("FAULTLINE_URL"),   # Explicit env var override (check first)
-        "http://faultline:8000",            # Docker service name (same network, most reliable)
-        "http://localhost:8001",            # Local development
-        "http://127.0.0.1:8001",            # Localhost IPv4
-        "http://192.168.1.10:8001",        # Production IP (fallback)
+        os.environ.get("FAULTLINE_URL"),      # Explicit override takes priority
+        "http://faultline:8001",               # Docker Compose service name (most likely in production)
+        "http://localhost:8001",               # Local development default
+        "http://127.0.0.1:8001",               # Explicit localhost IPv4
     ]
 
     for endpoint in candidates:
         if not endpoint:
             continue
         try:
-            # Quick health check via /correction-signals endpoint
-            resp = httpx.get(f"{endpoint}/correction-signals", timeout=2.0, follow_redirects=True)
+            # Quick health check via /health endpoint (reliable indicator of backend availability)
+            resp = httpx.get(f"{endpoint}/health", timeout=2.0, follow_redirects=True)
             if resp.status_code == 200:
                 return endpoint
         except Exception:
-            continue
+            pass
 
     return None
 
 
-# FaultLine backend URL — auto-detect at module load time, with env var override
-_FAULTLINE_URL = os.getenv("FAULTLINE_URL") or _detect_faultline_endpoint() or "http://localhost:8001"
+# Module-level endpoint detection (runs once at import time)
+_OPENWEBUI_LLM_ENDPOINT = _detect_openwebui_llm_endpoint()
+_FAULTLINE_URL = os.getenv("FAULTLINE_URL") or _detect_faultline_backend_endpoint() or "http://localhost:8001"
 
 # Marker for internal FaultLine prompts sent to LLM (dprompt-128 surgical fix)
 # Any prompt generated by FaultLine internals (retraction detection, etc.) is prefixed with this.
@@ -315,6 +332,11 @@ _DEDUP_WINDOW: float = 5.0  # seconds — Redis EX timeout for key expiration
 _INLET_CALL_COUNTER: int = 0  # Module-level counter to detect if state persists across calls
 _FALLBACK_DEDUP_CACHE: dict = {}  # In-memory dedup cache if Redis unavailable: {key: timestamp}
 
+# Redis-backed /query response cache (growth mindset: cache reads, invalidate writes)
+# Key: query:cache:{user_id}:{query_hash} | Value: JSON-serialized /query response | TTL: 30s
+_QUERY_CACHE_TTL: int = 30  # seconds — aggressive caching for reads, smart invalidation on writes
+_FALLBACK_QUERY_CACHE: dict = {}  # In-memory fallback: {cache_key: (timestamp, response)}
+
 def _check_dedup_fallback(dedup_key: str, window: float) -> bool:
     """Check dedup via in-memory cache (fallback when Redis unavailable).
     Returns True if this is a new message (should process), False if duplicate (should skip).
@@ -338,6 +360,94 @@ def _check_dedup_fallback(dedup_key: str, window: float) -> bool:
     _FALLBACK_DEDUP_CACHE[dedup_key] = now
     return True  # New message — process it
 
+
+def _get_query_cache_key(user_id: str, query_text: str) -> str:
+    """Generate Redis cache key for /query response."""
+    import hashlib
+    query_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
+    return f"query:cache:{user_id}:{query_hash}"
+
+
+def _get_redis_client():
+    """Get Redis client for caching (graceful fallback if unavailable)."""
+    try:
+        import redis
+        redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        redis_client.ping()  # Test connection
+        return redis_client
+    except Exception:
+        return None  # Graceful fallback to in-memory cache
+
+
+def _get_cached_query_response(redis_client, cache_key: str) -> dict | None:
+    """Get /query response from Redis cache (or fallback in-memory cache)."""
+    import json
+    import time
+
+    # Try Redis first
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            pass  # Fallback to in-memory
+
+    # Fallback: in-memory cache
+    if cache_key in _FALLBACK_QUERY_CACHE:
+        ts, response = _FALLBACK_QUERY_CACHE[cache_key]
+        if (time.time() - ts) < _QUERY_CACHE_TTL:
+            return response
+        else:
+            del _FALLBACK_QUERY_CACHE[cache_key]
+
+    return None
+
+
+def _cache_query_response(redis_client, cache_key: str, response: dict) -> None:
+    """Cache /query response in Redis (or fallback in-memory cache)."""
+    import json
+    import time
+
+    # Try Redis first
+    if redis_client:
+        try:
+            redis_client.setex(cache_key, _QUERY_CACHE_TTL, json.dumps(response))
+            return
+        except Exception:
+            pass  # Fallback to in-memory
+
+    # Fallback: in-memory cache with cleanup
+    now = time.time()
+    _FALLBACK_QUERY_CACHE[cache_key] = (now, response)
+    # Cleanup old entries
+    expired = [k for k, (ts, _) in _FALLBACK_QUERY_CACHE.items() if (now - ts) >= _QUERY_CACHE_TTL]
+    for k in expired:
+        del _FALLBACK_QUERY_CACHE[k]
+
+
+def _invalidate_query_cache(redis_client, user_id: str) -> None:
+    """Invalidate ALL query cache for a user (called after ingest/correction/retraction)."""
+    import redis
+
+    if redis_client:
+        try:
+            # Delete all keys matching pattern query:cache:{user_id}:*
+            cursor = 0
+            while True:
+                cursor, keys = redis_client.scan(cursor, match=f"query:cache:{user_id}:*", count=100)
+                if keys:
+                    redis_client.delete(*keys)
+                if cursor == 0:
+                    break
+        except Exception:
+            pass  # Non-fatal, continue without cache invalidation
+
+    # Cleanup in-memory fallback for this user
+    expired_keys = [k for k in _FALLBACK_QUERY_CACHE.keys() if k.startswith(f"query:cache:{user_id}:")]
+    for k in expired_keys:
+        del _FALLBACK_QUERY_CACHE[k]
+
 # Conversation context — per-user pronoun/entity tracking across turns
 _CONVERSATION_CONTEXT: dict[str, dict] = {}
 _CONVERSATION_MAX_ENTITIES: int = 10  # prune entity mentions beyond this
@@ -347,7 +457,7 @@ _CONVERSATION_MAX_ENTITIES: int = 10  # prune entity mentions beyond this
 # Retraction Detection & Scope Extraction (dprompt-107)
 # ============================================================================
 
-def _get_retraction_signals_cached() -> dict:
+def _get_retraction_signals_cached(db_url: Optional[str] = None) -> dict:
     """Get retraction signals with TTL-based caching (lazy load at runtime).
 
     Loads from DB on first call or when TTL expires.
@@ -367,7 +477,8 @@ def _get_retraction_signals_cached() -> dict:
         return cached_data
 
     # Cache expired or empty — try to load from DB
-    db_url = os.getenv("POSTGRES_DSN")
+    # Use provided db_url (from valve) or Docker default (faultline-postgres service)
+    db_url = db_url or "postgresql://faultline:faultline@faultline-postgres:5432/faultline_test"
     if not db_url:
         _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
         return {}
@@ -394,7 +505,8 @@ def _get_retraction_signals_cached() -> dict:
         # Graceful fallback — cache empty on error, retry next time TTL expires
         _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
 
-    return cached_data
+    # Return cached data (updated or empty on error)
+    return _RETRACTION_SIGNALS_CACHE_WITH_TTL[1]
 
 
 def _detect_retraction_pattern(text: str, signals_cache: dict) -> tuple[bool, Optional[str]]:
@@ -507,7 +619,7 @@ async def _call_extract_rewrite(
 
             if response.status_code == 200:
                 data = response.json()
-                triples = data.get("triples", [])
+                triples = data.get("edges", [])
 
                 # Compute confidence signal = average of all triple confidences
                 if triples:
@@ -627,7 +739,9 @@ def _extract_categorical_scope(text: str, db_url: Optional[str] = None) -> dict:
         print(f"[FaultLine] extract_categorical_scope_failed: {e}")
 
     # Default: granular scope (individual fact)
-    # Extract from context or return empty (backend will handle via LLM if needed)
+    # LLM semantic detection (Layer 1) should extract granular facts.
+    # Pattern matching (Layer 2) should fall back to LLM for extraction if needed.
+    # Avoid hardcoded regex patterns — let the LLM learn from feedback.
     return {
         "scope_level": "granular",
         "category": None,
@@ -767,9 +881,18 @@ If nothing to extract: []"""
 
 
 def _resolve_llm_config(valves, body: dict) -> tuple[str, str]:
-    """Resolve LLM endpoint via auto-detected OpenWebUI. Uses dprompt-111 detection (no valve config needed)."""
+    """Resolve LLM endpoint: Valve override > auto-detected > localhost (for internal Filter calls).
+
+    Priority:
+    1. valves.OPENWEBUI_LLM_URL (admin override)
+    2. _OPENWEBUI_LLM_ENDPOINT (auto-detected at module import)
+    3. http://localhost:3000 (Docker Compose internal — Filter calls LLM from inside OpenWebUI)
+
+    Note: Container can't reach itself by service name (open-webui:3000) from inside.
+    Use localhost for internal calls (retraction extraction, etc).
+    """
     model = body.get("model", "")
-    url = _OPENWEBUI_ENDPOINT or "http://localhost:8080"
+    url = valves.OPENWEBUI_LLM_URL or _OPENWEBUI_LLM_ENDPOINT or "http://localhost:3000"
     return model, url
 
 
@@ -954,7 +1077,7 @@ def _extract_basic_facts(text: str) -> list[dict]:
     tl = text.lower()
 
     # Self-identification patterns: "my name is X", "I am X", "I'm X", "call me X"
-    # Also handle parenthetical forms like "I(Chris) am" or "I (Chris) am"
+    # Also handle parenthetical forms like "I(${USER}) am" or "I (${USER}) am"
     _ID_PATTERNS = [
         (re.compile(r"\bmy\s+name\s+is\s+([a-z]+)", re.IGNORECASE), "also_known_as"),
         (re.compile(r"\bi\s*(?:\(([a-z]+)\)|am\s+([a-z]+))", re.IGNORECASE), "also_known_as"),
@@ -984,7 +1107,7 @@ def _extract_basic_facts(text: str) -> list[dict]:
     for pattern, rel_type in _ID_PATTERNS:
         m = pattern.search(text)
         if m:
-            # Some patterns have multiple capture groups (e.g., "I(Chris) am" or "I am Chris")
+            # Some patterns have multiple capture groups (e.g., "I(${USER}) am" or "I am ${USER}")
             name = (m.group(1) or m.group(2) or "").lower().strip()
             if name and name not in _STOPWORDS and len(name) > 1:
                 edges.append({
@@ -1270,7 +1393,12 @@ class Filter:
     class Valves(BaseModel):
         FAULTLINE_URL: str = Field(
             default=_FAULTLINE_URL,
-            description="FaultLine backend API endpoint (auto-detected). Docker: http://faultline:8000"
+            description="FaultLine backend API endpoint (port 8001, auto-detected). Docker: http://faultline:8001"
+        )
+
+        OPENWEBUI_LLM_URL: str = Field(
+            default=_OPENWEBUI_LLM_ENDPOINT or "http://open-webui:3000",
+            description="OpenWebUI LLM endpoint for retraction extraction (port 3000 for API calls, NOT 8080). Docker: http://open-webui:3000"
         )
 
         ENABLED: bool = Field(
@@ -1313,13 +1441,18 @@ class Filter:
             description="Default provenance label for facts stored via store_context."
         )
 
+        POSTGRES_DSN: str = Field(
+            default="postgresql://faultline:faultline@faultline-postgres:5432/faultline_test",
+            description="PostgreSQL DSN for retraction signal loading. Docker: faultline-postgres service"
+        )
+
     def __init__(self):
         self.valves = self.Valves()
         # All caches now lazy-loaded at runtime:
         # - Retraction signals via _get_retraction_signals_cached()
         # - Correction signals via _get_correction_signals_cached()
         # No startup dependencies on DB/backend being ready.
-        self.db_url = os.getenv("POSTGRES_DSN")
+        self.db_url = self.valves.POSTGRES_DSN
 
     def _last_message(self, messages: list, role: str) -> Optional[str]:
         for m in reversed(messages):
@@ -1357,11 +1490,14 @@ class Filter:
             )
             response.raise_for_status()
             data = response.json()
-            # Bust session cache on successful ingest so next /query fetches fresh data
+            # Invalidate query cache on successful ingest (growth mindset: fresh data on writes)
             if data.get("status") not in ("error", None):
                 _SESSION_MEMORY_CACHE.pop(user_id, None)
+                # Invalidate Redis /query cache for this user
+                redis_client = _get_redis_client()
+                _invalidate_query_cache(redis_client, user_id)
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] cache busted for user_id=[redacted]")
+                    print(f"[FaultLine Filter] /query cache invalidated for user_id=[redacted] (fresh data on ingest)")
             return data
         except httpx.ConnectError as e:
             if self.valves.ENABLE_DEBUG:
@@ -1463,12 +1599,12 @@ Return valid JSON only. If no facts, return [].
             if user_uuid:
                 request_data["chat_id"] = user_uuid
 
-            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_SECS) as client:
                 resp = await client.post(
                     f"{url}/api/chat/completions",
                     json=request_data,
                     headers=headers,
-                    timeout=self.valves.QWEN_TIMEOUT,
+                    timeout=_LLM_TIMEOUT_SECS,
                 )
                 resp.raise_for_status()
 
@@ -1638,8 +1774,8 @@ Return valid JSON only. If no facts, return [].
             return None
 
         # Prefer most specific: find which location has other locations inside it
-        # via located_in relationships (e.g., kitchener is located_in ontario)
-        # So ontario has kitchener inside it, making kitchener more specific.
+        # via located_in relationships (e.g., ${LOCATION} is located_in ontario)
+        # So ontario has ${LOCATION} inside it, making ${LOCATION} more specific.
         contained_locs = set()
         for f in facts:
             if f.get("rel_type") == "located_in":
@@ -1677,65 +1813,63 @@ Return valid JSON only. If no facts, return [].
             directive += f" Additional context: {'; '.join(context_parts)}."
         return directive
 
+    async def _fetch_recent_facts(self, user_id: str, limit: int = 10) -> list[dict]:
+        """
+        Fetch recent user facts from backend /query endpoint for retraction context.
+        Returns facts formatted for inclusion in LLM prompts.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/query",
+                    json={"user_id": user_id, "query": "recent facts"},
+                    timeout=5,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                facts = data.get("facts", [])[:limit]
+                return facts
+        except Exception as e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] failed to fetch recent facts: {e}")
+            return []
+
     async def _detect_retraction_intent(self, text: str, user_id: str) -> tuple[bool, dict]:
-        """Retraction detection: LLM semantic (primary) + pattern fallback (dprompt-108).
+        """Retraction detection: DUMB lookup only. Is signal in database?
+
+        Filter asks: "Is this signal registered in retraction_signals?"
+        If YES → call /retract/correct (backend handles extraction + learning)
+        If NO → fall through to normal ingest
+
+        All learning/confidence/LLM logic belongs in the BACKEND, not Filter.
+        Backend `/retract/correct` (dprompt-136) extracts what changed.
+        Re-embedder evaluates outcomes, registers high-frequency patterns.
 
         Returns: (should_retract: bool, scope_dict with method indicator)
         """
-        # Layer 1: LLM Semantic Detection (PRIMARY) — respects user authority
-        if self.valves.RETRACTION_ENABLED:
-            try:
-                llm_model, llm_url = _resolve_llm_config(self.valves, {})
-                auth_header = None
+        if not self.valves.RETRACTION_ENABLED:
+            return (False, {})
 
-                retraction = await self._extract_retraction(
-                    text,
-                    context=[],  # No context needed for retraction detection
-                    model=llm_model,
-                    url=llm_url,
-                    auth_header=auth_header,
-                    user_uuid=user_id,
-                )
+        # DUMB: just ask "is signal in DB?"
+        signals = _get_retraction_signals_cached(db_url=self.valves.POSTGRES_DSN)
+        text_lower = text.lower()
 
-                if retraction and retraction.get("is_retraction"):
-                    confidence = retraction.get("confidence", 0.0)
-                    rel_type = retraction.get("rel_type")
+        # Check if ANY signal from DB exists in text
+        matched_signal = None
+        for signal in signals.keys():
+            if signal in text_lower:
+                matched_signal = signal
+                break
 
-                    # Resolve rel_type via metadata-driven lookup (dprompt-108)
-                    # Queries rel_types table to handle inverse relationships generically
-                    if rel_type:
-                        rel_type = await _resolve_rel_type(rel_type, self.db_url)
-
-                    scope = {
-                        "scope_level": retraction.get("scope_level"),
-                        "subject": retraction.get("subject"),
-                        "rel_type": rel_type,
-                        "category": retraction.get("category"),
-                        "old_value": retraction.get("old_value"),
-                        "confidence": confidence,
-                        "method": "semantic",
-                    }
-
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] retraction.semantic method=semantic level={scope['scope_level']} category={scope.get('category')} confidence={confidence}")
-
-                    return (True, scope)
-            except Exception as e:
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] semantic_retraction_fallback: {e}")
-                # Fall through to pattern matching
-
-        # Layer 2: Pattern Matching (FALLBACK - only if LLM failed)
-        is_retraction, signal_category = _detect_retraction_pattern(text, _get_retraction_signals_cached())
-        if is_retraction:
-            scope = _extract_categorical_scope(text, self.db_url)
-            scope["method"] = "pattern"
-
+        if matched_signal:
+            # Signal found in DB → ask backend to extract + correct
             if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] retraction.pattern method=pattern level={scope.get('scope_level')} category={signal_category}")
+                print(f"[FaultLine Filter] retraction signal FOUND in DB: '{matched_signal}'")
+            return (True, {"signal": matched_signal, "method": "db_lookup"})
 
-            return (True, scope)
-
+        # Signal NOT in DB → no retraction, fall through to normal ingest
+        if self.valves.ENABLE_DEBUG:
+            print(f"[FaultLine Filter] retraction signal NOT found in DB for: {text[:60]}")
         return (False, {})
 
     async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
@@ -1745,13 +1879,25 @@ Return valid JSON only. If no facts, return [].
             if url.endswith("/api/chat/completions"):
                 url = url[:-len("/api/chat/completions")]
 
+            # dprompt-131: Build fact context for granular retraction identification
+            facts_context = ""
+            if context:
+                facts_lines = ["RECENT FACTS (to help identify what to retract):"]
+                for fact in context:
+                    subj = fact.get("subject", "?")
+                    rel = fact.get("rel_type", "?")
+                    obj = fact.get("object", "?")
+                    facts_lines.append(f"  - {subj} {rel} {obj}")
+                facts_context = "\n" + "\n".join(facts_lines) + "\n"
+
             # Prefix with marker so inlet recognizes this as internal FaultLine prompt
             # and doesn't re-process it as user input (dprompt-128 surgical fix)
             _RETRACTION_PROMPT = f"""{_FAULTLINE_INTERNAL_PREFIX} You are a retraction/correction detection system.
 Analyze the user's message for retraction intent: explicitly removing, forgetting, correcting, or negating a previously stated fact.
 
+{facts_context}
 RESPOND WITH VALID JSON ONLY (no markdown, no extra text):
-{
+{{
   "is_retraction": boolean,
   "scope_level": "granular" | "categorical" | "relational" | null,
   "subject": string or null,
@@ -1759,7 +1905,7 @@ RESPOND WITH VALID JSON ONLY (no markdown, no extra text):
   "category": string or null,
   "old_value": string or null,
   "confidence": float between 0 and 1
-}
+}}
 
 SCOPE LEVELS:
 - granular: Retracting a specific fact about a person (e.g., "Robert is not my son")
@@ -1767,6 +1913,11 @@ SCOPE LEVELS:
 - relational: Retracting all facts with someone (e.g., "I'm not married to Sarah anymore")
 
 RULES: If is_retraction=false, set all other fields to null. For categorical, populate category (domain: family, pets, work, location, health, etc). For granular, populate subject and optionally rel_type. For relational, populate subject and rel_type.
+
+GRANULAR EXAMPLES (using recent facts context):
+  User: "forget about ${CHILD1} being my child" + fact "user parent_of ${CHILD1}" → {{"is_retraction": true, "scope_level": "granular", "subject": "${CHILD1}", "rel_type": "parent_of", "confidence": 1.0}}
+  User: "forget about ${CHILD1}" + facts "user parent_of ${CHILD1}", "${CHILD1} age 12" → {{"is_retraction": true, "scope_level": "granular", "subject": "${CHILD1}", "rel_type": null, "confidence": 0.9}}
+  User: "${CHILD1} is not my child" → {{"is_retraction": true, "scope_level": "granular", "subject": "${CHILD1}", "rel_type": "parent_of", "confidence": 0.95}}
 """
             messages = [
                 {"role": "system", "content": _RETRACTION_PROMPT},
@@ -1774,6 +1925,8 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             ]
 
             headers = {}
+            if auth_header:
+                headers["Authorization"] = auth_header
 
             request_data = {
                 "model": model,
@@ -1786,12 +1939,12 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             if user_uuid:
                 request_data["chat_id"] = user_uuid
 
-            async with httpx.AsyncClient(timeout=self.valves.QWEN_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_SECS) as client:
                 resp = await client.post(
                     f"{url}/api/chat/completions",
                     json=request_data,
                     headers=headers,
-                    timeout=self.valves.QWEN_TIMEOUT,
+                    timeout=_LLM_TIMEOUT_SECS,
                 )
                 resp.raise_for_status()
 
@@ -1821,8 +1974,61 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             return {}
 
     async def _fire_retract(self, user_id: str, subject: Optional[str] = None, rel_type: Optional[str] = None,
-                           old_value: Optional[str] = None, scope: Optional[dict] = None) -> dict:
+                           old_value: Optional[str] = None, scope: Optional[dict] = None,
+                           text: Optional[str] = None) -> dict:
+        """
+        Fire retraction/correction to backend.
+
+        New flow (dprompt-135):
+        - Filter detects retraction pattern and extracts basic scope
+        - Filter POSTs to /retract/correct with full text + context
+        - Backend does LLM extraction with metadata-driven prompt
+        - Backend executes atomic correction (supersede + re-ingest)
+
+        Falls back to old /retract endpoint for bac${LOCATION}ard compatibility.
+        """
         try:
+            # Fetch recent facts for LLM context
+            context_facts = await self._fetch_recent_facts(user_id, limit=15)
+
+            # Try new surgical correction endpoint first (dprompt-135)
+            if text:
+                import hashlib
+                # Generate idempotency key from user + text to deduplicate retried corrections
+                idempotency_key = hashlib.sha256(f"{user_id}:{text}".encode()).hexdigest()
+
+                payload = {
+                    "text": text,
+                    "user_id": user_id,
+                    "context_facts": context_facts,
+                    "idempotency_key": idempotency_key
+                }
+                async with httpx.AsyncClient(timeout=_FAULTLINE_TIMEOUT_SECS) as client:
+                    try:
+                        resp = await client.post(
+                            f"{self.valves.FAULTLINE_URL}/retract/correct",
+                            json=payload,
+                            timeout=_FAULTLINE_TIMEOUT_SECS
+                        )
+                        resp.raise_for_status()
+                        result = resp.json()
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] /retract/correct success: status={result.get('status')} "
+                                  f"subject={result.get('subject_uuid')[:8] if result.get('subject_uuid') else 'none'}")
+                        # Invalidate query cache on successful correction (growth mindset: fresh data on writes)
+                        if result.get("status") not in ("error", None):
+                            _SESSION_MEMORY_CACHE.pop(user_id, None)
+                            redis_client = _get_redis_client()
+                            _invalidate_query_cache(redis_client, user_id)
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] /query cache invalidated for user_id=[redacted] (fresh data on correction)")
+                        return result
+                    except Exception as e:
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] /retract/correct failed: {e}, falling back to /retract")
+                        # Fall through to old endpoint
+
+            # Fallback: old /retract endpoint (for compatibility)
             payload = {"user_id": user_id}
             if subject:
                 payload["subject"] = subject
@@ -1832,10 +2038,25 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 payload["old_value"] = old_value
             if scope:
                 payload["scope"] = scope
+
             async with httpx.AsyncClient(timeout=_FAULTLINE_TIMEOUT_SECS) as client:
-                resp = await client.post(f"{self.valves.FAULTLINE_URL}/retract", json=payload)
+                resp = await client.post(
+                    f"{self.valves.FAULTLINE_URL}/retract",
+                    json=payload,
+                    timeout=_FAULTLINE_TIMEOUT_SECS
+                )
                 resp.raise_for_status()
-                return resp.json()
+                result = resp.json()
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] /retract fallback: status={result.get('status')}")
+                # Invalidate query cache on successful retraction (growth mindset: fresh data on writes)
+                if result.get("status") not in ("error", None):
+                    _SESSION_MEMORY_CACHE.pop(user_id, None)
+                    redis_client = _get_redis_client()
+                    _invalidate_query_cache(redis_client, user_id)
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] /query cache invalidated for user_id=[redacted] (fresh data on retraction)")
+                return result
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] _fire_retract error: {e}")
@@ -1858,7 +2079,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
             return False  # Validator not available or no DB connection
 
         try:
-            validator = LLMOutputValidator(llm_endpoint=_OPENWEBUI_ENDPOINT or "http://localhost:8080")
+            validator = LLMOutputValidator(llm_endpoint=_OPENWEBUI_LLM_ENDPOINT or "http://open-webui:3000")
 
             # Validate signal via unified validator
             validation = await validator.validate_output(
@@ -1980,7 +2201,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                 continue
             if any(c.isdigit() for c in preferred):
                 continue
-            if any(kw in preferred.lower() for kw in ("st ", "street", "ave", "road", "dr ", "lane")):
+            if any(${LOCATION} in preferred.lower() for ${LOCATION} in ("st ", "street", "ave", "road", "dr ", "lane")):
                 continue
             # If canonical is a UUID, use the preferred display name instead
             # to prevent UUID leakage to the LLM (dBug-024 edge case).
@@ -2058,7 +2279,7 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                         spouses_raw.append(subj)
 
             # Build compact family line (deduplicate — same entity may appear
-            # under multiple identity anchors like "user" and "chris")
+            # under multiple identity anchors like "user" and "${USER}")
             if children_raw or spouses_raw or siblings_raw:
                 family_parts = []
                 if spouses_raw:
@@ -2285,6 +2506,47 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] inlet dedup HIT (fallback): text_hash={dedup_key[-16:]}")
 
+            # dprompt-133: Check retraction BEFORE dedup reject (retractions bypass dedup to ensure they fire)
+            if self.valves.INGEST_ENABLED:
+                try:
+                    should_retract, scope = await self._detect_retraction_intent(text, user_id)
+                    if should_retract:
+                        # Signal found in DB → call /retract/correct (backend extracts via dprompt-136)
+                        try:
+                            retract_result = await self._fire_retract(
+                                user_id,
+                                text=text  # Backend does all extraction/learning via dprompt-136
+                            )
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] /retract/correct called, signal='{scope.get('signal')}'")
+                        except Exception as e:
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] /retract/correct error: {e}")
+                            retract_result = {}
+
+                        # Only short-circuit if correction succeeded
+                        if retract_result.get("status") in ("ok", "corrected"):
+                            # Inject confirmation and short-circuit
+                            confirmation = f"✓ Corrected: {retract_result.get('new_rel_type', 'fact')}"
+                            msgs = body.get("messages", [])
+                            if msgs:
+                                for i in range(len(msgs) - 1, -1, -1):
+                                    if msgs[i].get("role") == "user":
+                                        msgs.insert(i, {"role": "system", "content": confirmation})
+                                        break
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] correction succeeded, short-circuiting")
+                            return body
+                        else:
+                            # Extraction/correction failed → re-embedder decides via confidence injection
+                            # Fall through to normal ingest
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] correction failed, falling through to ingest")
+                except Exception as e:
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] retraction detection error: {e}")
+                    # Fall through to normal ingest if retraction detection fails
+
             if dedup_hit:
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] Skipping duplicate message (dedup window {_DEDUP_WINDOW}s)")
@@ -2354,38 +2616,59 @@ RULES: If is_retraction=false, set all other fields to null. For categorical, po
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] /query cache hit user_id=[redacted]")
                     else:
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
-                        resp = None
-                        await _initialize_http_client()  # Ensure persistent client is initialized
-                        for _attempt in range(2):
-                            try:
-                                resp = await _http_client.post(
-                                    f"{self.valves.FAULTLINE_URL}/query",
-                                    json={"text": text, "user_id": user_id, "top_k": 5},
-                                    timeout=_FAULTLINE_TIMEOUT_SECS,
-                                )
-                                break
-                            except httpx.ReadError:
-                                if _attempt == 0:
-                                    if self.valves.ENABLE_DEBUG:
-                                        print(f"[FaultLine Filter] /query ReadError on attempt 1, retrying...")
-                                    continue
-                                raise
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] /query status={resp.status_code}")
+                        # Try Redis-backed query cache first (growth mindset: aggressive read caching)
+                        redis_client = _get_redis_client()
+                        query_cache_key = _get_query_cache_key(user_id, text)
+                        cached_response = _get_cached_query_response(redis_client, query_cache_key)
 
-                        if resp.status_code == 200:
-                            data = resp.json()
+                        if cached_response:
+                            # Cache hit! Use Redis-cached response
+                            data = cached_response
                             facts = data.get("facts", [])
                             preferred_names = data.get("preferred_names", {})
                             canonical_identity = data.get("canonical_identity")
                             entity_attributes = data.get("attributes", {})
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] /query Redis cache hit (reduced query bloat)")
+                        else:
+                            # Cache miss — call backend
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
+                            resp = None
+                            await _initialize_http_client()  # Ensure persistent client is initialized
+                            for _attempt in range(2):
+                                try:
+                                    resp = await _http_client.post(
+                                        f"{self.valves.FAULTLINE_URL}/query",
+                                        json={"text": text, "user_id": user_id, "top_k": 5},
+                                        timeout=_FAULTLINE_TIMEOUT_SECS,
+                                    )
+                                    break
+                                except httpx.ReadError:
+                                    if _attempt == 0:
+                                        if self.valves.ENABLE_DEBUG:
+                                            print(f"[FaultLine Filter] /query ReadError on attempt 1, retrying...")
+                                        continue
+                                    raise
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] /query status={resp.status_code}")
 
-                            # Store raw unfiltered facts in cache
-                            _SESSION_MEMORY_CACHE[user_id] = (
-                                _time.time(), facts, preferred_names, canonical_identity, entity_attributes
-                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                facts = data.get("facts", [])
+                                preferred_names = data.get("preferred_names", {})
+                                canonical_identity = data.get("canonical_identity")
+                                entity_attributes = data.get("attributes", {})
+
+                                # Cache response for future reads (growth mindset)
+                                _cache_query_response(redis_client, query_cache_key, data)
+                                if self.valves.ENABLE_DEBUG:
+                                    print(f"[FaultLine Filter] /query cached in Redis (30s TTL)")
+
+                                # Store raw unfiltered facts in memory cache too
+                                _SESSION_MEMORY_CACHE[user_id] = (
+                                    _time.time(), facts, preferred_names, canonical_identity, entity_attributes
+                                )
 
                             raw_facts_for_extraction = list(facts)
 

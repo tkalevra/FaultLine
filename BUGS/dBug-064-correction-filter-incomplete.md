@@ -24,16 +24,16 @@ The extraction filter (dprompt-128 P4) is aliceigned to remove negated/old value
 - Result: Database updated with age=46 ✓
 
 ### Scenario 2: Identity Corrections (Name) ⚠️ PARTIALLY BROKEN
-**Input**: "Actually, I prefer to be called Chris, not John."  
+**Input**: "Actually, I prefer to be called ${USER}, not John."  
 **Extraction**: 
-- `(user, pref_name, Chris, **NO is_correction flag**)`
+- `(user, pref_name, ${USER}, **NO is_correction flag**)`
 - `(user, also_known_as, John, **NO is_correction flag**)`
 
 **Filter behavior**: 
 - Both triples lacked is_correction=true → filter didn't apply
 - Both INSERTed via ON CONFLICT
 - Result: pref_name=John (last INSERT wins) ✗
-- Database still shows "john" instead of "chris"
+- Database still shows "john" instead of "${USER}"
 
 **Root cause**: LLM didn't mark preference statements with is_correction=true (extraction prompt doesn't guide LLM to detect preference statements as corrections)
 
@@ -87,7 +87,7 @@ This should happen at INGEST time, not EXTRACTION time.
 
 ### 5. **UUID and Identity Hard Constraints** ⚠️ SIDE EFFECT
 ```
-When both pref_name="Chris" and pref_name="John" are stored:
+When both pref_name="${USER}" and pref_name="John" are stored:
   - ON CONFLICT (user_id, entity_id, attribute) DO UPDATE SET
   - Last INSERT wins (john)
   - No audit trail of which was the correction
@@ -220,9 +220,9 @@ VALUES ('age', 'overwrite')
 INSERT INTO rel_types (rel_type, correction_behavior) 
 VALUES ('pref_name', 'append'), ('also_known_as', 'append')
 ```
-**Input**: "Call me Chris, not John"  
+**Input**: "Call me ${USER}, not John"  
 **Expected**: Both stored, query returns both (or ordered by preference)  
-**Verify**: Both pref_name="john" AND pref_name="chris" exist
+**Verify**: Both pref_name="john" AND pref_name="${USER}" exist
 
 ### Test Case 3: Relationship Archive (parent_of, child_of)
 ```sql

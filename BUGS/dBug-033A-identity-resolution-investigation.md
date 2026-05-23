@@ -40,18 +40,18 @@ canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_que
 **Issues:**
 1. Line 3822: `SELECT DISTINCT subject_id FROM facts` returns entities in PostgreSQL arbitrary order
 2. Line 3838: No entity_type check — picks first returned, regardless of type
-3. Result: "dog" (unknown-type) returned before "chris" (Person)
+3. Result: "dog" (unknown-type) returned before "${USER}" (Person)
 
 ### Test Case Demonstrating Bug
 
 **Database state:**
 ```sql
-user_id: 10d7d879-63cd-4f31-92ce-f2c9edb760ab
+user_id: ${TEST_USER_ID}
 
 Facts with pref_name:
 - d807ffea-0140-5c9a-b312-930f964d469d | unknown | pref_name | dog
-- 10d7d879-63cd-4f31-92ce-f2c9edb760ab | Person  | pref_name | chris
-- efc8ea62-381a-5859-b7c3-e2588c89bba6 | Person  | pref_name | chris
+- ${TEST_USER_ID} | Person  | pref_name | ${USER}
+- efc8ea62-381a-5859-b7c3-e2588c89bba6 | Person  | pref_name | ${USER}
 ```
 
 **Current query result (arbitrary order):**
@@ -120,7 +120,7 @@ None of these apply the entity_type filtering to prioritize Person.
 ```python
 with db.cursor() as cur:
     # dprompt-dBug-031-FIX: Prioritize Person entities over unknown-type
-    # when multiple identity entities exist (e.g., "dog" created as artifact vs "chris" Person)
+    # when multiple identity entities exist (e.g., "dog" created as artifact vs "${USER}" Person)
     cur.execute(
         "SELECT DISTINCT subject_id FROM facts f "
         "WHERE f.user_id = %s AND f.rel_type IN ('pref_name', 'also_known_as') "
@@ -140,13 +140,13 @@ with db.cursor() as cur:
 
 **Query result (Person first):**
 ```
-[10d7d879-63cd-4f31-92ce-f2c9edb760ab, efc8ea62-..., d807ffea-...]
+[${TEST_USER_ID}, efc8ea62-..., d807ffea-...]
                     ↑ picked (correct!)
 ```
 
 **Logs after fix:**
 ```
-query.user_identity canonical=chris entity_id=10d7d879-... owui_user_id=10d7d879-...
+query.user_identity canonical=${USER} entity_id=10d7d879-... owui_user_id=10d7d879-...
 ```
 
 ---
@@ -179,5 +179,5 @@ query.user_identity canonical=chris entity_id=10d7d879-... owui_user_id=10d7d879
 
 **Testing:**
 - Verify canonical identity is Person when multiple identity entities exist
-- Check logs: `query.user_identity canonical=chris` not `canonical=dog`
+- Check logs: `query.user_identity canonical=${USER}` not `canonical=dog`
 - Test `/query` response scope is correct user, not artifact entity

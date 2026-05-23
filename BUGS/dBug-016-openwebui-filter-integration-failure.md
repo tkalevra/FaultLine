@@ -248,7 +248,7 @@ See validation commands in `BUGS/dBug-016-validation-deepseek.md` to check Ollam
 
 - **Scope:** All LLM calls (extraction, inference, taxonomy, embedding)
 - **Deployment:** Single container rebuild required (2026-05-18 03:55 UTC via Portainer)
-- **Backward compatibility:** Zero breaking changes (same request/response contracts)
+- **Bac${LOCATION}ard compatibility:** Zero breaking changes (same request/response contracts)
 - **Side effects:** None (chat_id injection is transparent to OpenWebUI)
 
 ## Post-Fix Validation (2026-05-18)

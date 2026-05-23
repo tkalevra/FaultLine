@@ -12,20 +12,20 @@
 
 **Setup:** P0 cleanup executed (pronoun/stopword entities deleted). P1 implementation applied (Class C filtering + identity normalization).
 
-**Test:** POST /query for user `10d7d879-63cd-4f31-92ce-f2c9edb760ab`, text "tell me about my family"
+**Test:** POST /query for user `${TEST_USER_ID}`, text "tell me about my family"
 
 **Expected Response:**
 ```json
 {
   "status": "ok",
   "facts": [
-    {"subject": "chris", "rel_type": "parent_of", "object": "bob", "confidence": 0.8, ...},
-    {"subject": "chris", "rel_type": "parent_of", "object": "charlie", "confidence": 0.8, ...},
-    {"subject": "chris", "rel_type": "parent_of", "object": "alice", "confidence": 0.8, ...},
-    {"subject": "chris", "rel_type": "spouse", "object": "emma", "confidence": 0.8, ...},
+    {"subject": "${USER}", "rel_type": "parent_of", "object": "bob", "confidence": 0.8, ...},
+    {"subject": "${USER}", "rel_type": "parent_of", "object": "charlie", "confidence": 0.8, ...},
+    {"subject": "${USER}", "rel_type": "parent_of", "object": "alice", "confidence": 0.8, ...},
+    {"subject": "${USER}", "rel_type": "spouse", "object": "emma", "confidence": 0.8, ...},
     ...
   ],
-  "preferred_names": {"uuid1": "chris", "uuid2": "emma", ...},
+  "preferred_names": {"uuid1": "${USER}", "uuid2": "emma", ...},
   "attributes": {...}
 }
 ```
@@ -45,7 +45,7 @@
 Filter receives empty facts array → injects no facts into system message → LLM responds:
 ```
 "I can't see your family information from the FaultLine database context provided. 
-The system only has limited entity data (John, charlie, Aurora) with attributes..."
+The system only has limited entity data (John, charlie, ${ENTITY}) with attributes..."
 ```
 
 ---
@@ -53,11 +53,11 @@ The system only has limited entity data (John, charlie, Aurora) with attributes.
 ## Database State (Verified)
 
 ```sql
-SELECT COUNT(*) FROM facts WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab';
+SELECT COUNT(*) FROM facts WHERE user_id = '${TEST_USER_ID}';
 -- Returns: 18 active facts
 
 SELECT rel_type, COUNT(*) FROM facts 
-WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab'
+WHERE user_id = '${TEST_USER_ID}'
 GROUP BY rel_type;
 -- pref_name: 10
 -- parent_of: 3
@@ -166,7 +166,7 @@ Lines 4586-4596 normalize user identity UUIDs. If `user_entity_ids_for_query` is
 curl -X POST "http://localhost:8001/query" \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "10d7d879-63cd-4f31-92ce-f2c9edb760ab",
+    "user_id": "${TEST_USER_ID}",
     "text": "tell me about my family"
   }' | jq '.facts | length'
 # Expected: 29 (or similar non-zero count)

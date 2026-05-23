@@ -14,13 +14,13 @@ When user queries "tell me about my family", `/query` endpoint selects wrong can
 ```
 Query: "tell me about my family"
 Identity selected: "dog" (unknown-type entity)
-Expected: "chris" (Person entity with pref_name)
-Result: Query returns facts for "dog", not for "chris"
+Expected: "${USER}" (Person entity with pref_name)
+Result: Query returns facts for "dog", not for "${USER}"
 ```
 
 **Logs confirm regression:**
 ```
-2026-05-16 15:00:04 [info] query.user_identity canonical=dog entity_id=d807ffea owui_user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+2026-05-16 15:00:04 [info] query.user_identity canonical=dog entity_id=d807ffea owui_user_id=${TEST_USER_ID}
 ```
 
 ---
@@ -31,12 +31,12 @@ Multiple entities with identity facts (pref_name) for same user:
 
 ```sql
 SELECT subject_id, entity_type, pref_name FROM facts 
-WHERE user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab'
+WHERE user_id = '${TEST_USER_ID}'
 AND rel_type = 'pref_name' AND superseded_at IS NULL;
 
 d807ffea-0140-5c9a-b312-930f964d469d | unknown   | dog        ← WRONG (selected)
-10d7d879-63cd-4f31-92ce-f2c9edb760ab | Person    | chris      ← CORRECT (should select)
-efc8ea62-381a-5859-b7c3-e2588c89bba6 | Person    | chris      ← Also correct
+${TEST_USER_ID} | Person    | ${USER}      ← CORRECT (should select)
+efc8ea62-381a-5859-b7c3-e2588c89bba6 | Person    | ${USER}      ← Also correct
 f119510d-8f7a-5843-8d72-bdffea35a538 | Person    | john ← Also correct
 ```
 
@@ -73,15 +73,15 @@ Should be selecting Person entities first, unknown/Animal second.
 
 - All `/query` responses affected
 - Wrong entity context for graph traversal
-- User facts not retrieved (facts about "dog", not about "chris")
+- User facts not retrieved (facts about "dog", not about "${USER}")
 - Family relationship queries return wrong scope
 
 ---
 
 ## Success Criteria
 
-- ✓ Query selects "chris" (Person) as canonical identity
-- ✓ "tell me about my family" returns facts scoped to "chris"
+- ✓ Query selects "${USER}" (Person) as canonical identity
+- ✓ "tell me about my family" returns facts scoped to "${USER}"
 - ✓ Unknown-type entities NOT selected as canonical identity
 - ✓ dBug-031 fix verified in code
 
@@ -95,7 +95,7 @@ curl -X POST "https://docker-host.helpalicekpro.ca/api/chat/completions" \
   -d '{"model": "faultline-test", "messages": [{"role": "user", "content": "tell me about my family"}]}'
 
 # Expected logs:
-# query.user_identity canonical=chris entity_id=10d7d879...
+# query.user_identity canonical=${USER} entity_id=10d7d879...
 
 # Actual logs:
 # query.user_identity canonical=dog entity_id=d807ffea...

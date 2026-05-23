@@ -104,7 +104,7 @@ User message → Filter enriches with context → /extract receives (text + user
    - What about hierarchies? (back → spine → vertebrae)
 
 4. **User Context / Pronoun Resolution:**
-   - Should GLiNER2 receive a system message about user identity? ("This is Chris, age 45, systems_analyst")
+   - Should GLiNER2 receive a system message about user identity? ("This is ${USER}, age 45, systems_analyst")
    - Should we pass user's existing facts? (family, location, occupation, medical history)
    - What level of context is too much (token budget, relevance)?
 
@@ -124,7 +124,7 @@ User message → Filter enriches with context → /extract receives (text + user
 
 2. **Entity Name Injection:**
    - Pre-populate schema with known entity names?
-   - Example: `"facts": [{"subject": "chris", "object": "back", "rel_type": "injury", ...}]`
+   - Example: `"facts": [{"subject": "${USER}", "object": "back", "rel_type": "injury", ...}]`
    - Does this help or confuse GLiNER2?
 
 3. **Ontology in Schema:**
