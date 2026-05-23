@@ -71,7 +71,7 @@ if status in ("valid", "conflict", "unknown"):
 
 After fix, test with:
 ```bash
-curl -X POST http://192.168.1.10:8001/ingest \
+curl -X POST http://${BACKEND_IP}:8001/ingest \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "I pulled my back",

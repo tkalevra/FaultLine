@@ -20,7 +20,7 @@ access to your personal relationships or know anyone outside of our conversation
 **Expected:**
 ```
 Your spouse is emma. You have three children: charlie (age 19), bob, and alice. 
-You have a computer named Aurora. You live at 156 Cedar Street S in Kitchener.
+You have a computer named ${ENTITY}. You live at 156 Cedar Street S in ${LOCATION}.
 ```
 
 ---
@@ -73,6 +73,6 @@ But: **LLM receives no facts in context**
 
 This bug is FIXED when:
 - User asks "tell me about my family"
-- System returns facts about spouse emma, children charlie/bob/alice, location, and Aurora
+- System returns facts about spouse emma, children charlie/bob/alice, location, and ${ENTITY}
 - Facts injected into system message BEFORE LLM generates response
 - Log shows Filter → `/query` call → facts returned → injected into prompt

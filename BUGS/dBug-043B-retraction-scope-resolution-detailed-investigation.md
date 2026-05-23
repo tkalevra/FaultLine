@@ -46,7 +46,7 @@ if result.get("retraction"):
     # Later, Filter calls:
     POST /retract with:
     {
-        "user_id": "10d7d879-63cd-4f31-92ce-f2c9edb760ab",
+        "user_id": "${TEST_USER_ID}",
         "scope": {
             "scope_level": "categorical",
             "category": "pets",

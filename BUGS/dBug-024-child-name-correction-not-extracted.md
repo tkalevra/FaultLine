@@ -6,7 +6,7 @@
 
 **Date Reported:** 2026-05-15
 
-**User Context:** John, user_id=`10d7d879-63cd-4f31-92ce-f2c9edb760ab`
+**User Context:** John, user_id=`${TEST_USER_ID}`
 
 ## Problem Summary
 
@@ -40,7 +40,7 @@ Entity alias conflict + extraction failure:
 ### OpenWebUI logs (11:52:36–11:52:42)
 ```
 [FaultLine Filter] user_id=[redacted] text='My chilrens names are bob, charlie, and alice'
-[FaultLine Filter] calling /query url=http://192.168.1.10:8001/query
+[FaultLine Filter] calling /query url=http://${BACKEND_IP}:8001/query
 [FaultLine Filter] /query status=200
 [FaultLine Filter] filtered: 43/43 facts
 ```

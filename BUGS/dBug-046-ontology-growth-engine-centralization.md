@@ -419,7 +419,7 @@ After implementation, verify:
 ## Success Criteria
 
 - ✅ Single evaluation framework for all ontologies
-- ✅ rel_types growth unchanged (backward compatible)
+- ✅ rel_types growth unchanged (bac${LOCATION}ard compatible)
 - ✅ Retraction signals auto-grow from LLM detections
 - ✅ re_embedder code reduced by ≥20%
 - ✅ New ontologies need only 10–20 lines of integration code

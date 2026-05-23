@@ -15,7 +15,7 @@ SELECT * FROM facts WHERE user_id='10d7d879...' AND rel_type='spouse'
 
 **Result:**
 - Fact ID: 48
-- subject_id: 10d7d879-63cd-4f31-92ce-f2c9edb760ab (user)
+- subject_id: ${TEST_USER_ID} (user)
 - rel_type: spouse
 - object_id: fb0868c4-12b4-587d-9a3b-ce96ca5979ca (Person entity)
 - confidence: 1.0

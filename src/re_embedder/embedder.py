@@ -268,7 +268,7 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
         embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
 
     try:
-        # Use persistent pooled client if available, fallback to httpx.post() for backward compatibility
+        # Use persistent pooled client if available, fallback to httpx.post() for bac${LOCATION}ard compatibility
         if _http_client_sync:
             response = _http_client_sync.post(
                 embed_url,
@@ -367,7 +367,7 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
     Returns True on success, False on failure.
     """
     try:
-        # Use persistent pooled client if available, fallback to httpx.put() for backward compatibility
+        # Use persistent pooled client if available, fallback to httpx.put() for bac${LOCATION}ard compatibility
         if _http_client_sync:
             response = _http_client_sync.put(
                 f"{qdrant_url}/collections/{collection}/points",
@@ -1189,6 +1189,211 @@ def has_pending_name_conflicts(db_conn) -> bool:
         return False
 
 
+def has_pending_retraction_outcomes(db_conn) -> bool:
+    """Check if there are unevaluated retraction outcomes (fast query).
+
+    dprompt-137: Event-driven guard to skip evaluation if no feedback available.
+    Returns True if retraction_outcomes table has any rows with was_correct=true or was_correct=false
+    (i.e., user has provided feedback/validation).
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM retraction_outcomes "
+                "WHERE was_correct IS NOT NULL LIMIT 1"
+            )
+            count = cur.fetchone()[0]
+            return count > 0
+    except Exception as e:
+        log.warning("re_embedder.pending_retraction_outcomes_check_failed", error=str(e))
+        return False
+
+
+def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
+    """Phase 4: Self-building learning loop for retraction signals (dprompt-137).
+
+    Learn from successful/unsuccessful retraction outcomes in real time.
+    Auto-register patterns where frequency >= threshold, update metrics for existing patterns.
+
+    Algorithm:
+    1. Query retraction_outcomes for rows with was_correct IS NOT NULL (user feedback)
+    2. Group by original_message (pattern proxy) to detect frequency
+    3. For each high-frequency pattern (freq >= threshold):
+       - Check if pattern exists in retraction_signals table
+       - If NOT exists: INSERT new pattern with empirical confidence + priority
+       - If EXISTS: UPDATE confidence/priority/false_positive_rate based on outcomes
+    4. Invalidate Filter cache to force reload on next request
+
+    Returns: {"discovered": int, "updated": int, "errors": int}
+
+    Design rationale:
+    - Frequency threshold of 3: prevents single-shot false learning (1-2 occurrences are noise)
+    - Confidence = avg(was_correct=true) / total_outcomes (empirical success rate)
+    - Priority = success_rate * 100 (0-100 scale), fed back to signal priority ordering
+    - False positive rate = (total - correct) / total, used by Filter for semantic gating
+    - No hardcoded patterns — all patterns learned from live data
+    """
+    stats = {"discovered": 0, "updated": 0, "errors": 0}
+
+    try:
+        # ────────────────────────────────────────────────────────────────
+        # Step 1: Query outcomes grouped by original_message pattern
+        # ────────────────────────────────────────────────────────────────
+        with db_conn.cursor() as cur:
+            cur.execute("""
+                SELECT original_message,
+                       COUNT(*) as freq,
+                       CAST(COUNT(CASE WHEN was_correct=true THEN 1 END) AS FLOAT) as correct_count,
+                       COUNT(*) as total_count,
+                       AVG(detected_confidence) as avg_confidence,
+                       AVG(CASE WHEN was_correct=true THEN 1.0 ELSE 0.0 END) as success_rate,
+                       retraction_method,
+                       MAX(created_at) as last_seen
+                FROM retraction_outcomes
+                WHERE was_correct IS NOT NULL
+                GROUP BY original_message, retraction_method
+                HAVING COUNT(*) >= %s
+                ORDER BY success_rate DESC, freq DESC
+            """, (frequency_threshold,))
+            outcomes = cur.fetchall()
+
+        if not outcomes:
+            log.debug(f"re_embedder.retraction_outcomes_empty no_feedback_found")
+            return stats
+
+        log.info(f"re_embedder.retraction_outcomes_eval found={len(outcomes)} patterns_to_evaluate")
+
+        # ────────────────────────────────────────────────────────────────
+        # Step 2: Process each high-frequency pattern
+        # ────────────────────────────────────────────────────────────────
+        for (pattern, freq, correct_count, total_count, avg_confidence,
+             success_rate, retraction_method, last_seen) in outcomes:
+
+            try:
+                if not pattern or len(pattern.strip()) < 2:
+                    continue  # Skip empty/whitespace patterns
+
+                pattern_lower = pattern.lower().strip()
+
+                # Compute empirical metrics
+                false_positive_rate = 1.0 - success_rate if success_rate else 0.5
+                priority = int(success_rate * 100) if success_rate else 50
+
+                # ────────────────────────────────────────────────────────────────
+                # Step 2a: Check if pattern already exists in retraction_signals
+                # ────────────────────────────────────────────────────────────────
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, signal_category, priority, false_positive_rate "
+                        "FROM retraction_signals "
+                        "WHERE signal = %s AND language = 'en'",
+                        (pattern_lower,)
+                    )
+                    existing = cur.fetchone()
+
+                if not existing:
+                    # ────────────────────────────────────────────────────────────────
+                    # Step 2b: NEW PATTERN — insert with empirical confidence
+                    # ────────────────────────────────────────────────────────────────
+                    category = 'inferred'  # Learned from live data, not seeded
+                    if retraction_method == 'semantic':
+                        category = 'correction'  # LLM-detected semantic patterns
+                    elif retraction_method == 'pattern':
+                        category = 'implicit_negation'  # Explicit pattern matches
+
+                    try:
+                        with db_conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO retraction_signals
+                                (signal, signal_category, language, priority, false_positive_rate, notes, created_at, updated_at)
+                                VALUES (%s, %s, 'en', %s, %s, %s, NOW(), NOW())
+                                ON CONFLICT (signal, language) DO NOTHING
+                            """, (
+                                pattern_lower,
+                                category,
+                                priority,
+                                false_positive_rate,
+                                f"Auto-learned: freq={freq}, success_rate={success_rate:.2f}, method={retraction_method}"
+                            ))
+                        db_conn.commit()
+                        stats["discovered"] += 1
+                        log.info(
+                            f"re_embedder.retraction_signal_discovered "
+                            f"pattern={pattern[:60]}"
+                            f" category={category} "
+                            f"freq={freq} success_rate={success_rate:.2f}"
+                        )
+                    except Exception as e:
+                        db_conn.rollback()
+                        stats["errors"] += 1
+                        log.error(f"re_embedder.retraction_signal_insert_failed pattern={pattern[:60]}: {e}")
+
+                else:
+                    # ────────────────────────────────────────────────────────────────
+                    # Step 2c: EXISTING PATTERN — update metrics based on empirical data
+                    # ────────────────────────────────────────────────────────────────
+                    existing_id, existing_category, existing_priority, existing_fpr = existing
+
+                    # Only update if metrics changed significantly (> 5% delta)
+                    priority_delta = abs(priority - existing_priority)
+                    fpr_delta = abs(false_positive_rate - existing_fpr)
+
+                    if priority_delta > 5 or fpr_delta > 0.05:
+                        try:
+                            with db_conn.cursor() as cur:
+                                cur.execute("""
+                                    UPDATE retraction_signals SET
+                                      priority = %s,
+                                      false_positive_rate = %s,
+                                      updated_at = NOW(),
+                                      notes = %s
+                                    WHERE id = %s
+                                """, (
+                                    priority,
+                                    false_positive_rate,
+                                    f"Updated: freq={freq}, success_rate={success_rate:.2f}, old_priority={existing_priority}",
+                                    existing_id
+                                ))
+                            db_conn.commit()
+                            stats["updated"] += 1
+                            log.info(
+                                f"re_embedder.retraction_signal_updated "
+                                f"pattern={pattern[:60]} "
+                                f"priority={existing_priority}->{priority} "
+                                f"fpr={existing_fpr:.2f}->{false_positive_rate:.2f}"
+                            )
+                        except Exception as e:
+                            db_conn.rollback()
+                            stats["errors"] += 1
+                            log.error(f"re_embedder.retraction_signal_update_failed pattern={pattern[:60]}: {e}")
+
+            except Exception as e:
+                stats["errors"] += 1
+                log.error(f"re_embedder.retraction_outcome_processing_failed pattern={pattern[:60]}: {e}")
+
+        # ────────────────────────────────────────────────────────────────
+        # Step 3: Invalidate Filter's retraction signal cache
+        # ────────────────────────────────────────────────────────────────
+        # Cache invalidation happens via TTL in Filter (60s default).
+        # For immediate invalidation, we'd need to clear a Redis key or
+        # reset an in-process timestamp. For now, rely on TTL.
+        # Filter will auto-reload signals on next _get_retraction_signals_cached() call.
+
+        if stats["discovered"] > 0 or stats["updated"] > 0:
+            log.info(
+                f"re_embedder.retraction_learning_cycle_complete "
+                f"discovered={stats['discovered']} "
+                f"updated={stats['updated']} "
+                f"errors={stats['errors']}"
+            )
+
+    except Exception as e:
+        log.error(f"re_embedder.retraction_outcomes_eval_failed: {e}")
+        stats["errors"] += 1
+
+    return stats
+
+
 def detect_embedding_model_change() -> None:
     """Auto-detect if embedding model version changed; clear cache if so.
 
@@ -1220,13 +1425,14 @@ def main():
     """Main poll loop."""
     global _http_client_sync
 
-    # Log startup environment for debugging container issues
-    log.info("re_embedder.startup_environment",
-             has_postgres_dsn=bool(os.getenv("POSTGRES_DSN")),
-             has_qdrant_url=bool(os.getenv("QDRANT_URL")),
-             has_redis_url=bool(os.getenv("REDIS_URL")),
-             reembed_interval=os.getenv("REEMBED_INTERVAL", "60"),
-             pythonpath=os.getenv("PYTHONPATH", "not_set"))
+    # Log startup environment for debugging container issues (using extra= for structured data)
+    log.info("re_embedder.startup_environment", extra={
+        "has_postgres_dsn": bool(os.getenv("POSTGRES_DSN")),
+        "has_qdrant_url": bool(os.getenv("QDRANT_URL")),
+        "has_redis_url": bool(os.getenv("REDIS_URL")),
+        "reembed_interval": os.getenv("REEMBED_INTERVAL", "60"),
+        "pythonpath": os.getenv("PYTHONPATH", "not_set")
+    })
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
@@ -1350,6 +1556,20 @@ def main():
                 n_expired = expire_staged_facts(db, qdrant_url)
                 if n_expired:
                     log.info(f"re_embedder.expiry_complete expired={n_expired}")
+
+                # dprompt-137: Evaluate retraction outcomes for continuous learning
+                # Auto-register high-frequency patterns, update metrics for existing patterns
+                if has_pending_retraction_outcomes(db):
+                    retraction_stats = evaluate_retraction_outcomes(db, frequency_threshold=3)
+                    if any(v > 0 for v in [retraction_stats["discovered"], retraction_stats["updated"]]):
+                        log.info(
+                            f"re_embedder.retraction_learning_complete "
+                            f"discovered={retraction_stats['discovered']} "
+                            f"updated={retraction_stats['updated']} "
+                            f"errors={retraction_stats['errors']}"
+                        )
+                else:
+                    log.debug("re_embedder.no_pending_retraction_outcomes")
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:

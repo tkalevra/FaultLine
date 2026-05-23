@@ -32,7 +32,7 @@ ERROR:src.re_embedder.embedder:re_embedder.embed_failed text_preview=My son alic
 
 **Ingest logs (pre-fix):**
 ```
-2026-05-18 03:56:56 [error    ] store_context.embed_failed     text_length=70 user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+2026-05-18 03:56:56 [error    ] store_context.embed_failed     text_length=70 user_id=${TEST_USER_ID}
 INFO:     172.16.3.1:39366 - "POST /store_context HTTP/1.1" 500 Internal Server Error
 ```
 

@@ -17,7 +17,7 @@ This is a **critical data integrity issue**: users believe facts are removed, bu
 ## Test Case That Triggered Bug
 
 **Test Environment**: Production docker-host.helpalicekpro.ca  
-**User**: John Thompson (uuid: 10d7d879-63cd-4f31-92ce-f2c9edb760ab)  
+**User**: John Thompson (uuid: ${TEST_USER_ID})  
 **Date**: 2026-05-17 20:17:12 UTC
 
 **Steps**:
@@ -47,8 +47,8 @@ WHERE (subject_id = 'eb3639e3-da33-59ff-8e93-c6293305e060'
 -- Result:
 rel_type  |              subject_id              |              object_id               | superseded_at 
 -----------+--------------------------------------+--------------------------------------+---------------
- child_of  | eb3639e3-da33-59ff-8e93-c6293305e060 | 10d7d879-63cd-4f31-92ce-f2c9edb760ab | [NULL]
- parent_of | 10d7d879-63cd-4f31-92ce-f2c9edb760ab | eb3639e3-da33-59ff-8e93-c6293305e060 | [NULL]
+ child_of  | eb3639e3-da33-59ff-8e93-c6293305e060 | ${TEST_USER_ID} | [NULL]
+ parent_of | ${TEST_USER_ID} | eb3639e3-da33-59ff-8e93-c6293305e060 | [NULL]
 ```
 
 **Expected**: Both rows should have `superseded_at = NOW()` timestamp  
@@ -59,7 +59,7 @@ rel_type  |              subject_id              |              object_id       
 ```
 2026-05-17 20:17:12 [warning  ] retract.qdrant_sync_flag_failed 
   error='syntax error at or near "LIMIT"\nLINE 3:                        LIMIT 1000\n                               ^\n' 
-  user_id=10d7d879-63cd-4f31-92ce-f2c9edb760ab
+  user_id=${TEST_USER_ID}
 
 INFO:     172.16.23.1:55484 - "POST /retract HTTP/1.1" 200 OK
 ```
@@ -74,7 +74,7 @@ The endpoint returns 200 OK immediately after logging a SQL syntax error. This s
 ```
 [FaultLine Filter] retraction.semantic method=semantic level=granular category=None confidence=1.0
 [FaultLine Filter] subject_resolution_failed: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed
-HTTP Request: POST http://192.168.1.10:8001/retract "HTTP/1.1 200 OK"
+HTTP Request: POST http://${BACKEND_IP}:8001/retract "HTTP/1.1 200 OK"
 [FaultLine Filter] /query status=200
 [FaultLine Filter] filtered: 74/74 facts
 ```

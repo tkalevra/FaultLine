@@ -28,10 +28,10 @@ DB_POOL_SIZE=15
 
 **Portainer Environment Variables (required):**
 ```
-OPENWEBUI_URL=https://example.com
-LLM_API_KEY=***REDACTED-API-KEY***
+OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
+LLM_API_KEY=${BEARER_TOKEN}
 FAULTLINE_MEMORY_CHAIN_UUID=00000000-0000-0000-0000-000000000000
-FAULTLINE_URL=http://192.168.1.10:8001
+FAULTLINE_URL=http://${BACKEND_IP}:8001
 POSTGRES_PASSWORD=faultline
 WGM_LLM_MODEL=qwen/qwen3.5-9b
 CATEGORY_LLM_MODEL=qwen2.5-coder
@@ -46,7 +46,7 @@ The FaultLine backend MUST follow this priority order for LLM endpoint resolutio
 
 **Priority Chain (in src/api/main.py):**
 1. **OPENWEBUI_URL** — Explicit environment variable (external/HTTP endpoint)
-   - Used when explicitly set: `OPENWEBUI_URL=https://example.com`
+   - Used when explicitly set: `OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}`
    - Endpoint format: `{OPENWEBUI_URL}/api/chat/completions`
    - Required: `LLM_API_KEY` bearer token for authentication
    
@@ -134,7 +134,7 @@ def get_llm_headers() -> dict:
 
 These must match model names available on the LLM backend:
 
-**For OpenWebUI (example.com):**
+**For OpenWebUI (${OPENWEBUI_DOMAIN}):**
 ```
 WGM_LLM_MODEL=qwen/qwen3.5-9b:2
 CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
@@ -155,15 +155,15 @@ CATEGORY_LLM_MODEL=qwen2.5-coder
 ### For Portainer Production:
 ```
 # OpenWebUI Integration (REQUIRED for production)
-OPENWEBUI_URL=https://example.com
-LLM_API_KEY=***REDACTED-API-KEY***
+OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
+LLM_API_KEY=${BEARER_TOKEN}
 
 # Database Configuration
 POSTGRES_PASSWORD=faultline
 POSTGRES_DSN=postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
 
 # FaultLine Backend
-FAULTLINE_URL=http://192.168.1.10:8001
+FAULTLINE_URL=http://${BACKEND_IP}:8001
 FAULTLINE_MEMORY_CHAIN_UUID=00000000-0000-0000-0000-000000000000
 
 # LLM Model Selection
@@ -228,8 +228,8 @@ Before deploying, verify:
 3. Bearer token is invalid or missing
 
 **Debug:**
-1. Check WGM_LLM_MODEL against available models: `curl https://example.com/api/models`
-2. Test endpoint directly: `curl -H "Authorization: Bearer YOUR_KEY" https://example.com/api/chat/completions -d '{"model":"qwen/qwen3.5-9b:2","messages":[...]}'`
+1. Check WGM_LLM_MODEL against available models: `curl https://${OPENWEBUI_DOMAIN}/api/models`
+2. Test endpoint directly: `curl -H "Authorization: Bearer YOUR_KEY" https://${OPENWEBUI_DOMAIN}/api/chat/completions -d '{"model":"qwen/qwen3.5-9b:2","messages":[...]}'`
 3. Check FaultLine logs for the actual error: `docker logs faultline 2>&1 | grep -i "400\|error"`
 
 ### Circular LLM Endpoint Resolution
@@ -244,7 +244,7 @@ This specification prepares for future MCP (Model Context Protocol) integration:
 When MCP support is added:
 ```
 LLM_BACKEND=openwebui    # or "mcp", "qwen", "ollama"
-OPENWEBUI_URL=https://example.com
+OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
 MCP_SERVER_URL=...       # Future
 ```
 

@@ -95,7 +95,7 @@ def _get_correction_signals_cached() -> list[dict]:
   - `_detect_implicit_correction(text, signals)` (pattern matching on live cache)
 
 ### Deployment (`Portainer`)
-- Environment variable: `FAULTLINE_URL=http://192.168.1.10:8001`
+- Environment variable: `FAULTLINE_URL=http://${BACKEND_IP}:8001`
 - Read once at filter module load, used globally throughout lifetime
 
 ---

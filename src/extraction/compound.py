@@ -143,7 +143,7 @@ def _has_correction_signal(text: str) -> bool:
 # These catch technical, scientific, mechanical, and infrastructure facts
 # that the family-specific patterns below don't handle.
 
-# "the hostname is Aurora" / "the system is a Ryzen 7" / "the ip is 192.168.1.10"
+# "the hostname is ${ENTITY}" / "the system is a Ryzen 7" / "the ip is 192.168.1.10"
 _GENERIC_IS_PATTERN: re.Pattern = re.compile(
     r"the\s+([\w\s]+?)\s+is\s+(?:a\s+)?([\w.]+(?:\s+[\w.]+)*?)(?=\s*(?:,|\.(?:\s+|$)|$|\s+with\s|\s+running\s|\s+and\s+the|\s+and\s+a|\s+the\s+|\s*$))",
     re.IGNORECASE
@@ -158,7 +158,7 @@ _GENERIC_EXPIRES_PATTERN: re.Pattern = re.compile(
     r"certificate\s+expires?\s+on\s+(.+?)(?=\s*(?:,|\.|$))",
     re.IGNORECASE
 )
-# "fqdn of aurora.helpalicekpro.ca"
+# "fqdn of ${ENTITY}.helpalicekpro.ca"
 _GENERIC_FQDN_PATTERN: re.Pattern = re.compile(
     r"fqdn\s+of\s+(\S+(?:\.\S+)*)",
     re.IGNORECASE
@@ -240,7 +240,7 @@ def extract_compound_facts(text: str) -> list[dict]:
         if raw and raw not in ("hostname","ip","fqdn","certificate","internal ip","ip address"):
             primary_subject = raw
 
-    # "the hostname is Aurora" / "the system is a Ryzen 7" / "the ip is 192.168.1.10"
+    # "the hostname is ${ENTITY}" / "the system is a Ryzen 7" / "the ip is 192.168.1.10"
     for m in _GENERIC_IS_PATTERN.finditer(text):
         prop = m.group(1).strip().lower()
         val = m.group(2).strip().lower()
@@ -263,7 +263,7 @@ def extract_compound_facts(text: str) -> list[dict]:
         if val and len(val) > 1:
             _add(primary_subject, val, "expires_on")
 
-    # "fqdn of aurora.helpalicekpro.ca"
+    # "fqdn of ${ENTITY}.helpalicekpro.ca"
     for m in _GENERIC_FQDN_PATTERN.finditer(text):
         val = m.group(1).strip().lower().rstrip(',.')
         if val and len(val) > 1:
@@ -323,7 +323,7 @@ def extract_compound_facts(text: str) -> list[dict]:
                         _add(subject, pref_name, "pref_name", is_pref=True)
             elif len(groups) == 1:
                 # "who prefers bob" — only captured the preferred name.
-                # Scan backward from match position to find the nearest
+                # Scan bac${LOCATION}ard from match position to find the nearest
                 # capitalized word (the entity this preference belongs to).
                 pref_name = groups[0]
                 if pref_name and not _is_stopword(pref_name) and len(pref_name) > 1:
