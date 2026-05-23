@@ -220,7 +220,7 @@ UUID-based, not name-based:
 3. Query dedup groups by `(subject_uuid, rel_type, object_uuid)`
 4. **Result**: Same entity with multiple aliases = single deduplicated fact
 
-Prevents hallucination from alias variation (chris/user/Christopher = one entity).
+Prevents hallucination from alias variation (${USER}/user/${USER} = one entity).
 
 ## Entity Type Classification
 

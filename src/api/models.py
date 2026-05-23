@@ -9,6 +9,7 @@ class EdgeInput(BaseModel):
     rel_type: str
     is_preferred_label: bool = False
     is_correction: bool = False
+    confidence: Optional[float] = None  # User corrections: 1.0. Default: None (ingest computes based on provenance)
     fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
     subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
@@ -18,9 +19,9 @@ class EdgeInput(BaseModel):
 
 
 class ExtractContext(BaseModel):
-    known_entities: list[dict] | None = None  # [{"name":"chris","type":"Person","uuid":"..."},...]
+    known_entities: list[dict] | None = None  # [{"name":"${USER}","type":"Person","uuid":"..."},...]
     ontology_hints: list[str] | None = None    # ["has_injury → Person,body_part", ...]
-    user_profile: str | None = None            # "User: chris. Family: spouse=mars..."
+    user_profile: str | None = None            # "User: ${USER}. Family: spouse=${SPOUSE}..."
 
 
 class IngestRequest(BaseModel):
@@ -53,6 +54,7 @@ class FactResult(BaseModel):
     status: str
     fact_class: str = "A"  # A, B, or C
     provenance: str = "llm_inferred"
+    definition: Optional[str] = None  # Natural language template from rel_types table (e.g., "X is Y's spouse")
 
 
 class IngestResponse(BaseModel):
@@ -118,7 +120,33 @@ class RewriteRequest(BaseModel):
 
 
 class RewriteResponse(BaseModel):
-    """LLM-extracted triples (facts) from input text."""
+    """LLM-extracted edges (facts) from input text."""
     status: str  # "success" or "error"
-    triples: list[EdgeInput] = []  # Extracted facts with types
+    edges: list[EdgeInput] = []  # Extracted facts with types
+
+
+class FactCorrectionRequest(BaseModel):
+    """User correction: old fact is wrong, new fact is right.
+    Surgical update: only supersede one specific fact, re-ingest through WGM gate.
+    """
+    text: str  # "Fraggle is a dog not a bunny"
+    user_id: str  # User UUID (will be validated against authenticated user)
+    context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
+    idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)
+
+
+class FactCorrectionResponse(BaseModel):
+    """Surgical correction result."""
+    status: str  # "corrected", "failed", "disambiguation_needed"
+    subject_uuid: Optional[str] = None
+    subject_name: Optional[str] = None
+    old_rel_type: Optional[str] = None
+    old_value: Optional[str] = None
+    new_rel_type: Optional[str] = None
+    new_value: Optional[str] = None
+    dimension: Optional[str] = None  # SCALAR | RELATIONAL | HIERARCHICAL | SUBJECT | REL_TYPE | ENTITY_TYPE
+    confidence: float = 0.0
+    facts_superseded: int = 0
+    hierarchies_modified: list[str] = []
+    message: Optional[str] = None
     error: Optional[str] = None
