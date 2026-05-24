@@ -1,7 +1,7 @@
 # Development Cycle Guide: From Problem to Production
 
 **Purpose:** Establish consistent, disciplined development cycles for FaultLine improvements.  
-**Audience:** Claude Code, Deepseek, Christopher Thompson  
+**Audience:** Claude Code, Deepseek, ${USER} Thompson  
 **Version:** 1.0  
 **Last Updated:** 2026-05-12
 
@@ -80,7 +80,7 @@ Next Iteration
 
 ### Who Does This: Deepseek (or Claude Code)
 
-**Environment:** Pre-Prod only (`example.com` or wherever live instance is)
+**Environment:** Pre-Prod only (`${OPENWEBUI_DOMAIN}` or wherever live instance is)
 
 **Method:** SSH, read-only queries, log inspection
 
@@ -102,7 +102,7 @@ ssh docker-host -x "sudo docker exec open-webui curl -s http://faultline:8001/he
 curl -H "Authorization: Bearer [token]" \
   -H "Content-Type: application/json" \
   -d '{"model":"faultline-wgm-test-10","messages":[{"role":"user","content":"Test message"}],"stream":false}' \
-  https://example.com/api/chat/completions
+  https://${OPENWEBUI_DOMAIN}/api/chat/completions
 ```
 
 **Output:** Findings documented in scratch.md (prefixed #deepseek)
@@ -119,7 +119,7 @@ curl -H "Authorization: Bearer [token]" \
 
 ### Who Does This: Deepseek
 
-**Environment:** Local dev repo (`/home/chris/Documents/013-GIT/FaultLine-dev/`)
+**Environment:** Local dev repo (`/home/user/Documents/013-GIT/FaultLine-dev/`)
 
 **Method:** Follow dprompt-Nb.md sequence exactly
 
@@ -161,7 +161,7 @@ Tests: 112 passed, 0 regressions
 
 **Before making changes:**
 ```bash
-cd /home/chris/Documents/013-GIT/FaultLine-dev
+cd /home/user/Documents/013-GIT/FaultLine-dev
 pytest tests/api/ --ignore=tests/evaluation -v
 # Expected: 112+ passed, 53 skipped, 0 failed
 ```
@@ -228,7 +228,7 @@ python -m py_compile src/re_embedder/embedder.py
 
 ## Phase 5: User Rebuild & Redeploy
 
-### Who Does This: Christopher Thompson (User)
+### Who Does This: ${USER} Thompson (User)
 
 **When:** After deepseek completes Phase 4 and STOPS
 
@@ -246,7 +246,7 @@ curl http://localhost:8001/health  # verify running
 Or if changes are only in FaultLine-dev (not yet synced to prod):
 ```bash
 # Copy changes from FaultLine-dev to faultline-prod
-cp /home/chris/Documents/013-GIT/FaultLine-dev/openwebui/faultline_tool.py \
+cp /home/user/Documents/013-GIT/FaultLine-dev/openwebui/faultline_tool.py \
    ~/faultline-prod/openwebui/
 
 # Rebuild
@@ -260,9 +260,9 @@ curl http://localhost:8001/health
 
 ## Phase 6: Live Validation (Pre-Prod)
 
-### Who Does This: Christopher Thompson or Deepseek (with direction)
+### Who Does This: ${USER} Thompson or Deepseek (with direction)
 
-**Environment:** Pre-Prod (`example.com`)
+**Environment:** Pre-Prod (`${OPENWEBUI_DOMAIN}`)
 
 **Validation Queries:** Specified in dprompt-Nb.md "Success Criteria"
 
@@ -272,7 +272,7 @@ curl http://localhost:8001/health
 curl -H "Authorization: Bearer [token]" \
   -H "Content-Type: application/json" \
   -d '{"model":"faultline-wgm-test-10","messages":[{"role":"user","content":"Tell me about our pets"}],"stream":false}' \
-  https://example.com/api/chat/completions
+  https://${OPENWEBUI_DOMAIN}/api/chat/completions
 # Expected: Response mentions has_pet facts (fraggle, morkie, etc.)
 
 # Test 2: Generic query returns identity facts
@@ -292,7 +292,7 @@ curl ... -d '{"messages":[{"role":"user","content":"When was I born?"}],...}'
 
 ## Phase 7: Next Iteration (Loop Back)
 
-### Who Does This: Christopher Thompson
+### Who Does This: ${USER} Thompson
 
 **Options:**
 1. **Approve & Merge:** "Results look good. Next dprompt?"
@@ -423,7 +423,7 @@ curl ... -d '{"messages":[{"role":"user","content":"When was I born?"}],...}'
 ## Quick Reference: File Locations
 
 ```
-/home/chris/Documents/013-GIT/FaultLine-dev/     ← Development (code changes here)
+/home/user/Documents/013-GIT/FaultLine-dev/     ← Development (code changes here)
 ├─ dprompt-template.md                           ← Use for specifications
 ├─ dprompt-templateb.md                          ← Use for formal prompts
 ├─ docs/DEV_CYCLE_GUIDE.md                       ← This file
@@ -443,9 +443,9 @@ curl ... -d '{"messages":[{"role":"user","content":"When was I born?"}],...}'
 ├─ docker-compose.yml
 └─ .env.example
 
-https://example.com                 ← Pre-Prod (live instance)
+https://${OPENWEBUI_DOMAIN}                 ← Pre-Prod (live instance)
 ├─ Investigation via SSH: ssh docker-host -x "sudo docker ..."
-├─ API: https://example.com/api/chat/completions
+├─ API: https://${OPENWEBUI_DOMAIN}/api/chat/completions
 └─ Model: faultline-wgm-test-10
 ```
 

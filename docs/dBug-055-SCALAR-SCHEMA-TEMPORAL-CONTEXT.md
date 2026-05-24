@@ -19,8 +19,8 @@
 ### Current Schema (INCOMPLETE)
 ```
 entity_id | attribute | value_text | value_int | value_float | value_date | ...
-Des UUID  | age       | NULL       | 12        | NULL        | NULL       |
-Des UUID  | age       | NULL       | 14        | NULL        | NULL       | (overwrites previous)
+${CHILD1} UUID  | age       | NULL       | 12        | NULL        | NULL       |
+${CHILD1} UUID  | age       | NULL       | 14        | NULL        | NULL       | (overwrites previous)
 ```
 
 **Problem:** When value_int=14 overwrites 12, there's no record of the correction sequence (12→14→16) or when each update occurred.
@@ -28,9 +28,9 @@ Des UUID  | age       | NULL       | 14        | NULL        | NULL       | (ove
 ### Needed Schema (COMPLETE)
 ```
 entity_id | attribute | value_text | value_int | value_float | value_date | created_at | updated_at | temporal_context | provenance
-Des UUID  | age       | NULL       | 12        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | user_stated
-Des UUID  | age       | NULL       | 14        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | correction
-Des UUID  | age       | NULL       | 16        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | correction
+${CHILD1} UUID  | age       | NULL       | 12        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | user_stated
+${CHILD1} UUID  | age       | NULL       | 14        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | correction
+${CHILD1} UUID  | age       | NULL       | 16        | NULL        | NULL       | 2026-05-19 | 2026-05-19 | NULL             | correction
 ---
 user UUID | action    | NULL       | NULL      | NULL        | NULL       | 2026-05-19 | 2026-05-22 | "in 4 days"      | user_stated
 ```
@@ -40,8 +40,8 @@ user UUID | action    | NULL       | NULL      | NULL        | NULL       | 2026
 ## Why This Matters
 
 ### Correction Validation Flow
-When user says "Des is 14 not 12":
-1. Parse: entity=Des, action=correction, rel_type=age, old=12, new=14
+When user says "${CHILD1} is 14 not 12":
+1. Parse: entity=${CHILD1}, action=correction, rel_type=age, old=12, new=14
 2. **Match correction pattern** against database
 3. If pattern exists (12→14): use it to update
 4. If pattern doesn't exist: create new pattern with weight
@@ -85,8 +85,8 @@ Update ON CONFLICT logic to preserve correction history:
 ## Correction Matching Logic (Once Schema Fixed)
 
 ```
-User: "Des is 14 not 12"
-Parse: entity_id=Des, rel_type=age, old_value=12, new_value=14
+User: "${CHILD1} is 14 not 12"
+Parse: entity_id=${CHILD1}, rel_type=age, old_value=12, new_value=14
 
 Query corrections table:
   SELECT * FROM correction_patterns 
@@ -97,7 +97,7 @@ If not: Create new pattern with base weight, evaluate when threshold met
 
 Track sequence: 
   SELECT value_int, updated_at FROM entity_attributes
-  WHERE entity_id=Des AND attribute='age'
+  WHERE entity_id=${CHILD1} AND attribute='age'
   ORDER BY updated_at
   RESULT: 12 (2026-05-19 01:00) → 14 (2026-05-19 01:05) → 16 (2026-05-19 01:10)
   PATTERN: Ascending corrections, increases by 2 each time
@@ -155,9 +155,9 @@ Validator philosophy (what we built):
 
 **Current state:** dprompt-117 adds correction early exit (returns after correction) but doesn't implement **pattern matching**.
 
-**Missing:** When user says "Des is 14 not 12", the system should:
+**Missing:** When user says "${CHILD1} is 14 not 12", the system should:
 
-1. **Parse correction** → entity=Des, action=correction, rel_type=age, old=12, new=14
+1. **Parse correction** → entity=${CHILD1}, action=correction, rel_type=age, old=12, new=14
 2. **Query correction_patterns** → Does pattern (12→14) exist?
 3. **If found:** Use pattern metadata (weight, confidence) to update fact
 4. **If not found:** Create new pattern, queue for evaluation when threshold met
@@ -203,7 +203,7 @@ Correction history:
 
 ### Example
 
-User corrections for Des age:
+User corrections for ${CHILD1} age:
 ```
 2026-05-19 01:00: 12 (initial)
 2026-05-19 01:05: 14 (user correction: "he's 14 not 12")
@@ -287,16 +287,16 @@ Entity stores age=12 → User corrects "14 not 12" → Correction matching looks
 
 ### Unit: Correction Parsing
 ```
-Input: "Des is 14 not 12"
-Expected: {entity: "Des", rel_type: "age", old: 12, new: 14, action: "correction"}
+Input: "${CHILD1} is 14 not 12"
+Expected: {entity: "${CHILD1}", rel_type: "age", old: 12, new: 14, action: "correction"}
 ```
 
 ### Integration: Correction Matching
 ```
-Store: Des age=12
-Correct: "Des is 14 not 12"
+Store: ${CHILD1} age=12
+Correct: "${CHILD1} is 14 not 12"
 Query: correction_patterns → (age, 12→14) → Found/Not found
-Action: Update Des age=14 with provenance='correction'
+Action: Update ${CHILD1} age=14 with provenance='correction'
 ```
 
 ### E2E: Pattern Learning

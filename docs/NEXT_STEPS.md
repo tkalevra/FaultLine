@@ -26,7 +26,7 @@
 ## dprompt-86: Taxonomy Seeding Fix
 
 ### Problem
-- User extracted "I live at 156 Cedar Street S, Kitchener, ON"
+- User extracted "I live at 156 Cedar Street S, ${LOCATION}, ON"
 - LLM produced 2 triples: (address, instance_of, location) + (user, lives_at, address)
 - Only 1 committed to database (the lives_at triple was rejected)
 - Root cause: Semantic conflict detector saw address as TYPE (due to instance_of), and lives_at is_leaf_only=TRUE prevented leaf rels on types
@@ -46,7 +46,7 @@ Removed both constraints:
 Backend graph traversal + LLM are authoritative. System should self-build ontology from data, not enforce hardcoded taxonomy constraints at ingest time. Taxonomies table remains available for data-driven population and query-time filtering, but seeding is gone.
 
 ### Verification
-After rebuild: Test "I live at 156 Cedar Street S, Kitchener, ON" extraction. Both triples should commit.
+After rebuild: Test "I live at 156 Cedar Street S, ${LOCATION}, ON" extraction. Both triples should commit.
 
 ### Debug Logging (dprompt-88b)
 Added comprehensive logging to /query endpoint:
@@ -61,7 +61,7 @@ This logging will help identify if lives_at facts are:
 
 Test steps:
 1. Rebuild container (migrations will update is_leaf_only=FALSE)
-2. Submit "I live at 156 Cedar Street S, Kitchener, ON" to OpenWebUI
+2. Submit "I live at 156 Cedar Street S, ${LOCATION}, ON" to OpenWebUI
 3. Check logs for query.initial_user_facts — should show lives_at if extraction+ingest worked
 4. Query "where do I live?" and check logs for rel_types returned
 5. If lives_at still missing, logs will show where it was filtered out
@@ -179,7 +179,7 @@ if novel_rel_type.tail_types != existing_rel_type.tail_types:
 1. Hierarchy facts missing (instance_of, member_of, same_as not extracted)
 2. Filter cannot match "we" (UUID d010884b...) to user (UUID 10d7d879...)
 
-**Solution:** Enhance /extract/rewrite to extract BOTH hierarchy + relational using typed_entities. Inject semantic definitions for relationship types at fact creation time. Definitions enable downstream models to understand hierarchy (vertical layers: Kitchener ⊂ Ontario ⊂ Canada) vs relational (horizontal connections: User parent_of Gabriella) without confusion.
+**Solution:** Enhance /extract/rewrite to extract BOTH hierarchy + relational using typed_entities. Inject semantic definitions for relationship types at fact creation time. Definitions enable downstream models to understand hierarchy (vertical layers: ${LOCATION} ⊂ Ontario ⊂ Canada) vs relational (horizontal connections: User parent_of ${CHILD3}) without confusion.
 
 **Implementation:** See dprompt-85.md
 - /extract/rewrite prompt: Add hierarchy extraction instructions + typed_entity usage

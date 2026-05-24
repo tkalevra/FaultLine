@@ -184,9 +184,9 @@ class TestScenario3AliasResolution:
 
         # Ingest: ${CHILD3} with alias ${CHILD3}
         edges = [
-            {"subject": "${CHILD3}", "object": "${CHILD3}", "rel_type": "pref_name",
+            {"subject": "gabriella", "object": "gabby", "rel_type": "pref_name",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "${CHILD3}", "object": "pizza", "rel_type": "likes",
+            {"subject": "gabriella", "object": "pizza", "rel_type": "likes",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
         ingest = _ingest(client,
@@ -195,7 +195,7 @@ class TestScenario3AliasResolution:
         assert ingest.get("status") == "valid", f"Ingest failed: {ingest}"
 
         # Query using nickname
-        result = _query(client, "what does ${CHILD3} like", self.uid)
+        result = _query(client, "what does gabby like", self.uid)
         assert result.get("status") == "ok"
 
         facts = result.get("facts", [])
@@ -230,7 +230,7 @@ class TestScenario4AgeUpdate:
         assert r2.get("status") == "valid"
 
         # Query — should return latest age (11), not both
-        result = _query(client, "how old is ${CHILD3}", self.uid)
+        result = _query(client, "how old is gabriella", self.uid)
         assert result.get("status") == "ok"
 
         facts = result.get("facts", [])
@@ -433,7 +433,7 @@ class TestScenario9UnknownRelType:
         client = TestClient(app)
 
         edges = [{
-            "subject": "user", "object": "${CHILD2}",
+            "subject": "user", "object": "cyrus",
             "rel_type": "mentor",
             "subject_type": "Person", "object_type": "Person"
         }]
@@ -445,7 +445,7 @@ class TestScenario9UnknownRelType:
             f"Unexpected ingest result: {ingest}"
 
         # Query must not crash
-        result = _query(client, "tell me about ${CHILD2}", self.uid)
+        result = _query(client, "tell me about cyrus", self.uid)
         assert result.get("status") == "ok"
 
 
@@ -469,11 +469,11 @@ class TestScenario10ExtendedFamily:
         edges = [
             {"subject": "alice", "object": "bob", "rel_type": "spouse",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "alice", "object": "${CHILD2}", "rel_type": "parent_of",
+            {"subject": "alice", "object": "cyrus", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "alice", "object": "${CHILD3}", "rel_type": "parent_of",
+            {"subject": "alice", "object": "gabriella", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "alice", "object": "${CHILD1}", "rel_type": "parent_of",
+            {"subject": "alice", "object": "desmonde", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
         ]
         ingest = _ingest(client,
@@ -512,13 +512,13 @@ class TestScenario11MyKidsAutoDiscovery:
         client = TestClient(app)
 
         edges = [
-            {"subject": "user", "object": "${CHILD2}", "rel_type": "parent_of",
+            {"subject": "user", "object": "cyrus", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "${CHILD2}", "object": "student", "rel_type": "occupation",
+            {"subject": "cyrus", "object": "student", "rel_type": "occupation",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "user", "object": "${CHILD3}", "rel_type": "parent_of",
+            {"subject": "user", "object": "gabriella", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "${CHILD3}", "object": "student", "rel_type": "occupation",
+            {"subject": "gabriella", "object": "student", "rel_type": "occupation",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
         ingest = _ingest(client,
@@ -617,7 +617,7 @@ class TestScenario13DuplicateIngest:
                 assert confirmed >= 1, f"confirmed_count={confirmed}, expected >=1"
 
         # Query returns the fact exactly once
-        result = _query(client, "how old is ${CHILD2}", self.uid)
+        result = _query(client, "how old is cyrus", self.uid)
         assert result.get("status") == "ok"
         facts = result.get("facts", [])
         age_facts = [f for f in facts if f["rel_type"] == "age"]

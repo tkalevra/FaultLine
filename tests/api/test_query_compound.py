@@ -50,7 +50,7 @@ class TestQueryFamilyCompound:
 
         text = (
             "My name is ${USER}, I prefer to be called ${USER}, "
-            "I am married to Marla, who prefers to be called ${SPOUSE}. "
+            "I am married to ${SPOUSE}, who prefers to be called ${SPOUSE}. "
             "We have 3 children, a daughter ${CHILD3}, age 10, who prefers ${CHILD3}, "
             "${CHILD2}, our son is 19, and a son named ${CHILD1}, age 12, who goes by ${CHILD1}."
         )
@@ -116,7 +116,7 @@ class TestQueryFamilyCompound:
 
 
 class TestQuerySystemAurora:
-    """Domain-agnostic: system facts about '${ENTITY}' ingest + query."""
+    """Domain-agnostic: system facts about 'aurora' ingest + query."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -127,7 +127,7 @@ class TestQuerySystemAurora:
         _clean_db(self.dsn, self.uid)
 
     def test_system_aurora_ingest_and_query(self):
-        """Ingest system facts and query 'tell me what you know about ${ENTITY}'."""
+        """Ingest system facts and query 'tell me what you know about aurora'."""
         from src.api.main import app
         client = TestClient(app)
 
@@ -143,7 +143,7 @@ class TestQuerySystemAurora:
         assert ingest.get("status") == "valid"
 
         result = _query(client,
-                        "Tell me what you know about the system named ${ENTITY}",
+                        "Tell me what you know about the system named aurora",
                         self.uid)
         assert result.get("status") == "ok"
 
@@ -164,7 +164,7 @@ class TestQuerySystemAurora:
         assert "hostname" in rel_types, \
             f"hostname fact missing from response. Facts: {rel_types}"
 
-        # The hostname fact object should resolve to "${ENTITY}" text, not a UUID
+        # The hostname fact object should resolve to "aurora" text, not a UUID
         hostname_facts = [f for f in facts if f["rel_type"] == "hostname"]
         assert len(hostname_facts) >= 1
         for h in hostname_facts:
@@ -175,6 +175,6 @@ class TestQuerySystemAurora:
         # Should have at least 1 system fact (hostname).
         # Other facts (fqdn, has_ram, etc.) are staged as Class C and may
         # not all resolve via entity lookup — the fqdn fact's subject is
-        # the "ryzen 7" entity, not "system" or "${ENTITY}".
+        # the "ryzen 7" entity, not "system" or "aurora".
         assert len(facts) >= 1, \
             f"Expected at least 1 system fact, got {len(facts)}: {rel_types}"

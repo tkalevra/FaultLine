@@ -17,7 +17,7 @@
 - **File bugs in BUGS/** with proper globbing (`dBug-NNN-name.md`), not in chat
 - **Commit to dev only** — user handles prod sync via deploy process
 - **Never rebuild containers or push to remote** — user owns those actions
-- **Test through production endpoint** (example.com) not localhost
+- **Test through production endpoint** (${OPENWEBUI_DOMAIN}) not localhost
 
 ## COMMUNICATION
 
@@ -43,7 +43,7 @@
 
 - ❌ Trying to fix things without reading logs first
 - ❌ Assuming code does what the comment says (verify in logs)
-- ❌ Using localhost:8001 for testing (use example.com with bearer token)
+- ❌ Using localhost:8001 for testing (use ${OPENWEBUI_DOMAIN} with bearer token)
 - ❌ Creating scratch.md entries in chat instead of proper format
 - ❌ Implementing code changes before scratch.md approval
 - ❌ Hardcoding rules instead of using metadata-driven queries
@@ -65,7 +65,7 @@
 - Logs win. Verify what's actually deployed, not what code claims.
 
 **Test passes locally but fails in prod**
-- Local ≠ prod. Test against example.com. User handles container state.
+- Local ≠ prod. Test against ${OPENWEBUI_DOMAIN}. User handles container state.
 
 **Should I rebuild the container?**
 - No. User rebuilds. Your job: code changes only.

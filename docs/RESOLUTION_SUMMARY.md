@@ -68,9 +68,9 @@ OpenWebUI → Filter → Extraction → Ingest → Staging → Re-embedder → F
 
 **Database Metrics:**
 - Facts table: 0 rows (awaiting promotion)
-- Staged facts: 1 Class B (works_for: christopher→linux)
+- Staged facts: 1 Class B (works_for: ${USER}→linux)
 - confirmed_count: 0 (needs 3 duplicates to reach promotion threshold)
-- Entities: 2 (christopher, linux)
+- Entities: 2 (${USER}, linux)
 - NoneType errors: 0
 
 **Component Status:**

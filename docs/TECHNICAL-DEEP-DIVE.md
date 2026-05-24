@@ -84,7 +84,7 @@ CREATE TABLE entity_attributes (
     user_id         TEXT NOT NULL,
     entity_id       TEXT NOT NULL,      -- UUID (normalized to "user" for user attributes)
     attribute       TEXT NOT NULL,      -- "age", "name", "height"
-    value_text      TEXT,               -- "Chris", "14"
+    value_text      TEXT,               -- "${USER}", "14"
     value_int       INT,
     value_float     FLOAT,
     value_date      DATE,
@@ -94,7 +94,7 @@ CREATE TABLE entity_attributes (
 );
 
 -- Example rows:
--- (user1, user_uuid, pref_name, "Chris", NULL, NULL, ...)
+-- (user1, user_uuid, pref_name, "${USER}", NULL, NULL, ...)
 -- (user1, des_uuid, age, "14", 14, NULL, ...)
 ```
 
@@ -120,7 +120,7 @@ CREATE TABLE entity_aliases (
 
 -- Example:
 -- entities: (uuid1, user1, Person)
--- aliases: (uuid1, user1, "Chris", true), (uuid1, user1, "christopher", false)
+-- aliases: (uuid1, user1, "${USER}", true), (uuid1, user1, "${USER}", false)
 ```
 
 **Key principle:** UUID v5 surrogates are deterministic. Same name always → same UUID. Prevents duplicates.
@@ -373,7 +373,7 @@ def deduplicate_facts(facts: List[Dict]) -> List[Dict]:
 ```
 
 **Why UUID-based?** Prevents alias multiplication:
-- "Chris", "Christopher", "chris" → all same UUID → one fact
+- "${USER}", "${USER}", "${USER}" → all same UUID → one fact
 - Without this: 3 separate facts for same person (wrong!)
 
 ### Prose Formatting
@@ -393,7 +393,7 @@ def format_fact_for_injection(fact):
     
     # Example:
     # REL_TYPE_TEMPLATES['spouse'] = "{subject} is your spouse, {object}"
-    # prose = "Marla is your spouse"
+    # prose = "${SPOUSE} is your spouse"
     
     # Add metadata
     metadata_prose = (
@@ -615,7 +615,7 @@ def test_layer1_rel_type_creation():
 
 def test_layer2_entity_classification():
     """Unknown entity should be classified on ingest"""
-    ingest(entity='Des', inferred_type='Person')
+    ingest(entity='${CHILD1}', inferred_type='Person')
     assert db.query(facts).filter(
         subject_id=des_uuid,
         rel_type='instance_of'

@@ -740,7 +740,7 @@ class TestRetractionPipelineComprehensive:
         # CORRECTIONS: Multiple dimensions
         corrections = [
             ("I'm not 25, I'm 26", "SCALAR", "age", "25", "26"),
-            ("My wife is Sarah, not ${ENTITY}", "RELATIONAL", "spouse", "${ENTITY}", "sarah"),
+            ("My wife is Sarah, not ${ENTITY}", "RELATIONAL", "spouse", "aurora", "sarah"),
             ("Spot is a cat, not a dog", "HIERARCHICAL", "instance_of", "dog", "cat"),
         ]
 

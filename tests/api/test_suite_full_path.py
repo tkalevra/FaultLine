@@ -101,7 +101,7 @@ class TestGroupABaseIntegration:
         # Ingest
         text = (
             "My name is ${USER}, I prefer to be called ${USER}. "
-            "I am married to Marla, who prefers to be called ${SPOUSE}. "
+            "I am married to ${SPOUSE}, who prefers to be called ${SPOUSE}. "
             "We have 3 children: ${CHILD2} (19), ${CHILD3} who goes by ${CHILD3} (10), "
             "and ${CHILD1} who prefers ${CHILD1} (12)."
         )
@@ -404,18 +404,18 @@ class TestGroupCHierarchyGraph:
         edges = [
             {"subject": "alice", "object": "${SPOUSE}", "rel_type": "spouse",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "${SPOUSE}", "object": "fraggle", "rel_type": "has_pet",
+            {"subject": "${SPOUSE}", "object": "${PET}", "rel_type": "has_pet",
              "subject_type": "Person", "object_type": "Animal"},
-            {"subject": "fraggle", "object": "morkie", "rel_type": "instance_of",
+            {"subject": "${PET}", "object": "morkie", "rel_type": "instance_of",
              "subject_type": "Animal", "object_type": "Concept"},
             {"subject": "morkie", "object": "dog", "rel_type": "subclass_of",
              "subject_type": "Concept", "object_type": "Concept"},
             {"subject": "dog", "object": "animal", "rel_type": "subclass_of",
              "subject_type": "Concept", "object_type": "Concept"},
         ]
-        _ingest(client, "Alice, ${SPOUSE}, Fraggle the morkie", self.uid, edges=edges)
+        _ingest(client, "alice, ${SPOUSE}, ${PET} the morkie", self.uid, edges=edges)
 
-        result = _query(client, "where do ${SPOUSE} and fraggle live", self.uid)
+        result = _query(client, "where do ${SPOUSE} and ${PET} live", self.uid)
         assert result.get("status") == "ok"
         facts = result.get("facts", [])
         rel_types = {f["rel_type"] for f in facts}
@@ -532,7 +532,7 @@ class TestGroupDSensitivityNovel:
 
         edges = [{"subject": "bob", "object": "alice", "rel_type": "mentors",
                   "subject_type": "Person", "object_type": "Person"}]
-        _ingest(client, "Bob mentors Alice", self.uid, edges=edges)
+        _ingest(client, "bob mentors alice", self.uid, edges=edges)
 
         result = _query(client, "tell me about bob", self.uid)
         assert result.get("status") == "ok"
