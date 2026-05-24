@@ -1541,6 +1541,57 @@ def main():
                 else:
                     log.debug("re_embedder.no_pending_ontology_work")
 
+                # dprompt-065: Async taxonomy discovery for novel rel_types (deferred from ingest)
+                # Runs in poll loop — no blocking LLM call in ingest hot path
+                try:
+                    from src.api.main import _llm_discover_taxonomy_from_facts, _load_taxonomy_cache
+                    from src.api.llm_client import build_llm_payload
+
+                    with db.cursor() as cur:
+                        cur.execute(
+                            "SELECT DISTINCT rel_type FROM staged_facts "
+                            "WHERE rel_type NOT IN (SELECT rel_type FROM rel_types) LIMIT 10"
+                        )
+                        novel_rels = [row[0] for row in cur.fetchall()]
+
+                    if novel_rels:
+                        for rel_type in novel_rels:
+                            try:
+                                discovered = _llm_discover_taxonomy_from_facts(
+                                    db, "system", [{"rel_type": rel_type}], qwen_api_url
+                                )
+                                if discovered and discovered.get("taxonomy_name"):
+                                    with db.cursor() as cur:
+                                        cur.execute(
+                                            "INSERT INTO entity_taxonomies "
+                                            "(taxonomy_name, description, member_entity_types, "
+                                            "rel_types_defining_group, has_transitivity, "
+                                            "transitive_rel_types, is_hierarchical, parent_rel_type, source) "
+                                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                                            "ON CONFLICT (taxonomy_name) DO NOTHING",
+                                            (
+                                                discovered.get("taxonomy_name"),
+                                                discovered.get("description", ""),
+                                                discovered.get("member_entity_types", "{}"),
+                                                discovered.get("rel_types_defining_group", []),
+                                                discovered.get("has_transitivity", False),
+                                                discovered.get("transitive_rel_types", "{}"),
+                                                discovered.get("is_hierarchical", False),
+                                                discovered.get("parent_rel_type"),
+                                                "engine_learned_re_embedder",
+                                            ),
+                                        )
+                                    db.commit()
+                                    _load_taxonomy_cache(db)
+                                    log.info("re_embedder.taxonomy_discovered_async",
+                                            rel_type=rel_type,
+                                            taxonomy=discovered.get("taxonomy_name"))
+                            except Exception as e:
+                                log.warning("re_embedder.taxonomy_discovery_failed",
+                                           rel_type=rel_type, error=str(e))
+                except Exception as e:
+                    log.warning("re_embedder.taxonomy_discovery_loop_failed", error=str(e))
+
                 # dprompt-128-P3: Evaluate correction signal candidates
                 # Patterns that occur >= 3 times are auto-approved to correction_signals
                 correction_stats = evaluate_correction_signal_candidates(db, qwen_api_url)

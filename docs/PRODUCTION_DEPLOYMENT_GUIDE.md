@@ -1,7 +1,7 @@
 # Production Deployment Guide: FaultLine-dev → faultline-prod
 
 **Purpose:** Standard Operating Procedure for deploying code from development to production.  
-**Audience:** Claude Code, Deepseek, Christopher Thompson  
+**Audience:** Claude Code, Deepseek, ${USER} Thompson  
 **Version:** 1.0  
 **Last Updated:** 2026-05-12
 
@@ -77,11 +77,11 @@ git show --name-only [commit-hash]
 | Category | Examples | Action |
 |----------|----------|--------|
 | Bearer Tokens | `sk-addb2220bf534bfaa8f78d96e6991989` | DELETE or replace with `<bearer-token>` |
-| Personal Names | Mia, Ellie, Leo, Theodore, Sam | Keep in test fixtures only; remove from config/docs |
-| Server Names | `example.com`, `docker-host` | Replace with `<hostname>`, `<server>`, `example.com` |
+| Personal Names | ${CHILD3}, ${SPOUSE}, ${CHILD2}, ${CHILD1}, ${USER} | Keep in test fixtures only; remove from config/docs |
+| Server Names | `${OPENWEBUI_DOMAIN}`, `docker-host` | Replace with `<hostname>`, `<server>`, `example.com` |
 | API Keys | Any `sk-`, `api_`, `secret_` patterns | DELETE |
 | Email Addresses | `tkalevra@users.noreply.github.com` | Replace with `user@example.com` |
-| IP Addresses | `192.168.1.10`, `172.16.18.3` | Keep only if generic (localhost, 0.0.0.0) |
+| IP Addresses | `${BACKEND_IP}`, `172.16.18.3` | Keep only if generic (localhost, 0.0.0.0) |
 | SSH Commands | Commands with auth tokens | Sanitize example commands |
 | Debug Comments | Comments with personal context | Generalize or remove |
 
@@ -94,7 +94,7 @@ grep -r "sk-[a-f0-9]\{32\}" /home/user/Documents/013-GIT/FaultLine-dev/openwebui
 grep -r "[a-z]*@[a-z]*\.[a-z]*" /home/user/Documents/013-GIT/FaultLine-dev/openwebui/
 
 # Search for personal names
-grep -r "Mia\|Mia\|Ellie\|Leo\|Theodore" /home/user/Documents/013-GIT/FaultLine-dev/src/
+grep -r "${CHILD3}\|${CHILD3}\|${SPOUSE}\|${CHILD2}\|${CHILD1}" /home/user/Documents/013-GIT/FaultLine-dev/src/
 
 # Search for server names
 grep -r "docker-host\|docker-host\|192\.168\|172\.16" /home/user/Documents/013-GIT/FaultLine-dev/
@@ -118,7 +118,7 @@ DEST="~/faultline-prod/openwebui/faultline_tool.py"
 cp "$SRC" "$DEST"
 
 # Inspect for issues
-grep -n "sk-\|docker-host\|Mia\|docker-host\|192.168\|172.16" "$DEST"
+grep -n "sk-\|docker-host\|${CHILD3}\|docker-host\|192.168\|172.16" "$DEST"
 # If matches found: manually edit, OR restore and abort deployment
 ```
 
@@ -127,9 +127,9 @@ grep -n "sk-\|docker-host\|Mia\|docker-host\|192.168\|172.16" "$DEST"
 | Pattern | Replace With | Reason |
 |---------|--------------|--------|
 | `sk-addb2220bf534bfaa8f78d96e6991989` | `<bearer-token>` | Bearer token exposure |
-| `Mia`, `Mia`, `Ellie`, `Leo`, `Theodore`, `Sam` | Generic names in comments | Personal data |
-| `example.com` | `<hostname>` or `example.com` | Server exposure |
-| `docker-host`, `192.168.1.10`, `172.16.18.3` | `<server>`, localhost defaults | Infrastructure exposure |
+| `${CHILD3}`, `${CHILD3}`, `${SPOUSE}`, `${CHILD2}`, `${CHILD1}`, `${USER}` | Generic names in comments | Personal data |
+| `${OPENWEBUI_DOMAIN}` | `<hostname>` or `example.com` | Server exposure |
+| `docker-host`, `${BACKEND_IP}`, `172.16.18.3` | `<server>`, localhost defaults | Infrastructure exposure |
 | `tkalevra@users.noreply.github.com` | `user@example.com` | Email exposure |
 | `ssh docker-host -x "sudo docker..."` | `ssh <server> -x "sudo docker..."` | Command examples sanitized |
 
@@ -139,7 +139,7 @@ cp /home/user/Documents/013-GIT/FaultLine-dev/openwebui/faultline_tool.py \
    ~/faultline-prod/openwebui/faultline_tool.py
 
 # Verify no secrets
-grep -E "sk-[a-f0-9]{32}|Mia|Ellie|Leo|Theodore|docker-host|docker-host" \
+grep -E "sk-[a-f0-9]{32}|${CHILD3}|${SPOUSE}|${CHILD2}|${CHILD1}|docker-host|docker-host" \
   ~/faultline-prod/openwebui/faultline_tool.py
 
 # Expected: no output (clean)
@@ -296,7 +296,7 @@ grep -r "sk-[a-f0-9]" ~/faultline-prod/ 2>/dev/null | grep -v ".git"
 # Expected: no output
 
 # No personal names in code
-grep -r "Mia\|Ellie\|Leo" ~/faultline-prod/src/ ~/faultline-prod/openwebui/ 2>/dev/null
+grep -r "${CHILD3}\|${SPOUSE}\|${CHILD2}" ~/faultline-prod/src/ ~/faultline-prod/openwebui/ 2>/dev/null
 # Expected: no output (or only in tests/fixtures)
 ```
 
@@ -397,7 +397,7 @@ When told "Deploy dprompt-XX to production":
 
 **Step 3: Audit**
 ```bash
-grep -r "sk-\|Mia\|docker-host\|docker-host" openwebui/faultline_tool.py
+grep -r "sk-\|${CHILD3}\|docker-host\|docker-host" openwebui/faultline_tool.py
 # (No output — clean)
 ```
 

@@ -62,16 +62,16 @@ _FIRST_PERSON_PREF_PATTERNS: list[tuple[re.Pattern, str]] = [
 # ── Third-person preference ────────────────────────────────────────────────
 # "X prefers to be called Y" / "X, who prefers Y" / "X goes by Y"
 _THIRD_PERSON_PREF_PATTERNS: list[re.Pattern] = [
-    # "Elena, who prefers to be called emma" / "diana, age 10, who prefers bob"
+    # "${SPOUSE}, who prefers to be called emma" / "diana, age 10, who prefers bob"
     # Middle clause allows: ", age N, " or ", our son, " etc. between name and "who prefers"
     re.compile(r"([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+prefers?\s+(?:to\s+be\s+called\s+)?([A-Z][a-z]+)", re.IGNORECASE),
-    # "Elena prefers to be called emma"
+    # "${SPOUSE} prefers to be called emma"
     re.compile(r"([A-Z][a-z]+)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Elena, who goes by emma" / "alicemonde, age 12, who goes by alice"
+    # "${SPOUSE}, who goes by emma" / "alicemonde, age 12, who goes by alice"
     re.compile(r"([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+goes\s+by\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Elena goes by emma" (must NOT match when preceded by "who " — caught above)
+    # "${SPOUSE} goes by emma" (must NOT match when preceded by "who " — caught above)
     re.compile(r"(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )([A-Z][a-z]+)\s+goes\s+by\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Elena, known as emma"
+    # "${SPOUSE}, known as emma"
     re.compile(r"([A-Z][a-z]+)\s*,\s*known\s+as\s+([A-Z][a-z]+)", re.IGNORECASE),
     # "who prefers bob" (bare preference, no "to be called")
     re.compile(r"who\s+prefers?\s+([A-Z][a-z]+)", re.IGNORECASE),
@@ -83,13 +83,13 @@ _THIRD_PERSON_PREF_PATTERNS: list[re.Pattern] = [
 
 # ── Marriage ────────────────────────────────────────────────────────────────
 _MARRIAGE_PATTERNS: list[re.Pattern] = [
-    # "I am married to Elena"
+    # "I am married to ${SPOUSE}"
     re.compile(r"\b(?:i\s+am|i'm)\s+married\s+to\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "married to Elena"
+    # "married to ${SPOUSE}"
     re.compile(r"\bmarried\s+to\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "my wife Elena" / "my husband X"
+    # "my wife ${SPOUSE}" / "my husband X"
     re.compile(r"\bmy\s+(wife|husband|spouse|partner)\s+([A-Z][a-z]+)", re.IGNORECASE),
-    # "Elena is my wife"
+    # "${SPOUSE} is my wife"
     re.compile(r"([A-Z][a-z]+)\s+is\s+my\s+(wife|husband|spouse|partner)", re.IGNORECASE),
 ]
 

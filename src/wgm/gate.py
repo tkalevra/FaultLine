@@ -15,11 +15,11 @@ log = structlog.get_logger()
 try:
     from src.api.logging_config import log_crit, log_warn, log_info, log_debug
 except ImportError:
-    # Fallback if logging_config not available (must match real signature: logger, msg, **${LOCATION})
-    def log_crit(logger, msg, **${LOCATION}): logger.critical(msg, **${LOCATION})
-    def log_warn(logger, msg, **${LOCATION}): logger.warning(msg, **${LOCATION})
-    def log_info(logger, msg, **${LOCATION}): logger.info(msg, **${LOCATION})
-    def log_debug(logger, msg, **${LOCATION}): logger.debug(msg, **${LOCATION})
+    # Fallback if logging_config not available (must match real signature: logger, msg, **)
+    def log_crit(logger, msg, **kwargs): logger.critical(msg, **kwargs)
+    def log_warn(logger, msg, **kwargs): logger.warning(msg, **kwargs)
+    def log_info(logger, msg, **kwargs): logger.info(msg, **kwargs)
+    def log_debug(logger, msg, **kwargs): logger.debug(msg, **kwargs)
 
 # Marker for internal FaultLine prompts (dprompt-128) — prevents context bloat if looped back
 _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
@@ -347,7 +347,7 @@ class WGMValidationGate:
             return True
         # High confidence (1.0 or 0.9+) implies user-stated
         confidence = edge_dict.get("confidence", 0.5)
-        return confidence >= 0.9
+        return (confidence or 0.0) >= 0.9
 
     def _find_conflicting_relationships(self, user_id: str, subject_id: str, new_rel_type: str) -> list[str]:
         """Find rel_types that conflict with the new relationship type for this subject."""
@@ -636,82 +636,12 @@ class WGMValidationGate:
                 """, (category,))
                 row = cur.fetchone()
                 if not row:
-                    # Eager learning: discover taxonomy NOW (like remembering a name immediately)
-                    log.info("wgm.taxonomy_missing_eager_discover", category=category, rel_type=rel_type)
-
-                    # Local import to avoid circular dependency
-                    from src.api.main import _llm_discover_taxonomy_from_facts
-
-                    # Try to discover taxonomy from this fact + rel_type
-                    current_fact = {
-                        "rel_type": rel_type,
-                        "subject": fact_dict.get("subject", ""),
-                        "subject_type": subject_type,
-                        "object": fact_dict.get("object", ""),
-                        "object_type": object_type
-                    }
-
-                    try:
-                        # Get LLM URL for discovery (auto-detect same as gate uses)
-                        llm_url = _detect_llm_endpoint()
-
-                        # Use separate DB connection to avoid transaction conflicts
-                        # self.db_conn is already in a transaction context
-                        db_discover = None
-                        try:
-                            db_discover = psycopg2.connect(os.getenv("POSTGRES_DSN"))
-                            discovered = _llm_discover_taxonomy_from_facts(
-                                db_discover,
-                                user_id or "unknown",
-                                [current_fact],  # Single fact for context
-                                llm_url
-                            )
-                        finally:
-                            if db_discover:
-                                try:
-                                    db_discover.close()
-                                except Exception:
-                                    pass
-
-                        if discovered:
-                            # Insert discovered taxonomy (don't commit here — let caller manage transaction)
-                            with self.db_conn.cursor() as insert_cur:
-                                insert_cur.execute("""
-                                    INSERT INTO entity_taxonomies
-                                    (taxonomy_name, description, member_entity_types, rel_types_defining_group,
-                                     has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type)
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (taxonomy_name) DO NOTHING
-                                """, (
-                                    discovered.get("taxonomy_name"),
-                                    discovered.get("description", ""),
-                                    json.dumps(discovered.get("member_entity_types", {})),
-                                    json.dumps(discovered.get("rel_types_defining_group", [])),
-                                    discovered.get("has_transitivity", False),
-                                    json.dumps(discovered.get("transitive_rel_types", {})),
-                                    discovered.get("is_hierarchical", False),
-                                    discovered.get("parent_rel_type")
-                                ))
-                            log.info("wgm.taxonomy_discovered_and_created",
-                                    category=category, rel_type=rel_type,
-                                    taxonomy_name=discovered.get("taxonomy_name"))
-                            # Retry the lookup
-                            cur.execute("""
-                                SELECT member_entity_types, rel_types_defining_group
-                                FROM entity_taxonomies
-                                WHERE taxonomy_name = %s
-                            """, (category,))
-                            row = cur.fetchone()
-                        else:
-                            # Discovery declined → allow fact anyway (user is truth)
-                            log.info("wgm.taxonomy_discovery_declined_fact_allowed",
-                                    category=category, rel_type=rel_type)
-                            return (False, "valid")
-                    except Exception as e:
-                        log.warning("wgm.taxonomy_eager_discovery_failed",
-                                   category=category, error=str(e))
-                        # On discovery failure, allow fact (user is truth)
-                        return (False, "valid")
+                    # dprompt-LLM-Fix: Taxonomy not found — allow fact, re-embedder discovers async
+                    # No synchronous LLM call in validation hot path
+                    log.info("wgm.taxonomy_missing_deferred_to_re_embedder",
+                            category=category, rel_type=rel_type,
+                            reason="re_embedder async discovery prevents ingest blocking")
+                    return (False, "valid")
 
                 member_entity_types = set(t.lower() for t in (row[0] or []))
                 category_rels = set(rt.lower() for rt in (row[1] or []))
@@ -834,7 +764,7 @@ class WGMValidationGate:
 
     def validate_edge(self, subject_id, object_id, rel_type: str,
                       user_id=None, provenance=None, subject_type: str = None,
-                      object_type: str = None, **edge_${LOCATION}args) -> dict:
+                      object_type: str = None, **edge_args) -> dict:
         """
         Validate an incoming edge against the ontology and existing DB state.
         If registry is provided, uses it; otherwise falls back to SEED_ONTOLOGY.
@@ -847,7 +777,7 @@ class WGMValidationGate:
         """
         # dprompt-90: Semantic supersession on user corrections
         # If this is a correction, archive conflicting facts before validation
-        if user_id and self._is_user_correction(edge_${LOCATION}args):
+        if user_id and self._is_user_correction(edge_args):
             conflicting_rels = self._find_conflicting_relationships(user_id, subject_id, rel_type)
             if conflicting_rels:
                 self._supersede_conflicting_facts(
@@ -866,31 +796,43 @@ class WGMValidationGate:
                 rt = canonical
                 log.info("wgm.validate_edge_canonical_form", original=rel_type.lower(), canonical=rt)
             else:
-                # Novel type: dprompt-130 activates synchronous LLM approval at ingest time
-                # instead of deferring to async re-embedder. This enables self-learning
-                # ontology bootstrap.
-                log.info("wgm.novel_rel_type_detected", rel_type=rt,
-                         note="Attempting synchronous approval via LLM inference")
+                # dprompt-140: User-stated facts get sync inference; others defer to async
+                is_high_confidence = (edge_args.get("confidence", 0.8) or 0.0) >= 0.9
 
-                approved = self._try_approve_novel_type(rt)
-
-                if approved:
-                    # Metadata inferred and inserted into rel_types
-                    # Proceed as valid fact (re-run full validation with newly approved rel_type)
-                    log.info("wgm.novel_rel_type_approved", rel_type=rt,
-                             note="Metadata inferred and stored in rel_types table")
-                    # Cache is refreshed by _try_approve_novel_type(); continue with fresh rel_type metadata
+                if is_high_confidence:
+                    # User-stated novel rel_type: sync LLM inference (authoritative)
+                    log.info("wgm.novel_rel_type_sync_inference_for_user_stated",
+                            rel_type=rt, confidence=edge_args.get("confidence"))
+                    approved = self._try_approve_novel_type(rt)
+                    if approved:
+                        # Metadata now in cache and DB, continue validation
+                        log.info("wgm.novel_rel_type_approved_sync", rel_type=rt)
+                    else:
+                        # LLM declined or unavailable, auto-approve with fallback metadata
+                        log.warning("wgm.novel_rel_type_auto_approved", rel_type=rt)
                 else:
-                    # Not approved (confidence < 0.7), pending types table
-                    # Return "novel_unapproved" so ingest routes fact as Class C (staged, pending)
-                    log.info("wgm.novel_rel_type_unapproved", rel_type=rt,
-                             note="Pending LLM confidence >= 0.7, recorded in pending_types table")
+                    # LLM-inferred novel rel_type: async deferred (preserves speed)
+                    log.info("wgm.novel_rel_type_deferred_to_async",
+                            rel_type=rt, confidence=edge_args.get("confidence"),
+                            reason="low confidence extraction deferred")
+
+                    # Insert into pending_types for re_embedder async evaluation
+                    try:
+                        with self.db_conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO pending_types (rel_type) VALUES (%s) ON CONFLICT DO NOTHING",
+                                (rel_type,)
+                            )
+                        self.db_conn.commit()
+                    except Exception as e:
+                        log.warning("wgm.pending_types_insert_failed", rel_type=rt, error=str(e))
+
                     return {"status": "novel_unapproved"}
 
         # dprompt-064 Phase 1: Apply correction semantics (metadata-driven)
         # BEFORE validation gates, check if this is an immutable fact
-        if user_id and self._is_user_correction(edge_${LOCATION}args):
-            correction_result = self._apply_correction_semantics(edge_${LOCATION}args, rt, user_id)
+        if user_id and self._is_user_correction(edge_args):
+            correction_result = self._apply_correction_semantics(edge_args, rt, user_id)
             if correction_result["action"] == "immutable":
                 log.warning(
                     "wgm.immutable_fact_correction_rejected",
@@ -908,8 +850,8 @@ class WGMValidationGate:
         # High-confidence facts (>= 0.95) bypass validation gates entirely.
         # User-stated facts (confidence 1.0) and clear extractions (0.95+) are
         # trusted and skip type constraints, hierarchy, and category validation.
-        raw_confidence = edge_${LOCATION}args.get("confidence", 0.8)
-        is_user_correction = self._is_user_correction(edge_${LOCATION}args)
+        raw_confidence = edge_args.get("confidence", 0.8) or 0.0
+        is_user_correction = self._is_user_correction(edge_args)
         if raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9):
             log.info("wgm.confidence_bypass_early",
                      rel_type=rt, confidence=raw_confidence,
@@ -988,7 +930,7 @@ class WGMValidationGate:
                 # Mark for low confidence/Class C if not user-corrected
                 # User-stated facts override this check (handled by confidence bypass above)
                 if not is_user_correction and raw_confidence < 0.95:
-                    edge_${LOCATION}args["hierarchy_violation"] = hier_mem_reason
+                    edge_args["hierarchy_violation"] = hier_mem_reason
                     log.info("wgm.hierarchy_violation_low_confidence",
                             rel_type=rt, reason=hier_mem_reason,
                             note="Will be stored as Class C (staged) for review")
@@ -1001,8 +943,8 @@ class WGMValidationGate:
         # based on a consistent confidence algorithm across all output types
         try:
             import asyncio
-            edge_confidence = edge_${LOCATION}args.get("confidence", 0.8)
-            is_user_correction = self._is_user_correction(edge_${LOCATION}args)
+            edge_confidence = edge_args.get("confidence", 0.8) or 0.0
+            is_user_correction = self._is_user_correction(edge_args)
 
             # For async validator in sync context, create a task if event loop exists
             try:
@@ -1033,7 +975,7 @@ class WGMValidationGate:
                 unified_confidence = 1.0 if is_user_correction else edge_confidence
         except Exception as e:
             log.warning(f"wgm.validator_confidence_failed: {e}")
-            unified_confidence = edge_${LOCATION}args.get("confidence", 0.8)
+            unified_confidence = edge_args.get("confidence", 0.8) or 0.0
 
         if user_id is None:
             return {"status": "valid", "unified_confidence": unified_confidence}
@@ -1081,8 +1023,8 @@ class WGMValidationGate:
             if not old_rows:
                 # dprompt-126: Include hierarchy_violation if present
                 result = {"status": "valid", "unified_confidence": unified_confidence}
-                if edge_${LOCATION}args.get("hierarchy_violation"):
-                    result["hierarchy_violation"] = edge_${LOCATION}args["hierarchy_violation"]
+                if edge_args.get("hierarchy_violation"):
+                    result["hierarchy_violation"] = edge_args["hierarchy_violation"]
                 return result
 
             cur.execute(

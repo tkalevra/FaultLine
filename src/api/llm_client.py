@@ -30,7 +30,7 @@ def build_llm_payload(
     max_tokens: int = 200,
     thinking: Optional[dict] = None,
     stream: bool = False,
-    **${LOCATION}args
+    **args
 ) -> dict:
     """
     Build LLM request payload with centralized dBug-016 chat_id injection.
@@ -53,7 +53,7 @@ def build_llm_payload(
         max_tokens: Max output tokens
         thinking: Thinking config dict (e.g. {"type": "disabled"})
         stream: Whether to stream response (default False for internal calls)
-        **${LOCATION}args: Additional fields to merge into payload
+        **args: Additional fields to merge into payload
 
     Returns:
         Complete payload dict ready for httpx.post(json=payload)
@@ -77,10 +77,10 @@ def build_llm_payload(
     if thinking:
         payload["thinking"] = thinking
 
-    # Merge any additional fields, but NEVER allow ${LOCATION}args to override stream
+    # Merge any additional fields, but NEVER allow args to override stream
     # (stream=false is CRITICAL and must not be overridden by callers)
-    ${LOCATION}args.pop("stream", None)
-    payload.update(${LOCATION}args)
+    args.pop("stream", None)
+    payload.update(args)
 
     return payload
 

@@ -10,14 +10,14 @@ from faultline_tool import _extract_query_entities
 
 def test_direct_token_match():
     """Tier 1a: query token matches display name directly."""
-    preferred_names = {"uuid1": "elena", "uuid2": "fraggle", "uuid3": "${CHILD1}"}
+    preferred_names = {"uuid1": "elena", "uuid2": "fraggle", "uuid3": "theo"}
     entities = _extract_query_entities("how is elena?", preferred_names)
     assert "elena" in entities
 
 
 def test_case_insensitive_match():
     """Token matching is case-insensitive."""
-    preferred_names = {"uuid1": "Elena", "uuid2": "Fraggle"}
+    preferred_names = {"uuid1": "${SPOUSE}", "uuid2": "${PET}"}
     entities = _extract_query_entities("How's ELENA?", preferred_names)
     assert "elena" in entities
 
@@ -52,12 +52,12 @@ def test_seed_pet_resolves_via_has_pet():
 
 def test_seed_son_resolves_via_parent_of():
     """Seed: 'son' → parent_of rel_type."""
-    preferred_names = {"des_uuid": "${CHILD1}", "fraggle_uuid": "fraggle"}
+    preferred_names = {"des_uuid": "theo", "fraggle_uuid": "fraggle"}
     facts = [
         {"subject": "user", "object": "des_uuid", "rel_type": "parent_of"},
     ]
     entities = _extract_query_entities("how old is my son?", preferred_names, facts=facts)
-    assert "${CHILD1}" in entities
+    assert "theo" in entities
 
 
 def test_dynamic_domain_agnostic_resolution():

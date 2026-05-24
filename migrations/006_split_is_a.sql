@@ -10,7 +10,7 @@ VALUES
     ('pref_name',    'preferred name', null, false, 1.0)
 ON CONFLICT (rel_type) DO NOTHING;
 
--- Mark is_a as deprecated but keep it valid for bac${LOCATION}ard compatibility
+-- Mark is_a as deprecated but keep it valid for backward compatibility
 UPDATE rel_types
 SET label = 'is a (deprecated: use instance_of or subclass_of)',
     confidence = 0.5
