@@ -246,18 +246,38 @@ class WGMValidationGate:
             object_type = self._resolve_entity_type(object_id, user_id)
 
         # If type unknown, skip validation with warning
-        if subject_type is None:
+        # NOTE: entity_type='unknown' (string) is the DB default for newly-created entities.
+        # Treat the string 'unknown' identically to None — blocking facts on unknown-type
+        # entities creates a chicken-and-egg problem where the entity can never be typed.
+        subject_is_unknown = (subject_type is None or (isinstance(subject_type, str) and subject_type.lower() == 'unknown'))
+        if subject_is_unknown:
+            # Growth engine: infer subject type from head_types constraint
+            if user_id and head_types and not head_any:
+                inferred = head_types[0]
+                self._infer_entity_type(subject_id, inferred, user_id)
+                log.info("wgm.entity_type_inferred",
+                         entity_id=subject_id, inferred_type=inferred,
+                         rel_type=rel_type.lower(), role="subject")
             log.warning(
                 "wgm.type_check_skipped",
                 extra={
-                    "rel_type": rel_type,
+                    "rel_type": rel_type.lower(),
                     "entity_id": subject_id,
                     "reason": "entity_type unknown",
                 },
             )
             return (True, "type_unknown")
 
-        if object_type is None:
+        object_is_unknown = (object_type is None or 
+                             (isinstance(object_type, str) and object_type.lower() == 'unknown'))
+        if object_is_unknown:
+            # Growth engine: infer object type from tail_types constraint
+            if user_id and tail_types and not tail_any and not is_scalar:
+                inferred = tail_types[0]
+                self._infer_entity_type(object_id, inferred, user_id)
+                log.info("wgm.entity_type_inferred",
+                         entity_id=object_id, inferred_type=inferred,
+                         rel_type=rel_type.lower(), role="object")
             log.warning(
                 "wgm.type_check_skipped",
                 extra={
@@ -267,6 +287,7 @@ class WGMValidationGate:
                 },
             )
             return (True, "type_unknown")
+
 
         # Constraint checks (case-insensitive type comparison)
         head_types_lower = [t.lower() for t in head_types] if head_types else []
@@ -314,6 +335,30 @@ class WGMValidationGate:
                 extra={"entity_id": entity_id, "error": str(e)},
             )
             return None
+
+    def _infer_entity_type(self, entity_id: str, inferred_type: str, user_id: str = None) -> bool:
+        """
+        Growth engine: infer entity type from rel_type tail_types/head_types constraint.
+        
+        When a fact uses a known rel_type that constrains entity types
+        (e.g., lives_at.tail_types=['Location']), and the entity has type 'unknown',
+        auto-assign the constraint's first allowed type.
+        
+        Only updates entity_type='unknown' — never overwrites known types.
+        Returns True if an update was performed.
+        """
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE entities SET entity_type = %s WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
+                    (inferred_type, entity_id, user_id),
+                )
+                updated = cur.rowcount > 0
+            self.db_conn.commit()
+            return updated
+        except Exception as e:
+            log.warning("wgm.entity_type_infer_failed", entity_id=entity_id, error=str(e))
+            return False
 
     # ── dprompt-90: Semantic Supersession on User Corrections ─────────
     # When user corrects a fact (e.g., "${ENTITY} is a computer"), archive conflicting facts
@@ -853,6 +898,24 @@ class WGMValidationGate:
         raw_confidence = edge_args.get("confidence", 0.8) or 0.0
         is_user_correction = self._is_user_correction(edge_args)
         if raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9):
+            # Growth engine: for bypassed high-confidence facts, still infer entity types
+            # from rel_type constraints. Prevents entities staying 'unknown' forever.
+            if user_id:
+                ontology = self.get_current_ontology()
+                entry = ontology.get(rt, {})
+                head_types = entry.get("head_types") or []
+                tail_types = entry.get("tail_types") or []
+                head_any = not head_types or "any" in [t.lower() for t in head_types]
+                tail_any = not tail_types or "any" in [t.lower() for t in tail_types]
+                is_scalar = tail_types and "scalar" in [t.lower() for t in tail_types]
+                if not head_any and head_types:
+                    st = self._resolve_entity_type(subject_id, user_id)
+                    if st and st.lower() == 'unknown':
+                        self._infer_entity_type(subject_id, head_types[0], user_id)
+                if not tail_any and not is_scalar and tail_types:
+                    ot = self._resolve_entity_type(object_id, user_id)
+                    if ot and ot.lower() == 'unknown':
+                        self._infer_entity_type(object_id, tail_types[0], user_id)
             log.info("wgm.confidence_bypass_early",
                      rel_type=rt, confidence=raw_confidence,
                      is_user_correction=is_user_correction,
