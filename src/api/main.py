@@ -830,7 +830,7 @@ def enforce_directionality(
 
     Examples:
     - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
-    - User says "${SPOUSE} is spouse of me" → store as-is (bidirectional, no correction needed)
+    - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
     """
@@ -2548,7 +2548,7 @@ def detect_historical(query_lower: str) -> tuple[bool, float]:
              confidence=confidence, query_lower=query_lower[:80])
     return (is_historical, confidence)
 
-def determine_scope_multi_factor(db, user_id: str, facts: list[dict]) -> set[str]:
+def determine_scope_multi_factor(db, user_id: str, facts: list[dict], query_lower: str = "") -> set[str]:
     """
     Determine scope (which taxonomies apply) using multi-factor analysis.
 
@@ -2563,21 +2563,49 @@ def determine_scope_multi_factor(db, user_id: str, facts: list[dict]) -> set[str
     detected_taxonomies = set()
     rel_types_in_facts = {f.get("rel_type") for f in facts if f.get("rel_type")}
 
-    # Factor 1: Match rel_types to taxonomies
-    for rel_type in rel_types_in_facts:
-        if not rel_type:
-            continue
+    # Factor 1: Query-driven taxonomy detection.
+    # Match query keywords against taxonomy descriptions and member entity types.
+    # "weather" → location, "family" → family, "work" → work, etc.
+    # When query has no domain keywords, detected_taxonomies stays empty = return ALL facts.
+    if query_lower:
         try:
             with db.cursor() as cur:
                 cur.execute(
-                    "SELECT DISTINCT taxonomy_name FROM entity_taxonomies "
-                    "WHERE %s = ANY(rel_types_defining_group)",
-                    (rel_type,)
+                    "SELECT taxonomy_name, description, member_entity_types "
+                    "FROM entity_taxonomies"
                 )
                 for row in cur.fetchall():
-                    detected_taxonomies.add(row[0])
+                    tax_name = row[0]
+                    description = (row[1] or "").lower()
+                    member_types = [t.lower() for t in (row[2] or [])]
+                    query_words = set(query_lower.split())
+                    desc_words = set(description.split())
+                    if query_words & desc_words:
+                        detected_taxonomies.add(tax_name)
+                        continue
+                    for mtype in member_types:
+                        if mtype in query_lower:
+                            detected_taxonomies.add(tax_name)
+                            break
         except Exception as e:
-            log.warning("query.scope_rel_type_match_failed", rel_type=rel_type, error=str(e))
+            log.warning("query.scope_query_driven_failed", error=str(e))
+
+    # Factor 2: Fact-driven fallback — only when query-driven returned nothing.
+    if not detected_taxonomies:
+        for rel_type in rel_types_in_facts:
+            if not rel_type:
+                continue
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT taxonomy_name FROM entity_taxonomies "
+                        "WHERE %s = ANY(rel_types_defining_group)",
+                        (rel_type,)
+                    )
+                    for row in cur.fetchall():
+                        detected_taxonomies.add(row[0])
+            except Exception as e:
+                log.warning("query.scope_rel_type_match_failed", rel_type=rel_type, error=str(e))
 
     log.info("determine_scope.multi_factor",
              rel_types=list(rel_types_in_facts),
@@ -2668,7 +2696,7 @@ def apply_archive_filter(db, query_lower: str, user_id: str,
         is_historical, temporal_confidence = detect_historical(query_lower)
 
         # Phase 2: Determine scope (multi-factor)
-        detected_taxonomies = determine_scope_multi_factor(db, user_id, facts)
+        detected_taxonomies = determine_scope_multi_factor(db, user_id, facts, query_lower)
 
         # Phase 3: Filter facts by scope + temporality
         filtered = []
@@ -4787,6 +4815,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     log.info("ingest.call_start", call_count=_INGEST_EXTRACTION_CALL_COUNT, user_id=req.user_id, has_text=bool(req.text), has_edges=bool(req.edges), text_len=len(req.text or ""))
     inferred_relations = []
 
+    # Pre-initialize GLiNER cache so it's always available (populated by preflight if model runs)
+    _gliner_cache = {}
+
     # dprompt-23: First-person pronoun set used by both the /extract/rewrite
     # normalizer and the req.edges normalizer below (dBug-023).
     _FIRST_PERSON_PRONOUNS = {"i", "me", "my", "myself", "we", "us", "our", "ourselves"}
@@ -5936,12 +5967,23 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                                 object=canonical_object,
                                                 reason="prerequisites satisfied")
                                     else:
+                                        # dprompt-growth: type_mismatch facts go to short-term memory (Class C + Qdrant).
+                                        # Store everything, classify later — even unknown-type facts are valuable
+                                        # for retrieval and will be strengthened by the re-embedder over time.
                                         log.warning("ingest.type_mismatch_after_prerequisites",
                                                    subject=fact_subject,
                                                    rel_type=canonical_rel_type,
                                                    object=canonical_object,
                                                    reason=validation.get("reason", ""))
-                                        continue
+                                        # Stage as Class C: short-term memory, 30-day expiry, Qdrant-synced
+                                        _commit_staged(db, [(
+                                            req.user_id, fact_subject, canonical_object,
+                                            canonical_rel_type, "ingest_type_mismatch",
+                                            "", "relational", False, []
+                                        )], "C", confidence=0.4)
+                                        log.info("ingest.type_mismatch_staged_class_c",
+                                                subject=fact_subject, rel_type=canonical_rel_type,
+                                                object=canonical_object)
 
                                 else:
                                     log.warning("ingest.type_mismatch",
@@ -5949,7 +5991,16 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                                rel_type=edge.rel_type,
                                                object=canonical_object,
                                                reason=validation.get("reason", ""))
-                                    continue
+                                    # dprompt-growth: Store everything, classify later.
+                                    # Route type_mismatch facts to Class C short-term memory.
+                                    _commit_staged(db, [(
+                                        req.user_id, fact_subject, canonical_object,
+                                        canonical_rel_type, "ingest_type_mismatch",
+                                        "", "relational", False, []
+                                    )], "C", confidence=0.4)
+                                    log.info("ingest.type_mismatch_staged_class_c",
+                                            subject=fact_subject, rel_type=canonical_rel_type,
+                                            object=canonical_object)
 
                     # dBug-027: Validate rel_type constraints from metadata (dprompt-97)
                     # Only check after WGMValidationGate passes; skip for scalars (handled separately)
@@ -6676,6 +6727,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 db.commit()
 
     except (psycopg2.Error, Exception) as err:
+        import traceback
         log.error("ingest.transaction_failed",
                  error_type=type(err).__name__,
                  error=str(err),
