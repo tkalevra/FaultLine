@@ -212,8 +212,8 @@ async def test_user_id_isolation_different_users():
     """Verify different user_ids produce different API call parameters."""
     captured_bodies = []
 
-    async def capture_post(url, **${LOCATION}args):
-        captured_bodies.append(${LOCATION}args.get("json", {}))
+    async def capture_post(url, **kwargs):
+        captured_bodies.append(kwargs.get("json", {}))
         mock = MagicMock()
         mock.json.return_value = {"facts": []}
         mock.raise_for_status = MagicMock()

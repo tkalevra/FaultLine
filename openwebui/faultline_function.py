@@ -13,6 +13,7 @@ import time as _time
 from collections import defaultdict
 from typing import Callable, Optional
 import sys
+import asyncio
 import hashlib
 
 import httpx
@@ -806,7 +807,7 @@ RELATIONSHIP RULES:
 - NEVER emit child_of with the speaker as subject. Use parent_of instead.
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
-- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
+- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is ${SPOUSE}" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
 - BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, alice), you MUST also emit (alice, child_of, user). If you emit (user, spouse, emma), you MUST also emit (emma, spouse, user). If you emit (alice, sibling_of, charlie), you MUST also emit (charlie, sibling_of, alice). Example: "I have a son named alice, my husband emma" → (user, parent_of, alice) + (alice, child_of, user) + (user, spouse, emma) + (emma, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
@@ -815,21 +816,21 @@ REL_TYPE REFERENCE:
 - has_pet: person owns an animal (NEVER a person).
 
 HIERARCHY RELATIONSHIPS — extract these whenever you see type/classification/part-of patterns. They appear in every domain and are as important as family relationships:
-- instance_of: entity IS a specific type or breed ("Fraggle is a morkie" → fraggle instance_of morkie)
+- instance_of: entity IS a specific type or breed ("${PET} is a morkie" → fraggle instance_of morkie)
 - subclass_of: type IS a subclass of another ("a morkie is a kind of dog" → morkie subclass_of dog)
 - member_of: entity belongs to a group or taxonomy ("my pets are family" → pets member_of family)
 - part_of: entity is a component of a larger whole ("Engineering dept of TechCorp" → engineering part_of techcorp)
 - is_a: type or category (deprecated; prefer instance_of or subclass_of).
 
 Hierarchy chains across domains (extract EVERY link in the chain):
-- Taxonomic: "I have a dog named Fraggle, a morkie" → fraggle instance_of morkie, morkie subclass_of dog, dog subclass_of animal
+- Taxonomic: "I have a dog named ${PET}, a morkie" → fraggle instance_of morkie, morkie subclass_of dog, dog subclass_of animal
 - Organizational: "Alice is an engineer in Engineering at TechCorp" → alice instance_of engineer, engineer member_of engineering, engineering part_of techcorp
 - Infrastructure: "Server 192.168.1.1 is in subnet 192.168.1.0/24 on the main network" → 192.168.1.1 part_of subnet_192_168_1, subnet_192_168_1 part_of network_main
 - Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
 - Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
 - Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
 
-HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Fraggle, a morkie" → extract fraggle instance_of morkie AND user has_pet fraggle, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
+HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named ${PET}, a morkie" → extract fraggle instance_of morkie AND user has_pet fraggle, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
 
 Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
@@ -939,7 +940,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 falls back to simple formatting.
 
                 Example outputs:
-                - "Marla is your spouse (Class A, confidence 1.0)"
+                - "${SPOUSE} is your spouse (Class A, confidence 1.0)"
                 - "You are the parent of alice (Class B, awaiting confirmation)"
                 - "You are 12 years old (Class A)"
                 """
@@ -1116,6 +1117,8 @@ def _extract_basic_facts(text: str) -> list[dict]:
                     "rel_type": rel_type,
                     "is_preferred_label": (rel_type == "pref_name"),
                     "is_correction": False,
+                    "confidence": 1.0,  # dprompt-140: user-stated regex match = authoritative
+                    "fact_provenance": "user_stated",
                 })
 
     # Extract relationship facts from possessive forms
@@ -1130,6 +1133,8 @@ def _extract_basic_facts(text: str) -> list[dict]:
                     "rel_type": rel_type,
                     "is_preferred_label": False,
                     "is_correction": False,
+                    "confidence": 1.0,  # dprompt-140: user-stated regex match = authoritative
+                    "fact_provenance": "user_stated",
                 })
 
     # Preference signals: "prefer to be called X", "goes by X"
@@ -1156,6 +1161,8 @@ def _extract_basic_facts(text: str) -> list[dict]:
                     "rel_type": "pref_name",
                     "is_preferred_label": True,
                     "is_correction": False,
+                    "confidence": 1.0,  # dprompt-140: user-stated preference = authoritative
+                    "fact_provenance": "user_stated",
                 })
     # dprompt-128: Correction detection now DB-driven via correction_signals table
     # LLM extraction detects corrections via metadata-driven patterns loaded at runtime
@@ -1463,6 +1470,46 @@ class Filter:
                 return c
         return None
 
+    def _classify_intent(self, text: str) -> str:
+        """
+        Classify message intent to route around LLM extraction when unnecessary.
+        
+        Returns: "query" | "statement"
+        
+        Query patterns are language-structural (pronouns, question words), not
+        domain-specific. No hardcoded entity types, categories, or rel_types.
+        Retraction/correction handled upstream by _detect_retraction_intent.
+        """
+        text_lower = text.lower().strip()
+        
+        # Layer 1: Query patterns — user asking about their own data
+        _query_patterns = [
+            "tell me about my", "what is my", "what are my",
+            "who is my", "who are my", "what do you know about",
+            "do i have", "how many", "how old is", "where do i",
+            "where is my", "what pets", "what family",
+        ]
+        for pattern in _query_patterns:
+            if pattern in text_lower:
+                return "query"
+        
+        # Layer 2: First-person questions
+        _question_starts = ("what ", "who ", "where ", "when ", "how ", "tell me ", "do i ", "does ")
+        if text_lower.startswith(_question_starts):
+            for token in text_lower.split():
+                clean = token.strip('.,!?;:\'"()[]{}')
+                if clean in ('i', 'my', 'me', 'we', 'our', 'us'):
+                    return "query"
+        
+        return "statement"
+
+    async def _fire_and_log(self, coro, label: str):
+        """Fire coroutine in background, log any failures (dprompt-140 Plan B)."""
+        try:
+            await coro
+        except Exception as e:
+            print(f"[FaultLine Filter] background {label} failed: {e}", file=sys.stderr)
+
     async def _fire_ingest(
         self,
         text: str,
@@ -1470,6 +1517,7 @@ class Filter:
         user_id: str = "anonymous",
         edges: Optional[list[dict]] = None,
         is_correction: bool = False,
+        memory_facts: Optional[list[dict]] = None,
     ) -> dict:
         try:
             await _initialize_http_client()  # Ensure persistent client is initialized
@@ -1482,6 +1530,8 @@ class Filter:
             }
             if edges:
                 payload["edges"] = edges
+            if memory_facts:
+                payload["memory_facts"] = memory_facts
 
             response = await _http_client.post(
                 f"{self.valves.FAULTLINE_URL}/ingest",
@@ -2201,7 +2251,7 @@ GRANULAR EXAMPLES (using recent facts context):
                 continue
             if any(c.isdigit() for c in preferred):
                 continue
-            if any(${LOCATION} in preferred.lower() for ${LOCATION} in ("st ", "street", "ave", "road", "dr ", "lane")):
+            if any(word in preferred.lower() for word in ("st ", "street", "ave", "road", "dr ", "lane")):
                 continue
             # If canonical is a UUID, use the preferred display name instead
             # to prevent UUID leakage to the LLM (dBug-024 edge case).
@@ -2705,53 +2755,64 @@ GRANULAR EXAMPLES (using recent facts context):
                 _MEMORY_MARKER = "⊢ FaultLine Memory"
                 clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
 
-                # CRITICAL: Always cache raw text to Qdrant first, regardless of downstream validation.
-                # This ensures no data loss — raw context is retrievable even if structured ingest fails.
-                try:
-                    await self._fire_store_context(clean_text, user_id)
+                # dprompt-semantic-routing: Classify intent before extraction
+                # Queries don't need LLM extraction — /query already has the facts
+                intent = self._classify_intent(clean_text)
+                
+                if intent == "query":
                     if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] raw text cached to Qdrant (store_context)")
-                except Exception as _e:
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] store_context failed (non-critical): {_e}")
+                        print(f"[FaultLine Filter] intent=query — skipping /ingest, using /query results")
+                    # No fire_ingest — /query already populated facts for KG injection
+                
+                else:  # statement
+                    # CRITICAL: Always cache raw text to Qdrant first, regardless of downstream validation.
+                    # This ensures no data loss — raw context is retrievable even if structured ingest fails.
+                    try:
+                        await self._fire_store_context(clean_text, user_id)
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] raw text cached to Qdrant (store_context)")
+                    except Exception as _e:
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] store_context failed (non-critical): {_e}")
 
-                # Compute signals for skip_rewrite check
-                _has_self_id = bool(_IDENTITY_RE.search(clean_text))
-                _has_preference_signal = any(
-                    signal in clean_text.lower()
-                    for signal in {
-                        "call me", "please call me", "prefer to be called",
-                        "i prefer", "i'd prefer", "i would prefer",
-                        "goes by", "go by", "known as", "prefer you call me",
-                        "would like to be called", "like to go by",
-                        "call her", "call him", "call them",
-                        "her name is", "his name is",
-                    }
-                )
+                    # Compute signals for skip_rewrite check
+                    _has_self_id = bool(_IDENTITY_RE.search(clean_text))
+                    _has_preference_signal = any(
+                        signal in clean_text.lower()
+                        for signal in {
+                            "call me", "please call me", "prefer to be called",
+                            "i prefer", "i'd prefer", "i would prefer",
+                            "goes by", "go by", "known as", "prefer you call me",
+                            "would like to be called", "like to go by",
+                            "call her", "call him", "call them",
+                            "her name is", "his name is",
+                        }
+                    )
 
-                _ATTRIBUTE_REQUESTS = {"how old", "how tall", "how heavy", "what age", "when was"}
-                _is_attribute_question = any(pat in clean_text.lower() for pat in _ATTRIBUTE_REQUESTS)
+                    _ATTRIBUTE_REQUESTS = {"how old", "how tall", "how heavy", "what age", "when was"}
+                    _is_attribute_question = any(pat in clean_text.lower() for pat in _ATTRIBUTE_REQUESTS)
 
-                _skip_rewrite = (
-                    _should_skip_extraction(clean_text)
-                    and not _has_self_id
-                    and not _has_preference_signal
-                    and not _is_attribute_question
-                )
-                if _skip_rewrite:
-                    typed_entities = []
-                    raw_triples = []
-                    if self.valves.ENABLE_DEBUG:
-                        print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
-                # dprompt-115: SIMPLIFIED FILTER (DUMB) — call /ingest once with raw text
-                # Backend handles detection (retraction vs correction vs normal) in unified gate
-                print(f"[FaultLine Filter] /ingest: text='{clean_text[:80]}' source={self.valves.DEFAULT_SOURCE} user_id={user_id}")
+                    _skip_rewrite = (
+                        _should_skip_extraction(clean_text)
+                        and not _has_self_id
+                        and not _has_preference_signal
+                        and not _is_attribute_question
+                    )
+                    if _skip_rewrite:
+                        typed_entities = []
+                        raw_triples = []
+                        if self.valves.ENABLE_DEBUG:
+                            print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
+                    # dprompt-115: SIMPLIFIED FILTER (DUMB) — call /ingest once with raw text
+                    # Backend handles detection (retraction vs correction vs normal) in unified gate
+                    print(f"[FaultLine Filter] /ingest: text='{clean_text[:80]}' source={self.valves.DEFAULT_SOURCE} user_id={user_id}")
 
-                await self._fire_ingest(
-                    clean_text,
-                    self.valves.DEFAULT_SOURCE,
-                    user_id,
-                )
+                    await self._fire_ingest(
+                        clean_text,
+                        self.valves.DEFAULT_SOURCE,
+                        user_id,
+                        memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                    )
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):

@@ -10,7 +10,7 @@ TOOLS = [
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Input text to extract entities from (e.g., 'My wife Marla and I live in Toronto')"
+                    "description": "Input text to extract entities from (e.g., 'My wife ${SPOUSE} and I live in Toronto')"
                 },
                 "user_id": {
                     "type": "string",
