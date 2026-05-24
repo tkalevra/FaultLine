@@ -1,5 +1,5 @@
 graph TD
-    A["Incoming Fact<br/>(Subject: Des<br/>Relationship: age<br/>Value: 12)"] -->|Check First| B{Is This a<br/>Retraction?}
+    A["Incoming Fact<br/>(Subject: ${CHILD1}<br/>Relationship: age<br/>Value: 12)"] -->|Check First| B{Is This a<br/>Retraction?}
 
     B -->|Yes| C["Retraction Path<br/>(Remove/archive fact)"]
     C --> D["Remove or Archive<br/>Old fact from database<br/>Preserve history"]
@@ -27,7 +27,7 @@ graph TD
     N --> P["Step 2: Learn Entity Type<br/>What type of thing<br/>is this entity?"]
     O --> P
 
-    P -->|Type Unknown| Q["Classify Entity<br/>Example: Des is a Person<br/>System records this"]
+    P -->|Type Unknown| Q["Classify Entity<br/>Example: ${CHILD1} is a Person<br/>System records this"]
 
     P -->|Type Known| R["Use Existing Type"]
 
@@ -42,11 +42,11 @@ graph TD
 
     U -->|Consistent| V{Where to Store?}
 
-    V -->|Simple Value<br/>age, name, height| W["Store as Attribute<br/>(One value per entity)<br/>Des.age = 12"]
+    V -->|Simple Value<br/>age, name, height| W["Store as Attribute<br/>(One value per entity)<br/>${CHILD1}.age = 12"]
 
-    V -->|Classification<br/>instance_of, subclass_of| X["Store as Classification<br/>(Type hierarchy)<br/>Des is-a Person<br/>Person is-a Organism"]
+    V -->|Classification<br/>instance_of, subclass_of| X["Store as Classification<br/>(Type hierarchy)<br/>${CHILD1} is-a Person<br/>Person is-a Organism"]
 
-    V -->|Relationship<br/>spouse, parent_of| Y["Store as Relationship<br/>(Connections)<br/>Des connects-to User<br/>as parent_of"]
+    V -->|Relationship<br/>spouse, parent_of| Y["Store as Relationship<br/>(Connections)<br/>${CHILD1} connects-to User<br/>as parent_of"]
 
     W --> Z{Assess Trust Level}
     X --> Z

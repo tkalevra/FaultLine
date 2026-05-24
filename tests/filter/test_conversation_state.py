@@ -66,11 +66,11 @@ def test_they_resolves_to_family():
     facts = [
         {"subject": "user", "object": "des_uuid", "rel_type": "parent_of"},
     ]
-    preferred_names = {"des_uuid": "${CHILD1}"}
+    preferred_names = {"des_uuid": "des"}
     _update_conversation_context(user_id, facts, preferred_names)
 
     entities = _resolve_pronouns("how old are they?", user_id)
-    assert "${CHILD1}" in entities
+    assert "des" in entities
 
 
 def test_pronoun_without_prior_mention_returns_empty():

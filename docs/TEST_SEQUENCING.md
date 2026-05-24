@@ -4,7 +4,7 @@ This document defines the test phases required before deploying any FaultLine ch
 
 ## Phase 1: Unit Tests (Local — Required)
 
-**Environment:** Developer local machine (`/home/chris/Documents/013-GIT/FaultLine-dev`)
+**Environment:** Developer local machine (`/home/user/Documents/013-GIT/FaultLine-dev`)
 **Tools:** pytest
 **Command:**
 ```bash
@@ -34,7 +34,7 @@ pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
 
 ## Phase 2: Integration Tests (Pre-Prod — Required Before Deployment)
 
-**Environment:** Pre-prod instance (docker-host, example.com)
+**Environment:** Pre-prod instance (docker-host, ${OPENWEBUI_DOMAIN})
 **Setup:** Deploy code to pre-prod container (docker build + restart)
 **Tools:** curl, docker logs, psql CLI
 
@@ -42,7 +42,7 @@ pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
 
 **Test:** Medical fact ingestion
 ```bash
-curl -s -X POST http://192.168.1.10:8001/ingest \
+curl -s -X POST http://${BACKEND_IP}:8001/ingest \
   -H 'Content-Type: application/json' \
   -d '{
     "text": "I hurt my back gardening",
@@ -67,7 +67,7 @@ curl -s -X POST http://192.168.1.10:8001/ingest \
 
 **Test:** Query returns staged facts
 ```bash
-curl -s -X POST http://192.168.1.10:8001/query \
+curl -s -X POST http://${BACKEND_IP}:8001/query \
   -H 'Content-Type: application/json' \
   -d '{"user_id": "integration-test-001", "text": "medical"}' | jq '.facts'
 ```
@@ -152,7 +152,7 @@ ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d fau
 
 **Test 1:** Identity facts still work
 ```bash
-# "My name is Chris"
+# "My name is ${USER}"
 # Expected: pref_name fact created
 ```
 
@@ -164,7 +164,7 @@ ssh docker-host -x "sudo docker exec faultline-postgres psql -U faultline -d fau
 
 **Test 3:** Knowledge graph queries still work
 ```bash
-curl -s -X POST http://192.168.1.10:8001/query \
+curl -s -X POST http://${BACKEND_IP}:8001/query \
   -H 'Content-Type: application/json' \
   -d '{"user_id": "FaultLine WGM Test 1.0", "text": "family"}' | jq '.facts | length'
 # Expected: ≥10 facts returned (existing knowledge graph intact)

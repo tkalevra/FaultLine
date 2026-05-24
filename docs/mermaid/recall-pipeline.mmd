@@ -10,9 +10,9 @@ graph TD
 
     E --> G["Related by Connections<br/>(Follow relationships)<br/>Example: Find spouse<br/>Find parents<br/>Find co-workers"]
 
-    E --> H["Related by Classification<br/>(Follow type hierarchy)<br/>Example: If Des is a Person,<br/>find all Persons<br/>Find what Des is part of"]
+    E --> H["Related by Classification<br/>(Follow type hierarchy)<br/>Example: If ${CHILD1} is a Person,<br/>find all Persons<br/>Find what ${CHILD1} is part of"]
 
-    E --> I["Stored Attributes<br/>(Simple values)<br/>Example: age=12<br/>name=Des"]
+    E --> I["Stored Attributes<br/>(Simple values)<br/>Example: age=12<br/>name=${CHILD1}"]
 
     F --> J["Similarity Search<br/>(In addition to above,<br/>search vector index<br/>for related memories)<br/>Returns top 10 matches"]
     G --> J
@@ -23,19 +23,19 @@ graph TD
 
     K --> L["Filter by Context<br/>(Is this relevant to<br/>the question?)<br/>Family query gets<br/>family facts only)"]
 
-    L --> M["Convert to Human Names<br/>(Fact stored as:<br/>8f4c9d2e_uuid to Marla)<br/>Replace IDs with<br/>readable names)"]
+    L --> M["Convert to Human Names<br/>(Fact stored as:<br/>8f4c9d2e_uuid to ${SPOUSE})<br/>Replace IDs with<br/>readable names)"]
 
-    M --> N["Attach Aliases<br/>(Include all names<br/>entity knows by)<br/>Marla → Marla/Mrs Smith<br/>Add trust level)"]
+    M --> N["Attach Aliases<br/>(Include all names<br/>entity knows by)<br/>${SPOUSE} → ${SPOUSE}/${SPOUSE_ALIAS}<br/>Add trust level)"]
 
-    N --> O["Convert to Natural Language<br/>(NOT: (Des,parent_of,user)<br/>BUT: You are Des's parent)<br/>Format for human reading)"]
+    N --> O["Convert to Natural Language<br/>(NOT: (${CHILD1},parent_of,user)<br/>BUT: You are ${CHILD1}'s parent)<br/>Format for human reading)"]
 
-    O --> P["Example Output:<br/>- You are parent of Des<br/>(High confidence)<br/>- Marla is your spouse<br/>(High confidence)<br/>- Des is age 12<br/>(High confidence)<br/>- Has pet named Fraggle<br/>(Pending confirmation)"]
+    O --> P["Example Output:<br/>- You are parent of ${CHILD1}<br/>(High confidence)<br/>- ${SPOUSE} is your spouse<br/>(High confidence)<br/>- ${CHILD1} is age 12<br/>(High confidence)<br/>- Has pet named ${PET}<br/>(Pending confirmation)"]
 
     P --> Q["Add to LLM Context<br/>(Insert before user's<br/>question in message)"]
 
     Q --> R["LLM Sees Memory Header<br/>(Facts in English<br/>with trust indicators)"]
 
-    R --> S["LLM Generates Response<br/>(Responds using<br/>the memory facts)<br/>Can say: Des is 12<br/>Knows: Marla is spouse"]
+    R --> S["LLM Generates Response<br/>(Responds using<br/>the memory facts)<br/>Can say: ${CHILD1} is 12<br/>Knows: ${SPOUSE} is spouse"]
 
     S --> T["User Gets Answer<br/>(Augmented with<br/>saved memories)"]
 

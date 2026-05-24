@@ -72,7 +72,7 @@ def test_conflict_inserts_new_fact():
     cursor_mock.fetchone.return_value = (99,)  # new_id from RETURNING
 
     gate = WGMValidationGate(mock_conn)
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "${USER}", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["status"] == "conflict"
@@ -88,7 +88,7 @@ def test_conflict_penalizes_old_fact():
     cursor_mock.fetchone.return_value = (99,)
 
     gate = WGMValidationGate(mock_conn)
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "${USER}", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["superseded_fact_id"] == 42
@@ -333,6 +333,6 @@ def test_same_as_valid():
 
 
 def test_is_a_deprecated_but_valid():
-    """is_a is deprecated but remains valid for bac${LOCATION}ard compatibility."""
+    """is_a is deprecated but remains valid for backward compatibility."""
     from wgm.gate import SEED_ONTOLOGY
     assert "is_a" in SEED_ONTOLOGY

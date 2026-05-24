@@ -106,8 +106,8 @@ class TestScenario1BasicGraphHierarchy:
         # Ingest: spouse → pet → classification chain
         text = (
             "My name is Alice. I am married to ${SPOUSE}. "
-            "${SPOUSE} has a pet named Fraggle. "
-            "Fraggle is a Morkie. Morkie is a type of Dog. "
+            "${SPOUSE} has a pet named ${PET}. "
+            "${PET} is a Morkie. Morkie is a type of Dog. "
             "Dog is an Animal. "
             "We live at 156 Cedar St."
         )
@@ -116,7 +116,7 @@ class TestScenario1BasicGraphHierarchy:
         assert ingest.get("committed", 0) >= 5
 
         # Query for family members
-        result = _query(client, "where do ${SPOUSE} and fraggle live", self.uid)
+        result = _query(client, "where do mars and fraggle live", self.uid)
         assert result.get("status") == "ok"
 
         facts = result.get("facts", [])

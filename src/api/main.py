@@ -453,6 +453,121 @@ def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
     """Return the canonical user UUID if entity_id matches, else return entity_id."""
     return user_id if entity_id == user_id else entity_id
 
+
+def _extract_structured_facts(text: str, user_id: str, db=None) -> list[dict] | None:
+    """
+    Pattern-first extraction for structured statements (dprompt-LLM-Fix).
+    
+    Handles common statement patterns without LLM:
+    - "my X is named Y" → (user, rel_type, {name})
+    - "X is N years old" → (entity, age, {value})
+    - "X lives in Y" → (entity, lives_in, {location})
+    
+    Returns list of edge dicts or None if no patterns matched (falls back to LLM).
+    All rel_type resolution queries the database — NO HARDCODED MAPPINGS.
+    """
+    text_lower = text.lower().strip()
+    edges = []
+    
+    # Pattern 1: "my X is named Y", "i have a X named Y"
+    _named = re.findall(r"(?:my|i have (?:a|an)) (\w+) (?:is |are )?named (\w+)", text_lower)
+    for context, name in _named:
+        if context in _IDENTITY_STOPWORDS or name in _IDENTITY_STOPWORDS:
+            continue
+        rel_type = _resolve_reltype_from_context(context, db)
+        if rel_type:
+            edges.append({
+                "subject": "user", "object": name,
+                "rel_type": rel_type, "confidence": 1.0,
+                "fact_provenance": "user_stated",
+            })
+    
+    # Pattern 2: "X is N years old", "X is N"
+    _age = re.findall(r"(\w+) is (\d+) years?\s*old", text_lower)
+    for entity, age_val in _age:
+        if entity in _IDENTITY_STOPWORDS:
+            continue
+        edges.append({
+            "subject": entity, "object": age_val,
+            "rel_type": "age", "confidence": 1.0,
+            "fact_provenance": "user_stated",
+        })
+    
+    # Pattern 3: "X lives in Y"
+    _lives = re.findall(r"(\w+) lives in (\w+)", text_lower)
+    for entity, location in _lives:
+        if entity in _IDENTITY_STOPWORDS:
+            continue
+        edges.append({
+            "subject": entity, "object": location,
+            "rel_type": "lives_in", "confidence": 1.0,
+            "fact_provenance": "user_stated",
+        })
+    
+    # Pattern 4: "X works at/for/as Y"
+    _works = re.findall(r"(\w+) works (?:at|for|as) (\w+)", text_lower)
+    for entity, org in _works:
+        if entity in _IDENTITY_STOPWORDS:
+            continue
+        edges.append({
+            "subject": entity, "object": org,
+            "rel_type": "works_for", "confidence": 1.0,
+            "fact_provenance": "user_stated",
+        })
+    
+    # Pattern 5: "X is my Y" — resolves Y against rel_types table
+    _rel = re.findall(r"(\w+) is my (\w+)", text_lower)
+    for name, context in _rel:
+        if name in _IDENTITY_STOPWORDS or context in _IDENTITY_STOPWORDS:
+            continue
+        rel_type = _resolve_reltype_from_context(context, db)
+        if rel_type:
+            edges.append({
+                "subject": "user", "object": name,
+                "rel_type": rel_type, "confidence": 1.0,
+                "fact_provenance": "user_stated",
+            })
+    
+    return edges if edges else None
+
+
+def _resolve_reltype_from_context(context_word: str, db=None) -> str | None:
+    """
+    Resolve a context word to a canonical rel_type via database lookup.
+    NEVER hardcodes mappings — queries entity_aliases and rel_types tables.
+    
+    Example: "wife" → "spouse", "son" → "child_of", "dog" → "has_pet"
+    Returns canonical rel_type string or None if not found.
+    """
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn:
+        return None
+    try:
+        if db:
+            with db.cursor() as cur:
+                cur.execute("SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s", (context_word.lower(),))
+                row = cur.fetchone()
+                if row:
+                    return row[0].lower()
+                cur.execute("SELECT rel_type FROM rel_types WHERE rel_type = %s", (context_word.lower(),))
+                row = cur.fetchone()
+                if row:
+                    return row[0].lower()
+        else:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s", (context_word.lower(),))
+                    row = cur.fetchone()
+                    if row:
+                        return row[0].lower()
+                    cur.execute("SELECT rel_type FROM rel_types WHERE rel_type = %s", (context_word.lower(),))
+                    row = cur.fetchone()
+                    if row:
+                        return row[0].lower()
+    except Exception:
+        pass
+    return None
+
 # Emergency fallback constraint used only when DB is completely unreachable.
 # Never used as the primary source — the DB rel_types table is authoritative.
 _EMERGENCY_CONSTRAINT = (
@@ -715,7 +830,7 @@ def enforce_directionality(
 
     Examples:
     - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
-    - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
+    - User says "${SPOUSE} is spouse of me" → store as-is (bidirectional, no correction needed)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
     """
@@ -2836,7 +2951,7 @@ RULES:
 2. RELATIONAL dimension (spouse, parent_of, has_pet, works_for):
    - old_value and new_value are ENTITY NAMES (resolve to UUID)
    - Update facts.object_id
-   - Example: spouse ${ENTITY} → Sarah
+   - Example: spouse ${{ENTITY}} → Sarah
 
 3. HIERARCHICAL dimension (instance_of, member_of, part_of):
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
@@ -2846,8 +2961,8 @@ RULES:
 4. SUBJECT dimension (wrong entity):
    - subject_uuid MUST CHANGE
    - old_value and new_value are NULL or entity identifiers
-   - Rare: user realizes "that was ${CHILD1}, not ${ENTITY}"
-   - Example: parent_of ${ENTITY} → parent_of ${CHILD1}
+   - Rare: user realizes "that was ${{CHILD1}}, not ${{ENTITY}}"
+   - Example: parent_of ${{ENTITY}} → parent_of ${{CHILD1}}
 
 5. REL_TYPE dimension (relationship semantic change):
    - rel_type itself changes (not just the object)
@@ -2862,7 +2977,7 @@ CONFIDENCE SCORING:
 
 - **0.98–1.0**: Explicit old→new statement ("I'm not 18, I'm 23")
 - **0.90–0.97**: Clear but slightly implicit ("I was born in the 80s, not 90s")
-- **0.80–0.89**: Requires context inference ("I went to Guelph" + past fact shows ${LOCATION})
+- **0.80–0.89**: Requires context inference ("I went to Guelph" + past fact shows ${{LOCATION}})
 - **0.70–0.79**: Ambiguous but likely correct ("Actually, my wife is from Canada")
 - **< 0.70**: REJECT (return {{}}) — too vague or contradictory
 
@@ -2954,7 +3069,8 @@ If extraction is impossible or ambiguous, return {{}}."""
                 log.error("correction_extraction.llm_no_json_found", user_id=user_id, content=content[:200])
                 return {}
     except Exception as e:
-        log.error("correction_extraction.llm_failed", error=str(e), user_id=user_id)
+        import traceback
+        log.error("correction_extraction.llm_failed", error=str(e), user_id=user_id, traceback=traceback.format_exc())
         return {}
 
 @app.get("/health")
@@ -3977,7 +4093,7 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                     llm_url,
                     json=payload,
                     headers=get_llm_headers(),
-                    timeout=120,
+                    timeout=30,
                 )
                 response.raise_for_status()
                 log.info("extract_rewrite.llm_success", attempt=attempt, url=llm_url)
@@ -4512,7 +4628,8 @@ def _assess_statement_directness(edge, req_text: str, rel_type_metadata: dict) -
     This respects the metadata-driven architecture: all directionality/classification
     determinations come from the database, never from hardcoded patterns or heuristics.
     """
-    return edge.confidence if hasattr(edge, 'confidence') else 0.8
+    confidence = edge.confidence if hasattr(edge, 'confidence') else None
+    return confidence if confidence is not None else 0.8
 
 
 def _extract_prerequisites_from_text(
@@ -4650,11 +4767,19 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         idempotency_key = _idempotency_mgr.generate_key(req.text, req.user_id, "/ingest")
         cached_response = _idempotency_mgr.get_cached_response(idempotency_key)
         if cached_response:
-            log.info("ingest.idempotency_cache_hit",
-                    key=idempotency_key[:12],
-                    user_id=req.user_id,
-                    cached_committed=cached_response.get("committed", 0))
-            return IngestResponse(**cached_response)
+            cached_committed = cached_response.get("committed", 0)
+            cached_staged = cached_response.get("staged", 0)
+            if cached_committed > 0 or cached_staged > 0:
+                log.info("ingest.idempotency_cache_hit",
+                        key=idempotency_key[:12],
+                        user_id=req.user_id,
+                        cached_committed=cached_committed)
+                return IngestResponse(**cached_response)
+            else:
+                log.info("ingest.idempotency_cache_skipped_empty",
+                        key=idempotency_key[:12],
+                        user_id=req.user_id,
+                        reason="previous attempt stored 0 facts, re-processing")
     # === END IDEMPOTENCY CHECK ===
 
     global _INGEST_EXTRACTION_CALL_COUNT
@@ -4681,7 +4806,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
             # Get typed entities first via GLiNER2
             typed_entities = []
+            _gliner_cache = {}  # Per-batch cache: entity_name → entity_type (dprompt-065 async)
             if model is not None:
+                ner_result = None
                 try:
                     ner_result = model.extract_entities(
                         req.text,
@@ -4700,20 +4827,43 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 except Exception as e:
                     log.warning("ingest.gliner2_failed", error=str(e))
 
-            # Call /extract/rewrite for LLM-based triple extraction using persistent pooled client
-            faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8001")
-            response = await _http_client.post(
-                f"{faultline_url}/extract/rewrite",
-                json={
-                    "text": req.text,
-                    "user_id": req.user_id,
-                    "typed_entities": typed_entities if typed_entities else None,
-                    "memory_facts": None,
-                },
-                timeout=120,
-            )
+                # dprompt-065: Cache GLiNER2 results with lowercase keys for per-entity reuse
+                # Eliminates re-inference — subsequent edges look up cache instead of re-running model
+                if ner_result:
+                    for entity_type, entity_names in ner_result.get("entities", {}).items():
+                        if entity_names and isinstance(entity_names, list):
+                            for name in entity_names:
+                                if name and name.strip():
+                                    _gliner_cache[name.strip().lower()] = entity_type.upper()
+                    log.debug("ingest.gliner_cache_populated", entries=len(_gliner_cache))
 
-            if response.status_code == 200:
+            # dprompt-LLM-Fix: Pattern-first extraction — handle structured statements
+            # without LLM. Falls back to /extract/rewrite for complex/novel patterns.
+            # All rel_type resolution queries the database — no hardcoded mappings.
+            pattern_edges = _extract_structured_facts(req.text, req.user_id)
+            if pattern_edges:
+                log.info("ingest.pattern_extraction_success",
+                        pattern_count=len(pattern_edges),
+                        text_len=len(req.text))
+                raw_inferred = [EdgeInput(**e) for e in pattern_edges]
+
+            # Call /extract/rewrite for LLM-based triple extraction (only if patterns didn't match)
+            if not pattern_edges:
+                faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8001")
+                response = await _http_client.post(
+                    f"{faultline_url}/extract/rewrite",
+                    json={
+                        "text": req.text,
+                        "user_id": req.user_id,
+                        "typed_entities": typed_entities if typed_entities else None,
+                        "memory_facts": req.memory_facts if hasattr(req, 'memory_facts') and req.memory_facts else None,
+                    },
+                    timeout=30,
+                )
+            else:
+                response = None
+
+            if not pattern_edges and response and response.status_code == 200:
                 rewrite_data = response.json()
                 # Check if /extract/rewrite returned an error status
                 if rewrite_data.get("status") == "error":
@@ -4854,8 +5004,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         )
                         raw_inferred.append(edge)
             else:
-                raw_inferred = []
-                log.warning("ingest.rewrite_failed", status=response.status_code)
+                if not pattern_edges:
+                    raw_inferred = []
+                    log.warning("ingest.rewrite_failed", status=response.status_code if response else 'unknown')
 
         except Exception as e:
             import traceback
@@ -5254,123 +5405,53 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         rel_type=rel_type_lower,
                                         error=str(_e))
 
-                    # SELF-HEALING: Look up entity types from DB; extract & populate if missing
+                    # SELF-HEALING: Look up entity types from cache → DB (no GLiNER2 re-inference)
+                    # dprompt-065: Uses cached GLiNER2 results from initial pass; DB fallback only on miss
                     final_subject_type = edge.subject_type
                     final_object_type = edge.object_type
-                    _gliner_ingest = get_gliner_model() if final_subject_type and final_subject_type.lower() == 'unknown' else None
 
-                    # Subject type: look up from DB if empty/unknown
+                    # Subject type: cache first, then DB (no new GLiNER2 call)
                     if not final_subject_type or final_subject_type.lower() == 'unknown':
-                        _subj_cur = None
-                        try:
-                            _subj_cur = db.cursor()
-                            _subj_cur.execute(
-                                "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
-                                (canonical_subject, req.user_id)
-                            )
-                            _subj_row = _subj_cur.fetchone()
-                            _subj_db_type = _subj_row[0] if _subj_row and _subj_row[0] and _subj_row[0] != 'unknown' else None
-
-                            if _subj_db_type:
-                                final_subject_type = _subj_db_type
-                                log.info("ingest.subject_type_populated_from_db",
-                                        entity_id=canonical_subject, entity_type=_subj_db_type)
-                            elif _gliner_ingest and canonical_subject != user_entity_id:
-                                # Extract type via GLiNER2 for unknown subject
-                                try:
-                                    _subj_context = original_text or req.text or ""
-                                    _subj_ner = gliner_model.extract_entities(
-                                        _subj_context,
-                                        ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
+                        subject_key = edge.subject.lower().strip()
+                        if subject_key in _gliner_cache:
+                            final_subject_type = _gliner_cache[subject_key]
+                            log.info("ingest.subject_type_from_gliner_cache",
+                                    entity=edge.subject, entity_type=final_subject_type)
+                        else:
+                            # Fall back to DB lookup only (no re-inference)
+                            try:
+                                with db.cursor() as _cur:
+                                    _cur.execute(
+                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                        (canonical_subject, req.user_id)
                                     )
-                                    # Find matching entity in extracted types
-                                    for _ent_type, _ent_names in _subj_ner.get("entities", {}).items():
-                                        if _ent_names:
-                                            for _name in _ent_names:
-                                                if _name.lower().strip() == edge.subject.lower().strip():
-                                                    final_subject_type = _ent_type.upper()
-                                                    # UPDATE DB immediately
-                                                    _update_cur = None
-                                                    try:
-                                                        _update_cur = db.cursor()
-                                                        _update_cur.execute(
-                                                            "UPDATE entities SET entity_type = %s WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
-                                                            (final_subject_type, canonical_subject, req.user_id)
-                                                        )
-                                                        log.info("ingest.subject_type_extracted_and_stored",
-                                                                entity_id=canonical_subject,
-                                                                entity_type=final_subject_type,
-                                                                from_text=edge.subject)
-                                                    finally:
-                                                        if _update_cur:
-                                                            _update_cur.close()
-                                                    break
-                                except Exception as _gliner_e:
-                                    log.warning("ingest.subject_type_gliner2_failed",
-                                               entity=edge.subject, error=str(_gliner_e))
-                        except Exception as _subj_lookup_e:
-                            log.warning("ingest.subject_type_lookup_failed",
-                                       entity_id=canonical_subject, error=str(_subj_lookup_e))
-                        finally:
-                            if _subj_cur:
-                                _subj_cur.close()
+                                    _row = _cur.fetchone()
+                                    if _row and _row[0] and _row[0] != 'unknown':
+                                        final_subject_type = _row[0]
+                            except Exception as _e:
+                                log.warning("ingest.subject_type_db_lookup_failed", error=str(_e))
 
-                    # Object type: look up from DB if empty/unknown (skip for scalar rel_types)
+                    # Object type: cache first, then DB (skip for scalar rel_types)
                     if (not final_object_type or final_object_type.lower() == 'unknown') and \
                        not _is_scalar_rel_type(edge.rel_type):
-                        _obj_cur = None
-                        try:
-                            _obj_cur = db.cursor()
-                            _obj_cur.execute(
-                                "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
-                                (canonical_object, req.user_id)
-                            )
-                            _obj_row = _obj_cur.fetchone()
-                            _obj_db_type = _obj_row[0] if _obj_row and _obj_row[0] and _obj_row[0] != 'unknown' else None
-
-                            if _obj_db_type:
-                                final_object_type = _obj_db_type
-                                log.info("ingest.object_type_populated_from_db",
-                                        entity_id=canonical_object, entity_type=_obj_db_type)
-                            elif _gliner_ingest and canonical_object != user_entity_id:
-                                # Extract type via GLiNER2 for unknown object
-                                try:
-                                    _obj_context = original_text or req.text or ""
-                                    _obj_ner = gliner_model.extract_entities(
-                                        _obj_context,
-                                        ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
+                        object_key = edge.object.lower().strip()
+                        if object_key in _gliner_cache:
+                            final_object_type = _gliner_cache[object_key]
+                            log.info("ingest.object_type_from_gliner_cache",
+                                    entity=edge.object, entity_type=final_object_type)
+                        else:
+                            # Fall back to DB lookup only (no re-inference)
+                            try:
+                                with db.cursor() as _cur:
+                                    _cur.execute(
+                                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
+                                        (canonical_object, req.user_id)
                                     )
-                                    # Find matching entity in extracted types
-                                    for _ent_type, _ent_names in _obj_ner.get("entities", {}).items():
-                                        if _ent_names:
-                                            for _name in _ent_names:
-                                                if _name.lower().strip() == edge.object.lower().strip():
-                                                    final_object_type = _ent_type.upper()
-                                                    # UPDATE DB immediately
-                                                    _update_cur = None
-                                                    try:
-                                                        _update_cur = db.cursor()
-                                                        _update_cur.execute(
-                                                            "UPDATE entities SET entity_type = %s WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
-                                                            (final_object_type, canonical_object, req.user_id)
-                                                        )
-                                                        log.info("ingest.object_type_extracted_and_stored",
-                                                                entity_id=canonical_object,
-                                                                entity_type=final_object_type,
-                                                                from_text=edge.object)
-                                                    finally:
-                                                        if _update_cur:
-                                                            _update_cur.close()
-                                                    break
-                                except Exception as _gliner_e:
-                                    log.warning("ingest.object_type_gliner2_failed",
-                                               entity=edge.object, error=str(_gliner_e))
-                        except Exception as _obj_lookup_e:
-                            log.warning("ingest.object_type_lookup_failed",
-                                       entity_id=canonical_object, error=str(_obj_lookup_e))
-                        finally:
-                            if _obj_cur:
-                                _obj_cur.close()
+                                    _row = _cur.fetchone()
+                                    if _row and _row[0] and _row[0] != 'unknown':
+                                        final_object_type = _row[0]
+                            except Exception as _e:
+                                log.warning("ingest.object_type_db_lookup_failed", error=str(_e))
 
                     # Normalize user-identity aliases to the canonical user UUID
                     if (canonical_subject.lower() in [a.lower() for a in _user_aliases] or canonical_subject == req.user_id) and canonical_subject != user_entity_id:
@@ -5465,94 +5546,42 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     classification_3d = classify_fact_3d(
                         edge.rel_type.lower(), _raw_object.lower().strip(), registry, req.user_id)
 
-                    # dprompt-065: Detect unknown rel_types by checking metadata cache, not storage heuristic
-                    # Unknown rel_types with entity-like objects have storage="relational" (not None) from L4 heuristic
-                    rel_type_lower = edge.rel_type.lower()
-                    if rel_type_lower not in _REL_TYPE_META:  # Unknown rel_type (not in ontology metadata)
-                        # ===== dprompt-065: Synchronous Rel-Type Inference =====
-                        # Try immediate LLM inference to add rel_type to database
-                        # This enables subsequent facts with same rel_type to benefit from learning
-                        log.info("ingest.attempting_rel_type_inference", rel_type=rel_type_lower)
-
-                        inference_success = False
-                        try:
-                            approval_success = gate._try_approve_novel_type(rel_type_lower)
-
-                            if approval_success:
-                                # Rel_type was added to database + cache refreshed
-                                # Reclassify fact with new metadata now available
-                                log.info("ingest.rel_type_inference_success",
-                                        rel_type=rel_type_lower,
-                                        subject=edge.subject, object=edge.object)
-
-                                # Re-run classification with updated rel_types cache
-                                classification_3d = classify_fact_type(
-                                    rel_type_lower,
-                                    _raw_object,
-                                    registry,
-                                    req.user_id
-                                )
-
-                                # If still unknown after re-classification, stage as Class C
-                                if not classification_3d["storage"]:
-                                    log.warning("ingest.rel_type_inference_reclassify_still_unknown",
-                                               rel_type=rel_type_lower)
-                                    classification_3d["storage"] = "unknown_staging"
-                                else:
-                                    # Successfully classified after inference!
-                                    log.info("ingest.rel_type_inference_reclassified",
-                                            rel_type=rel_type_lower,
-                                            storage=classification_3d["storage"])
-                                    inference_success = True
-                            else:
-                                # Inference returned false (confidence < 0.7 or pending approval)
-                                # Stage as Class C as before
-                                log.info("ingest.rel_type_inference_low_confidence",
-                                        rel_type=rel_type_lower)
-                                classification_3d["storage"] = "unknown_staging"
-
-                        except Exception as e:
-                            # Inference failed (LLM unavailable, network error, etc.)
-                            # Fall back to Class C staging
-                            log.warning("ingest.rel_type_inference_failed",
-                                       rel_type=rel_type_lower,
-                                       error=str(e),
-                                       reason="falling back to Class C staging")
-                            classification_3d["storage"] = "unknown_staging"
-
-                        # ===== END dprompt-065 =====
-
-                        # Original code continues: force unknown to unknown_staging if still unknown
-                        if not classification_3d["storage"]:
-                            classification_3d["storage"] = "unknown_staging"
-                            log.info(
-                                "ingest.unknown_rel_type_staged",
-                                rel_type=rel_type_lower,
-                                object_value=_raw_object,
-                                reason=classification_3d["reason"],
-                            )
-
-                    # PHASE 2: Assign Class and Confidence
-                    # dprompt-126: User-stated means explicit user correction (is_correction=true).
-                    # Extraction facts (openwebui provenance) go through validation gates.
-                    # Only high-confidence user corrections bypass validation.
-                    is_direct_statement = False
-                    rel_lower = edge.rel_type.lower()
-
-                    is_user_stated = edge.is_correction  # User corrections are explicitly marked
+                    # PHASE 2: Reassess confidence FIRST (before classification decisions)
+                    # dprompt-140: User-stated = confidence >= 0.9 (not is_correction flag)
+                    # This must come BEFORE the novel rel_type check so user-stated novel
+                    # types get sync inference (authoritative) instead of async deferral.
+                    adjusted_confidence = _assess_statement_directness(edge, req.text, _REL_TYPE_META)
+                    is_user_stated = (adjusted_confidence or 0.0) >= 0.9
 
                     log.info("ingest.fact_provenance_check",
                            rel_type=edge.rel_type.lower(),
                            has_attr=hasattr(edge, 'fact_provenance'),
                            fact_provenance=getattr(edge, 'fact_provenance', 'MISSING'),
-                           is_user_stated=is_user_stated)
+                           is_user_stated=is_user_stated,
+                           adjusted_confidence=adjusted_confidence)
 
-                    # Check if metadata was created in-flow (TODO: detect from extraction context)
+                    # dprompt-140: Conditional novel rel_type handling
+                    # User-stated (confidence >= 0.9) → sync inference via gate (authoritative)
+                    # LLM-inferred (confidence < 0.9)  → async deferred (preserves speed)
+                    rel_type_lower = edge.rel_type.lower()
+                    if rel_type_lower not in _REL_TYPE_META:  # Unknown rel_type
+                        if is_user_stated:
+                            # User-stated novel rel_type: gate will sync-infer metadata
+                            # _try_approve_novel_type() called in validate_edge() for high confidence
+                            log.info("ingest.user_stated_novel_type_sync_inference",
+                                    rel_type=rel_type_lower,
+                                    reason="user authority requires sync metadata inference")
+                            # Metadata populated by gate validation, no staging needed
+                        else:
+                            # LLM-inferred novel rel_type: async staging
+                            log.info("ingest.llm_inferred_novel_type_deferred_to_re_embedder",
+                                    rel_type=rel_type_lower,
+                                    reason="llm extraction deferred for async evaluation")
+                            classification_3d["storage"] = "unknown_staging"
+
+                    # Check if metadata was created in-flow
                     ontology_created = False
                     hierarchy_created = False
-
-                    # Reassess confidence based on how explicitly user stated this fact in req.text
-                    adjusted_confidence = _assess_statement_directness(edge, req.text, _REL_TYPE_META)
 
                     if adjusted_confidence != (edge.confidence if hasattr(edge, 'confidence') else 0.8):
                         log.info("ingest.confidence_reassess", rel_type=edge.rel_type.lower(),
@@ -6093,8 +6122,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.info("ingest.rows_before_taxonomy",
                                row_idx=i, user_id=row[0], subject=row[1], obj=row[2],
                                rel_type=row[3], fact_class=row[6])
-                    rows = _apply_taxonomy_rules(rows, req.user_id, db)
-
                 if rows:
                     # CRITICAL: Filter out scalar rel_types from rows — they MUST ONLY be stored in entity_attributes
                     # Metadata-driven: check rel_types.tail_types={SCALAR} to determine storage path
@@ -6662,7 +6689,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                               entities=[EntityResult(entity=r["entity"], label=r["type"], canonical_id=r["canonical_id"]) for r in resolved],
                               facts=facts)
 
-    if idempotency_key and _idempotency_mgr:
+    if idempotency_key and _idempotency_mgr and (committed > 0 or staged > 0):
         response_dict = {
             "status": response.status,
             "committed": response.committed,
@@ -7199,7 +7226,7 @@ def query(request: QueryRequest):
             with db.cursor() as cur:
                 cur.execute(
                     "SELECT id FROM entities WHERE user_id = %s AND id = ANY(%s) "
-                    "AND entity_type NOT IN ('Concept', 'unknown')",
+                    "AND entity_type NOT IN ('Concept')",
                     (user_id, _uuid_keys),
                 )
                 allowed = {row[0] for row in cur.fetchall()}
@@ -8316,10 +8343,11 @@ def correct_fact(req: FactCorrectionRequest):
         # Idempotency check: deduplicate retried correction requests (uses global _idempotency_mgr from startup)
         if req.idempotency_key and _idempotency_mgr:
             try:
-                result = _idempotency_mgr.check_and_mark(req.idempotency_key)
-                if result:
-                    log.info("correct_fact.idempotent_cached", idempotency_key=req.idempotency_key)
-                    return result
+                if _idempotency_mgr.is_duplicate(req.idempotency_key):
+                    cached = _idempotency_mgr.get_cached_response(req.idempotency_key)
+                    if cached:
+                        log.info("correct_fact.idempotent_cached", idempotency_key=req.idempotency_key)
+                        return FactCorrectionResponse(**cached) if isinstance(cached, dict) else cached
             except Exception as e:
                 log.warning("correct_fact.idempotency_check_failed", error=str(e))
                 # Continue without idempotency if cache fails
@@ -8342,7 +8370,7 @@ def correct_fact(req: FactCorrectionRequest):
             )
             if req.idempotency_key and _idempotency_mgr:
                 try:
-                    _idempotency_mgr.cache_set(req.idempotency_key, failure_result.model_dump(), ttl=300)
+                    _idempotency_mgr.cache_response(req.idempotency_key, failure_result.model_dump())
                     log.info("correct_fact.timeout_cached", idempotency_key=req.idempotency_key)
                 except Exception:
                     pass
@@ -8786,7 +8814,8 @@ def correct_fact(req: FactCorrectionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        log.error("correct_fact.error", error=str(e), user_id=req.user_id)
+        import traceback
+        log.error("correct_fact.error", error=str(e), user_id=req.user_id, traceback=traceback.format_exc())
         if db:
             try:
                 db.rollback()

@@ -49,7 +49,7 @@ The token represents the user's API key generated in OpenWebUI settings.
 ### Minimal Valid Request Example
 
 ```bash
-curl -X POST https://example.com/api/chat/completions \
+curl -X POST https://${OPENWEBUI_DOMAIN}/api/chat/completions \
   -H "Authorization: Bearer sk-your-api-key-here" \
   -H "Content-Type: application/json" \
   -d '{
@@ -95,7 +95,7 @@ curl -X POST https://example.com/api/chat/completions \
 
 | Cause | Check | Fix |
 |-------|-------|-----|
-| Invalid model name | `curl https://example.com/api/models -H "Authorization: Bearer YOUR_KEY"` | Use exact model name from models endpoint |
+| Invalid model name | `curl https://${OPENWEBUI_DOMAIN}/api/models -H "Authorization: Bearer YOUR_KEY"` | Use exact model name from models endpoint |
 | Missing required fields | Request body missing `model` or `messages` | Include both fields |
 | Invalid message format | Messages not array of {role, content} objects | Validate message structure |
 | Bearer token missing | No `Authorization` header | Add header: `Authorization: Bearer token` |
@@ -114,7 +114,7 @@ curl -X POST https://example.com/api/chat/completions \
 | Cause | Fix |
 |-------|-----|
 | Wrong URL path | Use `/api/chat/completions` not other variations |
-| OpenWebUI not running | Verify deployment at example.com |
+| OpenWebUI not running | Verify deployment at ${OPENWEBUI_DOMAIN} |
 
 ### How Filters Execute
 
@@ -151,7 +151,7 @@ curl -X POST http://faultline:8001/extract/rewrite \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "user-uuid",
-    "text": "My name is Chris and I have 3 children",
+    "text": "My name is ${USER} and I have 3 children",
     "messages": []
   }'
 ```
@@ -160,14 +160,14 @@ curl -X POST http://faultline:8001/extract/rewrite \
 
 **Step 1: Verify OpenWebUI is running**
 ```bash
-curl -X GET https://example.com/api/models \
+curl -X GET https://${OPENWEBUI_DOMAIN}/api/models \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -v
 ```
 
 **Step 2: Check available models**
 ```bash
-curl -X GET https://example.com/api/models \
+curl -X GET https://${OPENWEBUI_DOMAIN}/api/models \
   -H "Authorization: Bearer YOUR_API_KEY" \
   | jq '.data[].name'
 ```
@@ -181,7 +181,7 @@ Not:      qwen3.5-9b
 
 **Step 4: Test with minimal request**
 ```bash
-curl -X POST https://example.com/api/chat/completions \
+curl -X POST https://${OPENWEBUI_DOMAIN}/api/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -200,8 +200,8 @@ ssh docker-host -x "sudo docker logs faultline 2>&1 | grep -i 'error\|400\|extra
 **Required when using OPENWEBUI_URL:**
 
 ```bash
-OPENWEBUI_URL=https://example.com
-LLM_API_KEY=***REDACTED-API-KEY***
+OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
+LLM_API_KEY=${BEARER_TOKEN}
 WGM_LLM_MODEL=qwen/qwen3.5-9b:2
 CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
 ```
@@ -218,7 +218,7 @@ CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
 
 | Aspect | OpenWebUI | Direct Qwen/Ollama |
 |--------|-----------|-------------------|
-| Endpoint | `https://example.com/api/chat/completions` | `http://localhost:11434/v1/chat/completions` |
+| Endpoint | `https://${OPENWEBUI_DOMAIN}/api/chat/completions` | `http://localhost:11434/v1/chat/completions` |
 | Authentication | Bearer token in Authorization header | None (local) |
 | Model name format | `provider/model:version` | `model` |
 | Filters | Inlet/outlet execute | No filters |

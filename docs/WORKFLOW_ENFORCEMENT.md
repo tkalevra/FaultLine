@@ -73,7 +73,7 @@
 
 **Enforcement:**
 - I read deepseek's analysis
-- I discuss with Christopher (scope, approach, constraints)
+- I discuss with ${USER} (scope, approach, constraints)
 - I write formal `dprompt-Nb.md` using DEEPSEEK_INSTRUCTION_TEMPLATE
 - I commit both dBug-NNN and dprompt-Nb.md together
 - I update `scratch.md` with direction pointer: "See dprompt-Nb.md for execution"
@@ -233,7 +233,7 @@ To verify this workflow is being followed:
 **This file (WORKFLOW_ENFORCEMENT.md) is the audit standard.**
 
 - I reference it when deepseek deviates from flow
-- Christopher can verify the flow is being respected by checking against this map
+- ${USER} can verify the flow is being respected by checking against this map
 - Compact mode explicitly commits to these hard rules
 - Future deepseek sessions read this alongside deepseek-system-prompt.md
 

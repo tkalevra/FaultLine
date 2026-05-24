@@ -14,13 +14,13 @@ def test_uuid_resolved_to_display_name():
         {"subject": "54214459-3d2e-5ff5-8c6c-a541667d93aa", "object": "7e4bff75-706e-5feb-b8b5-f4ca1247fd3b", "rel_type": "has_pet"},
     ]
     preferred_names = {
-        "54214459-3d2e-5ff5-8c6c-a541667d93aa": "${SPOUSE}",
+        "54214459-3d2e-5ff5-8c6c-a541667d93aa": "mars",
         "7e4bff75-706e-5feb-b8b5-f4ca1247fd3b": "fraggle",
     }
     identity = "3f8e6836-72e3-43d4-bbc5-71fc8668b070"
 
     resolved = _resolve_display_names(facts, preferred_names, identity)
-    assert resolved[0]["subject"] == "${SPOUSE}"
+    assert resolved[0]["subject"] == "mars"
     assert resolved[0]["object"] == "fraggle"
 
 
@@ -66,11 +66,11 @@ def test_multiple_facts_all_resolved():
         {"subject": "uuid_mars", "object": "uuid_fraggle", "rel_type": "has_pet"},
         {"subject": "uuid_user", "object": "uuid_mars", "rel_type": "spouse"},
     ]
-    preferred_names = {"uuid_mars": "${SPOUSE}", "uuid_fraggle": "fraggle"}
+    preferred_names = {"uuid_mars": "mars", "uuid_fraggle": "fraggle"}
     identity = "uuid_user"
 
     resolved = _resolve_display_names(facts, preferred_names, identity)
-    assert resolved[0]["subject"] == "${SPOUSE}"
+    assert resolved[0]["subject"] == "mars"
     assert resolved[0]["object"] == "fraggle"
     assert resolved[1]["subject"] == "user"
-    assert resolved[1]["object"] == "${SPOUSE}"
+    assert resolved[1]["object"] == "mars"

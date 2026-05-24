@@ -10,15 +10,15 @@ Three complementary flows showing how facts enter (extract), learn (ingest), and
 
 ```mermaid
 graph TD
-    A["User Message<br/>(Example: My son Des is 12<br/>Actually, he's 14)"] -->|Filter Inlet| B["DETECT CORRECTIONS<br/>(Regex: actually, wrong,<br/>I meant, corrected to)"]
+    A["User Message<br/>(Example: My son ${CHILD1} is 12<br/>Actually, he's 14)"] -->|Filter Inlet| B["DETECT CORRECTIONS<br/>(Regex: actually, wrong,<br/>I meant, corrected to)"]
     
-    B -->|Correction Found| C["LLM EXTRACT CORRECTION<br/>(What's being corrected?<br/>Old value: 12<br/>New value: 14<br/>Subject: Des, Rel: age)"]
+    B -->|Correction Found| C["LLM EXTRACT CORRECTION<br/>(What's being corrected?<br/>Old value: 12<br/>New value: 14<br/>Subject: ${CHILD1}, Rel: age)"]
     
     C --> D["MARK AS CORRECTION<br/>(is_correction=true<br/>Will bypass staging)"]
     
     B -->|No Correction| E["DETECT RETRACTION<br/>(Regex: forget, delete,<br/>wrong, no longer, not true)"]
     
-    E -->|Retraction Found| F["LLM EXTRACT RETRACTION<br/>(What fact is wrong?<br/>Subject: Des<br/>Rel: age<br/>Action: DELETE or SUPERSEDE)"]
+    E -->|Retraction Found| F["LLM EXTRACT RETRACTION<br/>(What fact is wrong?<br/>Subject: ${CHILD1}<br/>Rel: age<br/>Action: DELETE or SUPERSEDE)"]
     
     F --> G["MARK AS RETRACTION<br/>(is_retraction=true<br/>Skip to retraction path)"]
     
@@ -65,7 +65,7 @@ graph TD
 
 ```mermaid
 graph TD
-    A["Extracted Triple<br/>(subject: Des<br/>rel_type: age<br/>object: 12)"] -->|Filter Inlet| B{Retraction Signal?}
+    A["Extracted Triple<br/>(subject: ${CHILD1}<br/>rel_type: age<br/>object: 12)"] -->|Filter Inlet| B{Retraction Signal?}
     
     B -->|YES| C["RETRACTION PATH<br/>(LLM extracted retraction)"]
     C --> D["DELETE or SUPERSEDE<br/>from facts table<br/>Mark superseded_at<br/>Archive old data"]
@@ -93,7 +93,7 @@ graph TD
     N --> P["CHECK ENTITY TYPES<br/>(Do entities exist?)<br/>(Are they classified?)"]
     O --> P
     
-    P -->|Type Unknown| Q["LAYER 2: Create entity_type<br/>Engine classifies entities<br/>Example: Des instance_of Person<br/>Stores via instance_of rel_type"]
+    P -->|Type Unknown| Q["LAYER 2: Create entity_type<br/>Engine classifies entities<br/>Example: ${CHILD1} instance_of Person<br/>Stores via instance_of rel_type"]
     
     P -->|Type Known| R["Use Existing Types"]
     
@@ -110,7 +110,7 @@ graph TD
     
     V -->|SCALAR<br/>age, height, name| W["LAYER 3: SCALAR PATH<br/>entity_attributes table<br/>Key: user_id, entity_id, attr<br/>Value: 12"]
     
-    V -->|HIERARCHY<br/>instance_of, subclass_of| X["LAYER 3: HIERARCHY PATH<br/>facts table<br/>Defines classifications<br/>Des instance_of person"]
+    V -->|HIERARCHY<br/>instance_of, subclass_of| X["LAYER 3: HIERARCHY PATH<br/>facts table<br/>Defines classifications<br/>${CHILD1} instance_of person"]
     
     V -->|RELATIONAL<br/>spouse, parent_of| Y["LAYER 3: RELATIONAL PATH<br/>facts table<br/>Connectivity/relationships<br/>user spouse marla"]
     
@@ -124,7 +124,7 @@ graph TD
     
     Z -->|Novel pattern<br/>new types created<br/>confidence < 0.6| AC["CLASS C<br/>Ephemeral<br/>confidence: 0.4<br/>STAGE for evaluation<br/>Re-embedder decides fate<br/>EXPIRE after 30 days"]
     
-    AA --> AD["COMMIT FACTS<br/>(INSERT INTO facts)<br/>Example: Des, age, 12<br/>confidence: 1.0"]
+    AA --> AD["COMMIT FACTS<br/>(INSERT INTO facts)<br/>Example: ${CHILD1}, age, 12<br/>confidence: 1.0"]
     AB --> AE["STAGE FACTS<br/>(INSERT INTO staged_facts)<br/>Awaiting confirmations<br/>or re-embedder evaluation"]
     AC --> AE
     
@@ -178,7 +178,7 @@ graph TD
     
     E --> G["GRAPH TRAVERSAL<br/>(_graph_traverse: single-hop)<br/>spouse, parent_of, works_for<br/>(Example: user spouse marla)"]
     
-    E --> H["HIERARCHY EXPANSION<br/>(_hierarchy_expand: upward chains)<br/>instance_of, subclass_of<br/>(Example: Des instance_of person)"]
+    E --> H["HIERARCHY EXPANSION<br/>(_hierarchy_expand: upward chains)<br/>instance_of, subclass_of<br/>(Example: ${CHILD1} instance_of person)"]
     
     E --> I["ENTITY ATTRIBUTES<br/>(SELECT * FROM entity_attributes)<br/>Convert scalars to facts<br/>(Example: age=12)"]
     
@@ -191,21 +191,21 @@ graph TD
     
     K --> L["FILTER BY SCOPE<br/>(Query taxonomy match?)<br/>family: Person + Animal entities<br/>work: Person + Organization"]
     
-    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: marla_uuid to Marla<br/>Example: des_uuid to Des"]
+    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: marla_uuid to ${SPOUSE}<br/>Example: des_uuid to ${CHILD1}"]
     
     M --> N["ATTACH METADATA<br/>(_aliases: all names)<br/>entity_types: person, animal<br/>fact_class: A/B/C"]
     
     N --> O["FORMAT AS PROSE<br/>(Natural language injection)<br/>NOT raw tuples or UUIDs"]
     
-    O --> P["Example Formatted Facts:<br/>- You are the parent of Des<br/>(Class A, confidence 1.0)<br/>- Marla is your spouse<br/>(Class A, confidence 1.0)<br/>- Des is 12 years old<br/>(Class A, confidence 1.0)<br/>- You have a pet named Fraggle<br/>(Class B, pending confirmation)"]
+    O --> P["Example Formatted Facts:<br/>- You are the parent of ${CHILD1}<br/>(Class A, confidence 1.0)<br/>- ${SPOUSE} is your spouse<br/>(Class A, confidence 1.0)<br/>- ${CHILD1} is 12 years old<br/>(Class A, confidence 1.0)<br/>- You have a pet named ${PET}<br/>(Class B, pending confirmation)"]
     
     P --> Q["INJECT INTO CONTEXT<br/>(System message added before<br/>last user message)"]
     
     Q --> R["FaultLine Memory Header<br/>(Facts in readable prose)<br/>Metadata shown to LLM<br/>(Class, confidence, expiry)"]
     
-    R --> S["LLM PROCESSES<br/>(Qwen receives augmented context)<br/>Can reference: Your son Des<br/>Your spouse Marla, etc"]
+    R --> S["LLM PROCESSES<br/>(Qwen receives augmented context)<br/>Can reference: Your son ${CHILD1}<br/>Your spouse ${SPOUSE}, etc"]
     
-    S --> T["LLM RESPONSE<br/>(Generated with memory context)<br/>References facts naturally<br/>Example: Des is 12, right?"]
+    S --> T["LLM RESPONSE<br/>(Generated with memory context)<br/>References facts naturally<br/>Example: ${CHILD1} is 12, right?"]
     
     T --> U["RETURN TO USER<br/>(Memory-augmented response)<br/>Facts flow into conversation"]
     
@@ -249,18 +249,18 @@ graph TD
 ### RECALL
 - **Four retrieval sources:** Facts + Graph + Hierarchy + Attributes
 - **UUID-based dedup:** Prevents alias variations from creating duplicates
-- **Prose injection:** LLM sees "Marla is your spouse", not "uuid1→spouse→uuid2"
+- **Prose injection:** LLM sees "${SPOUSE} is your spouse", not "uuid1→spouse→uuid2"
 - **Metadata transparency:** Class/confidence shown to LLM (allows reasoning about certainty)
 
 ---
 
 ## Example: Full Lifecycle with Dynamic Type Creation
 
-**User says:** "My son Des is 12"
+**User says:** "My son ${CHILD1} is 12"
 
 ### EXTRACT
 1. No correction or retraction detected
-2. LLM extracts: `{subject: Des, rel: age, object: 12, subject_type: Person}`
+2. LLM extracts: `{subject: ${CHILD1}, rel: age, object: 12, subject_type: Person}`
 3. Checks DB: age rel_type exists, SCALAR tail_types
 4. Returns triple with metadata
 
@@ -268,21 +268,21 @@ graph TD
 1. Message length check: ✅ Pass
 2. Not a correction: ✅ Normal ingest path
 3. WGM gate checks: age rel_type exists ✅
-4. No entity type for Des: Creates Des instance_of Person (Class A) → **LAYER 2**
+4. No entity type for ${CHILD1}: Creates ${CHILD1} instance_of Person (Class A) → **LAYER 2**
 5. Routes to SCALAR path
 6. Confidence = 1.0 (user-stated) → **CLASS A**
-7. Commits: (user, Des, age, 12) to entity_attributes
+7. Commits: (user, ${CHILD1}, age, 12) to entity_attributes
 8. Re-embedder syncs to Qdrant
 
 ### RECALL
-1. User asks: "How old is Des?"
-2. Retrieves baseline facts: finds Des entity
-3. Graph traversal: Des connected to user via parent_of
-4. Attributes: finds entity_attributes row (Des, age, 12)
+1. User asks: "How old is ${CHILD1}?"
+2. Retrieves baseline facts: finds ${CHILD1} entity
+3. Graph traversal: ${CHILD1} connected to user via parent_of
+4. Attributes: finds entity_attributes row (${CHILD1}, age, 12)
 5. Dedup: consolidates to one fact
-6. Formats as prose: "Des is 12 years old (Class A, confidence 1.0)"
+6. Formats as prose: "${CHILD1} is 12 years old (Class A, confidence 1.0)"
 7. Injects into LLM context
-8. LLM responds: "Des is 12 years old, right?"
+8. LLM responds: "${CHILD1} is 12 years old, right?"
 
 **The full cycle: EXTRACT → INGEST (learn) → STORE → RECALL → OUTPUT** ✨
 
@@ -301,9 +301,9 @@ Engine creates: rel_type="age", category="person_attributes", tail_types={SCALAR
     ↓
 Stored in rel_types table → available for future facts
     ↓
-Extract finds: Des instance_of ??? (type unknown)
+Extract finds: ${CHILD1} instance_of ??? (type unknown)
     ↓ [LAYER 2]
-Engine creates: instance_of rel_type, Des as Person entity
+Engine creates: instance_of rel_type, ${CHILD1} as Person entity
     ↓
 Stored as hierarchy fact → shapes future recalls
     ↓

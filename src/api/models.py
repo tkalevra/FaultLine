@@ -31,6 +31,7 @@ class IngestRequest(BaseModel):
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
     user_id: Optional[str] = "anonymous"
     context: ExtractContext | None = None  # Optional context enrichment for /extract (dBug-018)
+    memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution during extraction
     is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
     idempotency_key: Optional[str] = None  # Phase 2: Deduplicate retried requests via idempotency cache
 
@@ -129,7 +130,7 @@ class FactCorrectionRequest(BaseModel):
     """User correction: old fact is wrong, new fact is right.
     Surgical update: only supersede one specific fact, re-ingest through WGM gate.
     """
-    text: str  # "Fraggle is a dog not a bunny"
+    text: str  # "${PET} is a dog not a bunny"
     user_id: str  # User UUID (will be validated against authenticated user)
     context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
     idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)

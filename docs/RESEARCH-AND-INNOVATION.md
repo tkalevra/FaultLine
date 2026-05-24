@@ -34,8 +34,8 @@ Traditional approaches suffer from three critical failures:
 - Storage without validation is storage of noise
 
 **How it works:**
-1. LLM extracts triple: (Des, age, 14)
-2. WGM gate checks: "Does age rel_type exist? Does Des have a known type? Is 14 valid for age?"
+1. LLM extracts triple: (${CHILD1}, age, 14)
+2. WGM gate checks: "Does age rel_type exist? Does ${CHILD1} have a known type? Is 14 valid for age?"
 3. If valid → store. If invalid → reject or penalize
 
 **What research says:**
@@ -114,7 +114,7 @@ CLASS C (Novel pattern)
 
 ```
 Layer 1: Rel_type Creation
-  LLM extracts: (Chris, admires, physics)
+  LLM extracts: (${USER}, admires, physics)
   Unknown rel_type: "admires"
   Engine creates: rel_types['admires'] = {
     category: 'preference',
@@ -407,7 +407,7 @@ If you use FaultLine in research:
 ```bibtex
 @software{faultline2026,
   title={FaultLine: Write-Validated Knowledge Graph for AI Memory},
-  author={Kalevra, Christopher},
+  author={Kalevra, ${USER}},
   year={2026},
   url={https://github.com/tkalevra/FaultLine}
 }

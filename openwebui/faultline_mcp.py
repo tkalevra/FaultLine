@@ -19,7 +19,7 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called emma", the subject is "marla" not "i".
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "${SPOUSE}, who prefers to be called emma", the subject is "marla" not "i".
 - For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being alicecribed, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
@@ -244,9 +244,20 @@ class Function:
         # Strip low-confidence edges (weight-based filtering optimization)
         confident = [e for e in raw_edges if not e.get("low_confidence", False)]
 
-        # Remove the low_confidence key — EdgeInput does not accept it
+        # Preserve all EdgeInput fields — confidence is required for classification
+        # dprompt-140: confidence must never be None (crashes is_user_stated >= 0.9)
         edges = [
-            {"subject": e["subject"], "object": e["object"], "rel_type": e["rel_type"]}
+            {
+                "subject": e["subject"],
+                "object": e["object"],
+                "rel_type": e["rel_type"],
+                "confidence": e.get("confidence", 0.8),
+                "fact_provenance": e.get("fact_provenance", "llm_inferred"),
+                "subject_type": e.get("subject_type"),
+                "object_type": e.get("object_type"),
+                "is_correction": e.get("is_correction", False),
+                "is_preferred_label": e.get("is_preferred_label", False),
+            }
             for e in confident
             if e.get("subject") and e.get("object") and e.get("rel_type")
         ]

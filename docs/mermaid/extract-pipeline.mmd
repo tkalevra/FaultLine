@@ -1,19 +1,19 @@
 graph TD
-    A["User Message<br/>(e.g., My son Des is 12<br/>Actually he's 14)"] -->|Step 1| B["Check for Corrections<br/>(Look for: actually, wrong,<br/>corrected to, meant to say)"]
+    A["User Message<br/>(e.g., My son ${CHILD1} is 12<br/>Actually he's 14)"] -->|Step 1| B["Check for Corrections<br/>(Look for: actually, wrong,<br/>corrected to, meant to say)"]
 
-    B -->|Found| C["LLM Extracts Correction<br/>(What changed?)<br/>Old: age=12<br/>New: age=14<br/>Who: Des"]
+    B -->|Found| C["LLM Extracts Correction<br/>(What changed?)<br/>Old: age=12<br/>New: age=14<br/>Who: ${CHILD1}"]
 
     C --> D["Flag as User Correction<br/>(Will skip validation staging,<br/>goes straight to database)"]
 
     B -->|Not Found| E["Check for Retractions<br/>(Look for: forget, delete,<br/>no longer true, not true)"]
 
-    E -->|Found| F["LLM Extracts Retraction<br/>(What's being removed?)<br/>Subject: Des<br/>Fact: age<br/>Action: delete or archive)"]
+    E -->|Found| F["LLM Extracts Retraction<br/>(What's being removed?)<br/>Subject: ${CHILD1}<br/>Fact: age<br/>Action: delete or archive)"]
 
     F --> G["Flag as Retraction<br/>(Skip normal storage,<br/>route to removal path)"]
 
     E -->|Not Found| H["Normal Extraction<br/>(Extract new facts<br/>from conversation)"]
 
-    H --> I["LLM Identifies Fact Elements<br/>Entity: Des (type: Person)<br/>Relationship: age<br/>Value: 12 (type: Number)<br/>Confidence: 95%"]
+    H --> I["LLM Identifies Fact Elements<br/>Entity: ${CHILD1} (type: Person)<br/>Relationship: age<br/>Value: 12 (type: Number)<br/>Confidence: 95%"]
 
     I --> J{Is This Relationship<br/>Already Defined?}
 
