@@ -3,6 +3,8 @@
 import os
 import httpx
 import structlog
+import uuid
+import time
 from typing import Optional, Any
 
 log = structlog.get_logger(__name__)
@@ -67,11 +69,14 @@ def build_llm_payload(
     }
 
     # dBug-016 fix: inject chat_id to prevent OpenWebUI process_chat NoneType crash
-    # Use user_id if available, fallback to environment variable for cases where
-    # user context isn't available (e.g., taxonomy inference, retraction detection)
+    # Priority chain (metadata-driven, no hardcoding):
+    # 1. user_id (context provided by caller)
+    # 2. FAULTLINE_MEMORY_CHAIN_UUID (environment fallback for system calls)
+    # 3. Dynamic generation: local:faultline-<timestamp> (last resort, avoids None)
     chat_id = user_id or os.environ.get("FAULTLINE_MEMORY_CHAIN_UUID")
-    if chat_id:
-        payload["chat_id"] = chat_id
+    if not chat_id:
+        chat_id = f"local:faultline-{int(time.time() * 1000)}"
+    payload["chat_id"] = chat_id
 
     # Optional thinking config
     if thinking:

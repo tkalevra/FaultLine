@@ -64,4 +64,4 @@ SELECT id, 'anonymous', alias, true FROM (
     (uuid_generate_v5('6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid, 'foot'), 'foot'),
     (uuid_generate_v5('6ba7b810-9dad-11d1-80b4-00c04fd430c8'::uuid, 'chest'), 'chest')
 ) AS bp(id, alias)
-ON CONFLICT (entity_id, user_id, alias) DO NOTHING;
+ON CONFLICT (user_id, alias) DO UPDATE SET is_preferred = true;

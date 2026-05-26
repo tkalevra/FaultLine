@@ -1,6 +1,8 @@
 import uuid
 import psycopg2
+import psycopg2.errorcodes
 import structlog
+from fastapi import HTTPException
 
 log = structlog.get_logger()
 
@@ -34,8 +36,9 @@ class EntityRegistry:
     - Never allow aliases to appear as subject_id/object_id in facts
     """
 
-    def __init__(self, db_conn):
+    def __init__(self, db_conn, auto_commit=True):
         self.db_conn = db_conn
+        self.auto_commit = auto_commit
 
     @staticmethod
     def _is_valid_uuid(value: str) -> bool:
@@ -160,12 +163,15 @@ class EntityRegistry:
         canonical: str,
         alias: str,
         is_preferred: bool = False,
+        entity_type: str = 'unknown',
     ) -> None:
         """
         Register an alias for a canonical entity (UUID).
         canonical is a UUID string (already lowercase).
         alias is a display name.
         If is_preferred=True, clears other preferred aliases for this entity.
+        entity_type: Entity type (e.g., "Person", "Animal", "Organization")
+                    Default 'unknown' for backward compatibility
 
         User-authoritative: if the alias already exists pointing to a corrupted
         (string) entity_id, delete it first so the correct UUID registration wins.
@@ -173,33 +179,88 @@ class EntityRegistry:
         canonical = canonical.strip()
         alias = alias.lower().strip()
 
-        with self.db_conn.cursor() as cur:
-            # Ensure canonical entity exists
-            cur.execute(
-                "INSERT INTO entities (id, user_id, entity_type) "
-                "VALUES (%s, %s, 'unknown') ON CONFLICT (id, user_id) DO NOTHING",
-                (canonical, user_id),
-            )
+        # Validate entity_type against known types
+        valid_types = self._get_valid_entity_types()
+        if entity_type not in valid_types and entity_type != 'unknown':
+            log.warning("entity_type_not_recognized",
+                       entity_type=entity_type,
+                       available_types=valid_types)
+            # Use 'unknown' as fallback, but log the issue for re-embedder awareness
+            actual_type = 'unknown'
+        else:
+            actual_type = entity_type
 
-            if is_preferred:
-                # Clear other preferred aliases for this entity
+        try:
+            with self.db_conn.cursor() as cur:
+                # Ensure canonical entity exists with validated type
                 cur.execute(
-                    "UPDATE entity_aliases SET is_preferred = false "
-                    "WHERE user_id = %s AND entity_id = %s AND alias != %s",
-                    (user_id, canonical, alias),
+                    "INSERT INTO entities (id, user_id, entity_type) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (id, user_id) DO UPDATE "
+                    "SET entity_type = EXCLUDED.entity_type WHERE entities.entity_type = 'unknown'",
+                    (canonical, user_id, actual_type),
                 )
 
-            cur.execute(
-                "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, alias) DO UPDATE SET "
-                "entity_id = EXCLUDED.entity_id, "
-                "is_preferred = EXCLUDED.is_preferred OR entity_aliases.is_preferred",
-                (canonical, user_id, alias, is_preferred),
-            )
-        self.db_conn.commit()
-        log.info("entity_registry.alias_registered",
-                 canonical=canonical, alias=alias, preferred=is_preferred)
+                if is_preferred:
+                    # Clear other preferred aliases for this entity
+                    cur.execute(
+                        "UPDATE entity_aliases SET is_preferred = false "
+                        "WHERE user_id = %s AND entity_id = %s AND alias != %s",
+                        (user_id, canonical, alias),
+                    )
+
+                # Insert/update with proper constraint
+                cur.execute(
+                    "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (user_id, alias) DO UPDATE SET "
+                    "entity_id = EXCLUDED.entity_id, "
+                    "is_preferred = EXCLUDED.is_preferred",
+                    (canonical, user_id, alias, is_preferred),
+                )
+                log.info("entity_registry.alias_registered",
+                         canonical=canonical, alias=alias, preferred=is_preferred)
+        except psycopg2.IntegrityError as err:
+            # Only rollback if this registry instance owns the transaction
+            if self.auto_commit:
+                self.db_conn.rollback()
+            log.error("entity_registry.alias_constraint_violation",
+                     error=str(err),
+                     user_id=user_id,
+                     canonical=canonical,
+                     alias=alias,
+                     auto_commit=self.auto_commit)
+            raise
+        except Exception as err:
+            # Only rollback if this registry instance owns the transaction
+            if self.auto_commit:
+                self.db_conn.rollback()
+            log.error("entity_registry.alias_registration_failed",
+                     error=str(err),
+                     user_id=user_id,
+                     canonical=canonical,
+                     alias=alias,
+                     auto_commit=self.auto_commit)
+            raise
+
+    def _get_valid_entity_types(self) -> set:
+        """Query all valid entity types from database (metadata-driven).
+
+        Returns a set of valid entity types from the entities table.
+        Always includes 'unknown' as a valid fallback.
+        Falls back to minimal set if DB query fails.
+        """
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT entity_type FROM entities WHERE entity_type IS NOT NULL")
+                rows = cur.fetchall()
+                types = {row[0] for row in rows} if rows else set()
+                # Always include 'unknown' as valid fallback
+                types.add('unknown')
+                return types
+        except Exception as err:
+            log.error("failed_to_load_entity_types", error=str(err))
+            # Graceful degradation: return known minimal set
+            return {'unknown', 'Person', 'Animal', 'Organization', 'Location', 'Concept'}
 
     def get_preferred_name(self, user_id: str, canonical: str) -> str:
         """Return preferred display name for entity, or canonical if none set.
