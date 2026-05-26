@@ -19,7 +19,7 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "${SPOUSE}, who prefers to be called emma", the subject is "marla" not "i".
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "<entity>, who prefers to be called <alias>", the subject is "<entity>" not "i".
 - For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being alicecribed, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 

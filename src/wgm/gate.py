@@ -8,6 +8,7 @@ import logging
 import structlog
 from src.fact_store.store import FactStoreManager
 from src.api.llm_output_validator import LLMOutputValidator
+from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts
 
 log = structlog.get_logger()
 
@@ -487,8 +488,7 @@ class WGMValidationGate:
                 with self.db_conn.cursor() as cur:
                     cur.execute("""
                         UPDATE facts
-                        SET superseded_at = NOW(),
-                            superseded_reason = 'user_correction'
+                        SET superseded_at = NOW()
                         WHERE user_id = %s
                           AND subject_id = %s
                           AND rel_type = %s
@@ -1159,22 +1159,16 @@ class WGMValidationGate:
         If approved with confidence >= 0.7, inserts into rel_types and returns True.
         Otherwise, inserts into pending_types and returns False.
         """
-        qwen_url = _detect_llm_endpoint()
-        if not qwen_url:
-            return self._auto_approve_novel_type(rel_type)
-
         try:
-            from src.api.llm_client import get_llm_headers, build_llm_payload
-
-            payload = build_llm_payload(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"{_FAULTLINE_INTERNAL_PREFIX} You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""For the relationship type '{rel_type}', provide complete ontology metadata.
+            # Use centralized retry logic instead of raw httpx.post()
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"{_FAULTLINE_INTERNAL_PREFIX} You are a knowledge graph ontology validator. Respond only with valid JSON, no markdown."
+                },
+                {
+                    "role": "user",
+                    "content": f"""For the relationship type '{rel_type}', provide complete ontology metadata.
 
 Respond with EXACTLY this JSON structure, no markdown:
 {{
@@ -1198,24 +1192,16 @@ Examples:
 - age: symmetric=false, inverse=null, head=[Any], tail=[SCALAR], hierarchy=false
 
 Respond with ONLY the JSON, no explanation."""
-                    }
-                ],
-                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
-                user_id=getattr(self, '_user_id', None),  # dBug-016: inject user_id as chat_id
-                temperature=0.0,
-                max_tokens=200,
-                thinking={"type": "disabled"},
-            )
+                }
+            ]
 
-            response = httpx.post(
-                qwen_url,
-                json=payload,
-                headers=get_llm_headers(),
-                timeout=10.0,
+            result = call_llm_with_retry_sync(
+                messages=messages,
+                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                user_id=getattr(self, '_user_id', None),
+                timeout=LLMTimeouts.get("ENRICHMENT"),
+                operation="rel_type_enrichment",
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"].strip()
-            result = json.loads(content)
 
             if result.get("valid") and result.get("confidence", 0) >= 0.7:
                 # Insert into rel_types with full metadata

@@ -30,6 +30,7 @@ class IngestRequest(BaseModel):
     edges: list[EdgeInput] | None = None
     known_types: list[str] = ["Person", "Organization", "Location", "Event", "Concept"]
     user_id: Optional[str] = "anonymous"
+    chat_id: Optional[str] = None  # dBug-016: Preserve OpenWebUI conversation context
     context: ExtractContext | None = None  # Optional context enrichment for /extract (dBug-018)
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution during extraction
     is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
@@ -115,6 +116,7 @@ class RewriteRequest(BaseModel):
     FaultLine controls which LLM to use and manages all LLM configuration."""
     text: str
     user_id: Optional[str] = "anonymous"
+    chat_id: Optional[str] = None  # dBug-016: Preserve OpenWebUI conversation context
     messages: list[dict] | None = None  # Prior conversation context
     typed_entities: list[dict] | None = None  # Pre-extracted entities from GLiNER2
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution
@@ -130,7 +132,7 @@ class FactCorrectionRequest(BaseModel):
     """User correction: old fact is wrong, new fact is right.
     Surgical update: only supersede one specific fact, re-ingest through WGM gate.
     """
-    text: str  # "${PET} is a dog not a bunny"
+    text: str  # "Fraggle is a dog not a bunny"
     user_id: str  # User UUID (will be validated against authenticated user)
     context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
     idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)
