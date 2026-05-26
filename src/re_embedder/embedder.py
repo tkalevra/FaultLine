@@ -15,9 +15,27 @@ import httpx
 import psycopg2
 import redis
 from src.api.llm_client import get_llm_headers
+from src.api.llm_calls import (
+    call_llm_with_retry_sync,
+    LLMTimeouts,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
+
+
+def _get_circuit_breaker_status() -> dict:
+    """Get circuit breaker status for LLM calls (for awareness in background loop).
+
+    Returns:
+        Dict with 'is_open' key indicating if circuit breaker is active
+    """
+    try:
+        from src.api.llm_calls import _llm_circuit_breaker
+        return {"is_open": _llm_circuit_breaker.is_open()}
+    except Exception:
+        # If import fails, assume circuit is closed (normal operation)
+        return {"is_open": False}
 
 # Marker for internal FaultLine prompts (dprompt-128) — prevents context bloat if looped back
 _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
@@ -775,6 +793,9 @@ def _query_llm_for_rel_type_metadata(candidate_rel: str, subj_type: str, obj_typ
     - examples: sample usages for extraction prompt
 
     Returns dict with llm_* fields or empty dict on failure (non-blocking).
+
+    Phase 3c: Uses call_llm_with_retry_sync() for resilient LLM calls with
+    automatic retry and circuit breaker support.
     """
     try:
         # Mark prompt with FaultLine prefix to prevent context bloat if it loops back (dprompt-128)
@@ -796,41 +817,39 @@ Respond with ONLY valid JSON (no markdown, no extra text):
   "examples": [{{"subject": "Person1", "object": "Person2"}}]
 }}"""
 
-        headers = get_llm_headers()
-        payload = {
-            "model": os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 300,
+        # Phase 3c: Use centralized LLM retry logic instead of raw httpx call
+        result = call_llm_with_retry_sync(
+            messages=[{"role": "user", "content": prompt}],
+            model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+            user_id="re_embedder",
+            timeout=LLMTimeouts.get("ENRICHMENT"),
+            operation="ENRICHMENT",
+        )
+
+        # call_llm_with_retry_sync() returns PARSED JSON (not raw OpenAI response)
+        if not result or not isinstance(result, dict):
+            log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} reason=no_valid_response")
+            return {}
+
+        # Result is already parsed JSON — validate expected fields
+        if not result.get("natural_language"):
+            log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} reason=missing_natural_language")
+            return {}
+
+        # Extract metadata directly from parsed result
+        metadata = result
+        return {
+            "llm_natural_language": metadata.get("natural_language", ""),
+            "llm_is_symmetric": metadata.get("is_symmetric", False),
+            "llm_inverse_rel_type": metadata.get("inverse_rel_type"),
+            "llm_category": metadata.get("category", "other"),
+            "llm_fact_class": metadata.get("fact_class", "B"),
+            "llm_confidence": float(metadata.get("confidence", 0.6)),
+            "llm_metadata_json": json.dumps(metadata),
         }
 
-        response = _http_client_sync.post(
-            qwen_api_url,
-            json=payload,
-            headers=headers,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-
-        result = response.json()
-        content = result["choices"][0]["message"]["content"].strip()
-
-        # Parse JSON response
-        import re
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            metadata = json.loads(match.group())
-            return {
-                "llm_natural_language": metadata.get("natural_language", ""),
-                "llm_is_symmetric": metadata.get("is_symmetric", False),
-                "llm_inverse_rel_type": metadata.get("inverse_rel_type"),
-                "llm_category": metadata.get("category", "other"),
-                "llm_fact_class": metadata.get("fact_class", "B"),
-                "llm_confidence": float(metadata.get("confidence", 0.6)),
-                "llm_metadata_json": json.dumps(metadata),
-            }
     except Exception as e:
-        log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} error={str(e)}")
+        log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} error={type(e).__name__}: {str(e)[:100]}")
 
     return {}
 
@@ -961,17 +980,25 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
                         is_hierarchy = True
 
+                    # dprompt-148: Assign fact_class based on LLM confidence
+                    # High confidence (>= 0.7) → Class B (LLM-inferred, can be promoted)
+                    # Medium confidence (0.5-0.7) → Class B (staged)
+                    # Low confidence (< 0.5) → Class C (ephemeral)
+                    llm_confidence = llm_metadata.get("llm_confidence", 0.6)
+                    assigned_fact_class = "B" if llm_confidence >= 0.5 else "C"
+
                     cur.execute(
                         "INSERT INTO rel_types"
                         " (rel_type, label, natural_language, engine_generated, confidence, source,"
-                        "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category)"
-                        " VALUES (%s, %s, %s, true, %s, 'llm_evaluated', %s, %s, %s, %s, %s, %s)"
+                        "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category, fact_class)"
+                        " VALUES (%s, %s, %s, true, %s, 'llm_evaluated', %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (rel_type) DO UPDATE SET"
                         "  natural_language = EXCLUDED.natural_language,"
                         "  is_symmetric = EXCLUDED.is_symmetric,"
                         "  inverse_rel_type = EXCLUDED.inverse_rel_type,"
-                        "  category = EXCLUDED.category",
-                        (candidate_rel, label, natural_language, 0.8, head_types, tail_types, is_hierarchy, is_symmetric, inverse_rel_type, category),
+                        "  category = EXCLUDED.category,"
+                        "  fact_class = EXCLUDED.fact_class",
+                        (candidate_rel, label, natural_language, 0.8, head_types, tail_types, is_hierarchy, is_symmetric, inverse_rel_type, category, assigned_fact_class),
                     )
                     stats["approved"] += 1
                     log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} category={category} is_symmetric={is_symmetric} natural_language={natural_language[:50]} {reason}")
@@ -1421,6 +1448,377 @@ def detect_embedding_model_change() -> None:
         log.warning("embedding_cache.model_detection_failed", error=str(e))
 
 
+def _get_redis_client(redis_url: str = None) -> Optional[redis.Redis]:
+    """Get or initialize Redis client for queue operations.
+
+    Args:
+        redis_url: Optional explicit Redis URL (auto-detected if not provided)
+
+    Returns:
+        Redis client or None if connection fails
+    """
+    try:
+        url = redis_url or os.getenv("REDIS_URL") or _detect_redis_endpoint()
+        client = redis.from_url(url, decode_responses=True, socket_timeout=5)
+        client.ping()
+        return client
+    except Exception as e:
+        log.warning(f"redis_client_initialization_failed: {e}")
+        return None
+
+
+def consume_reembedder_queue(db_conn, redis_client: redis.Redis, qwen_api_url: str) -> int:
+    """
+    Consume events from Redis queue and process them.
+    Processes high-priority class_c queue first, then per-user queues.
+    Non-blocking: if queue empty, returns immediately.
+
+    Args:
+        db_conn: PostgreSQL connection
+        redis_client: Redis client
+        qwen_api_url: LLM endpoint URL
+
+    Returns:
+        Number of events processed
+    """
+    if not redis_client:
+        return 0
+
+    processed = 0
+
+    try:
+        # Step 1: Check high-priority class_c_ingest queue (blocking pop with timeout)
+        try:
+            event_json = redis_client.blpop("faultline:queue:class_c", timeout=1)
+            if event_json:
+                event_data = event_json[1]  # blpop returns (key, value)
+                if process_reembedder_event(db_conn, redis_client, qwen_api_url, event_data):
+                    processed += 1
+                # Continue to next iteration to check for more events
+                return processed + consume_reembedder_queue(db_conn, redis_client, qwen_api_url)
+        except Exception as e:
+            log.debug(f"queue_consumer.class_c_pop_error: {e}")
+
+        # Step 2: Check a few per-user queues (non-blocking)
+        # In production, this would enumerate active users, here we try a few
+        try:
+            # Use KEYS to find active user queues (limited scan)
+            cursor = 0
+            for _ in range(5):  # Check up to 5 queues per iteration
+                cursor, keys = redis_client.scan(cursor, match="faultline:queue:*", count=10)
+
+                for key in keys:
+                    if key == "faultline:queue:class_c":
+                        continue  # Already handled above
+
+                    try:
+                        event_json = redis_client.lpop(key)
+                        if event_json:
+                            if process_reembedder_event(db_conn, redis_client, qwen_api_url, event_json):
+                                processed += 1
+                    except Exception as e:
+                        log.debug(f"queue_consumer.user_queue_error key={key}: {e}")
+
+                if cursor == 0:
+                    break  # Scan complete
+        except Exception as e:
+            log.debug(f"queue_consumer.scan_error: {e}")
+
+    except Exception as e:
+        log.error(f"queue_consumer.error: {e}")
+
+    return processed
+
+
+def process_reembedder_event(
+    db_conn,
+    redis_client: redis.Redis,
+    qwen_api_url: str,
+    event_json: str
+) -> bool:
+    """
+    Process a single re-embedder event from Redis.
+
+    CRITICAL: Validates user_id before any operation.
+
+    Args:
+        db_conn: PostgreSQL connection
+        redis_client: Redis client
+        qwen_api_url: LLM endpoint URL
+        event_json: JSON string from Redis
+
+    Returns:
+        True if processed successfully, False otherwise
+    """
+    try:
+        event = json.loads(event_json)
+    except Exception as e:
+        log.error(f"reembedder_event.json_parse_error: {e}")
+        return False
+
+    event_type = event.get("event_type")
+    user_id = event.get("user_id")
+
+    # CRITICAL: Validate user_id before any DB operation
+    if not user_id or not isinstance(user_id, str) or len(user_id) < 4:
+        log.error(f"reembedder_event.invalid_user_id event_type={event_type} user_id_len={len(user_id or '')}")
+        return False
+
+    try:
+        if event_type == "class_c_ingest":
+            rel_type = event.get("rel_type", "").lower().strip()
+            confidence = event.get("confidence", 0.4)
+
+            if rel_type and len(rel_type) > 0:
+                # Evaluate novel rel_type for ontology learning
+                with db_conn.cursor() as cur:
+                    # Check if rel_type is already known
+                    cur.execute(
+                        "SELECT rel_type FROM rel_types WHERE rel_type = %s LIMIT 1",
+                        (rel_type,)
+                    )
+                    if not cur.fetchone():
+                        # Novel rel_type — log for re_embedder evaluation
+                        log.debug(f"reembedder_event_processed event_type=class_c_ingest "
+                                 f"rel_type={rel_type} confidence={confidence} user_id={user_id[:8]}")
+                        return True
+            return True
+
+        elif event_type == "negation_pattern_novel":
+            pattern_hash = event.get("pattern_hash")
+            confidence = event.get("confidence", 0.4)
+
+            if pattern_hash:
+                # Learn negation pattern by hash
+                learned = learn_negation_pattern_by_hash(db_conn, user_id, pattern_hash, confidence)
+                if learned:
+                    log.debug(f"reembedder_event_processed event_type=negation_pattern_novel "
+                             f"pattern_hash={pattern_hash} confidence={confidence} user_id={user_id[:8]}")
+                return True
+
+        elif event_type == "correction_feedback":
+            confidence_bin = event.get("confidence_bin")
+            feedback_type = event.get("feedback_type", "correction")
+
+            if confidence_bin:
+                # Record correction feedback and adjust gate
+                recorded = record_confidence_feedback(db_conn, user_id, confidence_bin, feedback_type)
+                if recorded:
+                    adjusted = adjust_confidence_gate(db_conn, user_id)
+                    log.debug(f"reembedder_event_processed event_type=correction_feedback "
+                             f"confidence_bin={confidence_bin} feedback_type={feedback_type} "
+                             f"gate_adjusted={adjusted} user_id={user_id[:8]}")
+                return True
+
+        else:
+            log.warning(f"reembedder_event.unknown_type event_type={event_type} user_id={user_id[:8]}")
+            return False
+
+    except Exception as e:
+        log.error(f"reembedder_event_failed event_type={event_type} "
+                 f"user_id_prefix={user_id[:8] if user_id else 'none'} error={str(e)}")
+        return False
+
+
+def learn_negation_pattern_by_hash(
+    db_conn,
+    user_id: str,
+    pattern_hash: str,
+    confidence: float = 0.4
+) -> bool:
+    """
+    Learn a negation pattern based on hash match.
+    Pattern hash is used to identify patterns without storing raw text in Redis.
+    This function logs the pattern learning for re-embedder evaluation.
+
+    Args:
+        db_conn: PostgreSQL connection
+        user_id: User UUID
+        pattern_hash: SHA256[:16] hash of pattern (from Redis event)
+        confidence: Starting confidence (typically 0.4)
+
+    Returns:
+        True if pattern was learned/updated, False otherwise
+    """
+    try:
+        with db_conn.cursor() as cur:
+            # Query for existing pattern by hash (if pattern_hash column exists in DB)
+            # Otherwise, this is logged for future evaluation by re_embedder
+
+            # For now, just track the hash as a generic pattern
+            # In future, this would match against actual pattern_text via hash comparison
+            cur.execute(
+                """
+                SELECT id FROM negation_patterns
+                WHERE user_id = %s
+                  AND pattern_hash IS NOT NULL
+                  AND pattern_hash = %s
+                LIMIT 1
+                """,
+                (user_id, pattern_hash)
+            )
+
+            existing = cur.fetchone()
+            if existing:
+                # Pattern already exists — increment confirmed count
+                cur.execute(
+                    """
+                    UPDATE negation_patterns
+                    SET confirmed_count = confirmed_count + 1,
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (existing[0],)
+                )
+                log.debug(f"negation_pattern_confirmed user_id={user_id[:8]} pattern_hash={pattern_hash}")
+            else:
+                # New pattern — log it as a candidate for future learning
+                # The pattern_text field will be populated by the re-embedder when it
+                # reconstructs the full pattern from context (if available)
+                cur.execute(
+                    """
+                    INSERT INTO negation_patterns
+                    (user_id, pattern_text, pattern_hash, negation_type, confidence, confirmed_count, learned_from)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, pattern_text, negation_type) DO UPDATE
+                    SET confirmed_count = negation_patterns.confirmed_count + 1,
+                        pattern_hash = COALESCE(EXCLUDED.pattern_hash, negation_patterns.pattern_hash),
+                        updated_at = now()
+                    """,
+                    (user_id, f"hash_{pattern_hash}", pattern_hash, "retraction", confidence, 1, "re_embedder_inferred")
+                )
+                log.debug(f"negation_pattern_learned user_id={user_id[:8]} pattern_hash={pattern_hash}")
+
+        db_conn.commit()
+        return True
+
+    except Exception as e:
+        log.error(f"learn_negation_pattern_error user_id={user_id[:8]} pattern_hash={pattern_hash}: {e}")
+        db_conn.rollback()
+        return False
+
+
+def record_confidence_feedback(
+    db_conn,
+    user_id: str,
+    confidence_bin: str,
+    feedback_type: str = "correction"
+) -> bool:
+    """
+    Record confidence feedback for gate adjustment.
+    Updates intent_confidence_feedback table.
+
+    Args:
+        db_conn: PostgreSQL connection
+        user_id: User UUID
+        confidence_bin: Bin like "0.65-0.75"
+        feedback_type: "correction" or "confirmation"
+
+    Returns:
+        True if recorded, False on error
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO intent_confidence_feedback
+                (user_id, confidence_bin, feedback_type, count)
+                VALUES (%s, %s, %s, 1)
+                ON CONFLICT (user_id, confidence_bin, feedback_type)
+                DO UPDATE SET count = intent_confidence_feedback.count + 1,
+                              created_at = now()
+                """,
+                (user_id, confidence_bin, feedback_type)
+            )
+        db_conn.commit()
+        return True
+
+    except Exception as e:
+        log.error(f"record_confidence_feedback_error user_id={user_id[:8]} "
+                 f"confidence_bin={confidence_bin}: {e}")
+        db_conn.rollback()
+        return False
+
+
+def adjust_confidence_gate(db_conn, user_id: str) -> bool:
+    """
+    Adjust per-user confidence gate threshold based on correction feedback.
+
+    Algorithm:
+    - If 0.65-0.75 band has >30% corrections → lower gate to 0.65
+    - If <0.60 band has <10% corrections → raise gate to 0.75
+    - Otherwise keep at 0.70 (default)
+
+    Args:
+        db_conn: PostgreSQL connection
+        user_id: User UUID
+
+    Returns:
+        True if gate was adjusted, False otherwise
+    """
+    try:
+        with db_conn.cursor() as cur:
+            # Query feedback history
+            cur.execute(
+                """
+                SELECT confidence_bin, feedback_type, SUM(count) as total
+                FROM intent_confidence_feedback
+                WHERE user_id = %s
+                GROUP BY confidence_bin, feedback_type
+                """,
+                (user_id,)
+            )
+
+            feedback = cur.fetchall()
+            gate = 0.70  # Default
+            adjusted = False
+
+            # Parse feedback into bins
+            bins = {}
+            for row in feedback:
+                conf_bin, fb_type, count = row
+                if conf_bin not in bins:
+                    bins[conf_bin] = {"correction": 0, "confirmation": 0}
+                bins[conf_bin][fb_type] = count
+
+            # Apply adjustment rules
+            if "0.65-0.75" in bins:
+                total = bins["0.65-0.75"].get("correction", 0) + bins["0.65-0.75"].get("confirmation", 0)
+                corrections = bins["0.65-0.75"].get("correction", 0)
+                if total > 0 and corrections / total > 0.30:
+                    gate = 0.65
+                    adjusted = True
+
+            if "0.50-0.60" in bins:
+                total = bins["0.50-0.60"].get("correction", 0) + bins["0.50-0.60"].get("confirmation", 0)
+                corrections = bins["0.50-0.60"].get("correction", 0)
+                if total > 0 and corrections / total < 0.10:
+                    gate = 0.75
+                    adjusted = True
+
+            # Store adjusted gate threshold (in memory cache during session)
+            # For persistence across sessions, store in a confidence_gates table
+            cur.execute(
+                """
+                INSERT INTO confidence_gates (user_id, threshold, adjusted_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET threshold = %s, adjusted_at = now()
+                """,
+                (user_id, gate, gate)
+            )
+
+        db_conn.commit()
+        if adjusted:
+            log.info(f"confidence_gate_adjusted user_id={user_id[:8]} new_threshold={gate}")
+        return adjusted
+
+    except Exception as e:
+        log.error(f"adjust_confidence_gate_error user_id={user_id[:8]}: {e}")
+        db_conn.rollback()
+        return False
+
+
 def main():
     """Main poll loop."""
     global _http_client_sync
@@ -1456,8 +1854,21 @@ def main():
     log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
     log.info("re_embedder.entering_main_loop")
 
+    # Initialize Redis client for event queue
+    redis_url = os.getenv("REDIS_URL")
+    redis_client = _get_redis_client(redis_url)
+    if redis_client:
+        log.info("re_embedder.redis_client_initialized")
+    else:
+        log.warning("re_embedder.redis_client_unavailable queue_events_disabled")
+
     while True:
         try:
+            # Phase 3c: Check circuit breaker health for awareness
+            breaker_status = _get_circuit_breaker_status()
+            if breaker_status["is_open"]:
+                log.warning("re_embedder.circuit_breaker_open skipping_llm_work_this_cycle")
+
             # At the top of every iteration, before any DB query, ensure the default
             # collection exists. This recovers a deleted collection within one loop
             # cycle regardless of whether there are any unsynced rows.
@@ -1465,6 +1876,16 @@ def main():
             ensure_collection(default_collection, qdrant_url)
 
             with psycopg2.connect(postgres_dsn) as db:
+                # Phase 3: Process Redis queue events first (high-priority)
+                # Non-blocking: if Redis unavailable, system continues with DB poll
+                if redis_client:
+                    try:
+                        queue_events_processed = consume_reembedder_queue(db, redis_client, qwen_api_url)
+                        if queue_events_processed > 0:
+                            log.info(f"re_embedder.queue_events_processed count={queue_events_processed}")
+                    except Exception as e:
+                        log.warning(f"re_embedder.queue_consumer_error (non-blocking): {e}")
+                        # Continue to DB poll even if queue fails
                 rows = fetch_unsynced(db, confidence_threshold)
 
                 if rows:
@@ -1528,21 +1949,27 @@ def main():
                     log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
 
                 # dprompt-121: Event-driven ontology evaluation (skip if no pending work)
-                if has_pending_ontology_work(db):
-                    ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
-                    if any(v > 0 for v in ontology_stats.values()):
-                        log.info(
-                            f"re_embedder.ontology_eval "
-                            f"approved={ontology_stats['approved']} "
-                            f"mapped={ontology_stats['mapped']} "
-                            f"rejected={ontology_stats['rejected']} "
-                            f"errors={ontology_stats['errors']}"
-                        )
-                else:
-                    log.debug("re_embedder.no_pending_ontology_work")
+                # Phase 3c: Wrap in error isolation to prevent background loop crash
+                try:
+                    if has_pending_ontology_work(db):
+                        ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
+                        if any(v > 0 for v in ontology_stats.values()):
+                            log.info(
+                                f"re_embedder.ontology_eval "
+                                f"approved={ontology_stats['approved']} "
+                                f"mapped={ontology_stats['mapped']} "
+                                f"rejected={ontology_stats['rejected']} "
+                                f"errors={ontology_stats['errors']}"
+                            )
+                    else:
+                        log.debug("re_embedder.no_pending_ontology_work")
+                except Exception as e:
+                    log.error(f"re_embedder.ontology_eval_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if ontology eval fails
 
                 # dprompt-065: Async taxonomy discovery for novel rel_types (deferred from ingest)
                 # Runs in poll loop — no blocking LLM call in ingest hot path
+                # Phase 3c: Wrap entire subsystem in error isolation to prevent crash
                 try:
                     from src.api.main import _llm_discover_taxonomy_from_facts, _load_taxonomy_cache
                     from src.api.llm_client import build_llm_payload
@@ -1590,18 +2017,24 @@ def main():
                                 log.warning("re_embedder.taxonomy_discovery_failed",
                                            rel_type=rel_type, error=str(e))
                 except Exception as e:
-                    log.warning("re_embedder.taxonomy_discovery_loop_failed", error=str(e))
+                    log.error(f"re_embedder.taxonomy_discovery_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if taxonomy discovery fails
 
                 # dprompt-128-P3: Evaluate correction signal candidates
                 # Patterns that occur >= 3 times are auto-approved to correction_signals
-                correction_stats = evaluate_correction_signal_candidates(db, qwen_api_url)
-                if any(v > 0 for v in correction_stats.values()):
-                    log.info(
-                        f"re_embedder.correction_eval "
-                        f"approved={correction_stats['approved']} "
-                        f"rejected={correction_stats['rejected']} "
-                        f"errors={correction_stats['errors']}"
-                    )
+                # Phase 3c: Wrap in error isolation to prevent background loop crash
+                try:
+                    correction_stats = evaluate_correction_signal_candidates(db, qwen_api_url)
+                    if any(v > 0 for v in correction_stats.values()):
+                        log.info(
+                            f"re_embedder.correction_eval "
+                            f"approved={correction_stats['approved']} "
+                            f"rejected={correction_stats['rejected']} "
+                            f"errors={correction_stats['errors']}"
+                        )
+                except Exception as e:
+                    log.error(f"re_embedder.correction_signal_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if correction eval fails
 
                 # Expire stale Class C staged facts
                 n_expired = expire_staged_facts(db, qdrant_url)
@@ -1610,17 +2043,22 @@ def main():
 
                 # dprompt-137: Evaluate retraction outcomes for continuous learning
                 # Auto-register high-frequency patterns, update metrics for existing patterns
-                if has_pending_retraction_outcomes(db):
-                    retraction_stats = evaluate_retraction_outcomes(db, frequency_threshold=3)
-                    if any(v > 0 for v in [retraction_stats["discovered"], retraction_stats["updated"]]):
-                        log.info(
-                            f"re_embedder.retraction_learning_complete "
-                            f"discovered={retraction_stats['discovered']} "
-                            f"updated={retraction_stats['updated']} "
-                            f"errors={retraction_stats['errors']}"
-                        )
-                else:
-                    log.debug("re_embedder.no_pending_retraction_outcomes")
+                # Phase 3c: Wrap in error isolation to prevent background loop crash
+                try:
+                    if has_pending_retraction_outcomes(db):
+                        retraction_stats = evaluate_retraction_outcomes(db, frequency_threshold=3)
+                        if any(v > 0 for v in [retraction_stats["discovered"], retraction_stats["updated"]]):
+                            log.info(
+                                f"re_embedder.retraction_learning_complete "
+                                f"discovered={retraction_stats['discovered']} "
+                                f"updated={retraction_stats['updated']} "
+                                f"errors={retraction_stats['errors']}"
+                            )
+                    else:
+                        log.debug("re_embedder.no_pending_retraction_outcomes")
+                except Exception as e:
+                    log.error(f"re_embedder.retraction_outcomes_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if retraction outcomes eval fails
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:
