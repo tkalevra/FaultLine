@@ -3,6 +3,7 @@ services:
   faultline:
     build:
       context: .
+      dockerfile: Dockerfile
       network: host
     ports:
       - "8001:8000"

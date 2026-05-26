@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_outcomes_user ON retraction_outcomes(user_id);
 CREATE INDEX IF NOT EXISTS idx_outcomes_was_correct ON retraction_outcomes(was_correct);
 
 -- PHASE 5: Start with empty retraction_signals table
--- Signal patterns are discovered purely from ${USER}'s language patterns
+-- Signal patterns are discovered purely from Christopher's language patterns
 -- via retraction_outcomes learning table, not bootstrap biases
 -- Learned patterns (frequency >= 3) accumulate over time at priority > 70
 -- Bootstrap signals would mask actual user patterns, so we learn from zero state
