@@ -4118,15 +4118,16 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
 
         print(f"[/classify-intent] Parsed: intent={intent} | confidence={confidence:.3f} | type={type(intent_result)}", flush=True)
 
-        # WIRE #1: Query negation_patterns for DB-learned overrides (dprompt-144 Layer 2)
-        # If text contains known negation pattern, override GLiNER2 if needed
+        # WIRE #1: Query negation_patterns + retraction_signals for DB-learned overrides (dprompt-144 Layer 2)
+        # Layer 2a: negation_patterns — intent classification (user-specific + global)
+        # Layer 2b: retraction_signals — learned from successful retractions (re_embedder feedback)
         try:
             text_lower = text.lower()
             dsn = os.getenv("POSTGRES_DSN")
             if dsn:
                 with psycopg2.connect(dsn) as conn:
+                    # Layer 2a: Query learned negation_patterns (intent override)
                     with conn.cursor() as cur:
-                        # Query both user-specific AND global linguistic patterns
                         cur.execute("""
                             SELECT pattern_text, negation_type, confidence
                             FROM negation_patterns
@@ -4137,14 +4138,12 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                               confidence DESC
                             LIMIT 50
                         """, (user_id, user_id))
-
                         patterns = cur.fetchall()
 
-                if patterns:
-                    for pattern_text, pattern_intent, pattern_conf in patterns:
-                        if pattern_text and pattern_text.lower() in text_lower:
-                            # Pattern matched — override GLiNER2 if pattern confidence is high enough
-                            if pattern_conf >= 0.8:
+                    if patterns:
+                        for pattern_text, pattern_intent, pattern_conf in patterns:
+                            if pattern_text and pattern_text.lower() in text_lower:
+                                # Pattern matched — override GLiNER2 unconditionally
                                 intent = pattern_intent.upper()
                                 confidence = pattern_conf
                                 print(f"[/classify-intent] negation_pattern_HIT: pattern='{pattern_text}' → intent={intent} confidence={confidence:.2f}", flush=True)
@@ -4153,9 +4152,41 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                                        override_intent=intent,
                                        pattern_text=pattern_text,
                                        pattern_confidence=pattern_conf)
-                                break
+                                return {
+                                    "intent": intent,
+                                    "confidence": confidence
+                                }
+
+                    # Layer 2b: Query retraction_signals (learned from successful retractions)
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT signal, signal_category, priority
+                            FROM retraction_signals
+                            WHERE language = 'en' AND priority >= 50
+                            ORDER BY priority DESC
+                            LIMIT 50
+                        """)
+                        retraction_signals = cur.fetchall()
+
+                    if retraction_signals:
+                        for signal_text, signal_category, signal_priority in retraction_signals:
+                            if signal_text and signal_text.lower() in text_lower:
+                                # Retraction signal matched — classify as RETRACTION
+                                intent = "RETRACTION"
+                                confidence = min(0.95, signal_priority / 100.0)  # priority 50-100 → confidence 0.5-0.95
+                                print(f"[/classify-intent] retraction_signal_HIT: signal='{signal_text}' (priority={signal_priority}) → intent={intent} confidence={confidence:.2f}", flush=True)
+                                log.info("classify_intent.retraction_signal_override",
+                                       original_intent=intent_result,
+                                       override_intent=intent,
+                                       signal_text=signal_text,
+                                       signal_priority=signal_priority)
+                                return {
+                                    "intent": intent,
+                                    "confidence": confidence
+                                }
+
         except Exception as e:
-            log.warning("classify_intent.negation_pattern_query_failed", error=str(e))
+            log.warning("classify_intent.pattern_query_failed", error=str(e))
             # Continue with GLiNER2 result on DB error — non-blocking
 
         # Log intent (no text, no user_id, just decision)
@@ -9046,11 +9077,25 @@ def correct_fact(req: FactCorrectionRequest):
         # This requires DB queries BEFORE transaction — fresh context
         subject_name = extraction.get("subject") or extraction.get("subject_uuid")  # Fallback to subject_uuid if already resolved
         subject_uuid = None
-        old_rel_type = extraction.get("old_rel_type", "").lower()
-        old_value = extraction.get("old_value")
-        new_rel_type = extraction.get("new_rel_type", "").lower()
-        new_value = extraction.get("new_value")
         confidence = extraction.get("confidence", 0.0)
+
+        # RETRACTION vs CORRECTION: extract different fields
+        if is_retraction:
+            # Retraction fields: subject, rel_type, object, action, dimension
+            rel_type_to_negate = extraction.get("rel_type", "").lower()
+            object_to_negate = extraction.get("object")
+            old_rel_type = rel_type_to_negate
+            old_value = object_to_negate
+            new_rel_type = None
+            new_value = None
+            action = extraction.get("action", "remove")
+        else:
+            # Correction fields: old_rel_type, old_value, new_rel_type, new_value
+            old_rel_type = extraction.get("old_rel_type", "").lower()
+            old_value = extraction.get("old_value")
+            new_rel_type = extraction.get("new_rel_type", "").lower()
+            new_value = extraction.get("new_value")
+            action = "correct"
 
         # Resolve subject name → UUID using EntityRegistry (same as /ingest)
         # Special case: "user" or "me" → use user_id directly
@@ -9071,24 +9116,35 @@ def correct_fact(req: FactCorrectionRequest):
                 subject_uuid = None
 
         # Validate extraction
-        if not subject_uuid or not old_rel_type or not new_rel_type:
+        if not subject_uuid or not old_rel_type:
             log.warning("correct_fact.extraction_incomplete",
                        subject_name=subject_name,
                        subject_uuid=subject_uuid,
                        old_rel_type=old_rel_type,
+                       is_retraction=is_retraction)
+            return FactCorrectionResponse(
+                status="failed",
+                message=f"Could not resolve entity '{subject_name}' or incomplete {'retraction' if is_retraction else 'correction'} details"
+            )
+
+        # For corrections (not retractions), also require new_rel_type
+        if not is_retraction and not new_rel_type:
+            log.warning("correct_fact.correction_incomplete",
+                       subject_name=subject_name,
                        new_rel_type=new_rel_type)
             return FactCorrectionResponse(
                 status="failed",
-                message=f"Could not resolve entity '{subject_name}' or incomplete correction details"
+                message="Correction requires both old and new relationship details"
             )
 
         log.info("correct_fact.extraction_success",
                 user_id=req.user_id,
                 subject=subject_uuid,
                 old=f"{old_rel_type}={old_value}",
-                new=f"{new_rel_type}={new_value}",
+                new=f"{new_rel_type}={new_value}" if new_rel_type else "RETRACTION",
                 dimension=extraction.get("dimension", "RELATIONAL"),
-                confidence=confidence)
+                confidence=confidence,
+                is_retraction=is_retraction)
 
         # PHASE 6: Immutability enforcement (fail-fast, before transaction)
         IMMUTABLE_REL_TYPES = {"born_on", "born_in", "nationality"}
@@ -9119,9 +9175,10 @@ def correct_fact(req: FactCorrectionRequest):
                         entity=subject_uuid,
                         attribute=old_rel_type,
                         old_value=old_value,
-                        new_value=new_value)
+                        new_value=new_value,
+                        is_retraction=is_retraction)
 
-                # Special case: pref_name (delete from entity_aliases, re-register new name)
+                # Special case: pref_name (delete from entity_aliases)
                 if old_rel_type in ["pref_name", "also_known_as"]:
                     # Delete old preferred name from entity_aliases
                     cur.execute("""
@@ -9130,57 +9187,74 @@ def correct_fact(req: FactCorrectionRequest):
                     """, (req.user_id, subject_uuid))
                     log.info("correct_fact.scalar_old_pref_name_deleted",
                             entity=subject_uuid,
-                            old_name=old_value)
+                            old_name=old_value,
+                            is_retraction=is_retraction)
 
-                    # Register new preferred name
-                    try:
-                        cur.execute("""
-                            INSERT INTO entity_aliases (user_id, entity_id, alias, is_preferred)
-                            VALUES (%s, %s, %s, true)
-                            ON CONFLICT (user_id, alias) DO UPDATE
-                            SET is_preferred = true, entity_id = EXCLUDED.entity_id
-                        """, (req.user_id, subject_uuid, new_value.lower()))
-                        log.info("correct_fact.scalar_new_pref_name_registered",
+                    # RETRACTION: Stop here (name is deleted)
+                    if is_retraction:
+                        log.info("correct_fact.scalar_retraction_complete",
                                 entity=subject_uuid,
-                                new_name=new_value)
-                    except Exception as e:
-                        log.error("correct_fact.scalar_pref_name_registration_failed",
-                                error=str(e), entity=subject_uuid, new_name=new_value)
-                        raise
+                                attribute=old_rel_type)
+                    else:
+                        # CORRECTION: Register new preferred name
+                        try:
+                            cur.execute("""
+                                INSERT INTO entity_aliases (user_id, entity_id, alias, is_preferred)
+                                VALUES (%s, %s, %s, true)
+                                ON CONFLICT (user_id, alias) DO UPDATE
+                                SET is_preferred = true, entity_id = EXCLUDED.entity_id
+                            """, (req.user_id, subject_uuid, new_value.lower()))
+                            log.info("correct_fact.scalar_new_pref_name_registered",
+                                    entity=subject_uuid,
+                                    new_name=new_value)
+                        except Exception as e:
+                            log.error("correct_fact.scalar_pref_name_registration_failed",
+                                    error=str(e), entity=subject_uuid, new_name=new_value)
+                            raise
 
                 else:
-                    # Standard scalar update: entity_attributes table
-                    # Determine new value type (int, float, date, or text)
-                    value_int = None
-                    value_float = None
-                    value_date = None
-                    value_text = new_value
+                    # RETRACTION: Delete scalar attribute
+                    if is_retraction:
+                        cur.execute("""
+                            DELETE FROM entity_attributes
+                            WHERE user_id = %s AND entity_id = %s AND attribute = %s
+                        """, (req.user_id, subject_uuid, old_rel_type))
+                        log.info("correct_fact.scalar_retraction_deleted",
+                                entity=subject_uuid,
+                                attribute=old_rel_type)
+                    else:
+                        # CORRECTION: Standard scalar update: entity_attributes table
+                        # Determine new value type (int, float, date, or text)
+                        value_int = None
+                        value_float = None
+                        value_date = None
+                        value_text = new_value
 
-                    try:
-                        value_int = int(new_value)
-                    except (ValueError, TypeError):
                         try:
-                            value_float = float(new_value)
+                            value_int = int(new_value)
                         except (ValueError, TypeError):
                             try:
-                                from datetime import datetime
-                                value_date = datetime.fromisoformat(new_value).date()
+                                value_float = float(new_value)
                             except (ValueError, TypeError):
-                                # Keep as text
-                                pass
+                                try:
+                                    from datetime import datetime
+                                    value_date = datetime.fromisoformat(new_value).date()
+                                except (ValueError, TypeError):
+                                    # Keep as text
+                                    pass
 
-                    # Surgical update: only update the target attribute for this entity
-                    cur.execute("""
-                        UPDATE entity_attributes
-                        SET value_text = %s, value_int = %s, value_float = %s, value_date = %s, updated_at = now()
-                        WHERE user_id = %s AND entity_id = %s AND attribute = %s
-                    """, (value_text, value_int, value_float, value_date, req.user_id, subject_uuid, old_rel_type))
+                        # Surgical update: only update the target attribute for this entity
+                        cur.execute("""
+                            UPDATE entity_attributes
+                            SET value_text = %s, value_int = %s, value_float = %s, value_date = %s, updated_at = now()
+                            WHERE user_id = %s AND entity_id = %s AND attribute = %s
+                        """, (value_text, value_int, value_float, value_date, req.user_id, subject_uuid, old_rel_type))
 
-                    log.info("correct_fact.scalar_updated",
-                            entity=subject_uuid,
-                            attribute=old_rel_type,
-                            old_value=old_value,
-                            new_value=new_value)
+                        log.info("correct_fact.scalar_updated",
+                                entity=subject_uuid,
+                                attribute=old_rel_type,
+                                old_value=old_value,
+                                new_value=new_value)
 
             # ═════════════════════════════════════════════════════════════════════════════
             # DIMENSION 2 & 3: RELATIONAL & HIERARCHICAL (facts table, symmetric/inverse)
@@ -9190,27 +9264,83 @@ def correct_fact(req: FactCorrectionRequest):
                         subject=subject_uuid,
                         rel_type=old_rel_type,
                         old_value=old_value,
-                        new_value=new_value)
+                        new_value=new_value,
+                        is_retraction=is_retraction)
 
-                # Verify old fact exists
-                cur.execute("""
-                    SELECT id, object_id FROM facts
-                    WHERE user_id = %s AND subject_id = %s AND rel_type = %s
-                      AND superseded_at IS NULL
-                    LIMIT 1
-                """, (req.user_id, subject_uuid, old_rel_type))
+                # Verify old fact exists (with 4-way match for retractions: forward/inverse, subject/object reversed)
+                old_fact_row = None
+                found_via = None
 
-                old_fact_row = cur.fetchone()
+                # For retractions, resolve object_value to UUID first (if provided)
+                object_uuid = None
+                if old_value:
+                    try:
+                        object_uuid = registry.resolve(old_value, req.user_id)
+                    except Exception as e:
+                        log.warning("correct_fact.object_resolution_failed",
+                                   old_value=old_value,
+                                   error=str(e))
+
+                # Try 4 combinations (forward/inverse × subject/object):
+                # 1. subject child_of object (direct)
+                if not old_fact_row and object_uuid:
+                    cur.execute("""
+                        SELECT id, object_id FROM facts
+                        WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s
+                          AND superseded_at IS NULL
+                        LIMIT 1
+                    """, (req.user_id, subject_uuid, object_uuid, old_rel_type))
+                    old_fact_row = cur.fetchone()
+                    if old_fact_row:
+                        found_via = f"direct({old_rel_type})"
+
+                # 2. object inverse_rel_type subject (inverse with swapped subject/object)
+                if not old_fact_row and object_uuid and is_retraction:
+                    inverse_rel_type = None
+                    if old_rel_type in _REL_TYPE_META:
+                        inverse_rel_type = _REL_TYPE_META[old_rel_type].get("inverse_rel_type")
+
+                    if inverse_rel_type:
+                        cur.execute("""
+                            SELECT id, object_id FROM facts
+                            WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s
+                              AND superseded_at IS NULL
+                            LIMIT 1
+                        """, (req.user_id, object_uuid, subject_uuid, inverse_rel_type))
+                        old_fact_row = cur.fetchone()
+                        if old_fact_row:
+                            found_via = f"inverse({inverse_rel_type})"
+                            # Swap for retraction: we'll supersede the inverse fact
+                            subject_uuid = object_uuid
+                            old_rel_type = inverse_rel_type
+
+                # 3. subject rel_type (no specific object, find any)
+                if not old_fact_row:
+                    cur.execute("""
+                        SELECT id, object_id FROM facts
+                        WHERE user_id = %s AND subject_id = %s AND rel_type = %s
+                          AND superseded_at IS NULL
+                        LIMIT 1
+                    """, (req.user_id, subject_uuid, old_rel_type))
+                    old_fact_row = cur.fetchone()
+                    if old_fact_row:
+                        found_via = f"subject_only({old_rel_type})"
+
                 if not old_fact_row:
                     log.warning("correct_fact.old_fact_not_found",
                                subject=subject_uuid,
                                rel_type=old_rel_type,
                                old_value=old_value,
-                               dimension=dimension)
+                               dimension=dimension,
+                               found_via=found_via)
                     return FactCorrectionResponse(
                         status="failed",
                         message=f"Old {dimension.lower()} fact not found: {old_rel_type}"
                     )
+
+                log.info("correct_fact.fact_located",
+                        found_via=found_via,
+                        rel_type=old_rel_type)
 
                 old_fact_id = old_fact_row[0]
                 old_fact_object_id = old_fact_row[1]
@@ -9224,46 +9354,56 @@ def correct_fact(req: FactCorrectionRequest):
                 """, (old_fact_id,))
                 log.info("correct_fact.old_fact_superseded",
                         fact_id=old_fact_id,
-                        rel_type=old_rel_type)
+                        rel_type=old_rel_type,
+                        is_retraction=is_retraction)
 
-                # Resolve new_value to entity UUID (case-insensitive)
-                new_value_uuid = registry.resolve(
-                    req.user_id,
-                    new_value.lower().strip()
-                )
+                # RETRACTION: Stop here (fact is superseded, no new fact created)
+                if is_retraction:
+                    log.info("correct_fact.retraction_complete",
+                            subject=subject_uuid,
+                            rel_type=old_rel_type,
+                            action=action)
+                    # Continue to commit after transaction
+                else:
+                    # CORRECTION: Create new fact with corrected value
+                    # Resolve new_value to entity UUID (case-insensitive)
+                    new_value_uuid = registry.resolve(
+                        new_value.lower().strip(),
+                        req.user_id
+                    )
 
-                # If rel_type changed, validate new rel_type metadata
-                if old_rel_type != new_rel_type:
+                    # If rel_type changed, validate new rel_type metadata
+                    if old_rel_type != new_rel_type:
+                        new_edges = [{
+                            "subject": subject_uuid,
+                            "object": new_value_uuid,
+                            "rel_type": new_rel_type
+                        }]
+                        gate.validate_edges(new_edges)
+                        log.info("correct_fact.new_rel_type_validated",
+                                new_rel_type=new_rel_type)
+
+                    # Create new fact (Class A, confidence 1.0)
                     new_edges = [{
                         "subject": subject_uuid,
                         "object": new_value_uuid,
                         "rel_type": new_rel_type
                     }]
-                    gate.validate_edges(new_edges)
-                    log.info("correct_fact.new_rel_type_validated",
-                            new_rel_type=new_rel_type)
 
-                # Create new fact (Class A, confidence 1.0)
-                new_edges = [{
-                    "subject": subject_uuid,
-                    "object": new_value_uuid,
-                    "rel_type": new_rel_type
-                }]
+                    committed = manager.commit_facts(
+                        cur,
+                        user_id=req.user_id,
+                        edges=new_edges,
+                        fact_class="A",
+                        confidence=1.0,
+                        provenance="user_correction"
+                    )
 
-                committed = manager.commit_facts(
-                    cur,
-                    user_id=req.user_id,
-                    edges=new_edges,
-                    fact_class="A",
-                    confidence=1.0,
-                    provenance="user_correction"
-                )
-
-                log.info("correct_fact.new_fact_committed",
-                        subject=subject_uuid,
-                        rel_type=new_rel_type,
-                        new_object=new_value_uuid,
-                        dimension=dimension)
+                    log.info("correct_fact.new_fact_committed",
+                            subject=subject_uuid,
+                            rel_type=new_rel_type,
+                            new_object=new_value_uuid,
+                            dimension=dimension)
 
             # ═════════════════════════════════════════════════════════════════════════════
             # DIMENSION 4: SUBJECT (fact about wrong entity)
@@ -9430,6 +9570,39 @@ def correct_fact(req: FactCorrectionRequest):
                         old_type=old_value,
                         new_type=new_value)
 
+            elif dimension == "ENTITY":
+                # ENTITY dimension: "forget aurora completely" → delete/remove entity
+                # For retractions: remove all facts about Aurora (all relationships + attributes)
+                # For corrections: not applicable
+                if is_retraction:
+                    log.info("correct_fact.dimension_entity_start",
+                            entity=subject_uuid,
+                            action="remove_all_facts")
+
+                    # Supersede ALL facts about this entity (subject or object)
+                    cur.execute("""
+                        UPDATE facts
+                        SET superseded_at = now(), qdrant_synced = false
+                        WHERE user_id = %s AND (subject_id = %s OR object_id = %s)
+                          AND superseded_at IS NULL
+                    """, (req.user_id, subject_uuid, subject_uuid))
+
+                    # Delete ALL attributes about this entity
+                    cur.execute("""
+                        DELETE FROM entity_attributes
+                        WHERE user_id = %s AND entity_id = %s
+                    """, (req.user_id, subject_uuid))
+
+                    log.info("correct_fact.entity_retraction_complete",
+                            entity=subject_uuid)
+                else:
+                    log.warning("correct_fact.entity_correction_invalid",
+                               entity=subject_uuid)
+                    return FactCorrectionResponse(
+                        status="rejected",
+                        message="Cannot correct an entire entity. Specify which fact about the entity needs correction."
+                    )
+
             else:
                 # Unknown dimension: reject with clear error
                 log.error("correct_fact.unknown_dimension",
@@ -9437,7 +9610,7 @@ def correct_fact(req: FactCorrectionRequest):
                          user_id=req.user_id)
                 return FactCorrectionResponse(
                     status="failed",
-                    message=f"Unknown dimension: {dimension}. Expected: SCALAR|RELATIONAL|HIERARCHICAL|SUBJECT|REL_TYPE|ENTITY_TYPE"
+                    message=f"Unknown dimension: {dimension}. Expected: SCALAR|RELATIONAL|HIERARCHICAL|SUBJECT|ENTITY"
                 )
 
             # Step: Track outcome (for learning loop) — applies to all dimensions
@@ -9449,21 +9622,20 @@ def correct_fact(req: FactCorrectionRequest):
 
             cur.execute("""
                 INSERT INTO retraction_outcomes (
-                    user_id, detected_pattern, extracted_subject,
-                    extracted_old_rel_type, extracted_new_rel_type,
-                    extracted_old_value, extracted_new_value,
-                    retraction_method, confidence, was_correct, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NOW())
+                    user_id, original_message, detected_as_retraction,
+                    extracted_subject, extracted_rel_type, extracted_old_value,
+                    retraction_method, detected_confidence, actually_retracted
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 req.user_id,
-                f"{dimension}:{old_rel_type}→{new_rel_type}",
+                req.text,
+                is_retraction,
                 subject_uuid,
                 old_rel_type,
-                new_rel_type,
                 old_value,
-                new_value,
                 f"surgical_{dimension.lower()}",
-                confidence
+                confidence,
+                True  # actually_retracted — we just did it in the transaction
             ))
 
             db.commit()
