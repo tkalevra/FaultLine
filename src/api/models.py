@@ -1,4 +1,5 @@
 from typing import Optional
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -35,12 +36,6 @@ class IngestRequest(BaseModel):
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution during extraction
     is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
     idempotency_key: Optional[str] = None  # Phase 2: Deduplicate retried requests via idempotency cache
-
-
-class QueryRequest(BaseModel):
-    text: str
-    source: Optional[str] = "openwebui"
-    user_id: Optional[str] = "anonymous"
 
 
 class EntityResult(BaseModel):
@@ -152,4 +147,42 @@ class FactCorrectionResponse(BaseModel):
     facts_superseded: int = 0
     hierarchies_modified: list[str] = []
     message: Optional[str] = None
+    error: Optional[str] = None
+
+
+# Phase 1: Query Redesign Models
+class ConversationMessage(BaseModel):
+    """Single message in conversation history."""
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: Optional[datetime] = None
+
+
+class QueryPath(BaseModel):
+    """Determines which database paths to query based on keywords."""
+    scalar_rels: list[str] = []
+    relationship_rels: list[str] = []
+    taxonomy_groups: list[str] = []
+    traversal_depth: int = 1
+    fetch_all_details: bool = False
+
+
+class QueryRequest(BaseModel):
+    """Updated QueryRequest with conversation history for Phase 1."""
+    text: str
+    source: Optional[str] = "openwebui"
+    user_id: Optional[str] = "anonymous"
+    conversation_history: Optional[list[ConversationMessage]] = None
+    known_entities: Optional[dict[str, str]] = None  # {name: uuid}
+
+
+class QueryResponse(BaseModel):
+    """Response from /query endpoint."""
+    anchor: str  # UUID or user_id of grounding entity
+    facts: list[dict] = []  # Structured facts with metadata (definition contains prose)
+    preferred_names: dict = {}  # UUID → display name mapping for Filter's UUID resolution
+    canonical_identity: Optional[str] = None  # Same as anchor, for backward compatibility
+    attributes: dict = {}  # entity_id → {attr: value} mapping for attributes
+    confidence_applied: bool = True
+    staged_facts_count: int = 0  # Class C facts included
     error: Optional[str] = None
