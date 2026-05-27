@@ -87,6 +87,58 @@ def _initialize_redis_client(redis_url: str = None):
 # Persistent HTTP client for pooled connections (avoid socket churn from new client per request)
 _http_client: httpx.AsyncClient = None
 
+def _parse_response_json_robust(response_text: str, context: str = "") -> dict | list | None:
+    """
+    Robustly parse JSON from HTTP response, handling dBug-016 corrupted responses.
+
+    dBug-016: OpenWebUI sometimes returns corrupted JSON (truncated, malformed).
+    This function attempts multiple strategies to extract valid JSON:
+
+    1. Direct JSON parse (handles normal case)
+    2. Streaming response detection (LLM uses server-sent events, incomplete in dBug-016)
+    3. Fallback to empty dict/list (graceful degradation)
+
+    Args:
+        response_text: Raw response body
+        context: Brief description for logging (e.g., "extraction_result", "intent_classification")
+
+    Returns:
+        Parsed JSON (dict or list), or None on failure
+    """
+    if not response_text or not isinstance(response_text, str):
+        if context:
+            print(f"[FaultLine Filter] JSON parse SKIP: empty response ({context})", file=sys.stderr)
+        return None
+
+    try:
+        # Case 1: Normal response — direct JSON parse
+        return json.loads(response_text)
+    except json.JSONDecodeError as e:
+        # Case 2: Streaming response (server-sent events)
+        # Format: data: {...}\ndata: {...}\n
+        # dBug-016 truncates at last newline, leaving incomplete data
+        if response_text.startswith("data: "):
+            try:
+                lines = response_text.strip().split("\n")
+                for line in reversed(lines):  # Try last line first (most complete)
+                    if line.startswith("data: "):
+                        chunk = line[6:].strip()  # Remove "data: " prefix
+                        if chunk and chunk != "[DONE]":
+                            parsed = json.loads(chunk)
+                            if isinstance(parsed, dict) and "choices" in parsed:
+                                if context:
+                                    print(f"[FaultLine Filter] JSON parse RECOVERED: streaming format ({context})", file=sys.stderr)
+                                return parsed
+            except json.JSONDecodeError:
+                pass  # Fall through to graceful degradation
+
+        # Case 3: All parsing failed — log and return None
+        if context:
+            print(f"[FaultLine Filter] JSON parse FAILED ({context}): {str(e)[:100]}", file=sys.stderr)
+            print(f"[FaultLine Filter]   Response preview: {response_text[:200]}", file=sys.stderr)
+
+    return None
+
 async def _initialize_http_client():
     """Initialize persistent HTTP client for reuse across requests."""
     global _http_client
@@ -173,7 +225,10 @@ async def _detect_implicit_correction(text: str, faultline_url: str, user_id: st
         if resp.status_code != 200:
             return False, None
 
-        result = resp.json()
+        result = _parse_response_json_robust(resp.text, "correction_pattern")
+        if not isinstance(result, dict):
+            return False, None
+
         pattern = result.get("pattern")
         confidence = result.get("confidence", 0.0)
 
@@ -717,7 +772,10 @@ async def _call_extract_rewrite(
             )
 
             if response.status_code == 200:
-                data = response.json()
+                data = _parse_response_json_robust(response.text, "extract_rewrite")
+                if not isinstance(data, dict):
+                    return [], 0.0
+
                 triples = data.get("edges", [])
 
                 # Compute confidence signal = average of all triple confidences
@@ -905,7 +963,7 @@ RELATIONSHIP RULES:
 - NEVER emit child_of with the speaker as subject. Use parent_of instead.
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
-- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my spouse's name is <spouse>" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
+- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
 - BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, alice), you MUST also emit (alice, child_of, user). If you emit (user, spouse, emma), you MUST also emit (emma, spouse, user). If you emit (alice, sibling_of, charlie), you MUST also emit (charlie, sibling_of, alice). Example: "I have a son named alice, my husband emma" → (user, parent_of, alice) + (alice, child_of, user) + (user, spouse, emma) + (emma, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
@@ -1035,7 +1093,10 @@ async def _classify_intent_via_backend(faultline_url: str, text: str, user_id: s
         )
 
         if resp.status_code == 200:
-            result = resp.json()
+            result = _parse_response_json_robust(resp.text, "intent_classify")
+            if not isinstance(result, dict):
+                return {"intent": "STATEMENT", "confidence": 0.0}
+
             intent = result.get("intent", "STATEMENT")
             confidence = float(result.get("confidence", 0.0))
             print(f"[FaultLine Filter] intent_classify_response: intent={intent} confidence={confidence:.3f} | full_response={result}", flush=True)
@@ -1085,8 +1146,8 @@ async def _query_negation_patterns(faultline_url: str, text: str, user_id: str, 
         )
 
         if resp.status_code == 200:
-            result = resp.json()
-            if result:
+            result = _parse_response_json_robust(resp.text, "negation_patterns")
+            if isinstance(result, dict) and result:
                 if debug:
                     print(f"[FaultLine Filter] negation_patterns_match: type={result.get('negation_type')} "
                           f"confidence={result.get('confidence', 0.0):.2f}")
@@ -1130,7 +1191,11 @@ async def _get_confidence_gate(faultline_url: str, user_id: str, debug: bool = F
         )
 
         if resp.status_code == 200:
-            data = resp.json()
+            data = _parse_response_json_robust(resp.text, "confidence_gate")
+            if not isinstance(data, dict):
+                _CONFIDENCE_GATES_CACHE[user_id] = 0.70
+                return 0.70
+
             gate = float(data.get("threshold", 0.70))
             _CONFIDENCE_GATES_CACHE[user_id] = gate
             if debug:
@@ -1188,7 +1253,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 falls back to simple formatting.
 
                 Example outputs:
-                - "<spouse> is your spouse (Class A, confidence 1.0)"
+                - "Marla is your spouse (Class A, confidence 1.0)"
                 - "You are the parent of alice (Class B, awaiting confirmation)"
                 - "You are 12 years old (Class A)"
                 """
@@ -1293,11 +1358,21 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 headers=headers,
             )
             response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"].strip()
-            triples = json.loads(content)
-            if not isinstance(triples, list):
+            resp_data = _parse_response_json_robust(response.text, "llm_extraction")
+            if not isinstance(resp_data, dict) or "choices" not in resp_data:
                 return []
-            return triples
+
+            content = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not content:
+                return []
+
+            try:
+                triples = json.loads(content)
+                if not isinstance(triples, list):
+                    return []
+                return triples
+            except json.JSONDecodeError:
+                return []
     except ValueError as e:
         # Configuration error: always print (not debug-only) to be visible to user
         print(f"\n{'='*80}")
@@ -1848,7 +1923,10 @@ class Filter:
                 timeout=self.valves.FAULTLINE_TIMEOUT_SECS,
             )
             response.raise_for_status()
-            data = response.json()
+            data = _parse_response_json_robust(response.text, "ingest")
+            if not isinstance(data, dict):
+                return {"status": "error", "detail": "JSON parsing failed"}
+
             # Invalidate query cache on successful ingest (growth mindset: fresh data on writes)
             if data.get("status") not in ("error", None):
                 _SESSION_MEMORY_CACHE.pop(user_id, None)
@@ -1901,7 +1979,9 @@ class Filter:
                     json={"text": text, "source": "preflight", "user_id": user_id},
                 )
             if resp.status_code == 200:
-                return resp.json().get("entities", [])
+                data = _parse_response_json_robust(resp.text, "fetch_entities")
+                if isinstance(data, dict):
+                    return data.get("entities", [])
         except Exception:
             pass
         return []
@@ -1967,7 +2047,10 @@ Return valid JSON only. If no facts, return [].
                 )
                 resp.raise_for_status()
 
-            result = resp.json()
+            result = _parse_response_json_robust(resp.text, "extract_triples_openwebui")
+            if not isinstance(result, dict) or "choices" not in result:
+                return []
+
             content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
             if not content:
@@ -2185,7 +2268,10 @@ Return valid JSON only. If no facts, return [].
                     timeout=5,
                 )
                 resp.raise_for_status()
-                data = resp.json()
+                data = _parse_response_json_robust(resp.text, "fetch_recent_facts")
+                if not isinstance(data, dict):
+                    return []
+
                 facts = data.get("facts", [])[:limit]
                 return facts
         except Exception as e:
@@ -2310,7 +2396,10 @@ GRANULAR EXAMPLES (using recent facts context):
                 )
                 resp.raise_for_status()
 
-            result = resp.json()
+            result = _parse_response_json_robust(resp.text, "extract_retraction_openwebui")
+            if not isinstance(result, dict) or "choices" not in result:
+                return {}
+
             content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
             if not content:
@@ -2382,7 +2471,10 @@ GRANULAR EXAMPLES (using recent facts context):
                         timeout=self.valves.FAULTLINE_TIMEOUT_SECS
                     )
                     resp.raise_for_status()
-                    result = resp.json()
+                    result = _parse_response_json_robust(resp.text, "retract_correct")
+                    if not isinstance(result, dict):
+                        return {"status": "error", "detail": "JSON parsing failed"}
+
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] /retract/correct success: status={result.get('status')} "
                               f"subject={result.get('subject_uuid')[:8] if result.get('subject_uuid') else 'none'}")
@@ -2425,7 +2517,10 @@ GRANULAR EXAMPLES (using recent facts context):
                     timeout=self.valves.FAULTLINE_TIMEOUT_SECS
                 )
                 resp.raise_for_status()
-                result = resp.json()
+                result = _parse_response_json_robust(resp.text, "retract_fallback")
+                if not isinstance(result, dict):
+                    return {"status": "error", "detail": "JSON parsing failed"}
+
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] /retract fallback: status={result.get('status')}")
                 # Invalidate query cache on successful retraction (growth mindset: fresh data on writes)
@@ -2491,7 +2586,10 @@ GRANULAR EXAMPLES (using recent facts context):
                 timeout=5.0  # Should be <50ms, allow 5s for latency
             )
             resp.raise_for_status()
-            result = resp.json()
+            result = _parse_response_json_robust(resp.text, "classify_message_intent")
+            if not isinstance(result, dict):
+                return ("STATEMENT", 0.0)
+
             intent = result.get("intent", "STATEMENT")
             confidence = float(result.get("confidence", 0.0))
 
@@ -3153,23 +3251,49 @@ GRANULAR EXAMPLES (using recent facts context):
                                 print(f"[FaultLine Filter] /query status={resp.status_code}")
 
                             if resp.status_code == 200:
-                                data = resp.json()
-                                facts = data.get("facts", [])
-                                preferred_names = data.get("preferred_names", {})
-                                canonical_identity = data.get("canonical_identity")
-                                entity_attributes = data.get("attributes", {})
+                                data = _parse_response_json_robust(resp.text, "inlet_query")
+                                if not isinstance(data, dict):
+                                    # Parse failed or returned None — use safe defaults
+                                    facts = []
+                                    preferred_names = {}
+                                    canonical_identity = None
+                                    entity_attributes = {}
+                                    raw_facts_for_extraction = []
+                                    anchor = None
+                                else:
+                                    # Support both old (prose-only) and new (structured) response formats
+                                    facts = data.get("facts", [])
+                                    preferred_names = data.get("preferred_names", {})
+                                    canonical_identity = data.get("canonical_identity")
+                                    entity_attributes = data.get("attributes", {})
+                                    anchor = data.get("anchor")
+
+                                    # Backward compatibility: if facts are strings (prose-only format),
+                                    # convert to simple dict wrappers so Filter code still works
+                                    if facts and isinstance(facts[0], str):
+                                        # Old format: facts are prose strings only
+                                        # Convert to minimal dicts for backward compatibility
+                                        facts = [{"definition": f} for f in facts]
+
+                                    raw_facts_for_extraction = list(facts)
 
                                 # Cache response for future reads (growth mindset)
-                                _cache_query_response(redis_client, query_cache_key, data)
-                                if self.valves.ENABLE_DEBUG:
-                                    print(f"[FaultLine Filter] /query cached in Redis (30s TTL)")
+                                if isinstance(data, dict):
+                                    _cache_query_response(redis_client, query_cache_key, data)
+                                    if self.valves.ENABLE_DEBUG:
+                                        print(f"[FaultLine Filter] /query cached in Redis (30s TTL)")
 
                                 # Store raw unfiltered facts in memory cache too
                                 _SESSION_MEMORY_CACHE[user_id] = (
                                     _time.time(), facts, preferred_names, canonical_identity, entity_attributes
                                 )
-
-                            raw_facts_for_extraction = list(facts)
+                            else:
+                                # Non-200 status — use safe defaults
+                                facts = []
+                                preferred_names = {}
+                                canonical_identity = None
+                                entity_attributes = {}
+                                raw_facts_for_extraction = []
 
                             # Filtering happens after cache store, not before
                             facts = self._filter_relevant_facts(
@@ -3471,6 +3595,10 @@ GRANULAR EXAMPLES (using recent facts context):
         except Exception as e:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] inlet error: {type(e).__name__}: {e}")
+
+        # dBug-016 fix: Ensure chat_id is never None (OpenWebUI crashes on None.startswith())
+        if body.get("chat_id") is None:
+            body["chat_id"] = user_id
 
         # NUCLEAR OPTION: redact any UUID patterns from all messages before
         # returning to OpenWebUI. Catches UUIDs from ANY source: OpenWebUI

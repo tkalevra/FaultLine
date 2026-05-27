@@ -5,10 +5,70 @@ Store validated facts through the FaultLine WGM pipeline with user-facing status
 
 import json
 import os
+import re
 from typing import Callable, Optional
 
 import httpx
 from pydantic import BaseModel
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUNCTION: Parse LLM Response Robustly (dBug-016 Handling)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_response_robust(response) -> dict:
+    """
+    Parse FaultLine backend HTTP response robustly, handling dBug-016 corruption.
+
+    Attempts three strategies:
+    1. Standard JSON parsing (happy path)
+    2. Line-delimited JSON (streaming format)
+    3. Regex extraction from corrupted JSON (dBug-016 case)
+
+    Args:
+        response: httpx.Response object
+
+    Returns:
+        dict: Parsed response, or {} on failure
+    """
+    try:
+        # Strategy 1: Standard JSON parsing
+        result = response.json()
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Line-delimited JSON
+    try:
+        lines = response.text.strip().split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    # Strategy 3: Regex extraction (dBug-016 corruption case)
+    try:
+        text = response.text
+        matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
+        for match in matches:
+            try:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    return {}
 
 
 _TRIPLE_SYSTEM_PROMPT = """\
@@ -19,7 +79,7 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "<entity>, who prefers to be called <alias>", the subject is "<entity>" not "i".
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called emma", the subject is "marla" not "i".
 - For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being alicecribed, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
@@ -329,9 +389,9 @@ class Function:
             await self._emit(__event_emitter__, error_msg)
             return error_msg
 
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
+        # Parse response robustly (handles dBug-016 corruption)
+        data = _parse_response_robust(response)
+        if not data:
             error_msg = f"[FaultLine] Invalid JSON response: {response.text[:200]}"
             await self._emit(__event_emitter__, error_msg)
             return error_msg
