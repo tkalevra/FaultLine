@@ -1,35 +1,47 @@
-#!/usr/bin/env sh
+#!/bin/bash
 set -e
 
-echo "[entrypoint] Waiting for PostgreSQL..."
-until pg_isready -d "$POSTGRES_DSN" -q; do
+# Wait for PostgreSQL
+echo "Waiting for PostgreSQL..."
+POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+POSTGRES_PORT=${POSTGRES_PORT:-5432}
+MAX_ATTEMPTS=30
+ATTEMPT=0
+
+until [ $ATTEMPT -ge $MAX_ATTEMPTS ]; do
+  if timeout 2 bash -c "echo > /dev/tcp/$POSTGRES_HOST/$POSTGRES_PORT" 2>/dev/null; then
+    echo "PostgreSQL is up"
+    break
+  fi
+  ATTEMPT=$((ATTEMPT + 1))
+  echo "PostgreSQL is unavailable (attempt $ATTEMPT/$MAX_ATTEMPTS) - sleeping"
   sleep 1
 done
 
-echo "[entrypoint] Running migrations..."
-for migration in $(ls /app/migrations/*.sql | sort); do
-    echo "[entrypoint] Applying $migration..."
-    if ! psql "$POSTGRES_DSN" --set ON_ERROR_STOP=on -f "$migration"; then
-        echo "[entrypoint] WARNING: $migration had errors (may already be applied) — continuing"
-    fi
-done
-echo "[entrypoint] Migrations complete."
-
-echo "[entrypoint] Starting re_embedder service (background)..."
-# Export environment variables for subprocess (subshell inherits parent's env but explicit export ensures propagation)
-export POSTGRES_DSN QDRANT_URL QDRANT_COLLECTION QWEN_API_URL OPENWEBUI_URL REEMBED_INTERVAL QDRANT_SYNC_CONFIDENCE_THRESHOLD
-export PYTHONPATH=/app PYTHONUNBUFFERED=1
-
-# Launch re_embedder with redirected output to aide debugging
-python -m src.re_embedder.embedder > /tmp/re_embedder.log 2>&1 &
-REEMBED_PID=$!
-echo "[entrypoint] Re-embedder PID: $REEMBED_PID"
-sleep 2
-if ! kill -0 $REEMBED_PID 2>/dev/null; then
-    echo "[entrypoint] ERROR: Re-embedder process died immediately. Check /tmp/re_embedder.log:"
-    head -30 /tmp/re_embedder.log || echo "Log file not readable"
-    exit 1
+if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+  echo "Failed to connect to PostgreSQL after $MAX_ATTEMPTS attempts"
+  exit 1
 fi
 
-echo "[entrypoint] Starting FaultLine WGM service (foreground)..."
-exec uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+# Run migrations
+echo "Running migrations..."
+for migration in /app/migrations/*.sql; do
+  echo "Applying $migration..."
+  psql "${POSTGRES_DSN}" -f "$migration" || true  # Ignore errors for idempotency
+done
+
+echo "Migrations complete"
+
+# Start the FastAPI app
+echo "Starting FaultLine backend..."
+uvicorn src.api.main:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --log-level info &
+
+# Start the re-embedder background task
+echo "Starting re-embedder..."
+python -m src.re_embedder.embedder &
+
+# Wait for all background processes
+wait

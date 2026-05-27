@@ -133,6 +133,83 @@ class CircuitBreakerState:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# FUNCTION: Parse LLM Response Robustly (dBug-016 Handling)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_llm_response_robust(response) -> dict:
+    """
+    Parse LLM HTTP response robustly, handling dBug-016 corruption.
+
+    OpenWebUI sometimes returns HTTP 200 with malformed JSON due to dBug-016
+    (NoneType crash on missing chat_id). This parser attempts three strategies:
+
+    1. Standard JSON parsing (happy path)
+    2. Line-delimited JSON (streaming format)
+    3. Regex extraction from corrupted JSON (dBug-016 case)
+
+    All three extraction methods validate for "choices" key to ensure we extract
+    actual LLM response object, not unrelated JSON fragments.
+
+    Args:
+        response: httpx.Response object from LLM endpoint
+
+    Returns:
+        dict: Parsed response with "choices" key, or {} on failure
+    """
+    try:
+        # Strategy 1: Standard JSON parsing (most common)
+        result = response.json()
+        if isinstance(result, dict) and "choices" in result:
+            return result
+    except json.JSONDecodeError:
+        log.debug("parse_llm_response.json_decode_failed")
+
+    # Strategy 2: Line-delimited JSON (streaming format)
+    # Some LLM endpoints return one JSON object per line
+    try:
+        lines = response.text.strip().split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict) and "choices" in parsed:
+                    log.debug("parse_llm_response.recovered_line_delimited")
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    # Strategy 3: Regex extraction (dBug-016 corruption case)
+    # Extract first valid JSON object containing "choices" key
+    try:
+        import re
+        # Match JSON object patterns { ... }
+        # Search for patterns that contain "choices" to avoid extracting garbage
+        text = response.text
+
+        # Find all potential JSON objects
+        matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
+        for match in matches:
+            try:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, dict) and "choices" in parsed:
+                    log.debug("parse_llm_response.recovered_regex_extraction")
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+
+    # All strategies failed
+    log.warning("parse_llm_response.all_strategies_failed",
+               response_text_preview=response.text[:300],
+               response_status=response.status_code)
+    return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLASS: LLMTimeouts
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -386,10 +463,17 @@ def call_llm_with_retry_sync(
                         elapsed_seconds=round(elapsed, 2),
                         endpoint_index=endpoint_idx)
 
-                # Success — reset circuit breaker and parse response
+                # Success — reset circuit breaker and parse response robustly (dBug-016)
                 _llm_circuit_breaker.record_success()
 
-                result = response.json()
+                result = _parse_llm_response_robust(response)
+                if not result:
+                    log.warning("llm_call.response_parse_failed",
+                               user_id=user_id,
+                               operation=operation,
+                               endpoint_index=endpoint_idx)
+                    continue
+
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
                 if not content:
@@ -538,10 +622,17 @@ async def call_llm_with_retry_async(
                         elapsed_seconds=round(elapsed, 2),
                         endpoint_index=endpoint_idx)
 
-                # Success — reset circuit breaker
+                # Success — reset circuit breaker and parse response robustly (dBug-016)
                 _llm_circuit_breaker.record_success()
 
-                result = response.json()
+                result = _parse_llm_response_robust(response)
+                if not result:
+                    log.warning("llm_call_async.response_parse_failed",
+                               user_id=user_id,
+                               operation=operation,
+                               endpoint_index=endpoint_idx)
+                    continue
+
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
                 if not content:
@@ -688,7 +779,13 @@ def call_llm_no_retry_sync(
                 operation=operation,
                 elapsed_seconds=round(elapsed, 2))
 
-        result = response.json()
+        result = _parse_llm_response_robust(response)
+        if not result:
+            log.warning("llm_call_no_retry.response_parse_failed",
+                       user_id=user_id,
+                       operation=operation)
+            return None
+
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
         if not content:
