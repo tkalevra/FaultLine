@@ -265,28 +265,19 @@ class EntityRegistry:
     def get_preferred_name(self, user_id: str, canonical: str) -> str:
         """Return preferred display name for entity, or canonical if none set.
 
-        Skips:
-        - Self-referential aliases where alias == entity_id (useless entries)
-        - UUID aliases (never valid display names, must be human-readable strings)
+        DUMB EXTRACT LAYER: Returns whatever is in the database without validation.
+        The /query layer (_populate_preferred_names in main.py) is responsible for
+        filtering bad data. Do not add validation here — validate on READ, not WRITE.
         """
-        import re
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
                 "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
-                "ORDER BY alias DESC "
-                "LIMIT 10",
+                "LIMIT 1",
                 (user_id, canonical),
             )
-            _UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
-            for row in cur.fetchall():
-                alias = row[0]
-                # Skip self-referential and UUID aliases
-                if alias != canonical and not _UUID_PATTERN.match(alias):
-                    return alias
-            # Fallback to canonical if no valid alias found.
-            # Callers must handle UUID fallback (e.g., _clean_preferred_names).
-            return canonical
+            row = cur.fetchone()
+            return row[0] if row else canonical
 
     def get_any_alias(self, user_id: str, entity_id: str) -> str | None:
         """Return first available alias for an entity (preferred or not).
