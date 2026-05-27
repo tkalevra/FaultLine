@@ -21,7 +21,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse
+from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, ConversationMessage, QueryPath, QueryResponse
 from .llm_client import get_llm_headers, build_llm_payload
 from .llm_calls import call_llm_with_retry_sync, LLMTimeouts
 from .idempotency import IdempotencyManager
@@ -903,8 +903,8 @@ def enforce_directionality(
     Enforce rel_type directionality rules. Correct asymmetric rels to canonical direction.
 
     Examples:
-    - User says "<child> is parent of me" → invert to "I am parent of <child>" (parent_of canonical)
-    - User says "<spouse> is spouse of me" → store as-is (bidirectional, no correction needed)
+    - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
+    - User says "Marla is spouse of me" → store as-is (bidirectional, no correction needed)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
     """
@@ -3481,7 +3481,7 @@ RULES:
    - dimension = HIERARCHICAL
    - rel_type = the hierarchy rel (instance_of, member_of, part_of)
    - object = the type/class being removed
-   - Example: "<pet> is not a <animal_type>" → rel_type="instance_of", object="bunny"
+   - Example: "Spot is not a bunny" → rel_type="instance_of", object="bunny"
 
 4. ENTITY (alias removal):
    - dimension = ENTITY
@@ -4117,6 +4117,46 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
             confidence = 0.5  # Unknown confidence
 
         print(f"[/classify-intent] Parsed: intent={intent} | confidence={confidence:.3f} | type={type(intent_result)}", flush=True)
+
+        # WIRE #1: Query negation_patterns for DB-learned overrides (dprompt-144 Layer 2)
+        # If text contains known negation pattern, override GLiNER2 if needed
+        try:
+            text_lower = text.lower()
+            dsn = os.getenv("POSTGRES_DSN")
+            if dsn:
+                with psycopg2.connect(dsn) as conn:
+                    with conn.cursor() as cur:
+                        # Query both user-specific AND global linguistic patterns
+                        cur.execute("""
+                            SELECT pattern_text, negation_type, confidence
+                            FROM negation_patterns
+                            WHERE (user_id = %s OR user_id = '00000000-0000-0000-0000-000000000000'::uuid)
+                            AND confidence >= 0.8
+                            ORDER BY
+                              CASE WHEN user_id = %s THEN 0 ELSE 1 END,  -- User patterns first
+                              confidence DESC
+                            LIMIT 50
+                        """, (user_id, user_id))
+
+                        patterns = cur.fetchall()
+
+                if patterns:
+                    for pattern_text, pattern_intent, pattern_conf in patterns:
+                        if pattern_text and pattern_text.lower() in text_lower:
+                            # Pattern matched — override GLiNER2 if pattern confidence is high enough
+                            if pattern_conf >= 0.8:
+                                intent = pattern_intent.upper()
+                                confidence = pattern_conf
+                                print(f"[/classify-intent] negation_pattern_HIT: pattern='{pattern_text}' → intent={intent} confidence={confidence:.2f}", flush=True)
+                                log.info("classify_intent.negation_pattern_override",
+                                       original_intent=intent_result,
+                                       override_intent=intent,
+                                       pattern_text=pattern_text,
+                                       pattern_confidence=pattern_conf)
+                                break
+        except Exception as e:
+            log.warning("classify_intent.negation_pattern_query_failed", error=str(e))
+            # Continue with GLiNER2 result on DB error — non-blocking
 
         # Log intent (no text, no user_id, just decision)
         log.debug("classify_intent.result", intent=intent, confidence=round(confidence, 2))
@@ -4835,7 +4875,8 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                                 ner_result = gliner_model.extract_entities(
                                     req.text,
                                     gliner_labels,
-                                    threshold=0.3
+                                    threshold=0.3,
+                                    max_len=2048
                                 )
                                 for entity_type, entity_names in ner_result.get("entities", {}).items():
                                     if entity_names:
@@ -4862,7 +4903,8 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                                     ner_result = gliner_model.extract_entities(
                                         req.text,
                                         default_entity_types,  # FIXED: Provide non-empty default types
-                                        threshold=0.25
+                                        threshold=0.25,
+                                        max_len=2048
                                     )
                                     for entity_type, entity_names in ner_result.get("entities", {}).items():
                                         if entity_names and entity_type:
@@ -5355,6 +5397,37 @@ def _extract_prerequisites_from_text(
     return prerequisites
 
 
+def _extract_negation_patterns_from_text(text: str) -> list[str]:
+    """
+    Extract negation signals from text.
+    Returns list of matched pattern strings.
+    Used for learning via negation_pattern_novel events.
+
+    Patterns are METADATA-DRIVEN in negation_patterns table.
+    This is BOOTSTRAP extraction for the first occurrence.
+    """
+    import re
+
+    text_lower = text.lower()
+    patterns = [
+        r'\b(forget|delete|remove|erase)\b',
+        r'\b(no longer|not anymore|never)\b',
+        r'\b(was|changed from)\b',
+        r'\bnot\s+(my|a|an|the)\b',  # Catches "is not a person", "is not a computer"
+        r'\b(actually|really|i meant|i meant to say)\b',
+        r'\b(wrong|incorrect|mistake|typo)\b',
+        r'\b(not\s+\w+\s+but|instead\s+of)\b',
+    ]
+
+    matched = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text_lower)
+        if matches:
+            matched.extend(matches)
+
+    return matched
+
+
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -5429,7 +5502,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 try:
                     ner_result = model.extract_entities(
                         req.text,
-                        ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
+                        ["Person", "Animal", "Organization", "Location", "Object", "Concept"],
+                        max_len=2048
                     )
                     for entity_type, entity_names in ner_result.get("entities", {}).items():
                         if entity_names and isinstance(entity_names, list):
@@ -5467,7 +5541,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     gliner_relations = model.extract_relations(
                         req.text,
                         relation_types={},  # Zero-shot mode: empty dict discovers any relationships
-                        threshold=0.5
+                        threshold=0.5,
+                        max_len=2048
                     )
                     log.debug("ingest.gliner2_raw_output",
                              relations=gliner_relations,
@@ -6489,7 +6564,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                             if match:
                                 relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                                entity_name = match.group(2).lower()  # alice, Sophia, <pet>, etc.
+                                entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
 
                                 # Resolve the mentioned entity to its canonical ID
                                 resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -7033,6 +7108,37 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         if decision == "supersede_new":
                             log.info("ingest.conflict_superseded",
                                      rel_type=_rel, subject=_subj, object=_obj, reason=reason)
+
+                            # WIRE #2: Enqueue negation pattern learning event (dprompt-144 growth loop)
+                            # When a fact is rejected due to semantic conflict, extract patterns from text
+                            # so re_embedder can learn them for future intent classification
+                            try:
+                                negation_signals = _extract_negation_patterns_from_text(req.text)
+                                if negation_signals:
+                                    import hashlib
+                                    for signal in negation_signals:
+                                        pattern_hash = hashlib.sha256(signal.encode()).hexdigest()[:16]
+                                        try:
+                                            asyncio.create_task(_enqueue_reembedder_event(
+                                                event_type="negation_pattern_novel",
+                                                user_id=req.user_id,
+                                                data={
+                                                    "pattern_hash": pattern_hash,
+                                                    "pattern_text": signal,
+                                                    "confidence": 0.85  # High confidence: conflict-triggered learning
+                                                },
+                                                priority="normal"
+                                            ))
+                                            log.info(f"ingest.negation_pattern_enqueued_on_conflict",
+                                                    signal=signal,
+                                                    pattern_hash=pattern_hash,
+                                                    user_id=req.user_id[:8],
+                                                    conflicted_rel_type=_rel)
+                                        except Exception as e:
+                                            log.debug(f"ingest.negation_pattern_enqueue_failed signal={signal}: {e}")
+                            except Exception as e:
+                                log.debug(f"ingest.negation_extraction_error: {e}")
+
                             conflict_count += 1
                             continue  # skip this fact — it's semantically invalid
                         conflict_free_rows.append(row)
@@ -7737,1451 +7843,1122 @@ def _determine_query_scope(db, query_text: str, user_id: str) -> set[str]:
 
     return detected_taxonomies
 
-@app.post("/query")
-def query(request: QueryRequest):
-    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-    qwen_api_url = _configured_llm_url()
-    user_id = request.user_id or "anonymous"
-    collection = derive_collection(user_id)
 
-    preferred_names = {}
-    canonical_identity = None
-    baseline_facts = []
-    attributes = {}
-    resolved_entity_ids = set()  # Track entities resolved in entity_resolution block
-    user_surrogate = user_id  # OWUI UUID IS the surrogate — always
-    db = None
-    registry = None
-    def _fetch_user_facts(
-        db_conn,
-        user_id: str,
-        entity_id: str = None,
-        rel_types: tuple[str, ...] = None,
-        taxonomies: set[str] = None,
-    ) -> list[dict]:
-        """
-        Fetch facts from BOTH facts and staged_facts tables.
-        Uses two separate queries (not UNION) to avoid parameter binding
-        issues with psycopg2 shared params across multiple SELECTs.
-        Attaches fact_state metadata so the Filter can distinguish
-        long-term (authoritative) from staged (provisional) facts.
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 1: QUERY REDESIGN - Anchor Resolution & Path Selection
+# ──────────────────────────────────────────────────────────────────────────────
 
-        taxonomies: Optional set of taxonomy names to filter by (e.g., {'family', 'work'}).
-                   When provided, only returns facts whose taxonomies overlap with this set.
+def _infer_gender_from_name(name: str) -> str:
+    """
+    Quick heuristic to infer gender from name endings.
+    Female-typical endings: a, e, y, ah
+    Otherwise: unknown
+    """
+    if not name:
+        return "unknown"
+    name_lower = name.lower()
+    female_endings = ("a", "e", "y", "ah")
+    if name_lower.endswith(female_endings):
+        return "female"
+    return "unknown"
 
-        Returns list of {subject, object, rel_type, provenance, confidence,
-                          category, fact_state, fact_class, is_preferred_label,
-                          staged_confirmations, promoted_at, expires_at} dicts.
-        """
-        results = []
-        try:
-            with db_conn.cursor() as cur:
-                # --- Build base conditions (all qualified with table alias for JOIN safety) ---
-                f_conds = ["f.user_id = %s", "f.superseded_at IS NULL",
-                           "f.hard_delete_flag = false",
-                           "(f.valid_until IS NULL OR f.valid_until > now())"]
-                s_conds = ["s.user_id = %s", "s.expires_at > now()",
-                           "s.promoted_at IS NULL",
-                           "(s.fact_class = 'A' OR s.fact_class = 'B')"]
 
-                if rel_types:
-                    ph = ",".join(["%s"] * len(rel_types))
-                    f_conds.append(f"f.rel_type IN ({ph})")
-                    s_conds.append(f"s.rel_type IN ({ph})")
+def _extract_entity_references(text: str) -> list[dict]:
+    """
+    Extract potential entity references from text.
+    Returns list of dicts with 'name' and 'inferred_gender'.
 
-                if entity_id:
-                    f_conds.append("(f.subject_id = %s OR f.object_id = %s)")
-                    s_conds.append("(s.subject_id = %s OR s.object_id = %s)")
+    This is a naive implementation that looks for capitalized words.
+    Production version would use NER/GLiNER2.
+    """
+    import re
+    entities = []
+    # Match capitalized words (simple heuristic)
+    words = re.findall(r'\b[A-Z][a-z]+\b', text)
+    for word in words:
+        entities.append({
+            "name": word,
+            "inferred_gender": _infer_gender_from_name(word)
+        })
+    return entities
 
-                if taxonomies:
-                    f_conds.append("f.taxonomies && %s::text[]")
-                    s_conds.append("s.taxonomies && %s::text[]")
 
-                f_where = " AND ".join(f_conds)
-                s_where = " AND ".join(s_conds)
+def _get_semantic_word_mappings(db, word: str) -> dict:
+    """
+    Maps a word to rel_types that describe it.
 
-                # --- Build independent params for each query ---
-                base_params = [user_id]
-                f_params = list(base_params)
-                s_params = list(base_params)
+    Returns dict with:
+    - identity_rels: pref_name, also_known_as, same_as → user resolution
+    - family_rels: spouse, parent_of, child_of, sibling_of → group
+    - hierarchy_rels: instance_of, subclass_of, member_of → expansion
+    - category: "identity" | "family" | "hierarchy" | "unknown"
+    """
+    if not db or not word:
+        return {"category": "unknown", "rels": []}
 
-                if rel_types:
-                    f_params.extend(rel_types)
-                    s_params.extend(rel_types)
-
-                if entity_id:
-                    f_params.extend([entity_id, entity_id])
-                    s_params.extend([entity_id, entity_id])
-
-                if taxonomies:
-                    f_params.append(list(taxonomies))
-                    s_params.append(list(taxonomies))
-
-                # --- Query 1: facts table (long-term) ---
-                f_query = (
-                    f"SELECT f.subject_id, f.object_id, f.rel_type, f.provenance, f.confidence,"
-                    f"  f.confirmed_count, f.fact_class, f.is_preferred_label, r.natural_language "
-                    f"FROM facts f "
-                    f"LEFT JOIN rel_types r ON f.rel_type = r.rel_type "
-                    f"WHERE {f_where}"
-                )
-                # Debug: log query params for troubleshooting (dprompt-88c)
-                log.info("fetch_user_facts.facts_query", where=f_where, params=f_params[:3] if len(f_params) > 3 else f_params, entity_id=entity_id)
-                cur.execute(f_query, f_params)
-                seen = set()
-                for r in cur.fetchall():
-                    key = (r[0], r[1], r[2])
-                    if key not in seen:
-                        seen.add(key)
-                        results.append({
-                            "subject": r[0], "object": r[1], "rel_type": r[2],
-                            "provenance": r[3],
-                            "confidence": float(r[4]) if r[4] else 1.0,
-                            "category": _get_rel_type_category(r[2]),
-                            "fact_state": "long_term",
-                            "fact_class": r[6] if r[6] else "A",
-                            "is_preferred_label": bool(r[7]) if r[7] is not None else False,
-                            "staged_confirmations": r[5] if r[5] else 0,
-                            "promoted_at": None,
-                            "expires_at": None,
-                            "definition": r[8] if len(r) > 8 and r[8] else '',
-                        })
-
-                # --- Query 2: staged_facts table (provisional) ---
-                s_query = (
-                    f"SELECT s.subject_id, s.object_id, s.rel_type, s.provenance, s.confidence,"
-                    f"  s.confirmed_count, s.fact_class, s.promoted_at, s.expires_at, r.natural_language "
-                    f"FROM staged_facts s "
-                    f"LEFT JOIN rel_types r ON s.rel_type = r.rel_type "
-                    f"WHERE {s_where}"
-                )
-                cur.execute(s_query, s_params)
-                for r in cur.fetchall():
-                    key = (r[0], r[1], r[2])
-                    if key not in seen:
-                        seen.add(key)
-                        promoted = r[7].isoformat() if r[7] else None
-                        expires = r[8].isoformat() if r[8] else None
-                        results.append({
-                            "subject": r[0], "object": r[1], "rel_type": r[2],
-                            "provenance": r[3],
-                            "confidence": float(r[4]) if r[4] else 0.0,
-                            "category": _get_rel_type_category(r[2]),
-                            "fact_state": "staged",
-                            "fact_class": r[6] if r[6] else "B",
-                            "is_preferred_label": False,
-                            "staged_confirmations": r[5] if r[5] else 0,
-                            "promoted_at": promoted,
-                            "expires_at": expires,
-                            "definition": r[9] if len(r) > 9 and r[9] else '',
-                        })
-        except Exception as e:
-            log.warning("query.fetch_user_facts_failed", error=str(e))
-        return results
-
-    def _fetch_user_events(
-        db_conn,
-        user_id: str,
-        entity_id: str = None,
-    ) -> list[dict]:
-        """Fetch events for user from events table, optionally filtered by entity."""
-        results = []
-        try:
-            with db_conn.cursor() as cur:
-                query = "SELECT id, subject_id, object_id, event_type, occurs_on, recurrence, confidence FROM events WHERE user_id = %s"
-                params = [user_id]
-                if entity_id:
-                    query += " AND subject_id = %s"
-                    params.append(entity_id)
-                cur.execute(query, params)
-                for row in cur.fetchall():
-                    results.append({
-                        "id": row[0],
-                        "subject": row[1],
-                        "object": row[2],
-                        "event_type": row[3],
-                        "occurs_on": row[4],
-                        "recurrence": row[5],
-                        "confidence": row[6],
-                        "source": "events_table",
-                    })
-        except Exception as e:
-            log.warning("query.fetch_user_events_failed", error=str(e))
-        return results
-    def _fetch_attributes(
-        db_conn,
-        user_id: str,
-        entity_ids: list[str],
-        max_sensitivity: str = "private",
-    ) -> dict:
-        """
-        Fetch entity_attributes for a list of entity IDs.
-        max_sensitivity controls which tiers are returned:
-          'public'  — only public attributes
-          'private' — public + private (default)
-          'secret'  — all including secret (never use in query path)
-        Returns {entity_id: {attribute: value}} dict.
-        """
-        if not entity_ids:
-            return {}
-        sensitivity_filter = {
-            "public": ("public",),
-            "private": ("public", "private"),
-            "secret": ("public", "private", "secret"),
-        }.get(max_sensitivity, ("public", "private"))
-
-        try:
-            _ph = ",".join(["%s"] * len(entity_ids))
-            _sh = ",".join(["%s"] * len(sensitivity_filter))
-            with db_conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT entity_id, attribute, value_int, value_float, value_text, "
-                    f"value_date, category "
-                    f"FROM entity_attributes "
-                    f"WHERE user_id = %s AND entity_id IN ({_ph}) "
-                    f"AND sensitivity IN ({_sh})",
-                    [user_id] + list(entity_ids) + list(sensitivity_filter),
-                )
-                attributes = {}
-                for row in cur.fetchall():
-                    eid, attr, vi, vf, vt, vd, cat = row
-                    if eid not in attributes:
-                        attributes[eid] = {}
-                    attributes[eid][attr] = {
-                        "value": (
-                            vi if vi is not None else
-                            vf if vf is not None else
-                            vt if vt is not None else
-                            str(vd) if vd is not None else None
-                        ),
-                        "category": cat,
-                    }
-                return attributes
-        except Exception as e:
-            log.warning("query.attributes_fetch_failed", error=str(e))
-            return {}
-
-    def _resolve_display_names(facts: list[dict], registry, user_id: str, user_entity_id: str = "user") -> list[dict]:
-        """
-        Resolve UUID subject_id/object_id to preferred display names.
-        dprompt-32: Falls back to non-preferred aliases when preferred name is missing
-        (e.g., name collision loser entities).
-        """
-        resolved = []
-        for f in facts:
-            subject_display = registry.get_preferred_name(user_id, f["subject"])
-            object_display = registry.get_preferred_name(user_id, f["object"])
-
-            # dprompt-32: if preferred name is a UUID (no human-readable alias found),
-            # fall back to any non-preferred alias so the entity isn't invisible
-            if subject_display and _UUID_PATTERN.match(str(subject_display)):
-                fallback = registry.get_any_alias(user_id, f["subject"])
-                if fallback:
-                    subject_display = fallback
-            if object_display and _UUID_PATTERN.match(str(object_display)):
-                fallback = registry.get_any_alias(user_id, f["object"])
-                if fallback:
-                    object_display = fallback
-
-            if f.get("rel_type") == "spouse":
-                log.info("query.resolve_display_names.spouse",
-                        original_subject=f["subject"], resolved_subject=subject_display,
-                        original_object=f["object"], resolved_object=object_display)
-
-            # FIXED: Normalize user entity IDs to "user" placeholder for consistent display
-            if f["subject"] == user_entity_id or subject_display == user_entity_id:
-                subject_display = "user"
-            if f["object"] == user_entity_id or object_display == user_entity_id:
-                object_display = "user"
-
-            resolved.append({
-                **f,
-                "subject": subject_display,
-                "object": object_display,
-                "_subject_id": f["subject"],   # dprompt-61: preserve UUID for dedup
-                "_object_id": f["object"],     # dprompt-61: preserve UUID for dedup
-            })
-        return resolved
-
-    def _populate_preferred_names(merged_facts: list[dict], direct_facts: list[dict], baseline_facts: list[dict], qdrant_facts: list[dict], attributes: dict) -> dict:
-        """Populate preferred_names dict from merged facts using UUID-to-display-name resolution.
-
-        dprompt-61: Builds UUID→display_name mappings for the Filter to resolve UUIDs in facts.
-        Uses three sources: entity_aliases (primary), entity_attributes pref_name scalar (fallback),
-        UUID itself (last resort).
-        """
-        preferred_names = {}
-        if not registry:
-            log.warning("query._populate_preferred_names.registry_none", user_id=user_id, merged_facts_count=len(merged_facts))
-            return preferred_names
-
-        # Build set of real entity UUIDs from pre-resolution PostgreSQL facts (direct + baseline)
-        _real_entity_ids: set[str] = {user_entity_id_for_query}
-        for f in direct_facts + baseline_facts:
-            if _UUID_PATTERN.match(f.get("subject", "")):
-                _real_entity_ids.add(f["subject"])
-            if _UUID_PATTERN.match(f.get("object", "")):
-                _real_entity_ids.add(f["object"])
-
-        # Populate preferred_names for all UUID entities in merged_facts
-        # NO RECURSIVE MATCHING — checks pre-extracted values only
-        log.info("query._populate_preferred_names.start", merged_facts_count=len(merged_facts), attributes_keys=list(attributes.keys()) if attributes else [])
-        for f in merged_facts:
-            for field in ("subject", "object"):
-                val = f[field]
-                if not val or val in preferred_names:
-                    continue
-                # Try entity_aliases first (primary)
-                resolved = registry.get_preferred_name(user_id, val)
-                if resolved and resolved != val:
-                    preferred_names[val] = resolved
-                    log.info("query._populate_preferred_names.alias_found", val=val, resolved=resolved)
-                elif _UUID_PATTERN.match(val):
-                    # UUID with no alias — check entity_attributes for pref_name scalar
-                    if attributes and val in attributes:
-                        pref_name_attr = attributes[val].get("pref_name")
-                        if isinstance(pref_name_attr, dict):
-                            pref_name_value = pref_name_attr.get("value")
-                        else:
-                            pref_name_value = pref_name_attr
-                        if pref_name_value:
-                            preferred_names[val] = str(pref_name_value)
-                            log.info("query._populate_preferred_names.pref_name_found", val=val, pref_name=pref_name_value)
-                        else:
-                            preferred_names[val] = val
-                    else:
-                        preferred_names[val] = val
-
-        # Ensure user entity is in preferred_names (dBug-user-entity-preferred-name-skipped)
-        # User's pref_name from attributes should be included so Filter can resolve user's UUID
-        if user_entity_id_for_query and user_entity_id_for_query not in preferred_names:
-            if attributes and user_entity_id_for_query in attributes:
-                user_pref_name_attr = attributes[user_entity_id_for_query].get("pref_name")
-                if user_pref_name_attr:
-                    if isinstance(user_pref_name_attr, dict):
-                        user_pref_name = user_pref_name_attr.get("value")
-                    else:
-                        user_pref_name = user_pref_name_attr
-                    if user_pref_name:
-                        preferred_names[user_entity_id_for_query] = str(user_pref_name)
-                        log.info("query._populate_preferred_names.user_pref_name_found", user_id=user_entity_id_for_query, pref_name=user_pref_name)
-
-        log.info("query._populate_preferred_names.complete", preferred_names_count=len(preferred_names))
-
-        return preferred_names
-
-    def _clean_preferred_names(pns: dict) -> dict:
-        """Remove empty strings, Concept/unknown entity types.
-
-        Keep UUID→UUID mappings (entities without registered preferred names) so
-        Filter can still resolve them. Concept entities (e.g. "pets", "family", "dog")
-        are taxonomy labels, not named entities. Excluding them prevents the Filter's
-        Tier 1 entity matching from returning only member_of/is_a facts for category
-        queries. # NO RECURSIVE MATCHING — _UUID_PATTERN is a static compile-once pattern.
-        """
-        # Keep all non-empty values, including UUID→UUID fallbacks
-        cleaned = {k: v for k, v in pns.items() if v}
-        if not cleaned or not db:
-            return cleaned
-        # dprompt-50: exclude Concept/unknown entities from name resolution
-        _uuid_keys = [k for k in cleaned if _UUID_PATTERN.match(str(k))]
-        if not _uuid_keys:
-            return cleaned
-        try:
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM entities WHERE user_id = %s AND id = ANY(%s) "
-                    "AND entity_type NOT IN ('Concept')",
-                    (user_id, _uuid_keys),
-                )
-                allowed = {row[0] for row in cur.fetchall()}
-            return {k: v for k, v in cleaned.items()
-                    if not _UUID_PATTERN.match(str(k)) or k in allowed}
-        except Exception:
-            return cleaned
-
-    def _get_entity_aliases(entity_id: str) -> list[dict]:
-        """Return all aliases for an entity UUID with is_preferred flag.
-        Returns empty list on DB error or if entity has no aliases.
-        """
-        if not db or not entity_id:
-            return []
-        try:
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT alias, is_preferred FROM entity_aliases "
-                    "WHERE user_id = %s AND entity_id = %s "
-                    "ORDER BY is_preferred DESC, alias",
-                    (user_id, entity_id),
-                )
-                return [
-                    {"name": row[0], "is_preferred": row[1]}
-                    for row in cur.fetchall()
-                ]
-        except Exception:
-            return []
-
-    def _build_entity_types(pns: dict) -> dict:
-        """Build entity_types dict parallel to preferred_names.
-
-        Maps entity_id (UUID or display string) → entity_type from the entities table.
-        For UUID keys: batch query the entities table directly.
-        For non-UUID keys: resolve via entity_aliases → entities JOIN.
-        Graceful degradation: returns empty dict on DB error.
-        """
-        entity_types = {}
-        if not db:
-            return entity_types
-
-        # UUID-keyed entries: batch query entities table
-        _uuid_keys_in_pns = [k for k in pns if _UUID_PATTERN.match(str(k))]
-        if _uuid_keys_in_pns:
-            try:
-                with db.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, entity_type FROM entities "
-                        "WHERE user_id = %s AND id = ANY(%s)",
-                        (user_id, _uuid_keys_in_pns),
-                    )
-                    for entity_id, etype in cur.fetchall():
-                        entity_types[entity_id] = etype or "unknown"
-            except Exception:
-                pass  # graceful — missing entity_types is non-fatal
-
-        # Non-UUID keys (display-name strings): resolve via entity_aliases → entities
-        _non_uuid_keys = [k for k in pns if not _UUID_PATTERN.match(str(k))]
-        if _non_uuid_keys:
-            try:
-                with db.cursor() as cur:
-                    cur.execute(
-                        "SELECT ea.alias, COALESCE(e.entity_type, 'unknown') "
-                        "FROM entity_aliases ea "
-                        "LEFT JOIN entities e ON e.id = ea.entity_id AND e.user_id = ea.user_id "
-                        "WHERE ea.user_id = %s AND ea.alias = ANY(%s)",
-                        (user_id, _non_uuid_keys),
-                    )
-                    for alias, etype in cur.fetchall():
-                        entity_types[alias] = etype or "unknown"
-            except Exception:
-                pass
-        return entity_types
-
-    def _attributes_to_facts(attributes: dict) -> list[dict]:
-        """
-        Convert entity_attributes to facts format for injection.
-        Each attribute becomes a fact with subject=entity, rel_type=attribute.
-        Works for all entities, not just "user".
-        """
-        facts = []
-        # Collect all attribute rel_types to fetch definitions in bulk
-        attr_rel_types = set()
-        for entity_attrs in attributes.values():
-            if isinstance(entity_attrs, dict):
-                attr_rel_types.update(entity_attrs.keys())
-
-        # Fetch definitions for all attribute rel_types at once
-        attr_definitions = {}
-        if attr_rel_types and db:
-            try:
-                with db.cursor() as cur:
-                    placeholders = ",".join(["%s"] * len(attr_rel_types))
-                    cur.execute(
-                        f"SELECT rel_type, natural_language FROM rel_types WHERE rel_type IN ({placeholders})",
-                        list(attr_rel_types)
-                    )
-                    attr_definitions = {row[0]: (row[1] or "") for row in cur.fetchall()}
-            except Exception as e:
-                log.warning("query.attributes_definitions_lookup_failed", error=str(e))
-
-        for entity_id, entity_attrs in attributes.items():
-            if not isinstance(entity_attrs, dict):
-                continue
-            for attribute, attr_data in entity_attrs.items():
-                if isinstance(attr_data, dict):
-                    value = attr_data.get("value")
-                    category = attr_data.get("category")
-                else:
-                    # Bac${LOCATION}ard compat: legacy scalar values
-                    value = attr_data
-                    category = None
-                if value is not None:
-                    facts.append({
-                        "subject": entity_id,
-                        "rel_type": attribute,
-                        "object": str(value),
-                        "confidence": 1.0,
-                        "fact_class": "A",
-                        "fact_state": "long_term",
-                        "category": category,
-                        "definition": attr_definitions.get(attribute, ""),
-                    })
-        return facts
-
-    # ── Taxonomy-driven query intent (dprompt-23) ──────────────────────────
-    # Detect intent → load taxonomy → fetch ONLY rel_types in that taxonomy.
-    # No hardcoded signal sets. Entity_taxonomies table IS the map.
-    #
-    # Generic fallback signals: queries that don't match a taxonomy but still
-    # need graph traversal (e.g., "tell me about", "what is", bare questions).
-    _GENERIC_SELF_REF_SIGNALS = {
-        "tell me about", "what do you know", "what you know",
-        "what is", "what are", "how many", "how much",
-        "list all", "show me", "alicecribe",
-    }
-
-    # Initialize database connection and entity registry FIRST
-    # so we can resolve the user's entity UUID
-    db = None
-    registry = None
-    user_entity_id_for_query = None
-    canonical_identity = None
+    word_lower = word.lower()
 
     try:
-        db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-        registry = EntityRegistry(db)
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # dprompt-93: Semantic Query Resolution Framework
-        # Three-step identity resolution: Self Anchor → Hierarchy → Ontology
-        # ═══════════════════════════════════════════════════════════════════════
-
-        # Step 1: Self Anchor — Check if user_id itself has identity facts
-        candidate_entities = []
+        # Check if word matches a rel_type in database
         with db.cursor() as cur:
             cur.execute(
-                "SELECT f.subject_id, e.entity_type, f.confidence, f.created_at "
-                "FROM facts f "
-                "JOIN entities e ON e.id = f.subject_id "
-                "WHERE f.user_id = %s AND f.subject_id = %s "
-                "AND f.rel_type IN ('pref_name', 'also_known_as') "
-                "AND f.superseded_at IS NULL "
-                "ORDER BY f.confidence DESC, f.created_at DESC "
-                "LIMIT 1",
-                (user_id, user_id)
+                "SELECT rel_type, category FROM rel_types WHERE rel_type = %s",
+                (word_lower,)
             )
             row = cur.fetchone()
             if row:
-                candidate_entities.append((row[0], row[1], row[2], row[3], "self_anchor"))
-                log.info("query.identity_self_anchor_found", entity_id=row[0][:8], entity_type=row[1])
+                rel_type, category = row
+                return {
+                    "category": "rel_type_direct",
+                    "rel_type": rel_type,
+                    "db_category": category
+                }
 
-        # Step 2: Hierarchy — If Self Anchor not found, query all identity candidates with types
-        if not candidate_entities:
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT f.subject_id, e.entity_type, f.confidence, f.created_at "
-                    "FROM facts f "
-                    "JOIN entities e ON e.id = f.subject_id "
-                    "WHERE f.user_id = %s AND f.rel_type IN ('pref_name', 'also_known_as') "
-                    "AND f.superseded_at IS NULL "
-                    "ORDER BY f.confidence DESC, f.created_at DESC",
-                    (user_id,)
-                )
-                candidate_entities = [(row[0], row[1], row[2], row[3], "hierarchy") for row in cur.fetchall()]
-
-        # Keep full list of identity entities for downstream fact fetching (dprompt-88d)
-        user_entity_ids_for_query = [ent[0] for ent in candidate_entities]
-
-        # Step 3: Ontology — Score candidates by semantic type and instance_of chains
-        # Query which entity_types appear in "user-centric" taxonomies (family, household, work)
-        semantic_user_types = set()
+        # Check if word is a taxonomy keyword (family, household, work)
         with db.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT UNNEST(member_entity_types) as entity_type "
-                "FROM entity_taxonomies "
-                "WHERE taxonomy_name IN ('family', 'household', 'work')"
+                "SELECT taxonomy_name, member_entity_types FROM entity_taxonomies "
+                "WHERE taxonomy_name = %s",
+                (word_lower,)
             )
-            semantic_user_types = {row[0] for row in cur.fetchall()}
-            log.info("query.semantic_user_types_loaded", types=list(semantic_user_types))
-
-        # Score candidates: prefer those in "user-centric" taxonomies
-        scored_candidates = []
-        for entity_id, entity_type, confidence, created_at, source in candidate_entities:
-            score = 0.0
-
-            # Bonus: entity_type in semantic user taxonomies
-            if entity_type in semantic_user_types:
-                score += 2.0
-
-            # Bonus: confidence score
-            score += confidence
-
-            # Preserve created_at for deterministic tie-breaking (dprompt-93 robustness)
-            scored_candidates.append((entity_id, entity_type, score, created_at, source))
-            log.info("query.identity_candidate_scored", entity_id=entity_id[:8], entity_type=entity_type, score=score, source=source)
-
-        # Pick highest-scoring candidate as canonical identity for context
-        # Deterministic tie-breaking: score DESC, then created_at DESC (most recent wins)
-        user_entity_id_for_query = None
-        if scored_candidates:
-            scored_candidates.sort(key=lambda x: (-x[2], -x[3].timestamp() if hasattr(x[3], 'timestamp') else 0), reverse=False)
-            user_entity_id_for_query = scored_candidates[0][0]
-            log.info("query.identity_resolved", entity_id=user_entity_id_for_query[:8], entity_type=scored_candidates[0][1], score=scored_candidates[0][2], method="semantic_scoring")
-
-        # Fallback: if no identity facts found, create/resolve user entity
-        # Defensive: validate fallback produces a valid UUID before using
-        if not user_entity_id_for_query:
-            fallback_id = registry.resolve(user_id, "user")
-            if not fallback_id:
-                from src.entity_registry.registry import _make_surrogate
-                fallback_id = _make_surrogate(user_id, user_id)
-            # Validate fallback_id is non-empty UUID (dprompt-93 robustness)
-            if fallback_id and isinstance(fallback_id, str) and len(fallback_id) > 0:
-                user_entity_id_for_query = fallback_id
-                user_entity_ids_for_query = [fallback_id]
-                log.info("query.identity_fallback_registry", entity_id=fallback_id[:8])
-            else:
-                log.warning("query.identity_fallback_failed", fallback_id=fallback_id)
-
-        # Get canonical identity display name
-        canonical_identity = None
-        if user_entity_id_for_query:
-            canonical_identity = registry.get_preferred_name(user_id, user_entity_id_for_query)
-            if not canonical_identity or _UUID_PATTERN.match(canonical_identity):
-                canonical_identity = user_id
-
-        log.info("query.user_identity", owui_user_id=user_id, entity_id=user_entity_id_for_query[:8] if user_entity_id_for_query else "none", canonical=canonical_identity)
-    except Exception as _e:
-        log.warning("query.db_init_failed", error=str(_e))
-        if db:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-
-    direct_facts = []
-    detected_taxonomies = None
-    query_detected_taxonomies = None
-
-    # dprompt-27: always fetch baseline identity facts + graph traversal for connected entities
-    # dprompt-88d: fetch from ALL user identity entities, not just the first one
-    # SOLUTION-CLASSIFY-FORWARD: Use pre-computed taxonomies for scope filtering
-    # Taxonomy detection: (1) query entity_taxonomies, (2) if none found, LLM discovers and creates new taxonomy
-    if db and registry and canonical_identity:
-        # dprompt-130: Determine query-driven scope BEFORE fetching facts
-        # Matches query keywords against entity_taxonomies metadata (NOT hardcoded)
-        query_detected_taxonomies = _determine_query_scope(db, request.text, user_id)
-
-        # Fetch baseline facts, optionally filtered by query-detected scope
-        # NOTE: Only pass taxonomies filter if facts table actually has taxonomies populated
-        # For now, skip filtering since existing facts have empty taxonomies column
-        # (taxonomy population is handled at ingest time for new facts)
-        for eid in user_entity_ids_for_query:
-            direct_facts.extend(_fetch_user_facts(db, user_id, entity_id=eid))
-
-        # dprompt-130: Apply query-scope filtering to facts (post-fetch)
-        # Only apply if query detected a specific scope (not broad queries)
-        log.info("query.scope_filter_check", query_detected_taxonomies=list(query_detected_taxonomies) if query_detected_taxonomies else None,
-                 count=len(query_detected_taxonomies) if query_detected_taxonomies else 0)
-        if query_detected_taxonomies and len(query_detected_taxonomies) <= 3:
-            # Build rel_type → taxonomies map to filter
-            rel_type_to_taxonomies = {}
-            try:
-                with db.cursor() as cur:
-                    cur.execute(
-                        "SELECT DISTINCT rt.rel_type, et.taxonomy_name FROM rel_types rt "
-                        "INNER JOIN entity_taxonomies et ON et.rel_types_defining_group @> ARRAY[rt.rel_type] "
-                        "WHERE et.taxonomy_name = ANY(%s)",
-                        (list(query_detected_taxonomies),)
-                    )
-                    results = cur.fetchall()
-                    log.info("query.scope_filter_sql_results", results_count=len(results) if results else 0,
-                             taxonomies=list(query_detected_taxonomies))
-                    for rel_type, tax_name in results:
-                        if rel_type not in rel_type_to_taxonomies:
-                            rel_type_to_taxonomies[rel_type] = set()
-                        rel_type_to_taxonomies[rel_type].add(tax_name)
-            except Exception as e:
-                log.warning("query.scope_filter_map_failed", error=str(e))
-                rel_type_to_taxonomies = {}
-
-            # Filter facts to only those whose rel_type belongs to detected scope
-            if rel_type_to_taxonomies:
-                initial_count = len(direct_facts)
-                direct_facts = [
-                    f for f in direct_facts
-                    if f.get("rel_type") in rel_type_to_taxonomies
-                ]
-                log.info("query.scope_filter_applied", query_scope=list(query_detected_taxonomies),
-                         before=initial_count, after=len(direct_facts))
-
-        # dprompt-130: Skip fact-based scope detection if query-based already succeeded
-        # Only try fact-based detection if query didn't detect a specific scope
-        if direct_facts and not query_detected_taxonomies:
-            try:
-                fact_detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
-                # Use fact-detected scope if available
-                if fact_detected_taxonomies:
-                    detected_taxonomies = fact_detected_taxonomies
-                    log.info("query.scope_detected_from_facts", taxonomies=list(detected_taxonomies),
-                             fact_count=len(direct_facts))
-                else:
-                    # Fallback: LLM discovers what taxonomy these facts might define
-                    log.info("query.no_taxonomy_detected_attempting_discovery", fact_count=len(direct_facts))
-                    # dprompt-142: Removed qwen_api_url parameter — now uses centralized resolver
-                    discovered = _llm_discover_taxonomy_from_facts(db, user_id, direct_facts)
-                    if discovered:
-                        # Create the taxonomy in DB
-                        try:
-                            with db.cursor() as cur:
-                                cur.execute(
-                                    "INSERT INTO entity_taxonomies "
-                                    "(taxonomy_name, description, member_entity_types, rel_types_defining_group, "
-                                    "has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, source) "
-                                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                                    (
-                                        discovered["taxonomy_name"],
-                                        discovered.get("description", ""),
-                                        discovered.get("member_entity_types", "{}"),
-                                        discovered.get("rel_types_defining_group", []),
-                                        discovered.get("has_transitivity", False),
-                                        discovered.get("transitive_rel_types", "{}"),
-                                        discovered.get("is_hierarchical", False),
-                                        discovered.get("parent_rel_type"),
-                                        discovered.get("source", "llm_learned"),
-                                    ),
-                                )
-                            # Reload taxonomy cache
-                            _load_taxonomy_cache(db)
-                            # Re-detect with the new taxonomy
-                            detected_taxonomies = determine_scope_multi_factor(db, user_id, direct_facts)
-                            log.info("query.taxonomy_created_and_detected",
-                                     taxonomy_name=discovered["taxonomy_name"],
-                                     taxonomies_detected=list(detected_taxonomies or []))
-                        except Exception as e:
-                            log.warning("query.taxonomy_creation_failed", error=str(e))
-            except Exception as e:
-                log.warning("query.scope_detection_failed", error=str(e))
-                detected_taxonomies = None
-
-        # Debug: log what facts fetched for user (dprompt-88b)
-        user_rels = {}
-        for f in direct_facts:
-            rt = f.get("rel_type", "unknown")
-            user_rels[rt] = user_rels.get(rt, 0) + 1
-        log.info("query.initial_user_facts", count=len(direct_facts), rel_types=dict(sorted(user_rels.items())),
-                 detected_taxonomies=list(detected_taxonomies or []))
-
-        # dprompt-130: Stop on confidence — if scope-detected facts answer the query, return early
-        # Query-detected scope is more trustworthy than graph traversal (which adds all connected facts)
-        # If we detected a specific scope (1-3 taxonomies), scope-filtered facts are our answer
-        if query_detected_taxonomies and direct_facts and len(query_detected_taxonomies) <= 2:
-            _avg_confidence = sum(f.get("confidence", 0.5) for f in direct_facts) / len(direct_facts)
-            log.info("query.stop_on_confidence", count=len(direct_facts), avg_confidence=_avg_confidence,
-                     scope=list(query_detected_taxonomies),
-                     reason="query_scope_detected_facts_sufficient")
-            # Skip graph traversal and hierarchy expansion — scope-detected facts answer the query
-            merged_facts = direct_facts
-            try:
-                # Populate preferred_names using helper (dprompt-61)
-                preferred_names = _populate_preferred_names(merged_facts, direct_facts, [], [], {})
-                entity_types = _build_entity_types(preferred_names)
+            row = cur.fetchone()
+            if row:
+                taxonomy, members = row
                 return {
-                    "status": "ok",
-                    "facts": merged_facts,
-                    "preferred_names": _clean_preferred_names(preferred_names),
-                    "canonical_identity": canonical_identity,
-                    "entity_types": entity_types,
-                    "attributes": {},
+                    "category": "taxonomy",
+                    "taxonomy": taxonomy,
+                    "member_types": members
                 }
-            except Exception as e:
-                log.warning("query.stop_on_confidence_failed", error=str(e))
-                # Fall through to graph traversal if early return fails
 
-    if direct_facts or (db and registry and canonical_identity):
-        try:
-            # Resolve named entities from query (e.g., "${ENTITY}", "system")
-            # and fetch their facts for domain-agnostic queries.
-            # _fetch_user_facts already searches both subject_id AND object_id
-            # when entity_id is provided, so one call covers both directions.
-            # Scan both capitalized words AND lowercase tokens that match known aliases.
-            _query_words = set(re.findall(r'\b([A-Z][a-z]+)\b', request.text))
-            _query_words.discard("Tell")
-            # Also check lowercase tokens against entity_aliases
-            _common_words = {'the','and','for','you','are','that','what','how','who','tell','know','about','with','from','your','this','have','been','does','will','name','system'}
-            for _token in request.text.lower().split():
-                _token = _token.strip('.,!?;:()[]{}"\'')
-                if len(_token) > 2 and _token not in _common_words and _token not in _query_words:
-                    _query_words.add(_token)
-            for _word in _query_words:
-                try:
-                    _entity_id = registry.resolve(user_id, _word)
-                    if _entity_id and _entity_id != user_entity_id_for_query:
-                        _extra = _fetch_user_facts(db, user_id, entity_id=_entity_id)
-                        if _extra:
-                            direct_facts.extend(_extra)
-                            log.info("query.entity_resolved",
-                                     word=_word, entity_id=_entity_id,
-                                     extra_facts=len(_extra))
-                except Exception:
-                    pass
+        # Fallback: word might be an entity instance
+        return {"category": "unknown"}
 
-            # dprompt-27: graph traversal — find connected entities via _REL_TYPE_GRAPH
-            _connected = _graph_traverse(db, user_id, user_entity_id_for_query)
-            if _connected:
-                # dprompt-88: Removed taxonomy filtering (dprompt-47c was breaking queries).
-                # Rationale: Graph traversal via _REL_TYPE_GRAPH is the authoritative filter.
-                # Taxonomy constraints were filtering out necessary connected entities,
-                # preventing both relationship and hierarchy facts from being returned.
-                # Example: "where do I live?" would return instance_of but exclude lives_at
-                # because taxonomy filter removed the address from _connected.
-                # The graph itself filters what's connected; taxonomy filtering was redundant and harmful.
+    except Exception as e:
+        log.error("semantic_word_mapping.failed", word=word, error=str(e))
+        return {"category": "unknown"}
 
-                log.info("query.graph_traverse", identity=canonical_identity,
-                         connected_count=len(_connected))
-                for _conn_id in _connected:
-                    _conn_facts = _fetch_user_facts(db, user_id, entity_id=_conn_id)
-                    # Debug: log facts for each connected entity (dprompt-88b)
-                    if _conn_facts:
-                        _conn_rels = {}
-                        for f in _conn_facts:
-                            rt = f.get("rel_type", "unknown")
-                            _conn_rels[rt] = _conn_rels.get(rt, 0) + 1
-                        log.info("query.connected_entity_facts", entity_id=_conn_id[:8], count=len(_conn_facts), rel_types=dict(sorted(_conn_rels.items())))
-                    if _conn_facts:
-                        seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
-                        for _cf in _conn_facts:
-                            _key = (_cf["subject"], _cf["object"], _cf["rel_type"])
-                            if _key not in seen:
-                                direct_facts.append(_cf)
-                                seen.add(_key)
-                log.info("query.graph_traverse_complete",
-                         connected_entities=len(_connected),
-                         total_facts=len(direct_facts))
 
-                # dprompt-28: hierarchy expansion — enrich each connected entity with taxonomy
-                _enriched = set(_connected)
-                for _conn_id in _connected:
-                    _upchain = _hierarchy_expand(db, user_id, _conn_id, direction="up", max_depth=3)
-                    _enriched.update(_upchain)
-                # Fetch facts for hierarchy entities not already covered
-                _new_entities = _enriched - _connected - {user_entity_id_for_query}
-                if _new_entities:
-                    seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
-                    for _hid in _new_entities:
-                        _hfacts = _fetch_user_facts(db, user_id, entity_id=_hid)
-                        if _hfacts:
-                            for _hf in _hfacts:
-                                _key = (_hf["subject"], _hf["object"], _hf["rel_type"])
-                                if _key not in seen:
-                                    direct_facts.append(_hf)
-                                    seen.add(_key)
-                    log.info("query.hierarchy_expanded",
-                             enriched_entities=len(_enriched),
-                             new_hierarchy_facts=sum(1 for f in direct_facts if f.get("rel_type") in _get_hierarchy_rels()),
-                             total_facts=len(direct_facts))
+def resolve_anchor(
+    query_text: str,
+    conversation_history: list[ConversationMessage],
+    user_id: str,
+    db
+) -> str:
+    """
+    Phase 1: Semantic Anchor Resolution
 
-                # dBug-019: fetch hierarchy facts for graph-connected entities
-                # Graph traversal finds connected entities (pets, family) but doesn't
-                # return their type/classification facts. This ensures instance_of,
-                # subclass_of, member_of, part_of are included for complete context.
-                _graph_entity_ids = set(_connected)
-                if _graph_entity_ids:
-                    _hier_facts = _fetch_hierarchy_facts(db, user_id, _graph_entity_ids)
-                    if _hier_facts:
-                        seen = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
-                        _added = 0
-                        for _hf in _hier_facts:
-                            _key = (_hf["subject"], _hf["object"], _hf["rel_type"])
-                            if _key not in seen:
-                                direct_facts.append(_hf)
-                                seen.add(_key)
-                                _added += 1
-                        log.info("query.hierarchy_facts_fetched",
-                                 graph_entities=len(_graph_entity_ids),
-                                 hierarchy_facts_added=_added,
-                                 total_facts=len(direct_facts))
+    Maps query words to rel_type operations to determine WHO we're talking about.
 
-            entity_ids = list({f["subject"] for f in direct_facts} | {f["object"] for f in direct_facts})
-            attributes = _fetch_attributes(db, user_id, entity_ids, max_sensitivity="private")
+    Rules (in order):
+    1. Identity keywords (me, I) → user_uuid
+    2. Possessive family/group keywords (my) + taxonomy word → user_uuid
+    3. Possessive entity names (my Aurora) → entity_uuid
+    4. Direct entity match (Tell me about Aurora) → entity_uuid ONLY if not preceded by identity keyword
+    5. Pronoun resolution → entity from history
+    6. Default → user_uuid
 
-            # dBug-035: Log spouse facts at this point (after graph traversal)
-            spouse_in_direct = [f for f in direct_facts if f.get("rel_type") == "spouse"]
-            if spouse_in_direct:
-                log.info("query.dBug035_spouse_after_graph_traversal",
-                         count=len(spouse_in_direct),
-                         spouse_facts=[{
-                             "subject": f.get("subject", "?")[:8],
-                             "object": f.get("object", "?")[:8],
-                             "confidence": f.get("confidence"),
-                             "fact_state": f.get("fact_state"),
-                         } for f in spouse_in_direct])
-            else:
-                log.warning("query.dBug035_spouse_missing_after_graph_traversal",
-                           direct_facts_total=len(direct_facts))
+    Returns: UUID or user_id string
+    """
+    if not db or not query_text:
+        return user_id
 
-            if direct_facts:
-                log.info("query.graph_traversal", identity=canonical_identity, hits=len(direct_facts))
-                # Don't return early — merge with Qdrant results below
-                # Postgres facts are authoritative; Qdrant adds associative context
-        except Exception as _e:
-            log.warning("query.graph_traversal_failed", error=str(_e))
-        finally:
-            pass
+    query_lower = query_text.lower()
+    words = query_text.split()
 
-    # Named-entity attribute resolution
-    # Triggered when query contains attribute signals
-    # # NO RECURSIVE MATCHING — all comparisons use pre-lowercased query_lower only
-    _ATTRIBUTE_SIGNALS = {
-        "old", "age", "height", "tall", "weight", "heavy",
-        "job", "work", "occupation", "born", "birthday",
-        "live", "address", "home", "location",
-    }
+    try:
+        # Rule 1: Identity keywords (me, I, myself)
+        identity_keywords = ["me", "i", "myself"]
+        for word in words:
+            if word.lower() in identity_keywords:
+                log.info("resolve_anchor.identity_keyword", keyword=word, anchor=user_id)
+                return user_id
 
-    _STOPWORDS = {
-        "how", "what", "is", "are", "was", "the", "a", "an",
-        "my", "your", "his", "her", "their", "our", "its",
-        "do", "does", "did", "please", "tell", "me", "about"
-    }
+        # Rule 2: Possessive + taxonomy keyword
+        # "my family", "my job", "my location" → user (not entity)
+        possessive_keywords = ["my", "mine"]
+        for i, word in enumerate(words):
+            if word.lower() in possessive_keywords:
+                # Look at word AFTER possessive
+                if i + 1 < len(words):
+                    next_word = words[i + 1]
+                    semantic = _get_semantic_word_mappings(db, next_word)
 
-    query_lower = request.text.lower()
-    has_attribute_signal = any(sig in query_lower for sig in _ATTRIBUTE_SIGNALS)
-    log.info("query.entity_resolution.start", has_attribute_signal=has_attribute_signal, query_lower=query_lower)
+                    # If next word is a taxonomy keyword → user
+                    if semantic["category"] == "taxonomy":
+                        log.info(
+                            "resolve_anchor.possessive_taxonomy",
+                            possessive=word,
+                            taxonomy=semantic["taxonomy"],
+                            anchor=user_id
+                        )
+                        return user_id
 
-    if has_attribute_signal and db:
-        try:
-            # Tokenize query, strip stopwords, get candidate name tokens
-            tokens = [
-                t.strip("?.,!").lower()
-                for t in request.text.split()
-                if t.strip("?.,!").lower() not in _STOPWORDS
-                and len(t.strip("?.,!")) > 1
-            ]
-            log.info("query.entity_resolution.tokens", tokens=tokens)
+                    # If next word is an entity instance → entity
+                    if semantic["category"] == "unknown":
+                        # Try to resolve as entity name
+                        with db.cursor() as cur:
+                            cur.execute(
+                                "SELECT entity_id FROM entity_aliases "
+                                "WHERE alias = %s AND user_id = %s LIMIT 1",
+                                (next_word.lower(), user_id)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                log.info(
+                                    "resolve_anchor.possessive_entity",
+                                    possessive=word,
+                                    entity=next_word,
+                                    anchor=row[0]
+                                )
+                                return row[0]
 
-            if tokens:
-                # Resolve tokens against entity_aliases for this user
-                placeholders = ",".join(["%s"] * len(tokens))
+        # Rule 3: Direct entity name match (only if NOT preceded by identity keyword)
+        # "Tell me about Aurora" → Aurora (NOT user, despite "me")
+        # Skip if query contains identity keywords (covered by Rule 1)
+        has_identity_keyword = any(kw in query_lower for kw in identity_keywords)
+
+        if not has_identity_keyword:
+            for word in words:
+                # Skip if word is a rel_type, taxonomy, or common word
+                if len(word) < 2 or word.lower() in {"my", "me", "i", "you", "we", "about", "the", "a", "is", "are", "tell"}:
+                    continue
+
+                # Check if word matches an entity instance
                 with db.cursor() as cur:
                     cur.execute(
-                        f"""
-                        SELECT DISTINCT ea.entity_id, ea.alias
-                        FROM entity_aliases ea
-                        WHERE ea.user_id = %s
-                          AND lower(ea.alias) IN ({placeholders})
-                        """,
-                        [user_id] + tokens
+                        "SELECT entity_id FROM entity_aliases "
+                        "WHERE alias = %s AND user_id = %s LIMIT 1",
+                        (word.lower(), user_id)
                     )
-                    resolved = cur.fetchall()
-                log.info("query.entity_resolution.resolved", resolved=[(r[0], r[1]) for r in resolved])
+                    row = cur.fetchone()
+                    if row:
+                        # Verify it's an entity instance, not a taxonomy
+                        semantic = _get_semantic_word_mappings(db, word)
+                        if semantic["category"] != "taxonomy":
+                            log.info(
+                                "resolve_anchor.direct_entity",
+                                entity=word,
+                                anchor=row[0]
+                            )
+                            return row[0]
 
-                if resolved:
-                    resolved_ids = {row[0] for row in resolved}
+        # Rule 4: Pronoun resolution from conversation history
+        pronouns = {
+            "she": "female", "her": "female", "hers": "female",
+            "he": "male", "him": "male", "his": "male",
+            "they": "any", "them": "any", "theirs": "any"
+        }
 
-                    # Verify each resolved entity is related to the user
-                    # (appears as subject or object in an existing fact)
-                    with db.cursor() as cur:
-                        id_placeholders = ",".join(["%s"] * len(resolved_ids))
-                        cur.execute(
-                            f"""
-                            SELECT DISTINCT subject_id, object_id
+        for word in query_lower.split():
+            if word in pronouns:
+                gender = pronouns[word]
+                if conversation_history:
+                    for msg in reversed(conversation_history[-10:]):
+                        entities = _extract_entity_references(msg.content)
+                        for entity in entities:
+                            entity_gender = entity.get("inferred_gender", "unknown")
+                            if gender == "any" or entity_gender == gender:
+                                with db.cursor() as cur:
+                                    cur.execute(
+                                        "SELECT entity_id FROM entity_aliases "
+                                        "WHERE alias = %s AND user_id = %s LIMIT 1",
+                                        (entity["name"].lower(), user_id)
+                                    )
+                                    row = cur.fetchone()
+                                    if row:
+                                        log.info(
+                                            "resolve_anchor.pronoun",
+                                            pronoun=word,
+                                            entity=entity["name"],
+                                            anchor=row[0]
+                                        )
+                                        return row[0]
+
+        # Rule 5: Default to user
+        log.info("resolve_anchor.default", query=query_text[:50], anchor=user_id)
+        return user_id
+
+    except Exception as e:
+        log.error("resolve_anchor.failed", query=query_text[:50], error=str(e))
+        return user_id
+
+
+def _get_rels_by_taxonomy(db, taxonomy_name: str) -> list:
+    """
+    Get all rel_types that belong to a taxonomy.
+
+    Args:
+        db: Database connection
+        taxonomy_name: Name of taxonomy (e.g., 'family', 'work', 'location')
+
+    Returns:
+        List of rel_type strings, lowercased. Empty list if taxonomy not found or on error.
+
+    Example:
+        _get_rels_by_taxonomy(db, 'family')
+        → ['spouse', 'parent_of', 'child_of', 'sibling_of', 'has_pet']
+    """
+    if not db or not taxonomy_name:
+        return []
+
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT rel_types_defining_group FROM entity_taxonomies WHERE taxonomy_name = %s",
+                (taxonomy_name.lower(),)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                rel_types_json = row[0]
+                # Handle both string JSON and native array (depends on DB driver)
+                if isinstance(rel_types_json, str):
+                    import json
+                    rels = json.loads(rel_types_json)
+                    return [r.lower() for r in rels] if rels else []
+                elif isinstance(rel_types_json, list):
+                    return [r.lower() for r in rel_types_json] if rel_types_json else []
+        return []
+    except Exception as e:
+        log.warning("get_rels_by_taxonomy.failed", taxonomy=taxonomy_name, error=str(e))
+        return []
+
+
+def determine_path(query_text: str, db) -> QueryPath:
+    """
+    Phase 1: Determine What's Being Asked
+
+    Extracts keywords from query and matches against:
+    1. rel_types.natural_language (semantic keyword match)
+    2. entity_taxonomies.taxonomy_name (direct taxonomy match)
+
+    Returns QueryPath with scalar_rels, relationship_rels, taxonomy_groups.
+    If no matches, sets fetch_all_details=True.
+    """
+    import re
+
+    if not db or not query_text:
+        return QueryPath(fetch_all_details=True)
+
+    path = QueryPath()
+    query_lower = query_text.lower()
+
+    # Extract keywords (words, remove common stopwords)
+    keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
+
+    noise_words = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+        'what', 'how', 'when', 'where', 'why', 'who', 'which', 'that',
+        'and', 'or', 'not', 'but', 'if', 'to', 'of', 'in', 'on', 'at',
+        'by', 'for', 'with', 'from', 'up', 'about', 'as', 'can', 'will',
+        'would', 'could', 'should', 'may', 'might', 'must', 'do', 'does',
+        'did', 'have', 'has', 'had', 'me', 'my', 'you', 'your', 'tell',
+        'me', 'about', 'like', 'know', 'have', 'tell'
+    }
+    keywords -= noise_words
+
+    if not keywords:
+        path.fetch_all_details = True
+        return path
+
+    try:
+        with db.cursor() as cur:
+            # Match against rel_types.natural_language
+            for keyword in keywords:
+                cur.execute(
+                    "SELECT rel_type, tail_types FROM rel_types "
+                    "WHERE natural_language ILIKE %s LIMIT 1",
+                    (f"%{keyword}%",)
+                )
+                row = cur.fetchone()
+                if row:
+                    rel_type, tail_types = row[0], row[1]
+                    if tail_types and tail_types[0] == 'SCALAR':
+                        path.scalar_rels.append(rel_type)
+                    else:
+                        path.relationship_rels.append(rel_type)
+
+            # Match against entity_taxonomies.taxonomy_name
+            for keyword in keywords:
+                cur.execute(
+                    "SELECT taxonomy_name FROM entity_taxonomies "
+                    "WHERE taxonomy_name = %s LIMIT 1",
+                    (keyword,)
+                )
+                row = cur.fetchone()
+                if row:
+                    path.taxonomy_groups.append(row[0])
+
+        # If no matches found, fetch all details
+        if not path.scalar_rels and not path.relationship_rels and not path.taxonomy_groups:
+            path.fetch_all_details = True
+
+        log.info(
+            "determine_path",
+            query=query_text[:50],
+            keywords=list(keywords)[:5],
+            scalar_rels=path.scalar_rels,
+            relationship_rels=path.relationship_rels,
+            taxonomy_groups=path.taxonomy_groups
+        )
+
+        return path
+
+    except Exception as e:
+        log.error("determine_path.failed", query=query_text[:50], error=str(e))
+        return QueryPath(fetch_all_details=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 2: DB Lookup & Confidence Gate Functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fetch_facts_from_anchor(
+    anchor_uuid: str,
+    user_id: str,
+    path: QueryPath,
+) -> list[dict]:
+    """
+    Phase 2 Function: Fetch facts from database anchored to anchor_uuid.
+
+    Returns facts with confidence scores included, organized by storage path:
+    - Direct facts: (anchor, rel_type, object)
+    - Inverse facts: (subject, rel_type, anchor)
+    - Scalar attributes: (anchor, attribute, value)
+    - Staged facts: Class B + C awaiting promotion
+    - Taxonomy members: if path.taxonomy_groups set
+
+    Args:
+        anchor_uuid: UUID of the entity to query from
+        user_id: User ID for scoping
+        path: QueryPath specifying which rel_types to fetch
+
+    Returns:
+        List of dicts with keys: subject, object, rel_type, confidence, fact_class,
+                                  source (db|staged|attributes)
+    """
+    facts = []
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn:
+        log.warning("fetch_facts_from_anchor.no_dsn")
+        return facts
+
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                # ─── Fetch DIRECT facts: (anchor, rel_type, object) ───
+                if path.fetch_all_details or path.relationship_rels or path.scalar_rels:
+                    direct_query = """
+                        SELECT subject_id, object_id, rel_type, confidence, fact_class
+                        FROM facts
+                        WHERE user_id = %s
+                          AND subject_id = %s
+                          AND superseded_at IS NULL
+                    """
+                    cur.execute(direct_query, (user_id, anchor_uuid))
+                    for row in cur.fetchall():
+                        facts.append({
+                            "subject": row[0],
+                            "object": row[1],
+                            "rel_type": row[2],
+                            "confidence": float(row[3]) if row[3] else 1.0,
+                            "fact_class": row[4] or "A",
+                            "source": "db"
+                        })
+
+                # ─── Fetch INVERSE facts: (subject, rel_type, anchor) ───
+                # FIX 3: Invert rel_type for asymmetric relationships (dprompt-148 Phase 3)
+                if path.fetch_all_details or path.relationship_rels:
+                    inverse_query = """
+                        SELECT subject_id, object_id, rel_type, confidence, fact_class
+                        FROM facts
+                        WHERE user_id = %s
+                          AND object_id = %s
+                          AND superseded_at IS NULL
+                    """
+                    cur.execute(inverse_query, (user_id, anchor_uuid))
+                    for row in cur.fetchall():
+                        subject_id, object_id, rel_type_orig, confidence, fact_class = row
+
+                        # Check metadata to determine if rel_type needs inversion
+                        rel_type_lower = rel_type_orig.lower() if rel_type_orig else ""
+                        rel_type_meta = _REL_TYPE_META.get(rel_type_lower, {})
+                        is_symmetric = rel_type_meta.get("is_symmetric", False)
+                        inverse_rel_type = rel_type_meta.get("inverse_rel_type")
+
+                        # For asymmetric relationships, use the inverse rel_type
+                        # For symmetric relationships, keep the original rel_type
+                        rel_type_final = rel_type_orig
+                        if not is_symmetric and inverse_rel_type:
+                            rel_type_final = inverse_rel_type
+                            facts.append({
+                                "subject": subject_id,
+                                "object": object_id,
+                                "rel_type": rel_type_final,
+                                "confidence": float(confidence) if confidence else 1.0,
+                                "fact_class": fact_class or "A",
+                                "source": "db",
+                                "_is_inverse": True  # Debug metadata
+                            })
+                        elif is_symmetric:
+                            facts.append({
+                                "subject": subject_id,
+                                "object": object_id,
+                                "rel_type": rel_type_final,
+                                "confidence": float(confidence) if confidence else 1.0,
+                                "fact_class": fact_class or "A",
+                                "source": "db"
+                            })
+                        else:
+                            # Fallback: log warning if rel_type not in metadata
+                            log.warning("query.inverse_fact.rel_type_not_found",
+                                       rel_type=rel_type_orig,
+                                       subject=subject_id[:8] if subject_id else "unknown",
+                                       object=object_id[:8] if object_id else "unknown")
+                            # Keep original rel_type as safe fallback
+                            facts.append({
+                                "subject": subject_id,
+                                "object": object_id,
+                                "rel_type": rel_type_orig,
+                                "confidence": float(confidence) if confidence else 1.0,
+                                "fact_class": fact_class or "A",
+                                "source": "db"
+                            })
+
+                # ─── Fetch SCALAR ATTRIBUTES: (anchor, attribute, value) ───
+                if path.fetch_all_details or path.scalar_rels:
+                    attrs_query = """
+                        SELECT entity_id, attribute, value_text, value_int, value_float, value_date
+                        FROM entity_attributes
+                        WHERE user_id = %s
+                          AND entity_id = %s
+                    """
+                    cur.execute(attrs_query, (user_id, anchor_uuid))
+                    for row in cur.fetchall():
+                        # Scalar facts have STRING objects (value_text is canonical)
+                        value = row[2]  # value_text is primary
+                        if value is None and row[3] is not None:
+                            value = str(row[3])  # value_int fallback
+                        if value is None and row[4] is not None:
+                            value = str(row[4])  # value_float fallback
+                        if value is None and row[5] is not None:
+                            value = str(row[5])  # value_date fallback
+
+                        facts.append({
+                            "subject": row[0],
+                            "rel_type": row[1],
+                            "object": value,
+                            "confidence": 1.0,  # Scalar attributes from entity_attributes are user-authoritative
+                            "fact_class": "A",
+                            "source": "attributes"
+                        })
+
+                # ─── Fetch STAGED FACTS: Class B + C awaiting promotion ───
+                staged_query = """
+                    SELECT subject_id, object_id, rel_type, confidence, fact_class, expires_at
+                    FROM staged_facts
+                    WHERE user_id = %s
+                      AND (subject_id = %s OR object_id = %s)
+                      AND expires_at > NOW()
+                """
+                cur.execute(staged_query, (user_id, anchor_uuid, anchor_uuid))
+                for row in cur.fetchall():
+                    expires_at = row[5].isoformat() if row[5] else None
+                    facts.append({
+                        "subject": row[0],
+                        "object": row[1],
+                        "rel_type": row[2],
+                        "confidence": float(row[3]) if row[3] else 0.4,
+                        "fact_class": row[4] or "B",
+                        "source": "staged",
+                        "expires_at": expires_at
+                    })
+                # ─── Fetch TAXONOMY MEMBERS: if path.taxonomy_groups set ───
+                # Fix dprompt-taxonomy-query-path: Query facts from anchor with taxonomy rel_types
+                if path.taxonomy_groups:
+                    for taxonomy in path.taxonomy_groups:
+                        # Get rel_types in this taxonomy category
+                        category_rels = _get_rels_by_taxonomy(conn, taxonomy)
+                        if not category_rels:
+                            log.warning("taxonomy_rels.empty", taxonomy=taxonomy)
+                            continue
+
+                        # Query facts from anchor with these rel_types
+                        placeholders = ",".join(["%s"] * len(category_rels))
+                        taxonomy_query = f"""
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class
                             FROM facts
-                            WHERE user_id = %s
-                              AND superseded_at IS NULL
-                              AND hard_delete_flag = false
-                              AND (subject_id IN ({id_placeholders})
-                                   OR object_id IN ({id_placeholders}))
-                            """,
-                            [user_id] + list(resolved_ids) + list(resolved_ids)
-                        )
-                        related_rows = cur.fetchall()
-
-                    # Collect confirmed related entity IDs
-                    confirmed_ids = set()
-                    for row in related_rows:
-                        if row[0] in resolved_ids:
-                            confirmed_ids.add(row[0])
-                        if row[1] in resolved_ids:
-                            confirmed_ids.add(row[1])
-                    log.info("query.entity_resolution.confirmed", confirmed_ids=list(confirmed_ids))
-                    # Track resolved entities so we fetch their attributes later
-                    resolved_entity_ids.update(confirmed_ids)
-
-                    if confirmed_ids:
-                        # Fetch facts anchored to confirmed entities
-                        with db.cursor() as cur:
-                            id_placeholders = ",".join(["%s"] * len(confirmed_ids))
-                            cur.execute(
-                                f"""
-                                SELECT subject_id, object_id, rel_type, provenance, confidence
-                                FROM facts
-                                WHERE user_id = %s
-                                  AND superseded_at IS NULL
-                                  AND hard_delete_flag = false
-                                  AND (subject_id IN ({id_placeholders})
-                                       OR object_id IN ({id_placeholders}))
-                                """,
-                                [user_id] + list(confirmed_ids) + list(confirmed_ids)
-                            )
-                            entity_facts = cur.fetchall()
-
-                        # Fetch attributes for confirmed entities
-                        entity_attrs = _fetch_attributes(
-                            db, user_id, list(confirmed_ids),
-                            max_sensitivity="private"
-                        )
-                        log.info("query.entity_resolution.attributes", entity_attrs=entity_attrs)
-
-                        # Explicitly fetch scalar facts for resolved entities
-                        # (age, height, weight, born_on) to ensure they appear in facts array
-                        scalar_facts = []
-                        with db.cursor() as cur:
-                            id_placeholders = ",".join(["%s"] * len(confirmed_ids))
-                            cur.execute(
-                                f"""
-                                SELECT subject_id, object_id, rel_type, provenance, confidence
-                                FROM facts
-                                WHERE user_id = %s
-                                  AND superseded_at IS NULL
-                                  AND hard_delete_flag = false
-                                  AND rel_type IN ('age', 'height', 'weight', 'born_on')
-                                  AND subject_id IN ({id_placeholders})
-                                """,
-                                [user_id] + list(confirmed_ids)
-                            )
-                            scalar_facts = [
-                                {
-                                    "subject": row[0],
-                                    "object": row[1],
-                                    "rel_type": row[2],
-                                    "provenance": row[3],
-                                    "confidence": float(row[4]) if row[4] else 1.0,
-                                    "category": "physical"
-                                }
-                                for row in cur.fetchall()
-                            ]
-                        log.info("query.entity_resolution.scalar_facts", count=len(scalar_facts))
-
-                        # Merge into direct_facts and attributes
-                        for row in entity_facts:
-                            fact = {
+                            WHERE user_id = %s AND subject_id = %s AND rel_type IN ({placeholders})
+                            AND superseded_at IS NULL
+                            ORDER BY confidence DESC, last_seen_at DESC
+                            LIMIT 50
+                        """
+                        cur.execute(taxonomy_query, [user_id, anchor_uuid] + category_rels)
+                        for row in cur.fetchall():
+                            facts.append({
                                 "subject": row[0],
                                 "object": row[1],
                                 "rel_type": row[2],
-                                "provenance": row[3],
-                                "confidence": float(row[4]) if row[4] else 0.0,
-                                "category": _get_rel_type_category(row[2])
-                                            or _infer_category(row[2])
-                            }
-                            if fact not in direct_facts:
-                                direct_facts.append(fact)
+                                "confidence": float(row[3]) if row[3] else 1.0,
+                                "fact_class": row[4] or "A",
+                                "source": "db"
+                            })
+                        log.info("fetch_facts_from_anchor.taxonomy_fetched",
+                                 taxonomy=taxonomy, count=len(category_rels), facts_found=len(facts))
 
-                        # Merge scalar facts into direct_facts (avoid duplicates)
-                        existing_keys = {(f["subject"], f["object"], f["rel_type"]) for f in direct_facts}
-                        for sf in scalar_facts:
-                            key = (sf["subject"], sf["object"], sf["rel_type"])
-                            if key not in existing_keys:
-                                direct_facts.append(sf)
-                                existing_keys.add(key)
+    except Exception as e:
+        log.error("fetch_facts_from_anchor.failed",
+                  anchor=anchor_uuid[:8] if anchor_uuid else "unknown",
+                  user_id=user_id[:8] if user_id else "unknown",
+                  error=str(e))
 
-                        for entity_id, attr_dict in entity_attrs.items():
-                            if entity_id not in attributes:
-                                attributes[entity_id] = attr_dict
-                            else:
-                                attributes[entity_id].update(attr_dict)
-        except Exception as e:
-            log.error("query.entity_resolution.error", error=str(e))
+    return facts
 
-    # Embed after graph traversal so Postgres results are returned even when the
-    # embedding service is unavailable. fallback=False: skip Qdrant rather than
-    # searching with a hash vector that can't match nomic-embedded stored facts.
-    vector = embed_text(request.text, qwen_api_url, timeout=10.0, fallback=False, embedding_url=_EMBEDDING_API_URL)
-    if vector is None:
-        log.warning("query.embed_unavailable — skipping Qdrant search")
-        # Resolve display names for Postgres facts before returning
-        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
-        resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
-        _attr_db = None
-        try:
-            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
-            attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
-            _attr_db.commit()
-        except Exception:
-            if _attr_db:
-                try:
-                    _attr_db.rollback()
-                except Exception:
-                    pass
-        finally:
-            if _attr_db:
-                try:
-                    _attr_db.close()
-                except Exception:
-                    pass
-        attr_facts = _attributes_to_facts(attributes)
-        log.info("query.embed_fail_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
-        resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
-        merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
-        events = _fetch_user_events(db, user_id)
-        if events:
-            events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
-            merged_facts.extend(events_resolved)
-        log.info("query.embed_fail_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-        # Fetch attributes for preferred_names population (dprompt-61)
-        _attr_db = None
-        try:
-            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            pre_resolution_fact_ids = {user_entity_id_for_query} | resolved_entity_ids
-            for f in direct_facts + baseline_facts:
-                if _UUID_PATTERN.match(f.get("subject", "")):
-                    pre_resolution_fact_ids.add(f["subject"])
-                if _UUID_PATTERN.match(f.get("object", "")):
-                    pre_resolution_fact_ids.add(f["object"])
-            attributes = _fetch_attributes(_attr_db, user_id, list(pre_resolution_fact_ids), max_sensitivity="private")
-            _attr_db.commit()
-        except Exception:
-            if _attr_db:
-                try:
-                    _attr_db.rollback()
-                except Exception:
-                    pass
-            attributes = {}
-        finally:
-            if _attr_db:
-                try:
-                    _attr_db.close()
-                except Exception:
-                    pass
-        preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
-        entity_types = _build_entity_types(preferred_names)
 
-        # Debug: log what facts are being returned (dprompt-88)
-        # dBug-035: Enhanced logging to trace spouse fact through pipeline
-        rel_types_returned = {}
-        spouse_facts = []
-        for f in merged_facts:
-            rt = f.get("rel_type", "unknown")
-            rel_types_returned[rt] = rel_types_returned.get(rt, 0) + 1
-            if rt == "spouse":
-                spouse_facts.append({
-                    "subject": f.get("subject", "?")[:8],
-                    "object": f.get("object", "?")[:8],
-                    "confidence": f.get("confidence"),
-                    "fact_state": f.get("fact_state"),
-                    "fact_class": f.get("fact_class"),
-                })
-        log.info("query.facts_summary",
-                 total=len(merged_facts),
-                 rel_types=dict(sorted(rel_types_returned.items())),
-                 spouse_count=len(spouse_facts),
-                 spouse_facts=spouse_facts,
-                 query=request.text[:100])
+def apply_confidence_gate(
+    db_facts: list[dict],
+    qdrant_facts: list[dict] = None,
+    min_confidence: float = 0.4
+) -> list[dict]:
+    """
+    Phase 2 Function: Filter facts by confidence threshold and order by confidence DESC.
 
-        # dprompt-91: Apply archive filtering (multi-factor scope + temporality)
-        try:
-            filtered_facts, archive_metadata = apply_archive_filter(
-                db, query_lower, user_id, merged_facts
-            )
-            log.info("query.archive_filtering_applied", **archive_metadata)
-            merged_facts = filtered_facts
-        except Exception as e:
-            log.error("query.archive_filter_failed", error=str(e))
-            raise  # HARD FAIL: archive filter failure is non-recoverable
+    Applies the confidence gate hard stop:
+    - Class A (1.0) always passes
+    - Class B (0.8/0.6) passes if >= min_confidence
+    - Class C (0.4) from Qdrant passes if qdrant_score >= 0.3 (contextually relevant)
+    - Class C from DB passes if confidence >= min_confidence
+    - Below threshold facts are discarded (NO recursion, NO enrichment)
 
-        return {
-            "status": "ok",
-            "facts": merged_facts,
-            "preferred_names": _clean_preferred_names(preferred_names),
-            "canonical_identity": canonical_identity,
-            "entity_types": entity_types,
-            "attributes": attributes,
-        }
+    Args:
+        db_facts: Facts from PostgreSQL
+        qdrant_facts: Facts from Qdrant semantic search (optional)
+        min_confidence: Threshold for filtering (default 0.4)
+
+    Returns:
+        Merged list of facts ordered by confidence DESC
+    """
+    if qdrant_facts is None:
+        qdrant_facts = []
+
+    all_facts = []
+
+    # Add DB facts that pass threshold
+    for fact in db_facts:
+        confidence = fact.get("confidence", 0.4)
+        if confidence >= min_confidence:
+            all_facts.append(fact)
+
+    # Add Qdrant facts with special handling for Class C
+    for fact in qdrant_facts:
+        fact_class = fact.get("fact_class", "C")
+        confidence = fact.get("confidence", 0.4)
+        qdrant_score = fact.get("qdrant_score")  # May be None for non-Qdrant facts
+
+        # Class C: only pass if from Qdrant AND contextually relevant (qdrant_score >= 0.3)
+        if fact_class == "C":
+            if qdrant_score is not None and qdrant_score >= 0.3:
+                all_facts.append(fact)
+            # Class C from DB (no qdrant_score) filtered by threshold
+            elif qdrant_score is None and confidence >= min_confidence:
+                all_facts.append(fact)
+        # Other classes (A, B): standard confidence threshold
+        elif confidence >= min_confidence:
+            all_facts.append(fact)
+
+    # Order by confidence DESC (Class A first, then B, then C)
+    all_facts.sort(key=lambda f: f.get("confidence", 0.0), reverse=True)
+
+    return all_facts
+
+
+def qdrant_semantic_search(
+    query_text: str,
+    conversation_history: list[dict] = None,
+    user_id: str = "anonymous",
+    qdrant_url: str = "http://qdrant:6333",
+    qwen_api_url: str = None,
+    score_threshold: float = 0.3,
+    limit: int = 10
+) -> list[dict]:
+    """
+    Phase 3 Function: Semantic search in Qdrant for contextually relevant facts.
+
+    Searches the user's Qdrant collection for semantically similar facts based on
+    current query + recent conversation context. Returns Class C staged facts that
+    are contextually relevant for confirmation and promotion.
+
+    Args:
+        query_text: Current user query
+        conversation_history: Recent conversation messages (last 3 for context)
+        user_id: User identifier (required for collection naming)
+        qdrant_url: Qdrant base URL (default http://qdrant:6333)
+        qwen_api_url: LLM endpoint for embedding (required for embed_text)
+        score_threshold: Minimum cosine similarity score (default 0.3)
+        limit: Max facts to return (default 10)
+
+    Returns:
+        List of facts dicts with:
+        - subject: Display name or UUID
+        - rel_type: Relationship type
+        - object: Display name or UUID (if relationship)
+        - confidence: Confidence score
+        - fact_class: A, B, or C
+        - qdrant_score: Cosine similarity score from Qdrant
+
+    Handles errors gracefully:
+        - Missing embedding endpoint → return empty list
+        - Qdrant down → return empty list
+        - Missing conversation history → use query_text only
+    """
+    if conversation_history is None:
+        conversation_history = []
+
+    if not qwen_api_url:
+        qwen_api_url = _configured_llm_url()
 
     try:
-        resp = _http_client_sync.post(
+        # Build context: current query + last 3 messages from conversation
+        context_parts = [query_text]
+        if conversation_history:
+            for msg in conversation_history[-3:]:
+                if isinstance(msg, dict):
+                    content = msg.get("content") or msg.get("text", "")
+                    if content:
+                        context_parts.append(content)
+                else:
+                    # Handle object with .content attribute
+                    if hasattr(msg, "content"):
+                        context_parts.append(msg.content)
+
+        context = ". ".join(context_parts)
+
+        # Embed context
+        embedding = embed_text(context, qwen_api_url, fallback=False)
+        if embedding is None:
+            log.warning("qdrant_semantic_search: embedding failed, returning empty results")
+            return []
+
+        # Determine collection name: faultline-{user_id}
+        collection = derive_collection(user_id)
+
+        # Search Qdrant
+        response = httpx.post(
             f"{qdrant_url}/collections/{collection}/points/search",
-            json={"vector": vector, "limit": 10, "with_payload": True, "score_threshold": 0.3},
-            timeout=10.0,
+            json={
+                "vector": embedding,
+                "score_threshold": score_threshold,
+                "limit": limit,
+                "with_payload": True,
+                "with_vectors": False
+            },
+            timeout=10.0
         )
-        if resp.status_code == 404:
-            ensure_collection(collection, qdrant_url)
-            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
-            resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
-            _attr_db = None
-            try:
-                _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
-                attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
-                _attr_db.commit()
-            except Exception:
-                if _attr_db:
-                    try:
-                        _attr_db.rollback()
-                    except Exception:
-                        pass
-            finally:
-                if _attr_db:
-                    try:
-                        _attr_db.close()
-                    except Exception:
-                        pass
-            attr_facts = _attributes_to_facts(attributes)
-            log.info("query.404_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
-            resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
-            merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
-            events = _fetch_user_events(db, user_id)
-            if events:
-                events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
-                merged_facts.extend(events_resolved)
-            log.info("query.404_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-            # Populate preferred_names (dprompt-61)
-            preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
-            entity_types_404 = _build_entity_types(preferred_names)
 
-            # dprompt-91: Apply archive filtering (404 case)
-            try:
-                filtered_facts, archive_metadata = apply_archive_filter(
-                    db, query_lower, user_id, merged_facts
-                )
-                log.info("query.404.archive_filtering_applied", **archive_metadata)
-                merged_facts = filtered_facts
-            except Exception as e:
-                log.error("query.404.archive_filter_failed", error=str(e))
-                raise
+        if response.status_code != 200:
+            log.warning(f"qdrant_semantic_search: search failed status={response.status_code} collection={collection}")
+            return []
 
-            return {
-                    "status": "ok",
-                    "facts": merged_facts,
-                    "preferred_names": _clean_preferred_names(preferred_names),
-                    "canonical_identity": canonical_identity,
-                    "entity_types": entity_types_404,
-                    "attributes": attributes,
-                }
-        if resp.status_code != 200:
-            log.warning("query.qdrant_error", status=resp.status_code, collection=collection)
-            resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
-            resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
-            _attr_db = None
-            try:
-                _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-                _early_ids = list({user_entity_id_for_query} | {f["subject"] for f in resolved_direct + resolved_baseline} | {f["object"] for f in resolved_direct + resolved_baseline} | resolved_entity_ids)
-                attributes = _fetch_attributes(_attr_db, user_id, _early_ids, max_sensitivity="private")
-                _attr_db.commit()
-            except Exception:
-                if _attr_db:
-                    try:
-                        _attr_db.rollback()
-                    except Exception:
-                        pass
-            finally:
-                if _attr_db:
-                    try:
-                        _attr_db.close()
-                    except Exception:
-                        pass
-            attr_facts = _attributes_to_facts(attributes)
-            log.info("query.error_attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
-            resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
-            merged_facts = resolved_direct + resolved_baseline + resolved_attr_facts
-            events = _fetch_user_events(db, user_id)
-            if events:
-                events_resolved = _resolve_display_names(events, registry, user_id, user_entity_id_for_query) if registry else events
-                merged_facts.extend(events_resolved)
-            log.info("query.error_merged", attr_count=len(resolved_attr_facts), total=len(merged_facts))
-            # Populate preferred_names (dprompt-61)
-            preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, [], attributes)
-            entity_types_err = _build_entity_types(preferred_names)
+        data = response.json()
+        results = []
 
-            # dprompt-91: Apply archive filtering (error case)
-            try:
-                filtered_facts, archive_metadata = apply_archive_filter(
-                    db, query_lower, user_id, merged_facts
-                )
-                log.info("query.error.archive_filtering_applied", **archive_metadata)
-                merged_facts = filtered_facts
-            except Exception as e:
-                log.error("query.error.archive_filter_failed", error=str(e))
-                raise
+        # Extract facts from search results
+        for result in data.get("result", []):
+            payload = result.get("payload", {})
+            score = result.get("score", 0.0)
 
-            return {
-                    "status": "ok",
-                    "facts": merged_facts,
-                    "preferred_names": _clean_preferred_names(preferred_names),
-                    "canonical_identity": canonical_identity,
-                    "entity_types": entity_types_err,
-                    "attributes": attributes,
-                }
-
-        qdrant_facts = [
-            {
-                "subject": h["payload"].get("subject"),
-                "object": h["payload"].get("object"),
-                "rel_type": h["payload"].get("rel_type"),
-                "provenance": h["payload"].get("provenance"),
-                "confidence": h["payload"].get("confidence", 1.0),
-                "category": _get_rel_type_category(h["payload"].get("rel_type") or ""),
-                "fact_state": (
-                    "long_term" if h["payload"].get("fact_class") in ("A", None)
-                    else "staged" if h["payload"].get("fact_class") == "B"
-                    else "ephemeral"
-                ),
-                "fact_class": h["payload"].get("fact_class", "A"),
-                "definition": "",  # Will be populated from rel_types below
+            fact = {
+                "subject": payload.get("subject"),
+                "rel_type": payload.get("rel_type"),
+                "object": payload.get("object"),
+                "confidence": payload.get("confidence", 0.4),
+                "fact_class": payload.get("fact_class", "C"),  # Usually Class C from staging
+                "qdrant_score": score,
+                "source": "qdrant"
             }
-            for h in resp.json().get("result", [])
-            if h.get("payload")
-        ]
+            results.append(fact)
 
-        # Fetch definitions from rel_types for Qdrant facts (dprompt-filter-nl)
-        if qdrant_facts:
-            try:
-                rel_types_in_qdrant = set(f["rel_type"] for f in qdrant_facts if f.get("rel_type"))
-                if rel_types_in_qdrant:
-                    with db.cursor() as cur:
-                        placeholders = ",".join(["%s"] * len(rel_types_in_qdrant))
-                        cur.execute(
-                            f"SELECT rel_type, natural_language FROM rel_types WHERE rel_type IN ({placeholders})",
-                            list(rel_types_in_qdrant)
-                        )
-                        definitions = {row[0]: (row[1] or "") for row in cur.fetchall()}
-                    for f in qdrant_facts:
-                        f["definition"] = definitions.get(f.get("rel_type"), "")
-            except Exception as e:
-                log.warning("query.qdrant_definitions_lookup_failed", error=str(e))
+        return results
 
-        log.info("query.ok", collection=collection, hits=len(qdrant_facts))
-
-        # Resolve display names for all facts before merging
-        resolved_baseline = _resolve_display_names(baseline_facts, registry, user_id, user_entity_id_for_query) if registry else baseline_facts
-        resolved_direct = _resolve_display_names(direct_facts, registry, user_id, user_entity_id_for_query) if registry else direct_facts
-        resolved_qdrant = _resolve_display_names(qdrant_facts, registry, user_id, user_entity_id_for_query) if registry else qdrant_facts
-
-        # Merge: Postgres facts are authoritative, Qdrant adds associative context
-        # Deduplicate on (subject_uuid, rel_type, object_uuid) — Postgres wins.
-        # Use UUIDs from _subject_id/_object_id, not display names, because same
-        # UUID may have different aliases (e.g., "${USER}" vs "user" for user entity).
-        pg_keys = {(f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"]) for f in resolved_direct}
-        merged_facts = resolved_direct.copy()
-        for f in resolved_qdrant:
-            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
-            if key not in pg_keys:
-                merged_facts.append(f)
-                pg_keys.add(key)
-
-        # Merge baseline personal facts (location, attributes) — always present for
-        # known identities regardless of whether Qdrant or graph traversal returned them.
-        for f in resolved_baseline:
-            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
-            if key not in pg_keys:
-                merged_facts.append(f)
-                pg_keys.add(key)
-
-        # Extract entity IDs from PRE-RESOLUTION facts to get UUIDs, not display names
-        pre_resolution_fact_ids = {user_entity_id_for_query} | resolved_entity_ids
-        for f in direct_facts + baseline_facts + qdrant_facts:
-            if _UUID_PATTERN.match(f.get("subject", "")):
-                pre_resolution_fact_ids.add(f["subject"])
-            if _UUID_PATTERN.match(f.get("object", "")):
-                pre_resolution_fact_ids.add(f["object"])
-
-        _attr_db = None
-        try:
-            _attr_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
-            attributes = _fetch_attributes(_attr_db, user_id, list(pre_resolution_fact_ids), max_sensitivity="private")
-            _attr_db.commit()
-        except Exception as _ae:
-            if _attr_db:
-                try:
-                    _attr_db.rollback()
-                except Exception:
-                    pass
-            log.warning("query.qdrant_attributes_failed", error=str(_ae))
-            attributes = {}
-        finally:
-            if _attr_db:
-                try:
-                    _attr_db.close()
-                except Exception:
-                    pass
-
-        # Merge user entity_attributes as facts (born_on, age, height, etc.)
-        attr_facts = _attributes_to_facts(attributes)
-        log.info("query.attributes_to_facts", count=len(attr_facts), attributes_keys=list(attributes.keys()) if attributes else [])
-        resolved_attr_facts = _resolve_display_names(attr_facts, registry, user_id, user_entity_id_for_query) if registry else attr_facts
-        attr_added = 0
-        for f in resolved_attr_facts:
-            # dprompt-92: Use UUID keys for dedup to match other facts (baseline, qdrant)
-            # _subject_id/_object_id preserve UUIDs, same display names may vary by alias
-            key = (f.get("_subject_id", f["subject"]), f.get("_object_id", f["object"]), f["rel_type"])
-            if key not in pg_keys:
-                merged_facts.append(f)
-                pg_keys.add(key)
-                attr_added += 1
-        log.info("query.attributes_merged", added=attr_added, total_after=len(merged_facts))
-
-        # Populate preferred_names (dprompt-61) — use extracted attributes from above
-        preferred_names = _populate_preferred_names(merged_facts, direct_facts, baseline_facts, qdrant_facts, attributes)
-
-        log.info("query.merged", pg_hits=len(pg_keys), baseline=len(resolved_baseline), total=len(merged_facts))
-
-        # ── dprompt-61: Deduplicate by entity UUID + attach alias metadata ──
-        # Facts may have different display names for the same entity_id
-        # (e.g., john spouse emma AND ${USER} spouse emma). Deduplicate
-        # using underlying UUIDs (_subject_id, _object_id) preserved by _resolve_display_names.
-        _deduped: dict[tuple, dict] = {}
-        for _f in merged_facts:
-            _sid = _f.pop("_subject_id", _f.get("subject", ""))
-            _oid = _f.pop("_object_id", _f.get("object", ""))
-            _key = (_sid, _f.get("rel_type", ""), _oid)
-            if _key not in _deduped or _deduped[_key].get("confidence", 0) < _f.get("confidence", 0):
-                _deduped[_key] = _f
-
-        # Attach alias metadata for each deduplicated fact
-        _aliased_facts = []
-        for (_sid, _rel, _oid), _f in _deduped.items():
-            _f["_aliases"] = {
-                "subject": _get_entity_aliases(_sid),
-                "object": _get_entity_aliases(_oid),
-            }
-            _aliased_facts.append(_f)
-
-        merged_facts = _aliased_facts
-        log.info("query.deduplicated", before=len(pg_keys), after=len(merged_facts))
-        # ── end dprompt-61 ──────────────────────────────────────────────────
-
-        # dprompt-91: Apply archive filtering (main success case)
-        try:
-            filtered_facts, archive_metadata = apply_archive_filter(
-                db, query_lower, user_id, merged_facts
-            )
-            log.info("query.success.archive_filtering_applied", **archive_metadata)
-            merged_facts = filtered_facts
-        except Exception as e:
-            log.error("query.success.archive_filter_failed", error=str(e))
-            raise
-
-        # Strip internal metadata before returning to Filter
-        _INTERNAL_KEYS = ("user_id", "qdrant_synced", "superseded_at", "fact_class", "promoted_at", "confirmed_count")
-        for _f in merged_facts:
-            for _k in _INTERNAL_KEYS:
-                _f.pop(_k, None)
-
-        entity_types = _build_entity_types(preferred_names)
-        return {
-            "status": "ok",
-            "facts": merged_facts,
-            "preferred_names": _clean_preferred_names(preferred_names),
-            "canonical_identity": canonical_identity,
-            "entity_types": entity_types,
-            "attributes": attributes,
-        }
     except Exception as e:
-        log.error("query.failed", error=str(e))
-        return {
-            "status": "ok",
-            "facts": [],
-            "entity_types": {},
-            "preferred_names": _clean_preferred_names(preferred_names),
-            "canonical_identity": canonical_identity,
-            "attributes": {},
-        }
+        log.error(f"qdrant_semantic_search: error user_id={user_id} collection={derive_collection(user_id)}: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 4: Natural Language Conversion - Convert Facts to Prose
+# ──────────────────────────────────────────────────────────────────────────────
+
+def resolve_display_name(entity_id: str, db) -> str:
+    """
+    Resolve a UUID or user_id to a human-readable display name.
+
+    Args:
+        entity_id: UUID or 'user' string
+        db: Database connection
+
+    Returns:
+        Display name (from entity_aliases.alias where is_preferred=true)
+        Fallback: any alias if preferred not found
+        Fallback: UUID itself if no alias exists
+
+    Never returns None — always returns a string.
+    """
+    if not entity_id:
+        return "unknown"
+
+    # Special case: user entity
+    if entity_id == "user":
+        return "user"
+
+    # If it's already a short display name (not a UUID), return as-is
+    if not _UUID_PATTERN.match(str(entity_id)):
+        return str(entity_id)
+
+    try:
+        # Primary lookup: preferred alias from entity_aliases
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT alias FROM entity_aliases WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                (entity_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+
+        # Fallback: any alias (non-preferred)
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT alias FROM entity_aliases WHERE entity_id = %s LIMIT 1",
+                (entity_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+
+        # Fallback: return UUID itself
+        return str(entity_id)
+
+    except Exception as e:
+        log.warning("resolve_display_name.error", entity_id=entity_id, error=str(e))
+        return str(entity_id)
+
+
+def convert_to_prose(facts: list[dict], db) -> list[str]:
+    """
+    Convert facts to human-readable prose using rel_types.natural_language.
+
+    Args:
+        facts: List of fact dicts with keys:
+            - subject_id (UUID)
+            - rel_type (string)
+            - object_id (UUID, only for relational facts)
+            - fact_class (optional: 'A', 'B', or 'C')
+            - Other metadata
+        db: Database connection
+
+    Returns:
+        List of prose strings (e.g., "You are married to Marla")
+        Class C facts marked with "[staged]" prefix
+        Facts with missing natural_language template are skipped with warning logged
+    """
+    prose_list = []
+
+    if not facts:
+        return prose_list
+
+    try:
+        # Build rel_type → natural_language lookup
+        rel_type_templates = {}
+        with db.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(set(f.get("rel_type", "").lower() for f in facts if f.get("rel_type"))))
+            if placeholders:
+                rel_types_list = list(set(f.get("rel_type", "").lower() for f in facts if f.get("rel_type")))
+                cur.execute(
+                    f"SELECT rel_type, natural_language FROM rel_types WHERE rel_type IN ({placeholders})",
+                    rel_types_list
+                )
+                for row in cur.fetchall():
+                    rel_type_templates[row[0]] = row[1]
+
+        # Convert each fact to prose
+        for fact in facts:
+            try:
+                rel_type = fact.get("rel_type", "").lower()
+                subject_id = fact.get("subject_id") or fact.get("subject")
+                object_id = fact.get("object_id") or fact.get("object")
+                fact_class = fact.get("fact_class")
+
+                # Get natural_language template
+                template = rel_type_templates.get(rel_type)
+                if not template:
+                    log.warning("convert_to_prose.no_template", rel_type=rel_type)
+                    continue
+
+                # Resolve display names
+                subject_name = resolve_display_name(subject_id, db)
+                object_name = resolve_display_name(object_id, db) if object_id else None
+
+                # Format prose
+                try:
+                    prose = template.format(subject=subject_name, object=object_name)
+                except KeyError as e:
+                    log.warning("convert_to_prose.template_format_error",
+                               rel_type=rel_type, template=template, error=str(e))
+                    continue
+
+                # Mark Class C facts as staged
+                if fact_class == "C":
+                    prose = f"[staged] {prose}"
+
+                prose_list.append(prose)
+
+            except Exception as e:
+                log.warning("convert_to_prose.fact_error",
+                           rel_type=fact.get("rel_type"), error=str(e))
+                continue
+
+        return prose_list
+
+    except Exception as e:
+        log.error("convert_to_prose.error", error=str(e))
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 5: FINAL INTEGRATION - Complete /query Endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# This endpoint orchestrates the complete query pipeline:
+# 1. Resolve anchor (WHO are we talking about?)
+# 2. Determine path (WHAT information is being asked for?)
+# 3. Fetch facts from anchor (DB lookup with confidence)
+# 4. Qdrant semantic search (contextual Class C facts for confirmation)
+# 5. Apply confidence gate (filter by MIN_INJECT_CONFIDENCE valve)
+# 6. Convert to prose (format using rel_types.natural_language)
+# 7. Return QueryResponse (facts as human-readable prose only)
+#
+# Re-embedder Phase 6 Integration:
+# - Returned facts appear in conversation context
+# - Class C facts from Qdrant are monitored for confirmation
+# - Confirmed facts (confirmed_count >= 3) auto-promoted to Class B
+# - Promoted facts get confidence 0.8, visible in future queries
+# - This is the self-strengthening loop
+
+@app.post("/query")
+async def query(request: QueryRequest) -> QueryResponse:
+    """
+    Phase 5 Query Endpoint: Simplified orchestration of Phase 1-4 components.
+
+    Args:
+        request: QueryRequest with:
+            - text: current user query
+            - user_id: UUID or "anonymous"
+            - conversation_history: list[ConversationMessage] with role + content
+            - known_entities: optional {name: uuid} mapping
+
+    Returns:
+        QueryResponse with:
+            - anchor: UUID of WHO we're talking about
+            - facts: list[str] of prose facts (human-readable only, NO UUIDs/rel_types)
+            - confidence_applied: bool (always True for Phase 5)
+            - staged_facts_count: int (number of Class C facts included)
+            - error: optional error message
+
+    Pipeline:
+    1. Resolve anchor (WHO) — pronouns + direct names + possessives
+    2. Determine path (WHAT) — scalar/relationship/taxonomy routing
+    3. Fetch DB facts from anchor — confidence scores included
+    4. Qdrant semantic search — contextual Class C facts
+    5. Apply confidence gate — hard stop at MIN_INJECT_CONFIDENCE (0.4)
+    6. Convert to prose — rel_types.natural_language formatting
+    7. Return facts as prose (no UUIDs or rel_type names)
+    """
+    user_id = request.user_id or "anonymous"
+    query_text = request.text
+    conversation_history = request.conversation_history or []
+    min_confidence = float(os.environ.get("MIN_INJECT_CONFIDENCE", 0.4))
+    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+
+    db = None
+    try:
+        # Initialize database connection
+        dsn = os.environ.get("POSTGRES_DSN")
+        if dsn:
+            db = psycopg2.connect(dsn)
+        else:
+            log.warning("query.phase5.no_postgres_dsn")
+
+        # Step 1: Resolve anchor (WHO are we talking about?)
+        anchor = resolve_anchor(query_text, conversation_history, user_id, db)
+        log.info("query.phase5.anchor_resolved", anchor=anchor[:8] if anchor else "unknown", query=query_text[:50])
+
+        # Step 2: Determine path (WHAT are we asking for?)
+        path = determine_path(query_text, db)
+        log.info("query.phase5.path_determined",
+                scalars=len(path.scalar_rels), relationships=len(path.relationship_rels),
+                taxonomies=len(path.taxonomy_groups), fetch_all=path.fetch_all_details)
+
+        # Step 3: Fetch facts from anchor (PostgreSQL lookup)
+        db_facts = fetch_facts_from_anchor(anchor, user_id, path)
+        log.info("query.phase5.db_facts_fetched", count=len(db_facts))
+
+        # Step 4: Qdrant semantic search (contextual Class C facts)
+        qdrant_facts = qdrant_semantic_search(
+            query_text,
+            conversation_history,
+            user_id,
+            qdrant_url
+        )
+        log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
+
+        # Step 5: Apply confidence gate (hard stop at threshold)
+        gated_facts = apply_confidence_gate(db_facts, qdrant_facts, min_confidence)
+        log.info("query.phase5.confidence_gate_applied", before=len(db_facts) + len(qdrant_facts), after=len(gated_facts), threshold=min_confidence)
+
+        # Step 6: Build preferred_names and attributes dicts from facts
+        preferred_names = {}
+        attributes = {}
+
+        # Collect all unique UUIDs from facts to resolve display names
+        entity_uuids = set()
+        for fact in gated_facts:
+            subject_id = fact.get("subject_id") or fact.get("subject")
+            object_id = fact.get("object_id") or fact.get("object")
+            if subject_id and isinstance(subject_id, str) and len(subject_id) == 36:  # UUID length
+                entity_uuids.add(subject_id)
+            if object_id and isinstance(object_id, str) and len(object_id) == 36:
+                entity_uuids.add(object_id)
+
+        # Query entity_aliases to get display names for all UUIDs
+        if entity_uuids:
+            try:
+                with db.cursor() as cur:
+                    placeholders = ",".join(["%s"] * len(entity_uuids))
+                    cur.execute(
+                        f"SELECT entity_id, alias FROM entity_aliases WHERE entity_id IN ({placeholders}) AND is_preferred = true",
+                        list(entity_uuids)
+                    )
+                    for entity_id, alias in cur.fetchall():
+                        preferred_names[entity_id] = alias
+            except Exception as e:
+                log.warning("query.preferred_names_lookup.failed", error=str(e))
+
+        # FIX 1: UUID Fallback Removal (dprompt-148 Phase 1)
+        # Removed: fallback that stored uuid → uuid mappings
+        # This prevents UUID leakage to API response (CLAUDE.md constraint)
+        # Unresolved UUIDs will be skipped in the fact resolution loop below
+
+        # FIX 2: Fact Resolution Loop (dprompt-148 Phase 2)
+        # Transform all facts to resolve subject/object UUIDs to display names
+        # Skip facts with unresolved UUIDs (both subject and object)
+        # Separate logic for relational (UUID) vs scalar (STRING) objects
+        resolved_facts = []
+        for fact in gated_facts:
+            subject_id = fact.get("subject_id") or fact.get("subject")
+            object_id = fact.get("object_id") or fact.get("object")
+            rel_type = fact.get("rel_type", "").lower() if fact.get("rel_type") else ""
+
+            # Determine if subject is a UUID
+            subject_is_uuid = subject_id and isinstance(subject_id, str) and _UUID_PATTERN.match(subject_id)
+
+            # Determine if object is a UUID
+            object_is_uuid = object_id and isinstance(object_id, str) and _UUID_PATTERN.match(object_id)
+
+            # Skip facts where subject is unresolved UUID
+            if subject_is_uuid and subject_id not in preferred_names:
+                log.debug("query.fact_resolution.skipped_unresolved_subject",
+                         rel_type=rel_type, subject_uuid=subject_id[:8])
+                continue
+
+            # Handle subject resolution
+            subject_display = preferred_names.get(subject_id, subject_id) if subject_is_uuid else subject_id
+
+            # Handle object resolution based on type (UUID vs STRING)
+            if object_is_uuid:
+                # Relational fact: object is a UUID
+                if object_id not in preferred_names:
+                    log.debug("query.fact_resolution.skipped_unresolved_object",
+                             rel_type=rel_type, object_uuid=object_id[:8])
+                    continue
+                object_display = preferred_names.get(object_id, object_id)
+            else:
+                # FIX 4: Scalar fact: object is STRING value (age="12", name="Marla")
+                object_display = object_id  # Use as-is (already a string value)
+
+            # Create resolved fact with display names (remove internal _id fields)
+            resolved_fact = fact.copy()
+            resolved_fact["subject"] = subject_display
+            resolved_fact["object"] = object_display
+
+            # Remove internal metadata fields that shouldn't be in API response
+            resolved_fact.pop("subject_id", None)
+            resolved_fact.pop("object_id", None)
+            resolved_fact.pop("_is_inverse", None)
+
+            resolved_facts.append(resolved_fact)
+
+            # Build attributes dict using display names (FIX 4)
+            # For scalar facts (stored in entity_attributes), check metadata to determine if rel_type is scalar
+            # CLAUDE.md constraint: Metadata-driven validation via rel_types table (line 198, 292-298)
+            rel_meta = _REL_TYPE_META.get(rel_type, {})
+            tail_types = rel_meta.get("tail_types", [])
+            is_scalar_rel = "SCALAR" in tail_types if isinstance(tail_types, list) else False
+
+            if is_scalar_rel:
+                if subject_display:
+                    if subject_display not in attributes:
+                        attributes[subject_display] = {}
+                    attributes[subject_display][rel_type] = object_display
+
+        # Step 7: Convert to prose and add definition field to each fact
+        prose_facts = convert_to_prose(resolved_facts, db)
+
+        # Rebuild facts list with definition field added
+        facts_with_definition = []
+        prose_index = 0
+        for fact in resolved_facts:
+            fact_copy = fact.copy()
+            # Add prose definition if available
+            if prose_index < len(prose_facts):
+                fact_copy["definition"] = prose_facts[prose_index]
+                prose_index += 1
+            facts_with_definition.append(fact_copy)
+
+        staged_count = sum(1 for f in resolved_facts if f.get("fact_class") == "C")
+        log.info("query.phase5.prose_converted", facts=len(facts_with_definition), staged=staged_count)
+
+        # Step 8: Return QueryResponse with structured facts + metadata dicts
+        return QueryResponse(
+            anchor=anchor,
+            facts=facts_with_definition,
+            preferred_names=preferred_names,
+            canonical_identity=anchor,
+            attributes=attributes,
+            confidence_applied=True,
+            staged_facts_count=staged_count,
+            error=None
+        )
+
+    except Exception as e:
+        # Error handling: return empty response with error message
+        log.error("query.phase5.failed", error=str(e), query=query_text[:50])
+        return QueryResponse(
+            anchor="",
+            facts=[],
+            confidence_applied=False,
+            staged_facts_count=0,
+            error=str(e)
+        )
+
     finally:
-        # === ATOMIC CLEANUP: Close connection after entire query completes ===
+        # Cleanup: close database connection if opened
         if db:
             try:
                 db.close()
             except Exception:
                 pass
+
+
 
 # ── SURGICAL FACT CORRECTION ENDPOINT ────────────────────────────────────────
 @app.post("/retract/correct", response_model=FactCorrectionResponse)
