@@ -1330,6 +1330,7 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
 
                     try:
                         with db_conn.cursor() as cur:
+                            # Insert into retraction_signals (extraction/detection layer)
                             cur.execute("""
                                 INSERT INTO retraction_signals
                                 (signal, signal_category, language, priority, false_positive_rate, notes, created_at, updated_at)
@@ -1342,18 +1343,41 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                                 false_positive_rate,
                                 f"Auto-learned: freq={freq}, success_rate={success_rate:.2f}, method={retraction_method}"
                             ))
+
+                            # Also insert into negation_patterns (intent classification layer)
+                            # Map retraction_signals to negation_patterns for /classify-intent
+                            negation_type = 'retraction' if category != 'correction' else 'correction'
+                            negation_confidence = min(0.99, priority / 100.0)  # priority 50-100 → confidence 0.5-0.99
+                            global_user_id = '00000000-0000-0000-0000-000000000000'  # Global patterns
+
+                            cur.execute("""
+                                INSERT INTO negation_patterns
+                                (user_id, pattern_text, negation_type, learned_from, confidence, created_at)
+                                VALUES (%s, %s, %s, 'retraction_outcome_learning', %s, NOW())
+                                ON CONFLICT (user_id, pattern_text, negation_type) DO UPDATE
+                                SET confidence = GREATEST(negation_patterns.confidence, %s),
+                                    created_at = NOW()
+                            """, (
+                                global_user_id,
+                                pattern_lower,
+                                negation_type,
+                                negation_confidence,
+                                negation_confidence
+                            ))
+
                         db_conn.commit()
                         stats["discovered"] += 1
                         log.info(
-                            f"re_embedder.retraction_signal_discovered "
-                            f"pattern={pattern[:60]}"
-                            f" category={category} "
+                            f"re_embedder.pattern_learned_to_both_tables "
+                            f"pattern={pattern[:60]} "
+                            f"retraction_signals.priority={priority} "
+                            f"negation_patterns.confidence={negation_confidence:.2f} "
                             f"freq={freq} success_rate={success_rate:.2f}"
                         )
                     except Exception as e:
                         db_conn.rollback()
                         stats["errors"] += 1
-                        log.error(f"re_embedder.retraction_signal_insert_failed pattern={pattern[:60]}: {e}")
+                        log.error(f"re_embedder.pattern_learning_failed pattern={pattern[:60]}: {e}")
 
                 else:
                     # ────────────────────────────────────────────────────────────────
@@ -1368,6 +1392,7 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                     if priority_delta > 5 or fpr_delta > 0.05:
                         try:
                             with db_conn.cursor() as cur:
+                                # Update retraction_signals (extraction/detection layer)
                                 cur.execute("""
                                     UPDATE retraction_signals SET
                                       priority = %s,
@@ -1381,12 +1406,31 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                                     f"Updated: freq={freq}, success_rate={success_rate:.2f}, old_priority={existing_priority}",
                                     existing_id
                                 ))
+
+                                # Also update negation_patterns (intent classification layer)
+                                negation_type = 'retraction' if existing_category != 'correction' else 'correction'
+                                negation_confidence = min(0.99, priority / 100.0)
+                                global_user_id = '00000000-0000-0000-0000-000000000000'
+
+                                cur.execute("""
+                                    UPDATE negation_patterns SET
+                                      confidence = GREATEST(confidence, %s),
+                                      created_at = NOW()
+                                    WHERE user_id = %s AND pattern_text = %s AND negation_type = %s
+                                """, (
+                                    negation_confidence,
+                                    global_user_id,
+                                    pattern_lower,
+                                    negation_type
+                                ))
+
                             db_conn.commit()
                             stats["updated"] += 1
                             log.info(
-                                f"re_embedder.retraction_signal_updated "
+                                f"re_embedder.pattern_updated_in_both_tables "
                                 f"pattern={pattern[:60]} "
-                                f"priority={existing_priority}->{priority} "
+                                f"retraction_signals.priority={existing_priority}->{priority} "
+                                f"negation_patterns.confidence updated "
                                 f"fpr={existing_fpr:.2f}->{false_positive_rate:.2f}"
                             )
                         except Exception as e:
