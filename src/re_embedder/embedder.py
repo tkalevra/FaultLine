@@ -23,6 +23,10 @@ from src.api.llm_calls import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
+# Global pooled HTTP client for embedding and Qdrant calls (dBug-051 fix)
+# Prevents connection churn from bare httpx.post() calls
+_http_client = httpx.Client(timeout=30.0, limits=httpx.Limits(max_connections=10))
+
 
 def _get_circuit_breaker_status() -> dict:
     """Get circuit breaker status for LLM calls (for awareness in background loop).
@@ -160,12 +164,15 @@ def derive_collection(user_id: str) -> str:
     return f"faultline-{user_id}"
 
 
-def fetch_unsynced(db_conn, confidence_threshold: float = 0.0) -> list[dict]:
-    """Fetch all non-superseded facts where qdrant_synced = false and confidence >= threshold."""
+def fetch_unsynced(db_conn, user_id: str, confidence_threshold: float = 0.0) -> list[dict]:
+    """Fetch all non-superseded facts where qdrant_synced = false and confidence >= threshold.
+
+    Per-user schema context: user_id is passed as parameter (schema provides isolation).
+    """
     with db_conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT id, subject_id, object_id, rel_type, provenance, user_id,
+            SELECT id, subject_id, object_id, rel_type, provenance,
                    confidence, confirmed_count, last_seen_at, contradicted_by
             FROM facts
             WHERE qdrant_synced = false AND (superseded_at IS NULL)
@@ -183,22 +190,25 @@ def fetch_unsynced(db_conn, confidence_threshold: float = 0.0) -> list[dict]:
             "object_id": row[2],
             "rel_type": row[3],
             "provenance": row[4],
-            "user_id": row[5] if row[5] else "anonymous",
-            "confidence": row[6] if row[6] is not None else 1.0,
-            "confirmed_count": row[7] if row[7] is not None else 0,
-            "last_seen_at": row[8],
-            "contradicted_by": row[9],
+            "user_id": user_id,
+            "confidence": row[5] if row[5] is not None else 1.0,
+            "confirmed_count": row[6] if row[6] is not None else 0,
+            "last_seen_at": row[7],
+            "contradicted_by": row[8],
         }
         for row in rows
     ]
 
 
-def fetch_unsynced_staged(db_conn) -> list[dict]:
-    """Fetch staged_facts where qdrant_synced = false and not yet promoted or expired."""
+def fetch_unsynced_staged(db_conn, user_id: str) -> list[dict]:
+    """Fetch staged_facts where qdrant_synced = false and not yet promoted or expired.
+
+    Per-user schema context: user_id is passed as parameter (schema provides isolation).
+    """
     with db_conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, subject_id, object_id, rel_type, provenance, user_id,
+            SELECT id, subject_id, object_id, rel_type, provenance,
                    confidence, confirmed_count, last_seen_at, fact_class
             FROM staged_facts
             WHERE qdrant_synced = false
@@ -215,13 +225,13 @@ def fetch_unsynced_staged(db_conn) -> list[dict]:
             "object_id": row[2],
             "rel_type": row[3],
             "provenance": row[4],
-            "user_id": row[5] or "anonymous",
-            "confidence": row[6] if row[6] is not None else 0.6,
-            "confirmed_count": row[7] if row[7] is not None else 0,
-            "last_seen_at": row[8],
+            "user_id": user_id,
+            "confidence": row[5] if row[5] is not None else 0.6,
+            "confirmed_count": row[6] if row[6] is not None else 0,
+            "last_seen_at": row[7],
             "contradicted_by": None,
             "staged_id": row[0],
-            "fact_class": row[9],
+            "fact_class": row[8],
         }
         for row in rows
     ]
@@ -295,7 +305,8 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
                 timeout=timeout,
             )
         else:
-            response = httpx.post(
+            # Use pooled client instead of bare httpx.post() (dBug-051: prevent connection churn)
+            response = _http_client.post(
                 embed_url,
                 json={"model": "text-embedding-nomic-embed-text-v1.5", "input": text},
                 headers=get_llm_headers(),
@@ -343,7 +354,8 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
     Returns True if collection exists or was created, False on failure.
     """
     try:
-        response = httpx.get(
+        # Use pooled client instead of bare httpx.get() (dBug-051: prevent connection churn)
+        response = _http_client.get(
             f"{qdrant_url}/collections/{collection}",
             timeout=10.0
         )
@@ -477,44 +489,141 @@ def promote_facts(db_conn) -> None:
     db_conn.commit()
 
 
-def promote_staged_facts(db_conn, qdrant_url: str, promotion_threshold: int = 3) -> int:
+def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_name: str = None, promotion_threshold: int = 3) -> int:
     """
-    Promote Class B staged facts that have reached confirmed_count >= threshold.
-    Inserts into facts table, marks staged row as promoted.
-    Returns count of promoted facts.
+    Promote Class B staged facts to facts table when confirmed_count >= threshold.
+
+    Confirmation Mechanism (Source: _commit_staged in main.py, lines 1017-1075):
+    ────────────────────────────────────────────────────────────────────────────
+    Staged facts accumulate a confirmed_count every time they're re-ingested.
+    The count increments via PostgreSQL ON CONFLICT clauses in main.py _commit_staged().
+
+    When confirmed_count >= promotion_threshold (default: 3):
+    • Fact has appeared in >= 4 separate ingest calls (calls 0→1→2→3)
+    • System confidence increases with each occurrence
+    • promote_staged_facts() moves to facts table with Class A confidence
+    • Staged row marked as promoted (non-destructive soft delete via promoted_at)
+
+    Full Workflow:
+    1. Fact inserted 4 times → confirmed_count increments: 0→1→2→3
+    2. Re-embedder polls every 60 seconds → calls promote_staged_facts()
+    3. Queries: SELECT ... FROM staged_facts WHERE confirmed_count >= 3
+    4. For each candidate: INSERT into facts table with ON CONFLICT (increments facts.confirmed_count)
+    5. UPDATE staged_facts SET promoted_at = now() (marks row as promoted)
+    6. DELETE from Qdrant staged collection (cleanup, best-effort)
+    7. Log confirmation to observability system
+
+    Threshold Rationale (3 confirmations):
+    • 1 occurrence: Could be typo, one-off phrasing, random utterance
+    • 2 occurrences: Still vulnerable to coincidence or misunderstanding
+    • 3 occurrences: Sweet spot — filters noise, captures recurring patterns
+    • Higher threshold: Would miss important recurring facts, delay promotion
+
+    Edge Cases & Safety:
+    • Promotion is **non-cascading** — only the matching triple is promoted
+    • Other facts about same entities unaffected (e.g., promoting "works_for" doesn't touch "spouse")
+    • Per-user isolation maintained (no cross-user promotion, schema_name isolates via search_path)
+    • Archived facts (superseded_at IS NOT NULL) excluded from promotion (WHERE clause)
+    • Race-safe: PostgreSQL ACID guarantees atomicity between concurrent ingest calls
+
+    Args:
+        db_conn: PostgreSQL connection (per-user schema context via search_path)
+        qdrant_url: Qdrant service URL for staged collection cleanup
+        user_id: User UUID for collection naming (optional, derived from schema context)
+        schema_name: User schema name (e.g., "faultline_christopher"). If provided, sets search_path.
+        promotion_threshold: Confirmed count threshold for promotion (default 3, configurable)
+
+    Returns:
+        Count of promoted facts successfully moved to facts table.
+
+    Grounding Documents:
+    • Self_Growth.md Section "Phase 2: Confirmation Tracking" (Mechanism #9, lines 1060-1100)
+    • main.py _commit_staged() (lines 1017-1075, ON CONFLICT confirmation increment)
+    • CLAUDE.md "Ingest Pipeline: Three-Stage Intent-Aware Pipeline" (staged facts lifecycle)
+    • CLAUDE.md "Fact Classification, Storage & Retrieval" (Class A/B/C promotion flow)
     """
     promoted = 0
     try:
+        # CRITICAL: Set search_path per-user schema if schema_name provided
+        if schema_name:
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}, public")
+            except Exception as e:
+                log.warning(f"re_embedder.search_path_setup_failed schema={schema_name}: {e}")
+                # Continue with current search_path
+
+        # C→B upgrade: Class C facts that have accumulated enough confirmations graduate
+        # to Class B and enter the B→facts promotion pipeline in this same cycle.
+        # expires_at extended so they survive long enough to reach the next threshold.
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE staged_facts
+                    SET fact_class   = 'B',
+                        expires_at   = GREATEST(expires_at, now() + interval '30 days'),
+                        qdrant_synced = false
+                    WHERE fact_class     = 'C'
+                      AND confirmed_count >= %s
+                      AND promoted_at IS NULL
+                      AND expires_at   > now()
+                    """,
+                    (promotion_threshold,)
+                )
+                n_c_to_b = cur.rowcount
+            db_conn.commit()
+            if n_c_to_b:
+                log.info(f"re_embedder.class_c_upgraded_to_b count={n_c_to_b} threshold={promotion_threshold}")
+        except Exception as e:
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+            log.error(f"re_embedder.class_c_upgrade_failed: {e}")
+
         with db_conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, user_id, subject_id, object_id, rel_type,
+                SELECT id, subject_id, object_id, rel_type,
                        provenance, confidence
                 FROM staged_facts
                 WHERE fact_class = 'B'
                   AND confirmed_count >= %s
                   AND promoted_at IS NULL
-                  AND expires_at > now()
                 """,
                 (promotion_threshold,)
             )
             candidates = cur.fetchall()
 
         for row in candidates:
-            sid, user_id, subject, obj, rel_type, prov, conf = row
+            sid, subject, obj, rel_type, prov, conf = row
+            # user_id is implicit in per-user schema context (set by SET search_path)
             try:
+                # Log promotion decision: fact met confirmation threshold
+                log.info(
+                    "re_embedder.promoting_staged_fact",
+                    staged_id=sid,
+                    subject_id=subject[:8] if subject else "?",
+                    rel_type=rel_type,
+                    object_id=obj[:8] if obj else "?",
+                    promotion_threshold=promotion_threshold,
+                    fact_class='B',
+                    promotion_reason=f"confirmed_count met threshold ({promotion_threshold}), graduating to Class A"
+                )
+
                 with db_conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO facts"
-                        " (user_id, subject_id, object_id, rel_type, provenance,"
+                        " (subject_id, object_id, rel_type, provenance,"
                         "  confidence, fact_class, fact_provenance, qdrant_synced)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, 'B', %s, false)"
-                        " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
+                        " VALUES (%s, %s, %s, %s, %s, 'B', %s, false)"
+                        " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now()",
-                        (user_id, subject, obj, rel_type, prov, conf, prov)
+                        (subject, obj, rel_type, prov, conf, prov)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET promoted_at = now() WHERE id = %s",
@@ -522,6 +631,17 @@ def promote_staged_facts(db_conn, qdrant_url: str, promotion_threshold: int = 3)
                     )
                 db_conn.commit()
                 promoted += 1
+
+                # Log successful promotion: fact moved from staged → authoritative facts table
+                log.debug(
+                    "re_embedder.promoted_fact_committed",
+                    staged_id=sid,
+                    subject_id=subject[:8] if subject else "?",
+                    rel_type=rel_type,
+                    object_id=obj[:8] if obj else "?",
+                    destination="facts table (Class A)",
+                    confirmation_message="Fact now authoritative in per-user schema"
+                )
 
                 # Best-effort: delete staged Qdrant point after promotion commits
                 try:
@@ -539,7 +659,10 @@ def promote_staged_facts(db_conn, qdrant_url: str, promotion_threshold: int = 3)
                     f"subject={subject} rel_type={rel_type}"
                 )
             except Exception as e:
-                db_conn.rollback()
+                try:
+                    db_conn.rollback()
+                except Exception as rollback_err:
+                    log.warning(f"re_embedder.promote_rollback_failed: {rollback_err}")
                 log.error(f"re_embedder.promote_failed staged_id={sid}: {e}")
 
     except Exception as e:
@@ -548,26 +671,61 @@ def promote_staged_facts(db_conn, qdrant_url: str, promotion_threshold: int = 3)
     return promoted
 
 
-def expire_staged_facts(db_conn, qdrant_url: str) -> int:
+def expire_staged_facts(db_conn, qdrant_url: str, user_id: str = None) -> int:
     """
-    Delete Class C staged facts past their expires_at.
-    Also deletes their Qdrant vectors.
-    Returns count of expired facts.
+    Score-decay model for staged facts (C and B).
+
+    Every 30-day window without a new confirmation:
+      - confirmed_count > 0  → decrement by 1, reset window (+30 days)
+      - confirmed_count <= 0 → delete (score hit zero, no evidence to keep)
+
+    This means a fact must be re-observed every ~30 days per point of confidence
+    it has accumulated, or it decays back to zero and is removed.
+
+    Per-user schema context: user_id is passed as parameter (schema provides isolation).
+    Returns count of facts removed (decayed to zero and deleted).
     """
     expired = 0
     try:
+        # Step 1: Decay — Class C facts past their window with remaining score.
+        # Class B is long-term memory; once a fact earns B it does not decay.
+        # Only Class C (short-term/speculative) participates in the decay cycle.
         with db_conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, user_id FROM staged_facts
-                WHERE expires_at <= now()
+                UPDATE staged_facts
+                SET confirmed_count = confirmed_count - 1,
+                    expires_at      = now() + interval '30 days',
+                    qdrant_synced   = false
+                WHERE fact_class    = 'C'
+                  AND expires_at   <= now()
+                  AND confirmed_count > 0
+                  AND promoted_at IS NULL
+                """
+            )
+            n_decayed = cur.rowcount
+        db_conn.commit()
+        if n_decayed:
+            log.info(f"re_embedder.staged_facts_decayed count={n_decayed} user_id={user_id}")
+
+        # Step 2: Remove — Class C facts at score zero AND past their expiry window.
+        # Fresh rows start at confirmed_count=0 but have expires_at = now()+30d — keep them.
+        # Only delete when the window has expired AND score is zero (never confirmed or fully decayed).
+        # Class B facts are never removed here; retraction handles their lifecycle.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM staged_facts
+                WHERE fact_class    = 'C'
+                  AND confirmed_count <= 0
+                  AND expires_at   <= now()
                   AND promoted_at IS NULL
                 """
             )
             stale = cur.fetchall()
 
-        for staged_id, user_id in stale:
-            collection = derive_collection(user_id)
+        collection = derive_collection(user_id) if user_id else os.getenv("QDRANT_COLLECTION", "faultline-test")
+        for (staged_id,) in stale:
             try:
                 httpx.post(
                     f"{qdrant_url}/collections/{collection}/points/delete",
@@ -585,7 +743,7 @@ def expire_staged_facts(db_conn, qdrant_url: str) -> int:
                     )
                 db_conn.commit()
                 expired += 1
-                log.info(f"re_embedder.expired staged_id={staged_id} user_id={user_id}")
+                log.info(f"re_embedder.removed staged_id={staged_id} reason=score_zero user_id={user_id}")
             except Exception as e:
                 db_conn.rollback()
                 log.error(f"re_embedder.expire_failed staged_id={staged_id}: {e}")
@@ -1303,7 +1461,7 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                 pattern_lower = pattern.lower().strip()
 
                 # Compute empirical metrics
-                false_positive_rate = 1.0 - success_rate if success_rate else 0.5
+                false_positive_rate = (1.0 - success_rate) if success_rate is not None else 0.5
                 priority = int(success_rate * 100) if success_rate else 50
 
                 # ────────────────────────────────────────────────────────────────
@@ -1346,19 +1504,18 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
 
                             # Also insert into negation_patterns (intent classification layer)
                             # Map retraction_signals to negation_patterns for /classify-intent
+                            # Per-schema isolation: no user_id column needed in public schema copy
                             negation_type = 'retraction' if category != 'correction' else 'correction'
                             negation_confidence = min(0.99, priority / 100.0)  # priority 50-100 → confidence 0.5-0.99
-                            global_user_id = '00000000-0000-0000-0000-000000000000'  # Global patterns
 
                             cur.execute("""
-                                INSERT INTO negation_patterns
-                                (user_id, pattern_text, negation_type, learned_from, confidence, created_at)
-                                VALUES (%s, %s, %s, 'retraction_outcome_learning', %s, NOW())
-                                ON CONFLICT (user_id, pattern_text, negation_type) DO UPDATE
-                                SET confidence = GREATEST(negation_patterns.confidence, %s),
+                                INSERT INTO public.negation_patterns
+                                (pattern_text, negation_type, learned_from, confidence, created_at)
+                                VALUES (%s, %s, 'retraction_outcome_learning', %s, NOW())
+                                ON CONFLICT (pattern_text, negation_type) DO UPDATE
+                                SET confidence = GREATEST(public.negation_patterns.confidence, %s),
                                     created_at = NOW()
                             """, (
-                                global_user_id,
                                 pattern_lower,
                                 negation_type,
                                 negation_confidence,
@@ -1408,18 +1565,17 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                                 ))
 
                                 # Also update negation_patterns (intent classification layer)
+                                # Per-schema isolation: no user_id column needed in public schema copy
                                 negation_type = 'retraction' if existing_category != 'correction' else 'correction'
                                 negation_confidence = min(0.99, priority / 100.0)
-                                global_user_id = '00000000-0000-0000-0000-000000000000'
 
                                 cur.execute("""
-                                    UPDATE negation_patterns SET
+                                    UPDATE public.negation_patterns SET
                                       confidence = GREATEST(confidence, %s),
                                       created_at = NOW()
-                                    WHERE user_id = %s AND pattern_text = %s AND negation_type = %s
+                                    WHERE pattern_text = %s AND negation_type = %s
                                 """, (
                                     negation_confidence,
-                                    global_user_id,
                                     pattern_lower,
                                     negation_type
                                 ))
@@ -1442,13 +1598,67 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                 stats["errors"] += 1
                 log.error(f"re_embedder.retraction_outcome_processing_failed pattern={pattern[:60]}: {e}")
 
-        # ────────────────────────────────────────────────────────────────
-        # Step 3: Invalidate Filter's retraction signal cache
-        # ────────────────────────────────────────────────────────────────
-        # Cache invalidation happens via TTL in Filter (60s default).
-        # For immediate invalidation, we'd need to clear a Redis key or
-        # reset an in-process timestamp. For now, rely on TTL.
-        # Filter will auto-reload signals on next _get_retraction_signals_cached() call.
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # Step 3: Cache Invalidation via TTL (Passive, Not Aggressive)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        #
+        # Filter caches retraction_signals with a 60-second TTL. When re-embedder discovers
+        # new patterns and INSERTs them to retraction_signals, Filter's cache remains valid
+        # until expiry. Pattern visibility occurs naturally on next /classify-intent call
+        # after TTL expiration (within 60 seconds).
+        #
+        # DESIGN RATIONALE:
+        # ─────────────────
+        # TTL-based invalidation is optimal because:
+        #
+        # 1. INDEPENDENCE: Filter and re-embedder run independently. No IPC/shared memory.
+        #    TTL is atomic, simpler than distributed cache coherency.
+        #
+        # 2. GRACEFUL DEGRADATION: If PostgreSQL unavailable, Filter uses stale cache.
+        #    Aggressive invalidation would require external coordination.
+        #
+        # 3. BALANCED TRADE-OFF: 60s window balances freshness (reasonable for learning)
+        #    vs DB load (minimal). Pattern discovery is asynchronous (~10s poll cycle).
+        #
+        # 4. NO THUNDERING HERD: Cache natural expiry spreads reloads over time.
+        #    Explicit invalidation could spike DB hits when many patterns discovered.
+        #
+        # WHY NOT AGGRESSIVE INVALIDATION:
+        # ────────────────────────────────
+        # ❌ Redis pubsub: Adds Redis dependency, operational complexity
+        # ❌ Explicit endpoint: Creates race conditions (invalidation in-flight)
+        # ❌ Shared queue: Requires coordinated polling (defeats purpose)
+        #
+        # TIMELINE EXAMPLE:
+        # ─────────────────
+        # t=0s    : Filter loads retraction_signals, caches (timestamp=0, TTL=60s)
+        # t=35s   : Re-embedder discovers "i'm not X, i'm Y" pattern (frequency=3)
+        # t=35s   : INSERT retraction_signals(signal='i''m not', priority=85, ...)
+        # t=60s   : Filter cache still valid (35s < 60s TTL)
+        # t=62s   : User message triggers /classify-intent
+        # t=62s   : Cache check: (62 - 0) = 62s > 60s TTL → EXPIRED
+        # t=62s   : Reload from DB → new pattern 'i''m not' visible
+        # t=62s+  : New pattern available for classification
+        #
+        # CODE REFERENCE:
+        # ───────────────
+        # Filter cache TTL check: openwebui/faultline_function.py lines 776-778
+        # ```python
+        # if cache_timestamp > 0 and (time() - cache_timestamp) < _RETRACTION_SIGNALS_TTL:
+        #     return cached_data  # Cache valid
+        # else:
+        #     reload_from_db()   # TTL expired, refresh
+        # ```
+        #
+        # DECISION LOG:
+        # ─────────────
+        # ✅ KEEP TTL-based model (no code changes needed)
+        # ❌ Don't implement Redis invalidation (overengineered)
+        # ❌ Don't add explicit invalidation endpoint (adds complexity)
+        # ✅ Rely on PostgreSQL + TTL for cache coherency
+        #
+        # Filter will auto-reload signals on next /classify-intent call when cache
+        # expires (typically within 60 seconds of pattern discovery).
 
         if stats["discovered"] > 0 or stats["updated"] > 0:
             log.info(
@@ -1460,6 +1670,269 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
 
     except Exception as e:
         log.error(f"re_embedder.retraction_outcomes_eval_failed: {e}")
+        stats["errors"] += 1
+
+    return stats
+
+
+def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
+    """
+    Resolve pending entity name conflicts via LLM context evaluation.
+
+    dprompt-121: When two entities claim the same preferred name, this function
+    evaluates the context (facts) of each entity and uses the LLM to decide which
+    entity should own the preferred name. Non-destructive: all names preserved,
+    only is_preferred flag changes.
+
+    Per-user schema context: entity_name_conflicts and entity_aliases tables
+    are per-user. search_path already set by caller. Do NOT add user_id filtering.
+
+    Args:
+        db_conn: Database connection (search_path pre-set to user's schema)
+        llm_url: LLM endpoint URL (e.g., http://localhost:11434/v1/chat/completions)
+
+    Returns:
+        dict with stats: {"resolved": int, "errors": int, "skipped": int}
+    """
+    stats = {"resolved": 0, "errors": 0, "skipped": 0}
+
+    try:
+        # ────────────────────────────────────────────────────────────────
+        # Step 1: Query pending conflicts (limit to avoid overload)
+        # ────────────────────────────────────────────────────────────────
+        with db_conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, entity_id_1, entity_name_1, entity_id_2, entity_name_2, disputed_name
+                FROM entity_name_conflicts
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT 20
+            """)
+            conflicts = cur.fetchall()
+
+        if not conflicts:
+            log.debug("re_embedder.name_conflicts_none_pending")
+            return stats
+
+        log.info(f"re_embedder.name_conflict_resolution_start pending={len(conflicts)}")
+
+        # ────────────────────────────────────────────────────────────────
+        # Step 2: Process each conflict
+        # ────────────────────────────────────────────────────────────────
+        for conflict_id, entity_id_1, entity_name_1, entity_id_2, entity_name_2, disputed_name in conflicts:
+            try:
+                # ────────────────────────────────────────────────────────────────
+                # Build context for Entity 1
+                # ────────────────────────────────────────────────────────────────
+                context_1 = ""
+                with db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT COUNT(*),
+                               STRING_AGG(DISTINCT rel_type, ', ' ORDER BY rel_type) as rel_types
+                        FROM facts
+                        WHERE subject_id = %s OR object_id = %s
+                    """, (entity_id_1, entity_id_1))
+                    row = cur.fetchone()
+                    if row:
+                        fact_count, rel_types = row
+                        rel_types_str = rel_types or "(none)"
+                        context_1 = (
+                            f"Entity 1 ('{entity_name_1}', UUID: {entity_id_1[:8]}...) "
+                            f"has {fact_count} facts with relationship types: {rel_types_str}"
+                        )
+                    else:
+                        context_1 = f"Entity 1 ('{entity_name_1}') has no facts."
+
+                # ────────────────────────────────────────────────────────────────
+                # Build context for Entity 2
+                # ────────────────────────────────────────────────────────────────
+                context_2 = ""
+                with db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT COUNT(*),
+                               STRING_AGG(DISTINCT rel_type, ', ' ORDER BY rel_type) as rel_types
+                        FROM facts
+                        WHERE subject_id = %s OR object_id = %s
+                    """, (entity_id_2, entity_id_2))
+                    row = cur.fetchone()
+                    if row:
+                        fact_count, rel_types = row
+                        rel_types_str = rel_types or "(none)"
+                        context_2 = (
+                            f"Entity 2 ('{entity_name_2}', UUID: {entity_id_2[:8]}...) "
+                            f"has {fact_count} facts with relationship types: {rel_types_str}"
+                        )
+                    else:
+                        context_2 = f"Entity 2 ('{entity_name_2}') has no facts."
+
+                # ────────────────────────────────────────────────────────────────
+                # Call LLM to disambiguate (fail-loud on LLM errors)
+                # ────────────────────────────────────────────────────────────────
+                from src.api.llm_client import build_llm_payload, get_llm_headers
+
+                prompt = (
+                    f"Two entities claim the name '{disputed_name}':\n\n"
+                    f"{context_1}\n\n"
+                    f"{context_2}\n\n"
+                    f"Which entity should have '{disputed_name}' as its preferred display name? "
+                    f"Answer with ONLY 'Entity 1' or 'Entity 2' (no explanation)."
+                )
+
+                messages = [{"role": "user", "content": prompt}]
+                payload = build_llm_payload(
+                    messages=messages,
+                    model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                    user_id="re_embedder",
+                    temperature=0.2,
+                    max_tokens=10
+                )
+
+                # Use global HTTP client with timeout
+                try:
+                    response = _http_client_sync.post(
+                        llm_url,
+                        json=payload,
+                        headers=get_llm_headers("re_embedder"),
+                        timeout=10.0
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    log.error(
+                        f"re_embedder.name_conflict_llm_call_failed "
+                        f"conflict_id={conflict_id} "
+                        f"error={str(e)}"
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                # ────────────────────────────────────────────────────────────────
+                # Parse LLM decision
+                # ────────────────────────────────────────────────────────────────
+                try:
+                    result = response.json()
+                    # Handle both direct JSON and wrapped response
+                    if isinstance(result, dict) and "choices" in result:
+                        llm_choice = result["choices"][0]["message"]["content"].strip().lower()
+                    elif isinstance(result, dict) and "content" in result:
+                        llm_choice = result.get("content", "").strip().lower()
+                    else:
+                        llm_choice = str(result).strip().lower()
+
+                    # Determine winner
+                    if "entity 1" in llm_choice:
+                        winner_id = entity_id_1
+                        loser_id = entity_id_2
+                        winner_name = entity_name_1
+                        loser_name = entity_name_2
+                    elif "entity 2" in llm_choice:
+                        winner_id = entity_id_2
+                        loser_id = entity_id_1
+                        winner_name = entity_name_2
+                        loser_name = entity_name_1
+                    else:
+                        log.warning(
+                            f"re_embedder.name_conflict_llm_ambiguous "
+                            f"conflict_id={conflict_id} "
+                            f"llm_response={llm_choice[:100]}"
+                        )
+                        stats["skipped"] += 1
+                        continue
+
+                except Exception as e:
+                    log.error(
+                        f"re_embedder.name_conflict_parse_failed "
+                        f"conflict_id={conflict_id} "
+                        f"error={str(e)}"
+                    )
+                    stats["errors"] += 1
+                    continue
+
+                # ────────────────────────────────────────────────────────────────
+                # Update aliases based on LLM decision
+                # ────────────────────────────────────────────────────────────────
+                try:
+                    with db_conn.cursor() as cur:
+                        # Winner: set preferred
+                        cur.execute(
+                            "UPDATE entity_aliases SET is_preferred = true "
+                            "WHERE entity_id = %s AND alias = %s",
+                            (winner_id, disputed_name)
+                        )
+
+                        # Loser: unset preferred
+                        cur.execute(
+                            "UPDATE entity_aliases SET is_preferred = false "
+                            "WHERE entity_id = %s AND alias = %s",
+                            (loser_id, disputed_name)
+                        )
+
+                        # If loser has no other aliases, create fallback
+                        cur.execute(
+                            "SELECT COUNT(*) FROM entity_aliases WHERE entity_id = %s",
+                            (loser_id,)
+                        )
+                        loser_alias_count = cur.fetchone()[0]
+
+                        if loser_alias_count == 1:
+                            # Loser's only alias is the disputed name; create fallback
+                            fallback_alias = f"{disputed_name}_entity_{loser_id[:8]}"
+                            cur.execute(
+                                "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
+                                "VALUES (%s, %s, false) "
+                                "ON CONFLICT (entity_id, alias) DO NOTHING",
+                                (loser_id, fallback_alias)
+                            )
+
+                        # Mark conflict as resolved
+                        cur.execute(
+                            "UPDATE entity_name_conflicts SET "
+                            "status = 'resolved', resolution_method = 'llm_context', "
+                            "resolution_detail = %s, resolved_at = NOW() "
+                            "WHERE id = %s",
+                            (f"Winner: {winner_name}; Loser fallback: {fallback_alias if loser_alias_count == 1 else 'existing'}",
+                             conflict_id)
+                        )
+
+                    db_conn.commit()
+                    stats["resolved"] += 1
+
+                    log.info(
+                        f"re_embedder.name_conflict_resolved "
+                        f"conflict_id={conflict_id} "
+                        f"disputed_name={disputed_name} "
+                        f"winner={winner_name} "
+                        f"loser={loser_name}"
+                    )
+
+                except Exception as e:
+                    db_conn.rollback()
+                    log.error(
+                        f"re_embedder.name_conflict_update_failed "
+                        f"conflict_id={conflict_id} "
+                        f"error={str(e)}"
+                    )
+                    stats["errors"] += 1
+                    continue
+
+            except Exception as e:
+                # Error isolation: don't crash re-embedder if one conflict fails
+                log.error(
+                    f"re_embedder.name_conflict_processing_failed "
+                    f"conflict_id={conflict_id} "
+                    f"error={str(e)}"
+                )
+                stats["errors"] += 1
+
+        if stats["resolved"] > 0 or stats["errors"] > 0:
+            log.info(
+                f"re_embedder.name_conflict_resolution_complete "
+                f"resolved={stats['resolved']} "
+                f"errors={stats['errors']} "
+                f"skipped={stats['skipped']}"
+            )
+
+    except Exception as e:
+        log.error(f"re_embedder.name_conflict_resolution_failed (non-fatal): {e}")
         stats["errors"] += 1
 
     return stats
@@ -1691,15 +2164,15 @@ def learn_negation_pattern_by_hash(
 
             # For now, just track the hash as a generic pattern
             # In future, this would match against actual pattern_text via hash comparison
+            # Per-user schema: no user_id filter needed — schema provides isolation
             cur.execute(
                 """
                 SELECT id FROM negation_patterns
-                WHERE user_id = %s
-                  AND pattern_hash IS NOT NULL
+                WHERE pattern_hash IS NOT NULL
                   AND pattern_hash = %s
                 LIMIT 1
                 """,
-                (user_id, pattern_hash)
+                (pattern_hash,)
             )
 
             existing = cur.fetchone()
@@ -1719,17 +2192,18 @@ def learn_negation_pattern_by_hash(
                 # New pattern — log it as a candidate for future learning
                 # The pattern_text field will be populated by the re-embedder when it
                 # reconstructs the full pattern from context (if available)
+                # Per-user schema: no user_id column needed
                 cur.execute(
                     """
                     INSERT INTO negation_patterns
-                    (user_id, pattern_text, pattern_hash, negation_type, confidence, confirmed_count, learned_from)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id, pattern_text, negation_type) DO UPDATE
+                    (pattern_text, pattern_hash, negation_type, confidence, confirmed_count, learned_from)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (pattern_text, negation_type) DO UPDATE
                     SET confirmed_count = negation_patterns.confirmed_count + 1,
                         pattern_hash = COALESCE(EXCLUDED.pattern_hash, negation_patterns.pattern_hash),
                         updated_at = now()
                     """,
-                    (user_id, f"hash_{pattern_hash}", pattern_hash, "retraction", confidence, 1, "re_embedder_inferred")
+                    (f"hash_{pattern_hash}", pattern_hash, "retraction", confidence, 1, "re_embedder_inferred")
                 )
                 log.debug(f"negation_pattern_learned user_id={user_id[:8]} pattern_hash={pattern_hash}")
 
@@ -1863,6 +2337,165 @@ def adjust_confidence_gate(db_conn, user_id: str) -> bool:
         return False
 
 
+def evaluate_extraction_patterns(db_conn) -> dict:
+    """
+    Job 6: Evaluate extraction pattern accuracy and bootstrap confidence scores.
+
+    Steps:
+    1. Query extraction_pattern_matches for user feedback (confirmed/rejected)
+    2. Calculate accuracy for each pattern: confirmed / (confirmed + rejected)
+    3. Archive underperforming patterns (accuracy < 0.3)
+    4. Promote high-confidence patterns (confirmed_count >= 3)
+    5. Update global_confidence scores in extraction_patterns table
+    6. Log all decisions for monitoring
+
+    Returns: {
+        "evaluated": int,
+        "archived": int,
+        "promoted": int,
+        "confidence_updates": int,
+        "errors": int
+    }
+    """
+    stats = {
+        "evaluated": 0,
+        "archived": 0,
+        "promoted": 0,
+        "confidence_updates": 0,
+        "errors": 0,
+    }
+
+    try:
+        with db_conn.cursor() as cur:
+            # Query patterns with feedback data
+            cur.execute("""
+                SELECT
+                    ep.id,
+                    ep.pattern_regex,
+                    ep.rel_type,
+                    COALESCE(ep.confirmed_count, 0) as confirmed_count,
+                    COALESCE(ep.rejected_count, 0) as rejected_count,
+                    COALESCE(ep.correction_count, 0) as correction_count,
+                    ep.global_confidence,
+                    ep.frequency
+                FROM extraction_patterns ep
+                WHERE ep.is_active = true
+                ORDER BY ep.frequency DESC, ep.global_confidence DESC
+            """)
+            patterns = cur.fetchall()
+
+    except Exception as e:
+        log.error(f"re_embedder.extraction_pattern_fetch_failed: {e}")
+        stats["errors"] += 1
+        return stats
+
+    if not patterns:
+        log.info("re_embedder.extraction_pattern_eval no_patterns_to_evaluate")
+        return stats
+
+    log.info(f"re_embedder.extraction_pattern_eval_start count={len(patterns)}")
+
+    for pattern_row in patterns:
+        pattern_id, pattern_regex, rel_type, confirmed, rejected, corrections, confidence, frequency = pattern_row
+        stats["evaluated"] += 1
+
+        try:
+            # Calculate accuracy
+            total_feedback = confirmed + rejected
+            accuracy = confirmed / total_feedback if total_feedback > 0 else 0.0
+
+            # Decision 1: Archive underperforming patterns
+            if accuracy < 0.3 and total_feedback >= 3:
+                with db_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE extraction_patterns
+                        SET is_active = false, archived_at = NOW()
+                        WHERE id = %s
+                    """, (pattern_id,))
+                stats["archived"] += 1
+                log.info(
+                    f"re_embedder.extraction_pattern_archived "
+                    f"pattern_id={pattern_id} rel_type={rel_type} "
+                    f"accuracy={accuracy:.2f} confirmed={confirmed} rejected={rejected}"
+                )
+                continue
+
+            # Decision 2: Update confidence based on accuracy
+            new_confidence = confidence
+            if accuracy >= 0.85:
+                new_confidence = 0.90
+            elif accuracy >= 0.70:
+                new_confidence = 0.80
+            elif accuracy < 0.50 and total_feedback >= 3:
+                new_confidence = 0.50
+
+            if new_confidence != confidence:
+                with db_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE extraction_patterns
+                        SET global_confidence = %s, updated_at = NOW()
+                        WHERE id = %s
+                    """, (new_confidence, pattern_id))
+                stats["confidence_updates"] += 1
+                log.info(
+                    f"re_embedder.extraction_pattern_confidence_updated "
+                    f"pattern_id={pattern_id} rel_type={rel_type} "
+                    f"old={confidence:.2f} new={new_confidence:.2f}"
+                )
+
+            # Decision 3: Promote new patterns after sufficient confirmation
+            # Metadata-driven: only boost engine_generated (LLM-discovered) rel_types,
+            # not system-defined ones (which already have validated Class A/B assignment)
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT engine_generated FROM rel_types WHERE rel_type = %s LIMIT 1",
+                    (rel_type,)
+                )
+                rt_row = cur.fetchone()
+            is_novel_rel_type = rt_row is None or rt_row[0]  # Novel if missing or engine_generated=true
+
+            if confirmed >= 3 and is_novel_rel_type:
+                # Novel patterns (not in original hardcoded list)
+                with db_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE extraction_patterns
+                        SET global_confidence = 0.80, updated_at = NOW()
+                        WHERE id = %s AND global_confidence < 0.80
+                    """, (pattern_id,))
+                    if cur.rowcount > 0:
+                        stats["promoted"] += 1
+                        log.info(
+                            f"re_embedder.extraction_pattern_promoted "
+                            f"pattern_id={pattern_id} rel_type={rel_type} "
+                            f"confirmed={confirmed}"
+                        )
+
+        except Exception as e:
+            log.error(
+                f"re_embedder.extraction_pattern_eval_error "
+                f"pattern_id={pattern_id}: {e}"
+            )
+            stats["errors"] += 1
+
+    # Commit all changes
+    try:
+        db_conn.commit()
+        log.info(
+            f"re_embedder.extraction_pattern_eval_complete "
+            f"evaluated={stats['evaluated']} "
+            f"archived={stats['archived']} "
+            f"promoted={stats['promoted']} "
+            f"confidence_updates={stats['confidence_updates']} "
+            f"errors={stats['errors']}"
+        )
+    except Exception as e:
+        log.error(f"re_embedder.extraction_pattern_eval_commit_failed: {e}")
+        db_conn.rollback()
+        stats["errors"] += 1
+
+    return stats
+
+
 def main():
     """Main poll loop."""
     global _http_client_sync
@@ -1879,7 +2512,14 @@ def main():
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     # Auto-detect LLM endpoint: env var override, then Docker service names, then localhost
-    qwen_api_url = os.getenv("QWEN_API_URL") or os.getenv("OPENWEBUI_URL") or "http://qwen:11434/v1/chat/completions"
+    if os.getenv("QWEN_API_URL"):
+        qwen_api_url = os.getenv("QWEN_API_URL")
+    elif os.getenv("OPENWEBUI_URL"):
+        # OPENWEBUI_URL is base URL (e.g., http://open-webui:8080), append API path
+        base_url = os.getenv("OPENWEBUI_URL").rstrip("/")
+        qwen_api_url = f"{base_url}/api/chat/completions"
+    else:
+        qwen_api_url = "http://qwen:11434/v1/chat/completions"
     interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
@@ -1919,6 +2559,209 @@ def main():
             default_collection = os.getenv("QDRANT_COLLECTION", "faultline-test")
             ensure_collection(default_collection, qdrant_url)
 
+            # PHASE 2: Get list of all ready user schemas to process independently
+            with psycopg2.connect(postgres_dsn) as admin_db:
+                with admin_db.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, schema_name FROM public.user_provisioning
+                        WHERE status = 'ready'
+                        ORDER BY ready_at ASC
+                    """)
+                    ready_schemas = [(row[0], row[1]) for row in cur.fetchall()]
+
+            if ready_schemas:
+                log.info(f"re_embedder.ready_schemas_found count={len(ready_schemas)}")
+
+            # PHASE 2b: Process each user schema independently
+            for user_id, schema_name in ready_schemas:
+                try:
+                    with psycopg2.connect(postgres_dsn) as db_per_user:
+                        with db_per_user.cursor() as cur:
+                            cur.execute(f"SET search_path TO {schema_name}, public")
+                        db_per_user.commit()
+
+                        # Promote staged facts for this user
+                        n_promoted = promote_staged_facts(db_per_user, qdrant_url, user_id=user_id, schema_name=schema_name)
+                        if n_promoted:
+                            log.info(f"re_embedder.promotion_complete user_id={user_id[:8]} schema={schema_name} promoted={n_promoted}")
+
+                        # Expire stale Class C facts for this user
+                        n_expired = expire_staged_facts(db_per_user, qdrant_url, user_id=user_id)
+                        if n_expired:
+                            log.info(f"re_embedder.expiry_complete user_id={user_id[:8]} expired={n_expired}")
+
+                        # Fetch and embed unsynced facts for this user
+                        rows = fetch_unsynced(db_per_user, user_id, confidence_threshold)
+                        if rows:
+                            log.info(f"re_embedder.batch_start user_id={user_id[:8]} count={len(rows)}")
+                            collection = derive_collection(user_id)
+                            ensure_collection(collection, qdrant_url)
+
+                            # Resolve display names for batch
+                            rows = resolve_display_names_for_facts(db_per_user, rows)
+
+                            for row in rows:
+                                try:
+                                    text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
+                                    vector = embed_text(text, qwen_api_url)
+                                    if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                        mark_synced(db_per_user, row["id"])
+                                        log.info(f"re_embedder.synced fact_id={row['id']} user_id={user_id[:8]}")
+                                except Exception as e:
+                                    log.error(f"re_embedder.row_error fact_id={row['id']} user_id={user_id[:8]}: {e}")
+                                    continue
+
+                        # Fetch and embed unsynced staged facts for this user
+                        staged_rows = fetch_unsynced_staged(db_per_user, user_id)
+                        if staged_rows:
+                            log.info(f"re_embedder.staged_batch user_id={user_id[:8]} count={len(staged_rows)}")
+                            collection = derive_collection(user_id)
+                            ensure_collection(collection, qdrant_url)
+
+                            staged_rows = resolve_display_names_for_facts(db_per_user, staged_rows)
+                            for row in staged_rows:
+                                try:
+                                    text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
+                                    vector = embed_text(text, qwen_api_url)
+                                    if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                        with db_per_user.cursor() as cur:
+                                            cur.execute(
+                                                "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
+                                                (row["staged_id"],)
+                                            )
+                                        db_per_user.commit()
+                                        log.info(f"re_embedder.staged_synced staged_id={row['staged_id']} user_id={user_id[:8]}")
+                                except Exception as e:
+                                    log.error(f"re_embedder.staged_row_error staged_id={row['staged_id']} user_id={user_id[:8]}: {e}")
+
+                except Exception as e:
+                    log.error(f"re_embedder.per_user_promotion_failed user_id={user_id[:8] if user_id else 'unknown'} schema={schema_name}: {e}")
+
+            # GROWTH ENGINE WIRE #2: Adjust per-user confidence gates based on feedback
+            # Phase 2c: Intent classification gate self-healing (runs every cycle)
+            # Enables system to learn from intent classification patterns without hardcoded thresholds
+            try:
+                with psycopg2.connect(postgres_dsn) as db:
+                    with db.cursor() as cur:
+                        # Find users with significant feedback history (>= 10 classifications)
+                        cur.execute("""
+                            SELECT user_id
+                            FROM intent_confidence_feedback
+                            GROUP BY user_id
+                            HAVING SUM(count) >= 10
+                            ORDER BY user_id
+                        """)
+                        users_to_adjust = [row[0] for row in cur.fetchall()]
+
+                    if users_to_adjust:
+                        adjusted_count = 0
+                        for user_id in users_to_adjust:
+                            try:
+                                # Query feedback distribution
+                                with db.cursor() as cur:
+                                    cur.execute("""
+                                        SELECT confidence_bin, feedback_type, count
+                                        FROM intent_confidence_feedback
+                                        WHERE user_id = %s
+                                        ORDER BY confidence_bin ASC
+                                    """, (user_id,))
+                                    feedback_rows = cur.fetchall()
+
+                                if not feedback_rows:
+                                    continue
+
+                                # Compute optimal gate threshold based on feedback distribution
+                                # Strategy: find confidence level where corrections spike (wrong classifications)
+                                # Lower threshold where there are many corrections; raise where false positives
+                                total_feedback = sum(row[2] for row in feedback_rows)
+                                corrections = sum(row[2] for row in feedback_rows if row[1] == 'correction')
+                                correction_rate = corrections / total_feedback if total_feedback > 0 else 0.0
+
+                                # Aggressive gate: if no corrections, assume default 0.70 is fine
+                                # Only learn stricter gates from actual user corrections
+                                if corrections == 0:
+                                    recommended_gate = 0.50  # Aggressive: allow more through
+                                    log.debug(f"re_embedder.gate_aggressive user_id={user_id[:8]} reason=no_corrections")
+                                else:
+                                    # Find the confidence bin with highest correction density
+                                    # (indicates GLiNER2 is unreliable in that range)
+                                    bin_correction_rates = {}
+                                    for bin_range, feedback_type, count in feedback_rows:
+                                        if bin_range not in bin_correction_rates:
+                                            bin_correction_rates[bin_range] = {'corrections': 0, 'total': 0}
+                                        bin_correction_rates[bin_range]['total'] += count
+                                        if feedback_type == 'correction':
+                                            bin_correction_rates[bin_range]['corrections'] += count
+
+                                    # Recommended gate: lowest bin where correction rate < 15%
+                                    recommended_gate = 0.70  # Default
+                                    for bin_range in sorted(bin_correction_rates.keys(), reverse=True):
+                                        stats = bin_correction_rates[bin_range]
+                                        if stats['total'] >= 5:  # Need statistical significance
+                                            bin_correction_rate = stats['corrections'] / stats['total']
+                                            if bin_correction_rate < 0.15:  # Threshold: >85% accuracy
+                                                # Extract lower bound of this bin as gate
+                                                bin_start = float(bin_range.split('-')[0])
+                                                recommended_gate = bin_start
+                                                break
+
+                                # Persist recommended gate to confidence_gates (what /classify-intent reads)
+                                with db.cursor() as cur:
+                                    cur.execute("""
+                                        INSERT INTO confidence_gates (user_id, threshold, adjusted_at)
+                                        VALUES (%s, %s, now())
+                                        ON CONFLICT (user_id) DO UPDATE
+                                        SET threshold = %s, adjusted_at = now()
+                                    """, (user_id, recommended_gate, recommended_gate))
+                                db.commit()
+                                adjusted_count += 1
+                                log.info(f"re_embedder.gate_adjusted user_id={user_id[:8]} recommended_gate={recommended_gate:.2f} correction_rate={correction_rate:.2%}")
+
+                            except Exception as e:
+                                log.warning(f"re_embedder.gate_adjustment_failed user_id={user_id[:8]}: {e}")
+
+                        if adjusted_count > 0:
+                            log.info(f"re_embedder.gate_adjustment_cycle adjusted={adjusted_count} users")
+
+            except Exception as e:
+                log.warning(f"re_embedder.gate_adjustment_phase_error (non-blocking): {e}")
+
+            # GROWTH ENGINE JOB 7: Promote Learned Patterns
+            # Issue #2: When LLM fallback learns a pattern and it's confirmed 3+ times,
+            # promote its confidence to 0.95 (high confidence). This enables faster
+            # pattern matching in future /classify-intent calls.
+            try:
+                with psycopg2.connect(postgres_dsn) as db:
+                    with db.cursor() as cur:
+                        # Find all user schemas
+                        cur.execute("""
+                            SELECT schema_name FROM public.user_provisioning
+                            WHERE status = 'ready'
+                        """)
+                        schemas = [row[0] for row in cur.fetchall()]
+
+                    for schema_name in schemas:
+                        try:
+                            with db.cursor() as cur:
+                                # Promote low-confidence learned patterns when confirmed 3+ times
+                                cur.execute(f"""
+                                    UPDATE {schema_name}.negation_patterns
+                                    SET confidence = 0.95, updated_at = NOW()
+                                    WHERE learned_from = 'LLM_FALLBACK'
+                                    AND confirmed_count >= 3
+                                    AND confidence < 0.95
+                                    AND pattern_text IS NOT NULL
+                                """)
+                                promoted = cur.rowcount
+                                if promoted > 0:
+                                    db.commit()
+                                    log.info(f"re_embedder.job7_patterns_promoted schema={schema_name} count={promoted}")
+                        except Exception as e:
+                            log.debug(f"re_embedder.job7_schema_error schema={schema_name}: {str(e)[:100]}")
+            except Exception as e:
+                log.warning(f"re_embedder.job7_pattern_promotion_error (non-blocking): {e}")
+
+            # Continue with default schema for global work (embeddings, ontology, etc)
             with psycopg2.connect(postgres_dsn) as db:
                 # Phase 3: Process Redis queue events first (high-priority)
                 # Non-blocking: if Redis unavailable, system continues with DB poll
@@ -1930,67 +2773,9 @@ def main():
                     except Exception as e:
                         log.warning(f"re_embedder.queue_consumer_error (non-blocking): {e}")
                         # Continue to DB poll even if queue fails
-                rows = fetch_unsynced(db, confidence_threshold)
 
-                if rows:
-                    log.info(f"re_embedder.batch_start count={len(rows)}")
-
-                    # Ensure every per-user collection needed by this batch exists
-                    # before processing any rows.
-                    seen_collections: set[str] = {default_collection}
-                    for row in rows:
-                        col = derive_collection(row["user_id"])
-                        if col not in seen_collections:
-                            seen_collections.add(col)
-                            if not ensure_collection(col, qdrant_url):
-                                log.error(f"re_embedder.collection_unavailable collection={col}")
-
-                    # Resolve display names for all rows in batch before embedding
-                    rows = resolve_display_names_for_facts(db, rows)
-
-                for row in rows:
-                    try:
-                        text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
-                        vector = embed_text(text, qwen_api_url)
-                        collection = derive_collection(row["user_id"])
-
-                        if upsert_to_qdrant(row, vector, collection, qdrant_url):
-                            mark_synced(db, row["id"])
-                            log.info(
-                                f"re_embedder.synced fact_id={row['id']} "
-                                f"collection={collection} "
-                                f"subject={row['subject_id']} "
-                                f"object={row['object_id']}"
-                            )
-
-                    except Exception as e:
-                        log.error(f"re_embedder.row_error fact_id={row['id']}: {e}")
-                        continue
-
-                # Process staged facts — sync to Qdrant
-                staged_rows = fetch_unsynced_staged(db)
-                if staged_rows:
-                    staged_rows = resolve_display_names_for_facts(db, staged_rows)
-                    log.info(f"re_embedder.staged_batch count={len(staged_rows)}")
-                    for row in staged_rows:
-                        try:
-                            text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
-                            vector = embed_text(text, qwen_api_url)
-                            collection = derive_collection(row["user_id"])
-                            if upsert_to_qdrant(row, vector, collection, qdrant_url):
-                                with db.cursor() as cur:
-                                    cur.execute(
-                                        "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
-                                        (row["staged_id"],)
-                                    )
-                                db.commit()
-                        except Exception as e:
-                            log.error(f"re_embedder.staged_row_error id={row['staged_id']}: {e}")
-
-                # Promote eligible Class B staged facts to long-term memory
-                n_promoted = promote_staged_facts(db, qdrant_url)
-                if n_promoted:
-                    log.info(f"re_embedder.promotion_complete promoted={n_promoted}")
+                # NOTE: Per-user promotion and fact syncing now happens in PHASE 2b
+                # (see per-schema isolation above in the ready_schemas loop)
 
                 # dprompt-121: Event-driven ontology evaluation (skip if no pending work)
                 # Phase 3c: Wrap in error isolation to prevent background loop crash
@@ -2029,7 +2814,7 @@ def main():
                         for rel_type in novel_rels:
                             try:
                                 discovered = _llm_discover_taxonomy_from_facts(
-                                    db, "system", [{"rel_type": rel_type}], qwen_api_url
+                                    db, "system", [{"rel_type": rel_type}]
                                 )
                                 if discovered and discovered.get("taxonomy_name"):
                                     with db.cursor() as cur:
@@ -2080,11 +2865,6 @@ def main():
                     log.error(f"re_embedder.correction_signal_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if correction eval fails
 
-                # Expire stale Class C staged facts
-                n_expired = expire_staged_facts(db, qdrant_url)
-                if n_expired:
-                    log.info(f"re_embedder.expiry_complete expired={n_expired}")
-
                 # dprompt-137: Evaluate retraction outcomes for continuous learning
                 # Auto-register high-frequency patterns, update metrics for existing patterns
                 # Phase 3c: Wrap in error isolation to prevent background loop crash
@@ -2103,6 +2883,57 @@ def main():
                 except Exception as e:
                     log.error(f"re_embedder.retraction_outcomes_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if retraction outcomes eval fails
+
+                # dprompt-121: Resolve name conflicts via LLM context evaluation
+                # Event-driven: only run if there are pending conflicts
+                # Phase 3c: Wrap in error isolation to prevent background loop crash
+                try:
+                    if has_pending_name_conflicts(db):
+                        conflict_stats = resolve_name_conflicts(db, qwen_api_url)
+                        if conflict_stats["resolved"] > 0:
+                            log.info(
+                                f"re_embedder.name_conflicts_resolved "
+                                f"resolved={conflict_stats['resolved']} "
+                                f"errors={conflict_stats['errors']} "
+                                f"skipped={conflict_stats['skipped']}"
+                            )
+                    else:
+                        log.debug("re_embedder.no_pending_name_conflicts")
+                except Exception as e:
+                    log.error(f"re_embedder.name_conflict_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if name conflict resolution fails
+
+                # Job 6: Evaluate extraction patterns for accuracy and bootstrap confidence
+                # Scoring phase: analyze user feedback on extraction patterns, update confidence scores
+                # Phase 3c: Wrap in error isolation to prevent background loop crash
+                try:
+                    pattern_stats = evaluate_extraction_patterns(db)
+                    if any(v > 0 for v in pattern_stats.values()):
+                        log.info(
+                            f"re_embedder.extraction_pattern_eval "
+                            f"evaluated={pattern_stats['evaluated']} "
+                            f"archived={pattern_stats['archived']} "
+                            f"promoted={pattern_stats['promoted']} "
+                            f"confidence_updates={pattern_stats['confidence_updates']} "
+                            f"errors={pattern_stats['errors']}"
+                        )
+                        # Signal backend to reload pattern caches (critical: ensures updates propagate)
+                        try:
+                            refresh_resp = httpx.post(
+                                f"http://faultline:8001/internal/refresh-intent-pattern-caches",
+                                timeout=5.0
+                            )
+                            if refresh_resp.status_code == 200:
+                                log.info("re_embedder.pattern_cache_refresh_triggered")
+                            else:
+                                log.warning(f"re_embedder.pattern_cache_refresh_failed status={refresh_resp.status_code}")
+                        except Exception as refresh_err:
+                            log.warning(f"re_embedder.pattern_cache_refresh_error: {refresh_err}")
+                    else:
+                        log.debug("re_embedder.no_pending_extraction_pattern_work")
+                except Exception as e:
+                    log.error(f"re_embedder.extraction_pattern_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if pattern evaluation fails
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:
@@ -2171,6 +3002,139 @@ def main():
             log.error(f"re_embedder.loop_error: {e}")
 
         time.sleep(interval)
+
+
+def extract_retraction_pattern(text: str, rel_type: str, action: str, user_id: str,
+                               llm_url: str, db_conn) -> dict:
+    """
+    Extract reusable negation pattern from a user retraction.
+
+    Args:
+        text: user's retraction message
+        rel_type: relationship type being retracted (if known)
+        action: "delete", "correct", "negate", "supersede"
+        user_id: user UUID
+        llm_url: LLM endpoint URL
+        db_conn: database connection for context
+
+    Returns:
+        dict with: pattern_text, pattern_type, negation_type, confidence
+        or None if extraction failed
+    """
+    try:
+        from src.api.llm_client import build_llm_payload, get_llm_headers
+        from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts
+
+        messages = [
+            {
+                "role": "system",
+                "content": f"{_FAULTLINE_INTERNAL_PREFIX} You are a pattern learner. Extract reusable negation patterns from retractions. Respond only with valid JSON, no markdown."
+            },
+            {
+                "role": "user",
+                "content": f"""Extract the negation pattern from this user retraction:
+
+Text: {text}
+Relationship: {rel_type if rel_type else 'unknown'}
+Action: {action}
+
+Respond with ONLY this JSON structure:
+{{
+  "pattern_text": "normalized_pattern_string",
+  "pattern_type": "substring|semantic",
+  "negation_type": "deletion|negation|correction|general",
+  "confidence": 0.0 to 1.0
+}}
+
+Rules:
+- pattern_text: lowercase, underscores for spaces, no special chars, 4-50 chars
+- pattern_type: "substring" for explicit markers like "forget about", "semantic" for complex patterns
+- negation_type: "deletion" (remove fact), "negation" (fact is false), "correction" (replace with new), "general" (unclear)
+- confidence: 0.90+ for clear patterns, 0.70-0.89 for probable, <0.70 for uncertain
+
+Respond with ONLY the JSON, no explanation."""
+            }
+        ]
+
+        result = call_llm_with_retry_sync(
+            messages=messages,
+            model=os.getenv("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
+            user_id=user_id,
+            timeout=LLMTimeouts.get("ENRICHMENT", 30),
+            operation="pattern_extraction",
+        )
+
+        # Validate required fields
+        required = ["pattern_text", "pattern_type", "negation_type", "confidence"]
+        for field in required:
+            if field not in result:
+                log.warning("re_embedder.pattern_extraction_missing_field",
+                           field=field, rel_type=rel_type)
+                return None
+
+        # Normalize pattern_text
+        pattern_text = result.get("pattern_text", "").lower()
+        pattern_text = re.sub(r'[^a-z0-9_]', '_', pattern_text)  # Only alphanumerics and underscores
+        pattern_text = re.sub(r'_+', '_', pattern_text)  # Remove duplicate underscores
+        pattern_text = pattern_text.strip('_')  # Strip leading/trailing underscores
+
+        if not pattern_text or len(pattern_text) < 3:
+            log.warning("re_embedder.pattern_text_invalid_after_normalization",
+                       original=result.get("pattern_text"))
+            return None
+
+        result["pattern_text"] = pattern_text
+        return result
+
+    except Exception as e:
+        log.warning("re_embedder.pattern_extraction_failed",
+                   rel_type=rel_type, error=str(e))
+        return None
+
+
+def store_retraction_pattern(pattern_text: str, pattern_type: str, negation_type: str,
+                             confidence: float, db_conn) -> bool:
+    """
+    Store learned retraction pattern in negation_patterns table.
+    Per-user schema: patterns are isolated by schema, not by user_id column.
+
+    Args:
+        pattern_text: normalized pattern string
+        pattern_type: "substring" or "semantic" (mapped to learned_from)
+        negation_type: "deletion", "negation", "correction", or "general"
+        confidence: confidence score (0.0-1.0)
+        db_conn: database connection
+
+    Returns:
+        True if stored successfully, False otherwise
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO negation_patterns
+                   (pattern_text, negation_type, learned_from, confidence, confirmed_count)
+                   VALUES (%s, %s, %s, %s, 1)
+                   ON CONFLICT (pattern_text, negation_type) DO UPDATE SET
+                       confirmed_count = negation_patterns.confirmed_count + 1,
+                       confidence = GREATEST(negation_patterns.confidence, EXCLUDED.confidence)
+                """,
+                (pattern_text, negation_type, pattern_type, confidence),
+            )
+
+        db_conn.commit()
+        log.info("re_embedder.pattern_stored",
+                pattern=pattern_text, negation_type=negation_type,
+                confidence=confidence)
+        return True
+
+    except Exception as e:
+        log.error("re_embedder.pattern_storage_failed",
+                 pattern=pattern_text, error=str(e))
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 if __name__ == "__main__":

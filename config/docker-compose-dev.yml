@@ -1,0 +1,28 @@
+# Dev-only: all services use host networking (no Docker bridge)
+services:
+  postgres:
+    image: postgres:16-alpine
+    network_mode: host
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: faultline
+      POSTGRES_DB: faultline_test
+      PGPORT: 5433
+      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_SHARED_BUFFERS: "256MB"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test -p 5433"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    network_mode: host
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+
+  redis:
+    image: redis:7-alpine
+    container_name: faultline-redis
+    network_mode: host

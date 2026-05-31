@@ -80,7 +80,7 @@ RULES:
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
 - If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called emma", the subject is "marla" not "i".
-- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being alicecribed, never the speaker.
+- For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being described, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
 RELATIONSHIP RULES (strictly enforced):
@@ -102,7 +102,7 @@ RELATIONSHIP RULES (strictly enforced):
 5. is_a = type or category (e.g. "morkie is_a dog breed").
 6. has_pet = person owns an animal (e.g. "we have a dog named Biskit").
 7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
-   between the alicecriptor and the name.
+   between the descriptor and the name.
 8. Pronoun resolution: replace he/she/it with the named entity if clear.
 9. If unsure, set "low_confidence": true. Never return empty if facts exist.
 10. First-person "my/our/we/I/me" refers to the named user entity if established,
@@ -116,10 +116,10 @@ RELATIONSHIP RULES (strictly enforced):
 12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
     emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
     NEVER use a nickname or name as the age value.
-    If the sentence contains both an age AND a nickname (e.g. "alicemonde age 12, goes by alice"),
+    If the sentence contains both an age AND a nickname (e.g. "Desmonde age 12, goes by des"),
     emit TWO separate triples:
-    {"subject":"alicemonde","object":"12","rel_type":"age"}
-    {"subject":"alicemonde","object":"alice","rel_type":"also_known_as"}
+    {"subject":"desmonde","object":"12","rel_type":"age"}
+    {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
 13. For height patterns ("X is 6ft tall", "X height 6’", "X stands 6 feet", "X is 6’ tall"):
     emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
     Normalize units to feet/inches format. Use ' for feet, \" for inches.
@@ -166,7 +166,7 @@ class Function:
         """Emit a status event to the user via EventEmitter."""
         if __event_emitter__:
             await __event_emitter__(
-                {"type": "status", "data": {"alicecription": status, "done": False}}
+                {"type": "status", "data": {"description": status, "done": False}}
             )
 
     def _normalize_edges(self, edges: list[dict]) -> list[dict]:
@@ -422,7 +422,7 @@ class Function:
 
         if __event_emitter__:
             await __event_emitter__(
-                {"type": "status", "data": {"alicecription": result, "done": True}}
+                {"type": "status", "data": {"description": result, "done": True}}
             )
 
         return result

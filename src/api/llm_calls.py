@@ -176,10 +176,11 @@ def _parse_llm_response_robust(response) -> dict:
                 if isinstance(parsed, dict) and "choices" in parsed:
                     log.debug("parse_llm_response.recovered_line_delimited")
                     return parsed
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                log.warning("parse_llm_response.json_decode_failed", error=str(e), line_preview=line[:100])
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("parse_llm_response.line_delimited_parse_failed", error=str(e), response_preview=response.text[:200])
 
     # Strategy 3: Regex extraction (dBug-016 corruption case)
     # Extract first valid JSON object containing "choices" key
@@ -197,10 +198,11 @@ def _parse_llm_response_robust(response) -> dict:
                 if isinstance(parsed, dict) and "choices" in parsed:
                     log.debug("parse_llm_response.recovered_regex_extraction")
                     return parsed
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                log.warning("parse_llm_response.regex_json_decode_failed", error=str(e), match_preview=match.group()[:100])
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("parse_llm_response.regex_extraction_failed", error=str(e), response_preview=response.text[:200])
 
     # All strategies failed
     log.warning("parse_llm_response.all_strategies_failed",
@@ -284,7 +286,10 @@ class LLMTimeouts:
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Global circuit breaker instance (shared across all LLM calls)
-_llm_circuit_breaker = CircuitBreakerState()
+_llm_circuit_breaker = CircuitBreakerState(
+    failure_threshold=int(os.environ.get("LLM_CIRCUIT_BREAKER_THRESHOLD", "5")),
+    timeout_seconds=int(os.environ.get("LLM_CIRCUIT_BREAKER_TIMEOUT", "30")),
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,11 +409,22 @@ def call_llm_with_retry_sync(
     """
     # Check circuit breaker first
     if _llm_circuit_breaker.is_open():
+        time_until_reset = (
+            _llm_circuit_breaker.last_failure_time +
+            timedelta(seconds=_llm_circuit_breaker.timeout_seconds) -
+            datetime.utcnow()
+        ).total_seconds()
+
+        error_msg = {
+            "error": "circuit_breaker_open",
+            "message": f"Language model not responding. Wait {max(1, int(time_until_reset))}s or restart backend.",
+            "debug": "Check logs: ssh docker-host -x 'sudo docker logs faultline --tail=50' | grep circuit_breaker"
+        }
         log.warning("call_llm.circuit_breaker_open",
                    user_id=user_id,
                    operation=operation,
-                   returning_safe_default=True)
-        return {}
+                   time_until_reset_seconds=max(1, int(time_until_reset)))
+        return error_msg
 
     # Select timeout based on operation type
     if timeout is None:
@@ -565,11 +581,22 @@ async def call_llm_with_retry_async(
     """
     # Check circuit breaker first
     if _llm_circuit_breaker.is_open():
+        time_until_reset = (
+            _llm_circuit_breaker.last_failure_time +
+            timedelta(seconds=_llm_circuit_breaker.timeout_seconds) -
+            datetime.utcnow()
+        ).total_seconds()
+
+        error_msg = {
+            "error": "circuit_breaker_open",
+            "message": f"Language model not responding. Wait {max(1, int(time_until_reset))}s or restart backend.",
+            "debug": "Check logs: ssh docker-host -x 'sudo docker logs faultline --tail=50' | grep circuit_breaker"
+        }
         log.warning("call_llm_async.circuit_breaker_open",
                    user_id=user_id,
                    operation=operation,
-                   returning_safe_default=True)
-        return {}
+                   time_until_reset_seconds=max(1, int(time_until_reset)))
+        return error_msg
 
     # Select timeout based on operation type
     if timeout is None:
