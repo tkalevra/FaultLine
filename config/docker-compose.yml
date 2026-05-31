@@ -15,12 +15,16 @@ services:
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://faultline-redis:6379/0
       REEMBED_INTERVAL: ${REEMBED_INTERVAL:-60}
       EMBEDDING_CACHE_TTL: ${EMBEDDING_CACHE_TTL:-86400}
       EMBEDDING_MODEL_VERSION: ${EMBEDDING_MODEL_VERSION:-nomic-v1.5}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       DB_POOL_SIZE: 15
+      LLM_TIMEOUT_CORRECTION: ${LLM_TIMEOUT_CORRECTION:-60}
+      LLM_CIRCUIT_BREAKER_THRESHOLD: ${LLM_CIRCUIT_BREAKER_THRESHOLD:-5}
+      LLM_CIRCUIT_BREAKER_TIMEOUT: ${LLM_CIRCUIT_BREAKER_TIMEOUT:-30}
+      FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,8 +64,23 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: faultline-redis
     ports:
       - "6379:6379"
+    networks:
+      - faultline-test
+
+  faultline-mcp:
+    image: faultline-wgm:latest
+    command: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    ports:
+      - "8002:8002"
+    environment:
+      FAULTLINE_API_URL: http://faultline:8000
+      FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
+      MCP_API_KEY: ${MCP_API_KEY:-}
+    depends_on:
+      - faultline
     networks:
       - faultline-test
 

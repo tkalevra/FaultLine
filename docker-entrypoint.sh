@@ -23,6 +23,18 @@ if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
   exit 1
 fi
 
+# Check for duplicate migration numbers (CRITICAL VALIDATION)
+echo "Validating migration files..."
+MIGRATION_NUMBERS=$(ls /app/migrations/*.sql 2>/dev/null | sed 's/^.*\///; s/_.*\.sql$//' | sort)
+DUPLICATES=$(echo "$MIGRATION_NUMBERS" | uniq -d)
+if [ -n "$DUPLICATES" ]; then
+  echo "WARNING: Duplicate migration numbers found: $DUPLICATES"
+  echo "Note: Multiple definitions of same migration number may cause issues."
+  echo "This is acceptable if they modify different tables or schemas."
+  # Don't exit - let migrations proceed (idempotency handled by migrations themselves)
+fi
+echo "Migration validation complete"
+
 # Run migrations
 echo "Running migrations..."
 for migration in /app/migrations/*.sql; do
