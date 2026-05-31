@@ -6,6 +6,13 @@ from fastapi import HTTPException
 
 log = structlog.get_logger()
 
+# Maximum length for entity names and aliases stored in entity_aliases.alias.
+# 256 chars eliminates injection payload viability (no coherent multi-sentence directive fits
+# within 256 chars) while preserving all real-world personal data: full legal names with
+# titles, addresses, employer names.  Truncation is used (not rejection) because legitimate
+# long names are possible edge cases.  Mitigates TM-01.
+_ENTITY_NAME_MAX_LEN = 256
+
 
 # Stable namespace UUID for deriving surrogates when user_id is not a valid UUID
 _FAULTLINE_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
@@ -36,9 +43,10 @@ class EntityRegistry:
     - Never allow aliases to appear as subject_id/object_id in facts
     """
 
-    def __init__(self, db_conn, auto_commit=True):
+    def __init__(self, db_conn, auto_commit=True, schema_name=None):
         self.db_conn = db_conn
         self.auto_commit = auto_commit
+        self.schema_name = schema_name
 
     @staticmethod
     def _is_valid_uuid(value: str) -> bool:
@@ -58,6 +66,13 @@ class EntityRegistry:
         """
         original_name = name
         name = name.lower().strip()
+        if len(name) > _ENTITY_NAME_MAX_LEN:
+            log.warning(
+                "entity_registry.name_truncated",
+                name_length=len(name),
+                user_id=user_id,
+            )
+            name = name[:_ENTITY_NAME_MAX_LEN]
         log.info("entity_registry.resolve_start", original_name=original_name, normalized_name=name, user_id=user_id)
         if not name:
             raise ValueError("Entity name cannot be empty")
@@ -68,13 +83,13 @@ class EntityRegistry:
         if name == "user":
             entity_id = user_id if self._is_valid_uuid(user_id) else _make_surrogate(user_id, user_id)
             log.info("entity_registry.resolve_user_special_case", entity_id=entity_id)
-            # Ensure the user entity exists
+            # Ensure the user entity exists (per-user schema, no user_id column needed)
             with self.db_conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO entities (id, user_id, entity_type) "
-                    "VALUES (%s, %s, 'Person') "
-                    "ON CONFLICT (id, user_id) DO NOTHING",
-                    (entity_id, user_id),
+                    "INSERT INTO entities (id, entity_type) "
+                    "VALUES (%s, 'Person') "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (entity_id,),
                 )
             self.db_conn.commit()
             log.info("entity_registry.resolve_returning_user", return_value=entity_id)
@@ -84,8 +99,8 @@ class EntityRegistry:
             # Check if it's a known alias (but only if it points to a valid UUID)
             cur.execute(
                 "SELECT entity_id FROM entity_aliases "
-                "WHERE user_id = %s AND alias = %s",
-                (user_id, name),
+                "WHERE alias = %s",
+                (name,),
             )
             row = cur.fetchone()
             log.info("entity_registry.alias_query_executed", name=name, user_id=user_id, found=row is not None)
@@ -101,9 +116,10 @@ class EntityRegistry:
                 # If entity_id is a string (corrupted), fall through to generate a proper UUID
 
             # Check if it's already a canonical UUID (exact match)
+            # Per-user schema isolation: entities table has no user_id column; schema isolation is sufficient
             cur.execute(
-                "SELECT id FROM entities WHERE user_id = %s AND id = %s",
-                (user_id, name),
+                "SELECT id FROM entities WHERE id = %s",
+                (name,),
             )
             row = cur.fetchone()
             log.info("entity_registry.uuid_query_executed", name=name, user_id=user_id, found=row is not None)
@@ -133,21 +149,28 @@ class EntityRegistry:
                          message="HARD CONSTRAINT: rel_type names cannot be registered as entities")
                 raise ValueError(f"Cannot register rel_type '{name}' as an entity (HARD CONSTRAINT)")
 
-            # Unknown — generate UUID v5 surrogate and register
+            # Unknown — generate UUID v5 surrogate and register (per-user schema, no user_id column)
             surrogate = _make_surrogate(user_id, name)
             log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate, surrogate_has_dashes=surrogate.count('-'))
             try:
+                # Probe for aborted transaction before attempting registration
+                try:
+                    cur.execute("SELECT 1")
+                except Exception:
+                    self.db_conn.rollback()
+                    if self.schema_name:
+                        cur.execute(f"SET search_path TO {self.schema_name}, public")
                 cur.execute(
-                    "INSERT INTO entities (id, user_id, entity_type) "
-                    "VALUES (%s, %s, 'unknown') "
-                    "ON CONFLICT (id, user_id) DO NOTHING",
-                    (surrogate, user_id),
+                    "INSERT INTO entities (id, entity_type) "
+                    "VALUES (%s, 'unknown') "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (surrogate,),
                 )
                 cur.execute(
-                    "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
-                    "VALUES (%s, %s, %s, true) "
-                    "ON CONFLICT (user_id, alias) DO UPDATE SET entity_id = EXCLUDED.entity_id, is_preferred = EXCLUDED.is_preferred",
-                    (surrogate, user_id, name),
+                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
+                    "VALUES (%s, %s, true) "
+                    "ON CONFLICT (entity_id, alias) DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
+                    (surrogate, name),
                 )
                 self.db_conn.commit()
                 log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
@@ -159,7 +182,6 @@ class EntityRegistry:
 
     def register_alias(
         self,
-        user_id: str,
         canonical: str,
         alias: str,
         is_preferred: bool = False,
@@ -175,9 +197,18 @@ class EntityRegistry:
 
         User-authoritative: if the alias already exists pointing to a corrupted
         (string) entity_id, delete it first so the correct UUID registration wins.
+
+        Per-user schema isolation: no user_id parameter needed (schema itself provides isolation).
         """
         canonical = canonical.strip()
         alias = alias.lower().strip()
+        if len(alias) > _ENTITY_NAME_MAX_LEN:
+            log.warning(
+                "entity_registry.alias_truncated",
+                alias_length=len(alias),
+                alias_prefix=alias[:20],
+            )
+            alias = alias[:_ENTITY_NAME_MAX_LEN]
 
         # Validate entity_type against known types
         valid_types = self._get_valid_entity_types()
@@ -192,54 +223,149 @@ class EntityRegistry:
 
         try:
             with self.db_conn.cursor() as cur:
-                # Ensure canonical entity exists with validated type
+                # Ensure canonical entity exists with validated type (per-user schema, no user_id column)
                 cur.execute(
-                    "INSERT INTO entities (id, user_id, entity_type) "
-                    "VALUES (%s, %s, %s) ON CONFLICT (id, user_id) DO UPDATE "
+                    "INSERT INTO entities (id, entity_type) "
+                    "VALUES (%s, %s) ON CONFLICT (id) DO UPDATE "
                     "SET entity_type = EXCLUDED.entity_type WHERE entities.entity_type = 'unknown'",
-                    (canonical, user_id, actual_type),
+                    (canonical, actual_type),
                 )
 
+                # ──────────────────────────────────────────────────────────────
+                # dprompt-121: Collision Detection & Staging
+                # Check if this alias is already preferred for a DIFFERENT entity
+                # ──────────────────────────────────────────────────────────────
+                alias_lower = alias.lower()
+                collision_entity = None
+
                 if is_preferred:
+                    # Only check for collisions if we're trying to set as preferred
+                    cur.execute(
+                        "SELECT entity_id FROM entity_aliases "
+                        "WHERE alias = %s AND is_preferred = true "
+                        "AND entity_id != %s LIMIT 1",
+                        (alias_lower, canonical),
+                    )
+                    collision_row = cur.fetchone()
+                    if collision_row:
+                        collision_entity = collision_row[0]
+
+                if collision_entity:
+                    # ──────────────────────────────────────────────────────────────
+                    # COLLISION DETECTED: Two entities claim same preferred name
+                    # Stage for LLM resolution instead of silently overwriting
+                    # ──────────────────────────────────────────────────────────────
+                    try:
+                        # Get entity names for logging/context
+                        cur.execute(
+                            "SELECT alias FROM entity_aliases "
+                            "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                            (collision_entity,),
+                        )
+                        collision_name_row = cur.fetchone()
+                        collision_name = collision_name_row[0] if collision_name_row else collision_entity[:8]
+
+                        canonical_name_row = None
+                        if canonical != collision_entity:
+                            cur.execute(
+                                "SELECT alias FROM entity_aliases "
+                                "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                                (canonical,),
+                            )
+                            canonical_name_row = cur.fetchone()
+                        canonical_name = canonical_name_row[0] if canonical_name_row else canonical[:8]
+
+                        # Stage collision for LLM resolution
+                        cur.execute(
+                            "INSERT INTO entity_name_conflicts "
+                            "(entity_id_1, entity_name_1, entity_id_2, entity_name_2, "
+                            "disputed_name, conflict_type, status, created_at, updated_at) "
+                            "VALUES (%s, %s, %s, %s, %s, 'pref_name_collision', 'pending', NOW(), NOW()) "
+                            "ON CONFLICT (entity_id_1, entity_id_2, disputed_name) DO NOTHING",
+                            (collision_entity, collision_name, canonical, canonical_name,
+                             alias_lower),
+                        )
+                        self.db_conn.commit()
+
+                        log.warning(
+                            "entity_registry.name_collision_detected",
+                            alias=alias,
+                            entity_1_id=collision_entity[:8],
+                            entity_1_name=collision_name,
+                            entity_2_id=canonical[:8],
+                            entity_2_name=canonical_name,
+                            status="staged_for_llm_resolution"
+                        )
+
+                        # Register new entity's alias as NON-preferred (fallback)
+                        # This prevents silent overwrite while collision is pending resolution
+                        is_pref = False
+                    except Exception as e:
+                        log.error(
+                            "entity_registry.collision_staging_failed",
+                            alias=alias,
+                            canonical=canonical,
+                            collision_entity=collision_entity,
+                            error=str(e)
+                        )
+                        # Rollback collision staging, reapply search_path (SET is rolled back too)
+                        self.db_conn.rollback()
+                        if self.schema_name:
+                            try:
+                                with self.db_conn.cursor() as _r:
+                                    _r.execute(f"SET search_path TO {self.schema_name}, public")
+                            except Exception:
+                                pass
+                        is_pref = is_preferred
+                else:
+                    # No collision: use requested preference
+                    is_pref = is_preferred
+
+                if is_pref:
                     # Clear other preferred aliases for this entity
                     cur.execute(
                         "UPDATE entity_aliases SET is_preferred = false "
-                        "WHERE user_id = %s AND entity_id = %s AND alias != %s",
-                        (user_id, canonical, alias),
+                        "WHERE entity_id = %s AND alias != %s",
+                        (canonical, alias),
                     )
 
-                # Insert/update with proper constraint
+                # Insert/update with proper constraint (per-user schema: unique on entity_id, alias)
                 cur.execute(
-                    "INSERT INTO entity_aliases (entity_id, user_id, alias, is_preferred) "
-                    "VALUES (%s, %s, %s, %s) "
-                    "ON CONFLICT (user_id, alias) DO UPDATE SET "
-                    "entity_id = EXCLUDED.entity_id, "
+                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (entity_id, alias) DO UPDATE SET "
                     "is_preferred = EXCLUDED.is_preferred",
-                    (canonical, user_id, alias, is_preferred),
+                    (canonical, alias, is_pref),
                 )
                 log.info("entity_registry.alias_registered",
-                         canonical=canonical, alias=alias, preferred=is_preferred)
+                         canonical=canonical, alias=alias, preferred=is_pref)
         except psycopg2.IntegrityError as err:
-            # Only rollback if this registry instance owns the transaction
-            if self.auto_commit:
+            # Always rollback on error — aborted transactions must be cleared regardless of auto_commit
+            try:
                 self.db_conn.rollback()
+                if self.schema_name:
+                    with self.db_conn.cursor() as _r:
+                        _r.execute(f"SET search_path TO {self.schema_name}, public")
+            except Exception:
+                pass
             log.error("entity_registry.alias_constraint_violation",
                      error=str(err),
-                     user_id=user_id,
                      canonical=canonical,
-                     alias=alias,
-                     auto_commit=self.auto_commit)
+                     alias=alias)
             raise
         except Exception as err:
-            # Only rollback if this registry instance owns the transaction
-            if self.auto_commit:
+            # Always rollback on error — aborted transactions must be cleared regardless of auto_commit
+            try:
                 self.db_conn.rollback()
+                if self.schema_name:
+                    with self.db_conn.cursor() as _r:
+                        _r.execute(f"SET search_path TO {self.schema_name}, public")
+            except Exception:
+                pass
             log.error("entity_registry.alias_registration_failed",
                      error=str(err),
-                     user_id=user_id,
                      canonical=canonical,
-                     alias=alias,
-                     auto_commit=self.auto_commit)
+                     alias=alias)
             raise
 
     def _get_valid_entity_types(self) -> set:
@@ -258,51 +384,62 @@ class EntityRegistry:
                 types.add('unknown')
                 return types
         except Exception as err:
+            # Rollback to clear any aborted transaction state before returning fallback
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
             log.error("failed_to_load_entity_types", error=str(err))
-            # Graceful degradation: return known minimal set
             return {'unknown', 'Person', 'Animal', 'Organization', 'Location', 'Concept'}
 
-    def get_preferred_name(self, user_id: str, canonical: str) -> str:
+    def get_preferred_name(self, canonical: str) -> str:
         """Return preferred display name for entity, or canonical if none set.
 
         DUMB EXTRACT LAYER: Returns whatever is in the database without validation.
         The /query layer (_populate_preferred_names in main.py) is responsible for
         filtering bad data. Do not add validation here — validate on READ, not WRITE.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s AND is_preferred = true "
+                "WHERE entity_id = %s AND is_preferred = true "
                 "LIMIT 1",
-                (user_id, canonical),
+                (canonical,),
             )
             row = cur.fetchone()
             return row[0] if row else canonical
 
-    def get_any_alias(self, user_id: str, entity_id: str) -> str | None:
+    def get_any_alias(self, entity_id: str) -> str | None:
         """Return first available alias for an entity (preferred or not).
 
         Used as fallback when get_preferred_name returns a UUID — ensures
         the entity has at least one human-readable name for display resolution.
         Returns None if no alias exists.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s "
+                "WHERE entity_id = %s "
                 "ORDER BY is_preferred DESC LIMIT 1",
-                (user_id, entity_id),
+                (entity_id,),
             )
             row = cur.fetchone()
             return row[0] if row else None
 
-    def get_all_aliases(self, user_id: str, entity_id: str) -> list[str]:
-        """Return all display name aliases for a surrogate entity_id."""
+    def get_all_aliases(self, entity_id: str) -> list[str]:
+        """Return all display name aliases for a surrogate entity_id.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
+        """
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT alias FROM entity_aliases "
-                "WHERE user_id = %s AND entity_id = %s",
-                (user_id, entity_id),
+                "WHERE entity_id = %s",
+                (entity_id,),
             )
             return [row[0] for row in cur.fetchall()]
 

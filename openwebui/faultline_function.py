@@ -14,6 +14,7 @@ from typing import Callable, Optional
 from collections import defaultdict
 import sys
 import asyncio
+import threading
 
 import httpx
 import redis
@@ -27,7 +28,7 @@ LLMOutputValidator = None
 # Endpoint Detection: Container-First, Env-Override, No Hardcoded IPs (dprompt-134)
 # Configuration is admin-managed via Valves (OpenWebUI UI)
 # NO auto-detection, NO localhost fallbacks, NO network calls at module import time
-# Docker: Use service names (http://open-webui:8080, http://faultline:8001)
+# Docker: Use service names (http://open-webui:8080, http://faultline:8000 - INTERNAL container port)
 # Admins override in Valves for non-Docker deployments
 # Filter accesses via self.valves.OPENWEBUI_LLM_URL and self.valves.FAULTLINE_URL
 
@@ -83,6 +84,151 @@ def _initialize_redis_client(redis_url: str = None):
 
     print(f"[FaultLine Filter] WARNING: All Redis URLs failed, dedup disabled (dBug-INLET-DEDUP)", file=sys.stderr)
     _redis_client = None
+
+
+# dprompt-150: FaultLine URL Smart Detection with Fallback Chain
+# Container-first approach: Valve > env var > Docker service (internal port 8000) > hardcoded fallback
+
+def _normalize_url(url: str) -> str:
+    """
+    Normalize URL: ensure protocol prefix, strip trailing slash, remove paths.
+
+    Examples:
+        "faultline:8000" → "http://faultline:8000"
+        "http://faultline:8000/" → "http://faultline:8000"
+        "http://faultline:8000/ingest" → "http://faultline:8000"
+        "https://my.domain/faultline" → "https://my.domain/faultline"
+
+    Args:
+        url: URL string to normalize
+
+    Returns:
+        str: Normalized URL with protocol, no trailing slash, no paths
+
+    Raises:
+        ValueError: if URL is malformed
+    """
+    from urllib.parse import urlparse
+
+    if not url or not isinstance(url, str):
+        raise ValueError(f"Invalid URL: expected non-empty string, got {type(url).__name__}")
+
+    url = url.strip()
+
+    # Add protocol if missing
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+
+    # Parse to validate and extract components
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        raise ValueError(f"Failed to parse URL '{url}': {e}")
+
+    # Reconstruct without path/query/fragment
+    if not parsed.netloc:
+        raise ValueError(f"URL has no netloc (host:port): {url}")
+
+    # Rebuild: scheme + netloc only (no path)
+    normalized = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Strip trailing slash if present
+    normalized = normalized.rstrip("/")
+
+    return normalized
+
+
+def _can_reach_url(url: str, timeout: float = 1.0) -> bool:
+    """
+    Non-blocking reachability check via HTTP HEAD request.
+    Returns True if URL is reachable, False otherwise (never raises exception).
+
+    Args:
+        url: URL to test (must be absolute, no validation)
+        timeout: Request timeout in seconds (default 1s for fast fallthrough)
+
+    Returns:
+        bool: True if status 200-299, False on timeout/connection error/any exception
+
+    Behavior:
+    - No redirects (follow_redirects=False)
+    - Silent on any exception
+    - Used only for fallback selection, not critical
+    """
+    try:
+        # Use httpx.Client (synchronous, no async overhead)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.head(url, follow_redirects=False)
+            # 2xx or 3xx = reachable
+            return 200 <= response.status_code < 400
+    except Exception:
+        # Any error (timeout, connection refused, DNS) = unreachable
+        return False
+
+
+def _get_faultline_url(valve_url: Optional[str] = None) -> str:
+    """
+    Detect FaultLine backend URL via smart priority chain.
+
+    Priority:
+    1. User-configured Valve (admin setting, explicit override)
+    2. Docker service auto-detection (http://faultline:8000 - internal container port)
+    3. Environment variable fallback (FAULTLINE_API_URL)
+    4. Localhost fallback (http://localhost:8000, for local dev with Docker)
+    5. Hardcoded absolute fallback (last resort, non-fatal)
+
+    Args:
+        valve_url: User-configured URL from Valve. If provided and non-empty, use it first.
+
+    Returns:
+        str: FaultLine API base URL (e.g., "http://faultline:8000" or "http://localhost:8000")
+
+    Implementation Philosophy:
+    - User Valve = highest priority (explicit admin intent)
+    - Container detection = next (works in Docker, zero config)
+    - Environment variable = fallback (supports k8s, custom networks)
+    - Localhost = dev fallback (single-machine, no Docker)
+    - Hardcoded = absolute fallback (should rarely be reached)
+
+    NO network calls at module load time. Detection happens at request time.
+    NO prompts or interactive configuration. Fail gracefully, log clearly.
+    """
+    # Priority 1: User-configured Valve
+    if valve_url and isinstance(valve_url, str) and valve_url.strip():
+        try:
+            detected = _normalize_url(valve_url)
+            print(f"[FaultLine Filter] faultline_url_detect: using_valve_configured={detected}", flush=True)
+            return detected
+        except ValueError as e:
+            print(f"[FaultLine Filter] faultline_url_detect: valve_url_invalid={valve_url}, error={e}", file=sys.stderr, flush=True)
+            # Fall through to chain
+
+    # Priority 2: Docker service name (internal container port 8000, NOT host port 8001)
+    docker_url = "http://faultline:8000"
+    if _can_reach_url(docker_url, timeout=1.0):
+        print(f"[FaultLine Filter] faultline_url_detect: docker_service_reachable, using={docker_url}", flush=True)
+        return docker_url
+
+    # Priority 3: Environment variable
+    env_url = os.environ.get("FAULTLINE_API_URL", "").strip()
+    if env_url:
+        try:
+            detected = _normalize_url(env_url)
+            print(f"[FaultLine Filter] faultline_url_detect: env_var_detected={detected}", flush=True)
+            return detected
+        except ValueError as e:
+            print(f"[FaultLine Filter] faultline_url_detect: env_url_invalid={env_url}, error={e}", file=sys.stderr, flush=True)
+
+    # Priority 4: Localhost (local development with Docker - use internal port 8000)
+    localhost_url = "http://localhost:8000"
+    if _can_reach_url(localhost_url, timeout=1.0):
+        print(f"[FaultLine Filter] faultline_url_detect: localhost_reachable, using={localhost_url}", flush=True)
+        return localhost_url
+
+    # Priority 5: Absolute fallback (non-fatal, will fail at first request if unreachable)
+    fallback_url = "http://faultline:8000"
+    print(f"[FaultLine Filter] faultline_url_detect: all_detection_failed, using_fallback={fallback_url}", file=sys.stderr, flush=True)
+    return fallback_url
 
 # Persistent HTTP client for pooled connections (avoid socket churn from new client per request)
 _http_client: httpx.AsyncClient = None
@@ -276,6 +422,7 @@ _CORRECTION_SIGNALS_TTL: int = 60  # seconds — refresh every minute
 
 # Session memory cache — keyed by user_id, value: (timestamp, facts, preferred_names, canonical_identity, entity_attributes)
 _SESSION_MEMORY_CACHE: dict[str, tuple] = {}
+_SESSION_MEMORY_CACHE_LOCK = threading.Lock()  # Thread-safety for concurrent async writes
 _SESSION_MEMORY_TTL: int = 30  # seconds
 
 # Deduplication tracker — prevents the inlet from processing the same text repeatedly.
@@ -468,46 +615,6 @@ def _check_dedup_fallback(dedup_key: str, window: float, intent: str = "STATEMEN
     return "pending", {}
 
 
-def _generate_fact_dedup_key(user_id: str, subject: str, rel_type: str, object_val: str) -> str:
-    """Generate fact-level idempotency key from triple components.
-
-    Fact-level dedup ensures identical facts are recognized even if message text differs.
-    This allows corrections like "age 30" → "age 42" to bypass dedup and update the fact.
-
-    Key format: dedup:fact:{user_id}:{sha256(subject|rel_type|object)}
-
-    Args:
-        user_id: User UUID
-        subject: Entity name/display name
-        rel_type: Relationship type (lowercased)
-        object_val: Object value (entity name or scalar value, lowercased)
-
-    Returns:
-        Fact-level dedup key (40 chars)
-    """
-    # Normalize all components to lowercase for consistent matching
-    triple = f"{subject.lower()}|{rel_type.lower()}|{object_val.lower()}".encode('utf-8')
-    triple_hash = hashlib.sha256(triple).hexdigest()
-    return f"dedup:fact:{user_id}:{triple_hash}"
-
-
-def _generate_message_dedup_key(user_id: str, text: str) -> str:
-    """Generate message-level dedup key (fallback for when extraction fails).
-
-    Used when fact-level key generation fails due to extraction error.
-    Still more granular than text hash alone — includes user_id.
-
-    Key format: dedup:msg:{user_id}:{sha256(text)}
-
-    Args:
-        user_id: User UUID
-        text: Full message text
-
-    Returns:
-        Message-level dedup key
-    """
-    text_hash = hashlib.sha256(text.encode()).hexdigest()
-    return f"dedup:msg:{user_id}:{text_hash}"
 
 
 def _get_query_cache_key(user_id: str, query_text: str) -> str:
@@ -1075,7 +1182,7 @@ async def _classify_intent_via_backend(faultline_url: str, text: str, user_id: s
         debug: Enable debug logging
 
     Returns:
-        {'intent': 'QUERY'|'RETRACTION'|'CORRECTION'|'STATEMENT', 'confidence': float}
+        {'intent': 'QUERY'|'RETRACTION'|'CORRECTION'|'STATEMENT', 'confidence': float, 'is_preference_pattern': bool (optional)}
         Defaults to {'intent': 'STATEMENT', 'confidence': 0.0} on error.
     """
     if not text or not faultline_url or not user_id:
@@ -1099,10 +1206,11 @@ async def _classify_intent_via_backend(faultline_url: str, text: str, user_id: s
 
             intent = result.get("intent", "STATEMENT")
             confidence = float(result.get("confidence", 0.0))
-            print(f"[FaultLine Filter] intent_classify_response: intent={intent} confidence={confidence:.3f} | full_response={result}", flush=True)
+            is_preference_pattern = result.get("is_preference_pattern", False)
+            print(f"[FaultLine Filter] intent_classify_response: intent={intent} confidence={confidence:.3f} is_preference={is_preference_pattern} | full_response={result}", flush=True)
             if debug:
-                print(f"[FaultLine Filter] intent_classify: intent={intent} confidence={confidence:.2f}")
-            return {"intent": intent, "confidence": confidence}
+                print(f"[FaultLine Filter] intent_classify: intent={intent} confidence={confidence:.2f} is_preference={is_preference_pattern}")
+            return {"intent": intent, "confidence": confidence, "is_preference_pattern": is_preference_pattern}
         elif resp.status_code == 429:
             # Rate limited — safe fallback
             print(f"[FaultLine Filter] intent_classify: rate_limited (429)", flush=True)
@@ -1720,8 +1828,8 @@ class Filter:
 
     class Valves(BaseModel):
         FAULTLINE_URL: str = Field(
-            default="http://faultline:8000",
-            description="FaultLine backend API endpoint (internal container port). Docker Compose: http://faultline:8000 (service name + container port). Override in Valves for non-Docker deployments."
+            default="",
+            description="FaultLine backend API endpoint (optional). If empty, Filter auto-detects via Docker service name, env var, or localhost. Override here to explicitly set custom URL (e.g., for reverse proxy deployments). Examples: http://faultline:8000 (Docker), http://my-domain.com/faultline, http://10.0.0.5:8001 (external port)"
         )
 
         OPENWEBUI_LLM_URL: str = Field(
@@ -1799,8 +1907,21 @@ class Filter:
         # All caches now lazy-loaded at runtime:
         # - Retraction signals via _get_retraction_signals_cached()
         # - Correction signals via _get_correction_signals_cached()
+        # - FaultLine URL via _get_faultline_url_cached() (dprompt-150)
         # No startup dependencies on DB/backend being ready.
         self.db_url = self.valves.POSTGRES_DSN
+        self._faultline_url_cache = None  # Cache detected URL (dprompt-150)
+
+    def _get_faultline_url_cached(self) -> str:
+        """Get FaultLine URL, detect once per Filter instance (dprompt-150).
+
+        Caches detected URL in instance variable to avoid repeated detection
+        across multiple method calls in the same request/session.
+        """
+        if self._faultline_url_cache is None:
+            self._faultline_url_cache = _get_faultline_url(self.valves.FAULTLINE_URL)
+            print(f"[FaultLine Filter] detected_faultline_url: {self._faultline_url_cache}", flush=True)
+        return self._faultline_url_cache
 
     def _last_message(self, messages: list, role: str) -> Optional[str]:
         for m in reversed(messages):
@@ -1811,7 +1932,7 @@ class Filter:
                 return c
         return None
 
-    async def _classify_intent(self, text: str, user_id: str) -> str:
+    async def _classify_intent(self, text: str, user_id: str) -> dict:
         """
         dprompt-144 Phase 2: Three-layer intent classification.
 
@@ -1819,19 +1940,19 @@ class Filter:
         Layer 2: Negation patterns fallback (if confidence < gate)
         Layer 3: Self-adjusting confidence gate (per-user threshold)
 
-        Returns: "QUERY" | "RETRACTION" | "CORRECTION" | "STATEMENT"
+        Returns: {'intent': 'QUERY'|'RETRACTION'|'CORRECTION'|'STATEMENT', 'confidence': float}
 
         This is metadata-driven: all patterns/thresholds from DB, zero hardcoding.
         Non-blocking: backend unavailable → defaults to STATEMENT.
         """
         if not text or not user_id:
             print(f"[FaultLine Filter] _classify_intent: missing params (text={bool(text)} user={bool(user_id)})", flush=True)
-            return "STATEMENT"
+            return {"intent": "STATEMENT", "confidence": 0.0}
 
         # CRITICAL: Filter is dumb — backend is smart
         # Call backend for GLiNER2 classification
         intent_result = await _classify_intent_via_backend(
-            self.valves.FAULTLINE_URL,
+            self._get_faultline_url_cached(),
             text,
             user_id,
             debug=self.valves.ENABLE_DEBUG
@@ -1839,11 +1960,12 @@ class Filter:
 
         intent = intent_result.get("intent", "STATEMENT")
         gliner_confidence = intent_result.get("confidence", 0.0)
+        final_confidence = gliner_confidence
         print(f"[FaultLine Filter] _classify_intent.layer1: intent={intent} | gliner_confidence={gliner_confidence:.3f}", flush=True)
 
         # Get per-user confidence gate threshold
         gate_threshold = await _get_confidence_gate(
-            self.valves.FAULTLINE_URL,
+            self._get_faultline_url_cached(),
             user_id,
             debug=self.valves.ENABLE_DEBUG
         )
@@ -1860,7 +1982,7 @@ class Filter:
             # Low confidence — query negation_patterns fallback (Layer 2)
             print(f"[FaultLine Filter] intent_gate_FAILED: {gliner_confidence:.3f} < {gate_threshold:.3f} | trying negation_patterns fallback", flush=True)
             pattern_match = await _query_negation_patterns(
-                self.valves.FAULTLINE_URL,
+                self._get_faultline_url_cached(),
                 text,
                 user_id,
                 debug=self.valves.ENABLE_DEBUG
@@ -1869,20 +1991,22 @@ class Filter:
             if pattern_match and pattern_match.get("confidence", 0.0) >= 0.5:
                 # DB pattern override
                 final_intent = pattern_match.get("negation_type", "STATEMENT").upper()
+                final_confidence = pattern_match.get("confidence", 0.0)
                 print(f"[FaultLine Filter] intent_gate_fallback_HIT: final_intent={final_intent} | pattern_match={pattern_match}", flush=True)
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] intent_gate_fallback: intent={final_intent} "
-                          f"from negation_patterns (confidence={pattern_match.get('confidence', 0.0):.2f})")
+                          f"from negation_patterns (confidence={final_confidence:.2f})")
             else:
                 # No override — default to STATEMENT
                 final_intent = "STATEMENT"
+                final_confidence = 0.0
                 print(f"[FaultLine Filter] intent_gate_fallback_MISS: defaulting to STATEMENT | pattern_match={pattern_match}", flush=True)
                 if self.valves.ENABLE_DEBUG:
                     print(f"[FaultLine Filter] intent_gate_default: intent=STATEMENT "
                           f"(gliner_confidence={gliner_confidence:.2f} < gate={gate_threshold:.2f})")
 
-        print(f"[FaultLine Filter] _classify_intent.FINAL: intent={final_intent}", flush=True)
-        return final_intent
+        print(f"[FaultLine Filter] _classify_intent.FINAL: intent={final_intent} confidence={final_confidence:.3f}", flush=True)
+        return {"intent": final_intent, "confidence": final_confidence}
 
     async def _fire_and_log(self, coro, label: str):
         """Fire coroutine in background, log any failures (dprompt-140 Plan B)."""
@@ -1918,7 +2042,7 @@ class Filter:
                 payload["chat_id"] = chat_id
 
             response = await _http_client.post(
-                f"{self.valves.FAULTLINE_URL}/ingest",
+                f"{self._get_faultline_url_cached()}/ingest",
                 json=payload,
                 timeout=self.valves.FAULTLINE_TIMEOUT_SECS,
             )
@@ -1929,7 +2053,8 @@ class Filter:
 
             # Invalidate query cache on successful ingest (growth mindset: fresh data on writes)
             if data.get("status") not in ("error", None):
-                _SESSION_MEMORY_CACHE.pop(user_id, None)
+                with _SESSION_MEMORY_CACHE_LOCK:
+                    _SESSION_MEMORY_CACHE.pop(user_id, None)
                 # Invalidate Redis /query cache for this user
                 redis_client = _get_redis_client(self.valves.REDIS_URL)
                 _invalidate_query_cache(redis_client, user_id)
@@ -1958,7 +2083,7 @@ class Filter:
         try:
             await _initialize_http_client()  # Ensure persistent client is initialized
             await _http_client.post(
-                f"{self.valves.FAULTLINE_URL}/store_context",
+                f"{self._get_faultline_url_cached()}/store_context",
                 json={
                     "text": text,
                     "user_id": user_id,
@@ -1975,7 +2100,7 @@ class Filter:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
-                    f"{self.valves.FAULTLINE_URL}/extract",
+                    f"{self._get_faultline_url_cached()}/extract",
                     json={"text": text, "source": "preflight", "user_id": user_id},
                 )
             if resp.status_code == 200:
@@ -2263,7 +2388,7 @@ Return valid JSON only. If no facts, return [].
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.post(
-                    f"{self.valves.FAULTLINE_URL}/query",
+                    f"{self._get_faultline_url_cached()}/query",
                     json={"user_id": user_id, "text": "recent facts"},
                     timeout=5,
                 )
@@ -2426,7 +2551,7 @@ GRANULAR EXAMPLES (using recent facts context):
 
     async def _fire_retract(self, user_id: str, subject: Optional[str] = None, rel_type: Optional[str] = None,
                            old_value: Optional[str] = None, scope: Optional[dict] = None,
-                           text: Optional[str] = None, __event_emitter__: Optional[Callable] = None) -> dict:
+                           text: Optional[str] = None, intent: Optional[str] = None, __event_emitter__: Optional[Callable] = None) -> dict:
         """
         Fire retraction/correction to backend.
 
@@ -2458,6 +2583,7 @@ GRANULAR EXAMPLES (using recent facts context):
                 payload = {
                     "text": text,
                     "user_id": user_id,
+                    "intent": intent,
                     "context_facts": context_facts,
                     "idempotency_key": idempotency_key
                 }
@@ -2466,7 +2592,7 @@ GRANULAR EXAMPLES (using recent facts context):
                     if _http_client is None:
                         await _initialize_http_client()
                     resp = await _http_client.post(
-                        f"{self.valves.FAULTLINE_URL}/retract/correct",
+                        f"{self._get_faultline_url_cached()}/retract/correct",
                         json=payload,
                         timeout=self.valves.FAULTLINE_TIMEOUT_SECS
                     )
@@ -2480,7 +2606,8 @@ GRANULAR EXAMPLES (using recent facts context):
                               f"subject={result.get('subject_uuid')[:8] if result.get('subject_uuid') else 'none'}")
                     # Invalidate query cache on successful correction (growth mindset: fresh data on writes)
                     if result.get("status") not in ("error", None):
-                        _SESSION_MEMORY_CACHE.pop(user_id, None)
+                        with _SESSION_MEMORY_CACHE_LOCK:
+                            _SESSION_MEMORY_CACHE.pop(user_id, None)
                         redis_client = _get_redis_client(self.valves.REDIS_URL)
                         _invalidate_query_cache(redis_client, user_id)
                         if self.valves.ENABLE_DEBUG:
@@ -2512,7 +2639,7 @@ GRANULAR EXAMPLES (using recent facts context):
                 if _http_client is None:
                     await _initialize_http_client()
                 resp = await _http_client.post(
-                    f"{self.valves.FAULTLINE_URL}/retract",
+                    f"{self._get_faultline_url_cached()}/retract",
                     json=payload,
                     timeout=self.valves.FAULTLINE_TIMEOUT_SECS
                 )
@@ -2525,7 +2652,8 @@ GRANULAR EXAMPLES (using recent facts context):
                     print(f"[FaultLine Filter] /retract fallback: status={result.get('status')}")
                 # Invalidate query cache on successful retraction (growth mindset: fresh data on writes)
                 if result.get("status") not in ("error", None):
-                    _SESSION_MEMORY_CACHE.pop(user_id, None)
+                    with _SESSION_MEMORY_CACHE_LOCK:
+                        _SESSION_MEMORY_CACHE.pop(user_id, None)
                     redis_client = _get_redis_client(self.valves.REDIS_URL)
                     _invalidate_query_cache(redis_client, user_id)
                     if self.valves.ENABLE_DEBUG:
@@ -2581,7 +2709,7 @@ GRANULAR EXAMPLES (using recent facts context):
             # Backend endpoint signature: classify_intent(req: dict, user_id: str = None)
             # FastAPI treats user_id parameter as query param when not in body
             resp = await _http_client.post(
-                f"{self.valves.FAULTLINE_URL}/classify-intent?user_id={user_id}",
+                f"{self._get_faultline_url_cached()}/classify-intent?user_id={user_id}",
                 json={"text": text},
                 timeout=5.0  # Should be <50ms, allow 5s for latency
             )
@@ -2701,6 +2829,7 @@ GRANULAR EXAMPLES (using recent facts context):
                     "⊢ FaultLine Memory — treat these as established ground truth for this response.\n"
                     + "\n".join(f"- {l}" for l in lines)
                     + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user (location, relationships, preferences, history). Use them to inform your entire response—not just tool routing. Be confident and direct in leveraging verified information. Don't say 'I don't know' or 'I can't access' when the answer is in your facts. Route sensitive data to tools internally as needed; keep personal details private in responses but reason with them confidently. Provide personalized, grounded context naturally."
+                    + "\n[/FAULTLINE_MEMORY]"
                 )
             else:
                 # No location found - fall through to conversational mode
@@ -2793,101 +2922,18 @@ GRANULAR EXAMPLES (using recent facts context):
                 # Fallback: return as-is (already display name or UUID)
                 return str(name).title()
 
-            # Extract family relationships using category metadata (not hardcoded rel_type names)
-            family_facts = [f for f in facts if f.get("category") == "family"]
-            children_raw = []
-            spouses_raw = []
-            siblings_raw = []
-
-            for f in family_facts:
-                if not identity or f.get("subject") not in _user_anchors:
-                    continue
-                rel = f.get("rel_type", "")
-                obj = f.get("object")
-                if rel == "parent_of" and obj:
-                    children_raw.append(obj)
-                elif rel == "spouse" and obj:
-                    spouses_raw.append(obj)
-                elif rel == "sibling_of" and obj:
-                    siblings_raw.append(obj)
-
-            # Handle symmetric spouse relationships (both directions)
-            for f in family_facts:
-                if f.get("rel_type") == "spouse" and identity and f.get("object") in _user_anchors:
-                    subj = f.get("subject")
-                    if subj and subj not in spouses_raw:
-                        spouses_raw.append(subj)
-
-            # Build compact family line (deduplicate — same entity may appear
-            # under multiple identity anchors like "user" and "${USER}")
-            if children_raw or spouses_raw or siblings_raw:
-                family_parts = []
-                if spouses_raw:
-                    family_parts.append(f"spouse={', '.join(_dn(s) for s in set(spouses_raw))}")
-                if children_raw:
-                    family_parts.append(f"children={', '.join(_dn(c) for c in dict.fromkeys(children_raw))}")
-                if siblings_raw:
-                    family_parts.append(f"siblings={', '.join(_dn(s) for s in dict.fromkeys(siblings_raw))}")
-                lines.append(f"family: {', '.join(family_parts)}")
-
-            # Extract and display ages from facts
-            ages = []
-            for f in facts:
-                if f.get("rel_type") == "age":
-                    subj = f.get("subject", "")
-                    obj = f.get("object", "")
-                    if subj and obj and subj != "user":
-                        ages.append(f"{_dn(subj)}:{obj}")
-                    elif subj and obj and subj == "user":
-                        ages.append(f"user:{obj}")
-            if ages:
-                lines.append(f"ages: {', '.join(ages)}")
-
-
-            # Format temporal events with natural language
-            events = [f for f in facts if f.get("source") == "events_table"]
-            for evt in events:
-                recurrence = evt.get("recurrence", "once")
-                rel_type = evt.get("rel_type", evt.get("event_type", ""))
-                subj = evt.get("subject", "")
-                obj = evt.get("object", evt.get("occurs_on", ""))
-                if recurrence == "yearly":
-                    lines.append(f"⭐ {subj}'s {rel_type.replace('_', ' ')}: {obj} (annually)")
-                elif recurrence == "once":
-                    lines.append(f"📅 {subj} {rel_type.replace('_', ' ')}: {obj}")
-                else:
-                    lines.append(f"{rel_type}: {obj}")
-
-            # Remove events from facts list so they don't appear twice
-            facts = [f for f in facts if f.get("source") != "events_table"]
-
-            # Build compact fact lines (metadata-driven: use category to determine what to skip)
-            # Skip: family facts (already formatted above), identity facts (names), temporal facts, age facts
-            _covered_categories = {"family"}
-            _covered_rel_types = {"also_known_as", "pref_name", "same_as", "age"}
+            # DUMB FILTER: Inject all facts with prose definitions (backend handles filtering)
+            # Backend /query already selected relevant facts. Filter just formats them.
+            _covered_rel_types = {"also_known_as", "pref_name", "same_as"}
 
             for f in facts:
-                if f.get("category") in _covered_categories or f.get("rel_type") in _covered_rel_types:
+                # Skip only identity rel_types (name facts handled separately above)
+                if f.get("rel_type") in _covered_rel_types:
                     continue
-                _s = f.get("subject", "").strip().lower()
-                _o = f.get("object", "").strip().lower()
-                if not _s or len(_s) <= 1 or _s == "x" or not _o or len(_o) <= 1 or _o == "x":
-                    continue
-                subj = f.get("subject", "")
-                obj = f.get("object", "")
-                rel = f.get("rel_type", "")
-                label = f.get("definition", rel).lower() if f.get("definition") else rel
-
-                # Format fact using resolved display names
-                subj_display = _dn(subj)
-                obj_display = _dn(obj)
-
-                if identity and subj in _user_anchors:
-                    lines.append(f"{label}: {obj_display}")
-                elif identity and obj in _user_anchors:
-                    lines.append(f"{subj_display} ← {label}")
-                else:
-                    lines.append(f"{subj_display} → {label} → {obj_display}")
+                definition = f.get("definition", "")
+                if definition:
+                    # Use backend prose definition directly (no brittle filter formatting)
+                    lines.append(f"- {definition}")
 
             # Display attributes for all entities mentioned in facts
             if entity_attributes:
@@ -2979,6 +3025,7 @@ GRANULAR EXAMPLES (using recent facts context):
         return (
             "\n".join(f"- {l}" for l in limited)
             + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user. Use them to inform ALL responses and provide personalized, grounded context. Be confident and direct—don't say 'I don't know' or 'I can't' when the answer is in your facts. Route facts to tools/APIs internally as needed, but reason with all verified information to enrich your responses. Keep sensitive details private in responses unless directly asked, but leverage them confidently in your thinking. Trust these facts as ground truth."
+            + "\n[/FAULTLINE_MEMORY]"
         )
 
     async def inlet(
@@ -3004,6 +3051,55 @@ GRANULAR EXAMPLES (using recent facts context):
             return body
 
         try:
+            # PHASE 2: Provisioning blocker — check if user's backend is ready via HTTP call
+            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+            user_name = __user__.get("name", "") if __user__ else ""
+
+            is_ready = False
+            try:
+                # Check provisioning status via backend HTTP endpoint instead of direct import
+                # (FaultLine source is not in OpenWebUI's PYTHONPATH)
+                import httpx
+
+                backend_url = self._get_faultline_url_cached()
+                response = httpx.get(
+                    f"{backend_url}/provisioning/status",
+                    params={"user_id": user_id, "user_name": user_name},
+                    timeout=5.0
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    is_ready = result.get("status") == "ready"
+
+                if not is_ready:
+                    # User's backend is still being provisioned — show progress and pass through
+                    if __event_emitter__:
+                        __event_emitter__({
+                            "type": "status",
+                            "data": {
+                                "description": f"⏳ FaultLine is setting up your memory backend...",
+                                "done": False
+                            }
+                        })
+                    return body  # Pass through without processing
+
+                # status == "ready" — continue to normal inlet flow
+
+            except Exception as e:
+                # Provisioning status check failed — log explicitly, show progress, don't crash
+                user_id_short = user_id[:8] if len(str(user_id)) > 8 else user_id
+                print(f"[FaultLine Filter] provisioning_status_check FAILED: user_id={user_id_short} error={str(e)}", file=sys.stderr)
+                if __event_emitter__:
+                    __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": f"⏳ FaultLine is setting up your memory backend...",
+                            "done": False
+                        }
+                    })
+                return body  # Pass through without processing
+
             text = self._last_message(body.get("messages", []), "user")
             if not text:
                 return body
@@ -3033,7 +3129,7 @@ GRANULAR EXAMPLES (using recent facts context):
             # memory injection → another inlet call → infinite recursive loop (dBug-INLET-DEDUP).
             # User UUID also injected as chat_id in extraction LLM requests to prevent
             # OpenWebUI's NoneType crash on missing chat_id (dBug-016 / openwebui#24550).
-            user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
+            # PHASE 2: user_id already extracted at inlet start (provisioning blocker) — reuse it here
 
             # REFACTORED DEDUP (dprompt-145): State-tracking + intent-aware (ATOMIC GATE SEMANTICS)
             # OLD: message_text hash → blocks legitimate corrections/retractions
@@ -3087,22 +3183,36 @@ GRANULAR EXAMPLES (using recent facts context):
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] dedup_state={dedup_state} intent={message_intent} confidence={intent_confidence:.2f}")
 
-            # Step 4: CRITICAL FIX (dBug-INLET-LOOP + dBug-QUERY-STALE-CACHE)
-            # QUERY intents must BYPASS dedup cache and call /query FRESH each time
-            # Reason: Users ask different questions in sequence; stale dedup cache prevents fact injection
-            # Example: "tell me about my family?" called twice in 30s should both inject facts (same question, fresh data wanted)
-            # STATEMENT intents still use dedup to prevent inlet cascades (optimization, not correctness)
-            # ROOT CAUSE (dBug-INLET-LOOP): Duplicate STATEMENT calls process in parallel, call /ingest, inject memory, trigger another inlet
-            # FIX: QUERY bypasses; STATEMENT/CORRECTION/RETRACTION use dedup. Idempotency prevents duplicate ingest loops.
-            if dedup_state == "cached" and message_intent != "QUERY":
+            # Step 4: CRITICAL FIX (dBug-INLET-DEDUP-WRITE-BLOCKING)
+            # ONLY dedup QUERY operations (reads are idempotent). STATEMENT/CORRECTION/RETRACTION are writes.
+            # ROOT CAUSE: Previous logic applied dedup to all intents, blocking /ingest for duplicate messages
+            # Example: Saying "Aurora is a dog" twice should ingest BOTH times (facts may differ, user may correct)
+            # FIX: Dedup applies ONLY to QUERY (safe to cache). Writes bypass dedup at filter level.
+            # Note: Backend WGMValidationGate still prevents duplicate fact storage (idempotency at ingest layer)
+            if dedup_state == "cached" and message_intent == "QUERY":
                 if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] returning cached result for {message_intent} (dedup prevents recursive inlet)")
-                return body  # CRITICAL: Early return prevents loop escalation for duplicate STATEMENT/CORRECTION/RETRACTION
+                    print(f"[FaultLine Filter] returning cached result for {message_intent} (dedup cache hit for read-only operation)")
+                return body  # Only cache QUERY responses; writes always proceed
 
-            # Step 5: If pending from a different intent type, allow override for CORRECTION/RETRACTION
-            if dedup_state == "pending" and message_intent in ("CORRECTION", "RETRACTION"):
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] forcing new {message_intent} (overriding pending STATEMENT)")
+            # Step 5: Handle cached dedup state (parallel duplicate detection)
+            # dedup_state meanings:
+            #   "pending" = THIS call successfully claimed the lock → PROCEED (not parallel duplicate)
+            #   "cached" = SOMEONE ELSE claimed it → SHORT-CIRCUIT (parallel duplicate detected)
+            #
+            # CRITICAL FIX (Race Condition Prevention): When dedup_state="cached", another inlet call
+            # already claimed the key and is processing. Skip to prevent parallel duplicate backend calls.
+            # ONLY QUERY is safe to cache (reads). STATEMENT/CORRECTION/RETRACTION are writes and must proceed.
+            if dedup_state == "cached":
+                if message_intent == "QUERY":
+                    # QUERY is read-only, safe to return cached result
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] returning cached QUERY result (dedup cache hit for read-only operation)")
+                    return body
+                elif message_intent in ("CORRECTION", "RETRACTION"):
+                    # CORRECTION/RETRACTION must override cached STATEMENT (user wants to correct facts)
+                    if self.valves.ENABLE_DEBUG:
+                        print(f"[FaultLine Filter] forcing new {message_intent} (overriding cached state)")
+                # else: STATEMENT continues (write operation, cannot be cached)
 
             # CRITICAL: Handle intent-routed corrections/retractions (PART 2: CACHE INVALIDATION)
             # When message_intent = CORRECTION/RETRACTION, INVALIDATE /query cache BEFORE ingest
@@ -3121,7 +3231,7 @@ GRANULAR EXAMPLES (using recent facts context):
 
                 # Call /retract/correct endpoint (backend handles extraction + validation)
                 try:
-                    retract_result = await self._fire_retract(user_id, text=text)
+                    retract_result = await self._fire_retract(user_id, text=text, intent=message_intent)
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] /retract/correct status={retract_result.get('status')}")
 
@@ -3202,7 +3312,8 @@ GRANULAR EXAMPLES (using recent facts context):
             # Run /query first (with caching) so memory facts can aid pronoun resolution during ingest
             if will_query:
                 try:
-                    cached = _SESSION_MEMORY_CACHE.get(user_id)
+                    with _SESSION_MEMORY_CACHE_LOCK:
+                        cached = _SESSION_MEMORY_CACHE.get(user_id)
                     if cached and (_time.time() - cached[0]) < _SESSION_MEMORY_TTL:
                         _, facts, preferred_names, canonical_identity, entity_attributes = cached
                         raw_facts_for_extraction = list(facts)
@@ -3230,13 +3341,13 @@ GRANULAR EXAMPLES (using recent facts context):
                         else:
                             # Cache miss — call backend
                             if self.valves.ENABLE_DEBUG:
-                                print(f"[FaultLine Filter] calling /query url={self.valves.FAULTLINE_URL}/query")
+                                print(f"[FaultLine Filter] calling /query url={self._get_faultline_url_cached()}/query")
                             resp = None
                             await _initialize_http_client()  # Ensure persistent client is initialized
                             for _attempt in range(2):
                                 try:
                                     resp = await _http_client.post(
-                                        f"{self.valves.FAULTLINE_URL}/query",
+                                        f"{self._get_faultline_url_cached()}/query",
                                         json={"text": text, "user_id": user_id, "top_k": 5},
                                         timeout=self.valves.FAULTLINE_TIMEOUT_SECS,
                                     )
@@ -3284,9 +3395,10 @@ GRANULAR EXAMPLES (using recent facts context):
                                         print(f"[FaultLine Filter] /query cached in Redis (30s TTL)")
 
                                 # Store raw unfiltered facts in memory cache too
-                                _SESSION_MEMORY_CACHE[user_id] = (
-                                    _time.time(), facts, preferred_names, canonical_identity, entity_attributes
-                                )
+                                with _SESSION_MEMORY_CACHE_LOCK:
+                                    _SESSION_MEMORY_CACHE[user_id] = (
+                                        _time.time(), facts, preferred_names, canonical_identity, entity_attributes
+                                    )
                             else:
                                 # Non-200 status — use safe defaults
                                 facts = []
@@ -3307,7 +3419,7 @@ GRANULAR EXAMPLES (using recent facts context):
 
                 except httpx.ConnectError as e:
                     # Connection error: provide diagnostic guidance
-                    url = f"{self.valves.FAULTLINE_URL}/query"
+                    url = f"{self._get_faultline_url_cached()}/query"
                     print(f"\n{'='*80}")
                     print(f"[FaultLine] CONFIGURATION ERROR - Cannot reach FaultLine backend:")
                     print(f"URL: {url}")
@@ -3315,7 +3427,7 @@ GRANULAR EXAMPLES (using recent facts context):
                     print(f"\nFix: If FaultLine is running in Docker, use service name:")
                     print(f"  Set FAULTLINE_URL to: http://faultline:8000 (container port, not host port)")
                     print(f"\nIf running locally outside Docker:")
-                    print(f"  Set FAULTLINE_URL to: http://localhost:8001")
+                    print(f"  Set FAULTLINE_URL to: http://localhost:8000 (internal port)")
                     print(f"{'='*80}\n")
                 except httpx.TimeoutException as e:
                     if self.valves.ENABLE_DEBUG:
@@ -3328,12 +3440,33 @@ GRANULAR EXAMPLES (using recent facts context):
                 # dprompt-144 Phase 2: Intent classification with Layer 1/2/3 gating
                 # Queries don't need LLM extraction — /query already has the facts
                 # Retractions/corrections route to /retract (handled upstream at line 2590)
-                # (Violation 1 Fix) Reuse cached message_intent from dedup phase (line 2950)
-                # Previously called _classify_intent() again here (duplicate GLiNER2 call)
-                # Now using cached value to eliminate 2x calls per message
-                print(f"[FaultLine Filter] ROUTING: using cached intent for text='{clean_text[:60]}...'", flush=True)
-                final_intent = message_intent
-                print(f"[FaultLine Filter] ROUTING.DECISION: final_intent={final_intent}", flush=True)
+                #
+                # Route intent: QUERY can use cached (reads are idempotent)
+                # STATEMENT/CORRECTION/RETRACTION must call fresh (enables Layer 2c + confidence gates)
+
+                # Initialize result dict to avoid NameError at line 3553 if not set by _classify_intent
+                result = {}
+
+                if message_intent == "QUERY":
+                    # QUERY is idempotent, safe to use cached
+                    final_intent = message_intent
+                    intent_confidence = 0.0
+                    print(f"[FaultLine Filter] ROUTING: using cached intent (QUERY) for text='{clean_text[:60]}...'", flush=True)
+                else:
+                    # STATEMENT/CORRECTION/RETRACTION: Call /classify-intent fresh
+                    # This ensures Layer 2c preference signal detection + confidence gates execute
+                    print(f"[FaultLine Filter] ROUTING: calling fresh /classify-intent for {message_intent} intent", flush=True)
+                    try:
+                        result = await self._classify_intent(clean_text, user_id)
+                        final_intent = result.get("intent", message_intent)
+                        intent_confidence = result.get("confidence", 0.0)
+                        print(f"[FaultLine Filter] ROUTING.DECISION: final_intent={final_intent} confidence={intent_confidence:.2f}", flush=True)
+                    except Exception as e:
+                        # Fallback to cached on error (non-blocking)
+                        print(f"[FaultLine Filter] ROUTING: fresh /classify-intent failed ({e}), falling back to cached {message_intent}", flush=True)
+                        final_intent = message_intent
+                        intent_confidence = 0.0
+                        result = {}  # Ensure result is a dict even on exception
 
                 if final_intent == "QUERY":
                     print(f"[FaultLine Filter] ROUTE_TAKEN: QUERY — skipping /ingest, using /query results", flush=True)
@@ -3349,7 +3482,7 @@ GRANULAR EXAMPLES (using recent facts context):
                     # If we reach here, it means retraction detection didn't fire earlier
                     # Call _fire_retract as fallback
                     try:
-                        retract_result = await self._fire_retract(user_id, text=clean_text)
+                        retract_result = await self._fire_retract(user_id, text=clean_text, intent="RETRACTION")
                         if retract_result.get("status") in ("ok", "corrected"):
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] retraction succeeded via intent routing")
@@ -3363,7 +3496,7 @@ GRANULAR EXAMPLES (using recent facts context):
                         print(f"[FaultLine Filter] intent=CORRECTION — routing to /retract")
                     # Corrections are handled similarly to retractions
                     try:
-                        retract_result = await self._fire_retract(user_id, text=clean_text)
+                        retract_result = await self._fire_retract(user_id, text=clean_text, intent="CORRECTION")
                         if retract_result.get("status") in ("ok", "corrected"):
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] correction succeeded via intent routing")
@@ -3422,11 +3555,18 @@ GRANULAR EXAMPLES (using recent facts context):
                         # Backend handles detection (retraction vs correction vs normal) in unified gate
                         print(f"[FaultLine Filter] /ingest: text='{clean_text[:80]}' source={self.valves.DEFAULT_SOURCE} user_id={user_id}")
 
+                        # CRITICAL: If preference pattern detected, mark as is_correction=True
+                        # This ensures user identity statements get Class A routing (confidence=1.0)
+                        is_correction_ingest = result.get("is_preference_pattern", False) if result else False
+                        if is_correction_ingest:
+                            print(f"[FaultLine Filter] preference pattern detected — marking ingest as is_correction=True", flush=True)
+
                         ingest_result = await self._fire_ingest(
                             clean_text,
                             self.valves.DEFAULT_SOURCE,
                             user_id,
                             memory_facts=raw_facts_for_extraction if raw_facts_for_extraction else None,
+                            is_correction=is_correction_ingest,
                         )
 
                         # Record result in dedup cache for duplicate requests (PART 1: Redis dedup state recording)
@@ -3584,7 +3724,7 @@ GRANULAR EXAMPLES (using recent facts context):
                         await __event_emitter__({
                             "type": "status",
                             "data": {
-                                "alicecription": f"⊢ FaultLine — {fact_count} fact{('s' if fact_count != 1 else '')} loaded",
+                                "description": f"⊢ FaultLine — {fact_count} fact{('s' if fact_count != 1 else '')} loaded",
                                 "done": True
                             }
                         })

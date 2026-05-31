@@ -5,14 +5,15 @@ class FactStoreManager:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def commit(self, connections: list[tuple], confidence: float = 1.0, source_weight: float = 1.0, unified_confidence: float = None) -> int:
+    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None) -> int:
         """
-        Insert edges into facts.
+        Insert edges into facts with temporal metadata.
         connections: list of tuples with varying length:
                      (user_id, subject_id, object_id, rel_type, provenance) - 5 elements
                      (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label) - 6 elements
                      (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition) - 7 elements
-                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition, storage_type, is_hierarchy_rel, taxonomies) - 10 elements
+                     (user_id, subject_id, object_id, rel_type, provenance, is_preferred_label, definition, storage_type, is_hierarchy_rel, taxonomies) - 13 elements
+                     (with temporal: ...taxonomies, statement_date, valid_until, temporal_confidence) - 16 elements
         unified_confidence: blended confidence from LLMOutputValidator (frequency + llm_confidence).
                            Defaults to confidence if not provided.
         Returns count of rows attempted. Rolls back and re-raises on psycopg2.Error.
@@ -27,8 +28,22 @@ class FactStoreManager:
                     storage_type = None
                     is_hierarchy_rel = False
                     taxonomies = []
+                    statement_date = None
+                    valid_until = None
+                    temporal_confidence = None
 
-                    if len(row) >= 10:
+                    if len(row) >= 16:
+                        # Full row with temporal metadata
+                        user_id, sub, obj, rel, prov, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies = row[:10]
+                        # Temporal fields follow
+                        if len(row) > 13:
+                            statement_date = row[13]
+                            valid_until = row[14] if len(row) > 14 else None
+                            temporal_confidence = row[15] if len(row) > 15 else None
+                    elif len(row) >= 13:
+                        # Row with taxonomies but no temporal fields
+                        user_id, sub, obj, rel, prov, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies = row[:10]
+                    elif len(row) >= 10:
                         user_id, sub, obj, rel, prov, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies = row[:10]
                     elif len(row) >= 7:
                         user_id, sub, obj, rel, prov, is_preferred, definition = row
@@ -56,9 +71,9 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (user_id, subject_id, object_id, rel_type, provenance, confidence, unified_confidence, source_weight, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies)"
+                        " (subject_id, object_id, rel_type, provenance, confidence, unified_confidence, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, valid_from, valid_until)"
                         " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-                        " ON CONFLICT (user_id, subject_id, object_id, rel_type)"
+                        " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
@@ -66,8 +81,10 @@ class FactStoreManager:
                         "   unified_confidence = EXCLUDED.unified_confidence,"
                         "   rel_type_definition = EXCLUDED.rel_type_definition,"
                         "   storage_type = COALESCE(EXCLUDED.storage_type, facts.storage_type),"
-                        "   taxonomies = COALESCE(EXCLUDED.taxonomies, facts.taxonomies)",
-                        (user_id, sub, obj, rel, prov, confidence, unified_confidence, source_weight, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies),
+                        "   taxonomies = COALESCE(EXCLUDED.taxonomies, facts.taxonomies),"
+                        "   valid_from = COALESCE(EXCLUDED.valid_from, facts.valid_from),"
+                        "   valid_until = COALESCE(EXCLUDED.valid_until, facts.valid_until)",
+                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until),
                     )
                     count += 1
             self.db_conn.commit()
@@ -79,17 +96,16 @@ class FactStoreManager:
     def mark_contradicted(self, old_id: int, new_id: int, penalty: float = 0.5) -> None:
         """
         Penalize old_id by reducing its confidence by penalty and linking it to new_id.
-        Uses GREATEST to floor confidence at 0.0. Penalty is stored for audit.
+        Uses GREATEST to floor confidence at 0.0.
         """
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "UPDATE facts SET"
                 "  confidence = GREATEST(confidence - %s, 0.0),"
                 "  contradicted_by = %s,"
-                "  contradiction_confidence_penalty = %s,"
                 "  updated_at = now()"
                 " WHERE id = %s",
-                (penalty, new_id, penalty, old_id),
+                (penalty, new_id, old_id),
             )
         self.db_conn.commit()
 
@@ -99,9 +115,13 @@ class FactStoreManager:
         Retract facts matching the given criteria. Returns list of affected fact IDs.
         Behavior is controlled by mode: 'hard_delete' (DELETE), 'supersede' (set superseded_at).
         subject and old_value are pre-resolved UUIDs (already lowercase).
+
+        CLAUDE.md Compliance: Per-user schema isolation means NO user_id column.
+        Caller must set search_path to user's schema before calling this method.
+        This method only filters on subject_id/object_id/rel_type (no user_id).
         """
-        conditions = ["user_id = %s", "subject_id = %s", "superseded_at IS NULL"]
-        params = [user_id, subject]
+        conditions = ["subject_id = %s", "superseded_at IS NULL"]
+        params = [subject]
 
         if rel_type:
             conditions.append("rel_type = %s")

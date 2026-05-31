@@ -2,142 +2,67 @@
 
 TOOLS = [
     {
-        "name": "extract",
-        "description": "Preflight entity extraction using GLiNER2. Returns typed entities from text "
-                       "before full ingest. Useful for previewing what entities would be extracted.",
+        "name": "recall_memory",
+        "description": "Query FaultLine knowledge graph to recall facts relevant to the conversation. "
+                       "Call this at the start of any turn where you need to remember things about the user. "
+                       "Returns prose facts from PostgreSQL (graph traversal + hierarchy) merged with "
+                       "Qdrant semantic search results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What you want to recall (e.g., 'family', 'tell me about my pets', 'where does the user live')"
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "remember_facts",
+        "description": "Store facts from the current conversation into the FaultLine knowledge graph. "
+                       "Call this when the user states something worth remembering: their name, family, "
+                       "preferences, relationships, or corrections to prior facts. "
+                       "Internally runs extract/rewrite → WGM validation → ingest. "
+                       "Returns the number of facts stored and their classification (Class A/B/C).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Input text to extract entities from (e.g., 'My spouse and I live in <city>')"
+                    "description": "The sentence or passage containing the fact(s) to remember"
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User UUID for per-user isolation"
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
                 }
             },
-            "required": ["text", "user_id"]
+            "required": ["text"]
         }
     },
     {
-        "name": "ingest",
-        "description": "Ingest facts into the FaultLine knowledge graph. Accepts pre-extracted edges "
-                       "(subject, object, rel_type with optional subject_type/object_type) and stores "
-                       "them after WGM validation. Supports Class A/B/C fact classification.",
+        "name": "retract_fact",
+        "description": "Remove or correct a previously stored fact. Use when the user says something "
+                       "was wrong, has changed, or should be forgotten. "
+                       "Accepts natural language (e.g., 'forget that Aurora is a computer', "
+                       "'Des is 13 now not 12'). Delegates semantic extraction to FaultLine backend.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Original text that produced these edges (for provenance)"
+                    "description": "Natural language retraction statement"
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User UUID for per-user isolation"
-                },
-                "edges": {
-                    "type": "array",
-                    "description": "Array of edge objects to ingest",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "subject": {"type": "string"},
-                            "object": {"type": "string"},
-                            "rel_type": {"type": "string"},
-                            "subject_type": {"type": "string"},
-                            "object_type": {"type": "string"}
-                        },
-                        "required": ["subject", "object", "rel_type"]
-                    }
-                },
-                "source": {
-                    "type": "string",
-                    "description": "Provenance source label (default: 'mcp')",
-                    "default": "mcp"
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
                 }
             },
-            "required": ["text", "user_id", "edges"]
-        }
-    },
-    {
-        "name": "query",
-        "description": "Query the FaultLine knowledge graph for memory recall. Returns facts from "
-                       "PostgreSQL (baseline + graph traversal + hierarchy expansion) merged with "
-                       "Qdrant vector similarity results. Used to inject relevant memories into "
-                       "conversation context.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Query text for fact retrieval (e.g., 'tell me about my family')"
-                },
-                "user_id": {
-                    "type": "string",
-                    "description": "User UUID for per-user isolation"
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "Max Qdrant vector search results (default: 5)",
-                    "default": 5
-                }
-            },
-            "required": ["text", "user_id"]
-        }
-    },
-    {
-        "name": "retract",
-        "description": "Retract (soft-delete or hard-delete) facts from the knowledge graph. "
-                       "Behavior controlled by the relationship type's correction_behavior: "
-                       "supersede (mark as superseded), hard_delete (DELETE from facts + entity_aliases), "
-                       "or immutable (no-op).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "user_id": {
-                    "type": "string",
-                    "description": "User UUID for per-user isolation"
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Subject entity of the fact to retract"
-                },
-                "rel_type": {
-                    "type": "string",
-                    "description": "Relationship type to retract (optional — retracts all if omitted)"
-                },
-                "old_value": {
-                    "type": "string",
-                    "description": "Old value/object to retract (for value corrections)"
-                },
-                "behavior": {
-                    "type": "string",
-                    "enum": ["supersede", "hard_delete", "immutable"],
-                    "description": "Override the default correction behavior for this rel_type"
-                }
-            },
-            "required": ["user_id", "subject"]
-        }
-    },
-    {
-        "name": "store_context",
-        "description": "Store raw text context directly to Qdrant vector store, bypassing WGM "
-                       "validation and PostgreSQL. For unstructured text that doesn't fit the "
-                       "fact model. Stored as Class C with 30-day expiry.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Raw text to embed and store"
-                },
-                "user_id": {
-                    "type": "string",
-                    "description": "User UUID for per-user isolation"
-                }
-            },
-            "required": ["text", "user_id"]
+            "required": ["text"]
         }
     }
 ]
@@ -172,4 +97,13 @@ def validate_edges(edges: list) -> str | None:
             return f"edges[{i}] must be an object"
         if "subject" not in edge or "object" not in edge or "rel_type" not in edge:
             return f"edges[{i}] missing required field (subject, object, rel_type)"
+    return None
+
+
+def validate_query(query: str) -> str | None:
+    """Return error message if query is invalid, None if valid."""
+    if not isinstance(query, str):
+        return "query must be a string"
+    if len(query.strip()) == 0:
+        return "query must not be empty"
     return None
