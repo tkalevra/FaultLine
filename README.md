@@ -1,8 +1,14 @@
 ![FaultLine Logo](./faultline_logo.svg)
 
+![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
+![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)
+![Docker](https://img.shields.io/badge/docker-ready-blue.svg)
+![MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue.svg)
+
 # FaultLine
 
-**A write-validated knowledge graph pipeline for OpenWebUI.** FaultLine intercepts conversations, extracts named entities and relationships, validates them against an ontology, and persists them to PostgreSQL as a personal knowledge base—enabling memory recall during future conversations via Qdrant semantic search.
+**A write-validated personal knowledge graph — with native MCP support for Claude Desktop, OpenWebUI integration, and any LLM.** FaultLine intercepts conversations, extracts named entities and relationships, validates them against an ontology, and persists them to PostgreSQL as a personal knowledge base—enabling memory recall during future conversations via Qdrant semantic search.
 
 ## Why FaultLine?
 
@@ -70,19 +76,69 @@ Three-Dimensional Classification Model
 # Install dependencies
 pip install -e ".[test]"
 
-# Run migrations
-docker compose up postgres qdrant
-python -m alembic upgrade head
+# Run via Docker Compose (recommended)
+docker compose -f config/docker-compose.yml up --build
 
-# Start backend
+# Or start backend directly (after running migrations manually)
 uvicorn src.api.main:app --host 0.0.0.0 --port 8001 --reload
-
-# Start re-embedder (background)
-python src/re_embedder/embedder.py
-
-# Deploy to OpenWebUI (via Docker Compose)
-docker compose up --build
+python -m src.re_embedder.embedder  # background process
 ```
+
+## MCP Support
+
+FaultLine ships a native MCP (Model Context Protocol) server exposing three tools directly to any MCP-compatible host:
+
+| Tool | What it does |
+|------|-------------|
+| `recall_memory` | Query the knowledge graph — call at conversation start to inject relevant facts |
+| `remember_facts` | Store facts from conversation — runs full extract/validate/ingest pipeline |
+| `retract_fact` | Remove or correct stored facts via natural language |
+
+### Claude Desktop (stdio)
+Add to `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "faultline": {
+      "command": "python",
+      "args": ["/path/to/FaultLine/tools/mcp_server.py"],
+      "env": {
+        "FAULTLINE_USER_ID": "YOUR-USER-UUID",
+        "FAULTLINE_API_URL": "http://YOUR-HOST:8001"
+      }
+    }
+  }
+}
+```
+
+### OpenWebUI Native Integration
+With the `faultline-mcp` Docker service running (included in all compose files):
+
+**Settings → Integrations → Tools → Add MCP Server**
+- URL: `http://faultline-mcp:8002/mcp`
+- Bearer Token: `<your MCP_API_KEY>`
+
+See `docs/MCP-SETUP.md` for complete setup instructions.
+
+## How It Compares
+
+| Capability | FaultLine | ChatGPT Memory | MemGPT / Letta | Mem0 | OpenWebUI Native RAG |
+|---|---|---|---|---|---|
+| Self-hosted / fully private | ✅ | ❌ Cloud only | ✅ | ✅ | ✅ |
+| Works with any LLM | ✅ | ❌ OpenAI only | ✅ | ✅ | ✅ |
+| MCP native server | ✅ | ❌ | ❌ | Partial | ❌ |
+| Structured knowledge graph | ✅ PostgreSQL | ❌ Opaque | Partial | Partial | ❌ Vector only |
+| Write-validated ontology | ✅ WGM gate | ❌ | ❌ | ❌ | ❌ |
+| Fact confidence classes (A/B/C) | ✅ | ❌ | ❌ | Partial | ❌ |
+| Non-destructive correction | ✅ Soft-archive | ❌ Overwrites | ❌ | ❌ | ❌ |
+| Graph traversal (relationships) | ✅ 1-hop + hierarchy | ❌ | ❌ | ❌ | ❌ |
+| Self-building ontology | ✅ Novel rel_types → staged → approved | ❌ | ❌ | ❌ | ❌ |
+| Per-user schema isolation | ✅ PostgreSQL schema | ✅ Account-level | ✅ | ✅ | ❌ Shared index |
+| Prompt injection protection | ✅ Input validation + framing | ❌ | ❌ | ❌ | ❌ |
+| Open source | ✅ Apache 2.0 | ❌ | ✅ MIT | Partial (core closed) | ✅ MIT |
+| Dead-naming prevention | ✅ Preferred name flags | ❌ | ❌ | ❌ | ❌ |
+
+FaultLine's differentiation is write-time validation — most memory systems are append-only RAG stores with no ontology enforcement. FaultLine knows the difference between `parent_of` and `child_of`, validates both directions, and never stores a UUID where a display name should appear.
 
 ## Environment Variables
 
@@ -92,6 +148,10 @@ QWEN_API_URL=http://localhost:11434/v1/chat/completions  # or OpenWebUI endpoint
 QDRANT_URL=http://qdrant:6333
 QDRANT_COLLECTION=faultline-test
 REEMBED_INTERVAL=10  # seconds
+
+# MCP Server (optional — only needed if running HTTP transport)
+MCP_API_KEY=your-generated-key-here   # Bearer token for HTTP transport
+FAULTLINE_USER_ID=your-uuid-here      # Single-user mode for MCP server
 ```
 
 ## Key Files
@@ -104,6 +164,11 @@ REEMBED_INTERVAL=10  # seconds
 | `openwebui/faultline_function.py` | OpenWebUI Filter — inlet intent classification, fact injection |
 | `src/schema_oracle/oracle.py` | Entity type resolution (GLiNER2 wrapper) |
 | `src/entity_registry/registry.py` | UUID v5 surrogates, alias tracking, preferred name resolution |
+| `src/mcp/server.py` | Stdio MCP server — stdio transport, tool dispatch, FAULTLINE_USER_ID mode |
+| `src/mcp/http_server.py` | HTTP/Streamable MCP transport — FastAPI, bearer auth, Docker sidecar |
+| `src/mcp/tools.py` | MCP tool schemas (recall_memory, remember_facts, retract_fact) |
+| `tools/mcp_server.py` | MCP server entry point — supports --transport stdio\|http |
+| `src/provisioning/schema_manager.py` | Per-user PostgreSQL schema creation and migration |
 
 ## Testing
 
@@ -121,11 +186,6 @@ curl -X POST "https://your-openwebui.com/api/chat/completions" \
     "messages": [{"role": "user", "content": "tell me about my family"}]
   }' | jq '.'
 ```
-
-## Known Issues
-
-- **dBug-016:** OpenWebUI crashes on missing `chat_id`. Workaround applied.
-- **Per-User Collections:** Qdrant naming is live (`faultline-{user_id}`). Never break this invariant.
 
 ---
 

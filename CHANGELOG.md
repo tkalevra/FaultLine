@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.1.0 (2026-06-01) — MCP Native Server + Security Hardening
+
+**MCP Support:**
+- Native MCP server (stdio + HTTP/Streamable transport) — `src/mcp/`
+- Three high-level tools: `recall_memory`, `remember_facts`, `retract_fact`
+- Bearer token auth on HTTP transport (`MCP_API_KEY`)
+- `faultline-mcp` Docker sidecar in all compose variants
+- `FAULTLINE_USER_ID` single-user mode for Claude Desktop
+- Transparent provisioning on first tool call per user
+- Protocol version 2025-03-26
+
+**Security Hardening:**
+- UUID format validation in schema name construction (`derive_user_slug_from_uuid`)
+- Entity name length cap (256 chars) — eliminates injection payload viability
+- 7-pattern prompt injection filter at MCP tool boundary
+- Memory block structural framing (`[/FAULTLINE_MEMORY]` closing tag)
+
+**Per-User Architecture:**
+- Migrations 050-059: per-user PostgreSQL schema provisioning system
+- Background provisioning worker, heartbeat monitoring
+- Per-user extraction patterns, intent classes, preference signals
+
+**Compose Variants:**
+- Added: `docker-compose-portainer.yml`, `docker-compose-portainer-withoutqdrant.yml`
+- Added: `docker-compose.local.external.yml`, `docker-compose.local.internal.yml`
+- All variants include `faultline-mcp` sidecar service
+
 ## v1.0.9 (2026-05-13) — Context-Enriched /extract Endpoint (dBug-018)
 
 **Extraction pipeline:** `/extract` endpoint now passes database-sourced context to GLiNER2: entity registry (known entities), ontology metadata (rel_types with type constraints), and user facts. All context sourced fresh from database per request (zero hardcoding, zero stale caches).

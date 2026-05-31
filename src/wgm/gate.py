@@ -26,33 +26,9 @@ except ImportError:
 _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
 
 
-def _detect_llm_endpoint() -> str:
-    """Auto-detect LLM endpoint with smart fallback (dprompt-111).
-    Priority: explicit OPENWEBUI_URL env var > auto-detect > localhost default.
-    Returns base URL only (without /api/chat/completions suffix).
-    """
-    # Explicit override: user-provided endpoint takes priority
-    openwebui_url = os.environ.get("OPENWEBUI_URL")
-    if openwebui_url:
-        return openwebui_url
-
-    # Auto-detect candidates
-    candidates = [
-        "http://open-webui:8080",      # Docker service name (most likely)
-        "http://localhost:8080",        # Local development
-        "http://127.0.0.1:8080",        # Localhost IPv4
-    ]
-
-    for endpoint in candidates:
-        try:
-            resp = httpx.get(f"{endpoint}/", timeout=2.0, follow_redirects=True)
-            if resp.status_code == 200:
-                return endpoint
-        except Exception:
-            continue
-
-    # Final fallback: localhost
-    return "http://localhost:8080"
+# DEAD CODE REMOVED: _detect_llm_endpoint()
+# All LLM endpoint logic consolidated in src/api/llm_calls._get_endpoint_list()
+# Use llm_calls module for all endpoint detection
 
 
 class RelTypeRegistry:
@@ -171,9 +147,11 @@ class WGMValidationGate:
         self.db_conn = db_conn
         self.registry = registry
         # Initialize unified LLM output validator (dBug-046 Phase 2a)
-        # If not provided, create instance with auto-detected LLM endpoint
+        # If not provided, create instance with auto-detected LLM endpoint via centralized logic
         if validator is None:
-            llm_endpoint = _detect_llm_endpoint()
+            from src.api.llm_calls import _get_endpoint_list
+            endpoints = _get_endpoint_list()
+            llm_endpoint = endpoints[0] if endpoints else "http://open-webui:8080/api/chat/completions"
             self.validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=llm_endpoint)
         else:
             self.validator = validator
@@ -189,11 +167,12 @@ class WGMValidationGate:
         object_id: str,
         subject_type: str = None,
         object_type: str = None,
-        user_id: str = None,
     ) -> tuple[bool, str]:
         """
         Validate entity types against rel_type head_types and tail_types constraints.
         Returns (valid: bool, reason: str).
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         # Normalize empty strings to None (extraction produces empty strings for unknown types)
         subject_type = subject_type if subject_type and subject_type.strip() else None
@@ -220,7 +199,7 @@ class WGMValidationGate:
             # Still validate head_types for subject
             if head_types and not (len(head_types) == 1 and head_types[0].lower() == "any"):
                 if subject_type is None:
-                    subject_type = self._resolve_entity_type(subject_id, user_id)
+                    subject_type = self._resolve_entity_type(subject_id)
                 if subject_type is None:
                     log.warning(
                         "wgm.type_check_skipped",
@@ -242,9 +221,9 @@ class WGMValidationGate:
 
         # Type resolution for subject and object
         if subject_type is None:
-            subject_type = self._resolve_entity_type(subject_id, user_id)
+            subject_type = self._resolve_entity_type(subject_id)
         if object_type is None:
-            object_type = self._resolve_entity_type(object_id, user_id)
+            object_type = self._resolve_entity_type(object_id)
 
         # If type unknown, skip validation with warning
         # NOTE: entity_type='unknown' (string) is the DB default for newly-created entities.
@@ -253,9 +232,9 @@ class WGMValidationGate:
         subject_is_unknown = (subject_type is None or (isinstance(subject_type, str) and subject_type.lower() == 'unknown'))
         if subject_is_unknown:
             # Growth engine: infer subject type from head_types constraint
-            if user_id and head_types and not head_any:
+            if head_types and not head_any:
                 inferred = head_types[0]
-                self._infer_entity_type(subject_id, inferred, user_id)
+                self._infer_entity_type(subject_id, inferred)
                 log.info("wgm.entity_type_inferred",
                          entity_id=subject_id, inferred_type=inferred,
                          rel_type=rel_type.lower(), role="subject")
@@ -269,13 +248,13 @@ class WGMValidationGate:
             )
             return (True, "type_unknown")
 
-        object_is_unknown = (object_type is None or 
+        object_is_unknown = (object_type is None or
                              (isinstance(object_type, str) and object_type.lower() == 'unknown'))
         if object_is_unknown:
             # Growth engine: infer object type from tail_types constraint
-            if user_id and tail_types and not tail_any and not is_scalar:
+            if tail_types and not tail_any and not is_scalar:
                 inferred = tail_types[0]
-                self._infer_entity_type(object_id, inferred, user_id)
+                self._infer_entity_type(object_id, inferred)
                 log.info("wgm.entity_type_inferred",
                          entity_id=object_id, inferred_type=inferred,
                          rel_type=rel_type.lower(), role="object")
@@ -312,22 +291,18 @@ class WGMValidationGate:
 
         return (True, "ok")
 
-    def _resolve_entity_type(self, entity_id: str, user_id: str = None) -> str:
+    def _resolve_entity_type(self, entity_id: str) -> str:
         """
         Resolve entity type from entities table. Returns None if not found.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         try:
             with self.db_conn.cursor() as cur:
-                if user_id:
-                    cur.execute(
-                        "SELECT entity_type FROM entities WHERE id = %s AND user_id = %s",
-                        (entity_id, user_id),
-                    )
-                else:
-                    cur.execute(
-                        "SELECT entity_type FROM entities WHERE id = %s",
-                        (entity_id,),
-                    )
+                cur.execute(
+                    "SELECT entity_type FROM entities WHERE id = %s",
+                    (entity_id,),
+                )
                 row = cur.fetchone()
                 return row[0] if row else None
         except Exception as e:
@@ -337,22 +312,24 @@ class WGMValidationGate:
             )
             return None
 
-    def _infer_entity_type(self, entity_id: str, inferred_type: str, user_id: str = None) -> bool:
+    def _infer_entity_type(self, entity_id: str, inferred_type: str) -> bool:
         """
         Growth engine: infer entity type from rel_type tail_types/head_types constraint.
-        
+
         When a fact uses a known rel_type that constrains entity types
         (e.g., lives_at.tail_types=['Location']), and the entity has type 'unknown',
         auto-assign the constraint's first allowed type.
-        
+
         Only updates entity_type='unknown' — never overwrites known types.
         Returns True if an update was performed.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         try:
             with self.db_conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE entities SET entity_type = %s WHERE id = %s AND user_id = %s AND entity_type = 'unknown'",
-                    (inferred_type, entity_id, user_id),
+                    "UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'",
+                    (inferred_type, entity_id),
                 )
                 updated = cur.rowcount > 0
             self.db_conn.commit()
@@ -395,15 +372,18 @@ class WGMValidationGate:
         confidence = edge_dict.get("confidence", 0.5)
         return (confidence or 0.0) >= 0.9
 
-    def _find_conflicting_relationships(self, user_id: str, subject_id: str, new_rel_type: str) -> list[str]:
-        """Find rel_types that conflict with the new relationship type for this subject."""
+    def _find_conflicting_relationships(self, subject_id: str, new_rel_type: str) -> list[str]:
+        """Find rel_types that conflict with the new relationship type for this subject.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
+        """
         conflicting = []
         for new_rt, conflict_rt in self._CONFLICTING_REL_PAIRS:
             if new_rel_type.lower() == new_rt:
                 conflicting.append(conflict_rt)
         return conflicting
 
-    def _supersede_conflicting_facts(self, user_id: str, subject_id: str,
+    def _supersede_conflicting_facts(self, subject_id: str,
                                      conflicting_rel_types: list[str], reason: str) -> int:
         """Archive facts with conflicting rel_types for this subject. Returns count archived."""
         if not conflicting_rel_types:
@@ -415,9 +395,9 @@ class WGMValidationGate:
                 for conflict_rt in conflicting_rel_types:
                     cur.execute(
                         "UPDATE facts SET archived_at = NOW() "
-                        "WHERE user_id = %s AND subject_id = %s AND rel_type = %s "
+                        "WHERE subject_id = %s AND rel_type = %s "
                         "AND archived_at IS NULL",
-                        (user_id, subject_id, conflict_rt),
+                        (subject_id, conflict_rt),
                     )
                     archived_count += cur.rowcount
             self.db_conn.commit()
@@ -425,16 +405,18 @@ class WGMValidationGate:
             if archived_count > 0:
                 log.info(
                     "wgm.semantic_supersession",
-                    user_id=user_id,
                     subject_id=subject_id,
                     archived_rel_types=conflicting_rel_types,
                     archived_count=archived_count,
                     reason=reason,
                 )
         except Exception as e:
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
             log.error(
                 "wgm.semantic_supersession_failed",
-                user_id=user_id,
                 subject_id=subject_id,
                 error=str(e),
             )
@@ -445,7 +427,7 @@ class WGMValidationGate:
     # Replaces hardcoded negation word list with rel_types.correction_behavior
     # Semantics: hard_delete (pref_name, age), supersede (lives_at), immutable (born_in, parent_of)
 
-    def _apply_correction_semantics(self, edge: dict, rel_type: str, user_id: str) -> dict:
+    def _apply_correction_semantics(self, edge: dict, rel_type: str) -> dict:
         """
         Apply correction semantics based on rel_type.correction_behavior metadata.
         REPLACES dprompt-128 P4 hardcoded negation filter.
@@ -458,10 +440,11 @@ class WGMValidationGate:
         Args:
             edge: dict with is_correction flag, confidence, subject_id, object_id
             rel_type: lowercase rel_type
-            user_id: user UUID
 
         Returns:
             {"action": str, "reason": str, "superseded_count": int (optional)}
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         # Is this a correction?
         if not self._is_user_correction(edge):
@@ -489,18 +472,16 @@ class WGMValidationGate:
                     cur.execute("""
                         UPDATE facts
                         SET superseded_at = NOW()
-                        WHERE user_id = %s
-                          AND subject_id = %s
+                        WHERE subject_id = %s
                           AND rel_type = %s
                           AND superseded_at IS NULL
-                    """, (user_id, subject_id, rel_type.lower()))
+                    """, (subject_id, rel_type.lower()))
                     superseded_count = cur.rowcount
                 self.db_conn.commit()
 
                 if superseded_count > 0:
                     log.info(
                         "wgm.correction_supersede",
-                        user_id=user_id,
                         subject_id=subject_id,
                         rel_type=rel_type,
                         superseded_count=superseded_count,
@@ -508,7 +489,6 @@ class WGMValidationGate:
             except Exception as e:
                 log.error(
                     "wgm.correction_supersede_failed",
-                    user_id=user_id,
                     subject_id=subject_id,
                     rel_type=rel_type,
                     error=str(e),
@@ -576,9 +556,9 @@ class WGMValidationGate:
 
     def _validate_hierarchy_rules(self, fact_dict: dict, rel_meta: dict) -> tuple[bool, str]:
         """
-        Validate hierarchy-based rel_types (instance_of, subclass_of, member_of, part_of).
+        Validate hierarchy-based rel_types (instance_of, subclass_of, member_of, part_of, is_a).
         dprompt-119: Ensures proper instance and composition relationships.
-        dprompt-126: Additional validation for instance_of to catch entity classification errors.
+        dprompt-126: Additional validation for typing rel_types to catch entity classification errors.
         Returns (valid: bool, reason: str).
         """
         rel_type = fact_dict.get("rel_type", "").lower()
@@ -586,43 +566,38 @@ class WGMValidationGate:
         if not rel_meta.get("is_hierarchy_rel"):
             return (True, "not_hierarchy")
 
-        # instance_of: subject must have entity_type, object must be a type/class
-        # dprompt-126: Validate instance_of against entity_taxonomies
-        if rel_type == "instance_of":
-            subject_id = fact_dict.get("subject_id")
-            subject_type = fact_dict.get("subject_type")
-            object_name = fact_dict.get("object", "").lower()  # The type being claimed
+        # Metadata-driven hierarchy rel_type handling
+        # All hierarchy rel_types validated against entity_taxonomies where applicable
+        # dprompt-126: Validate typing rel_types (instance_of, subclass_of, is_a) for entity classification correctness
+        subject_id = fact_dict.get("subject_id")
+        subject_type = fact_dict.get("subject_type")
+        object_name = fact_dict.get("object", "").lower()
+        object_type = fact_dict.get("object_type")
 
-            if subject_type and subject_type.lower() == "unknown":
-                log.warning("wgm.hierarchy_instance_of_unknown_subject",
-                           subject_id=subject_id)
-                # Don't block, but note it
+        if subject_type and subject_type.lower() == "unknown":
+            log.warning("wgm.hierarchy_unknown_subject_type",
+                       subject_id=subject_id, rel_type=rel_type)
+            # Don't block, but note it
 
-            # dprompt-126: Query entity_taxonomies to validate claimed type
-            # If "${ENTITY} instance_of person", validate that this makes sense
-            if object_name and subject_type:
-                try:
-                    with self.db_conn.cursor() as cur:
-                        # Check if the object (type) is valid for this subject
-                        # E.g., "${ENTITY}" shouldn't be "person" unless it's a name alias
-                        cur.execute("""
-                            SELECT member_entity_types FROM entity_taxonomies
-                            WHERE %s = ANY(member_entity_types)
-                        """, (subject_type.upper(),))
-                        hierarchy_matches = cur.fetchall()
+        # For all hierarchy relations, validate against entity_taxonomies if types are present
+        if object_name and subject_type:
+            try:
+                with self.db_conn.cursor() as cur:
+                    # Check if the subject type is valid in any taxonomy
+                    # E.g., "${ENTITY}" with type "person" should be valid for instance_of/subclass_of/is_a
+                    cur.execute("""
+                        SELECT member_entity_types FROM entity_taxonomies
+                        WHERE %s = ANY(member_entity_types)
+                    """, (subject_type.upper(),))
+                    hierarchy_matches = cur.fetchall()
 
-                        if not hierarchy_matches:
-                            log.warning("wgm.instance_of_type_not_in_any_hierarchy",
-                                       subject_id=subject_id, subject_type=subject_type,
-                                       claimed_type=object_name)
-                except Exception as e:
-                    log.warning("wgm.instance_of_validation_error",
-                               subject_id=subject_id, error=str(e))
-
-        # member_of: subject belongs to a group/category, object must be a group entity
-        if rel_type == "member_of":
-            object_type = fact_dict.get("object_type")
-            # Object should ideally be Organization, Location, or Group (if supported)
+                    if not hierarchy_matches:
+                        log.warning("wgm.hierarchy_type_not_in_any_taxonomy",
+                                   subject_id=subject_id, subject_type=subject_type,
+                                   rel_type=rel_type, object_name=object_name)
+            except Exception as e:
+                log.warning("wgm.hierarchy_validation_error",
+                           subject_id=subject_id, rel_type=rel_type, error=str(e))
 
         return (True, "hierarchy_valid")
 
@@ -656,13 +631,15 @@ class WGMValidationGate:
             log_crit(log, msg, taxonomy=taxonomy_name, error=str(e), component="entity_taxonomies")
             raise RuntimeError(msg)
 
-    def _validate_category_constraints(self, fact_dict: dict, rel_meta: dict, category: str, user_id: str = None) -> tuple[bool, str]:
+    def _validate_category_constraints(self, fact_dict: dict, rel_meta: dict, category: str) -> tuple[bool, str]:
         """
         Validate category-specific rel_type constraints.
         dprompt-119: Enforces domain rules (family only Person, location for Location, etc).
         Metadata-driven: Queries entity_taxonomies for category membership rules.
         Returns (valid: bool, reason: str).
         FAIL HARD if taxonomy not found — engine should have populated it.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         if not category:
             return (True, "no_category_defined")
@@ -726,7 +703,7 @@ class WGMValidationGate:
 
     # ── end dprompt-119 ──────────────────────────────────────────────────
 
-    def _validate_hierarchy_membership(self, rel_type: str, subject_type: str, object_type: str, user_id: str = None) -> tuple[bool, str, list]:
+    def _validate_hierarchy_membership(self, rel_type: str, subject_type: str, object_type: str) -> tuple[bool, str, list]:
         """
         dprompt-126 Layer 1 (Hierarchy Scoping): Validate entity types against hierarchy membership.
 
@@ -740,6 +717,8 @@ class WGMValidationGate:
         - valid: True if entity types match at least one hierarchy, False otherwise
         - reason: explanation of what was found or violated
         - matching_hierarchies: list of hierarchy_names that match both entity types
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         if not subject_type or not object_type or not rel_type:
             return (True, "missing_types_skip", [])  # Can't validate without types
@@ -808,7 +787,7 @@ class WGMValidationGate:
             return (True, f"validation_error:{str(e)}", [])  # Graceful fallback
 
     def validate_edge(self, subject_id, object_id, rel_type: str,
-                      user_id=None, provenance=None, subject_type: str = None,
+                      provenance=None, subject_type: str = None,
                       object_type: str = None, **edge_args) -> dict:
         """
         Validate an incoming edge against the ontology and existing DB state.
@@ -816,17 +795,16 @@ class WGMValidationGate:
         For novel types, calls Qwen to approve; if approved and confidence >= 0.7,
         inserts into rel_types and proceeds. Otherwise returns {"status": "novel"}.
         Returns {"status": "valid"} when no contradiction exists.
-        When user_id is supplied and a contradiction is detected (same user+subject+rel,
-        different object): inserts the new fact, penalizes all superseded facts via
-        mark_contradicted, and returns a conflict dict with the penalty details.
+
+        Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
         # dprompt-90: Semantic supersession on user corrections
         # If this is a correction, archive conflicting facts before validation
-        if user_id and self._is_user_correction(edge_args):
-            conflicting_rels = self._find_conflicting_relationships(user_id, subject_id, rel_type)
+        if self._is_user_correction(edge_args):
+            conflicting_rels = self._find_conflicting_relationships(subject_id, rel_type)
             if conflicting_rels:
                 self._supersede_conflicting_facts(
-                    user_id, subject_id, conflicting_rels,
+                    subject_id, conflicting_rels,
                     reason=f"user_correction:{rel_type.lower()}"
                 )
 
@@ -870,18 +848,21 @@ class WGMValidationGate:
                             )
                         self.db_conn.commit()
                     except Exception as e:
+                        try:
+                            self.db_conn.rollback()
+                        except Exception:
+                            pass
                         log.warning("wgm.pending_types_insert_failed", rel_type=rt, error=str(e))
 
                     return {"status": "novel_unapproved"}
 
         # dprompt-064 Phase 1: Apply correction semantics (metadata-driven)
         # BEFORE validation gates, check if this is an immutable fact
-        if user_id and self._is_user_correction(edge_args):
-            correction_result = self._apply_correction_semantics(edge_args, rt, user_id)
+        if self._is_user_correction(edge_args):
+            correction_result = self._apply_correction_semantics(edge_args, rt)
             if correction_result["action"] == "immutable":
                 log.warning(
                     "wgm.immutable_fact_correction_rejected",
-                    user_id=user_id,
                     rel_type=rt,
                     reason=correction_result["reason"],
                 )
@@ -900,22 +881,21 @@ class WGMValidationGate:
         if raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9):
             # Growth engine: for bypassed high-confidence facts, still infer entity types
             # from rel_type constraints. Prevents entities staying 'unknown' forever.
-            if user_id:
-                ontology = self.get_current_ontology()
-                entry = ontology.get(rt, {})
-                head_types = entry.get("head_types") or []
-                tail_types = entry.get("tail_types") or []
-                head_any = not head_types or "any" in [t.lower() for t in head_types]
-                tail_any = not tail_types or "any" in [t.lower() for t in tail_types]
-                is_scalar = tail_types and "scalar" in [t.lower() for t in tail_types]
-                if not head_any and head_types:
-                    st = self._resolve_entity_type(subject_id, user_id)
-                    if st and st.lower() == 'unknown':
-                        self._infer_entity_type(subject_id, head_types[0], user_id)
-                if not tail_any and not is_scalar and tail_types:
-                    ot = self._resolve_entity_type(object_id, user_id)
-                    if ot and ot.lower() == 'unknown':
-                        self._infer_entity_type(object_id, tail_types[0], user_id)
+            ontology = self.get_current_ontology()
+            entry = ontology.get(rt, {})
+            head_types = entry.get("head_types") or []
+            tail_types = entry.get("tail_types") or []
+            head_any = not head_types or "any" in [t.lower() for t in head_types]
+            tail_any = not tail_types or "any" in [t.lower() for t in tail_types]
+            is_scalar = tail_types and "scalar" in [t.lower() for t in tail_types]
+            if not head_any and head_types:
+                st = self._resolve_entity_type(subject_id)
+                if st and st.lower() == 'unknown':
+                    self._infer_entity_type(subject_id, head_types[0])
+            if not tail_any and not is_scalar and tail_types:
+                ot = self._resolve_entity_type(object_id)
+                if ot and ot.lower() == 'unknown':
+                    self._infer_entity_type(object_id, tail_types[0])
             log.info("wgm.confidence_bypass_early",
                      rel_type=rt, confidence=raw_confidence,
                      is_user_correction=is_user_correction,
@@ -929,7 +909,6 @@ class WGMValidationGate:
             rt, subject_id, object_id,
             subject_type=subject_type,
             object_type=object_type,
-            user_id=user_id,
         )
         if not type_ok:
             log.warning(
@@ -975,7 +954,7 @@ class WGMValidationGate:
                 "object_id": object_id,
                 "object_type": object_type,
             }
-            cat_valid, cat_reason = self._validate_category_constraints(fact_dict, rel_meta, category, user_id)
+            cat_valid, cat_reason = self._validate_category_constraints(fact_dict, rel_meta, category)
             if not cat_valid:
                 log.warning("wgm.category_validation_failed",
                            rel_type=rt, category=category, reason=cat_reason)
@@ -984,7 +963,7 @@ class WGMValidationGate:
         # Validate that entity types match hierarchy member_entity_types for this rel_type
         if subject_type and object_type:
             hier_mem_valid, hier_mem_reason, matching_hierarchies = self._validate_hierarchy_membership(
-                rt, subject_type, object_type, user_id=user_id
+                rt, subject_type, object_type
             )
             if not hier_mem_valid:
                 log.warning("wgm.hierarchy_membership_violation",
@@ -1040,9 +1019,6 @@ class WGMValidationGate:
             log.warning(f"wgm.validator_confidence_failed: {e}")
             unified_confidence = edge_args.get("confidence", 0.8) or 0.0
 
-        if user_id is None:
-            return {"status": "valid", "unified_confidence": unified_confidence}
-
         # Check for symmetric duplicates: if A→B exists and rel_type is symmetric,
         # do not insert B→A again (it's implicitly the same fact in both directions)
         # Query rel_types.is_symmetric metadata (FAIL HARD if not found — engine should have learned this)
@@ -1062,16 +1038,16 @@ class WGMValidationGate:
             with self.db_conn.cursor() as cur:
                 cur.execute(
                     "SELECT id FROM facts"
-                    " WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s",
-                    (user_id, subject_id, object_id, rt),
+                    " WHERE subject_id = %s AND object_id = %s AND rel_type = %s",
+                    (subject_id, object_id, rt),
                 )
                 if cur.fetchone():
                     return {"status": "valid", "note": "duplicate_exact", "unified_confidence": unified_confidence}
 
                 cur.execute(
                     "SELECT id FROM facts"
-                    " WHERE user_id = %s AND subject_id = %s AND object_id = %s AND rel_type = %s",
-                    (user_id, object_id, subject_id, rt),
+                    " WHERE subject_id = %s AND object_id = %s AND rel_type = %s",
+                    (object_id, subject_id, rt),
                 )
                 if cur.fetchone():
                     return {"status": "valid", "note": "symmetric_duplicate", "unified_confidence": unified_confidence}
@@ -1079,8 +1055,8 @@ class WGMValidationGate:
         with self.db_conn.cursor() as cur:
             cur.execute(
                 "SELECT id, confidence FROM facts"
-                " WHERE user_id = %s AND subject_id = %s AND rel_type = %s AND object_id != %s",
-                (user_id, subject_id, rt, object_id),
+                " WHERE subject_id = %s AND rel_type = %s AND object_id != %s",
+                (subject_id, rt, object_id),
             )
             old_rows = cur.fetchall()
             if not old_rows:
@@ -1091,11 +1067,11 @@ class WGMValidationGate:
                 return result
 
             cur.execute(
-                "INSERT INTO facts (user_id, subject_id, object_id, rel_type, provenance)"
-                " VALUES (%s, %s, %s, %s, %s)"
-                " ON CONFLICT (user_id, subject_id, object_id, rel_type) DO NOTHING"
+                "INSERT INTO facts (subject_id, object_id, rel_type, provenance)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON CONFLICT (subject_id, object_id, rel_type) DO NOTHING"
                 " RETURNING id",
-                (user_id, subject_id, object_id, rt, provenance or ""),
+                (subject_id, object_id, rt, provenance or ""),
             )
             row = cur.fetchone()
             # If the fact already exists (ON CONFLICT DO NOTHING returned no row),
@@ -1105,9 +1081,9 @@ class WGMValidationGate:
             else:
                 # Look up the existing fact id for contradiction marking
                 cur.execute(
-                    "SELECT id FROM facts WHERE user_id = %s AND subject_id = %s"
+                    "SELECT id FROM facts WHERE subject_id = %s"
                     " AND object_id = %s AND rel_type = %s",
-                    (user_id, subject_id, object_id, rt),
+                    (subject_id, object_id, rt),
                 )
                 new_id = cur.fetchone()[0]
 
@@ -1259,3 +1235,155 @@ Respond with ONLY the JSON, no explanation."""
         except Exception:
             # Qwen failure: auto-approve so facts are not silently dropped
             return self._auto_approve_novel_type(rel_type)
+
+    def _infer_novel_rel_type_metadata(self, rel_type: str, subject_type: str = None,
+                                       object_type: str = None, context: str = None) -> dict:
+        """
+        Infer ontology metadata for novel rel_type using LLM (synchronous).
+
+        Args:
+            rel_type: novel relationship name
+            subject_type: entity type of subject (e.g., "Person")
+            object_type: entity type of object (e.g., "Person")
+            context: surrounding text where rel_type appeared (first 500 chars)
+
+        Returns:
+            dict with: is_symmetric, inverse_rel_type, head_types, tail_types,
+                       is_hierarchy_rel, category, confidence
+            or None if inference failed
+        """
+        try:
+            # Prepare context for LLM
+            subject_context = f"Subject type: {subject_type}" if subject_type else "Subject type: Unknown"
+            object_context = f"Object type: {object_type}" if object_type else "Object type: Unknown"
+            text_context = f"Context: {context[:300]}" if context else "Context: None provided"
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": f"{_FAULTLINE_INTERNAL_PREFIX} You are an ontology expert. Infer relationship properties. Respond only with valid JSON, no markdown."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Infer complete ontology metadata for this novel relationship type:
+
+Relationship: {rel_type}
+{subject_context}
+{object_context}
+{text_context}
+
+Respond with EXACTLY this JSON structure, no markdown:
+{{
+  "is_symmetric": true or false,
+  "inverse_rel_type": "inverse_type_name" or null,
+  "head_types": ["array", "of", "allowed", "subject", "types"],
+  "tail_types": ["array", "of", "allowed", "object", "types"],
+  "is_hierarchy_rel": true or false,
+  "category": "family|work|location|physical|temporal|identity|medical|other",
+  "confidence": 0.0 to 1.0
+}}
+
+Respond with ONLY the JSON, no explanation."""
+                }
+            ]
+
+            result = call_llm_with_retry_sync(
+                messages=messages,
+                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                user_id=getattr(self, '_user_id', None),
+                timeout=LLMTimeouts.get("ENRICHMENT"),
+                operation="novel_rel_type_inference",
+            )
+
+            # Validate required fields
+            required = ["is_symmetric", "inverse_rel_type", "head_types", "tail_types",
+                       "is_hierarchy_rel", "category", "confidence"]
+            for field in required:
+                if field not in result:
+                    log.warning(
+                        "wgm.inference_missing_field",
+                        rel_type=rel_type,
+                        field=field,
+                    )
+                    return None
+
+            return result
+
+        except Exception as e:
+            log.warning(
+                "wgm.novel_rel_type_inference_failed",
+                rel_type=rel_type,
+                error=str(e),
+            )
+            return None
+
+    def _store_inferred_rel_type(self, rel_type: str, metadata: dict) -> bool:
+        """
+        Store inferred metadata in rel_types table.
+        Uses ON CONFLICT DO UPDATE to handle race conditions.
+
+        Args:
+            rel_type: novel relationship name
+            metadata: inferred metadata dict
+
+        Returns:
+            True if stored successfully, False otherwise
+        """
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO rel_types
+                       (rel_type, label, is_symmetric, inverse_rel_type, head_types, tail_types,
+                        is_hierarchy_rel, category, confidence, engine_generated, source)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'wgm_gate_inference')
+                       ON CONFLICT (rel_type) DO UPDATE SET
+                           is_symmetric = EXCLUDED.is_symmetric,
+                           inverse_rel_type = EXCLUDED.inverse_rel_type,
+                           head_types = EXCLUDED.head_types,
+                           tail_types = EXCLUDED.tail_types,
+                           is_hierarchy_rel = EXCLUDED.is_hierarchy_rel,
+                           category = EXCLUDED.category,
+                           confidence = EXCLUDED.confidence
+                    """,
+                    (
+                        rel_type,
+                        metadata.get("label") or rel_type.replace("_", " ").title(),
+                        metadata.get("is_symmetric", False),
+                        metadata.get("inverse_rel_type"),
+                        metadata.get("head_types", ["ANY"]),
+                        metadata.get("tail_types", ["ANY"]),
+                        metadata.get("is_hierarchy_rel", False),
+                        metadata.get("category", "other"),
+                        metadata.get("confidence", 0.5),
+                    )
+                )
+
+            self.db_conn.commit()
+
+            # Refresh metadata cache
+            if hasattr(self, 'registry') and hasattr(self.registry, '_refresh'):
+                self.registry._refresh()
+
+            # Refresh main.py caches
+            try:
+                from src.api.main import _refresh_rel_type_cache, _refresh_scalar_rel_types_cache
+                _refresh_rel_type_cache()
+                _refresh_scalar_rel_types_cache()
+            except ImportError:
+                pass  # main.py not available (test context)
+
+            log.info(
+                "wgm.inferred_rel_type_stored",
+                rel_type=rel_type,
+                confidence=metadata.get("confidence"),
+            )
+            return True
+
+        except Exception as e:
+            log.error(
+                "wgm.inferred_rel_type_storage_failed",
+                rel_type=rel_type,
+                error=str(e),
+            )
+            self.db_conn.rollback()
+            return False
