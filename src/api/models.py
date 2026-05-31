@@ -18,6 +18,11 @@ class EdgeInput(BaseModel):
     temporal_context: Optional[str] = None  # dBug-055: Text qualifier ("in 4 days", "next Tuesday", etc.)
     temporal_context_resolved_at: Optional[str] = None  # ISO 8601 timestamp when temporal expression resolves
 
+    # TEMPORAL FACT METADATA (Issue #5)
+    statement_date: Optional[str] = None  # ISO 8601 when user says fact is/was/will be true (e.g., "2024-05-01")
+    valid_until: Optional[str] = None  # ISO 8601 when fact expires/was superseded (e.g., "2024-08-15")
+    temporal_confidence: Optional[float] = None  # 0.5-0.95 confidence in date extraction (explicit: 0.95, implicit: 0.50)
+
 
 class ExtractContext(BaseModel):
     known_entities: list[dict] | None = None  # [{"name":"${USER}","type":"Person","uuid":"..."},...]
@@ -52,6 +57,7 @@ class FactResult(BaseModel):
     fact_class: str = "A"  # A, B, or C
     provenance: str = "llm_inferred"
     definition: Optional[str] = None  # Natural language template from rel_types table (e.g., "X is Y's spouse")
+    category: Optional[str] = None  # Category from rel_types.category (family, work, location, etc.)
 
 
 class IngestResponse(BaseModel):
@@ -129,6 +135,7 @@ class FactCorrectionRequest(BaseModel):
     """
     text: str  # "Fraggle is a dog not a bunny"
     user_id: str  # User UUID (will be validated against authenticated user)
+    intent: Optional[str] = None  # GLiNER2 classification from Filter: CORRECTION or RETRACTION
     context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
     idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)
 
@@ -174,6 +181,10 @@ class QueryRequest(BaseModel):
     user_id: Optional[str] = "anonymous"
     conversation_history: Optional[list[ConversationMessage]] = None
     known_entities: Optional[dict[str, str]] = None  # {name: uuid}
+
+    # TEMPORAL QUERY SCOPE (Issue #5)
+    temporal_scope: Optional[str] = None  # ISO date or date range: "2024-05-01" or "2024-01-01/2024-12-31"
+                                         # When set, filters facts to only those valid during period
 
 
 class QueryResponse(BaseModel):
