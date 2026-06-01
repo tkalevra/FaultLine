@@ -95,9 +95,9 @@ curl http://localhost:8000/health
 
 ---
 
-## MCP Server (Claude Desktop)
+## MCP Server (Claude Desktop + OpenWebUI Tools)
 
-FaultLine includes a Model Context Protocol server, exposing three tools to Claude Desktop or any MCP-compatible client:
+FaultLine includes a Model Context Protocol server exposing three tools:
 
 - `recall_memory` — query the knowledge graph
 - `remember_facts` — store new facts from conversation
@@ -105,11 +105,26 @@ FaultLine includes a Model Context Protocol server, exposing three tools to Clau
 
 The MCP server runs on port `8002` and is included in the Docker Compose stack automatically.
 
+### OpenWebUI (OpenAPI connection)
+
+OpenWebUI connects via its **OpenAPI** connection type. In **Settings → Connections → Tools → Add Connection**:
+
+| Field | Value |
+|-------|-------|
+| Type | `OpenAPI` |
+| URL | `http://faultline-mcp:8002` |
+| Auth | `Bearer <MCP_API_KEY>` |
+| OpenAPI Spec | `URL` → `openapi.json` (default) |
+
+OpenWebUI discovers the tools automatically from `/openapi.json`.
+
+### Claude Desktop (MCP native)
+
 ```json
 {
   "mcpServers": {
     "faultline": {
-      "url": "http://localhost:8002/mcp",
+      "url": "http://YOUR-HOST:8002/mcp",
       "headers": { "Authorization": "Bearer YOUR_MCP_API_KEY" }
     }
   }
