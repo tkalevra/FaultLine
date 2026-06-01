@@ -35,7 +35,7 @@ services:
     container_name: faultline
     restart: unless-stopped
     ports:
-      - "8001:8000"
+      - "8000:8000"
     environment:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_test
       OPENWEBUI_URL: ${OPENWEBUI_URL}
@@ -132,7 +132,8 @@ services:
 
   faultline-mcp:
     image: faultline-wgm:latest
-    command: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    container_name: faultline-mcp
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "8002:8002"
     environment:
