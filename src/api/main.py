@@ -5360,17 +5360,6 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
         elif req.context:
             ctx = req.context.model_dump() if hasattr(req.context, 'model_dump') else req.context
 
-        constraint = _get_constraint()
-        schema = {
-            "facts": [
-                "subject::str::The full proper name of the first entity. Never a pronoun.",
-                "object::str::The full proper name of the second entity. Never a pronoun.",
-                f"rel_type::[{constraint}]::str::The relationship type from subject to object.",
-                "subject_type::[Person|Animal|Organization|Location|Object|Concept]::str::The entity type of the subject.",
-                "object_type::[Person|Animal|Organization|Location|Object|Concept]::str::The entity type of the object.",
-            ]
-        }
-
         # GLiNER2 NER extraction — just get entity types, not relationships
         ner_result = model.extract_entities(
             req.text,
