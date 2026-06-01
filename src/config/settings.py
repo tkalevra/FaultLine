@@ -295,10 +295,10 @@ class Settings:
     def FAULTLINE_API_URL(self) -> str:
         """Public URL of FaultLine API (for filter to call backend).
 
-        Example: http://localhost:8001 or https://api.example.com
-        Default: http://localhost:8001
+        Example: http://localhost:8000 or https://api.example.com
+        Default: http://localhost:8000
         """
-        return os.environ.get("FAULTLINE_API_URL", "http://localhost:8001").rstrip("/")
+        return os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
 
     # ================================================================
     # MISCELLANEOUS
