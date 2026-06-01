@@ -91,17 +91,17 @@ def derive_user_slug_from_uuid(user_id: str) -> str:
     - Schema names are URL-safe (compatible with psql queries)
 
     Args:
-        user_id: UUID in standard format, e.g., "00000000-0000-0000-0000-000000000000"
+        user_id: UUID in standard format, e.g., "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
 
     Returns:
-        URL-safe slug, e.g., "550e8400_e29b_41d4_a716_446655440000"
+        URL-safe slug, e.g., "10d7d879_63cd_4f31_92ce_f2c9edb760ab"
 
     Raises:
         ValueError: If user_id is empty or None
 
     Examples:
-        >>> derive_user_slug_from_uuid("00000000-0000-0000-0000-000000000000")
-        "550e8400_e29b_41d4_a716_446655440000"
+        >>> derive_user_slug_from_uuid("10d7d879-63cd-4f31-92ce-f2c9edb760ab")
+        "10d7d879_63cd_4f31_92ce_f2c9edb760ab"
 
         >>> derive_user_slug_from_uuid("00000000-0000-0000-0000-000000000000")
         "550e8400_e29b_41d4_a716_446655440000"
@@ -446,7 +446,7 @@ def _validate_schema_structure(schema_name: str, user_id: str, db: psycopg2.exte
     If validation fails, create_user_schema will NOT mark status='ready'.
 
     Args:
-        schema_name: Schema to validate (e.g., "faultline_550e8400_...")
+        schema_name: Schema to validate (e.g., "faultline_10d7d879_...")
         user_id: User UUID (for logging)
         db: psycopg2 connection (must already be open)
 
@@ -707,6 +707,13 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
 
                 # Register user display name (user_slug) in entity_aliases
                 # Maps user_id UUID → display name (e.g., christopher, marla, etc.)
+                # Clear any stale preferred flag first — idx_entity_aliases_one_preferred
+                # allows only one is_preferred=true per entity_id. A prior partial
+                # provisioning may have left a preferred alias under a different name.
+                cur.execute("""
+                    UPDATE entity_aliases SET is_preferred = false
+                    WHERE entity_id = %s AND alias != %s AND is_preferred = true
+                """, (user_id, user_slug))
                 cur.execute("""
                     INSERT INTO entity_aliases (entity_id, alias, is_preferred)
                     VALUES (%s, %s, true)
