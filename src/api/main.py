@@ -10064,20 +10064,24 @@ def fetch_facts_from_anchor(
                         is_symmetric = rel_type_meta.get("is_symmetric", False)
                         inverse_rel_type = rel_type_meta.get("inverse_rel_type")
 
-                        # For asymmetric relationships, use the inverse rel_type
-                        # For symmetric relationships, keep the original rel_type
+                        # For asymmetric relationships, fully invert: swap subject/object
+                        # AND use the inverse rel_type. This transforms (cyrus, child_of, user)
+                        # → (user, parent_of, cyrus), matching the anchor's perspective.
+                        # The dedup step will merge this with any lower-confidence direct
+                        # counterpart and keep the higher-confidence version.
+                        # Half-inversion (flip rel_type only, no subject/object swap) produces
+                        # semantically wrong facts like "cyrus is the parent of user".
                         rel_type_final = rel_type_orig
                         if not is_symmetric and inverse_rel_type:
-                            rel_type_final = inverse_rel_type
                             facts.append({
-                                "subject": subject_id,
-                                "object": object_id,
-                                "rel_type": rel_type_final,
+                                "subject": object_id,       # swapped — anchor becomes subject
+                                "object": subject_id,       # swapped — original subject becomes object
+                                "rel_type": inverse_rel_type,
                                 "confidence": float(confidence) if confidence else 1.0,
                                 "fact_class": fact_class or "A",
                                 "source": "db",
-                                "_is_inverse": True,  # Debug metadata
-                                "category": _get_rel_type_category(rel_type_final)
+                                "_is_inverse": True,
+                                "category": _get_rel_type_category(inverse_rel_type)
                             })
                         elif is_symmetric:
                             facts.append({
