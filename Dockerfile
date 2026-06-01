@@ -30,6 +30,7 @@ COPY --from=builder /root/.cache /root/.cache
 
 COPY src/       ./src/
 COPY migrations/ ./migrations/
+COPY tools/     ./tools/
 COPY docker-entrypoint.sh ./
 
 RUN chmod +x docker-entrypoint.sh
@@ -38,6 +39,6 @@ ENV PATH="/venv/bin:$PATH"
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8001
+EXPOSE 8000
 
 ENTRYPOINT ["./docker-entrypoint.sh"]

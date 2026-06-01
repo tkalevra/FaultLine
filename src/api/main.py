@@ -5776,7 +5776,7 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     """
     LLM-based triple extraction. Replaces OpenWebUI Filter direct LLM calls.
 
-    FaultLine is the SINGLE ENTRY POINT (8001). Filter no longer calls OpenWebUI:3000.
+    FaultLine is the SINGLE ENTRY POINT (8000). Filter no longer calls OpenWebUI:3000.
     This eliminates brittleness on OpenWebUI internal API changes.
 
     FaultLine internally:
@@ -5784,7 +5784,7 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     - Calls the configured LLM backend (Qwen, Ollama, OpenAI, etc.)
     - Returns extracted triples
 
-    Filter only needs to know: http://faultline:8001/extract/rewrite
+    Filter only needs to know: http://faultline:8000/extract/rewrite
 
     dprompt-120: Extraction prompt is metadata-driven from rel_types table,
     not hardcoded. Reduces prompt bloat and makes system generic.
@@ -7000,7 +7000,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # Call /extract/rewrite for LLM-based triple extraction (only if patterns and GLiNER2 didn't match)
             # CRITICAL: pattern_edges from compound extraction (line ~6345) takes precedence — skip LLM if already found
             if not pattern_edges and not gliner_edges:
-                faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8001")
+                faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8000")
                 response = await _http_client.post(
                     f"{faultline_url}/extract/rewrite",
                     json={

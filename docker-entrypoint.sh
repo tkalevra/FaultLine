@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# If a custom command is passed as args (e.g., MCP server), exec it directly
+# without running migrations or starting the main backend.
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
 # Wait for PostgreSQL
 echo "Waiting for PostgreSQL..."
 POSTGRES_HOST=${POSTGRES_HOST:-postgres}
