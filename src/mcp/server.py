@@ -58,7 +58,7 @@ from .tools import (
     validate_user_id,
 )
 
-FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8001").rstrip("/")
+FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
 FAULTLINE_USER_ID = os.environ.get("FAULTLINE_USER_ID", "").strip()
 
 # Module-level HTTP client — initialised in run_mcp_server(), used by all tool handlers.

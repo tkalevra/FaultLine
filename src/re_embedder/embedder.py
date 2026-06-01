@@ -2920,7 +2920,7 @@ def main():
                         # Signal backend to reload pattern caches (critical: ensures updates propagate)
                         try:
                             refresh_resp = httpx.post(
-                                f"http://faultline:8001/internal/refresh-intent-pattern-caches",
+                                f"http://faultline:8000/internal/refresh-intent-pattern-caches",
                                 timeout=5.0
                             )
                             if refresh_resp.status_code == 200:

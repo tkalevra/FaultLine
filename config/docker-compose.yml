@@ -6,11 +6,11 @@ services:
       dockerfile: Dockerfile
       network: host
     ports:
-      - "8001:8000"
+      - "8000:8000"
     environment:
       OPENWEBUI_URL: ${OPENWEBUI_URL:-http://open-webui:8080}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
+      FAULTLINE_URL: ${FAULTLINE_URL:-http://localhost:8000}
       FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-00000000-0000-0000-0000-000000000000}
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
       QDRANT_URL: http://qdrant:6333
@@ -72,7 +72,8 @@ services:
 
   faultline-mcp:
     image: faultline-wgm:latest
-    command: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    container_name: faultline-mcp
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "8002:8002"
     environment:

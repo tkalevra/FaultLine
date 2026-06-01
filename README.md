@@ -1,124 +1,33 @@
-![FaultLine Logo](./faultline_logo.svg)
+# FaultLine — Persistent Memory for OpenWebUI and Self-Hosted LLMs
 
-![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
-![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)
-![Docker](https://img.shields.io/badge/docker-ready-blue.svg)
-![MCP](https://img.shields.io/badge/MCP-2025--03--26-purple.svg)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue.svg)
+> **Not the band. Not the game engine. Not the geology term.**  
+> FaultLine is an open-source, self-hosted **persistent memory layer** for [OpenWebUI](https://openwebui.com/) and local LLMs.
 
-# FaultLine
+FaultLine gives your local AI assistant long-term memory. It intercepts every conversation, extracts named entities and relationships, validates them against a write gate, and stores them in PostgreSQL as a personal knowledge graph. When you return to a conversation, relevant facts are injected before the model responds — so it already knows who you are, who matters to you, and what you've told it before.
 
-**A write-validated personal knowledge graph — with native MCP support for Claude Desktop, OpenWebUI integration, and any LLM.** FaultLine intercepts conversations, extracts named entities and relationships, validates them against an ontology, and persists them to PostgreSQL as a personal knowledge base—enabling memory recall during future conversations via Qdrant semantic search.
+**No cloud. No subscriptions. No vendor lock-in. Runs entirely on your hardware.**
 
-## Why FaultLine?
+---
 
-Large language models have no persistent memory of your identity, relationships, or personal facts. FaultLine solves this by:
-- **Extracting facts** from conversation (using GLiNER2 + LLM)
-- **Validating** facts against a metadata-driven ontology (no hardcoded rules)
-- **Storing** facts in PostgreSQL with confidence scores
-- **Injecting** relevant facts back into your prompts (before the model responds)
+## What It Does
 
-Result: Your LLM remembers who you are, who matters to you, and what you've told it—across all conversations.
+| Without FaultLine | With FaultLine |
+|---|---|
+| LLM forgets everything between sessions | LLM remembers your name, family, preferences, history |
+| You repeat yourself every conversation | Facts accumulate and strengthen over time |
+| Model hallucinates personal details | All stored facts pass a validation gate before storage |
+| One-size-fits-all memory | Per-user isolated knowledge graphs |
 
-## Architecture
+**Example:**
 
-```
-OpenWebUI Inlet Filter
-  ├─ Intent Classification (GLiNER2 → QUERY/RETRACTION/CORRECTION/STATEMENT)
-  │
-  ├─ POST /query (if QUERY intent)
-  │  └─ Five-Phase Resolution:
-  │     ├─ Phase 1: Anchor → WHO (resolve pronouns → user UUID)
-  │     ├─ Phase 2: Path → WHAT (scalar/relationship/taxonomy query)
-  │     ├─ Phase 3: DB Facts (PostgreSQL baseline + 1-hop graph + hierarchy)
-  │     ├─ Phase 4: Vector Search (Qdrant semantic, threshold 0.3)
-  │     └─ Phase 5: Fact Resolution (UUID→display names, dedup, return prose)
-  │
-  └─ Inject Facts → LLM Context (if facts found)
+> You: *"My daughter Gabby just started high school."*  
+> *(FaultLine stores: user → parent_of → Gabby, Gabby → instance_of → Person)*
 
-FaultLine Ingest Pipeline (POST /ingest)
-  ├─ Stage 1: Intent Classification
-  ├─ Stage 2: LLM Extraction (or GLiNER2 if known rel_types)
-  ├─ Stage 3: WGM Validation Gate
-  │  ├─ Semantic conflict detection (auto-supersede type/ownership conflicts)
-  │  ├─ Bidirectional validation (prevent impossible rel_type pairs)
-  │  ├─ Type constraint validation (head_types/tail_types from rel_types table)
-  │  └─ Fact Classification (Class A/B/C routing)
-  │
-  └─ PostgreSQL Commit + Qdrant Sync (re-embedder background)
+> Three weeks later...  
+> You: *"What do you know about my family?"*  
+> LLM: *"You have a daughter named Gabby who recently started high school..."*
 
-Three-Dimensional Classification Model
-  ├─ DIMENSION 1: Storage Path (SCALAR|RELATIONAL|HIERARCHICAL)
-  │  └─ Determined by rel_type metadata (deterministic on create)
-  │
-  ├─ DIMENSION 2: Confidence Class (A|B|C)
-  │  ├─ Class A: User-stated (1.0, always authoritative)
-  │  ├─ Class B: LLM-inferred following established ontology (0.8)
-  │  └─ Class C: Novel patterns awaiting approval (0.4)
-  │
-  └─ DIMENSION 3: Directionality (via rel_type metadata)
-     ├─ Ontology: is_symmetric + inverse_rel_type (parent_of ↔ child_of)
-     └─ Hierarchy: composition chains (instance_of, subclass_of, member_of)
-```
-
-## Key Features
-
-- **Metadata-Driven Validation:** Zero hardcoded rel_types or entity types. All validation reads from `rel_types` table at runtime.
-- **Write-Time Normalization:** Entity UUIDs are v5 surrogates, normalized at ingest. Query layer works with canonical forms.
-- **Non-Destructive Archival:** User corrections soft-delete conflicting facts (preserved for historical queries).
-- **Three-Layer Intent Classification:** GLiNER2 + negation patterns + dynamic confidence gating.
-- **Self-Building Ontology:** Novel rel_types staged as Class C, promoted by re-embedder via cosine similarity + frequency heuristics.
-- **Per-User Collections:** Qdrant indexed as `faultline-{user_id}` for multi-tenant deployments.
-
-## Quick Start
-
-```bash
-# Install dependencies
-pip install -e ".[test]"
-
-# Run via Docker Compose (recommended)
-docker compose -f config/docker-compose.yml up --build
-
-# Or start backend directly (after running migrations manually)
-uvicorn src.api.main:app --host 0.0.0.0 --port 8001 --reload
-python -m src.re_embedder.embedder  # background process
-```
-
-## MCP Support
-
-FaultLine ships a native MCP (Model Context Protocol) server exposing three tools directly to any MCP-compatible host:
-
-| Tool | What it does |
-|------|-------------|
-| `recall_memory` | Query the knowledge graph — call at conversation start to inject relevant facts |
-| `remember_facts` | Store facts from conversation — runs full extract/validate/ingest pipeline |
-| `retract_fact` | Remove or correct stored facts via natural language |
-
-### Claude Desktop (stdio)
-Add to `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "faultline": {
-      "command": "python",
-      "args": ["/path/to/FaultLine/tools/mcp_server.py"],
-      "env": {
-        "FAULTLINE_USER_ID": "YOUR-USER-UUID",
-        "FAULTLINE_API_URL": "http://YOUR-HOST:8001"
-      }
-    }
-  }
-}
-```
-
-### OpenWebUI Native Integration
-With the `faultline-mcp` Docker service running (included in all compose files):
-
-**Settings → Integrations → Tools → Add MCP Server**
-- URL: `http://faultline-mcp:8002/mcp`
-- Bearer Token: `<your MCP_API_KEY>`
-
-See `docs/MCP-SETUP.md` for complete setup instructions.
+---
 
 ## How It Compares
 
@@ -140,122 +49,177 @@ See `docs/MCP-SETUP.md` for complete setup instructions.
 
 FaultLine's differentiation is write-time validation — most memory systems are append-only RAG stores with no ontology enforcement. FaultLine knows the difference between `parent_of` and `child_of`, validates both directions, and never stores a UUID where a display name should appear.
 
+---
+
+## Requirements
+
+- Docker & Docker Compose
+- [OpenWebUI](https://openwebui.com/) (v0.9.5+)
+- A local LLM endpoint — [Ollama](https://ollama.ai/) or [LM Studio](https://lmstudio.ai/) with a Qwen2.5 model
+- 8 GB RAM minimum (16 GB recommended — GLiNER2 model loads at startup)
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone
+git clone https://github.com/tkalevra/FaultLine.git
+cd FaultLine
+
+# 2. Configure your LLM endpoint
+cp .env.example .env
+# Edit .env — set QWEN_API_URL to your Ollama/LM Studio endpoint
+
+# 3. Start the stack
+docker compose -f config/docker-compose.yml up -d
+
+# 4. Verify
+curl http://localhost:8000/health
+# → {"status": "ok", ...}
+```
+
+> First build downloads the GLiNER2 model weights (~500 MB). Allow 3–5 minutes.  
+> Full setup guide: **[docs/Docker.md](./docs/Docker.md)**
+
+---
+
+## Connecting to OpenWebUI
+
+1. In OpenWebUI → **Workspace → Functions → +**
+2. Paste the contents of `openwebui/faultline_function.py`
+3. Save, then open **Valves** and set `FAULTLINE_URL`:
+   - Same machine: `http://localhost:8000`
+   - Docker-internal: `http://faultline:8000`
+4. Enable the filter. Start a conversation — FaultLine begins learning.
+
+---
+
+## MCP Server (Claude Desktop)
+
+FaultLine includes a Model Context Protocol server, exposing three tools to Claude Desktop or any MCP-compatible client:
+
+- `recall_memory` — query the knowledge graph
+- `remember_facts` — store new facts from conversation
+- `retract_fact` — remove or correct a stored fact
+
+The MCP server runs on port `8002` and is included in the Docker Compose stack automatically.
+
+```json
+{
+  "mcpServers": {
+    "faultline": {
+      "url": "http://localhost:8002/mcp",
+      "headers": { "Authorization": "Bearer YOUR_MCP_API_KEY" }
+    }
+  }
+}
+```
+
+---
+
+## Architecture
+
+```
+OpenWebUI Conversation
+  │
+  ▼
+FaultLine Filter (OpenWebUI inlet)
+  ├─ Intent Classification  →  QUERY / STATEMENT / CORRECTION / RETRACTION
+  ├─ POST /query            →  inject relevant facts before LLM responds
+  └─ POST /ingest           →  extract + validate + store new facts
+
+FaultLine Backend (port 8000)
+  ├─ GLiNER2               →  zero-shot named entity + relation extraction
+  ├─ WGM Validation Gate   →  ontology check, conflict detection, type constraints
+  ├─ Three-Class Storage   →  Class A (user-stated) / B (LLM-inferred) / C (speculative)
+  └─ Re-Embedder           →  background: promote facts, sync Qdrant, evolve ontology
+
+Storage
+  ├─ PostgreSQL            →  authoritative fact store (per-user schemas)
+  └─ Qdrant                →  semantic vector index (derived from PostgreSQL)
+```
+
+**Key principle:** The LLM extracts facts; the backend validates and stores them. The LLM never has direct write access to the knowledge graph.
+
+---
+
 ## Environment Variables
 
 ```env
-POSTGRES_DSN=postgresql://user:pass@localhost:5432/faultline
-QWEN_API_URL=http://localhost:11434/v1/chat/completions  # or OpenWebUI endpoint
+# Required
+POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
+QWEN_API_URL=http://host.docker.internal:11434/v1/chat/completions
+
+# Optional (defaults shown)
 QDRANT_URL=http://qdrant:6333
 QDRANT_COLLECTION=faultline-test
-REEMBED_INTERVAL=10  # seconds
-
-# MCP Server (optional — only needed if running HTTP transport)
-MCP_API_KEY=your-generated-key-here   # Bearer token for HTTP transport
-FAULTLINE_USER_ID=your-uuid-here      # Single-user mode for MCP server
+REEMBED_INTERVAL=60
+MCP_API_KEY=                    # set to require auth on MCP server
+FAULTLINE_USER_ID=              # pin MCP server to a single user
 ```
+
+---
 
 ## Key Files
 
 | File | Role |
 |---|---|
-| `src/api/main.py` | FastAPI app — `/ingest`, `/query`, `/retract` endpoints |
-| `src/wgm/gate.py` | `WGMValidationGate` — ontology + conflict detection |
-| `src/re_embedder/embedder.py` | Background poll loop — promotes Class B, expires Class C, learns ontology |
-| `openwebui/faultline_function.py` | OpenWebUI Filter — inlet intent classification, fact injection |
-| `src/schema_oracle/oracle.py` | Entity type resolution (GLiNER2 wrapper) |
-| `src/entity_registry/registry.py` | UUID v5 surrogates, alias tracking, preferred name resolution |
-| `src/mcp/server.py` | Stdio MCP server — stdio transport, tool dispatch, FAULTLINE_USER_ID mode |
-| `src/mcp/http_server.py` | HTTP/Streamable MCP transport — FastAPI, bearer auth, Docker sidecar |
-| `src/mcp/tools.py` | MCP tool schemas (recall_memory, remember_facts, retract_fact) |
-| `tools/mcp_server.py` | MCP server entry point — supports --transport stdio\|http |
-| `src/provisioning/schema_manager.py` | Per-user PostgreSQL schema creation and migration |
+| `openwebui/faultline_function.py` | OpenWebUI Filter — inlet classification, fact injection |
+| `src/api/main.py` | FastAPI backend — `/ingest`, `/query`, `/retract` endpoints |
+| `src/wgm/gate.py` | Write-Validated Memory gate — ontology + conflict detection |
+| `src/re_embedder/embedder.py` | Background worker — fact promotion, Qdrant sync, ontology growth |
+| `src/mcp/http_server.py` | MCP HTTP server — Claude Desktop integration |
+| `config/docker-compose.yml` | Full stack (faultline + postgres + qdrant + redis + mcp) |
+
+---
 
 ## Testing
 
 ```bash
-# Unit tests (exclude evaluation/feature_extraction/model_inference/preprocessing)
+# Unit tests
 pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
               --ignore=tests/model_inference --ignore=tests/preprocessing
 
-# Integration test with OpenWebUI
-curl -X POST "https://your-openwebui.com/api/chat/completions" \
-  -H "Authorization: Bearer sk-YOUR_TOKEN" \
+# Live integration test (requires running stack)
+curl -X POST http://localhost:8000/ingest \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "FaultLine-Test",
-    "messages": [{"role": "user", "content": "tell me about my family"}]
-  }' | jq '.'
+  -d '{"text": "My name is Chris", "user_id": "test-user", "edges": [], "source": "test"}'
 ```
 
 ---
 
-## Built With: Open Source Software
+## Documentation
 
-FaultLine is built on the shoulders of excellent open-source projects:
-
-### Core Infrastructure
-- **[PostgreSQL](https://www.postgresql.org/)** — Authoritative fact storage with ACID guarantees
-- **[Qdrant](https://qdrant.tech/)** — Vector database for semantic fact search
-- **[Redis](https://redis.io/)** — Rate limiting, caching, event queues
-- **[FastAPI](https://fastapi.tiangolo.com/)** — High-performance Python web framework
-- **[Uvicorn](https://www.uvicorn.org/)** — ASGI server
-
-### Named Entity & Relation Extraction
-- **[GLiNER2](https://github.com/urchade/gliner)** — Zero-shot relation extraction with semantic constraints
-- **[nomic-embed-text](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)** — Lightweight semantic embeddings
-
-### Frontend & Integration
-- **[OpenWebUI](https://openwebui.com/)** — Self-hosted LLM interface (compatible with any OpenAI-compatible endpoint)
-- **[Hugging Face Hub](https://huggingface.co/)** — Model hosting and API
-
-### Development & Testing
-- **[pytest](https://pytest.org/)** — Unit testing framework
-- **[structlog](https://www.structlog.org/)** — Structured logging
-- **[psycopg2](https://www.psycopg.org/)** — PostgreSQL Python driver
-- **[httpx](https://www.python-httpx.org/)** — Async HTTP client
+| Document | Contents |
+|---|---|
+| [docs/Docker.md](./docs/Docker.md) | Step-by-step Docker deployment guide |
+| [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) | OpenWebUI filter setup + valve configuration |
+| [DEV/CONTAINER-ARCHITECTURE.md](./DEV/CONTAINER-ARCHITECTURE.md) | Container topology, networking, data flow |
+| [docs/RESEARCH-AND-INNOVATION.md](./docs/RESEARCH-AND-INNOVATION.md) | Research foundations, peer-reviewed references, comparison to prior work |
 
 ---
 
-## Research & Academic References
+## Built With
 
-FaultLine is grounded in peer-reviewed research on knowledge graphs, information extraction, and semantic understanding:
-
-### Named Entity & Relation Extraction
-- **GLiNER: Generalist Model for NER and RE** — [arXiv:2311.08526](https://arxiv.org/abs/2311.08526) — Zero-shot NER and relation extraction with semantic constraints; the foundation for FaultLine's entity typing and relationship classification
-- **GLiNER 2.0** — [GitHub](https://github.com/urchade/gliner) — Improved zero-shot extraction with confidence scoring
-- **Relation Extraction with Self-Supervision** — [arXiv:2305.12278](https://arxiv.org/abs/2305.12278) — Techniques for learning new relation types from minimal supervision
-
-### Knowledge Graphs & Semantic Networks
-- **Knowledge Graphs** (Fensel et al., 2020) — [ACM Digital Library](https://dl.acm.org/doi/10.1145/3418294) — Comprehensive survey on KG construction, validation, and querying
-- **Wikidata: A Free and Open Knowledge Base** — [arXiv:1407.6552](https://arxiv.org/abs/1407.6552) — Community-curated open knowledge graph; FaultLine's relation types are aligned to Wikidata PIDs (P40, P26, P31, etc.)
-- **Knowledge Graph Embedding by Translating on Hyperplanes** — [AAAI-14](https://ojs.aaai.org/index.php/AAAI/article/view/8870) — TransH model for learning semantic relationships
-
-### Information Extraction & Confidence Estimation
-- **Deep Learning for Generic Object Detection** — [arXiv:1506.02640](https://arxiv.org/abs/1506.02640) — Foundational deep learning techniques reused in entity extraction
-- **Confident Learning: Estimating Uncertainty in Dataset Labels** — [JMLR](https://jmlr.org/papers/v23/21-0889.html) — Techniques for confidence scoring applied to fact classification
-
-### Ontology Learning & Self-Building Systems
-- **Ontology Learning from Text** (Maedche & Staab, 2001) — [IEEE TKDE](https://ieeexplore.ieee.org/document/918630) — Foundational work on learning ontologies from conversational text; informs FaultLine's self-building ontology mechanism
-- **An Unsupervised Method for Automatic Language Identification** — [Computational Linguistics](https://aclanthology.org/J97-1003/) — Pattern frequency analysis reused in novel rel_type evaluation
-
-### Vector Similarity & Semantic Search
-- **Nomic: Powerful text embeddings for your use case** — [Blog](https://www.nomic.ai/blog/nomic-embed-text-v1) — Technical overview of nomic-embed-text-v1.5 embeddings used for Qdrant semantic search
-- **Dense Passage Retrieval for Open-Domain Question Answering** — [arXiv:2004.04906](https://arxiv.org/abs/2004.04906) — Dense retrieval techniques applied to fact ranking
-
-### Conflict Detection & Semantic Validation
-- **Detecting and Resolving Inconsistencies in Ontologies** — [Semantic Web Journal](http://www.semantic-web-journal.net/) — Techniques for auto-superseding conflicting facts (Dimension 1 of FaultLine's classification model)
-- **Bidirectional Relation Validation** — [ACM Transactions on Knowledge Discovery from Data](https://dl.acm.org/journal/tkdd) — Methods for preventing semantically impossible relationship pairs
+- **[PostgreSQL](https://www.postgresql.org/)** — Authoritative fact storage
+- **[Qdrant](https://qdrant.tech/)** — Vector similarity search
+- **[Redis](https://redis.io/)** — Rate limiting and caching
+- **[FastAPI](https://fastapi.tiangolo.com/)** + **[Uvicorn](https://www.uvicorn.org/)** — API backend
+- **[GLiNER2](https://github.com/urchade/gliner)** — Zero-shot named entity and relation extraction
+- **[nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)** — Semantic embeddings
+- **[OpenWebUI](https://openwebui.com/)** — Self-hosted LLM interface
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](./docs/LICENSE) for details.
+Apache License 2.0 — see [docs/LICENSE](./docs/LICENSE).
 
 ## Contributing
 
 Contributions welcome. Please ensure:
 - All tests pass (`pytest tests/`)
-- New rel_types are metadata-driven (added to `rel_types` table, not hardcoded)
-- No hardcoded validation constants (use `_get_rel_type_metadata()`)
+- New relationship types are metadata-driven (added to `rel_types` table, not hardcoded)
 - No UUIDs in LLM output (filter at injection time)
+- No hardcoded validation constants (use `_get_rel_type_metadata()`)
