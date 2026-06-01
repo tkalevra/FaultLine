@@ -165,13 +165,49 @@ async def store_context_tool(text: str, user_id: str) -> dict[str, Any]:
 
 
 async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
-    """Call FaultLine /query endpoint."""
+    """Call FaultLine /query endpoint and return human-readable prose."""
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/query",
         json={"text": query, "user_id": user_id},
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    facts = data.get("facts", [])
+    preferred_names: dict = data.get("preferred_names", {})
+    attributes: dict = data.get("attributes", {})
+    canonical_identity: str = data.get("canonical_identity", "")
+
+    if not facts and not attributes:
+        return {"memory": "No relevant facts found."}
+
+    # Build a slug→name map; always resolve the querying user's identity to "you"
+    slug = canonical_identity.replace("-", "_")
+    display: dict[str, str] = {}
+    for uid, name in preferred_names.items():
+        uid_slug = uid.replace("-", "_")
+        if uid == canonical_identity or uid_slug == slug or uid == "user":
+            display[uid] = "you"
+            display[uid_slug] = "you"
+        elif name and name != uid and name != uid_slug:
+            display[uid] = name
+            display[uid_slug] = name
+
+    lines: list[str] = []
+
+    for fact in facts:
+        definition = fact.get("definition", "")
+        if not definition:
+            continue
+        text = definition
+        for token, replacement in display.items():
+            text = text.replace(token, replacement)
+        lines.append(text)
+
+    for attr, value in attributes.items():
+        lines.append(f"{attr}: {value}")
+
+    return {"memory": "\n".join(lines) if lines else "No relevant facts found."}
 
 
 async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
