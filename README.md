@@ -36,6 +36,10 @@ RAG retrieves documents and asks the LLM to interpret them. The answer depends o
 
 Facts are stored as typed relationships — person, age, occupation, network device, IP address, MAC, hostname. Corrections update the record cleanly; the old value is archived, not lost. Memory strengthens over time: things mentioned once are held lightly, confirmed facts become authoritative.
 
+### 5. Teach it any domain — on your terms
+
+`/expand networking` teaches FaultLine how networking works before you mention your first device. `/expand kubernetes online https://kubernetes.io/docs/concepts/` reads the actual docs and builds the ontology from them. You point it at the source, it learns the structure, and every fact you mention in that domain from then on is stored and retrieved in context — not as an isolated string. And everything it learns is still correctable by you.
+
 ---
 
 ## What it looks like in practice
