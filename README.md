@@ -3,79 +3,91 @@
 </p>
 
 <h1 align="center">FaultLine</h1>
-<p align="center"><strong>Your AI actually remembers you.</strong></p>
+<p align="center"><strong>Validated, private, shareable memory for your AI.</strong></p>
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
   <img src="https://img.shields.io/badge/OpenWebUI-0.9.5%2B-green" alt="OpenWebUI"/>
-  <img src="https://img.shields.io/badge/MCP-Claude%20Desktop-purple" alt="MCP"/>
+  <img src="https://img.shields.io/badge/MCP-2025--03--26-purple" alt="MCP"/>
 </p>
 
 ---
 
-FaultLine gives your local AI a real memory. It runs quietly in the background — watching your conversations, learning who you are and what matters to you, and making sure your AI already knows the important stuff the next time you chat.
-
-**Everything stays on your machine. No cloud. No subscriptions.**
+FaultLine adds persistent, validated memory to your local AI. Facts are stored in a structured knowledge graph — not summarised into text blobs, not guessed from documents. When you correct something, it updates. When you ask about it later, the answer is right.
 
 ---
 
-## What changes
+## Why FaultLine
 
-Without FaultLine, your AI starts fresh every single conversation. It doesn't know your name, your family, your preferences, or anything you've told it before. With FaultLine, it does.
+### 1. Private by design
+
+Everything runs on your machine. Your conversations, your memories, your data — none of it leaves. No cloud sync, no accounts, no subscriptions.
+
+### 2. Share memory across any AI
+
+FaultLine exposes an MCP server. That means the same memory store is available to OpenWebUI, Claude Desktop, or any other MCP-capable endpoint. Change your server IP in one conversation, every model sees the update.
+
+### 3. Write-validated facts — not RAG guesswork
+
+RAG retrieves documents and asks the LLM to interpret them. The answer depends on wording, context, and luck. FaultLine validates facts before storing them and rejects hallucinations at the gate. Your AI knows "AlphaNode's IP is 192.0.2.20" — not "a document mentioned something about a server."
+
+### 4. Correctable, relational data
+
+Facts are stored as typed relationships — person, age, occupation, network device, IP address, MAC, hostname. Corrections update the record cleanly; the old value is archived, not lost. Memory strengthens over time: things mentioned once are held lightly, confirmed facts become authoritative.
+
+---
+
+## What it looks like in practice
 
 ```
-You:  "My name is Chris and I'm 42. I have a daughter named Gabby."
+You:  "I'm a sysadmin. My main workstation is called DevBox, IP 10.0.1.5."
 
-Next week, fresh conversation:
-You:  "What do you know about me?"
-AI:   "Your name is Chris, you're 42 years old, and you have a daughter named Gabby."
+Next session:
+You:  "What do you know about DevBox?"
+AI:   "DevBox is your workstation, IP address 10.0.1.5."
 ```
 
 ```
-You:  "My home server AlphaNode has ip 192.0.2.20"
+You:  "Actually DevBox moved to 10.0.1.10 after the network change."
 
-Later:
-You:  "What's AlphaNode's IP?"
-AI:   "AlphaNode has IP address 192.0.2.20."
+Next session:
+You:  "What's DevBox's IP?"
+AI:   "DevBox has IP address 10.0.1.10."
 ```
 
 ```
 You:  /expand networking
 
-Later, after mentioning your router:
-AI:   "Your router is a networking device at 192.168.1.1 — I remember that from earlier."
+Later, after mentioning your firewall:
+AI:   "Your firewall OPNsense is a networking device — I have that from earlier."
 ```
 
-**It remembers names. Ages. Relationships. Preferences. Corrections. Server IPs. Birthdays. Pets.** Anything you tell it, in plain English.
+**People, preferences, server IPs, MAC addresses, hostnames, relationships, corrections.** Anything you tell it, stored and ready.
 
 ---
 
-## What it does behind the scenes
+## How it works (briefly)
 
-You don't need to know any of this to use it — but if you're curious:
-
-- Every message gets checked for facts worth keeping ("my dog is called Spot", "my router IP is 192.168.1.1")
-- Facts go through a validation step before being stored, so hallucinated details don't pollute your memory
-- Relevant facts are quietly injected into the conversation before the AI responds — it just *knows*
-- Memories strengthen over time. Things you mention once are held lightly. Things you confirm repeatedly become rock-solid
-- Corrections work. Tell it "actually Des is 13, not 12" and it updates — the old fact is archived, not deleted
+- Every message is scanned for facts worth keeping
+- Facts go through a validation gate before storage — hallucinated details are rejected
+- Relevant facts are injected into the conversation before the AI responds
+- Memories strengthen with confirmation; corrections archive the old value cleanly
+- `/expand <topic>` teaches FaultLine how a domain is structured so facts about it land correctly
 
 ---
 
 ## `/expand` — teach it a topic
 
-Type `/expand <topic>` to teach FaultLine how a subject is structured. After that, your personal facts about that topic are understood in context.
-
 ```
 /expand networking
 /expand kubernetes
-/expand my home lab
+/expand home lab
 /expand tls online
 /expand kubernetes online https://kubernetes.io/docs/concepts/
 ```
 
-The `online` variants fetch real web content and ground the learning in it. Everything runs in the background — you get an immediate response and can keep chatting.
+The `online` variants fetch real web content and ground the learning in it. Runs in the background — you get an immediate response and can keep chatting.
 
 ---
 
@@ -85,16 +97,17 @@ The `online` variants fetch real web content and ground the learning in it. Ever
 |---|---|---|---|---|---|
 | Self-hosted, fully private | ✅ | ❌ Cloud only | ✅ | ✅ | ✅ |
 | Works with any local LLM | ✅ | ❌ OpenAI only | ✅ | ✅ | ✅ |
-| MCP server (Claude Desktop) | ✅ | ❌ | ❌ | Partial | ❌ |
+| MCP server — share across models | ✅ | ❌ | ❌ | Partial | ❌ |
+| Write-validated (no hallucination storage) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Correctable — updates cleanly, archives old | ✅ | ❌ Overwrites | ❌ | ❌ | ❌ |
+| Relational facts (not document chunks) | ✅ | ❌ | Partial | Partial | ❌ |
+| Remembers server IPs, MACs, hostnames | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Remembers relationships & people | ✅ | ✅ | Partial | Partial | ❌ |
-| Remembers server IPs, MACs, emails | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Corrections update memory cleanly | ✅ | ❌ Overwrites | ❌ | ❌ | ❌ |
+| Short → long-term promotion | ✅ | ❌ | Partial | ❌ | ❌ |
 | `/expand` topic learning | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Web-grounded learning | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Short → long-term promotion | ✅ | ❌ | Partial | ❌ | ❌ |
 | Dead-naming / preferred name support | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Per-user private memory | ✅ | ✅ Account | ✅ | ✅ | ❌ Shared |
-| Validated writes (no hallucination storage) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Open source | ✅ Apache 2.0 | ❌ | ✅ MIT | Partial | ✅ MIT |
 
 ---
@@ -123,24 +136,22 @@ curl http://localhost:8000/health
 # {"status": "ok", ...}
 ```
 
-The first start downloads the AI model used for extraction (~500 MB). Takes 3–5 minutes.
+The first start downloads the model used for extraction (~500 MB). Takes 3–5 minutes.
 
-### Connect it to OpenWebUI
+### Connect to OpenWebUI
 
 1. Go to **Workspace → Functions → +** in OpenWebUI
 2. Paste the contents of `openwebui/faultline_function.py`
 3. Open **Valves** and set `FAULTLINE_URL` to `http://faultline:8000` (or `http://localhost:8000` if not using Docker networking)
 4. Enable the filter
 
-That's it. Start a conversation and FaultLine begins learning straight away.
+Start a conversation — FaultLine begins learning immediately.
 
 ---
 
 ## Claude Desktop (MCP)
 
-FaultLine includes a built-in MCP server so Claude Desktop can store and recall memories too.
-
-Add this to your Claude Desktop config:
+FaultLine's MCP server makes the same memory available to Claude Desktop or any MCP-capable client.
 
 ```json
 {
@@ -153,7 +164,7 @@ Add this to your Claude Desktop config:
 }
 ```
 
-Claude will then have access to four tools: recalling memories, storing facts, retracting facts, and learning topic hierarchies — all backed by your local FaultLine instance.
+Four tools: recall memory, store facts, retract facts, learn topic hierarchies — all backed by the same local store your OpenWebUI conversations write to.
 
 ---
 
@@ -178,7 +189,7 @@ FAULTLINE_USER_ID=    # optional — pins the MCP server to one user
 |---|---|
 | `openwebui/faultline_function.py` | The OpenWebUI filter — drop this in and you're running |
 | `src/api/main.py` | The backend API |
-| `src/mcp/server.py` | The MCP tool server for Claude Desktop |
+| `src/mcp/server.py` | The MCP tool server |
 | `migrations/` | Database schema — runs automatically on first start |
 
 ---
