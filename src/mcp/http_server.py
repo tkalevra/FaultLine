@@ -47,6 +47,11 @@ class RetractRequest(BaseModel):
     text: str
     user_id: str = ""
 
+
+class LearnRequest(BaseModel):
+    text: str
+    user_id: str = ""
+
 # If set, all POST /mcp requests must present: Authorization: Bearer <MCP_API_KEY>
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()
 
@@ -153,6 +158,26 @@ async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONRe
     user_id = _mcp.FAULTLINE_USER_ID or body.user_id
     _log(f"REST remember_facts user_id={user_id[:8]}...")
     result = await _mcp.remember_facts_tool(text=body.text, user_id=user_id)
+    return JSONResponse(result)
+
+
+@app.post(
+    "/learn_facts",
+    summary="Store LLM-generated ontological knowledge into FaultLine",
+    description=(
+        "Store knowledge the LLM generates as explicit ontological statements into the "
+        "FaultLine knowledge graph with source=llm_learn. Use when the user asks to learn "
+        "a topic. Generate statements in the forms: 'X is a subclass of Y', "
+        "'X is an instance of Y', 'X is a part of Y' — one per line — then call this. "
+        "Facts are staged as Class B (llm_learn provenance) and confirmed over time."
+    ),
+)
+async def rest_learn_facts(body: LearnRequest, request: Request) -> JSONResponse:
+    if not _check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    user_id = _mcp.FAULTLINE_USER_ID or body.user_id
+    _log(f"REST learn_facts user_id={user_id[:8]}...")
+    result = await _mcp.learn_facts_tool(text=body.text, user_id=user_id)
     return JSONResponse(result)
 
 

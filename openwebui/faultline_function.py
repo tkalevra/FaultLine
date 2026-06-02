@@ -37,6 +37,69 @@ LLMOutputValidator = None
 # Inlet skips anything starting with this marker to prevent recursive cascaalice.
 _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
 
+# ── UX Humanization — presentation-layer only, no backend changes ─────────────
+
+def _rotate(pool: list, index: int) -> str:
+    """Deterministic rotation through a pool by index. Never random."""
+    return pool[index % len(pool)] if pool else ""
+
+
+_STRIP_PATTERNS = [
+    re.compile(r'^\[(?:staged|Class [ABC]|Class-[ABC])\]\s*', re.I),
+    re.compile(r'\bconfidence=[\d.]+\b', re.I),
+    re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I),
+]
+
+
+def _clean_fact_for_injection(text: str) -> str:
+    """Strip internal metadata annotations from a fact string before injection.
+
+    Removes [staged], [Class A/B/C], confidence= annotations, and UUID strings.
+    If the result is empty after stripping, the caller should skip the fact.
+    Never silently swallows exceptions — caller handles empty result.
+    """
+    for pat in _STRIP_PATTERNS:
+        text = pat.sub('', text)
+    return text.strip()
+
+
+_MEMORY_HEADERS = [
+    "Here's what I remember about you:",
+    "From memory:",
+    "Based on what I know about you:",
+    "Recalling relevant facts:",
+    "What I know:",
+]
+
+_ALERT_VARIANTS = [
+    "Note: memory search is rebuilding — facts are safe, full recall returns shortly. ({n} reminder{s} left)",
+    "Heads up: your recall index is tuning up — nothing is lost. ({n} note{s} remaining)",
+    "Memory search is temporarily limited while the index resets — your facts are intact. ({n} left)",
+    "Quick note: full memory recall will return shortly — facts are saved. ({n} reminder{s} left)",
+]
+
+_MEMORY_TIPS = [
+    "FaultLine learns from your conversations — the more you share, the better I remember.",
+    "Facts are stored in a knowledge graph (a map of how things connect to each other).",
+    "I use an ontology (a set of rules for what kinds of facts exist) to organize what I know.",
+    "New facts I'm less sure about are held temporarily until confirmed a few times.",
+    "Your memory is private — each user has a completely separate store of facts.",
+    "I can forget things too — just say 'forget that' or 'that's not right'.",
+    "Relationships like spouse, parent, and pet are always available — they never expire.",
+    "The more you correct me, the smarter I get — corrections always win over guesses.",
+    "I search your memory using both exact facts and meaning-based matching.",
+    "Facts flow through categories — a dog is an animal, an animal is a living thing.",
+]
+
+_EMPTY_MEMORY_VARIANTS = [
+    "I don't have any stored facts about this yet — feel free to tell me.",
+    "Nothing in memory on this topic yet.",
+    "No relevant memories found — I'll learn as we talk.",
+    "I'm still learning about you — share anything you'd like me to remember.",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Redis client for inlet dedup cache (dprompt-127 — proven Redis SET NX EX pattern)
 _redis_client: Optional[redis.Redis] = None
 _redis_init_attempted: bool = False  # Guard to prevent retry loops (dBug-2DAY-REDIS-HANG fix)
@@ -203,7 +266,7 @@ def _get_faultline_url(valve_url: Optional[str] = None) -> str:
             print(f"[FaultLine Filter] faultline_url_detect: valve_url_invalid={valve_url}, error={e}", file=sys.stderr, flush=True)
             # Fall through to chain
 
-    # Priority 2: Docker service name (internal container port 8000, NOT host port 8001)
+    # Priority 2: Docker service name (internal container port 8000, NOT host port 8000)
     docker_url = "http://faultline:8000"
     if _can_reach_url(docker_url, timeout=1.0):
         print(f"[FaultLine Filter] faultline_url_detect: docker_service_reachable, using={docker_url}", flush=True)
@@ -1829,7 +1892,7 @@ class Filter:
     class Valves(BaseModel):
         FAULTLINE_URL: str = Field(
             default="",
-            description="FaultLine backend API endpoint (optional). If empty, Filter auto-detects via Docker service name, env var, or localhost. Override here to explicitly set custom URL (e.g., for reverse proxy deployments). Examples: http://faultline:8000 (Docker), http://my-domain.com/faultline, http://10.0.0.5:8001 (external port)"
+            description="FaultLine backend API endpoint (optional). If empty, Filter auto-detects via Docker service name, env var, or localhost. Override here to explicitly set custom URL (e.g., for reverse proxy deployments). Examples: http://faultline:8000 (Docker), http://my-domain.com/faultline, http://10.0.0.5:8000 (external port)"
         )
 
         OPENWEBUI_LLM_URL: str = Field(
@@ -2805,6 +2868,7 @@ GRANULAR EXAMPLES (using recent facts context):
         locations: Optional[list[str]] = None,
         expose_preferences: bool = False,
         user_id: Optional[str] = None,
+        alerts: Optional[list[dict]] = None,
     ) -> str:
         identity_display = preferred_names.get("user")
         identity = canonical_identity or identity_display
@@ -2825,8 +2889,10 @@ GRANULAR EXAMPLES (using recent facts context):
                 lines.append("DIRECTLY ACTIONABLE: Use the facts and context below immediately to fulfill the request.")
                 lines.append(realtime_context)
 
+                _rt_index = len(facts) + (alerts[0].get("shown", 0) if alerts else 0)
+                _rt_header = _rotate(_MEMORY_HEADERS, _rt_index)
                 return (
-                    "⊢ FaultLine Memory — treat these as established ground truth for this response.\n"
+                    f"{_rt_header}\n"
                     + "\n".join(f"- {l}" for l in lines)
                     + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user (location, relationships, preferences, history). Use them to inform your entire response—not just tool routing. Be confident and direct in leveraging verified information. Don't say 'I don't know' or 'I can't access' when the answer is in your facts. Route sensitive data to tools internally as needed; keep personal details private in responses but reason with them confidently. Provide personalized, grounded context naturally."
                     + "\n[/FAULTLINE_MEMORY]"
@@ -2836,8 +2902,10 @@ GRANULAR EXAMPLES (using recent facts context):
                 is_realtime = False
 
         # CONVERSATIONAL MODE (from is_realtime=False or fallthrough)
+        _conv_index = len(facts) + (alerts[0].get("shown", 0) if alerts else 0)
+        _conv_header = _rotate(_MEMORY_HEADERS, _conv_index)
         lines = [
-            "⊢ FaultLine Memory (from long-term knowledge graph):",
+            _conv_header,
         ]
 
         if identity:
@@ -2932,8 +3000,12 @@ GRANULAR EXAMPLES (using recent facts context):
                     continue
                 definition = f.get("definition", "")
                 if definition:
-                    # Use backend prose definition directly (no brittle filter formatting)
-                    lines.append(f"- {definition}")
+                    # Strip internal metadata before injection (UX humanization)
+                    clean = _clean_fact_for_injection(definition)
+                    if clean:
+                        lines.append(f"- {clean}")
+                    else:
+                        print(f"[FaultLine Filter] WARNING: fact stripped to empty, skipping injection (definition={definition!r})", file=sys.stderr)
 
             # Display attributes for all entities mentioned in facts
             if entity_attributes:
@@ -3017,13 +3089,48 @@ GRANULAR EXAMPLES (using recent facts context):
                 "takes priority over alternate names."
             )
 
-        # Apply sentence limit
-        limited = lines[:self.valves.MAX_MEMORY_SENTENCES]
-        if len(lines) > self.valves.MAX_MEMORY_SENTENCES:
-            limited.append(f"... and {len(lines) - self.valves.MAX_MEMORY_SENTENCES} more facts (truncated).")
+        # Inject system alerts before facts are truncated so the notice is never cut off.
+        if alerts:
+            for _alert in alerts:
+                _remaining = _alert.get("max", 4) - _alert.get("shown", 0)
+                if _remaining <= 0:
+                    continue
+                _n = _remaining
+                _s = "s" if _n != 1 else ""
+                _variant = _rotate(_ALERT_VARIANTS, _alert.get("shown", 0))
+                _msg = _variant.format(n=_n, s=_s)
+                lines.insert(1, _msg)  # insert right after the header line
 
+        # Content lines are everything after the header (index 0)
+        _content_lines = lines[1:]
+
+        # Empty-memory state: no facts injected — use a neutral placeholder so the
+        # LLM knows memory was queried but came up empty (prevents hallucination).
+        if not _content_lines:
+            _empty_msg = _rotate(_EMPTY_MEMORY_VARIANTS, _conv_index)
+            return (
+                f"{lines[0]}\n"
+                + f"- {_empty_msg}"
+                + "\n[/FAULTLINE_MEMORY]"
+            )
+
+        # Apply sentence limit (header is index 0, limit applies to content lines)
+        limited = lines[:self.valves.MAX_MEMORY_SENTENCES + 1]  # +1 to account for header
+        if len(lines) > self.valves.MAX_MEMORY_SENTENCES + 1:
+            limited.append(f"... and {len(lines) - self.valves.MAX_MEMORY_SENTENCES - 1} more facts (truncated).")
+
+        # Rotating tip — only when facts are present, suppressed on empty state
+        _has_facts = any(
+            l.startswith("- ") or (not l.startswith("Note:") and not l.startswith("Heads up:") and not l.startswith("Memory search") and not l.startswith("Quick note:"))
+            for l in _content_lines
+        )
+        _tip = _rotate(_MEMORY_TIPS, _conv_index + 1) if _has_facts else ""
+
+        _body = "\n".join(f"- {l}" for l in limited)
+        if _tip:
+            _body += f"\n\n{_tip}"
         return (
-            "\n".join(f"- {l}" for l in limited)
+            _body
             + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user. Use them to inform ALL responses and provide personalized, grounded context. Be confident and direct—don't say 'I don't know' or 'I can't' when the answer is in your facts. Route facts to tools/APIs internally as needed, but reason with all verified information to enrich your responses. Keep sensitive details private in responses unless directly asked, but leverage them confidently in your thinking. Trust these facts as ground truth."
             + "\n[/FAULTLINE_MEMORY]"
         )
@@ -3118,10 +3225,53 @@ GRANULAR EXAMPLES (using recent facts context):
             text = text.strip()
 
             # OPTIMIZATION: Strip memory marker early to avoid duplicate intent classification
-            # (Violation 1 Fix) The _MEMORY_MARKER indicates FaultLine-injected facts have already been added.
-            # Remove it before intent classification to prevent second GLiNER2 call later at line 3200.
-            _MEMORY_MARKER = "⊢ FaultLine Memory"
-            clean_text = text.split(_MEMORY_MARKER)[0].strip() if _MEMORY_MARKER in text else text
+            # (Violation 1 Fix) The _MEMORY_MARKER sentinel indicates FaultLine-injected facts.
+            # Remove it before intent classification to prevent second GLiNER2 call.
+            # Uses [/FAULTLINE_MEMORY] closing sentinel (present in all memory block variants).
+            _MEMORY_SENTINEL = "[/FAULTLINE_MEMORY]"
+            _MEMORY_MARKER_LEGACY = "⊢ FaultLine Memory"  # backward compat for old-format blocks
+            if _MEMORY_SENTINEL in text:
+                clean_text = text.split(_MEMORY_SENTINEL)[0].strip()
+            elif _MEMORY_MARKER_LEGACY in text:
+                clean_text = text.split(_MEMORY_MARKER_LEGACY)[0].strip()
+            else:
+                clean_text = text
+
+            # ── /expand mode ───────────────────────────────────────────────────────
+            # Backend generates the concept hierarchy via its own LLM, parses it,
+            # ingests as llm_learn — no function calling, no outlet, no Redis needed.
+            # /expand maps how concepts relate (e.g. router → network device → hardware).
+            # It does NOT make the assistant an expert on the topic.
+            _EXPAND_RE = re.compile(r'^/expand\s+', re.IGNORECASE)
+            if _EXPAND_RE.match(clean_text):
+                topic = _EXPAND_RE.sub('', clean_text).strip()
+                faultline_url = self._get_faultline_url_cached()
+                print(f"[FaultLine Filter] /expand topic='{topic[:60]}'", flush=True)
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as _lc:
+                        _lr = await _lc.post(
+                            f"{faultline_url}/learn",
+                            json={"topic": topic, "user_id": user_id},
+                        )
+                    _ld = _lr.json() if _lr.status_code == 200 else {}
+                    _total = _ld.get("total", 0)
+                    _committed = _ld.get("committed", 0)
+                    _staged = _ld.get("staged", 0)
+                    _status_msg = (
+                        f"Built a concept map for '{topic}' — {_total} concept relationships mapped "
+                        f"({_committed} committed, {_staged} staged). "
+                        f"These help classify future facts about {topic}, not general knowledge about it."
+                    ) if _total > 0 else f"⊢ FaultLine /expand '{topic}': no concept relationships extracted."
+                except Exception as _e:
+                    _status_msg = f"⊢ FaultLine /expand failed: {_e}"
+                    print(f"[FaultLine Filter] /expand error: {_e}", file=sys.stderr)
+
+                messages = body.get("messages", [])
+                messages.insert(0, {"role": "system", "content": _status_msg})
+                body["messages"] = messages
+                print(f"[FaultLine Filter] /expand done: {_status_msg}", flush=True)
+                return body
+            # ── end /expand mode ───────────────────────────────────────────────────
 
             # Deduplication: skip if this exact text was already processed within the window.
             # OpenWebUI may fire the inlet multiple times for the same message (streaming
@@ -3308,6 +3458,7 @@ GRANULAR EXAMPLES (using recent facts context):
             # Initialize memory variables for use by FaultLine /extract/rewrite
             facts, preferred_names, canonical_identity, entity_attributes = [], {}, None, {}
             raw_facts_for_extraction = []  # Always initialize; set during /query if successful
+            alerts: list[dict] = []  # System alerts from /query response (e.g. Qdrant mismatch)
 
             # Run /query first (with caching) so memory facts can aid pronoun resolution during ingest
             if will_query:
@@ -3336,6 +3487,9 @@ GRANULAR EXAMPLES (using recent facts context):
                             preferred_names = data.get("preferred_names", {})
                             canonical_identity = data.get("canonical_identity")
                             entity_attributes = data.get("attributes", {})
+                            # Alerts are NOT read from Redis cache — the countdown must only tick
+                            # once per real /query execution, not on every cached read.
+                            # alerts stays as [] for cached responses.
                             if self.valves.ENABLE_DEBUG:
                                 print(f"[FaultLine Filter] /query Redis cache hit (reduced query bloat)")
                         else:
@@ -3378,6 +3532,7 @@ GRANULAR EXAMPLES (using recent facts context):
                                     canonical_identity = data.get("canonical_identity")
                                     entity_attributes = data.get("attributes", {})
                                     anchor = data.get("anchor")
+                                    alerts = data.get("alerts", [])
 
                                     # Backward compatibility: if facts are strings (prose-only format),
                                     # convert to simple dict wrappers so Filter code still works
@@ -3681,6 +3836,7 @@ GRANULAR EXAMPLES (using recent facts context):
                         locations=sorted(list(locations)) if locations else None,
                         expose_preferences=_query_asks_about_identity,
                         user_id=user_id,
+                        alerts=alerts,
                     )
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] injecting system message:\n{memory_block}")
@@ -3692,9 +3848,11 @@ GRANULAR EXAMPLES (using recent facts context):
                     # skip injection (no array modification) → no change detected → no re-evaluation loop.
                     msgs = body["messages"]
 
-                    # Check if FaultLine memory block already present in messages
+                    # Check if FaultLine memory block already present in messages.
+                    # Use [/FAULTLINE_MEMORY] sentinel (present in all memory block variants)
+                    # rather than the rotating header string.
                     faultline_already_present = any(
-                        "⊢ FaultLine Memory" in msg.get("content", "")
+                        "[/FAULTLINE_MEMORY]" in msg.get("content", "")
                         for msg in msgs
                         if msg.get("role") == "system"
                     )
