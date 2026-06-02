@@ -429,3 +429,20 @@ DROP TRIGGER IF EXISTS lowercase_rel_types_before_update ON rel_types;
 CREATE TRIGGER lowercase_rel_types_before_update
     BEFORE UPDATE ON rel_types
     FOR EACH ROW EXECUTE FUNCTION lowercase_rel_types();
+
+-- system_alerts: persistent per-user warnings with countdown suppression
+-- alert_type is unique per schema; alerts_shown tracks how many times the warning
+-- has been surfaced to the user; backend suppresses further noise once
+-- alerts_shown >= max_alerts; resolved_at is set when the condition clears.
+-- Migration 062 backfills this table into existing provisioned schemas.
+CREATE TABLE IF NOT EXISTS {schema_name}.system_alerts (
+    id            SERIAL      PRIMARY KEY,
+    alert_type    TEXT        NOT NULL,
+    alert_count   INTEGER     NOT NULL DEFAULT 1,
+    alerts_shown  INTEGER     NOT NULL DEFAULT 0,
+    max_alerts    INTEGER     NOT NULL DEFAULT 4,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at   TIMESTAMPTZ,
+    UNIQUE (alert_type)
+);

@@ -45,7 +45,17 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional, Any
 
+import httpx
+
 log = structlog.get_logger(__name__)
+
+# Module-level sync HTTP client — initialized at import time so it is available
+# in both the FastAPI process and the re_embedder subprocess without depending
+# on the FastAPI lifespan coroutine.
+_llm_http_client: httpx.Client = httpx.Client(
+    timeout=httpx.Timeout(30.0),
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -459,10 +469,7 @@ def call_llm_with_retry_sync(
 
                 start_time = time.time()
 
-                # Lazy import to avoid circular dependencies
-                from src.api.main import _http_client_sync
-
-                response = _http_client_sync.post(
+                response = _llm_http_client.post(
                     endpoint,
                     json=payload,
                     headers=get_llm_headers(),
@@ -788,10 +795,7 @@ def call_llm_no_retry_sync(
 
         start_time = time.time()
 
-        # Lazy import to avoid circular dependencies
-        from src.api.main import _http_client_sync
-
-        response = _http_client_sync.post(
+        response = _llm_http_client.post(
             endpoint,
             json=payload,
             headers=get_llm_headers(),
@@ -893,3 +897,8 @@ def reset_circuit_breaker():
     """
     _llm_circuit_breaker.reset()
     return get_circuit_breaker_status()
+
+
+def close_llm_http_client() -> None:
+    """Close the module-level LLM HTTP client. Call from process shutdown paths."""
+    _llm_http_client.close()

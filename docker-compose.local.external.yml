@@ -11,7 +11,7 @@ services:
     image: faultline:latest
     container_name: faultline-api
     ports:
-      - "8001:8001"
+      - "8000:8000"
     environment:
       # External PostgreSQL (docker-host)
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:password@192.168.1.10:5432/faultline}
@@ -30,7 +30,7 @@ services:
       QWEN_API_URL: ${QWEN_API_URL:-http://ollama:11434/v1/chat/completions}
 
       # FaultLine API self-reference
-      FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8001}
+      FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
 
       # LLM models
       WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen/qwen3.5-9b}
@@ -61,7 +61,7 @@ services:
       - faultline-net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -78,7 +78,7 @@ services:
     environment:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       # FaultLine integration via Valve config
-      FAULTLINE_BACKEND_URL: ${FAULTLINE_API_URL:-http://faultline:8001}
+      FAULTLINE_BACKEND_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
     volumes:
       - open_webui_data:/app/backend/data
     depends_on:
@@ -159,12 +159,13 @@ services:
       start_period: 60s
 
   faultline-mcp:
+    container_name: faultline-mcp
     image: faultline:latest
-    command: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "8002:8002"
     environment:
-      FAULTLINE_API_URL: http://faultline:8001
+      FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
     depends_on:

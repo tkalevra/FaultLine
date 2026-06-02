@@ -6,7 +6,14 @@ TOOLS = [
         "description": "Query FaultLine knowledge graph to recall facts relevant to the conversation. "
                        "Call this at the start of any turn where you need to remember things about the user. "
                        "Returns prose facts from PostgreSQL (graph traversal + hierarchy) merged with "
-                       "Qdrant semantic search results.",
+                       "Qdrant semantic search results.\n\n"
+                       "To build a concept map for a topic, prefix with /expand:\n"
+                       "  /expand networking\n"
+                       "  /expand networking online\n"
+                       "  /expand networking online https://example.com/networking-guide\n\n"
+                       "Note: /expand maps how concepts relate (e.g. router → network device → hardware) — "
+                       "it does not make the assistant an expert on the topic. Use it to help classify "
+                       "facts you plan to share about that domain.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -35,6 +42,32 @@ TOOLS = [
                 "text": {
                     "type": "string",
                     "description": "The sentence or passage containing the fact(s) to remember"
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
+                }
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "learn_facts",
+        "description": (
+            "Ingest structured ontological statements into the knowledge graph as source=llm_learn. "
+            "Use this to store concept hierarchies you generate — statements like "
+            "'X is a subclass of Y', 'X is an instance of Y', 'X is a part of Y'. "
+            "This maps how concepts relate to each other (not general knowledge). "
+            "Facts stored as Class B (staged, source=llm_learn), confirmed over time."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Your generated ontological statements — one per line, "
+                                   "using 'X is a subclass of Y', 'X is an instance of Y', "
+                                   "or 'X is a part of Y' forms only"
                 },
                 "user_id": {
                     "type": "string",

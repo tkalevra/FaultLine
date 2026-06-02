@@ -225,48 +225,88 @@ class WGMValidationGate:
         if object_type is None:
             object_type = self._resolve_entity_type(object_id)
 
-        # If type unknown, skip validation with warning
+        # If type unknown, attempt hierarchy-aware resolution before falling back.
         # NOTE: entity_type='unknown' (string) is the DB default for newly-created entities.
         # Treat the string 'unknown' identically to None — blocking facts on unknown-type
         # entities creates a chicken-and-egg problem where the entity can never be typed.
         subject_is_unknown = (subject_type is None or (isinstance(subject_type, str) and subject_type.lower() == 'unknown'))
         if subject_is_unknown:
-            # Growth engine: infer subject type from head_types constraint
-            if head_types and not head_any:
-                inferred = head_types[0]
-                self._infer_entity_type(subject_id, inferred)
-                log.info("wgm.entity_type_inferred",
-                         entity_id=subject_id, inferred_type=inferred,
+            # Hierarchy-1 lookup: walk instance_of/subclass_of upward from subject_id
+            # to find the effective entity type before falling back to infer-from-constraint.
+            # Hierarchy rel_types fetched from DB — never hardcoded.
+            hierarchy_type = self._resolve_entity_type_via_hierarchy(subject_id)
+            if hierarchy_type:
+                subject_type = hierarchy_type
+                subject_is_unknown = False
+                log.info("wgm.entity_type_resolved_via_hierarchy",
+                         entity_id=str(subject_id)[:16], resolved_type=hierarchy_type,
                          rel_type=rel_type.lower(), role="subject")
-            log.warning(
-                "wgm.type_check_skipped",
-                extra={
-                    "rel_type": rel_type.lower(),
-                    "entity_id": subject_id,
-                    "reason": "entity_type unknown",
-                },
-            )
-            return (True, "type_unknown")
+                # Check resolved type against head_types — mismatch signals wrong rel_type
+                if head_types and not head_any:
+                    head_types_lower = [h.lower() for h in head_types]
+                    if subject_type.lower() not in head_types_lower:
+                        log.warning("wgm.hierarchy_type_mismatch",
+                                    entity_id=str(subject_id)[:16],
+                                    discovered_type=subject_type,
+                                    required_types=head_types,
+                                    rel_type=rel_type.lower(), role="subject")
+                        return (False, "hierarchy_type_mismatch")
+            else:
+                # Growth engine: infer subject type from head_types constraint
+                if head_types and not head_any:
+                    inferred = head_types[0]
+                    self._infer_entity_type(subject_id, inferred)
+                    log.info("wgm.entity_type_inferred",
+                             entity_id=subject_id, inferred_type=inferred,
+                             rel_type=rel_type.lower(), role="subject")
+                log.warning(
+                    "wgm.type_check_skipped",
+                    extra={
+                        "rel_type": rel_type.lower(),
+                        "entity_id": subject_id,
+                        "reason": "entity_type unknown",
+                    },
+                )
+                return (True, "type_unknown")
 
         object_is_unknown = (object_type is None or
                              (isinstance(object_type, str) and object_type.lower() == 'unknown'))
         if object_is_unknown:
-            # Growth engine: infer object type from tail_types constraint
-            if tail_types and not tail_any and not is_scalar:
-                inferred = tail_types[0]
-                self._infer_entity_type(object_id, inferred)
-                log.info("wgm.entity_type_inferred",
-                         entity_id=object_id, inferred_type=inferred,
+            # Hierarchy-1 lookup for object entity type.
+            hierarchy_type = self._resolve_entity_type_via_hierarchy(object_id)
+            if hierarchy_type:
+                object_type = hierarchy_type
+                object_is_unknown = False
+                log.info("wgm.entity_type_resolved_via_hierarchy",
+                         entity_id=str(object_id)[:16], resolved_type=hierarchy_type,
                          rel_type=rel_type.lower(), role="object")
-            log.warning(
-                "wgm.type_check_skipped",
-                extra={
-                    "rel_type": rel_type,
-                    "entity_id": object_id,
-                    "reason": "entity_type unknown",
-                },
-            )
-            return (True, "type_unknown")
+                # Check resolved type against tail_types — mismatch signals wrong rel_type
+                if tail_types and not tail_any and not is_scalar:
+                    tail_types_lower = [t.lower() for t in tail_types]
+                    if object_type.lower() not in tail_types_lower:
+                        log.warning("wgm.hierarchy_type_mismatch",
+                                    entity_id=str(object_id)[:16],
+                                    discovered_type=object_type,
+                                    required_types=tail_types,
+                                    rel_type=rel_type.lower(), role="object")
+                        return (False, "hierarchy_type_mismatch")
+            else:
+                # Growth engine: infer object type from tail_types constraint
+                if tail_types and not tail_any and not is_scalar:
+                    inferred = tail_types[0]
+                    self._infer_entity_type(object_id, inferred)
+                    log.info("wgm.entity_type_inferred",
+                             entity_id=object_id, inferred_type=inferred,
+                             rel_type=rel_type.lower(), role="object")
+                log.warning(
+                    "wgm.type_check_skipped",
+                    extra={
+                        "rel_type": rel_type,
+                        "entity_id": object_id,
+                        "reason": "entity_type unknown",
+                    },
+                )
+                return (True, "type_unknown")
 
 
         # Constraint checks (case-insensitive type comparison)
@@ -310,6 +350,72 @@ class WGMValidationGate:
                 "wgm.type_resolve_error",
                 extra={"entity_id": entity_id, "error": str(e)},
             )
+            return None
+
+    def _resolve_entity_type_via_hierarchy(self, entity_id: str) -> str | None:
+        """Walk hierarchy facts upward to find effective entity type.
+
+        Queries both facts and staged_facts. Hierarchy rel_types are read from
+        the rel_types table (is_hierarchy_rel=true) — NOT hardcoded — so new
+        hierarchy rel_types registered in the ontology automatically participate.
+
+        Returns the most specific type found (shallowest hop), or None.
+
+        Per-user schema isolation: self.db_conn already has schema context set.
+        """
+        try:
+            with self.db_conn.cursor() as cur:
+                # Fetch hierarchy rel_types from DB — growth model, never hardcode
+                cur.execute(
+                    "SELECT rel_type FROM rel_types WHERE is_hierarchy_rel = true"
+                )
+                hier_rels = [r[0] for r in cur.fetchall()]
+                if not hier_rels:
+                    log.warning("wgm.hierarchy_type_resolve_no_hier_rels",
+                                entity_id=str(entity_id)[:16])
+                    return None
+
+                # Walk hierarchy upward via CTE, check both facts and staged_facts
+                cur.execute("""
+                    WITH RECURSIVE hier(entity_id, depth) AS (
+                        SELECT f.object_id, 1
+                        FROM (
+                            SELECT object_id FROM facts
+                            WHERE subject_id = %s AND rel_type = ANY(%s)
+                              AND superseded_at IS NULL
+                            UNION ALL
+                            SELECT object_id FROM staged_facts
+                            WHERE subject_id = %s AND rel_type = ANY(%s)
+                              AND promoted_at IS NULL
+                        ) f
+                        UNION ALL
+                        SELECT f2.object_id, h.depth + 1
+                        FROM (
+                            SELECT subject_id, object_id FROM facts
+                            WHERE rel_type = ANY(%s) AND superseded_at IS NULL
+                            UNION ALL
+                            SELECT subject_id, object_id FROM staged_facts
+                            WHERE rel_type = ANY(%s) AND promoted_at IS NULL
+                        ) f2
+                        JOIN hier h ON f2.subject_id = h.entity_id
+                        WHERE h.depth < 4
+                    )
+                    SELECT e.entity_type
+                    FROM hier h
+                    JOIN entities e ON e.id = h.entity_id
+                    WHERE e.entity_type IS NOT NULL AND e.entity_type != 'unknown'
+                    ORDER BY h.depth ASC
+                    LIMIT 1
+                """, (
+                    entity_id, hier_rels,
+                    entity_id, hier_rels,
+                    hier_rels, hier_rels,
+                ))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            log.warning("wgm.hierarchy_type_resolve_failed",
+                        entity_id=str(entity_id)[:16], error=str(e))
             return None
 
     def _infer_entity_type(self, entity_id: str, inferred_type: str) -> bool:
@@ -910,6 +1016,20 @@ class WGMValidationGate:
             subject_type=subject_type,
             object_type=object_type,
         )
+
+        # Hierarchy-aware mismatch: entity type was resolved via hierarchy facts but
+        # conflicts with rel_type's head/tail type constraints. Return valid but flag
+        # for downgrade to Class C in the ingest loop — never silently pass.
+        if not type_ok and type_reason == "hierarchy_type_mismatch":
+            log.info("wgm.hierarchy_type_mismatch_staged",
+                     rel_type=rt, subject_id=str(subject_id)[:16],
+                     object_id=str(object_id)[:16],
+                     note="entity type resolved via hierarchy chain; conflicts with rel_type constraint; downgrading to Class C")
+            return {
+                "status": "valid",
+                "hierarchy_type_mismatch": True,
+            }
+
         if not type_ok:
             log.warning(
                 "wgm.type_mismatch",
@@ -920,11 +1040,39 @@ class WGMValidationGate:
                     "object_id": object_id,
                 },
             )
-            return {
-                "status": "type_mismatch",
-                "reason": type_reason,
-                "committed": 0,
-            }
+            # Ask LLM whether this rel_type applies for these actual entity types.
+            # If so, expand the constraints in rel_types (ON CONFLICT DO UPDATE).
+            # This is the self-growth path — no hardcoded fallback rel_types.
+            inferred = self._infer_novel_rel_type_metadata(
+                rt,
+                subject_type=subject_type,
+                object_type=object_type,
+                context=f"{subject_id} {rt} {object_id}",
+            )
+            if inferred:
+                stored = self._store_inferred_rel_type(rt, inferred)
+                if stored:
+                    try:
+                        from src.api.main import _refresh_rel_type_cache
+                        _refresh_rel_type_cache()
+                    except Exception:
+                        pass
+                    type_ok2, type_reason2 = self._check_type_constraints(
+                        rt, subject_id, object_id,
+                        subject_type=subject_type,
+                        object_type=object_type,
+                    )
+                    if type_ok2:
+                        log.info("wgm.type_constraint_expanded_by_llm",
+                                 extra={"rel_type": rt, "subject_type": subject_type,
+                                        "object_type": object_type})
+                        # Fall through — constraint now passes, continue with validation
+                    else:
+                        return {"status": "type_mismatch", "reason": type_reason2, "committed": 0}
+                else:
+                    return {"status": "type_mismatch", "reason": type_reason, "committed": 0}
+            else:
+                return {"status": "type_mismatch", "reason": type_reason, "committed": 0}
 
         # dprompt-119: Validate hierarchy and category constraints (FRESH ontology)
         ontology = self.get_current_ontology()
@@ -1280,7 +1428,8 @@ Respond with EXACTLY this JSON structure, no markdown:
   "tail_types": ["array", "of", "allowed", "object", "types"],
   "is_hierarchy_rel": true or false,
   "category": "family|work|location|physical|temporal|identity|medical|other",
-  "confidence": 0.0 to 1.0
+  "confidence": 0.0 to 1.0,
+  "natural_language": "short human-readable phrase for this relationship, e.g. 'has IP address' or 'is the parent of'"
 }}
 
 Respond with ONLY the JSON, no explanation."""
@@ -1297,7 +1446,7 @@ Respond with ONLY the JSON, no explanation."""
 
             # Validate required fields
             required = ["is_symmetric", "inverse_rel_type", "head_types", "tail_types",
-                       "is_hierarchy_rel", "category", "confidence"]
+                       "is_hierarchy_rel", "category", "confidence", "natural_language"]
             for field in required:
                 if field not in result:
                     log.warning(
@@ -1333,21 +1482,24 @@ Respond with ONLY the JSON, no explanation."""
             with self.db_conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO rel_types
-                       (rel_type, label, is_symmetric, inverse_rel_type, head_types, tail_types,
-                        is_hierarchy_rel, category, confidence, engine_generated, source)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'wgm_gate_inference')
+                       (rel_type, label, natural_language, is_symmetric, inverse_rel_type,
+                        head_types, tail_types, is_hierarchy_rel, category, confidence,
+                        engine_generated, source)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'wgm_gate_inference')
                        ON CONFLICT (rel_type) DO UPDATE SET
-                           is_symmetric = EXCLUDED.is_symmetric,
-                           inverse_rel_type = EXCLUDED.inverse_rel_type,
-                           head_types = EXCLUDED.head_types,
-                           tail_types = EXCLUDED.tail_types,
-                           is_hierarchy_rel = EXCLUDED.is_hierarchy_rel,
-                           category = EXCLUDED.category,
-                           confidence = EXCLUDED.confidence
+                           is_symmetric      = EXCLUDED.is_symmetric,
+                           inverse_rel_type  = EXCLUDED.inverse_rel_type,
+                           head_types        = EXCLUDED.head_types,
+                           tail_types        = EXCLUDED.tail_types,
+                           is_hierarchy_rel  = EXCLUDED.is_hierarchy_rel,
+                           category          = EXCLUDED.category,
+                           confidence        = EXCLUDED.confidence,
+                           natural_language  = COALESCE(rel_types.natural_language, EXCLUDED.natural_language)
                     """,
                     (
                         rel_type,
                         metadata.get("label") or rel_type.replace("_", " ").title(),
+                        metadata.get("natural_language"),
                         metadata.get("is_symmetric", False),
                         metadata.get("inverse_rel_type"),
                         metadata.get("head_types", ["ANY"]),
