@@ -4,6 +4,7 @@ FaultLine Re-Embedder Service
 Polls the facts table for unsynced rows, embeds them, and upserts to per-user Qdrant collections.
 This is the only service that writes to Qdrant.
 """
+import atexit
 import hashlib
 import json
 import logging
@@ -17,6 +18,7 @@ import redis
 from src.api.llm_client import get_llm_headers
 from src.api.llm_calls import (
     call_llm_with_retry_sync,
+    close_llm_http_client,
     LLMTimeouts,
 )
 
@@ -350,9 +352,37 @@ def hash_vector(text: str, size: int = 768) -> list[float]:
 
 def ensure_collection(collection: str, qdrant_url: str) -> bool:
     """
-    Check if Qdrant collection exists, create if not.
-    Returns True if collection exists or was created, False on failure.
+    Check if Qdrant collection exists with the correct anonymous vector schema, create or
+    recreate if not.
+
+    Validates that an existing collection uses anonymous-vector schema
+    {"size": 768, "distance": "Cosine"}.  Collections pre-created by OpenWebUI or other
+    tools use named-vector schema ({"vectors": {}}) which causes Qdrant to return 400 on
+    every bare-list search.  When a schema mismatch is detected the collection is deleted
+    and recreated with the correct schema.
+
+    Returns True if collection exists with correct schema or was created/recreated.
+    Returns False on any unrecoverable failure.
     """
+    _EXPECTED_DIM = 768
+    _CORRECT_SCHEMA = {"size": _EXPECTED_DIM, "distance": "Cosine"}
+
+    def _create_collection() -> bool:
+        """PUT the collection with the correct anonymous-vector schema."""
+        create_response = httpx.put(
+            f"{qdrant_url}/collections/{collection}",
+            json={"vectors": _CORRECT_SCHEMA},
+            timeout=10.0,
+        )
+        if create_response.status_code == 200:
+            log.info(f"re_embedder.collection_created collection={collection}")
+            return True
+        log.error(
+            f"re_embedder.collection_create_failed collection={collection} "
+            f"status={create_response.status_code}"
+        )
+        return False
+
     try:
         # Use pooled client instead of bare httpx.get() (dBug-051: prevent connection churn)
         response = _http_client.get(
@@ -361,29 +391,67 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
         )
 
         if response.status_code == 200:
-            return True
+            # Validate that the existing collection uses anonymous-vector schema.
+            # OpenWebUI may pre-create collections with named-vector schema ("vectors": {})
+            # which causes Qdrant to return 400 on bare-list searches.
+            try:
+                body = response.json()
+                vectors_cfg = (
+                    body.get("result", {})
+                        .get("config", {})
+                        .get("params", {})
+                        .get("vectors", None)
+                )
+            except Exception as parse_err:
+                log.warning(
+                    f"re_embedder.collection_schema_parse_failed collection={collection} "
+                    f"error={parse_err} — treating as valid to avoid data loss"
+                )
+                return True
 
-        if response.status_code == 404:
-            # Create collection
-            create_response = httpx.put(
-                f"{qdrant_url}/collections/{collection}",
-                json={
-                    "vectors": {
-                        "size": 768,
-                        "distance": "Cosine"
-                    }
-                },
-                timeout=10.0
+            # Anonymous-vector schema: vectors_cfg is a dict with a top-level "size" key.
+            schema_ok = (
+                isinstance(vectors_cfg, dict)
+                and vectors_cfg.get("size") == _EXPECTED_DIM
             )
 
-            if create_response.status_code == 200:
-                log.info(f"re_embedder.collection_created collection={collection}")
+            if schema_ok:
                 return True
-            else:
-                log.error(f"re_embedder.collection_create_failed collection={collection} status={create_response.status_code}")
+
+            # Schema mismatch — log, delete, recreate.
+            log.warning(
+                f"re_embedder.collection_schema_mismatch "
+                f"collection={collection} "
+                f"found={vectors_cfg!r} "
+                f"expected=\"anonymous {_EXPECTED_DIM}-dim cosine\""
+            )
+
+            delete_response = _http_client.delete(
+                f"{qdrant_url}/collections/{collection}",
+                timeout=10.0,
+            )
+            if delete_response.status_code not in (200, 404):
+                log.error(
+                    f"re_embedder.collection_delete_failed collection={collection} "
+                    f"status={delete_response.status_code} — cannot recreate"
+                )
                 return False
 
-        log.error(f"re_embedder.collection_check_unexpected collection={collection} status={response.status_code}")
+            result = _create_collection()
+            if result:
+                log.info(
+                    f"re_embedder.collection_recreated_after_schema_fix "
+                    f"collection={collection}"
+                )
+            return result
+
+        if response.status_code == 404:
+            return _create_collection()
+
+        log.error(
+            f"re_embedder.collection_check_unexpected collection={collection} "
+            f"status={response.status_code}"
+        )
         return False
 
     except Exception as e:
@@ -600,16 +668,10 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
             sid, subject, obj, rel_type, prov, conf = row
             # user_id is implicit in per-user schema context (set by SET search_path)
             try:
-                # Log promotion decision: fact met confirmation threshold
                 log.info(
-                    "re_embedder.promoting_staged_fact",
-                    staged_id=sid,
-                    subject_id=subject[:8] if subject else "?",
-                    rel_type=rel_type,
-                    object_id=obj[:8] if obj else "?",
-                    promotion_threshold=promotion_threshold,
-                    fact_class='B',
-                    promotion_reason=f"confirmed_count met threshold ({promotion_threshold}), graduating to Class A"
+                    f"re_embedder.promoting_staged_fact staged_id={sid}"
+                    f" subject_id={subject[:8] if subject else '?'}"
+                    f" rel_type={rel_type} threshold={promotion_threshold}"
                 )
 
                 with db_conn.cursor() as cur:
@@ -632,15 +694,10 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                 db_conn.commit()
                 promoted += 1
 
-                # Log successful promotion: fact moved from staged → authoritative facts table
                 log.debug(
-                    "re_embedder.promoted_fact_committed",
-                    staged_id=sid,
-                    subject_id=subject[:8] if subject else "?",
-                    rel_type=rel_type,
-                    object_id=obj[:8] if obj else "?",
-                    destination="facts table (Class A)",
-                    confirmation_message="Fact now authoritative in per-user schema"
+                    f"re_embedder.promoted_fact_committed staged_id={sid}"
+                    f" subject_id={subject[:8] if subject else '?'}"
+                    f" rel_type={rel_type} object_id={obj[:8] if obj else '?'}"
                 )
 
                 # Best-effort: delete staged Qdrant point after promotion commits
@@ -966,7 +1023,7 @@ Sample: "{snippet}"
 
 Respond with ONLY valid JSON (no markdown, no extra text):
 {{
-  "natural_language": "X {candidate_rel.replace('_', ' ')} Y (e.g., 'X and Y are friends')",
+  "natural_language": "X {candidate_rel.replace('_', ' ')} Y  ← MUST use X for subject and Y for object (e.g., 'X and Y are friends', 'X has IP address Y')",
   "is_symmetric": boolean,
   "inverse_rel_type": "opposite rel_type or null",
   "category": "family|work|location|identity|temporal|behavioral|physical|social",
@@ -2532,6 +2589,9 @@ def main():
     _http_client_sync = httpx.Client(timeout=httpx.Timeout(30.0), limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
     log.info(f"re_embedder.http_client_initialized")
 
+    # Register LLM HTTP client cleanup so it drains on process exit (SIGTERM or KeyboardInterrupt)
+    atexit.register(close_llm_http_client)
+
     # dprompt-121: Detect if embedding model changed (auto-clear cache if so)
     detect_embedding_model_change()
 
@@ -2934,6 +2994,56 @@ def main():
                 except Exception as e:
                     log.error(f"re_embedder.extraction_pattern_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if pattern evaluation fails
+
+                # Job 7: Fill in missing natural_language for rel_types in use.
+                # Finds rel_types with NULL natural_language that appear in recent facts,
+                # calls LLM to generate the template, stores it. Runs at most 5 per cycle
+                # to avoid LLM saturation. Self-limiting: once filled, never runs again
+                # for that rel_type.
+                try:
+                    with db.cursor() as cur:
+                        # Find rel_types in active use that lack natural_language.
+                        # Prioritise those seen in recent facts but any will do.
+                        cur.execute(
+                            """SELECT rel_type FROM rel_types
+                               WHERE (natural_language IS NULL OR natural_language = '')
+                               ORDER BY confidence DESC
+                               LIMIT 5"""
+                        )
+                        missing_nl = [row[0] for row in cur.fetchall()]
+
+                    for rt in missing_nl:
+                        try:
+                            messages = [
+                                {"role": "system", "content":
+                                 "You are an ontology expert. Respond with ONLY a JSON object, no markdown."},
+                                {"role": "user", "content":
+                                 f'Generate a short human-readable phrase for the relationship type "{rt}".\n'
+                                 f'IMPORTANT: Use X for the subject and Y for the object in your phrase.\n'
+                                 f'Example: "parent_of" → "X is the parent of Y", "has_ip" → "X has IP address Y", "spouse" → "X and Y are spouses"\n'
+                                 f'Respond with ONLY: {{"natural_language": "your phrase here"}}'},
+                            ]
+                            result = call_llm_with_retry_sync(
+                                messages=messages,
+                                model=os.environ.get("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                                user_id="re_embedder",
+                                timeout=10,
+                                operation="natural_language_fill",
+                            )
+                            nl = result.get("natural_language", "").strip() if result else ""
+                            if nl:
+                                with db.cursor() as cur:
+                                    cur.execute(
+                                        "UPDATE rel_types SET natural_language = %s"
+                                        " WHERE rel_type = %s AND (natural_language IS NULL OR natural_language = '')",
+                                        (nl, rt),
+                                    )
+                                db.commit()
+                                log.info(f"re_embedder.natural_language_filled rel_type={rt} value={nl!r}")
+                        except Exception as nl_err:
+                            log.warning(f"re_embedder.natural_language_fill_failed rel_type={rt}: {nl_err}")
+                except Exception as e:
+                    log.warning(f"re_embedder.natural_language_job_error (non-fatal): {e}")
 
                 # Deletion pass — remove superseded facts from Qdrant
                 with db.cursor() as cur:

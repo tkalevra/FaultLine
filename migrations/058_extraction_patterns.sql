@@ -90,7 +90,7 @@ VALUES
   ('running\s+(.+?)(?=\s*(?:,|\.|$|\s+the\s+))', 'instance_of', 'Generic: running X', 'running Windows 11', 'technical', 'hardcoded_legacy', 0.80),
   ('certificate\s+expires?\s+on\s+(.+?)(?=\s*(?:,|\.|$))', 'expires_on', 'Generic: certificate expires on X', 'certificate expires on November 27th 2026', 'technical', 'hardcoded_legacy', 0.85),
   ('fqdn\s+of\s+(\S+(?:\.\S+)*)', 'fqdn', 'Generic: fqdn of X', 'fqdn of example.com', 'technical', 'hardcoded_legacy', 0.88),
-  ('(?:with|has)\s+(.+?)\s+of\s+(.+?)(?=\s*(?:,|\.|$|\s+and|\s+the\s+))', 'has_ram', 'Generic: with/has X of Y', 'with 64GB of ram', 'technical', 'hardcoded_legacy', 0.78),
+  ('(?:with|has)\s+(\d+\s*(?:GB|MB|TB|GHz|MHz|cores?|RAM|SSD|HDD|storage|memory))\s+of\s+([\w\s]+?)(?=\s*(?:,|\.|$|\s+and|\s+the\s+))', 'has_ram', 'Hardware spec: with/has N GB/MHz/cores of X (requires numeric measurement)', 'with 64GB of ram', 'technical', 'hardcoded_legacy', 0.78),
   (',?\s*a\s+(.+?)(?=\s*(?:,|\.(?:\s+|$)|$|\s+and\s+the|\s+the\s+|\s+running))', 'has_spec', 'Generic: a X (spec)', 'a 2TB M.2 Hard drive', 'technical', 'hardcoded_legacy', 0.72)
 ON CONFLICT (pattern_regex, rel_type) DO NOTHING;
 

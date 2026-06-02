@@ -111,6 +111,13 @@ class StoreContextResponse(BaseModel):
     point_id: str  # Qdrant point UUID
 
 
+class LearnTopicRequest(BaseModel):
+    topic: str
+    user_id: str = "anonymous"
+    source_text: Optional[str] = None   # pre-fetched content from a URL
+    source_url: Optional[str] = None    # informational, logged but not fetched again
+
+
 class RewriteRequest(BaseModel):
     """Request for LLM-based fact extraction (triple rewriting).
     Called by OpenWebUI Filter instead of hitting OpenWebUI's LLM directly.
@@ -197,3 +204,4 @@ class QueryResponse(BaseModel):
     confidence_applied: bool = True
     staged_facts_count: int = 0  # Class C facts included
     error: Optional[str] = None
+    alerts: list[dict] = []  # Active system alerts (e.g. Qdrant collection mismatch); empty = no issues

@@ -61,6 +61,75 @@ from .tools import (
 FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
 FAULTLINE_USER_ID = os.environ.get("FAULTLINE_USER_ID", "").strip()
 
+# Candidate URLs probed in order when the configured URL is unreachable.
+# Docker container IPs shift on rebuild; the bridge gateway (172.16.0.1) is
+# stable and reachable from sibling containers on the same Docker network.
+_FAULTLINE_URL_CANDIDATES: list[str] = [
+    FAULTLINE_API_URL,
+    "http://faultline:8000",
+    "http://172.16.0.1:8000",
+    "http://host.docker.internal:8000",
+    "http://localhost:8000",
+]
+_FAULTLINE_URL_DETECTED: bool = False
+
+
+async def _detect_faultline_url() -> None:
+    """Probe candidate URLs and update FAULTLINE_API_URL to the first that answers.
+
+    Called once before the first tool operation. Result is cached for the process
+    lifetime — no per-call overhead after the initial probe.
+    """
+    global FAULTLINE_API_URL, _FAULTLINE_URL_DETECTED
+    if _FAULTLINE_URL_DETECTED:
+        return
+    _FAULTLINE_URL_DETECTED = True  # mark early to prevent concurrent probes
+
+    seen: set[str] = set()
+    for candidate in _FAULTLINE_URL_CANDIDATES:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as probe:
+                r = await probe.get(f"{candidate}/health")
+                if r.status_code == 200:
+                    FAULTLINE_API_URL = candidate
+                    return
+        except Exception:
+            continue
+    # No candidate answered — keep the env var value and let callers surface errors
+
+# ── UX Humanization — rotating progress messages ──────────────────────────────
+
+def _rotate(pool: list, index: int) -> str:
+    """Deterministic rotation through a pool by index. Never random."""
+    return pool[index % len(pool)] if pool else ""
+
+
+_MCP_PROGRESS_STEP1 = [
+    "Checking your memory profile...",
+    "Looking up your profile...",
+    "Accessing memory...",
+    "Checking in with memory...",
+]
+
+_MCP_PROGRESS_STEP2 = [
+    "Profile ready — running now...",
+    "Memory loaded — working on it...",
+    "Got your facts — processing...",
+    "Memory ready — one moment...",
+]
+
+_MCP_PROGRESS_DONE = [
+    "Done.",
+    "Complete.",
+    "All set.",
+    "Finished.",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Module-level HTTP client — initialised in run_mcp_server(), used by all tool handlers.
 _http_client: httpx.AsyncClient | None = None
 
@@ -71,27 +140,101 @@ _initialized: bool = False
 _provisioned_users: set[str] = set()
 
 
+# ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+
+async def _post(url: str, **kwargs) -> httpx.Response:
+    """POST with stale-client fallback.
+
+    The lifespan AsyncClient can silently go stale after a container restart
+    or network hiccup. Retry once with a fresh client on any ConnectError so
+    every tool call is resilient without duplicating the fallback pattern.
+    """
+    try:
+        return await _http_client.post(url, **kwargs)
+    except (httpx.ConnectError, httpx.RemoteProtocolError):
+        async with httpx.AsyncClient(timeout=30.0) as fresh:
+            return await fresh.post(url, **kwargs)
+
+
+async def _get(url: str, **kwargs) -> httpx.Response:
+    """GET with stale-client fallback (same rationale as _post)."""
+    try:
+        return await _http_client.get(url, **kwargs)
+    except (httpx.ConnectError, httpx.RemoteProtocolError):
+        async with httpx.AsyncClient(timeout=30.0) as fresh:
+            return await fresh.get(url, **kwargs)
+
+
 # ── Provisioning helper ──────────────────────────────────────────────────────
 
 
 async def _ensure_provisioned(user_id: str) -> None:
-    """Poll /provisioning/status until ready (up to 12 s). Non-fatal on failure."""
+    """Trigger provisioning if needed, then poll until ready (up to ~18 s total).
+
+    The backend provisioning worker wakes every 5 s.  On first encounter the initial
+    GET enqueues the job and returns "not_found"; we then sleep 6 s so the worker has
+    time to notice the new job before burning poll slots on guaranteed misses.
+    Non-fatal on all errors.
+    """
+    await _detect_faultline_url()  # probe once, cache working URL for process lifetime
     if user_id in _provisioned_users:
         return
+    client = _http_client
+    own_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=30.0)
+        own_client = True
     try:
-        for _ in range(6):  # up to 12s total
-            resp = await _http_client.get(
+        # ── Initial GET: check status AND trigger enqueue if not_found ───────────
+        just_enqueued = False
+        try:
+            resp = await client.get(
                 f"{FAULTLINE_API_URL}/provisioning/status",
                 params={"user_id": user_id},
                 timeout=5.0,
             )
-            if resp.json().get("status") == "ready":
+            init_status = resp.json().get("status")
+            if init_status == "ready":
                 _provisioned_users.add(user_id)
                 return
+            if init_status == "not_found":
+                # Backend just enqueued the provisioning job.  The worker sleeps
+                # PROVISIONING_POLL_INTERVAL (default 5 s) between checks, so polls
+                # at t=2 s and t=4 s are guaranteed misses.  Sleep 6 s first to let
+                # the worker wake and start schema creation before we start polling.
+                just_enqueued = True
+                _log(f"Provisioning enqueued for {user_id[:8]} — waiting 6 s for worker")
+            else:
+                _log(f"Provisioning status for {user_id[:8]}: {init_status}")
+        except Exception as e:
+            _log(f"Initial provisioning GET failed for {user_id[:8]}: {e}")
+
+        if just_enqueued:
+            await asyncio.sleep(6.0)
+
+        # ── Poll loop: up to 6 × 2 s = 12 s additional wait ─────────────────────
+        for attempt in range(6):
+            try:
+                resp = await client.get(
+                    f"{FAULTLINE_API_URL}/provisioning/status",
+                    params={"user_id": user_id},
+                    timeout=5.0,
+                )
+                if resp.json().get("status") == "ready":
+                    _provisioned_users.add(user_id)
+                    _log(f"Provisioning ready for {user_id[:8]} (attempt {attempt + 1})")
+                    return
+            except Exception as e:
+                _log(f"Provisioning poll {attempt + 1} failed for {user_id[:8]}: {e}")
             await asyncio.sleep(2.0)
+
+        _log(f"Provisioning not ready after timeout for {user_id[:8]} — proceeding anyway")
     except Exception as e:
         _log(f"Provisioning check failed for {user_id[:8]}: {e}")
-        # Non-fatal — don't block tool calls if provisioning endpoint unreachable
+    finally:
+        if own_client:
+            await client.aclose()
 
 
 # ── Tool handlers ────────────────────────────────────────────────────────────
@@ -149,7 +292,7 @@ async def retract_tool(
         body["old_value"] = old_value
     if behavior:
         body["behavior"] = behavior
-    resp = await _http_client.post(f"{FAULTLINE_API_URL}/retract", json=body)
+    resp = await _post(f"{FAULTLINE_API_URL}/retract", json=body)
     resp.raise_for_status()
     return resp.json()
 
@@ -164,8 +307,109 @@ async def store_context_tool(text: str, user_id: str) -> dict[str, Any]:
     return resp.json()
 
 
+async def _learn_via_llm(
+    topic: str,
+    user_id: str,
+    source_url: str | None = None,
+    online: bool = False,
+) -> dict[str, Any]:
+    """Fire-and-forget /learn — return immediately, backend processes async.
+
+    The LLM ontology generation takes 30-60 seconds. Blocking the MCP tool
+    call for that long makes OpenWebUI appear frozen. Instead: start the
+    backend call as a background task and return an acknowledgment immediately.
+    The facts will be available by the time the user asks about the topic.
+
+    When source_url is provided, fetches the page content and passes it as
+    source_text to the backend so the LLM grounds ontology in real content.
+    On any fetch failure, falls back to topic-only (LLM training knowledge).
+    """
+    async def _background_learn() -> None:
+        import re as _re2
+        source_text: str | None = None
+
+        if source_url:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as fetcher:
+                    fetch_resp = await fetcher.get(
+                        source_url,
+                        follow_redirects=True,
+                        headers={"User-Agent": "FaultLine/1.0"},
+                    )
+                    fetch_resp.raise_for_status()
+                    raw = fetch_resp.text
+                    # Strip HTML tags, collapse whitespace
+                    text = _re2.sub(r'<[^>]+>', ' ', raw)
+                    text = _re2.sub(r'\s+', ' ', text).strip()
+                    source_text = text[:8000]
+                    _log(f"learn_online.fetched url={source_url} chars={len(source_text)}")
+            except Exception as e:
+                _log(f"learn_online.fetch_failed url={source_url} error={e} — falling back to LLM-only")
+
+        body: dict[str, Any] = {"topic": topic, "user_id": user_id}
+        if source_text:
+            body["source_text"] = source_text
+        if source_url:
+            body["source_url"] = source_url
+
+        try:
+            client = _http_client
+            if client is None:
+                client = httpx.AsyncClient(timeout=120.0)
+                resp = await client.post(f"{FAULTLINE_API_URL}/learn", json=body)
+                await client.aclose()
+            else:
+                try:
+                    resp = await client.post(
+                        f"{FAULTLINE_API_URL}/learn",
+                        json=body,
+                        timeout=120.0,
+                    )
+                except Exception:
+                    async with httpx.AsyncClient(timeout=120.0) as fresh:
+                        resp = await fresh.post(f"{FAULTLINE_API_URL}/learn", json=body)
+            _log(f"expand_complete topic={topic!r} status={resp.status_code} body={resp.text[:120]}")
+        except Exception as e:
+            _log(f"expand_background_failed topic={topic!r} error={e}")
+
+    asyncio.create_task(_background_learn())
+
+    if online and source_url:
+        ack = (
+            f"Building concept map for '{topic}' from {source_url} — maps how concepts relate, "
+            f"runs in the background (~30s). Ask me about '{topic}' in a moment."
+        )
+    elif online:
+        ack = (
+            f"Building concept map for '{topic}' — for richer results, add a source: "
+            f"/expand {topic} online https://your-source.com"
+        )
+    else:
+        ack = (
+            f"Building concept map for '{topic}' — maps how concepts relate to each other, "
+            f"runs in the background (~30s). Ask me about '{topic}' in a moment."
+        )
+
+    return {"memory": ack}
+
+
 async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
-    """Call FaultLine /query endpoint and return human-readable prose."""
+    """Call FaultLine /query endpoint and return human-readable prose.
+
+    If query starts with /learn, generate and ingest an ontological hierarchy
+    for the topic as llm_learn facts — no LLM function calling required.
+    """
+    _expand_full_re = _re.compile(
+        r'^/expand\s+(?P<topic>.+?)(?:\s+online(?:\s+(?P<url>https?://\S+))?)?\s*$',
+        _re.I,
+    )
+    m = _expand_full_re.match(query.strip())
+    if m:
+        topic = m.group("topic").strip()
+        url = m.group("url")  # may be None
+        online = "online" in query.lower()
+        return await _learn_via_llm(topic, user_id, source_url=url, online=online)
+
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/query",
         json={"text": query, "user_id": user_id},
@@ -237,6 +481,61 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     return ingest_resp.json()
 
 
+def _parse_ontological_statements(text: str) -> list[dict]:
+    """Parse 'X is a subclass/instance/part of Y' statements directly into edges.
+
+    Bypasses /extract/rewrite — LLM-generated structured statements are already
+    in the correct form and don't need LLM re-extraction. Handles singular/plural
+    and 'a/an' variants.
+    """
+    import re as _re
+    patterns = [
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?subclass(?:es)?\s+of\s+(.+)$', _re.I), 'subclass_of'),
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?instance(?:s)?\s+of\s+(.+)$', _re.I), 'instance_of'),
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+)?part(?:s)?\s+of\s+(.+)$', _re.I), 'part_of'),
+    ]
+    edges = []
+    for line in text.strip().splitlines():
+        line = line.strip().rstrip('.')
+        if not line:
+            continue
+        for pattern, rel_type in patterns:
+            m = pattern.match(line)
+            if m:
+                subject = m.group(1).strip().lower()
+                obj = m.group(2).strip().lower()
+                if subject and obj:
+                    edges.append({"subject": subject, "rel_type": rel_type, "object": obj})
+                break
+    return edges
+
+
+async def learn_facts_tool(text: str, user_id: str) -> dict[str, Any]:
+    """Parse LLM-generated ontological statements and ingest as source=llm_learn.
+
+    Parses 'X is a subclass of Y', 'X is an instance of Y', 'X is a part of Y'
+    directly into edges — no LLM re-extraction needed for already-structured input.
+    """
+    edges = _parse_ontological_statements(text)
+    if not edges:
+        return {"status": "no_facts", "message": "No ontological statements parsed — use forms: 'X is a subclass of Y', 'X is an instance of Y', 'X is a part of Y'"}
+    ingest_resp = await _http_client.post(
+        f"{FAULTLINE_API_URL}/ingest",
+        json={"text": text, "user_id": user_id, "edges": edges, "source": "llm_learn"},
+    )
+    ingest_resp.raise_for_status()
+    data = ingest_resp.json()
+    committed = data.get("committed", 0)
+    staged = data.get("staged", 0)
+    return {
+        "status": "learned",
+        "committed": committed,
+        "staged": staged,
+        "total": committed + staged,
+        "message": f"Learned {committed + staged} facts (llm_learn — {committed} committed, {staged} staged)",
+    }
+
+
 async def retract_fact_tool(text: str, user_id: str) -> dict[str, Any]:
     """Call FaultLine /retract/correct endpoint."""
     resp = await _http_client.post(
@@ -252,6 +551,7 @@ async def retract_fact_tool(text: str, user_id: str) -> dict[str, Any]:
 TOOL_DISPATCH: dict[str, callable] = {
     "recall_memory": recall_memory_tool,
     "remember_facts": remember_facts_tool,
+    "learn_facts": learn_facts_tool,
     "retract_fact": retract_fact_tool,
     # Low-level tools kept for direct testing — not advertised in TOOLS schema
     "extract": extract_tool,
@@ -279,7 +579,7 @@ def _validate_tool_input(tool_name: str, arguments: dict) -> dict | None:
         if err:
             return {"error": f"Invalid query: {err}"}
 
-    elif tool_name in ("remember_facts", "retract_fact"):
+    elif tool_name in ("remember_facts", "learn_facts", "retract_fact"):
         err = validate_text(arguments.get("text", ""))
         if err:
             return {"error": f"Invalid text: {err}"}
@@ -315,7 +615,24 @@ def _send(response: dict) -> None:
     sys.stdout.flush()
 
 
-async def _call_tool(tool_name: str, arguments: dict) -> dict:
+def _send_progress(
+    progress_token: str | int | None,
+    progress: float,
+    total: float | None = None,
+    message: str | None = None,
+) -> None:
+    """Send a notifications/progress notification. No-op if progress_token is None."""
+    if progress_token is None:
+        return
+    params: dict = {"progressToken": progress_token, "progress": progress}
+    if total is not None:
+        params["total"] = total
+    if message is not None:
+        params["message"] = message
+    _send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
+
+
+async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int | None = None) -> dict:
     """Dispatch tool call and return result or error."""
     validation_error = _validate_tool_input(tool_name, arguments)
     if validation_error:
@@ -334,11 +651,22 @@ async def _call_tool(tool_name: str, arguments: dict) -> dict:
     if FAULTLINE_USER_ID:
         arguments = {**arguments, "user_id": FAULTLINE_USER_ID}
 
+    # Rotation key: stable per tool_name, varied across tools
+    _rot = abs(hash(tool_name)) % 4
+
+    # Step 1: before provisioning check
+    _send_progress(progress_token, 1, 3, _rotate(_MCP_PROGRESS_STEP1, _rot))
+
     # Transparent provisioning — non-fatal if endpoint unreachable.
     await _ensure_provisioned(effective_user_id)
 
+    # Step 2: provisioning done, about to run tool
+    _send_progress(progress_token, 2, 3, _rotate(_MCP_PROGRESS_STEP2, _rot))
+
     try:
         result = await handler(**arguments)
+        # Step 3: work complete, send before assembling the final response
+        _send_progress(progress_token, 3, 3, _rotate(_MCP_PROGRESS_DONE, _rot))
         return {"content": [{"type": "text", "text": json.dumps(result)}]}
     except httpx.TimeoutException:
         return {"content": [{"type": "text", "text": json.dumps({"error": "FaultLine API timeout"})}]}
@@ -431,8 +759,9 @@ async def run_mcp_server() -> None:
                     params = request.get("params", {})
                     tool_name = params.get("name", "")
                     arguments = params.get("arguments", {})
+                    progress_token = params.get("_meta", {}).get("progressToken")
                     _log(f"Tool call: {tool_name} (user_id={arguments.get('user_id', '?')[:8]}...)")
-                    result = await _call_tool(tool_name, arguments)
+                    result = await _call_tool(tool_name, arguments, progress_token=progress_token)
                     _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
             else:

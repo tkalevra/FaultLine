@@ -23,7 +23,7 @@ from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
-from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, ConversationMessage, QueryPath, QueryResponse
+from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, ConversationMessage, QueryPath, QueryResponse
 from .llm_client import get_llm_headers, build_llm_payload
 from .llm_calls import call_llm_with_retry_sync, LLMTimeouts
 from .idempotency import IdempotencyManager
@@ -95,6 +95,12 @@ _PREFERENCE_PATTERNS_CACHE: list = []
 
 _UUID_PATTERN = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE
+)
+# Slug form: hyphens replaced with underscores (used as schema suffix and seeded
+# as is_preferred=true at provisioning time — a known bad default, see schema_manager fix)
+_UUID_SLUG_PATTERN = re.compile(
+    r'^[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$',
     re.IGNORECASE
 )
 
@@ -433,6 +439,17 @@ def _assign_category_via_llm(rel_type: str) -> Optional[str]:
         raise
 
     try:
+        from src.api.llm_calls import (
+            _llm_http_client,
+            _llm_circuit_breaker,
+            _get_endpoint_list,
+            _parse_llm_response_robust,
+        )
+
+        if _llm_circuit_breaker.is_open():
+            log.warning("assign_category_via_llm.circuit_breaker_open", rel_type=rel_type)
+            return None
+
         payload = build_llm_payload(
             messages=[{
                 "role": "user",
@@ -446,31 +463,45 @@ def _assign_category_via_llm(rel_type: str) -> Optional[str]:
             model=os.getenv("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
             temperature=0.0,
             max_tokens=10,
-            # NOTE: thinking parameter removed — Qwen doesn't support extended thinking
         )
 
-        # dprompt-142: Use centralized endpoint resolver
-        llm_url = _resolve_llm_endpoint(with_fallback=False)
+        endpoints = _get_endpoint_list()
+        if not endpoints:
+            log.error("assign_category_via_llm.no_endpoints", rel_type=rel_type)
+            return None
 
-        resp = _http_client_sync.post(
-            llm_url,
+        endpoint = endpoints[0]  # Best-effort: primary endpoint only, no retry
+
+        resp = _llm_http_client.post(
+            endpoint,
             json=payload,
             headers=get_llm_headers(),
-            timeout=10.0,
+            timeout=LLMTimeouts.get("ENRICHMENT"),
         )
-        if resp.status_code == 200:
-            raw = resp.json()["choices"][0]["message"]["content"].strip().lower()
-            if raw in valid_categories:
-                return raw
-            elif raw == "unknown":
-                log.warning(f"assign_category_via_llm: LLM could not categorize '{rel_type}'")
-                return None
-            else:
-                log.warning(
-                    f"assign_category_via_llm: LLM returned invalid category '{raw}' "
-                    f"(expected one of {valid_categories})"
-                )
-                return None
+        resp.raise_for_status()
+
+        parsed = _parse_llm_response_robust(resp)
+        if not parsed:
+            log.warning("assign_category_via_llm.parse_failed", rel_type=rel_type)
+            return None
+
+        raw = parsed.get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
+        if not raw:
+            log.warning("assign_category_via_llm.empty_response", rel_type=rel_type)
+            return None
+
+        if raw in valid_categories:
+            return raw
+        elif raw == "unknown":
+            log.warning(f"assign_category_via_llm: LLM could not categorize '{rel_type}'")
+            return None
+        else:
+            log.warning(
+                f"assign_category_via_llm: LLM returned invalid category '{raw}' "
+                f"(expected one of {valid_categories})"
+            )
+            return None
+
     except RuntimeError:
         raise  # Re-raise database errors
     except Exception as e:
@@ -1848,20 +1879,41 @@ Respond ONLY with valid JSON, no markdown or explanation."""
             # NOTE: thinking parameter removed — Qwen doesn't support extended thinking
         )
 
-        # dprompt-142: Use centralized endpoint resolver
-        llm_url = _resolve_llm_endpoint(with_fallback=False)
-        resp = _http_client_sync.post(llm_url, json=payload, headers=get_llm_headers(), timeout=10)
-        resp.raise_for_status()
+        from src.api.llm_calls import (
+            _llm_http_client,
+            _llm_circuit_breaker,
+            _get_endpoint_list,
+            _parse_llm_response_robust,
+        )
 
-        result = resp.json()
-        if not result.get("choices"):
+        if _llm_circuit_breaker.is_open():
+            log.warning("taxonomy.discover_circuit_breaker_open",
+                        rel_types=list(rel_type_counts.keys()))
             return None
 
-        content = result["choices"][0].get("message", {}).get("content", "").strip()
+        endpoints = _get_endpoint_list()
+        if not endpoints:
+            log.warning("taxonomy.discover_no_endpoints")
+            return None
+
+        endpoint = endpoints[0]  # Best-effort: primary endpoint only, no retry
+
+        resp = _llm_http_client.post(
+            endpoint,
+            json=payload,
+            headers=get_llm_headers(),
+            timeout=LLMTimeouts.get("TAXONOMY_DISCOVERY"),
+        )
+        resp.raise_for_status()
+
+        result = _parse_llm_response_robust(resp)
+        if not result:
+            return None
+
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         if not content:
             return None
 
-        # Parse JSON response
         import json
         parsed = json.loads(content)
         if not parsed.get("taxonomy_name"):
@@ -2725,8 +2777,14 @@ def _check_qdrant_health(url: str) -> bool:
 
 def _check_llm_health(url: str) -> bool:
     try:
-        resp = httpx.get(url.replace("/chat/completions", "/models"), timeout=2.0)
-        return resp.status_code in (200, 404)  # 404 = endpoint exists, just GET not supported
+        resp = httpx.get(
+            url.replace("/chat/completions", "/models"),
+            headers=get_llm_headers(),
+            timeout=2.0,
+        )
+        # 200/404: endpoint responded normally
+        # 401: server is up but auth required — our actual LLM calls send auth, so this is fine
+        return resp.status_code in (200, 401, 404)
     except Exception:
         return False
 
@@ -2751,6 +2809,12 @@ def _check_rate_limit(user_id: str) -> bool:
 _HTTPX_TIMEOUT = int(os.environ.get("HTTPX_TIMEOUT", "10"))
 _DB_TIMEOUT = int(os.environ.get("DB_TIMEOUT", "30"))
 _QDRANT_TIMEOUT = int(os.environ.get("QDRANT_TIMEOUT", "10"))
+
+# Query confidence gating — controls when to skip Qdrant and what to return.
+# QUERY_SKIP_QDRANT_GATE: if max fact confidence from Phase 3 meets this, skip Phase 4 (Qdrant).
+# QUERY_MIN_CONFIDENCE: facts below this floor are dropped in Phase 5 regardless of source.
+QUERY_SKIP_QDRANT_GATE = float(os.environ.get("QUERY_SKIP_QDRANT_GATE", "0.75"))
+QUERY_MIN_CONFIDENCE = float(os.environ.get("QUERY_MIN_CONFIDENCE", "0.35"))
 
 # ── End dprompt-41 ──────────────────────────────────────────────────────────
 
@@ -3029,6 +3093,8 @@ async def lifespan(app: FastAPI):
             _redis_client.close()
         except Exception:
             pass
+    from src.api.llm_calls import close_llm_http_client
+    close_llm_http_client()
     _gliner2_model = None
     _rel_type_registry = None
     _http_client = None
@@ -5422,6 +5488,168 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
         return {"entities": []}
 
 
+def _gliner2_entity_labels(source: str = "user", db_conn=None) -> list[str]:
+    """Return GLiNER2 entity type labels appropriate for the ingest source.
+
+    For source='llm_learn': queries entity_taxonomies for technical/ontological
+    content types and maps to short active descriptions (~3-7 words).
+    For all other sources: returns the standard personal-memory label set.
+
+    Constraints from our own benchmark (main.py:2838):
+    - Short: 3-7 words (longer descriptions hurt accuracy)
+    - No examples (V3 test proved this degrades performance)
+    - Semantically distinct — no overlapping labels
+    - Max 6 labels (GLiNER2 scores ALL labels against ALL spans; more = noise)
+    """
+    # Standard personal-memory labels — Person/Animal/Org/Location dominate here
+    _DEFAULT = ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
+
+    if source != "llm_learn":
+        return _DEFAULT
+
+    # Translation: bare entity_taxonomies member_entity_types → GLiNER2 descriptions
+    # Benchmark format: short noun phrase, no examples, semantically distinct
+    _DESC = {
+        "Person":       "A person or individual",
+        "Animal":       "An animal or organism",
+        "Organization": "An organization or institution",
+        "Location":     "A geographic location or place",
+        "Object":       "A physical device or component",
+        "Concept":      "A technical concept or abstract term",
+    }
+
+    member_types: set[str] = set()
+    if db_conn:
+        try:
+            with db_conn.cursor() as _cur:
+                # computer_system covers tech/ontological topics; work + location
+                # for professional and geographic content in learned hierarchies
+                _cur.execute(
+                    "SELECT member_entity_types FROM entity_taxonomies"
+                    " WHERE taxonomy_name IN ('computer_system', 'work', 'location')"
+                )
+                for row in _cur.fetchall():
+                    if row[0]:
+                        member_types.update(row[0])
+        except Exception:
+            pass
+
+    if not member_types:
+        member_types = {"Concept", "Object", "Organization", "Location"}
+
+    # Map to descriptions, deduplicate, cap at 6
+    labels: list[str] = []
+    seen: set[str] = set()
+    for t in sorted(member_types):     # sorted = deterministic order
+        desc = _DESC.get(t, t)
+        if desc not in seen:
+            seen.add(desc)
+            labels.append(desc)
+        if len(labels) >= 6:
+            break
+
+    return labels if labels else _DEFAULT
+
+
+def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
+    """Pre-flight scan for structured atomic values before LLM extraction.
+
+    Queries extraction_patterns (category='scalar_atomic') from DB, falls back
+    to hardcoded bootstrap patterns if unavailable. Finds values like IP addresses,
+    MAC addresses, emails, dates, FQDNs, URLs that the LLM would otherwise mangle
+    by splitting on delimiters (dots, colons, slashes).
+
+    Returns list of {value, type, rel_type} sorted by position in text.
+    Longer matches win over shorter overlapping matches (CIDR before bare IPv4).
+    """
+    import re as _re_atomic
+
+    _BOOTSTRAP = [
+        # (regex, type_label, rel_type) — ordered most-specific first
+        (r'https?://[^\s\)\"\']+',                                                 'url',        'has_url'),
+        (r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/\d{1,2}\b', 'cidr', 'has_subnet'),
+        (r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b', 'ip_address', 'has_ip'),
+        (r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b',                        'ip_address', 'has_ip'),
+        (r'\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b',                            'mac_address','has_mac'),
+        (r'\b[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}\b',                            'mac_address','has_mac'),
+        (r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',               'email',      'has_email'),
+        (r'\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b',        'phone',      'has_phone'),
+        (r'\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b',                'date',       'born_on'),
+        (r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', 'uuid', 'has_uuid'),
+        (r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b', 'fqdn', 'has_fqdn'),
+    ]
+
+    patterns = []
+    if db_conn:
+        try:
+            with db_conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT pattern_regex, description, rel_type FROM extraction_patterns"
+                    " WHERE category = 'scalar_atomic' AND is_active = true"
+                    " ORDER BY LENGTH(pattern_regex) DESC, global_confidence DESC"
+                )
+                rows = _cur.fetchall()
+                if rows:
+                    patterns = [(r[0], r[1] or r[2], r[2]) for r in rows]
+        except Exception:
+            pass
+
+    if not patterns:
+        patterns = _BOOTSTRAP
+
+    # Scan for matches, deduplicate by span (longer wins)
+    all_matches: list[dict] = []
+    occupied: list[tuple[int, int]] = []
+
+    for regex, type_label, rel_type in patterns:
+        try:
+            for m in _re_atomic.finditer(regex, text):
+                start, end = m.start(), m.end()
+                value = m.group(0).strip()
+                if not value:
+                    continue
+                # Skip if fully covered by a longer existing match
+                covered = any(
+                    s <= start and end <= e
+                    for s, e in occupied
+                )
+                if covered:
+                    continue
+                # Remove shorter matches that are covered by this one
+                occupied = [(s, e) for s, e in occupied if not (start <= s and e <= end)]
+                all_matches = [
+                    x for x in all_matches
+                    if not (start <= x["start"] and x["end"] <= end)
+                ]
+                occupied.append((start, end))
+
+                # Try to find a named subject before this atomic value.
+                # Matches: "IDENTIFIER has/had/have an? [value_type]" within 100 chars before the match.
+                _subj_pat = _re_atomic.compile(
+                    r'\b([A-Za-z][A-Za-z0-9\-_.]{1,})\s+(?:has|had|have)\b',
+                    _re_atomic.I
+                )
+                _text_window = text[max(0, start - 100): start]
+                _subj_match = None
+                for _sm in _subj_pat.finditer(_text_window):
+                    _subj_match = _sm  # take the last (closest) match
+                subject_hint = _subj_match.group(1).lower() if _subj_match else None
+
+                all_matches.append({
+                    "value": value,
+                    "type": type_label,
+                    "rel_type": rel_type,
+                    "start": start,
+                    "end": end,
+                    "subject_hint": subject_hint,   # may be None; used by supplementation block
+                })
+        except Exception:
+            continue
+
+    all_matches.sort(key=lambda x: x["start"])
+    return all_matches
+
+
 def _build_extraction_prompt(db_connection=None) -> str:
     """
     dprompt-127: Pattern-based extraction prompt, metadata-driven, domain-generic.
@@ -5904,6 +6132,7 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
 
         # Add user text
         user_content = req.text
+
         if req.typed_entities:
             entity_lines = "\n".join(
                 f"- {e.get('subject')} ({e.get('subject_type', 'unknown')}) "
@@ -6759,7 +6988,7 @@ async def wait_for_schema_ready(
         backoff_ms = min(backoff_ms * 2, max_backoff_ms)
 
 
-@app.post("/ingest", response_model=IngestResponse)
+@app.post("/ingest")
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
     Ingest endpoint orchestrates the FULL write-validated knowledge graph pipeline:
@@ -6854,7 +7083,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         key=idempotency_key[:12],
                         user_id=req.user_id,
                         cached_committed=cached_committed)
-                return IngestResponse(**cached_response)
+                return cached_response
             else:
                 log.info("ingest.idempotency_cache_skipped_empty",
                         key=idempotency_key[:12],
@@ -6913,7 +7142,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 try:
                     ner_result = model.extract_entities(
                         req.text,
-                        ["Person", "Animal", "Organization", "Location", "Object", "Concept"],
+                        _gliner2_entity_labels(
+                            source=getattr(req, "source", "user"),
+                            db_conn=None,  # db assigned 460 lines later; _gliner2_entity_labels guards with `if db_conn:`
+                        ),
                         max_len=2048
                     )
                     for entity_type, entity_names in ner_result.get("entities", {}).items():
@@ -7338,11 +7570,42 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # is_correction flag is propagated through IngestRequest → edges_dict.
     # No regex-based "not X" pattern detection here (was dprompt-45, removed for universality).
 
+    # Atomic value supplementation — ingest is smart, extract is dumb.
+    # If the original text contains structured values (IPs, emails, MACs, dates, etc.)
+    # that the LLM failed to extract correctly (or split on delimiters), add correct
+    # supplementary edges. Only adds edges for values NOT already present as an object
+    # in any existing edge, so correctly-extracted values are never duplicated.
+    if req.text:
+        try:
+            _atomic = _detect_atomic_values(req.text, None)
+            if _atomic:
+                _existing_objects = {
+                    str(e.object).lower().strip()
+                    for e in edges_dict.values()
+                    if e.object
+                }
+                for _av in _atomic:
+                    _val = _av["value"]
+                    if _val.lower() not in _existing_objects:
+                        subject = _av.get("subject_hint") or "user"
+                        _key = (subject, _val, _av["rel_type"])
+                        if _key not in edges_dict:
+                            edges_dict[_key] = EdgeInput(
+                                subject=subject,
+                                object=_val,
+                                rel_type=_av["rel_type"],
+                                fact_provenance="llm_inferred",
+                            )
+                            log.info("ingest.atomic_value_supplemented",
+                                     subject=subject, value=_val, type=_av["type"], rel_type=_av["rel_type"])
+        except Exception as _ae:
+            log.warning("ingest.atomic_supplementation_failed", error=str(_ae))
+
     edges = list(edges_dict.values())
 
 
 
-    facts, committed, staged, ingested = [], 0, 0, 0
+    facts, committed, staged, ingested, scalar_committed = [], 0, 0, 0, 0
     try:
             with psycopg2.connect(os.environ.get("POSTGRES_DSN")) as db:
                 # PHASE 2: Set search_path for user's schema (if provisioned)
@@ -7440,15 +7703,41 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                             reason="age object must be numeric")
                                 continue
                         if edge.subject.lower() == "user":
-                            # dprompt-128: User's own scalar facts (age, height, etc.) only accepted if marked as correction by LLM.
-                            # LLM learns correction patterns from correction_signals DB table — trust it.
+                            # dprompt-128: User's own scalar facts only accepted if marked as correction OR
+                            # if no existing value is stored (first-time write has nothing to correct).
+                            # Requires is_correction=true only when overwriting an existing value — prevents
+                            # silent overwrites while allowing clean-slate first ingestion.
                             is_correction = getattr(edge, "is_correction", False)
                             if not is_correction:
-                                log.warning("ingest.scalar_for_user_rejected",
-                                            subject=edge.subject, object=edge.object,
-                                            rel_type=edge.rel_type, reason="user scalar fact requires is_correction=true",
-                                            text=req.text[:100])
-                                continue
+                                try:
+                                    with db.cursor() as _chk:
+                                        _chk.execute(
+                                            "SELECT 1 FROM entity_attributes WHERE entity_id = 'user' AND attribute = %s LIMIT 1",
+                                            (edge.rel_type.lower(),)
+                                        )
+                                        _existing = _chk.fetchone()
+                                except Exception:
+                                    _existing = None
+                                if _existing:
+                                    log.warning("ingest.scalar_for_user_rejected",
+                                                subject=edge.subject, object=edge.object,
+                                                rel_type=edge.rel_type, reason="existing user scalar requires is_correction=true",
+                                                text=req.text[:100])
+                                    continue
+                                # No existing value — first-time write, allow through
+                                log.info("ingest.scalar_first_write_allowed",
+                                         rel_type=edge.rel_type, object=edge.object)
+
+                    # Pre-check: skip edges where subject or object name matches a known rel_type.
+                    # Uses _REL_TYPE_META (startup-loaded, DB-driven) — same guard as the pref_name
+                    # injection path. Prevents rel_type-as-entity collision from aborting the batch;
+                    # registry.py hard constraint stays intact, we just never reach it for these edges.
+                    _subj_lower = (edge.subject or "").lower().strip()
+                    _obj_lower = (edge.object or "").lower().strip()
+                    if _REL_TYPE_META and (_subj_lower in _REL_TYPE_META or _obj_lower in _REL_TYPE_META):
+                        log.warning("ingest.edge_skipped.rel_type_collision",
+                                    subject=_subj_lower, object=_obj_lower, rel_type=edge.rel_type)
+                        continue
 
                     # UUID guard: reject raw edge values that are UUIDs
                     # (canonical_ids may be UUIDs when entities exist without display names, which is fine)
@@ -7471,11 +7760,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.info("ingest.subject_resolved_at_extraction",
                                input=edge.subject, output=canonical_subject, user_id=req.user_id)
                     except ValueError as _e:
-                        log.error("ingest.subject_resolution_validation_error",
-                                 entity=edge.subject,
-                                 user_id=req.user_id,
-                                 error=str(_e))
-                        raise HTTPException(status_code=400, detail=f"Invalid entity name: {str(_e)}")
+                        log.warning("ingest.edge_skipped.entity_resolve_failed",
+                                    detail=str(_e), rel_type=getattr(edge, 'rel_type', ''))
+                        continue
                     except psycopg2.Error as _e:
                         log.error("ingest.subject_resolution_database_error",
                                  entity=edge.subject,
@@ -7506,11 +7793,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.info("ingest.object_resolved_at_extraction",
                                    input=edge.object, output=canonical_object, user_id=req.user_id)
                         except ValueError as _e:
-                            log.error("ingest.object_resolution_validation_error",
-                                     entity=edge.object,
-                                     user_id=req.user_id,
-                                     error=str(_e))
-                            raise HTTPException(status_code=400, detail=f"Invalid entity name: {str(_e)}")
+                            log.warning("ingest.edge_skipped.entity_resolve_failed",
+                                        detail=str(_e), rel_type=getattr(edge, 'rel_type', ''))
+                            continue
                         except psycopg2.Error as _e:
                             tb_str = traceback.format_exc()
                             log.error("ingest.object_resolution_database_error",
@@ -7928,6 +8213,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # types get sync inference (authoritative) instead of async deferral.
                     adjusted_confidence = _assess_statement_directness(edge, req.text, _REL_TYPE_META)
                     is_user_stated = (adjusted_confidence or 0.0) >= 0.9
+                    # llm_learn source is always LLM-generated — never Class A regardless of confidence.
+                    # User-stated facts (Class A) must always supersede llm_learn facts.
+                    if req.source == "llm_learn":
+                        is_user_stated = False
+                        adjusted_confidence = min(adjusted_confidence or 0.6, 0.6)
 
                     log.info("ingest.fact_provenance_check",
                            rel_type=edge.rel_type.lower(),
@@ -7972,6 +8262,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         rel_type=edge.rel_type,
                         confidence=adjusted_confidence,
                     )
+
+                    # llm_learn floor: known rel_types get minimum Class B (never C).
+                    # Novel rel_types (not in _REL_TYPE_META) stay Class C for async re_embedder evaluation.
+                    # Metadata-driven: checks _REL_TYPE_META, not hardcoded rel_type names.
+                    if req.source == "llm_learn" and fact_class == "C":
+                        rel_lower_check = edge.rel_type.lower()
+                        if rel_lower_check in _REL_TYPE_META:
+                            fact_class = "B"
+                            confidence = max(confidence, 0.6)
+                            log.info("ingest.llm_learn_floor_applied",
+                                     rel_type=rel_lower_check, old_class="C", new_class="B")
 
                     log.info(
                         "ingest.fact_classified",
@@ -8209,6 +8510,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.info("ingest.scalar_stored", entity=actual_subject, user_id=req.user_id,
                                      attribute=edge.rel_type, value_int=val_int, value_text=val_text,
                                      raw_input=_raw_object)
+                            scalar_committed += 1
                         except Exception as _e:
                             try:
                                 db.rollback()
@@ -8263,6 +8565,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     object_type=edge.object_type,
                                     reason=hierarchy_violation,
                                     note="Staged for re-embedder evaluation - classification mismatch")
+
+                        # Hierarchy-type mismatch: WGM resolved entity type via hierarchy chain
+                        # and found it conflicts with this rel_type's constraints.
+                        # Downgrade to Class C regardless of assign_class_and_confidence result.
+                        if validation.get("hierarchy_type_mismatch") and status == "valid":
+                            fact_class = "C"
+                            confidence = min(confidence, 0.3)
+                            log.info("ingest.downgraded_hierarchy_mismatch",
+                                     rel_type=canonical_rel_type,
+                                     subject=str(fact_subject)[:20],
+                                     new_class="C", new_confidence=confidence,
+                                     note="Entity type resolved via hierarchy; conflicts with rel_type head/tail constraints")
 
                         # Handle type_mismatch: user-stated facts override type constraints.
                         # The user is authoritative about their own data. Only reject
@@ -9256,24 +9570,22 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # === IDEMPOTENCY CACHE: Store response for deduplication ===
     # Only cache successful responses (status="valid", "extracted", "novel", "conflict").
     # Do not cache error responses (failures are not idempotent).
-    response = IngestResponse(status="valid", committed=committed, staged=staged,
-                              entities=[EntityResult(entity=r["entity"], label=r["type"], canonical_id=r["canonical_id"]) for r in resolved],
-                              facts=facts)
+    response = {
+        "status": "valid",
+        "committed": committed,
+        "staged": staged,
+        "scalar_committed": scalar_committed,  # entity_attributes inserts (not counted in committed)
+        "entities": [{"entity": r["entity"], "label": r["type"], "canonical_id": r["canonical_id"]} for r in resolved],
+        "facts": [f.model_dump() if hasattr(f, "model_dump") else f for f in facts],
+    }
 
-    if idempotency_key and _idempotency_mgr and (committed > 0 or staged > 0):
-        response_dict = {
-            "status": response.status,
-            "committed": response.committed,
-            "staged": response.staged,
-            "entities": [{"entity": e.entity, "label": e.label, "canonical_id": e.canonical_id} for e in response.entities],
-            "facts": response.facts,
-        }
-        success = _idempotency_mgr.cache_response(idempotency_key, response_dict)
+    if idempotency_key and _idempotency_mgr and (committed > 0 or staged > 0 or scalar_committed > 0):
+        success = _idempotency_mgr.cache_response(idempotency_key, response)
         if success:
             log.info("ingest.idempotency_cache_stored",
                     key=idempotency_key[:12],
                     user_id=req.user_id,
-                    committed=response.committed)
+                    committed=committed)
         else:
             log.warning("ingest.idempotency_cache_store_failed",
                        key=idempotency_key[:12],
@@ -9322,6 +9634,109 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     return response
 
+def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str]) -> list[dict]:
+    """Fetch ALL facts (any rel_type) where entity_uuids appear as subject or object.
+
+    Used by the entity-centric query path (Step 3b) to retrieve everything known
+    about a named entity — personal facts (has_ip, has_os), relational facts
+    (instance_of, has_pet), and ontological facts — regardless of rel_type.
+
+    Queries both facts and staged_facts so Class B short-term facts are visible.
+    """
+    results: list[dict] = []
+    if not entity_uuids:
+        return results
+    try:
+        placeholders = ",".join(["%s"] * len(entity_uuids))
+        entity_list = list(entity_uuids)
+        seen: set[tuple] = set()
+
+        with db_conn.cursor() as cur:
+            for role_col in ("subject_id", "object_id"):
+                cur.execute(
+                    f"SELECT subject_id, object_id, rel_type, confidence, fact_class"
+                    f" FROM facts"
+                    f" WHERE {role_col} IN ({placeholders})"
+                    f"   AND superseded_at IS NULL"
+                    f"   AND (valid_until IS NULL OR valid_until > now())",
+                    entity_list,
+                )
+                for r in cur.fetchall():
+                    key = (r[0], r[1], r[2])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({
+                            "subject": r[0], "object": r[1], "rel_type": r[2],
+                            "confidence": float(r[3]) if r[3] else 1.0,
+                            "fact_class": r[4] or "A",
+                            "source": "db",
+                            "category": _get_rel_type_category(r[2]),
+                            "valid_from": None, "valid_until": None,
+                        })
+
+            # Staged facts (Class B short-term) — subject side only (avoids explosion)
+            cur.execute(
+                f"SELECT subject_id, object_id, rel_type, confidence, fact_class"
+                f" FROM staged_facts"
+                f" WHERE subject_id IN ({placeholders})"
+                f"   AND (expires_at IS NULL OR expires_at > now())"
+                f"   AND promoted_at IS NULL",
+                entity_list,
+            )
+            for r in cur.fetchall():
+                key = (r[0], r[1], r[2])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "subject": r[0], "object": r[1], "rel_type": r[2],
+                        "confidence": float(r[3]) if r[3] else 0.6,
+                        "fact_class": r[4] or "B",
+                        "source": "staged",
+                        "category": _get_rel_type_category(r[2]),
+                        "valid_from": None, "valid_until": None,
+                    })
+
+            # ─── Fetch SCALAR ATTRIBUTES for all entity_uuids ───
+            # entity_attributes stores scalars (has_ip, age, occupation, etc.) keyed by entity_id.
+            # fetch_facts_from_anchor only queries for the anchor; this block fills the gap for
+            # connected entities discovered via entity-centric expansion (Step 3b in /query).
+            cur.execute(
+                "SELECT entity_id, attribute, value_text, value_int, value_float, value_date"
+                " FROM entity_attributes"
+                " WHERE entity_id = ANY(%s)",
+                (entity_list,),
+            )
+            for r in cur.fetchall():
+                entity_id_val, attribute, value_text, value_int, value_float, value_date = r
+                value = value_text
+                if value is None and value_int is not None:
+                    value = str(value_int)
+                if value is None and value_float is not None:
+                    value = str(value_float)
+                if value is None and value_date is not None:
+                    value = str(value_date)
+                if value is None:
+                    continue  # skip rows with no usable value
+                # Use (entity_id, attribute) as dedup key — scalar, no object UUID
+                attr_key = (entity_id_val, attribute, "__scalar__")
+                if attr_key not in seen:
+                    seen.add(attr_key)
+                    results.append({
+                        "subject": entity_id_val,
+                        "rel_type": attribute,
+                        "object": value,
+                        "confidence": 1.0,  # entity_attributes are user-authoritative
+                        "fact_class": "A",
+                        "source": "attributes",
+                        "category": _get_rel_type_category(attribute),
+                        "valid_from": None,
+                        "valid_until": None,
+                    })
+    except Exception as e:
+        log.warning("fetch_entity_facts.failed", error=str(e))
+    return results
+
+
 def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[dict]:
     """
     Fetch hierarchy facts (instance_of, subclass_of, member_of, part_of)
@@ -9346,7 +9761,6 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
                 f"  confirmed_count, fact_class FROM facts "
                 f"WHERE subject_id IN ({entity_placeholders})"
                 f"  AND rel_type IN ({rel_placeholders}) AND superseded_at IS NULL"
-                f"  AND hard_delete_flag = false"
                 f"  AND (valid_until IS NULL OR valid_until > now())",
                 params_f,
             )
@@ -10042,6 +10456,50 @@ def fetch_facts_from_anchor(
                             "valid_until": row[6],    # ISO 8601 or None
                         })
 
+                # ─── Fetch STAGED direct facts (Class B/C not yet promoted) ───
+                # CLAUDE.md: _fetch_user_facts() UNIONs facts + staged_facts so Class B
+                # is immediately visible. fetch_facts_from_anchor must do the same or
+                # llm_learn anchors (Class B, confidence 0.6) are invisible until promoted.
+                # Each query hit increments confirmed_count — 3 hits promotes to long-term.
+                if path.fetch_all_details or path.relationship_rels or path.scalar_rels:
+                    cur.execute(
+                        """
+                        SELECT id, subject_id, object_id, rel_type, confidence, fact_class
+                        FROM staged_facts
+                        WHERE subject_id = %s
+                          AND (expires_at IS NULL OR expires_at > now())
+                          AND promoted_at IS NULL
+                        """,
+                        (anchor_uuid,),
+                    )
+                    staged_rows = cur.fetchall()
+                    staged_hit_ids = []
+                    for row in staged_rows:
+                        staged_hit_ids.append(row[0])
+                        facts.append({
+                            "subject": row[1],
+                            "object": row[2],
+                            "rel_type": row[3],
+                            "confidence": float(row[4]) if row[4] else 0.6,
+                            "fact_class": row[5] or "B",
+                            "source": "staged",
+                            "category": _get_rel_type_category(row[3]),
+                            "valid_from": None,
+                            "valid_until": None,
+                        })
+                    # Query hit = confirmation signal → increment toward promotion
+                    if staged_hit_ids:
+                        try:
+                            cur.execute(
+                                "UPDATE staged_facts SET confirmed_count = confirmed_count + 1,"
+                                " last_seen_at = now() WHERE id = ANY(%s)",
+                                (staged_hit_ids,),
+                            )
+                            conn.commit()
+                        except Exception as _ce:
+                            log.warning("fetch_facts_from_anchor.staged_confirm_failed",
+                                        error=str(_ce))
+
                 # ─── Fetch INVERSE facts: (subject, rel_type, anchor) ───
                 # FIX 3: Invert rel_type for asymmetric relationships (dprompt-148 Phase 3)
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
@@ -10282,6 +10740,13 @@ def fetch_facts_from_anchor(
                         except Exception as tax_e:
                             log.error("taxonomy_validation.failed", taxonomy=taxonomy, error=str(tax_e))
 
+            # Hierarchy expansion is intentionally NOT done here.
+            # Expanding all connected entities regardless of query topic
+            # would mix personal memory facts with learned knowledge facts
+            # (ansible hierarchy returned for "tell me about my family").
+            # Query-scoped expansion happens in the /query endpoint where
+            # the query text is available to identify the relevant entity.
+
     except Exception as e:
         log.error("fetch_facts_from_anchor.failed",
                   anchor=anchor_uuid[:8] if anchor_uuid else "unknown",
@@ -10324,19 +10789,20 @@ def apply_confidence_gate(
     min_confidence: float = 0.4
 ) -> list[dict]:
     """
-    Phase 2 Function: Filter facts by confidence threshold and order by confidence DESC.
+    Phase 5 Function: Merge DB and Qdrant facts, order by confidence DESC.
 
-    Applies the confidence gate hard stop:
-    - Class A (1.0) always passes
-    - Class B (0.8/0.6) passes if >= min_confidence
-    - Class C (0.4) from Qdrant passes if qdrant_score >= 0.3 (contextually relevant)
-    - Class C from DB passes if confidence >= min_confidence
-    - Below threshold facts are discarded (NO recursion, NO enrichment)
+    DB facts (facts + staged_facts, Classes A/B/C) are NEVER filtered here —
+    they were already validated and committed by the ingest pipeline and must
+    surface to users so Class B/C facts can be confirmed and promoted.
+
+    Qdrant facts are pre-floored by QUERY_MIN_CONFIDENCE before reaching this
+    function (applied in the /query endpoint after Phase 4). This function
+    just merges and sorts.
 
     Args:
-        db_facts: Facts from PostgreSQL
-        qdrant_facts: Facts from Qdrant semantic search (optional)
-        min_confidence: Threshold for filtering (default 0.4)
+        db_facts: Facts from PostgreSQL (all classes pass through unchanged)
+        qdrant_facts: Facts from Qdrant semantic search (already confidence-floored)
+        min_confidence: Reserved for caller context; not applied to DB facts here.
 
     Returns:
         Merged list of facts ordered by confidence DESC
@@ -10344,35 +10810,117 @@ def apply_confidence_gate(
     if qdrant_facts is None:
         qdrant_facts = []
 
-    all_facts = []
+    # DB facts always pass — do not filter; staged Class C facts must surface for confirmation
+    all_facts = list(db_facts)
 
-    # Add DB facts that pass threshold
-    for fact in db_facts:
-        confidence = fact.get("confidence", 0.4)
-        if confidence >= min_confidence:
-            all_facts.append(fact)
-
-    # Add Qdrant facts with special handling for Class C
-    for fact in qdrant_facts:
-        fact_class = fact.get("fact_class", "C")
-        confidence = fact.get("confidence", 0.4)
-        qdrant_score = fact.get("qdrant_score")  # May be None for non-Qdrant facts
-
-        # Class C: only pass if from Qdrant AND contextually relevant (qdrant_score >= 0.3)
-        if fact_class == "C":
-            if qdrant_score is not None and qdrant_score >= 0.3:
-                all_facts.append(fact)
-            # Class C from DB (no qdrant_score) filtered by threshold
-            elif qdrant_score is None and confidence >= min_confidence:
-                all_facts.append(fact)
-        # Other classes (A, B): standard confidence threshold
-        elif confidence >= min_confidence:
-            all_facts.append(fact)
+    # Qdrant facts are already floored upstream; append directly
+    all_facts.extend(qdrant_facts)
 
     # Order by confidence DESC (Class A first, then B, then C)
     all_facts.sort(key=lambda f: f.get("confidence", 0.0), reverse=True)
 
     return all_facts
+
+
+def _record_system_alert(schema_name: str, alert_type: str) -> None:
+    """Record or increment a system alert in the user's per-user schema. Non-fatal.
+
+    Creates the system_alerts table if it does not exist (resilient to pre-migration-062 state).
+    Uses ON CONFLICT DO UPDATE so repeated detections increment alert_count without table bloat.
+    """
+    if not schema_name:
+        return
+    try:
+        import psycopg2 as _psycopg2_alert
+        with _psycopg2_alert.connect(os.environ.get("POSTGRES_DSN")) as _db:
+            with _db.cursor() as _cur:
+                _cur.execute(f"SET search_path TO {schema_name}, public")
+                _cur.execute("""
+                    CREATE TABLE IF NOT EXISTS system_alerts (
+                        id SERIAL PRIMARY KEY,
+                        alert_type TEXT NOT NULL,
+                        alert_count INTEGER NOT NULL DEFAULT 1,
+                        alerts_shown INTEGER NOT NULL DEFAULT 0,
+                        max_alerts INTEGER NOT NULL DEFAULT 4,
+                        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        resolved_at TIMESTAMPTZ,
+                        UNIQUE (alert_type)
+                    )
+                """)
+                _cur.execute("""
+                    INSERT INTO system_alerts (alert_type, alert_count, last_seen_at)
+                    VALUES (%s, 1, now())
+                    ON CONFLICT (alert_type) DO UPDATE SET
+                        alert_count = system_alerts.alert_count + 1,
+                        last_seen_at = now(),
+                        resolved_at = NULL
+                """, (alert_type,))
+            _db.commit()
+    except Exception as _e:
+        log.warning("system_alert.record_failed", alert_type=alert_type, error=str(_e))
+
+
+def _resolve_system_alert(schema_name: str, alert_type: str) -> None:
+    """Mark a system alert as resolved. Non-fatal.
+
+    Called when the condition that caused the alert is no longer detected (e.g. Qdrant
+    search succeeds after a previous 400). Sets resolved_at so subsequent /query calls
+    stop showing the alert. If the condition recurs, _record_system_alert() inserts fresh.
+    """
+    if not schema_name:
+        return
+    try:
+        import psycopg2 as _psycopg2_resolve
+        with _psycopg2_resolve.connect(os.environ.get("POSTGRES_DSN")) as _db:
+            with _db.cursor() as _cur:
+                _cur.execute(f"SET search_path TO {schema_name}, public")
+                _cur.execute("""
+                    UPDATE system_alerts
+                    SET resolved_at = now()
+                    WHERE alert_type = %s AND resolved_at IS NULL
+                """, (alert_type,))
+            _db.commit()
+    except Exception as _e:
+        log.warning("system_alert.resolve_failed", alert_type=alert_type, error=str(_e))
+
+
+def _get_active_alerts(schema_name: str) -> list[dict]:
+    """Return active (unresolved, under max_alerts ceiling) alerts for this user.
+
+    Also increments alerts_shown for each returned alert in the same transaction so the
+    countdown ticks once per real /query execution (not per Redis-cached read).
+    Returns empty list on any error — this must never block the query response.
+    """
+    if not schema_name:
+        return []
+    try:
+        import psycopg2 as _psycopg2_alerts
+        with _psycopg2_alerts.connect(os.environ.get("POSTGRES_DSN")) as _db:
+            with _db.cursor() as _cur:
+                _cur.execute(f"SET search_path TO {schema_name}, public")
+                # Check table exists before querying (resilient to pre-migration-062 schemas)
+                _cur.execute("""
+                    SELECT to_regclass(%s)
+                """, (f"{schema_name}.system_alerts",))
+                if _cur.fetchone()[0] is None:
+                    return []
+                _cur.execute("""
+                    SELECT alert_type, alerts_shown, max_alerts
+                    FROM system_alerts
+                    WHERE resolved_at IS NULL AND alerts_shown < max_alerts
+                """)
+                rows = _cur.fetchall()
+                if rows:
+                    _cur.execute("""
+                        UPDATE system_alerts
+                        SET alerts_shown = alerts_shown + 1
+                        WHERE resolved_at IS NULL AND alerts_shown < max_alerts
+                    """)
+            _db.commit()
+        return [{"type": r[0], "shown": r[1], "max": r[2]} for r in rows]
+    except Exception:
+        return []
 
 
 def qdrant_semantic_search(
@@ -10382,7 +10930,8 @@ def qdrant_semantic_search(
     qdrant_url: str = "http://qdrant:6333",
     qwen_api_url: str = None,
     score_threshold: float = 0.3,
-    limit: int = 10
+    limit: int = 10,
+    schema_name: str = None,
 ) -> list[dict]:
     """
     Phase 3 Function: Semantic search in Qdrant for contextually relevant facts.
@@ -10399,6 +10948,7 @@ def qdrant_semantic_search(
         qwen_api_url: LLM endpoint for embedding (required for embed_text)
         score_threshold: Minimum cosine similarity score (default 0.3)
         limit: Max facts to return (default 10)
+        schema_name: Per-user schema for alert recording (optional)
 
     Returns:
         List of facts dicts with:
@@ -10460,7 +11010,17 @@ def qdrant_semantic_search(
 
         if response.status_code != 200:
             log.warning(f"qdrant_semantic_search: search failed status={response.status_code} collection={collection}")
+            # HTTP 400 = persistent schema mismatch (not transient); HTTP 404 = collection missing.
+            # Both are detected conditions — record a system alert so /query can surface it to the user.
+            if response.status_code == 400:
+                _record_system_alert(schema_name, "qdrant_collection_mismatch")
+            elif response.status_code == 404:
+                _record_system_alert(schema_name, "qdrant_collection_missing")
             return []
+
+        # Successful search — resolve any pending Qdrant alerts for this user.
+        _resolve_system_alert(schema_name, "qdrant_collection_mismatch")
+        _resolve_system_alert(schema_name, "qdrant_collection_missing")
 
         data = response.json()
         results = []
@@ -10593,11 +11153,21 @@ def convert_to_prose(facts: list[dict], db) -> list[str]:
                 object_id = fact.get("object_id") or fact.get("object")
                 fact_class = fact.get("fact_class")
 
-                # Get natural_language template
+                # Get natural_language template — fall back to label then rel_type
+                # Never drop a fact just because the phrasing hasn't been learned yet.
+                # Job 7 in re_embedder will fill natural_language asynchronously.
                 template = rel_type_templates.get(rel_type)
                 if not template:
-                    log.warning("convert_to_prose.no_template", rel_type=rel_type)
-                    continue
+                    # Try label from rel_types as fallback ("Has IP Address" → "X has IP Address Y")
+                    try:
+                        with db.cursor() as _lc:
+                            _lc.execute("SELECT label FROM public.rel_types WHERE rel_type=%s", (rel_type,))
+                            lrow = _lc.fetchone()
+                            label = lrow[0] if lrow and lrow[0] else rel_type.replace("_", " ")
+                    except Exception:
+                        label = rel_type.replace("_", " ")
+                    template = f"X {label} Y"
+                    log.debug("convert_to_prose.label_fallback", rel_type=rel_type, label=label)
 
                 # Resolve display names
                 subject_name = resolve_display_name(subject_id, db)
@@ -10735,26 +11305,132 @@ async def query(request: QueryRequest) -> QueryResponse:
         db_facts = fetch_facts_from_anchor(anchor, user_id, path)
         log.info("query.phase5.db_facts_fetched", count=len(db_facts))
 
-        # Step 4: Qdrant semantic search — surfaces Class C facts not directly anchor-connected
-        # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
-        # apply_confidence_gate merges and deduplicates both sources.
-        qdrant_facts = []
+        # Step 3b: Entity-centric expansion.
+        #
+        # For any named entity mentioned in the query that exists in entity_aliases:
+        #   1. Fetch ALL facts where it's subject or object (_fetch_entity_facts)
+        #   2. Fetch hierarchy facts for it and compound-named entities (_fetch_hierarchy_facts)
+        #
+        # This handles two cases with one path:
+        #   - Personal entities:  "tell me about aurora" → aurora has_ip, instance_of, etc.
+        #   - Learned topics:     "what do I know about networking" → networking hierarchy
+        #
+        # Guard: only expands when at least one exact entity match exists in entity_aliases.
+        # "tell me about my family" → no entity named "family" → no expansion → correct.
+        # LLM generates "networking hardware", "networking technology" — compound names
+        # containing the topic word — caught by the substring pass which runs only after
+        # an exact match confirms the topic is in the knowledge graph.
         try:
-            llm_url = _get_llm_url()
-            if llm_url:
-                qdrant_facts = qdrant_semantic_search(
-                    query_text,
-                    conversation_history,
-                    user_id,
-                    qdrant_url,
-                    llm_url,
-                    score_threshold=0.3,
-                    limit=10,
-                )
-                if qdrant_facts:
-                    log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
-        except Exception as e:
-            log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
+            query_lower = query_text.lower()
+            stop = {"tell", "what", "know", "about", "does", "from", "with", "that",
+                    "this", "have", "your", "their", "show", "give", "list", "find"}
+            query_words = [
+                w.strip("?.,!'\"")
+                for w in query_lower.split()
+                if len(w.strip("?.,!'\"")) >= 4 and w.strip("?.,!'\"") not in stop
+            ]
+
+            entity_matches: set[str] = set()
+            if query_words and db:
+                with db.cursor() as _ec:
+                    # Pass 1: exact alias match — gates the rest.
+                    # Checks all aliases regardless of is_preferred status — consistent with
+                    # registry.get_any_alias() which already falls back to non-preferred.
+                    # A name conflict resolution may demote an alias to is_preferred=false
+                    # but it should still gate entity-centric expansion for that word.
+                    for word in query_words[:6]:
+                        _ec.execute(
+                            "SELECT DISTINCT entity_id FROM entity_aliases"
+                            " WHERE alias = %s LIMIT 5",
+                            (word,),
+                        )
+                        rows = _ec.fetchall()
+                        n_matches = 0
+                        for row in rows:
+                            if row[0] != anchor:
+                                entity_matches.add(row[0])
+                                n_matches += 1
+                        if n_matches:
+                            log.debug("query.entity_centric_alias_match",
+                                      word=word, matches=n_matches)
+
+                    # Pass 2: substring match — only if exact match confirmed topic exists.
+                    # Catches "networking hardware", "networking technology" etc.
+                    # No is_preferred filter — compounds may have been demoted by conflict
+                    # resolution but should still expand when topic is confirmed in graph.
+                    if entity_matches:
+                        for word in query_words[:3]:
+                            _ec.execute(
+                                "SELECT DISTINCT entity_id FROM entity_aliases"
+                                " WHERE alias ILIKE %s LIMIT 25",
+                                (f"%{word}%",),
+                            )
+                            for row in _ec.fetchall():
+                                if row[0] != anchor:
+                                    entity_matches.add(row[0])
+
+            if entity_matches:
+                entity_facts = _fetch_entity_facts(db, user_id, entity_matches)
+                hier_facts = _fetch_hierarchy_facts(db, user_id, entity_matches)
+                db_facts = db_facts + entity_facts + hier_facts
+                log.info("query.phase5.entity_centric_expanded",
+                         entities=len(entity_matches),
+                         entity_facts=len(entity_facts),
+                         hierarchy_facts=len(hier_facts))
+        except Exception as expand_e:
+            log.warning("query.phase5.entity_expansion_failed", error=str(expand_e))
+
+        # Coverage gate: compute max confidence across all DB facts collected in Phase 3.
+        # If the DB already has a confident answer, skip Phase 4 (Qdrant) to avoid noise.
+        _db_max_confidence = max(
+            (f.get("confidence", 0.0) for f in db_facts),
+            default=0.0,
+        )
+        _skip_qdrant = _db_max_confidence >= QUERY_SKIP_QDRANT_GATE
+        if _skip_qdrant:
+            log.info("query.qdrant_skipped_high_confidence",
+                     db_max_confidence=round(_db_max_confidence, 3),
+                     gate=QUERY_SKIP_QDRANT_GATE,
+                     db_facts_count=len(db_facts))
+
+        # Step 4: Qdrant semantic search — surfaces Class C facts not directly anchor-connected.
+        # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
+        # Skipped when DB facts already provide a confident answer (coverage gate above).
+        qdrant_facts = []
+        if not _skip_qdrant:
+            try:
+                llm_url = _get_llm_url()
+                if llm_url:
+                    qdrant_facts = qdrant_semantic_search(
+                        query_text,
+                        conversation_history,
+                        user_id,
+                        qdrant_url,
+                        llm_url,
+                        score_threshold=0.3,
+                        limit=10,
+                        schema_name=schema_name,
+                    )
+                    if qdrant_facts:
+                        log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
+            except Exception as e:
+                log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
+        else:
+            log.info("query.phase4_skipped", reason="db_confidence_sufficient")
+
+        # Minimum confidence floor — applied to Qdrant results ONLY.
+        # DB facts (including staged_facts / Class B/C) are never floored — Class C
+        # facts (confidence 0.4) must surface so users can confirm or correct them,
+        # enabling the staged→promoted lifecycle. Qdrant can return semantic noise from
+        # unrelated contexts; floor that before merging.
+        if qdrant_facts:
+            _before_floor = len(qdrant_facts)
+            qdrant_facts = [f for f in qdrant_facts if f.get("confidence", 0.0) >= QUERY_MIN_CONFIDENCE]
+            _dropped_floor = _before_floor - len(qdrant_facts)
+            if _dropped_floor:
+                log.info("query.qdrant_results_floored",
+                         dropped=_dropped_floor, min_confidence=QUERY_MIN_CONFIDENCE,
+                         remaining=len(qdrant_facts))
 
         # Step 5: Deduplicate DB facts, then apply confidence gate merging Qdrant results
         deduped_facts = deduplicate_facts(db_facts)
@@ -10807,14 +11483,31 @@ async def query(request: QueryRequest) -> QueryResponse:
         if user_id and user_id != "anonymous":
             try:
                 with db.cursor() as cur:
-                    # Look up the owner's preferred name (entity_aliases with is_preferred=true)
+                    # Look up the owner's preferred name (entity_aliases with is_preferred=true).
+                    # If the preferred alias is a UUID slug (provisioning artifact — the schema
+                    # manager previously seeded the UUID slug as is_preferred=true), fall back to
+                    # the first non-slug alias so the user's actual name is used.
                     cur.execute(
                         "SELECT alias FROM entity_aliases WHERE entity_id = %s AND is_preferred = true LIMIT 1",
                         (user_id,)
                     )
                     row = cur.fetchone()
-                    if row:
-                        preferred_names["user"] = row[0]  # Maps user_id → display name for Filter
+                    if row and not _UUID_SLUG_PATTERN.match(row[0]):
+                        # Clean preferred name — use it directly
+                        preferred_names["user"] = row[0]
+                        preferred_names[user_id] = row[0]
+                    else:
+                        # Preferred name is a UUID slug or missing — fetch first human alias instead
+                        cur.execute(
+                            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+                            "AND NOT (alias ~ '^[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$') "
+                            "ORDER BY is_preferred DESC, alias LIMIT 1",
+                            (user_id,)
+                        )
+                        fallback = cur.fetchone()
+                        if fallback:
+                            preferred_names["user"] = fallback[0]
+                            preferred_names[user_id] = fallback[0]
             except Exception as e:
                 log.debug("query.owner_identity_lookup.failed", user_id=user_id[:8], error=str(e))
 
@@ -10903,7 +11596,14 @@ async def query(request: QueryRequest) -> QueryResponse:
         staged_count = sum(1 for f in resolved_facts if f.get("fact_class") == "C")
         log.info("query.phase5.prose_converted", facts=len(facts_with_definition), staged=staged_count)
 
-        # Step 8: Return QueryResponse with structured facts + metadata dicts
+        # Step 8: Read active system alerts for this user (non-blocking; empty list if none/error).
+        # _get_active_alerts also increments alerts_shown so the countdown ticks once per query execution.
+        active_alerts = _get_active_alerts(schema_name)
+        if active_alerts:
+            log.warning("query.phase5.active_alerts", count=len(active_alerts),
+                        types=[a["type"] for a in active_alerts])
+
+        # Step 9: Return QueryResponse with structured facts + metadata dicts
         return QueryResponse(
             anchor=anchor,
             facts=facts_with_definition,
@@ -10911,7 +11611,8 @@ async def query(request: QueryRequest) -> QueryResponse:
             canonical_identity=anchor,
             confidence_applied=True,
             staged_facts_count=staged_count,
-            error=None
+            error=None,
+            alerts=active_alerts,
         )
 
     except Exception as e:
@@ -11898,3 +12599,223 @@ def store_context(req: StoreContextRequest):
     except Exception as e:
         log.error("store_context.error", error=str(e), user_id=req.user_id)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── /learn endpoint ────────────────────────────────────────────────────────────
+# LearnTopicRequest imported from .models (topic, user_id, source_text, source_url)
+
+
+def _parse_learn_statements(text: str) -> list[dict]:
+    """Parse 'X is a subclass/instance/part of Y' statements into edges.
+
+    Direct regex parse — no LLM re-extraction needed for structured input.
+    """
+    import re as _re
+    patterns = [
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?subclass(?:es)?\s+of\s+(.+)$', _re.I), 'subclass_of'),
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?instance(?:s)?\s+of\s+(.+)$', _re.I), 'instance_of'),
+        (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+)?part(?:s)?\s+of\s+(.+)$', _re.I), 'part_of'),
+    ]
+    edges = []
+    for line in text.strip().splitlines():
+        line = line.strip().rstrip('.')
+        if not line:
+            continue
+        for pattern, rel_type in patterns:
+            m = pattern.match(line)
+            if m:
+                subj = m.group(1).strip().lower()
+                obj = m.group(2).strip().lower()
+                if subj and obj:
+                    edges.append({"subject": subj, "rel_type": rel_type, "object": obj})
+                break
+    return edges
+
+
+@app.post("/learn")
+async def learn_topic(req: LearnTopicRequest):
+    """
+    Generate ontological hierarchy for a topic via LLM and ingest as source=llm_learn.
+
+    Called by the OpenWebUI filter when user sends /learn <topic>.
+    The LLM generation and parse happen here — filter just routes and injects the result.
+    User-stated facts (Class A) always supersede llm_learn facts (Class B, confidence <= 0.6).
+    """
+    topic = req.topic.strip()
+    user_id = req.user_id
+
+    if req.source_text:
+        # Truncate to 6000 chars to avoid LLM context overflow
+        source_excerpt = req.source_text[:6000].strip()
+        prompt = (
+            f"Using the following reference material about '{topic}':\n\n"
+            f"{source_excerpt}\n\n"
+            f"Generate a complete ontological hierarchy. "
+            f"Use ONLY these exact forms, one per line:\n"
+            f"  X is a subclass of Y\n"
+            f"  X is an instance of Y\n"
+            f"  X is a part of Y\n"
+            f"Go as deep as possible. No prose. No headers. No explanations. Statements only."
+        )
+        log.info("learn_topic.using_source_text",
+                 topic=topic, source_url=req.source_url or "none",
+                 source_len=len(source_excerpt))
+    else:
+        prompt = (
+            f"Generate the complete ontological hierarchy for: {topic}\n"
+            f"Use ONLY these exact forms, one per line:\n"
+            f"  X is a subclass of Y\n"
+            f"  X is an instance of Y\n"
+            f"  X is a part of Y\n"
+            f"Go as deep as possible. No prose. No headers. No explanations. Statements only."
+        )
+
+    try:
+        from src.api.llm_calls import (
+            _llm_http_client,
+            _llm_circuit_breaker,
+            _get_endpoint_list,
+            _parse_llm_response_robust,
+        )
+
+        if _llm_circuit_breaker.is_open():
+            log.error("learn_topic.circuit_breaker_open", topic=topic)
+            return {
+                "status": "error",
+                "topic": topic,
+                "detail": "LLM circuit breaker open — endpoint not responding",
+                "committed": 0,
+                "staged": 0,
+                "total": 0,
+            }
+
+        payload = build_llm_payload(
+            messages=[{"role": "user", "content": prompt}],
+            model=os.getenv("WGM_LLM_MODEL", "qwen2.5-coder"),
+            user_id=user_id,
+            temperature=0.1,
+            max_tokens=1024,
+        )
+
+        endpoints = _get_endpoint_list()
+        llm_text = None
+        last_error = None
+
+        for endpoint in endpoints:
+            try:
+                resp = _llm_http_client.post(
+                    endpoint,
+                    json=payload,
+                    headers=get_llm_headers(),
+                    timeout=LLMTimeouts.get("EXTRACTION"),
+                )
+                resp.raise_for_status()
+                parsed = _parse_llm_response_robust(resp)
+                if parsed:
+                    llm_text = parsed.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if llm_text:
+                        _llm_circuit_breaker.record_success()
+                        break
+            except Exception as _ep_err:
+                last_error = _ep_err
+                log.warning("learn_topic.endpoint_failed",
+                            topic=topic, endpoint=endpoint, error=str(_ep_err))
+                continue
+
+        if not llm_text:
+            _llm_circuit_breaker.record_failure()
+            log.error("learn_topic.llm_failed",
+                      topic=topic,
+                      error=str(last_error) if last_error else "no content returned")
+            return {
+                "status": "error",
+                "topic": topic,
+                "detail": f"LLM unavailable: {last_error}",
+                "committed": 0,
+                "staged": 0,
+                "total": 0,
+            }
+
+    except Exception as e:
+        log.error("learn_topic.llm_setup_failed", topic=topic, error=str(e))
+        return {"status": "error", "topic": topic, "detail": f"LLM setup error: {e}", "committed": 0, "staged": 0, "total": 0}
+
+    raw_edges = _parse_learn_statements(llm_text)
+    if not raw_edges:
+        log.warning("learn_topic.no_edges_parsed", topic=topic, llm_text_len=len(llm_text))
+        return {"status": "no_facts", "topic": topic, "committed": 0, "staged": 0, "total": 0}
+
+    edges = [
+        EdgeInput(subject=e["subject"], rel_type=e["rel_type"], object=e["object"],
+                  fact_provenance="llm_inferred")
+        for e in raw_edges
+    ]
+
+    try:
+        ingest_req = IngestRequest(
+            text=llm_text,
+            source="llm_learn",
+            edges=edges,
+            user_id=user_id,
+        )
+        result = await ingest(ingest_req, model=get_gliner_model())
+        committed = getattr(result, "committed", 0) if hasattr(result, "committed") else result.get("committed", 0) if isinstance(result, dict) else 0
+        staged = getattr(result, "staged", 0) if hasattr(result, "staged") else result.get("staged", 0) if isinstance(result, dict) else 0
+        total = committed + staged
+
+        # Anchor the topic to the user so Phase 3 graph traversal can reach it.
+        # Uses related_to (head={ANY}, tail={ANY}, is_hierarchy_rel=false) — passes
+        # WGM unconditionally, in graph traversal set, no LLM needed. The edges=[]
+        # path failed when LLM was unreachable (no extraction → no anchor written).
+        # related_to is metadata-driven from rel_types table, not hardcoded logic.
+        # source="llm_learn" — anchor stays Class B (short-term) alongside the
+        # hierarchy facts. Query hits increment confirmed_count (see
+        # fetch_facts_from_anchor staged_facts section), promoting to long-term
+        # after 3 queries. Both anchor and hierarchy earn long-term status
+        # together through use, not just by being commanded.
+        anchor_req = IngestRequest(
+            text=f"user is related to {topic}",
+            source="llm_learn",
+            edges=[EdgeInput(
+                subject="user",
+                rel_type="related_to",
+                object=topic,
+                fact_provenance="llm_inferred",
+            )],
+            user_id=user_id,
+        )
+        try:
+            await ingest(anchor_req, model=get_gliner_model())
+            log.info("learn_topic.anchor_written", topic=topic, rel_type="related_to")
+        except Exception as anchor_err:
+            log.warning("learn_topic.anchor_failed", topic=topic, error=str(anchor_err))
+
+        # Mark topic entity as Concept so entity-centric query expansion can type-filter it.
+        # entity_type='Concept' is the correct semantic type for a topic/domain entity.
+        # Only updates if currently unknown — never overwrites a more specific type.
+        # Schema must be resolved to scope the UPDATE to the correct per-user schema.
+        try:
+            from src.provisioning.schema_manager import derive_user_slug_from_uuid, derive_schema_name
+            _user_slug = derive_user_slug_from_uuid(user_id)
+            _schema = derive_schema_name(_user_slug)
+            _dsn = os.environ.get("POSTGRES_DSN")
+            if _dsn and _schema:
+                with psycopg2.connect(_dsn) as _tdb:
+                    with _tdb.cursor() as _tc:
+                        _tc.execute(f"SET search_path TO {_schema}, public")
+                        _tc.execute("""
+                            UPDATE entities SET entity_type = 'Concept'
+                            WHERE id = (
+                                SELECT entity_id FROM entity_aliases
+                                WHERE alias = %s LIMIT 1
+                            ) AND entity_type = 'unknown'
+                        """, (topic.lower(),))
+                    _tdb.commit()
+                    log.info("learn_topic.entity_typed_as_concept", topic=topic)
+        except Exception as _te:
+            log.warning("learn_topic.entity_type_update_failed", topic=topic, error=str(_te))
+
+        log.info("learn_topic.complete", topic=topic, committed=committed, staged=staged)
+        return {"status": "learned", "topic": topic, "committed": committed, "staged": staged, "total": total}
+    except Exception as e:
+        log.error("learn_topic.ingest_failed", topic=topic, error=str(e))
+        return {"status": "error", "topic": topic, "detail": str(e), "committed": 0, "staged": 0, "total": 0}
