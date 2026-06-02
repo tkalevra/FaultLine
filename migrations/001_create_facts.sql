@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS facts (
     rel_type    TEXT        NOT NULL,
     provenance  TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, subject_id, object_id, rel_type)
+    UNIQUE(subject_id, object_id, rel_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_pair
