@@ -62,11 +62,15 @@ def _load_extraction_patterns() -> list[tuple[re.Pattern, str]]:
         db = psycopg2.connect(dsn)
         cur = db.cursor()
 
-        # Query active patterns, sorted by confidence descending
+        # Query active compound patterns only — scalar_atomic category is handled
+        # exclusively by _detect_atomic_values() in main.py at ingest time.
+        # The category column is the metadata-driven boundary between the two
+        # pattern populations; do not collapse them into one load path.
         cur.execute("""
             SELECT pattern_regex, rel_type
             FROM extraction_patterns
             WHERE is_active = true
+              AND category != 'scalar_atomic'
             ORDER BY global_confidence DESC
         """)
 
@@ -181,6 +185,9 @@ def extract_compound_facts(text: str) -> list[dict]:
         for m in compiled_pattern.finditer(text):
             groups = m.groups()
             if not groups:
+                # Safety net: scalar_atomic patterns are filtered at load time via
+                # category != 'scalar_atomic'. Any remaining bare-match pattern here
+                # is an authoring error in extraction_patterns — skip it.
                 continue
 
             # Pattern-specific interpretation of captured groups
