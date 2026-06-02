@@ -77,17 +77,49 @@ AI:   "Your firewall OPNsense is a networking device — I have that from earlie
 
 ---
 
-## `/expand` — teach it a topic
+## `/expand` — on-demand domain intelligence
+
+Most memory systems store facts. FaultLine can learn how a *domain* works — the structure, the relationships, the vocabulary — so that facts about it land correctly and mean something.
+
+Without a domain expansion, "my firewall is OPNsense" is stored as a flat string. With `/expand networking`, FaultLine knows that a firewall is a type of network device, that it has IP addresses, that it sits between your LAN and WAN, and how it relates to switches, routers, and hosts. Every networking fact you mention after that is stored and retrieved in context.
+
+**The difference in practice:**
 
 ```
-/expand networking
-/expand kubernetes
-/expand home lab
-/expand tls online
+Without /expand:
+
+You:  "OPNsense is at 10.0.0.1, the switch is at 10.0.0.2"
+AI:   "OPNsense has IP 10.0.0.1 and the switch has IP 10.0.0.2."
+      (two isolated facts, no relationship, no structure)
+
+With /expand networking:
+
+You:  "OPNsense is at 10.0.0.1, the switch is at 10.0.0.2"
+AI:   "Your firewall OPNsense is at 10.0.0.1. Your switch is at 10.0.0.2,
+       downstream from it." (stored relationally — device types, roles, topology)
+```
+
+### You control the source
+
+Point it at the actual documentation and it grounds the expansion in that material — not in what the LLM guesses the domain looks like:
+
+```
 /expand kubernetes online https://kubernetes.io/docs/concepts/
+/expand tls online https://www.rfc-editor.org/rfc/rfc8446
+/expand networking
+/expand home lab
+/expand kubernetes
 ```
 
-The `online` variants fetch real web content and ground the learning in it. Runs in the background — you get an immediate response and can keep chatting.
+Without a URL, it reasons from its training knowledge. With one, it reads the source and builds the ontology from it. You decide how authoritative you need it to be.
+
+### Still correctable
+
+Everything `/expand` builds is subject to the same correction rules as any other fact. If it got the domain structure wrong, tell it — your correction wins and is stored as authoritative. The expansion is a starting point, not a constraint.
+
+### It compounds
+
+Expand once and every future conversation in that domain benefits automatically. New facts slot into the right relationships. Queries about that domain return structured, contextual answers instead of isolated strings. The more you use it, the more useful it gets.
 
 ---
 
