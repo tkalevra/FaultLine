@@ -570,10 +570,13 @@ async def learn_facts_tool(text: str, user_id: str) -> dict[str, Any]:
 
 async def retract_fact_tool(text: str, user_id: str) -> dict[str, Any]:
     """Call FaultLine /retract/correct endpoint."""
-    resp = await _http_client.post(
-        f"{FAULTLINE_API_URL}/retract/correct",
-        json={"text": text, "user_id": user_id, "intent": "RETRACTION"},
-    )
+    # Use a dedicated 90s timeout: /retract/correct invokes LLM extraction which takes 14–55s
+    # under load. The shared _http_client is 30s which is insufficient.
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(
+            f"{FAULTLINE_API_URL}/retract/correct",
+            json={"text": text, "user_id": user_id, "intent": "RETRACTION"},
+        )
     resp.raise_for_status()
     return resp.json()
 

@@ -384,10 +384,6 @@ _IDENTITY_QUERIES: frozenset[str] = frozenset({
 })
 
 
-# Retraction signals cache with TTL (lazy load at runtime, not at startup)
-# Format: {signal_text: {"category": str, "priority": int, "false_positive_rate": float}}
-_RETRACTION_SIGNALS_CACHE_WITH_TTL: tuple = (0, {})
-_RETRACTION_SIGNALS_TTL: int = 60  # refresh every 60 seconds
 
 _IDENTITY_RE = re.compile(
     r"\b(my name is|i am|i'm|call me|people call me)\s+[a-z]+", re.IGNORECASE
@@ -782,55 +778,6 @@ _CONVERSATION_MAX_ENTITIES: int = 10  # prune entity mentions beyond this
 # Retraction Detection & Scope Extraction (dprompt-107)
 # ============================================================================
 
-def _get_retraction_signals_cached(db_url: Optional[str] = None) -> dict:
-    """Get retraction signals with TTL-based caching (lazy load at runtime).
-
-    Loads from DB on first call or when TTL expires.
-    No startup dependency — database doesn't need to be ready at module load.
-    Gracefully degraalice to empty dict on error.
-
-    Returns: {signal_text: {"category": str, "priority": int}}
-    """
-    global _RETRACTION_SIGNALS_CACHE_WITH_TTL
-    import time
-
-    cache_timestamp, cached_data = _RETRACTION_SIGNALS_CACHE_WITH_TTL
-    now = time.time()
-
-    # Return cached if still valid (TTL not expired)
-    if cache_timestamp > 0 and (now - cache_timestamp) < _RETRACTION_SIGNALS_TTL:
-        return cached_data
-
-    # Cache expired or empty — try to load from DB
-    # Use provided db_url from Valves (POSTGRES_DSN must be set)
-    if not db_url:
-        _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
-        return {}
-
-    try:
-        import psycopg2
-        conn = psycopg2.connect(db_url)
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT signal, signal_category, priority
-                   FROM retraction_signals
-                   WHERE language = 'en'
-                   ORDER BY priority DESC"""
-            )
-            cached_data = {}
-            for signal, category, priority in cur.fetchall():
-                cached_data[signal.lower()] = {
-                    "category": category,
-                    "priority": priority,
-                }
-            conn.close()
-            _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, cached_data)
-    except Exception as e:
-        # Graceful fallback — cache empty on error, retry next time TTL expires
-        _RETRACTION_SIGNALS_CACHE_WITH_TTL = (now, {})
-
-    # Return cached data (updated or empty on error)
-    return _RETRACTION_SIGNALS_CACHE_WITH_TTL[1]
 
 
 def _detect_retraction_pattern(text: str, signals_cache: dict) -> tuple[bool, Optional[str]]:
@@ -1290,44 +1237,6 @@ async def _classify_intent_via_backend(faultline_url: str, text: str, user_id: s
     return {"intent": "STATEMENT", "confidence": 0.0}
 
 
-async def _query_negation_patterns(faultline_url: str, text: str, user_id: str, debug: bool = False) -> dict | None:
-    """
-    Layer 2: Query negation_patterns table for substring/fuzzy match fallback.
-    Called when GLiNER2 confidence < gate_threshold.
-
-    Args:
-        faultline_url: Backend URL (contains DB connection)
-        text: User message text
-        user_id: User UUID
-        debug: Enable debug logging
-
-    Returns:
-        {'negation_type': 'retraction', 'confidence': 0.85, 'source': 'db'}
-        or None if no match found
-    """
-    if not text or not faultline_url or not user_id:
-        return None
-
-    try:
-        await _initialize_http_client()
-        resp = await _http_client.post(
-            f"{faultline_url}/query-negation-patterns?user_id={user_id}",
-            json={"text": text},
-            timeout=3.0,
-        )
-
-        if resp.status_code == 200:
-            result = _parse_response_json_robust(resp.text, "negation_patterns")
-            if isinstance(result, dict) and result:
-                if debug:
-                    print(f"[FaultLine Filter] negation_patterns_match: type={result.get('negation_type')} "
-                          f"confidence={result.get('confidence', 0.0):.2f}")
-                return result
-    except Exception as e:
-        if debug:
-            print(f"[FaultLine Filter] negation_patterns_query_error: {type(e).__name__}: {str(e)[:60]}")
-
-    return None
 
 
 async def _get_confidence_gate(faultline_url: str, user_id: str, debug: bool = False) -> float:
@@ -1968,7 +1877,6 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         # All caches now lazy-loaded at runtime:
-        # - Retraction signals via _get_retraction_signals_cached()
         # - Correction signals via _get_correction_signals_cached()
         # - FaultLine URL via _get_faultline_url_cached() (dprompt-150)
         # No startup dependencies on DB/backend being ready.
@@ -2042,31 +1950,10 @@ class Filter:
             if self.valves.ENABLE_DEBUG:
                 print(f"[FaultLine Filter] intent_gate_passed: intent={final_intent} confidence={gliner_confidence:.2f} >= gate={gate_threshold:.2f}")
         else:
-            # Low confidence — query negation_patterns fallback (Layer 2)
-            print(f"[FaultLine Filter] intent_gate_FAILED: {gliner_confidence:.3f} < {gate_threshold:.3f} | trying negation_patterns fallback", flush=True)
-            pattern_match = await _query_negation_patterns(
-                self._get_faultline_url_cached(),
-                text,
-                user_id,
-                debug=self.valves.ENABLE_DEBUG
-            )
-
-            if pattern_match and pattern_match.get("confidence", 0.0) >= 0.5:
-                # DB pattern override
-                final_intent = pattern_match.get("negation_type", "STATEMENT").upper()
-                final_confidence = pattern_match.get("confidence", 0.0)
-                print(f"[FaultLine Filter] intent_gate_fallback_HIT: final_intent={final_intent} | pattern_match={pattern_match}", flush=True)
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] intent_gate_fallback: intent={final_intent} "
-                          f"from negation_patterns (confidence={final_confidence:.2f})")
-            else:
-                # No override — default to STATEMENT
-                final_intent = "STATEMENT"
-                final_confidence = 0.0
-                print(f"[FaultLine Filter] intent_gate_fallback_MISS: defaulting to STATEMENT | pattern_match={pattern_match}", flush=True)
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] intent_gate_default: intent=STATEMENT "
-                          f"(gliner_confidence={gliner_confidence:.2f} < gate={gate_threshold:.2f})")
+            # Low confidence — Layer 2 runs inside backend /classify-intent; default to STATEMENT here
+            final_intent = "STATEMENT"
+            final_confidence = 0.0
+            print(f"[FaultLine Filter] intent_gate_FAILED: {gliner_confidence:.3f} < {gate_threshold:.3f} | backend Layer 2 handled; defaulting to STATEMENT", flush=True)
 
         print(f"[FaultLine Filter] _classify_intent.FINAL: intent={final_intent} confidence={final_confidence:.3f}", flush=True)
         return {"intent": final_intent, "confidence": final_confidence}
@@ -2467,46 +2354,6 @@ Return valid JSON only. If no facts, return [].
                 print(f"[FaultLine Filter] failed to fetch recent facts: {e}")
             return []
 
-    async def _detect_retraction_intent(self, text: str, user_id: str) -> tuple[bool, dict]:
-        """Retraction detection: DUMB lookup only. Is signal in database?
-
-        Filter asks: "Is this signal registered in retraction_signals?"
-        If YES → call /retract/correct (backend handles extraction + learning)
-        If NO → fall through to normal ingest
-
-        All learning/confidence/LLM logic belongs in the BACKEND, not Filter.
-        Backend `/retract/correct` (dprompt-136) extracts what changed.
-        Re-embedder evaluates outcomes, registers high-frequency patterns.
-
-        Returns: (should_retract: bool, scope_dict with method indicator)
-        """
-        if not self.valves.RETRACTION_ENABLED:
-            return (False, {})
-
-        # DUMB: just ask "is signal in DB?"
-        signals = _get_retraction_signals_cached(db_url=self.valves.POSTGRES_DSN)
-        text_lower = text.lower()
-        # Normalize apostrophes for flexible matching (don't/dont, don't/dont)
-        text_normalized = text_lower.replace("'", "").replace("`", "").replace(""", "").replace(""", "")
-
-        # Check if ANY signal from DB exists in text (normalized)
-        matched_signal = None
-        for signal in signals.keys():
-            signal_normalized = signal.replace("'", "").replace("`", "").replace(""", "").replace(""", "")
-            if signal_normalized in text_normalized:
-                matched_signal = signal
-                break
-
-        if matched_signal:
-            # Signal found in DB → ask backend to extract + correct
-            if self.valves.ENABLE_DEBUG:
-                print(f"[FaultLine Filter] retraction signal FOUND in DB: '{matched_signal}'")
-            return (True, {"signal": matched_signal, "method": "db_lookup"})
-
-        # Signal NOT in DB → no retraction, fall through to normal ingest
-        if self.valves.ENABLE_DEBUG:
-            print(f"[FaultLine Filter] retraction signal NOT found in DB for: {text[:60]}")
-        return (False, {})
 
     async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
         """Call OpenWebUI LLM directly for retraction semantic detection. Reliable, portable, no external dependencies."""
@@ -3304,8 +3151,9 @@ GRANULAR EXAMPLES (using recent facts context):
             # Previous bug: Called _classify_message_intent() + _classify_intent() = 2x GLiNER2 calls
             # Fixed: Single call to _classify_intent() with three-layer logic reused for dedup + routing
             # (Violation 1 Fix) Classify clean_text (without memory marker) once, reuse for dedup + routing
-            message_intent = await self._classify_intent(clean_text, user_id)
-            intent_confidence = 0.0  # Three-layer classification doesn't expose confidence, placeholder for logging
+            _intent_result = await self._classify_intent(clean_text, user_id)
+            message_intent = _intent_result.get("intent", "STATEMENT")
+            intent_confidence = _intent_result.get("confidence", 0.0)
 
             # Step 2: Generate idempotency key (same semantics as /ingest endpoint)
             # Key format: dedup:{user_id}:{intent}:{sha256(text+intent)}
@@ -3641,9 +3489,7 @@ GRANULAR EXAMPLES (using recent facts context):
                     print(f"[FaultLine Filter] ROUTE_TAKEN: RETRACTION", flush=True)
                     if self.valves.ENABLE_DEBUG:
                         print(f"[FaultLine Filter] intent=RETRACTION — routing to /retract")
-                    # Already handled upstream by _detect_retraction_intent at line 2590
-                    # If we reach here, it means retraction detection didn't fire earlier
-                    # Call _fire_retract as fallback
+                    # Call _fire_retract — retraction routing via three-layer _classify_intent
                     try:
                         retract_result = await self._fire_retract(user_id, text=clean_text, intent="RETRACTION")
                         if retract_result.get("status") in ("ok", "corrected"):

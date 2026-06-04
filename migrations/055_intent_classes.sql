@@ -51,25 +51,25 @@ INSERT INTO intent_classes (intent_name, description, priority, refined_by)
 VALUES
     (
         'QUERY',
-        'User is asking a question to retrieve information about their knowledge, facts, or memories. The message ends with a question mark or contains question words (what, how, tell me, remind me, do I have, what do I know). User wants to be reminded of something they stored previously.',
+        'User is asking a question to retrieve information',
         100,
         'bootstrap'
     ),
     (
         'RETRACTION',
-        'User explicitly wants to remove, delete, erase, or forget previously stored information. Keywords: forget, delete, remove, don''t have, no longer, is not, is not a. Action: removes facts from the knowledge graph. Intent is negation of previous state.',
+        'User wants to remove or forget information',
         100,
         'bootstrap'
     ),
     (
         'CORRECTION',
-        'User is providing updated or corrected information that overrides or supersedes previous facts. Keywords: actually, correction, I meant, I was wrong, it''s not, change that, that was wrong, not the one. Action: replaces/updates existing facts (Class A override).',
+        'User is correcting or updating previous information',
         100,
         'bootstrap'
     ),
     (
         'STATEMENT',
-        'User is providing new information, facts, context, or personal details to be learned and stored. Keywords: my name, I have, I work at, I live in, I own, my spouse is, I am, I went to. Action: ingests new facts into knowledge graph.',
+        'User is providing new information or facts',
         100,
         'bootstrap'
     )
@@ -77,7 +77,7 @@ ON CONFLICT (intent_name) DO UPDATE
 SET
     description = EXCLUDED.description,
     priority = EXCLUDED.priority,
-    version = version + 1,
+    version = intent_classes.version + 1,
     refined_at = NOW(),
     updated_at = NOW()
 WHERE intent_classes.refined_by != 'user';  -- Don't override user customizations

@@ -3396,6 +3396,32 @@ def main():
                     log.error(f"re_embedder.extraction_pattern_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if pattern evaluation fails
 
+                # dprompt-153: Evict stale intent_pattern_cache entries
+                # TTL-based: delete expired rows with confirmed_count < 3; grace-extend the rest
+                try:
+                    with db.cursor() as cur:
+                        cur.execute("""
+                            DELETE FROM public.intent_pattern_cache
+                            WHERE is_permanent = false
+                              AND expires_at < now()
+                              AND confirmed_count < 3
+                        """)
+                        deleted = cur.rowcount
+                        cur.execute("""
+                            UPDATE public.intent_pattern_cache
+                            SET expires_at = now() + INTERVAL '7 days'
+                            WHERE is_permanent = false
+                              AND expires_at IS NOT NULL
+                              AND expires_at < now()
+                              AND confirmed_count >= 3
+                        """)
+                        extended = cur.rowcount
+                        db.commit()
+                    if deleted > 0 or extended > 0:
+                        log.info("re_embedder.pattern_cache_eviction", deleted=deleted, extended=extended)
+                except Exception as e:
+                    log.warning(f"re_embedder.pattern_cache_eviction_failed (non-fatal): {type(e).__name__}: {str(e)[:100]}")
+
                 # Job 7: Fill in missing natural_language for rel_types in use.
                 # Finds rel_types with NULL natural_language that appear in recent facts,
                 # calls LLM to generate the template, stores it. Runs at most 5 per cycle
