@@ -20,6 +20,26 @@ import httpx
 # Patterns require multi-word specificity to keep false-positive rate effectively zero.
 # Mitigates TM-01/TM-09 (prompt injection via ingested facts).
 
+# ── MCP recall output cleaning ────────────────────────────────────────────────
+# Strip internal FaultLine metadata annotations before returning facts to MCP callers.
+# Mirrors _clean_fact_for_injection() in the OpenWebUI Filter but lives here so the
+# MCP path produces equally clean output without depending on filter code.
+
+_MCP_STRIP_PATTERNS = [
+    _re.compile(r'^\[(?:staged|Class [ABC]|Class-[ABC])\]\s*', _re.I),
+    _re.compile(r'\bconfidence=[\d.]+\b', _re.I),
+    _re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', _re.I),
+]
+
+
+def _clean_for_mcp(text: str) -> str:
+    """Strip internal metadata annotations from a fact string before MCP return."""
+    for pat in _MCP_STRIP_PATTERNS:
+        text = pat.sub("", text)
+    return text.strip()
+
+
+# ── Injection signal detection ────────────────────────────────────────────────
 _INJECTION_PATTERNS = [
     _re.compile(
         r'\bignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)\b',
@@ -169,17 +189,19 @@ async def _get(url: str, **kwargs) -> httpx.Response:
 # ── Provisioning helper ──────────────────────────────────────────────────────
 
 
-async def _ensure_provisioned(user_id: str) -> None:
+async def _ensure_provisioned(user_id: str) -> bool:
     """Trigger provisioning if needed, then poll until ready (up to ~18 s total).
 
     The backend provisioning worker wakes every 5 s.  On first encounter the initial
     GET enqueues the job and returns "not_found"; we then sleep 6 s so the worker has
     time to notice the new job before burning poll slots on guaranteed misses.
-    Non-fatal on all errors.
+
+    Returns True if the user schema is confirmed ready, False otherwise.
+    Callers must not proceed with tool execution when False is returned.
     """
     await _detect_faultline_url()  # probe once, cache working URL for process lifetime
     if user_id in _provisioned_users:
-        return
+        return True
     client = _http_client
     own_client = False
     if client is None:
@@ -197,7 +219,7 @@ async def _ensure_provisioned(user_id: str) -> None:
             init_status = resp.json().get("status")
             if init_status == "ready":
                 _provisioned_users.add(user_id)
-                return
+                return True
             if init_status == "not_found":
                 # Backend just enqueued the provisioning job.  The worker sleeps
                 # PROVISIONING_POLL_INTERVAL (default 5 s) between checks, so polls
@@ -224,14 +246,16 @@ async def _ensure_provisioned(user_id: str) -> None:
                 if resp.json().get("status") == "ready":
                     _provisioned_users.add(user_id)
                     _log(f"Provisioning ready for {user_id[:8]} (attempt {attempt + 1})")
-                    return
+                    return True
             except Exception as e:
                 _log(f"Provisioning poll {attempt + 1} failed for {user_id[:8]}: {e}")
             await asyncio.sleep(2.0)
 
-        _log(f"Provisioning not ready after timeout for {user_id[:8]} — proceeding anyway")
+        _log(f"Provisioning not ready after timeout for {user_id[:8]} — not proceeding")
+        return False
     except Exception as e:
         _log(f"Provisioning check failed for {user_id[:8]}: {e}")
+        return False
     finally:
         if own_client:
             await client.aclose()
@@ -440,10 +464,16 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     lines: list[str] = []
 
     for fact in facts:
+        # Skip raw store_context cache entries — transport tag, not structured knowledge.
+        # "context" is set at /store_context write time and confirmed absent from rel_types table.
+        if fact.get("rel_type") == "context":
+            continue
         definition = fact.get("definition", "")
         if not definition:
             continue
-        text = definition
+        text = _clean_for_mcp(definition)
+        if not text:
+            continue
         for token, replacement in display.items():
             text = text.replace(token, replacement)
         lines.append(text)
@@ -465,6 +495,7 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     rewrite_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/extract/rewrite",
         json={"text": text, "user_id": user_id},
+        timeout=60.0,
     )
     rewrite_resp.raise_for_status()
     edges = [
@@ -476,6 +507,7 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     ingest_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/ingest",
         json={"text": text, "user_id": user_id, "edges": edges, "source": "mcp"},
+        timeout=30.0,
     )
     ingest_resp.raise_for_status()
     return ingest_resp.json()
@@ -540,7 +572,7 @@ async def retract_fact_tool(text: str, user_id: str) -> dict[str, Any]:
     """Call FaultLine /retract/correct endpoint."""
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/retract/correct",
-        json={"text": text, "user_id": user_id},
+        json={"text": text, "user_id": user_id, "intent": "RETRACTION"},
     )
     resp.raise_for_status()
     return resp.json()
@@ -657,8 +689,23 @@ async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int 
     # Step 1: before provisioning check
     _send_progress(progress_token, 1, 3, _rotate(_MCP_PROGRESS_STEP1, _rot))
 
-    # Transparent provisioning — non-fatal if endpoint unreachable.
-    await _ensure_provisioned(effective_user_id)
+    # Provisioning gate — must be ready before any tool executes.
+    provisioned = await _ensure_provisioned(effective_user_id)
+    if not provisioned:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "status": "provisioning",
+                            "message": "Memory is being set up for you — please retry in a moment.",
+                            "committed": 0,
+                        }
+                    ),
+                }
+            ]
+        }
 
     # Step 2: provisioning done, about to run tool
     _send_progress(progress_token, 2, 3, _rotate(_MCP_PROGRESS_STEP2, _rot))
