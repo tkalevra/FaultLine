@@ -262,6 +262,7 @@ class LLMTimeouts:
         "VALIDATION": 20.0,              # WGM ontology validation
         "ENRICHMENT": 15.0,              # Metadata inference for new rel_types
         "CORRECTION": 25.0,              # User correction extraction
+        "RETRACTION_EXTRACTION": 60.0,   # Retraction LLM extraction — longer due to context loading
         "EMBEDDING": 10.0,               # Text embedding operations
         "TAXONOMY_DISCOVERY": 20.0,      # Discover new taxonomies
         "DEFAULT": 30.0,                 # Fallback for unknown operations

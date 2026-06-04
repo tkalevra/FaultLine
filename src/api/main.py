@@ -3240,6 +3240,42 @@ def _load_preference_patterns_cache() -> list:
         return []
 
 
+def _update_pattern_cache(conn, user_id: str, pattern_text: str, intent_type: str, confirmed: bool) -> None:
+    """Update intent_pattern_cache confidence after a confirmed or contradicted pattern fire."""
+    try:
+        with conn.cursor() as cur:
+            if confirmed:
+                cur.execute("""
+                    UPDATE public.intent_pattern_cache
+                    SET confirmed_count = confirmed_count + 1,
+                        last_fired_at = now(),
+                        expires_at = CASE
+                            WHEN confirmed_count + 1 >= 10 THEN NULL
+                            ELSE GREATEST(expires_at, now()) + INTERVAL '7 days'
+                        END,
+                        is_permanent = (confirmed_count + 1 >= 10),
+                        confidence = LEAST(1.0, confidence + 0.02)
+                    WHERE (user_id = %s OR user_id = '__global__')
+                      AND pattern_text = %s AND intent_type = %s
+                """, (user_id, pattern_text, intent_type.lower()))
+            else:
+                cur.execute("""
+                    UPDATE public.intent_pattern_cache
+                    SET contradicted_count = contradicted_count + 1,
+                        confidence = GREATEST(0.0, confidence - 0.10),
+                        expires_at = CASE
+                            WHEN is_permanent = false AND expires_at IS NOT NULL
+                            THEN now() + ((expires_at - now()) / 2)
+                            ELSE expires_at
+                        END
+                    WHERE (user_id = %s OR user_id = '__global__')
+                      AND pattern_text = %s AND intent_type = %s
+                """, (user_id, pattern_text, intent_type.lower()))
+            conn.commit()
+    except Exception as e:
+        log.warning("pattern_cache.update_failed", error=str(e)[:80])
+
+
 def _build_intent_descriptions_for_gliner2() -> dict:
     """
     Intent descriptions for GLiNER2 zero-shot classification.
@@ -4484,6 +4520,7 @@ If extraction is impossible or confidence < 0.70, return {{}}."""
             model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
             user_id=user_id,
             operation="retraction_extraction",
+            max_retries=1,  # no retry — 3×60s=180s exceeds MCP client timeout
         )
 
         if extraction:
@@ -5434,41 +5471,39 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                     schema_name = f"faultline_{user_slug}"
 
                     with psycopg2.connect(dsn) as conn:
-                        # Layer 2a: Query per-user negation_patterns (intent override)
+                        # Layer 2a: intent_pattern_cache — TTL-scored evictable cache (dprompt-153)
+                        # Replaces permanent negation_patterns ledger; seeds start at low confidence
+                        # and must earn their way up via confirmed_count. ambiguous patterns never auto-route.
                         with conn.cursor() as cur:
-                            cur.execute(f"""
-                                SELECT pattern_text, negation_type, confidence
-                                FROM {schema_name}.negation_patterns
-                                WHERE confidence >= 0.8
-                                ORDER BY confidence DESC
-                                LIMIT 50
-                            """)
-                            patterns = cur.fetchall()
-
-                        # DEFENSIVE: Validate tuple structure before unpacking (FIX #1: prevents tuple index errors)
-                        # Ref: ROOT-CAUSE.md — schema mismatches cause unpacking failures
-                        if patterns:
-                            first_row = patterns[0]
-                            if not isinstance(first_row, tuple) or len(first_row) != 3:
-                                log.warning("classify_intent.unexpected_tuple_format",
-                                           layer="2a_negation_patterns",
-                                           expected_columns=3,
-                                           got_columns=len(first_row) if isinstance(first_row, tuple) else "not_a_tuple",
-                                           got_type=type(first_row).__name__)
-                                patterns = []  # Skip Layer 2a on schema mismatch
+                            patterns = []
+                            for uid in (user_id, "__global__"):
+                                cur.execute("""
+                                    SELECT pattern_text, intent_type, confidence
+                                    FROM public.intent_pattern_cache
+                                    WHERE user_id = %s
+                                      AND confidence >= 0.70
+                                      AND (is_permanent = true OR expires_at > now())
+                                    ORDER BY confidence DESC, confirmed_count DESC
+                                    LIMIT 50
+                                """, (uid,))
+                                patterns = cur.fetchall()
+                                if patterns:
+                                    break
 
                         if patterns:
-                            for pattern_text, pattern_intent, pattern_conf in patterns:
+                            for pattern_text, intent_type, pattern_conf in patterns:
                                 if pattern_text and pattern_text.lower() in text_lower:
-                                    # Pattern matched — override GLiNER2 unconditionally
-                                    intent = pattern_intent.upper()
+                                    if intent_type == "ambiguous":
+                                        continue  # ambiguous patterns require confirmation before routing
+                                    intent = intent_type.upper()
                                     confidence = pattern_conf
-                                    print(f"[/classify-intent] negation_pattern_HIT: pattern='{pattern_text}' → intent={intent} confidence={confidence:.2f}", flush=True)
-                                    log.info("classify_intent.negation_pattern_override",
+                                    print(f"[/classify-intent] intent_cache_HIT: pattern='{pattern_text}' → intent={intent} confidence={confidence:.2f}", flush=True)
+                                    log.info("classify_intent.intent_cache_override",
                                            original_intent=intent_result,
                                            override_intent=intent,
                                            pattern_text=pattern_text,
-                                           pattern_confidence=pattern_conf)
+                                           pattern_confidence=pattern_conf,
+                                           source="intent_pattern_cache")
                                     return {
                                         "intent": intent,
                                         "confidence": confidence
