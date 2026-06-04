@@ -192,27 +192,34 @@ def _parse_llm_response_robust(response) -> dict:
     except Exception as e:
         log.error("parse_llm_response.line_delimited_parse_failed", error=str(e), response_preview=response.text[:200])
 
-    # Strategy 3: Regex extraction (dBug-016 corruption case)
-    # Extract first valid JSON object containing "choices" key
+    # Strategy 3: Brace-counter extraction — handles arbitrary nesting depth.
+    # Scans for the first '{' and its matching '}', validates against "choices" key.
+    # No regex — works for any JSON regardless of nesting.
     try:
-        import re
-        # Match JSON object patterns { ... }
-        # Search for patterns that contain "choices" to avoid extracting garbage
         text = response.text
-
-        # Find all potential JSON objects
-        matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
-        for match in matches:
+        start = text.find('{')
+        while start != -1:
+            depth = 0
+            end = start
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
             try:
-                parsed = json.loads(match.group())
+                candidate = text[start:end]
+                parsed = json.loads(candidate)
                 if isinstance(parsed, dict) and "choices" in parsed:
-                    log.debug("parse_llm_response.recovered_regex_extraction")
+                    log.debug("parse_llm_response.recovered_brace_extraction")
                     return parsed
-            except json.JSONDecodeError as e:
-                log.warning("parse_llm_response.regex_json_decode_failed", error=str(e), match_preview=match.group()[:100])
-                continue
+            except json.JSONDecodeError:
+                pass
+            start = text.find('{', end)
     except Exception as e:
-        log.error("parse_llm_response.regex_extraction_failed", error=str(e), response_preview=response.text[:200])
+        log.error("parse_llm_response.brace_extraction_failed", error=str(e), response_preview=response.text[:200])
 
     # All strategies failed
     log.warning("parse_llm_response.all_strategies_failed",
@@ -350,13 +357,19 @@ def _get_endpoint_list() -> list[str]:
             qwen_api = f"http://{qwen_api}"
         endpoints.append(qwen_api.rstrip('/'))
 
-    # PRIORITY 4: Hardcoded fallbacks (development/testing)
-    # Docker service name (docker compose): open-webui:8080
-    endpoints.append("http://open-webui:8080/api/chat/completions")
-    # Localhost development: port 8080 (OpenWebUI default)
-    endpoints.append("http://localhost:8080/api/chat/completions")
-    # Localhost LLM backend: port 11434 (Ollama default)
-    endpoints.append("http://localhost:11434/v1/chat/completions")
+    # PRIORITY 4: Hardcoded fallbacks — ONLY when no env vars are configured.
+    # If the operator set OPENWEBUI_INTERNAL_URL, OPENWEBUI_URL, or QWEN_API_URL,
+    # localhost fallbacks must NOT be appended. In production (Portainer, Docker Compose)
+    # these localhost addresses don't exist inside the container and burning retry
+    # time probing them adds 5-30s of ConnectError waste per failed call.
+    # Fallbacks are only useful for bare local dev where no env vars are set at all.
+    if not endpoints:
+        # Docker service name (docker compose): open-webui:8080
+        endpoints.append("http://open-webui:8080/api/chat/completions")
+        # Localhost development: port 8080 (OpenWebUI default)
+        endpoints.append("http://localhost:8080/api/chat/completions")
+        # Localhost LLM backend: port 11434 (Ollama default)
+        endpoints.append("http://localhost:11434/v1/chat/completions")
 
     # Remove duplicates while preserving order
     seen = set()
