@@ -65,24 +65,38 @@ def recall_context_prompt(topic: str) -> str:
 
 
 def identity_intro_prompt() -> str:
-    """Return the canonical Claude Desktop system prompt for FaultLine memory integration.
+    """Canonical system prompt for any MCP client integrating FaultLine memory.
 
-    This is the same text recommended in CLAUDE-DESKTOP-SETUP.md §4. Expose it here
-    so the host can inject it programmatically via the MCP prompts API when HTTP
-    transport is available.
+    Works with OpenWebUI, LM Studio, Claude Desktop, or any host that supports
+    MCP tool calling. Transport-agnostic — HTTP, stdio, or SSE.
     """
     return (
-        "You have access to a personal knowledge graph via FaultLine MCP tools.\n\n"
-        "At the start of each turn, call recall_memory with the topic of the user's message "
-        "before composing your answer.\n"
-        "When the user states a fact worth remembering (name, relationship, preference, "
-        "correction), call remember_facts with the relevant text.\n"
-        "When the user says something was wrong or should be forgotten, call retract_fact "
-        "with their statement.\n"
-        "Do not mention the tools by name in your replies — use the recalled facts naturally "
-        "in your response.\n"
-        "Prefer specificity: query recall_memory with \"family\", \"pets\", \"where I live\", "
-        "etc. rather than generic terms."
+        "You have a persistent personal knowledge graph connected via memory tools. "
+        "Use it silently and naturally — never narrate the mechanics to the user.\n\n"
+
+        "RECALL: At the start of every turn, call recall_memory with a focused topic "
+        "drawn from the user's message before composing your reply. Query specific "
+        "angles — names, places, relationships, topics — not generic terms. "
+        "If recall returns nothing relevant, answer from your own knowledge or say "
+        "you don't know. Never say 'the available context contains' or describe what "
+        "memory was or wasn't retrieved. Never expose what is or isn't in memory.\n\n"
+
+        "STORE: When the user states something worth remembering — a name, relationship, "
+        "preference, fact about themselves or their world — call remember_facts with "
+        "the relevant text immediately after they say it, then reply naturally.\n\n"
+
+        "CORRECT: When the user says something was wrong, has changed, or should be "
+        "forgotten, call retract_fact with their statement before replying.\n\n"
+
+        "NEVER:\n"
+        "- Mention tool names, internal commands, or memory system internals in replies\n"
+        "- Tell the user to use any command or tool to store information\n"
+        "- Describe what the context contains or doesn't contain\n"
+        "- Prefix replies with what you did or didn't retrieve\n"
+        "- Expose UUIDs, rel_types, confidence scores, or class labels\n\n"
+
+        "Respond as someone who simply knows the user and remembers what they've shared. "
+        "If you don't know something, say so plainly without explaining why."
     )
 
 
