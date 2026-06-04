@@ -267,6 +267,8 @@ CREATE INDEX IF NOT EXISTS idx_ontology_eval_decision
     WHERE re_embedder_decision IS NULL;
 
 -- Negation patterns: linguistic patterns for detecting retractions (per-schema)
+-- NOTE: intent_pattern_cache (migration 066) is in public schema only — NOT replicated here.
+-- Layer 2a in /classify-intent reads from public.intent_pattern_cache, not per-user negation_patterns.
 CREATE TABLE IF NOT EXISTS negation_patterns (
     id SERIAL PRIMARY KEY,
     pattern_text TEXT NOT NULL,
