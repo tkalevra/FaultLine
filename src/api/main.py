@@ -31,6 +31,7 @@ from .idempotency import IdempotencyManager
 log = structlog.get_logger()
 
 _gliner2_model = None
+
 _rel_type_registry: RelTypeRegistry = None
 _rel_type_constraint: str = ""
 _REL_TYPE_META: dict = {}
@@ -161,6 +162,40 @@ def _get_hierarchy_rels() -> frozenset:
             if meta.get("is_hierarchy_rel", False)
         )
     return frozenset()
+
+
+def _get_structural_rels() -> frozenset:
+    """
+    D2: Structural rel_types that describe what an entity IS or what it's composed of.
+
+    Metadata-driven, no hardcoded names:
+      • every hierarchy rel_type (is_hierarchy_rel = true: instance_of, subclass_of,
+        part_of, is_a, member_of, ...) — from the rel_types table, and
+      • every rel_type whose NAME begins with ``has_`` (has_ip, has_mac, has_router, ...).
+        ``has_*`` rels assert a structural/compositional property of the entity; a
+        FALSE-learned one (e.g. "computer has_router") must surface in scope so the user
+        can correct it (→ Class A override), per spec A2.
+
+    These are ALWAYS included in a scoped fetch so structure is never filtered out for
+    being "off-topic". Falls back to the startup cache if the DB is unreachable.
+    """
+    structural: set[str] = set(_get_hierarchy_rels())
+
+    dsn = os.environ.get("POSTGRES_DSN")
+    if dsn:
+        try:
+            with psycopg2.connect(dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT rel_type FROM rel_types WHERE rel_type LIKE 'has\\_%'")
+                    structural.update(row[0] for row in cur.fetchall())
+                    return frozenset(structural)
+        except Exception as e:
+            log.warning("structural_rels.db_query_failed", error=str(e), using_fallback=True)
+
+    # Fallback to startup cache if DB unavailable
+    if _REL_TYPE_META:
+        structural.update(rt for rt in _REL_TYPE_META if rt.startswith("has_"))
+    return frozenset(structural)
 
 # dprompt-125: Rel-type alias cache (alias → canonical)
 # Loaded at startup, queries DB at runtime for fresh aliases from re_embedder
@@ -630,6 +665,290 @@ def _infer_category_from_rel_type(rel_type: str) -> str:
     # Default category
     return "general"
 
+def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
+    """
+    Normalize the LLM-returned metadata for a novel rel_type into a clean dict.
+
+    Phase 2 (B.2): the miss-handling LLM call returns COMPLETE metadata for any rel_type
+    it emits that is not already known. This coerces the raw LLM dict into the canonical
+    shape used to create the rel_type in-flow. Returns None if nothing usable is present.
+
+    Expected keys (any subset): head_types, tail_types, category, is_symmetric,
+    inverse_rel_type, natural_language.
+    """
+    if not isinstance(meta, dict):
+        return None
+
+    def _as_type_list(v):
+        # Accept list, comma-string, or single string; normalize to non-empty list or None.
+        if v is None:
+            return None
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            return parts or None
+        if isinstance(v, (list, tuple)):
+            parts = [str(p).strip() for p in v if str(p).strip()]
+            return parts or None
+        return None
+
+    head_types = _as_type_list(meta.get("head_types"))
+    tail_types = _as_type_list(meta.get("tail_types"))
+
+    category = meta.get("category")
+    if isinstance(category, str):
+        category = category.strip() or None
+    else:
+        category = None
+
+    is_symmetric = meta.get("is_symmetric")
+    is_symmetric = bool(is_symmetric) if is_symmetric is not None else None
+
+    inverse_rel_type = meta.get("inverse_rel_type")
+    if isinstance(inverse_rel_type, str):
+        inverse_rel_type = inverse_rel_type.strip().lower() or None
+        # LLM may return "null"/"none" as a string — treat as no inverse.
+        if inverse_rel_type in ("null", "none"):
+            inverse_rel_type = None
+    else:
+        inverse_rel_type = None
+
+    natural_language = meta.get("natural_language")
+    if isinstance(natural_language, str):
+        natural_language = natural_language.strip() or None
+    else:
+        natural_language = None
+
+    normalized = {
+        "head_types": head_types,
+        "tail_types": tail_types,
+        "category": category,
+        "is_symmetric": is_symmetric,
+        "inverse_rel_type": inverse_rel_type,
+        "natural_language": natural_language,
+    }
+    # Require at least one concrete field to consider this usable.
+    if not any(v is not None for v in normalized.values()):
+        return None
+    return normalized
+
+
+# ── Phase 4: GLiNER2 candidate-set helpers (Severance #1+E) ──────────────────
+# The GLiNER2 GLiREL relation extractor was trained with a 25-label-per-instance
+# cap (arxiv:2501.03172). Passing more than 25 relation_types operates outside the
+# training distribution and degrades confidence. These helpers (a) compute the
+# per-type confidence threshold from rel_type metadata (no hardcoding) and (b)
+# select WHICH relational rel_types are domain-relevant to the entities GLiNER2's
+# NER pass actually found in THIS text — so grown RELATIONAL types get their
+# "second shot" without polluting the seed (Pitfall 11) or exceeding the cap.
+_GLINER2_RELATION_LABEL_CAP = 25
+
+
+def _gliner2_threshold_for(head_types, category) -> float:
+    """Per-type GLiNER2 confidence threshold, metadata-driven (no hardcoded rel_types).
+
+    Mirrors the existing scalar build logic so relational candidates inherit the
+    SAME per-type discipline:
+      - Human types (Person in head_types, or identity/physical/temporal/work
+        category): 0.5
+      - Network/bootstrap (empty head_types + network category): 0.85 — blocks
+        false positives
+      - Default: 0.6
+    """
+    head_list = head_types if head_types else []
+    is_human = ("Person" in head_list or
+                category in ("identity", "physical", "temporal", "work"))
+    is_network = (not head_list and category == "network")
+    if is_human:
+        return 0.5
+    if is_network:
+        return 0.85
+    return 0.6
+
+
+def _select_domain_relational_rel_types(dsn: str, detected_entity_types: set) -> dict:
+    """Phase 4: select RELATIONAL rel_types domain-relevant to the entities present
+    in THIS text, so a grown relational type (e.g. ``runs``, ``manages``) gets handed
+    back to GLiNER2 on the next encounter (closes Severance #1+E / Link E).
+
+    Selection is fully metadata-driven, read from the DB at runtime — NO hardcoded
+    domain lists or rel_type names:
+
+      1. Map the GLiNER2-detected NER entity types → ``entity_taxonomies`` whose
+         ``member_entity_types`` intersect them; collect their
+         ``rel_types_defining_group``.
+      2. Additionally include any ``rel_types`` whose ``head_types`` or ``tail_types``
+         intersect the detected entity types.
+
+    Only RELATIONAL types are returned (``is_hierarchy_rel = false`` and NOT scalar)
+    — scalars are already built separately. Returns
+    ``{rel_type: {"description": natural_language, "threshold": float}}`` so the
+    caller can merge them straight into the GLiNER2 ``relation_types`` dict with
+    per-type thresholds preserved. Labels stay CLEAN (name + short natural_language
+    only — Pitfall 11). Returns ``{}`` on any failure (logged loud) so GLiNER2 still
+    gets the scalar seed (graceful degradation).
+    """
+    if not dsn or not detected_entity_types:
+        return {}
+
+    # Normalize detected types for case-insensitive matching against title-cased
+    # member_entity_types/head_types in the DB (NER cache uppercases, e.g. "OBJECT").
+    detected_lower = {t.strip().lower() for t in detected_entity_types if t and t.strip()}
+    if not detected_lower:
+        return {}
+
+    selected: dict = {}
+    try:
+        with psycopg2.connect(dsn) as _conn:
+            with _conn.cursor() as _cur:
+                # Component 1: taxonomy rel_types_defining_group for taxonomies whose
+                # member_entity_types intersect the detected entity types.
+                defining_rel_types: set = set()
+                _cur.execute(
+                    "SELECT member_entity_types, rel_types_defining_group"
+                    " FROM entity_taxonomies"
+                )
+                for _members, _defining in _cur.fetchall():
+                    members_lower = {m.strip().lower() for m in (_members or []) if m}
+                    if members_lower & detected_lower:
+                        for rt in (_defining or []):
+                            if rt:
+                                defining_rel_types.add(rt.strip().lower())
+
+                # Component 2: relational rel_types whose head_types/tail_types
+                # intersect the detected entity types — plus any taxonomy-defining
+                # rel_types from Component 1. Only RELATIONAL (non-hierarchy, non-scalar).
+                _cur.execute(
+                    "SELECT rel_type, natural_language, head_types, tail_types, category,"
+                    "       is_hierarchy_rel"
+                    " FROM rel_types"
+                    " WHERE tail_types IS NOT NULL"
+                    "   AND NOT (tail_types @> ARRAY['SCALAR']::TEXT[])"
+                    "   AND COALESCE(is_hierarchy_rel, false) = false"
+                )
+                for rt, desc, head_types, tail_types, category, _is_hier in _cur.fetchall():
+                    rt_lower = (rt or "").strip().lower()
+                    if not rt_lower:
+                        continue
+                    head_lower = {h.strip().lower() for h in (head_types or []) if h}
+                    tail_lower = {t.strip().lower() for t in (tail_types or []) if t}
+                    # "ANY" head/tail = unconstrained → treat as domain-relevant only
+                    # when the taxonomy already named it (avoids dumping all ANY rels).
+                    type_match = bool((head_lower & detected_lower) or
+                                      (tail_lower & detected_lower))
+                    taxonomy_match = rt_lower in defining_rel_types
+                    if not (type_match or taxonomy_match):
+                        continue
+                    selected[rt_lower] = {
+                        "description": desc or "",
+                        "threshold": _gliner2_threshold_for(head_types, category),
+                        # carried for cap prioritization (dropped before GLiNER2 call)
+                        "_type_match": type_match,
+                        "_category": category,
+                    }
+        log.debug("ingest.gliner2_domain_relational_selected",
+                  detected_types=sorted(detected_lower),
+                  defining_rel_types=sorted(defining_rel_types),
+                  selected_count=len(selected))
+    except Exception as _sel_err:
+        log.warning("ingest.gliner2_domain_relational_select_failed",
+                    error=str(_sel_err),
+                    detected_types=sorted(detected_lower),
+                    note="GLiNER2 falls back to scalar-only seed (graceful degradation)")
+        return {}
+    return selected
+
+
+def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: float,
+                             source: str = "llm_miss_inference") -> bool:
+    """
+    Create a novel rel_type in-flow WITH the COMPLETE metadata inferred by the miss-handling
+    LLM call (Phase 2 / B.2). Unlike _insert_novel_rel_type (heuristic, ANY/ANY defaults),
+    this persists the LLM-inferred head_types/tail_types/category/symmetry/inverse/
+    natural_language so WGM type validation is NOT a silent no-op for the new type.
+
+    Refreshes _REL_TYPE_META in-process so the SAME request can use the new type (Phase 3).
+    Returns True on success, False on failure (logs loudly — fail loud, never silent).
+    """
+    try:
+        rt_lower = (rel_type or "").lower().strip()
+        if not rt_lower:
+            log.warning("ingest.create_rel_type_in_flow.empty_rel_type")
+            return False
+
+        norm = metadata or {}
+        head_types = norm.get("head_types") or ["ANY"]
+        tail_types = norm.get("tail_types") or ["ANY"]
+        category = norm.get("category") or _infer_category_from_rel_type(rt_lower)
+        is_symmetric = norm.get("is_symmetric")
+        if is_symmetric is None:
+            is_symmetric = _infer_symmetry_from_rel_type(rt_lower)
+        inverse_rel_type = norm.get("inverse_rel_type")  # None acceptable
+        natural_language = norm.get("natural_language")
+        # is_hierarchy_rel is structural — infer from the rel_type name (metadata-driven heuristic).
+        is_hierarchy = _infer_hierarchy_from_rel_type(rt_lower)
+        label = rt_lower.replace("_", " ").title()
+
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO rel_types (
+                    rel_type, label, natural_language, confidence, source, category,
+                    is_symmetric, inverse_rel_type, is_hierarchy_rel,
+                    tail_types, head_types, fact_class,
+                    correction_behavior, engine_generated, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, now())
+                ON CONFLICT (rel_type) DO UPDATE SET
+                    natural_language = COALESCE(EXCLUDED.natural_language, rel_types.natural_language),
+                    category = COALESCE(EXCLUDED.category, rel_types.category),
+                    is_symmetric = EXCLUDED.is_symmetric,
+                    inverse_rel_type = COALESCE(EXCLUDED.inverse_rel_type, rel_types.inverse_rel_type),
+                    head_types = CASE WHEN rel_types.head_types IS NULL
+                                        OR rel_types.head_types = ARRAY[]::TEXT[]
+                                      THEN EXCLUDED.head_types ELSE rel_types.head_types END,
+                    tail_types = CASE WHEN rel_types.tail_types IS NULL
+                                        OR rel_types.tail_types = ARRAY[]::TEXT[]
+                                      THEN EXCLUDED.tail_types ELSE rel_types.tail_types END,
+                    confidence = GREATEST(rel_types.confidence, EXCLUDED.confidence)
+                """,
+                (
+                    rt_lower, label, natural_language, confidence, source, category,
+                    is_symmetric, inverse_rel_type, is_hierarchy,
+                    tail_types, head_types, "B",
+                    "supersede",
+                ),
+            )
+        db.commit()
+
+        log.info("ingest.rel_type_created_in_flow",
+                 rel_type=rt_lower, source=source, confidence=confidence,
+                 category=category, is_symmetric=is_symmetric,
+                 inverse_rel_type=inverse_rel_type,
+                 head_types=head_types, tail_types=tail_types,
+                 is_hierarchy=is_hierarchy)
+
+        # Phase 3: refresh in-process _REL_TYPE_META so the SAME request/session sees it.
+        try:
+            global _REL_TYPE_META
+            _REL_TYPE_META = _build_rel_type_meta(os.environ.get("POSTGRES_DSN", ""))
+            # Keep the routing/validation cache (_REL_TYPE_CACHE) consistent too.
+            _refresh_rel_type_cache()
+        except Exception as _refresh_err:
+            log.warning("ingest.rel_type_in_flow_cache_refresh_failed",
+                        rel_type=rt_lower, error=str(_refresh_err))
+
+        return True
+
+    except Exception as e:
+        log.error("ingest.create_rel_type_in_flow_failed",
+                  rel_type=rel_type, source=source, error=str(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
 def _insert_novel_rel_type(db, rel_type: str, confidence: float,
                             source: str = "gliner2_discovery",
                             text_snippet: str = "") -> bool:
@@ -767,7 +1086,8 @@ def _resolve_user_anchor(entity_id: str, user_id: str) -> str:
     return user_id if entity_id == user_id else entity_id
 
 
-def _convert_gliner_relations_to_edges(gliner_relations_dict: dict) -> list[dict] | None:
+def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
+                                       gliner_cache: dict | None = None) -> list[dict] | None:
     """
     Convert GLiNER2.extract_relations() output to EdgeInput format.
 
@@ -782,10 +1102,17 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict) -> list[dict
         {"subject": "marla", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
         {"subject": "des", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
     ]
+
+    Severance #4 (Phase 1): carry subject_type/object_type on each edge, sourced from the
+    GLiNER2 NER cache ({entity_name_lower: ENTITY_TYPE}) when available. Without this,
+    GLiNER2-path edges feed ontology_evaluations with NULL types, starving head_types/
+    tail_types inference. Types are looked up by lowercased name; absent → None (not blank).
     """
     # FIXED: Check for "relation_extraction" (correct GLiNER2 output format)
     if not gliner_relations_dict or "relation_extraction" not in gliner_relations_dict:
         return None
+
+    cache = gliner_cache or {}
 
     edges = []
     relation_data = gliner_relations_dict.get("relation_extraction", {})
@@ -802,12 +1129,17 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict) -> list[dict
             rel_type_clean = (rel_type or "").lower().strip()
 
             if subject and object_val and rel_type_clean:
+                # Source types from the NER cache (metadata-driven; None when unknown).
+                subject_type = cache.get(subject) or None
+                object_type = cache.get(object_val) or None
                 edges.append({
                     "subject": subject,
                     "object": object_val,
                     "rel_type": rel_type_clean,
                     "confidence": 0.85,  # Default GLiNER2 confidence
                     "fact_provenance": "gliner2",
+                    "subject_type": subject_type,
+                    "object_type": object_type,
                 })
 
     return edges if edges else None
@@ -1586,16 +1918,10 @@ def _ensure_schema(dsn: str) -> None:
                     cur.execute("""
                         INSERT INTO intent_classes (intent_name, description, priority, refined_by)
                         VALUES (%s, %s, %s, 'bootstrap')
-                        ON CONFLICT (intent_name) DO UPDATE
-                        SET
-                            description = EXCLUDED.description,
-                            priority = EXCLUDED.priority,
-                            version = intent_classes.version + 1,
-                            refined_at = NOW(),
-                            updated_at = NOW()
-                        WHERE intent_classes.refined_by != 'user'
+                        ON CONFLICT (intent_name) DO NOTHING
                     """, (intent_name, description, priority))
 
+                log.info("startup.intent_classes_seeded", inserted=cur.rowcount)
                 conn.commit()
                 log.info("startup.schema_check_complete")
     except Exception as e:
@@ -2810,11 +3136,30 @@ _HTTPX_TIMEOUT = int(os.environ.get("HTTPX_TIMEOUT", "10"))
 _DB_TIMEOUT = int(os.environ.get("DB_TIMEOUT", "30"))
 _QDRANT_TIMEOUT = int(os.environ.get("QDRANT_TIMEOUT", "10"))
 
-# Query confidence gating — controls when to skip Qdrant and what to return.
-# QUERY_SKIP_QDRANT_GATE: if max fact confidence from Phase 3 meets this, skip Phase 4 (Qdrant).
-# QUERY_MIN_CONFIDENCE: facts below this floor are dropped in Phase 5 regardless of source.
+# Query confidence gating — controls Qdrant ranking and Class C lifecycle hits.
+# D3: the gate RANKS A > B > C but NEVER EXCLUDES Class C — Qdrant rough memory is always
+# part of full scope. QUERY_SKIP_QDRANT_GATE no longer skips Phase 4; when the DB already has
+# a high-confidence answer it only RANKS DOWN the associative Qdrant/Class C results so the
+# authoritative facts lead and rough memory still surfaces (for return + correction loop).
+# QUERY_SKIP_QDRANT_GATE: DB max-confidence at/above this → rank Qdrant results down (not drop).
+# QUERY_MIN_CONFIDENCE: rank-down floor for Qdrant noise — low-relevance C is demoted, not removed.
 QUERY_SKIP_QDRANT_GATE = float(os.environ.get("QUERY_SKIP_QDRANT_GATE", "0.75"))
 QUERY_MIN_CONFIDENCE = float(os.environ.get("QUERY_MIN_CONFIDENCE", "0.35"))
+
+# D4: Class C query-scoped HIT threshold. A Qdrant Class C fact is a genuine HIT (→ hit_count+1,
+# expiry reset, promote-at-3 by re_embedder) only when its cosine score >= this STRICTER
+# threshold (higher than the loose 0.3 inclusion threshold used to populate full scope) OR its
+# subject/object is the resolved scope-anchor entity. Bulk/peripheral returns are no-ops
+# (anti-noise guarantee). Config-driven, never hardcoded inline.
+QUERY_CLASSC_HIT_THRESHOLD = float(os.environ.get("QUERY_CLASSC_HIT_THRESHOLD", "0.55"))
+
+# Amount a Qdrant/Class C fact's rank score is demoted when the DB already has a confident
+# answer (D3 rank-down instead of exclusion). Config-driven.
+QUERY_QDRANT_RANKDOWN = float(os.environ.get("QUERY_QDRANT_RANKDOWN", "0.5"))
+
+# Weight of content quality score in Qdrant rank-down blending. 0.25 = quality drives
+# 25% of rank, cosine confidence drives 75%. Tunable without rebuild.
+QUERY_QUALITY_WEIGHT = float(os.environ.get("QUERY_QUALITY_WEIGHT", "0.25"))
 
 # ── End dprompt-41 ──────────────────────────────────────────────────────────
 
@@ -3234,32 +3579,38 @@ def determine_scope_multi_factor(db, user_id: str, facts: list[dict], query_lowe
     detected_taxonomies = set()
     rel_types_in_facts = {f.get("rel_type") for f in facts if f.get("rel_type")}
 
-    # Factor 1: Query-driven taxonomy detection.
-    # Match query keywords against taxonomy descriptions and member entity types.
-    # "weather" → location, "family" → family, "work" → work, etc.
-    # When query has no domain keywords, detected_taxonomies stays empty = return ALL facts.
+    # Factor 1: GLiNER2 zero-shot classification of query against taxonomy descriptions.
+    # Same pattern as /classify-intent — labels from entity_taxonomies.description (DB-driven),
+    # description→name mapping post-call. Adding a new taxonomy row automatically participates.
     if query_lower:
-        try:
-            with db.cursor() as cur:
-                cur.execute(
-                    "SELECT taxonomy_name, description, member_entity_types "
-                    "FROM entity_taxonomies"
-                )
-                for row in cur.fetchall():
-                    tax_name = row[0]
-                    description = (row[1] or "").lower()
-                    member_types = [t.lower() for t in (row[2] or [])]
-                    query_words = set(query_lower.split())
-                    desc_words = set(description.split())
-                    if query_words & desc_words:
-                        detected_taxonomies.add(tax_name)
-                        continue
-                    for mtype in member_types:
-                        if mtype in query_lower:
-                            detected_taxonomies.add(tax_name)
-                            break
-        except Exception as e:
-            log.warning("query.scope_query_driven_failed", error=str(e))
+        _gliner = get_gliner_model()
+        if _gliner:
+            try:
+                with db.cursor() as cur:
+                    cur.execute("SELECT taxonomy_name, description FROM entity_taxonomies WHERE description IS NOT NULL")
+                    _tax_rows = cur.fetchall()
+                if _tax_rows:
+                    _desc_to_tax = {row[1]: row[0] for row in _tax_rows}
+                    _gliner_result = _gliner.classify_text(
+                        query_lower,
+                        {"taxonomy": list(_desc_to_tax.keys())},
+                        include_confidence=True,
+                    )
+                    _tax_hit = _gliner_result.get("taxonomy", {}) if isinstance(_gliner_result, dict) else {}
+                    _hit_label = _tax_hit.get("label") if isinstance(_tax_hit, dict) else None
+                    _hit_conf = float(_tax_hit.get("confidence", 0.0)) if isinstance(_tax_hit, dict) else 0.0
+                    if _hit_label and _hit_conf >= 0.3 and _hit_label in _desc_to_tax:
+                        detected_taxonomies.add(_desc_to_tax[_hit_label])
+                        log.info("query.scope_gliner2_match",
+                                 taxonomy=_desc_to_tax[_hit_label],
+                                 confidence=round(_hit_conf, 3),
+                                 query=query_lower[:50])
+                    else:
+                        log.debug("query.scope_gliner2_low_confidence",
+                                  confidence=round(_hit_conf, 3), label=_hit_label)
+            except Exception as _e:
+                log.warning("query.scope_gliner2_failed",
+                            error=str(_e), error_type=type(_e).__name__)
 
     # Factor 2: Fact-driven fallback — only when query-driven returned nothing.
     if not detected_taxonomies:
@@ -3782,22 +4133,47 @@ async def refresh_intent_pattern_caches():
     No authentication required (internal-only endpoint).
     Returns: {"status": "ok", "patterns_loaded": count}
     """
-    global _NEGATION_PATTERNS_CACHE, _PREFERENCE_PATTERNS_CACHE
+    global _NEGATION_PATTERNS_CACHE, _PREFERENCE_PATTERNS_CACHE, _REL_TYPE_META
+    rel_type_meta_count = None
     try:
-        from src.extraction.compound import reset_extraction_patterns_cache
-
         neg_patterns = _load_negation_patterns_cache()
         pref_patterns = _load_preference_patterns_cache()
-        reset_extraction_patterns_cache()
+
+        # Phase 3 (Severance #3): reload _REL_TYPE_META from rel_types IN THE BACKEND PROCESS.
+        # The re_embedder runs in a SEPARATE OS process; grown/updated rel_types are invisible
+        # to ingest until this reload runs in the uvicorn process. The re_embedder calls this
+        # endpoint each cycle after ontology approval / head-tail sweep — this is the cross-
+        # process bridge that closes the loop without a container restart.
+        try:
+            _REL_TYPE_META = _build_rel_type_meta(os.environ.get("POSTGRES_DSN", ""))
+            rel_type_meta_count = len(_REL_TYPE_META)
+            # Keep the routing/validation cache and scalar cache consistent in-process too.
+            _refresh_rel_type_cache()
+            _refresh_scalar_rel_types_cache()
+            log.info("refresh_intent_pattern_caches.rel_type_meta_reloaded",
+                     rel_type_count=rel_type_meta_count)
+        except Exception as _rm_err:
+            log.error("refresh_intent_pattern_caches.rel_type_meta_reload_failed",
+                      error=str(_rm_err)[:120])
+
+        # Reset the dead-path extraction pattern cache if present (best-effort; not on the
+        # self-growth path — kept only for backward compatibility of the existing import).
+        try:
+            from src.extraction.compound import reset_extraction_patterns_cache
+            reset_extraction_patterns_cache()
+        except Exception:
+            pass
 
         log.info("refresh_intent_pattern_caches.done",
                 negation_count=len(neg_patterns),
-                preference_count=len(pref_patterns))
+                preference_count=len(pref_patterns),
+                rel_type_meta_count=rel_type_meta_count)
 
         return {
             "status": "ok",
             "negation_patterns_loaded": len(neg_patterns),
             "preference_patterns_loaded": len(pref_patterns),
+            "rel_type_meta_loaded": rel_type_meta_count,
             "extraction_patterns_cache": "reset"
         }
     except Exception as e:
@@ -4991,18 +5367,14 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                 try:
                     db_conn = psycopg2.connect(dsn)
                     with db_conn.cursor() as cur:
-                        # FIX #3: Query per-user confidence gate from intent_confidence_feedback table
-                        # Looks for "gate=0.XX" format in confidence_bin column (stored by re_embedder)
-                        # This is metadata-driven learning: user corrections influence gate over time
+                        # Query per-user confidence gate from confidence_gates table (written by re_embedder)
+                        # This is metadata-driven learning: re_embedder adjusts threshold over time
                         result = None
                         try:
                             cur.execute("""
-                                SELECT confidence_bin
-                                FROM public.intent_confidence_feedback
+                                SELECT threshold
+                                FROM public.confidence_gates
                                 WHERE user_id = %s
-                                AND confidence_bin LIKE 'gate=%'
-                                ORDER BY created_at DESC
-                                LIMIT 1
                             """, (user_id,))
                             result = cur.fetchone()
                         except Exception as query_err:
@@ -5012,12 +5384,10 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                             except Exception:
                                 pass
                             # Continue with default threshold instead of returning
-                        # FIX #3: Defensive check on result structure before indexing
-                        if result and isinstance(result, tuple) and len(result) > 0 and result[0]:
+                        # Defensive check on result structure before indexing
+                        if result and isinstance(result, tuple) and len(result) > 0 and result[0] is not None:
                             try:
-                                # Extract gate value from "gate=0.65" format
-                                gate_str = result[0].replace('gate=', '').strip()
-                                gate_value = float(gate_str)
+                                gate_value = float(result[0])
                                 # Sanity check: valid range [0.50, 0.75]
                                 if 0.50 <= gate_value <= 0.75:
                                     user_gate_threshold = gate_value
@@ -5025,7 +5395,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                                 else:
                                     log.warning("classify_intent.gate_value_out_of_range", value=gate_value, min=0.50, max=0.75)
                             except (ValueError, TypeError, AttributeError) as e:
-                                log.warning("classify_intent.gate_value_parse_error", value=str(result[0])[:60] if result[0] else "None", error=str(e)[:60])
+                                log.warning("classify_intent.gate_value_parse_error", value=str(result[0])[:60] if result[0] is not None else "None", error=str(e)[:60])
                 except Exception as e:
                     log.warning("classify_intent.gate_lookup_connection_failed", error=str(e)[:100], user_id=user_id[:8])
                 finally:
@@ -5351,21 +5721,17 @@ async def get_confidence_gate(user_id: str):
 
         # GROWTH ENGINE WIRE #3: Check for re_embedder's recommended gate first
         # If re_embedder has computed a sophisticated gate based on feedback, use it
+        # Primary: read re_embedder's computed threshold from confidence_gates
         cursor.execute("""
-            SELECT confidence_bin
-            FROM intent_confidence_feedback
+            SELECT threshold
+            FROM confidence_gates
             WHERE user_id = %s
-            AND confidence_bin LIKE 'gate=%'
-            ORDER BY updated_at DESC
-            LIMIT 1
         """, (user_id,))
         gate_row = cursor.fetchone()
 
-        if gate_row and gate_row[0]:
+        if gate_row and gate_row[0] is not None:
             try:
-                # Extract gate value from "gate=0.65" format
-                gate_str = gate_row[0].replace('gate=', '')
-                threshold = float(gate_str)
+                threshold = float(gate_row[0])
                 threshold = max(0.5, min(0.75, threshold))
                 log.debug("get_confidence_gate.from_reembedder", user_id=user_id[:12], threshold=round(threshold, 2))
                 cursor.close()
@@ -5376,6 +5742,7 @@ async def get_confidence_gate(user_id: str):
 
         # Fallback: Query intent_confidence_feedback to calculate adaptive threshold
         # Uses correction rate to lower/raise gate dynamically
+        # Note: bare % in LIKE must be escaped as %% for psycopg2
         query = """
             SELECT
                 COALESCE(
@@ -5387,7 +5754,7 @@ async def get_confidence_gate(user_id: str):
                 ) as threshold
             FROM intent_confidence_feedback
             WHERE user_id = %s
-            AND confidence_bin NOT LIKE 'gate=%'
+            AND confidence_bin NOT LIKE 'gate=%%'
         """
         cursor.execute(query, (user_id,))
         row = cursor.fetchone()
@@ -5426,21 +5793,38 @@ def extract(req: IngestRequest, model=Depends(get_gliner_model)):
         elif req.context:
             ctx = req.context.model_dump() if hasattr(req.context, 'model_dump') else req.context
 
-        # GLiNER2 NER extraction — just get entity types, not relationships
-        ner_result = model.extract_entities(
-            req.text,
-            ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
-        )
+        # GLiNER2 NER extraction — entity types from entity_taxonomies (metadata-driven, grows with DB)
+        _extract_labels: dict[str, str] = {}  # type_name -> label string
+        try:
+            import psycopg2 as _psycopg2_ext
+            _db_ext = _psycopg2_ext.connect(os.environ.get("POSTGRES_DSN"))
+            with _db_ext.cursor() as _lc:
+                _lc.execute("""
+                    SELECT unnest(member_entity_types) AS etype,
+                           string_agg(description, '; ') AS ctx
+                    FROM entity_taxonomies GROUP BY etype ORDER BY etype
+                """)
+                for _et, _ctx in _lc.fetchall():
+                    if _et:
+                        _extract_labels[_et] = f"{_et}: {_ctx}" if _ctx else _et
+            _db_ext.close()
+        except Exception:
+            pass
+        if not _extract_labels:
+            _extract_labels = {t: t for t in ["Person", "Animal", "Organization", "Location", "Object", "Concept"]}
+
+        ner_result = model.extract_entities(req.text, list(_extract_labels.values()))
 
         # Convert NER result format to entity list with types
         raw_entities = []
-        for entity_type, entity_names in ner_result.get("entities", {}).items():
+        for label_str, entity_names in ner_result.get("entities", {}).items():
             if entity_names and isinstance(entity_names, list):
+                canonical_etype = label_str.split(":")[0].strip().upper()
                 for name in entity_names:
                     if name and name.strip():
                         raw_entities.append({
                             "subject": name.strip(),
-                            "subject_type": entity_type.upper(),
+                            "subject_type": canonical_etype,
                             "object": "",
                             "object_type": "",
                             "rel_type": ""
@@ -5623,31 +6007,85 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
                 ]
                 occupied.append((start, end))
 
-                # Try to find a named subject before this atomic value.
-                # Matches: "IDENTIFIER has/had/have an? [value_type]" within 100 chars before the match.
-                _subj_pat = _re_atomic.compile(
-                    r'\b([A-Za-z][A-Za-z0-9\-_.]{1,})\s+(?:has|had|have)\b',
-                    _re_atomic.I
-                )
-                _text_window = text[max(0, start - 100): start]
-                _subj_match = None
-                for _sm in _subj_pat.finditer(_text_window):
-                    _subj_match = _sm  # take the last (closest) match
-                subject_hint = _subj_match.group(1).lower() if _subj_match else None
-
                 all_matches.append({
                     "value": value,
                     "type": type_label,
                     "rel_type": rel_type,
                     "start": start,
                     "end": end,
-                    "subject_hint": subject_hint,   # may be None; used by supplementation block
+                    # subject_hint intentionally absent — subject attribution is always
+                    # resolved via _resolve_atomic_subjects_via_llm() which has full text
+                    # context. Regex lookbehind was brittle (English-only, grammar-specific)
+                    # and violated the no-brittle-code CLAUDE.md constraint.
                 })
         except Exception:
             continue
 
     all_matches.sort(key=lambda x: x["start"])
     return all_matches
+
+
+def _resolve_atomic_subjects_via_llm(text: str, unresolved: list[dict], user_id: str) -> list[dict]:
+    """Resolve subject attribution for atomic values via LLM callback.
+
+    When _detect_atomic_values finds structured values (IPs, emails, MACs, etc.)
+    but cannot determine the subject via heuristic lookbehind, this function
+    calls the LLM with the full text context to resolve ownership.
+
+    Self-growth: LLM resolutions feed into extraction_pattern_matches for
+    re_embedder pattern learning, strengthening the heuristic over time.
+    """
+    if not unresolved:
+        return []
+
+    values_desc = "\n".join(
+        f"  - value: {_av['value']} (rel_type: {_av['rel_type']}, type: {_av.get('type', '?')})"
+        for _av in unresolved
+    )
+
+    prompt = (
+        f"Given this text:\n\n{text}\n\n"
+        f"The following structured values were detected. Determine which entity in the text "
+        f"owns or is associated with each value. The subject can be any named entity "
+        f"(person, device, server, organization, etc.) — not necessarily the user.\n\n"
+        f"{values_desc}\n\n"
+        f"Return ONLY a JSON array. Each item: "
+        f'[{{"subject": "entity_name", "value": "the_value", "rel_type": "the_rel_type"}}]. '
+        f"Use lowercase for subject. Omit items where the owner is truly unknown."
+    )
+
+    try:
+        from src.api.llm_calls import call_llm_with_retry_sync
+        import os as _os
+
+        messages = [{"role": "user", "content": prompt}]
+        result = call_llm_with_retry_sync(
+            messages=messages,
+            model=_os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+            user_id=user_id,
+            operation="atomic_subject_resolution",
+        )
+
+        # call_llm_with_retry_sync returns json.loads(content) — a list or dict
+        if not isinstance(result, list):
+            return []
+
+        resolved = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            subject = (item.get("subject") or "").strip().lower()
+            value = (item.get("value") or "").strip()
+            rel_type = (item.get("rel_type") or "").strip().lower()
+            if not subject or subject == "unknown" or not value:
+                continue
+            for _av in unresolved:
+                if _av["value"].lower() == value.lower() and _av["rel_type"].lower() == rel_type:
+                    resolved.append({**_av, "subject": subject})
+                    break
+        return resolved
+    except Exception:
+        return []
 
 
 def _build_extraction_prompt(db_connection=None) -> str:
@@ -5755,12 +6193,20 @@ AMBIGUOUS PRONOUNS:
   - If "he", "she", "it", "they" appear, resolve from prior context IF POSSIBLE
   - Omit the fact if no prior context available (prevents hallucination)
 
-REL_TYPE METADATA (optional for novel rel_types):
-  - head_types: entity types allowed as subject (e.g., ["Person"])
-  - tail_types: object types allowed (e.g., ["Organization"], ["SCALAR"] for values)
-  - is_symmetric: true if bidirectional (spouse, friend_of), false if directional (parent_of, works_for)
-  - inverse_rel_type: reverse relationship (parent_of ↔ child_of)
-  - is_hierarchy_rel: true for classification (instance_of, subclass_of), false for relational
+REL_TYPE METADATA — REQUIRED for NOVEL rel_types (rel_types you invent that are not common):
+  When you emit a rel_type that is NOT a common, well-known one (i.e. it is novel/domain-specific,
+  e.g. "runs", "has_vlan", "connects_to", "mentors"), you MUST attach a "rel_type_metadata"
+  object to that triple describing the new relationship type. This lets the system create the
+  ontology entry in one step. Include ALL of these fields:
+    - head_types: list of entity types allowed as SUBJECT (e.g., ["Object"], ["Person"]); ["ANY"] if unconstrained
+    - tail_types: list of entity types allowed as OBJECT (e.g., ["Software"], ["Person"]); ["SCALAR"] if the object is a literal value
+    - category: one of family|work|location|identity|temporal|behavioral|physical|social|network|general
+    - is_symmetric: true if bidirectional (e.g. spouse, friend_of), false if directional (e.g. runs, works_for)
+    - inverse_rel_type: the reverse relationship name, or null if none (e.g. parent_of ↔ child_of)
+    - natural_language: a short human phrase using X for subject and Y for object (e.g. "X runs Y", "X mentors Y")
+  Structure:
+    {"subject":"...","object":"...","rel_type":"runs","definition":"...","rel_type_metadata":{"head_types":["Object"],"tail_types":["Software"],"category":"network","is_symmetric":false,"inverse_rel_type":null,"natural_language":"X runs Y"}}
+  For COMMON/known rel_types (parent_of, spouse, age, works_for, etc.) DO NOT include rel_type_metadata.
 
 CRITICAL — CORRECTION HANDLING:
 When extracting a CORRECTION (marked with "is_correction": true):
@@ -6062,32 +6508,6 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     _EXTRACT_REWRITE_CALL_COUNT += 1
     log.info("extract_rewrite.call_start", call_count=_EXTRACT_REWRITE_CALL_COUNT, user_id=req.user_id, text_len=len(req.text or ""))
 
-    # CRITICAL FIX: Try compound extraction FIRST (zero external calls)
-    # Catches "My name is X", "I am 42", "I prefer to be called Z", etc.
-    # This avoids calling the LLM for high-confidence scalar statements.
-    try:
-        from src.extraction.compound import extract_compound_facts
-        compound_facts = extract_compound_facts(req.text or "")
-        if compound_facts:
-            log.info("extract_rewrite.compound_edges_extracted",
-                    count=len(compound_facts),
-                    note="Pattern matching found facts (avoids LLM call)")
-            # Return early with compound extraction results, but release lock first
-            response = {
-                "status": "success",
-                "edges": compound_facts,
-                "message": f"Extracted {len(compound_facts)} facts via pattern matching"
-            }
-            # Cache successful response for idempotency (before releasing lock)
-            if _idempotency_mgr and idempotency_key and lock_acquired and len(compound_facts) > 0:
-                _idempotency_mgr.cache_response(idempotency_key, response, ttl_seconds=3600)
-            # Release lock
-            if _idempotency_mgr and idempotency_key and lock_acquired:
-                _idempotency_mgr.release_lock(idempotency_key)
-            return response
-    except Exception as e:
-        log.warning("extract_rewrite.compound_extraction_failed", error=str(e))
-
     try:
         import json
         import os
@@ -6291,33 +6711,59 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                                 log.debug("extract_rewrite.gliner2_constrained_inference",
                                          attempt=1, found=len(entity_types), db_types_available=len(db_types))
 
-                            # Attempt 2: Unconstrained inference for discovery (if still untyped entities remain)
+                            # Attempt 2: Discovery — runs whenever entities remain untyped after Attempt 1.
+                            # Labels are derived from entity_taxonomies.member_entity_types + descriptions
+                            # (metadata-driven, grows as new taxonomies are added — zero code changes needed).
+                            # Static taxonomy descriptions are used as GLiNER2 label context per docs:
+                            # "Natural language descriptions yield better results than single words."
+                            # No user-specific data or learned patterns injected (purity maintained).
                             untyped_remaining = {e for e in entities_needing_types if e.lower() not in entity_types}
-                            if untyped_remaining and not db_types:
-                                # No known types in DB: GLiNER2 discovery mode (infer freely)
-                                # Let GLiNER2 discover new entity types without seed constraints
+                            if untyped_remaining:
                                 log.debug("extract_rewrite.gliner2_discovery_mode_start",
                                          untyped_count=len(untyped_remaining))
                                 try:
-                                    # GLiNER2 unconstrained: provide default entity types for discovery
-                                    # GLiNER2 requires non-empty entity_types list
-                                    default_entity_types = [
-                                        "Person", "Animal", "Organization", "Location", "Object", "Concept"
-                                    ]
+                                    # Build labels from entity_taxonomies: "{type}: {taxonomy descriptions}"
+                                    # Query all distinct member_entity_types and their associated taxonomy descriptions.
+                                    # Result grows automatically when new taxonomy rows are added to the DB.
+                                    _taxonomy_labels: dict[str, str] = {}  # type_name -> label string
+                                    try:
+                                        with db_gliner.cursor() as _tc:
+                                            _tc.execute("""
+                                                SELECT unnest(member_entity_types) AS etype,
+                                                       string_agg(description, '; ') AS ctx
+                                                FROM entity_taxonomies
+                                                GROUP BY etype
+                                                ORDER BY etype
+                                            """)
+                                            for _etype, _ctx in _tc.fetchall():
+                                                if _etype:
+                                                    _taxonomy_labels[_etype] = f"{_etype}: {_ctx}" if _ctx else _etype
+                                    except Exception:
+                                        pass
+
+                                    # Fallback if DB unavailable or returns nothing
+                                    if not _taxonomy_labels:
+                                        _taxonomy_labels = {t: t for t in ["Person", "Animal", "Organization", "Location", "Object", "Concept"]}
+
+                                    discovery_labels = list(_taxonomy_labels.values())
                                     ner_result = gliner_model.extract_entities(
                                         req.text,
-                                        default_entity_types,  # FIXED: Provide non-empty default types
-                                        threshold=0.25,
+                                        discovery_labels,
+                                        threshold=0.3,
                                         max_len=2048
                                     )
-                                    for entity_type, entity_names in ner_result.get("entities", {}).items():
-                                        if entity_names and entity_type:
+                                    # Key in result is the label string; map back to canonical type name
+                                    for label_str, entity_names in ner_result.get("entities", {}).items():
+                                        if entity_names and label_str:
+                                            canonical_type = label_str.split(":")[0].strip()
                                             for name in entity_names:
                                                 name_clean = (name or "").strip().lower()
                                                 if name_clean and name_clean in untyped_remaining:
-                                                    entity_types[name_clean] = entity_type.upper()
+                                                    entity_types[name_clean] = canonical_type.upper()
                                     log.debug("extract_rewrite.gliner2_discovery_result",
-                                             attempt=2, found=len(entity_types), new_discoveries=len([e for e in untyped_remaining if e.lower() in entity_types]))
+                                             attempt=2, found=len(entity_types),
+                                             new_discoveries=len([e for e in untyped_remaining if e.lower() in entity_types]),
+                                             taxonomy_labels_used=len(discovery_labels))
                                 except Exception as e:
                                     log.debug("extract_rewrite.gliner2_discovery_failed", error=str(e))
 
@@ -6359,26 +6805,30 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                         db_strengthen = None
                         try:
                             import psycopg2
+                            from src.provisioning.schema_manager import derive_user_slug_from_uuid
+                            _strengthen_slug = derive_user_slug_from_uuid(req.user_id)
+                            _strengthen_schema = f"faultline_{_strengthen_slug}"
                             db_strengthen = psycopg2.connect(os.getenv("POSTGRES_DSN"))
-                            with db_strengthen.cursor() as cur:
-                                for entity_name, discovered_type in entity_types.items():
-                                    if discovered_type and discovered_type != "SCALAR":
-                                        # Register entity with discovered type
-                                        try:
-                                            from src.entity_registry.registry import EntityRegistry
-                                            registry = EntityRegistry(db_strengthen)
-                                            entity_uuid = registry.resolve(req.user_id, entity_name)
-                                            # Update entity type separately (resolve() doesn't take type_hint parameter)
-                                            with db_strengthen.cursor() as _cur:
-                                                _cur.execute(
-                                                    "UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'",
-                                                    (discovered_type.title(), entity_uuid, req.user_id)
-                                                )
-                                            log.debug("extract_rewrite.strengthen_entity_type_stored",
-                                                     entity_name=entity_name, entity_type=discovered_type, uuid=entity_uuid)
-                                        except Exception as e:
-                                            log.debug("extract_rewrite.strengthen_entity_type_store_failed",
-                                                     entity_name=entity_name, entity_type=discovered_type, error=str(e))
+                            # Must set search_path so ON CONFLICT (id) targets the per-user schema
+                            # whose entities PK is (id) alone — not the public schema's (id, user_id).
+                            with db_strengthen.cursor() as _sch_cur:
+                                _sch_cur.execute(f"SET search_path TO {_strengthen_schema}, public")
+                            for entity_name, discovered_type in entity_types.items():
+                                if discovered_type and discovered_type != "SCALAR":
+                                    try:
+                                        from src.entity_registry.registry import EntityRegistry
+                                        registry = EntityRegistry(db_strengthen, schema_name=_strengthen_schema)
+                                        entity_uuid = registry.resolve(req.user_id, entity_name)
+                                        with db_strengthen.cursor() as _cur:
+                                            _cur.execute(
+                                                "UPDATE entities SET entity_type = %s WHERE id = %s AND entity_type = 'unknown'",
+                                                (discovered_type.title(), entity_uuid)
+                                            )
+                                        log.debug("extract_rewrite.strengthen_entity_type_stored",
+                                                 entity_name=entity_name, entity_type=discovered_type, uuid=entity_uuid)
+                                    except Exception as e:
+                                        log.debug("extract_rewrite.strengthen_entity_type_store_failed",
+                                                 entity_name=entity_name, entity_type=discovered_type, error=str(e))
                             db_strengthen.commit()
                             log.info("extract_rewrite.strengthen_complete",
                                     types_stored=len([t for t in entity_types.values() if t and t != "SCALAR"]))
@@ -6474,30 +6924,6 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
         # Correction filtering now FULLY HANDLED by WGMValidationGate._apply_correction_semantics()
         # Extract returns ALL triples (dumb). Ingest applies semantics via rel_types.correction_behavior (smart).
         # Removed hardcoded negation filter — metadata-driven validation gate is authoritative.
-
-        # Dead name prevention: Augment LLM extraction with regex-based preference signal detection
-        # The compound extractor catches "goes by", "prefers to be called", etc. that LLM might miss
-        try:
-            from src.extraction.compound import extract_compound_facts
-            compound_edges = extract_compound_facts(req.text or "")
-
-            # Merge: prefer LLM extraction, but add pref_name edges from compound if missing
-            llm_keys = {(e.get("subject", "").lower(), e.get("rel_type", "").lower())
-                       for e in triples if e.get("rel_type")}
-
-            for ce in compound_edges:
-                ce_key = (ce.get("subject", "").lower(), ce.get("rel_type", "").lower())
-                # Add compound edge if: (1) it's a scalar rel_type, AND (2) we don't have that subject+rel_type from LLM
-                ce_rel_meta = _REL_TYPE_META.get(ce.get("rel_type", "").lower())
-                is_scalar = ce_rel_meta and "SCALAR" in ce_rel_meta.get("tail_types", [])
-                if is_scalar and ce_key not in llm_keys:
-                    triples.append(ce)
-                    log.info("extract.compound_pref_name_merged",
-                            subject=ce.get("subject"), object=ce.get("object"),
-                            is_preferred=ce.get("is_preferred_label"))
-        except Exception as e:
-            log.warning("extract.compound_augmentation_failed", error=str(e))
-            # Non-fatal: continue with LLM extraction only
 
         log.info("extract.rewrite_success", triple_count=len(triples), user_id=req.user_id)
 
@@ -7099,6 +7525,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # Pre-initialize GLiNER cache so it's always available (populated by preflight if model runs)
     _gliner_cache = {}
 
+    # Phase 2 (self-growth): metadata for novel rel_types returned by the miss-handling LLM
+    # call, keyed by lowercased rel_type. Consulted in the unknown-rel_type branch to create
+    # the rel_type in-flow WITH complete metadata and classify the fact Class B (0.6).
+    # { rel_type: {head_types, tail_types, category, is_symmetric, inverse_rel_type, natural_language} }
+    _novel_rel_metadata = {}
+
     # dprompt-23: First-person pronoun set used by both the /extract/rewrite
     # normalizer and the req.edges normalizer below (dBug-023).
     _FIRST_PERSON_PRONOUNS = {"i", "me", "my", "myself", "we", "us", "our", "ourselves"}
@@ -7107,28 +7539,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # context. If the LLM emits them literally, skip them — we cannot guess the referent.
     _THIRD_PERSON_PRONOUNS = {"it", "he", "she", "him", "her", "his", "they", "them", "hers", "its"}
 
-    # If raw text provided and no edges, extract via pattern matching → GLiNER2 → LLM
+    # If raw text provided and no edges, extract via GLiNER2 → LLM
     if not req.edges and req.text:
         try:
             import json
 
-            # CRITICAL FIX: Run compound extraction FIRST (zero external calls)
-            # Catches "My name is X", "I am married to Y", "I prefer to be called Z" etc.
-            # This avoids expensive GLiNER2/LLM calls for high-confidence scalar statements.
-            pattern_edges = []
             raw_inferred = []
-            try:
-                from src.extraction.compound import extract_compound_facts
-                compound_facts = extract_compound_facts(req.text)
-                if compound_facts:
-                    pattern_edges = compound_facts
-                    # Convert to EdgeInput objects
-                    raw_inferred = [EdgeInput(**e) for e in compound_facts]
-                    log.info("ingest.compound_edges_extracted",
-                            count=len(pattern_edges),
-                            note="Pattern matching for high-confidence scalar facts (avoids GLiNER2+LLM)")
-            except Exception as e:
-                log.warning("ingest.compound_extraction_failed", error=str(e))
 
             # Call /extract/rewrite to get LLM-inferred triples
             qwen_url = _LLM_URL
@@ -7177,24 +7593,176 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # reinforced by re_embedder when confirmed.
             gliner_edges = None
             pattern_edges = None
+            _gliner_miss = False  # Phase 1: set True when NER spans left unconnected by GLiNER2 edges
+            _miss_spans = set()
             if model is not None:
                 try:
-                    # CRITICAL: Zero-shot discovery — relation_types={} enables discovery of ANY relationship
-                    # (not just those in rel_types table). GLiNER2 native output includes confidence scores.
+                    # Fetch scalar rel_types from DB so GLiNER2 sees candidates from /expand-created types.
+                    # Metadata-driven: no hardcoding — any rel_type added via /expand is automatically included.
+                    # Description values (natural_language) are stored in _relation_metadata by GLiNER2 but
+                    # not passed to the model's embedding layer; only the rel_type name keys matter for
+                    # zero-shot extraction. DB values used as-is — no enrichment (Pitfall 11 prevention).
+                    # Falls back to _REL_TYPE_META startup cache if DB is unavailable.
+                    _scalar_relation_types: dict = {}
+                    _scalar_dsn = os.environ.get("POSTGRES_DSN")
+                    if _scalar_dsn:
+                        try:
+                            with psycopg2.connect(_scalar_dsn) as _scalar_conn:
+                                with _scalar_conn.cursor() as _scalar_cur:
+                                    _scalar_cur.execute(
+                                        "SELECT rel_type, natural_language, head_types, category FROM rel_types"
+                                        " WHERE tail_types @> ARRAY['SCALAR']::TEXT[]"
+                                        " AND natural_language IS NOT NULL"
+                                    )
+                                    for row in _scalar_cur.fetchall():
+                                        rt, desc, head_types, category = row[0], row[1], row[2], row[3]
+                                        # Per-relation thresholds (metadata-driven, no hardcoding):
+                                        # - Human types (Person head_types, identity/physical/temporal/work category): 0.5
+                                        # - Network/bootstrap (empty head_types, network category): 0.85 — blocks false positives
+                                        # - Default: 0.6
+                                        head_list = head_types if head_types else []
+                                        is_human = ("Person" in head_list or
+                                                   category in ("identity", "physical", "temporal", "work"))
+                                        is_network = (not head_list and category == "network")
+                                        if is_human:
+                                            _threshold = 0.5
+                                        elif is_network:
+                                            _threshold = 0.85
+                                        else:
+                                            _threshold = 0.6
+                                        _scalar_relation_types[rt] = {
+                                            "description": desc or "",
+                                            "threshold": _threshold,
+                                        }
+                            log.debug("ingest.gliner2_scalar_rel_types_loaded",
+                                     count=len(_scalar_relation_types))
+                        except Exception as _scalar_err:
+                            log.warning("ingest.gliner2_scalar_rel_types_db_failed",
+                                       error=str(_scalar_err),
+                                       fallback="using _REL_TYPE_META cache")
+                    # Fallback: derive from startup cache (no natural_language, but names are enough)
+                    if not _scalar_relation_types and _REL_TYPE_META:
+                        _scalar_relation_types = {
+                            rt: {"description": "", "threshold": 0.5}
+                            for rt, meta in _REL_TYPE_META.items()
+                            if "SCALAR" in (meta.get("tail_types") or [])
+                        }
+                        log.debug("ingest.gliner2_scalar_rel_types_from_cache",
+                                 count=len(_scalar_relation_types))
+
+                    # ── PHASE 4: GLiNER2's second shot for grown RELATIONAL types ───────
+                    # The scalar-only seed above means a grown relational type (e.g. `runs`,
+                    # `manages`) is NEVER handed to GLiNER2 → on the next encounter GLiNER2
+                    # still misses it and the LLM is called forever (Severance #1+E). Close
+                    # the loop: ALSO pass relational rel_types that are domain-relevant to
+                    # the entities GLiNER2's NER pass found in THIS text. Selection reads
+                    # entity_taxonomies + rel_types from the DB at runtime (no hardcoded
+                    # domains/rel_types). A newly-grown rel_type — now in rel_types and
+                    # visible via the Phase 3 _REL_TYPE_META refresh — will appear here on
+                    # the next encounter because the query reads the live rel_types table.
+                    # Labels stay CLEAN (name + short natural_language only — Pitfall 11).
+                    _detected_entity_types = {v for v in _gliner_cache.values() if v}
+                    _relational_candidates = _select_domain_relational_rel_types(
+                        os.environ.get("POSTGRES_DSN", ""),
+                        _detected_entity_types,
+                    )
+                    # Drop relational types already present as scalars (scalar wins — it is
+                    # the more specific storage path) so we never double-count toward the cap.
+                    _relational_candidates = {
+                        rt: meta for rt, meta in _relational_candidates.items()
+                        if rt not in _scalar_relation_types
+                    }
+
+                    # ── 25-LABEL CAP ENFORCEMENT (GLiREL training cap, arxiv:2501.03172) ──
+                    # Known scalars are the reliable, established seed → ALWAYS kept first.
+                    # Relational candidates fill the remaining budget, prioritized by:
+                    #   (1) direct head/tail type match to detected entities (most relevant),
+                    #   (2) then by per-type threshold ascending (cheaper-to-fire = more
+                    #       likely the intended domain relation).
+                    # Anything over the cap is TRUNCATED and logged LOUD (fail loud).
+                    _scalar_count = len(_scalar_relation_types)
+                    _relational_budget = _GLINER2_RELATION_LABEL_CAP - _scalar_count
+                    _truncated_relational = 0
+                    if _relational_budget <= 0:
+                        # Scalars alone meet/exceed the cap — no room for relational types.
+                        _truncated_relational = len(_relational_candidates)
+                        _relational_candidates = {}
+                    elif len(_relational_candidates) > _relational_budget:
+                        _ranked = sorted(
+                            _relational_candidates.items(),
+                            key=lambda kv: (
+                                0 if kv[1].get("_type_match") else 1,  # type match first
+                                kv[1].get("threshold", 0.6),            # then lower threshold
+                            ),
+                        )
+                        _kept = dict(_ranked[:_relational_budget])
+                        _truncated_relational = len(_relational_candidates) - len(_kept)
+                        _relational_candidates = _kept
+
+                    if _truncated_relational > 0:
+                        log.warning("gliner2.candidate_set_truncated",
+                                    scalar_count=_scalar_count,
+                                    relational_kept=len(_relational_candidates),
+                                    relational_truncated=_truncated_relational,
+                                    cap=_GLINER2_RELATION_LABEL_CAP,
+                                    detected_types=sorted(
+                                        {t.lower() for t in _detected_entity_types}),
+                                    note="relational candidate set exceeded 25-label GLiREL cap")
+
+                    # Merge: scalars + selected relational, stripping the internal
+                    # prioritization keys so GLiNER2 receives ONLY {description, threshold}.
+                    for _rt, _meta in _relational_candidates.items():
+                        _scalar_relation_types[_rt] = {
+                            "description": _meta.get("description", ""),
+                            "threshold": _meta.get("threshold", 0.6),
+                        }
+                    log.debug("ingest.gliner2_candidate_set_built",
+                              scalar_count=_scalar_count,
+                              relational_count=len(_relational_candidates),
+                              total=len(_scalar_relation_types),
+                              cap=_GLINER2_RELATION_LABEL_CAP)
+
                     gliner_relations = model.extract_relations(
                         req.text,
-                        relation_types={},  # Zero-shot mode: empty dict discovers any relationships
-                        threshold=0.5,
+                        relation_types=_scalar_relation_types,
+                        threshold=0.3,
                         max_len=2048
                     )
                     log.debug("ingest.gliner2_raw_output",
                              relations=gliner_relations,
                              type=type(gliner_relations).__name__)
 
-                    gliner_edges = _convert_gliner_relations_to_edges(gliner_relations)
+                    gliner_edges = _convert_gliner_relations_to_edges(gliner_relations, _gliner_cache)
                     log.debug("ingest.gliner2_conversion_result",
                              edges_count=len(gliner_edges) if gliner_edges else 0,
                              edges=gliner_edges)
+
+                    # ── MISS DETECTION (Phase 1, Severance #1) ──────────────────────────
+                    # GLiNER2 is told only the known scalar rel_types, so any relation it has
+                    # no label for is invisible. The "miss" is the set of NER entity spans
+                    # GLiNER2 found but left UNCONNECTED by any extracted relation edge.
+                    # When a miss exists we MUST run the LLM fallback even though GLiNER2
+                    # matched known relations — otherwise novel relations co-occurring with a
+                    # known scalar are lost forever. Trigger is scoped (the unconnected spans);
+                    # the LLM still receives FULL context (B.3).
+                    _connected_spans = set()
+                    for _ge in (gliner_edges or []):
+                        _s = (_ge.get("subject") or "").lower().strip()
+                        _o = (_ge.get("object") or "").lower().strip()
+                        if _s:
+                            _connected_spans.add(_s)
+                        if _o:
+                            _connected_spans.add(_o)
+                    # NER spans = keys of the GLiNER2 cache (lowercased entity names).
+                    _ner_spans = {n for n in _gliner_cache.keys() if n}
+                    _miss_spans = {sp for sp in _ner_spans if sp not in _connected_spans}
+                    _gliner_miss = bool(_miss_spans)
+                    if _gliner_miss:
+                        log.info("ingest.gliner2_miss_detected",
+                                 miss_spans=sorted(_miss_spans),
+                                 ner_span_count=len(_ner_spans),
+                                 connected_span_count=len(_connected_spans),
+                                 note="unconnected NER spans → LLM fallback (full context)")
 
                     if gliner_edges:
                         log.info("ingest.gliner2_relations_success",
@@ -7215,7 +7783,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 relation_count=len(gliner_edges),
                                 note="Novel rel_types will be auto-created by re_embedder (dprompt-149 fix)")
 
-                        # If compound extraction didn't find anything, use GLiNER2 results
+                        # Use GLiNER2 results as pattern_edges
                         if not pattern_edges:
                             pattern_edges = gliner_edges
                         raw_inferred = [EdgeInput(**e) for e in gliner_edges]
@@ -7229,14 +7797,35 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                error_type=type(e).__name__)
                     log.exception("ingest.gliner2_exception")
 
-            # Call /extract/rewrite for LLM-based triple extraction (only if patterns and GLiNER2 didn't match)
-            # CRITICAL: pattern_edges from compound extraction (line ~6345) takes precedence — skip LLM if already found
-            if not pattern_edges and not gliner_edges:
+            # LLM fallback fires (Phase 1, Severance #1) when EITHER:
+            #   (a) GLiNER2 found nothing at all, OR
+            #   (b) GLiNER2 found edges but left a MISS — NER spans unconnected by any edge.
+            # In the miss case the LLM is handed FULL context (full text + GLiNER2's edges)
+            # so it classifies confidently (B.3); we then MERGE without duplicating.
+            _run_llm_fallback = (not gliner_edges) or _gliner_miss
+            if _run_llm_fallback:
                 faultline_url = os.getenv("FAULTLINE_API_URL", "http://localhost:8000")
+                _fallback_reason = "gliner2_empty" if not gliner_edges else "gliner2_miss"
+                # Hand the LLM FULL context (B.3): the full text PLUS the edges GLiNER2 already
+                # extracted, so it does not re-extract known relations and has the complete
+                # picture of the message. RewriteRequest has no edge-context field, so the
+                # already-extracted edges are appended to the text as a context appendix
+                # (mirrors the existing "Detected entities" appendix pattern in extract_rewrite).
+                _llm_text = req.text
+                if gliner_edges:
+                    _ctx_lines = "\n".join(
+                        f"- ({e.get('subject')}) {e.get('rel_type')} ({e.get('object')})"
+                        for e in gliner_edges
+                    )
+                    _llm_text = (
+                        f"{req.text}\n\n"
+                        f"Already extracted (do NOT repeat these, extract only what is MISSING):\n"
+                        f"{_ctx_lines}"
+                    )
                 response = await _http_client.post(
                     f"{faultline_url}/extract/rewrite",
                     json={
-                        "text": req.text,
+                        "text": _llm_text,
                         "user_id": req.user_id,
                         "chat_id": req.chat_id if hasattr(req, 'chat_id') and req.chat_id else None,
                         "typed_entities": typed_entities if typed_entities else None,
@@ -7245,26 +7834,26 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     timeout=30,
                 )
                 log.info("ingest.llm_extraction_called",
-                        reason="compound_and_gliner2_both_empty")
+                        reason=_fallback_reason,
+                        gliner_edge_count=len(gliner_edges) if gliner_edges else 0,
+                        miss_spans=sorted(_miss_spans) if _miss_spans else [])
             else:
                 response = None
-                if pattern_edges:
-                    log.info("ingest.llm_extraction_skipped",
-                            reason="compound_edges_found",
-                            count=len(pattern_edges))
                 if gliner_edges:
                     log.info("ingest.llm_extraction_skipped",
-                            reason="gliner_edges_found",
+                            reason="gliner_edges_found_no_miss",
                             count=len(gliner_edges))
 
-            if not pattern_edges and response and response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 rewrite_data = response.json()
                 # Check if /extract/rewrite returned an error status
                 if rewrite_data.get("status") == "error":
                     log.error("ingest.extraction_endpoint_error",
                              error=rewrite_data.get("error"),
                              user_id=req.user_id)
-                    raw_inferred = []
+                    # Preserve GLiNER2 edges in the miss case; only clear when GLiNER2 found nothing.
+                    if not (gliner_edges and _gliner_miss):
+                        raw_inferred = []
                 else:
                     # dprompt-23: Normalize first-person pronouns to "user" before entity resolution.
                     # Safety net — the /extract/rewrite prompt instructs the LLM to use "user",
@@ -7319,7 +7908,14 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     count=(_before - len(_triples_all)),
                                     text_snippet=req.text[:80])
 
-                    raw_inferred = []
+                    # MERGE (Phase 1, B.3): in the miss case raw_inferred already holds the
+                    # GLiNER2 edges (set above). Start from those and add LLM edges, deduping on
+                    # (subject, object, rel_type). When GLiNER2 found nothing, raw_inferred is [].
+                    if not (gliner_edges and _gliner_miss):
+                        raw_inferred = []
+                    _existing_triple_keys = {
+                        (e.subject, e.object, e.rel_type) for e in raw_inferred
+                    }
                     for t in rewrite_data.get("edges", []):
                         if not (t.get("subject") and t.get("object") and t.get("rel_type")):
                             continue
@@ -7329,10 +7925,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # This ensures WGMValidationGate bypasses type validation for user corrections
                         correction_confidence = 1.0 if is_correction_flag else None
 
+                        _subj = t.get("subject", "").lower().strip()
+                        _obj = t.get("object", "").lower().strip()
+                        _rt = t.get("rel_type", "").lower().strip()
+                        # Skip duplicates of edges GLiNER2 already extracted (Phase 1 merge).
+                        if (_subj, _obj, _rt) in _existing_triple_keys:
+                            continue
+                        _existing_triple_keys.add((_subj, _obj, _rt))
+
                         edge = EdgeInput(
-                            subject=t.get("subject", "").lower().strip(),
-                            object=t.get("object", "").lower().strip(),
-                            rel_type=t.get("rel_type", "").lower().strip(),
+                            subject=_subj,
+                            object=_obj,
+                            rel_type=_rt,
                             subject_type=t.get("subject_type"),
                             object_type=t.get("object_type"),
                             definition=t.get("definition"),
@@ -7341,9 +7945,24 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             confidence=correction_confidence,  # dprompt-136: Set confidence before gate validation
                         )
                         raw_inferred.append(edge)
+
+                        # Phase 2 (B.2): capture COMPLETE metadata the LLM inferred for any
+                        # novel rel_type (not yet in _REL_TYPE_META) so the unknown-rel_type
+                        # branch can create it in-flow WITH full metadata and route Class B.
+                        if _rt and _rt not in _REL_TYPE_META:
+                            _meta = t.get("rel_type_metadata") or {}
+                            if isinstance(_meta, dict) and _meta:
+                                _norm = _normalize_novel_rel_metadata(_meta, _rt)
+                                if _norm:
+                                    _novel_rel_metadata[_rt] = _norm
+                                    log.info("ingest.novel_rel_metadata_captured",
+                                             rel_type=_rt,
+                                             head_types=_norm.get("head_types"),
+                                             tail_types=_norm.get("tail_types"),
+                                             category=_norm.get("category"))
             else:
-                if not pattern_edges:
-                    raw_inferred = []
+                raw_inferred = raw_inferred or []
+                if not gliner_edges:
                     log.warning("ingest.rewrite_failed", status=response.status_code if response else 'unknown')
 
         except Exception as e:
@@ -7577,31 +8196,55 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # in any existing edge, so correctly-extracted values are never duplicated.
     if req.text:
         try:
-            _atomic = _detect_atomic_values(req.text, None)
+            _atomic_db = None
+            try:
+                _atomic_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+            except Exception:
+                pass
+            _atomic = _detect_atomic_values(req.text, _atomic_db)
+            if _atomic_db:
+                try:
+                    _atomic_db.close()
+                except Exception:
+                    pass
             if _atomic:
                 _existing_objects = {
                     str(e.object).lower().strip()
                     for e in edges_dict.values()
                     if e.object
                 }
-                for _av in _atomic:
-                    _val = _av["value"]
-                    if _val.lower() not in _existing_objects:
-                        subject = _av.get("subject_hint") or "user"
-                        _key = (subject, _val, _av["rel_type"])
-                        if _key not in edges_dict:
-                            edges_dict[_key] = EdgeInput(
-                                subject=subject,
-                                object=_val,
-                                rel_type=_av["rel_type"],
-                                fact_provenance="llm_inferred",
-                            )
-                            log.info("ingest.atomic_value_supplemented",
-                                     subject=subject, value=_val, type=_av["type"], rel_type=_av["rel_type"])
+                # All atomic values go through LLM subject resolution.
+                # No regex-based subject_hint bypass — LLM has full text context
+                # and handles all grammatical structures (possessives, passive voice,
+                # non-English descriptions, etc.). Regex lookbehind removed as brittle.
+                _unresolved = [
+                    _av for _av in _atomic
+                    if _av["value"].lower() not in _existing_objects
+                ]
+                if _unresolved:
+                    try:
+                        _resolved = _resolve_atomic_subjects_via_llm(req.text, _unresolved, user_id)
+                        for _av in _resolved:
+                            _val = _av["value"]
+                            _key = (_av["subject"], _val, _av["rel_type"])
+                            if _key not in edges_dict:
+                                edges_dict[_key] = EdgeInput(
+                                    subject=_av["subject"],
+                                    object=_val,
+                                    rel_type=_av["rel_type"],
+                                    fact_provenance="llm_inferred",
+                                )
+                                log.info("ingest.atomic_value_llm_resolved",
+                                         subject=_av["subject"], value=_val, rel_type=_av["rel_type"])
+                    except Exception as _lle:
+                        log.warning("ingest.atomic_llm_resolution_failed", error=str(_lle))
         except Exception as _ae:
             log.warning("ingest.atomic_supplementation_failed", error=str(_ae))
 
     edges = list(edges_dict.values())
+    # Process identity edges FIRST to register user aliases before GLiNER2 edges
+    # resolve entity names — prevents ghost entity creation (Bug 2).
+    edges.sort(key=lambda e: 0 if e.subject == "user" else 1)
 
 
 
@@ -7755,10 +8398,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # Resolve all entity names to canonical form via registry
                     # This ensures aliases (emma, ${USER}) never appear as subject/object in facts
+                    # Short-circuit: literal "user" string → canonical user UUID.
+                    # registry.resolve("user") would create a ghost surrogate for the STRING "user"
+                    # instead of returning the real user UUID, corrupting all downstream alias mapping.
                     try:
-                        canonical_subject = registry.resolve(req.user_id, edge.subject)
-                        log.info("ingest.subject_resolved_at_extraction",
-                               input=edge.subject, output=canonical_subject, user_id=req.user_id)
+                        if edge.subject.lower() == "user":
+                            canonical_subject = user_entity_id
+                            log.info("ingest.subject_resolved_as_user_identity",
+                                   input=edge.subject, output=canonical_subject, user_id=req.user_id)
+                        else:
+                            canonical_subject = registry.resolve(req.user_id, edge.subject)
+                            log.info("ingest.subject_resolved_at_extraction",
+                                   input=edge.subject, output=canonical_subject, user_id=req.user_id)
                     except ValueError as _e:
                         log.warning("ingest.edge_skipped.entity_resolve_failed",
                                     detail=str(_e), rel_type=getattr(edge, 'rel_type', ''))
@@ -7788,10 +8439,16 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                rel_type=edge.rel_type, object=canonical_object)
                     else:
                         # For relationship rel_types, resolve object to UUID
+                        # Same short-circuit as subject: "user" → user_entity_id directly.
                         try:
-                            canonical_object = registry.resolve(req.user_id, edge.object)
-                            log.info("ingest.object_resolved_at_extraction",
-                                   input=edge.object, output=canonical_object, user_id=req.user_id)
+                            if edge.object.lower() == "user":
+                                canonical_object = user_entity_id
+                                log.info("ingest.object_resolved_as_user_identity",
+                                       input=edge.object, output=canonical_object, user_id=req.user_id)
+                            else:
+                                canonical_object = registry.resolve(req.user_id, edge.object)
+                                log.info("ingest.object_resolved_at_extraction",
+                                       input=edge.object, output=canonical_object, user_id=req.user_id)
                         except ValueError as _e:
                             log.warning("ingest.edge_skipped.entity_resolve_failed",
                                         detail=str(_e), rel_type=getattr(edge, 'rel_type', ''))
@@ -8230,7 +8887,103 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # User-stated (confidence >= 0.9) → sync inference via gate (authoritative)
                     # LLM-inferred (confidence < 0.9)  → async deferred (preserves speed)
                     rel_type_lower = edge.rel_type.lower()
-                    if rel_type_lower not in _REL_TYPE_META:  # Unknown rel_type
+
+                    # Check if metadata was created in-flow
+                    ontology_created = False
+                    hierarchy_created = False
+
+                    # Phase 2 (B.2): if the miss-handling LLM call returned COMPLETE metadata for
+                    # this novel rel_type, create it in-flow NOW with that metadata. This makes it a
+                    # KNOWN rel_type with non-empty head/tail types, so WGM validation works and the
+                    # fact routes Class B (0.6) per CLAUDE.md "ontology+hierarchy created in-flow" —
+                    # NOT the Class C 30-day graveyard. Reserve Class C for genuinely low-confidence
+                    # extractions where no metadata could be inferred.
+                    if rel_type_lower not in _REL_TYPE_META and rel_type_lower in _novel_rel_metadata:
+                        _inflow_conf = max(adjusted_confidence or 0.6, 0.6)
+                        _created = _create_rel_type_in_flow(
+                            db, rel_type_lower, _novel_rel_metadata[rel_type_lower],
+                            confidence=_inflow_conf, source="llm_miss_inference",
+                        )
+                        if _created:
+                            ontology_created = True
+                            if _infer_hierarchy_from_rel_type(rel_type_lower):
+                                hierarchy_created = True
+                            # Re-apply search_path: _create_rel_type_in_flow commits on its own
+                            # connection-state, but the in-process cache refresh + commit above
+                            # may have reset our request's search_path (Pitfall 13).
+                            if schema_name:
+                                try:
+                                    with db.cursor() as _sp:
+                                        _sp.execute(f"SET search_path TO {schema_name}, public")
+                                except Exception:
+                                    pass
+                            # Re-run 3D classification now that the rel_type is KNOWN with
+                            # complete metadata — storage routing (scalar/relational/hierarchical)
+                            # must reflect the freshly-created ontology entry, not the unknown heuristic.
+                            classification_3d = classify_fact_3d(
+                                edge.rel_type.lower(), _raw_object.lower().strip(),
+                                registry, req.user_id)
+                            log.info("ingest.novel_rel_type_created_in_flow_class_b",
+                                     rel_type=rel_type_lower,
+                                     confidence=_inflow_conf,
+                                     storage=classification_3d.get("storage"),
+                                     reason="LLM inferred complete metadata on miss")
+
+                            # Audit trail (B.2): record the in-flow creation in ontology_evaluations
+                            # with a decision marking it created at ingest. This gives the prior
+                            # `manages`-style sync mint a PROPER, fully-audited trail. The
+                            # re_embedder becomes reinforcement/validation, not sole creator.
+                            try:
+                                with db.cursor() as _probe2:
+                                    _probe2.execute("SELECT 1")
+                            except Exception:
+                                try:
+                                    db.rollback()
+                                    if schema_name:
+                                        with db.cursor() as _r2:
+                                            _r2.execute(f"SET search_path TO {schema_name}, public")
+                                except Exception:
+                                    pass
+                            try:
+                                with db.cursor() as _oc:
+                                    _oc.execute(
+                                        "INSERT INTO ontology_evaluations"
+                                        " (candidate_rel_type, candidate_subject_type,"
+                                        "  candidate_object_type, first_text_snippet,"
+                                        "  extraction_confidence, extraction_method,"
+                                        "  sample_subject_id, sample_object,"
+                                        "  occurrence_count, last_seen_at,"
+                                        "  re_embedder_decision, decision_timestamp,"
+                                        "  decision_reason, created_rel_type)"
+                                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, now(),"
+                                        "         'created_in_flow', now(), %s, %s)"
+                                        " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                                        " DO UPDATE SET"
+                                        "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
+                                        "   last_seen_at = now()",
+                                        (rel_type_lower,
+                                         edge.subject_type, edge.object_type,
+                                         req.text[:500], _inflow_conf, 'ingest_llm_miss',
+                                         canonical_subject, _raw_object,
+                                         "complete metadata inferred by miss-handling LLM",
+                                         rel_type_lower),
+                                    )
+                                db.commit()
+                                if schema_name:
+                                    with db.cursor() as _sp2:
+                                        _sp2.execute(f"SET search_path TO {schema_name}, public")
+                            except Exception as _oce:
+                                try:
+                                    db.rollback()
+                                    if schema_name:
+                                        with db.cursor() as _r3:
+                                            _r3.execute(f"SET search_path TO {schema_name}, public")
+                                except Exception:
+                                    pass
+                                log.warning("ingest.inflow_ontology_eval_audit_failed",
+                                            rel_type=rel_type_lower, error=str(_oce))
+
+                    if rel_type_lower not in _REL_TYPE_META:  # Still unknown (no in-flow metadata)
                         if is_user_stated:
                             # User-stated novel rel_type: gate will sync-infer metadata
                             # _try_approve_novel_type() called in validate_edge() for high confidence
@@ -8239,15 +8992,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     reason="user authority requires sync metadata inference")
                             # Metadata populated by gate validation, no staging needed
                         else:
-                            # LLM-inferred novel rel_type: async staging
+                            # LLM-inferred novel rel_type with NO inferred metadata: async staging
                             log.info("ingest.llm_inferred_novel_type_deferred_to_re_embedder",
                                     rel_type=rel_type_lower,
                                     reason="llm extraction deferred for async evaluation")
                             classification_3d["storage"] = "unknown_staging"
-
-                    # Check if metadata was created in-flow
-                    ontology_created = False
-                    hierarchy_created = False
 
                     if adjusted_confidence != (edge.confidence if hasattr(edge, 'confidence') else 0.8):
                         log.info("ingest.confidence_reassess", rel_type=edge.rel_type.lower(),
@@ -8273,6 +9022,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             confidence = max(confidence, 0.6)
                             log.info("ingest.llm_learn_floor_applied",
                                      rel_type=rel_lower_check, old_class="C", new_class="B")
+
+                    # Phase 2 / B.1: a rel_type whose COMPLETE metadata was created in-flow from
+                    # the LLM miss (ontology_created) is, by CLAUDE.md, Class B at confidence 0.6 —
+                    # "ontology AND hierarchy created in-flow". Floor it to B/0.6 unless the user
+                    # stated it (Class A authority preserved). Self-growth: this fact is now
+                    # staged + promotable, not dumped in the 30-day Class C graveyard.
+                    if ontology_created and not is_user_stated and fact_class == "C":
+                        fact_class = "B"
+                        confidence = max(confidence, 0.6)
+                        log.info("ingest.inflow_grown_class_b_floor_applied",
+                                 rel_type=rel_type_lower, old_class="C", new_class="B",
+                                 confidence=confidence)
 
                     log.info(
                         "ingest.fact_classified",
@@ -8546,7 +9307,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             fact_subject, canonical_object, canonical_rel_type,
                             subject_type=final_subject_type,
                             object_type=final_object_type,
-                            confidence=edge.confidence,  # dprompt-136: Pass confidence for bypass check
+                            confidence=confidence,  # reassessed confidence (1.0 for user-stated), not raw edge.confidence
                             is_correction=edge.is_correction,  # dprompt-136: Gate needs to know if this is a correction
                         )
                         status = validation.get("status")
@@ -8718,7 +9479,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # dBug-027: Validate rel_type constraints from metadata (dprompt-97)
                     # Only check after WGMValidationGate passes; skip for scalars (handled separately)
-                    if status == "valid" and classification_3d.get("storage") != "scalar":
+                    # Skip when caller provided edges (req.edges) — WGM already applied user-authority
+                    # override for type mismatches; re-checking here contradicts that decision.
+                    if status == "valid" and classification_3d.get("storage") != "scalar" and not req.edges:
                         rel_type_meta = _REL_TYPE_META.get(canonical_rel_type.lower(), {})
                         is_constraint_valid, constraint_reason = _validate_rel_type_constraints(
                             {
@@ -9035,8 +9798,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                               reason="object_id must be UUID or user_id for relationship rel_type")
                                     continue  # Skip this fact
 
-                        # Update row with resolved subject/object if they changed
-                        updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated, definition)
+                        # Update row with resolved subject/object if they changed.
+                        # Preserve tail elements (storage_type, is_hierarchy_rel, taxonomies, temporal)
+                        # beyond the first 10 — truncating them drops is_hierarchy_rel for the class
+                        # split at line 9273, causing hierarchy type propagation to never fire.
+                        updated_row = (user_id, subject, obj, rel_type, source, is_preferred, fact_class, confidence, is_engine_generated, definition) + row[10:]
                         validated_rows.append(updated_row)
 
                     rows = validated_rows
@@ -9168,6 +9934,78 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     if class_a_rows:
                         committed += manager.commit(class_a_rows)
                         log.info("ingest.class_a_committed", count=len(class_a_rows))
+
+                        # Hierarchy type propagation: after committing a hierarchical fact,
+                        # walk the object's ancestry chain to find the first known entity_type
+                        # and stamp it onto the subject.
+                        #
+                        # WHY full chain walk (not just one hop):
+                        #   - webserver01 instance_of server → server may have no type yet
+                        #   - BUT server subclass_of computer_system → computer_system = Object
+                        #   - Walk: server → computer_system → Object → stamp webserver01 = Object
+                        #   - Works regardless of /enhance order — out-of-order hierarchy is handled
+                        #
+                        # WHY override GLiNER2 types:
+                        #   - GLiNER2 guesses from span shape ("webserver01" → Person heuristic)
+                        #   - User-stated hierarchy (instance_of) is always more authoritative
+                        #
+                        # WHY metadata-driven:
+                        #   - Hierarchy rel_types queried from rel_types.is_hierarchy_rel=true
+                        #   - New hierarchy rel_types added to DB automatically participate
+                        #   - No hardcoded rel_type names
+                        try:
+                            # Fetch hierarchy rel_types from cache (metadata-driven, not hardcoded)
+                            _hier_rels = tuple(
+                                rt for rt, meta in _REL_TYPE_META.items()
+                                if meta.get("is_hierarchy_rel")
+                            ) or ("instance_of", "subclass_of", "part_of", "is_a", "member_of")
+
+                            with db.cursor() as _htp_cur:
+                                for _htp_uid, _htp_subject, _htp_obj, _htp_rel_type, _htp_src, _htp_pref, _htp_defn, _htp_storage, _htp_is_hier, _htp_tax in class_a_rows:
+                                    if not _htp_is_hier:
+                                        continue
+                                    # Walk ancestry chain: find first known entity_type above object
+                                    _htp_cur.execute("""
+                                        WITH RECURSIVE ancestry AS (
+                                            SELECT e.id, e.entity_type, 0 AS depth
+                                            FROM entities e WHERE e.id = %s
+                                            UNION ALL
+                                            SELECT e.id, e.entity_type, a.depth + 1
+                                            FROM ancestry a
+                                            JOIN facts f ON f.subject_id = a.id
+                                            JOIN entities e ON e.id = f.object_id
+                                            WHERE f.rel_type = ANY(%s)
+                                              AND f.superseded_at IS NULL
+                                              AND a.depth < 6
+                                        )
+                                        SELECT entity_type FROM ancestry
+                                        WHERE entity_type IS NOT NULL AND entity_type != 'unknown'
+                                        ORDER BY depth ASC LIMIT 1
+                                    """, (_htp_obj, list(_hier_rels)))
+                                    _chain_row = _htp_cur.fetchone()
+                                    _resolved_type = _chain_row[0] if _chain_row else None
+                                    if _resolved_type:
+                                        _htp_cur.execute(
+                                            "SELECT entity_type FROM entities WHERE id = %s",
+                                            (_htp_subject,),
+                                        )
+                                        _cur_row = _htp_cur.fetchone()
+                                        _cur_type = _cur_row[0] if _cur_row else "unknown"
+                                        if _cur_type != _resolved_type:
+                                            _htp_cur.execute(
+                                                "UPDATE entities SET entity_type = %s WHERE id = %s",
+                                                (_resolved_type, _htp_subject),
+                                            )
+                                            log.info(
+                                                "ingest.entity_type_propagated",
+                                                subject=_htp_subject[:8],
+                                                obj=_htp_obj[:8],
+                                                entity_type=_resolved_type,
+                                                overrode=_cur_type,
+                                                rel_type=_htp_rel_type,
+                                            )
+                        except Exception as _htp_err:
+                            log.warning("ingest.entity_type_propagation_failed", error=str(_htp_err))
 
                         # Apply correction_behavior supersession for Class A facts
                         # When a Class A user-stated fact is inserted, supersede contradictory existing facts
@@ -9810,14 +10648,11 @@ def _fetch_hierarchy_facts(db_conn, user_id: str, entity_ids: set[str]) -> list[
         log.warning("query.fetch_hierarchy_facts_failed", error=str(e))
     return results
 
-def _determine_query_scope(db, query_text: str, user_id: str) -> set[str]:
-    """
-    Determine query-driven scope from the user's question (NOT from facts).
-    Implements dprompt-130: metadata-driven query keyword matching.
 
-    Returns: set of taxonomy_name strings matching the query intent
-    METADATA-DRIVEN: Uses entity_taxonomies and rel_types tables, no hardcoding.
-    """
+
+def _determine_query_scope_unused(db, query_text: str, user_id: str) -> set[str]:
+    # DEAD CODE — taxonomy scope detection is in determine_scope_multi_factor.
+    # Kept as reference only. Do not call.
     if not query_text or not db:
         return set()
 
@@ -9843,20 +10678,43 @@ def _determine_query_scope(db, query_text: str, user_id: str) -> set[str]:
 
     try:
         with db.cursor() as cur:
-            # Phase 2A: Match keywords against taxonomy descriptions
-            for keyword in keywords:
+            # Phase 2A: GLiNER2 zero-shot classification against taxonomy descriptions.
+            # Replaces brittle ILIKE — same pattern as /classify-intent intent routing.
+            # Labels = taxonomy descriptions from DB. description→name mapping applied post-call.
+            # Low confidence → async LLM enrichment grows entity_taxonomies.description so
+            # future GLiNER2 passes score higher. Ingest=strong, query=lightweight.
+            _gliner = get_gliner_model()
+            if _gliner:
                 try:
-                    cur.execute(
-                        "SELECT DISTINCT taxonomy_name FROM entity_taxonomies "
-                        "WHERE description ILIKE %s",
-                        (f"%{keyword}%",)
-                    )
-                    for row in cur.fetchall():
-                        detected_taxonomies.add(row[0])
-                except Exception as e:
-                    log.debug("query.scope_description_match_failed", keyword=keyword, error=str(e))
+                    cur.execute("SELECT taxonomy_name, description FROM entity_taxonomies WHERE description IS NOT NULL")
+                    _tax_rows = cur.fetchall()
+                    if _tax_rows:
+                        _desc_to_tax = {row[1]: row[0] for row in _tax_rows}
+                        _tax_labels = list(_desc_to_tax.keys())
+                        _gliner_result = _gliner.classify_text(
+                            query_text,
+                            {"taxonomy": _tax_labels},
+                            include_confidence=True,
+                        )
+                        _tax_hit = _gliner_result.get("taxonomy", {}) if isinstance(_gliner_result, dict) else {}
+                        _hit_label = _tax_hit.get("label") if isinstance(_tax_hit, dict) else None
+                        _hit_conf = float(_tax_hit.get("confidence", 0.0)) if isinstance(_tax_hit, dict) else 0.0
 
-            # Phase 2B: Match keywords against rel_types and find their taxonomies
+                        if _hit_label and _hit_conf >= 0.3 and _hit_label in _desc_to_tax:
+                            detected_taxonomies.add(_desc_to_tax[_hit_label])
+                            log.info("query.scope_gliner2_match",
+                                     taxonomy=_desc_to_tax[_hit_label], confidence=round(_hit_conf, 3),
+                                     query=query_text[:50])
+                        elif _hit_conf < 0.3:
+                            # Low confidence — fire async LLM to infer taxonomy and enrich its description.
+                            # This grows entity_taxonomies so future GLiNER2 passes score higher.
+                            _enrich_taxonomy_async(query_text, _tax_rows, db)
+                            log.debug("query.scope_gliner2_low_confidence",
+                                      confidence=round(_hit_conf, 3), label=_hit_label)
+                except Exception as _ge:
+                    log.warning("query.scope_gliner2_failed", error=str(_ge), error_type=type(_ge).__name__)
+
+            # Phase 2B: Exact match against rel_types in taxonomy defining group — fast, metadata-driven.
             for keyword in keywords:
                 try:
                     cur.execute(
@@ -9870,14 +10728,14 @@ def _determine_query_scope(db, query_text: str, user_id: str) -> set[str]:
                 except Exception as e:
                     log.debug("query.scope_reltype_match_failed", keyword=keyword, error=str(e))
 
-            # Phase 2C: Entity type hierarchal fallback - resolve keywords as entity names
+            # Phase 2C: Entity alias match — find entities the user knows by name, map to taxonomy via type.
             for keyword in keywords:
                 try:
                     cur.execute(
                         "SELECT DISTINCT et.taxonomy_name FROM entity_aliases ea "
                         "INNER JOIN entities e ON ea.entity_id = e.id "
                         "INNER JOIN entity_taxonomies et ON et.member_entity_types @> ARRAY[e.entity_type] "
-                        "WHERE ea.alias ILIKE %s AND ea.user_id = %s",
+                        "WHERE ea.alias = %s AND ea.user_id = %s",
                         (keyword, user_id)
                     )
                     for row in cur.fetchall():
@@ -10236,7 +11094,7 @@ def determine_path(query_text: str, db) -> QueryPath:
                     else:
                         path.relationship_rels.append(rel_type)
 
-            # Match against entity_taxonomies.taxonomy_name
+            # Match against entity_taxonomies.taxonomy_name — exact match first
             for keyword in keywords:
                 cur.execute(
                     "SELECT taxonomy_name FROM entity_taxonomies "
@@ -10247,35 +11105,81 @@ def determine_path(query_text: str, db) -> QueryPath:
                 if row:
                     path.taxonomy_groups.append(row[0])
 
+            # GLiNER2 fallback: when exact taxonomy_name match misses, classify the full
+            # query text against taxonomy descriptions (zero-shot, same pattern as intent routing).
+            # Runs only when no taxonomy matched by name — avoids redundant inference.
+            if not path.taxonomy_groups:
+                _gliner = get_gliner_model()
+                if _gliner:
+                    try:
+                        cur.execute(
+                            "SELECT taxonomy_name, description FROM entity_taxonomies "
+                            "WHERE description IS NOT NULL"
+                        )
+                        _tax_rows = cur.fetchall()
+                        if _tax_rows:
+                            _desc_to_tax = {row[1]: row[0] for row in _tax_rows}
+                            _g_result = _gliner.classify_text(
+                                query_text,
+                                {"taxonomy": list(_desc_to_tax.keys())},
+                                include_confidence=True,
+                            )
+                            _g_hit = _g_result.get("taxonomy", {}) if isinstance(_g_result, dict) else {}
+                            _g_label = _g_hit.get("label") if isinstance(_g_hit, dict) else None
+                            _g_conf = float(_g_hit.get("confidence", 0.0)) if isinstance(_g_hit, dict) else 0.0
+                            if _g_label and _g_conf >= 0.3 and _g_label in _desc_to_tax:
+                                path.taxonomy_groups.append(_desc_to_tax[_g_label])
+                                log.info("determine_path.gliner2_taxonomy",
+                                         taxonomy=_desc_to_tax[_g_label],
+                                         confidence=round(_g_conf, 3),
+                                         query=query_text[:50])
+                    except Exception as _ge:
+                        log.warning("determine_path.gliner2_taxonomy_failed",
+                                    error=str(_ge), error_type=type(_ge).__name__)
+
             # COMPONENT 1: Expand taxonomies into rel_types (growth engine enabler)
-            # When a taxonomy is matched, extract its rel_types_defining_group and route by storage path
+            # When a taxonomy is matched, extract its rel_types_defining_group and route by storage path.
+            #
+            # FAIL LOUD (D1): this block is the COMPONENT-1 routing core. A failure here means
+            # the grown ontology metadata could not be consumed — collapsing to fetch_all would
+            # silently mask the breakage and over-fetch. So errors are logged AND re-raised; the
+            # outer handler no longer swallows them into fetch_all_details.
             if path.taxonomy_groups:
-                for tax_name in path.taxonomy_groups:
-                    cur.execute(
-                        "SELECT rel_types_defining_group FROM entity_taxonomies WHERE taxonomy_name=%s",
-                        (tax_name,)
-                    )
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        # rel_types_defining_group is a PostgreSQL array
-                        rel_types_list = row[0]
-                        if isinstance(rel_types_list, str):
-                            import json
-                            rel_types_list = json.loads(rel_types_list)
+                try:
+                    for tax_name in path.taxonomy_groups:
+                        cur.execute(
+                            "SELECT rel_types_defining_group FROM entity_taxonomies WHERE taxonomy_name=%s",
+                            (tax_name,)
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            # rel_types_defining_group is a PostgreSQL array
+                            rel_types_list = row[0]
+                            if isinstance(rel_types_list, str):
+                                import json
+                                rel_types_list = json.loads(rel_types_list)
 
-                        for rel_type in rel_types_list:
-                            rel_type_lower = rel_type.lower() if rel_type else ""
-                            metadata = _REL_TYPE_META.get(rel_type_lower, {})
-                            tail_types = metadata.get("tail_types", [])
-                            tail_types_str = str(tail_types) if tail_types else ''
+                            for rel_type in rel_types_list:
+                                rel_type_lower = rel_type.lower() if rel_type else ""
+                                metadata = _REL_TYPE_META.get(rel_type_lower, {})
+                                tail_types = metadata.get("tail_types", [])
+                                tail_types_str = str(tail_types) if tail_types else ''
 
-                            # Route by storage path: SCALAR or RELATIONAL
-                            if 'SCALAR' in tail_types_str:
-                                if rel_type_lower not in path.scalar_rels:
-                                    path.scalar_rels.append(rel_type_lower)
-                            else:
-                                if rel_type_lower not in path.relationship_rels:
-                                    path.relationship_rels.append(rel_type_lower)
+                                # Route by storage path: SCALAR or RELATIONAL
+                                if 'SCALAR' in tail_types_str:
+                                    if rel_type_lower not in path.scalar_rels:
+                                        path.scalar_rels.append(rel_type_lower)
+                                else:
+                                    if rel_type_lower not in path.relationship_rels:
+                                        path.relationship_rels.append(rel_type_lower)
+                except Exception as _comp1_e:
+                    # COMPONENT-1 routing error must surface, not collapse to fetch-all.
+                    log.error("determine_path.component1_failed",
+                              query=query_text[:50],
+                              taxonomies=path.taxonomy_groups,
+                              error=str(_comp1_e),
+                              error_type=type(_comp1_e).__name__)
+                    raise
 
             # COMPONENT 2: Add inverse rel_types for bidirectional search
             # For asymmetric relationships, add the inverse so we find facts from both directions
@@ -10303,8 +11207,15 @@ def determine_path(query_text: str, db) -> QueryPath:
 
         return path
 
-    except Exception as e:
-        log.error("determine_path.failed", query=query_text[:50], error=str(e))
+    except psycopg2.Error as e:
+        # D1: narrowed from broad `except Exception`. Only genuine DB-infrastructure
+        # errors (connection drop, query failure) degrade gracefully to fetch-all —
+        # a transient DB issue should not hard-fail the whole query. Logic/routing
+        # errors (KeyError, COMPONENT-1 re-raise, malformed metadata) are NOT caught
+        # here: they propagate and fail loud so taxonomy-routing breakage is visible
+        # instead of being silently masked as "fetch everything".
+        log.error("determine_path.db_error",
+                  query=query_text[:50], error=str(e), error_type=type(e).__name__)
         return QueryPath(fetch_all_details=True)
 
 
@@ -10434,15 +11345,52 @@ def fetch_facts_from_anchor(
                 # ─── Fetch DIRECT facts: (anchor, rel_type, object) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 # Issue #5: Include temporal columns (valid_from, valid_until) for time-aware queries
+                # D1: structural rel_types (instance_of/subclass_of/part_of/has_*) are ALWAYS
+                # included for in-scope entities so a false-learned structural fact surfaces
+                # for user correction (D2). Scoped relationship rels = path.relationship_rels
+                # ∪ structural rels — fetch-all only when path.fetch_all_details is genuinely set.
+                _direct_scope_rels = None
+                if not path.fetch_all_details:
+                    _direct_scope_rels = sorted(
+                        set(path.relationship_rels)
+                        | set(path.scalar_rels)
+                        | _get_structural_rels()
+                    )
+                # FIX-1: SAFETY FALLBACK — if path determination returned NO scopes,
+                # force fetch_all to prevent silent fact-loss. Better to return all facts
+                # than zero facts. This handles edge cases where query keywords don't match
+                # any registered rel_types or taxonomies (new deployments, novel domains).
+                if (not path.fetch_all_details and
+                    not path.relationship_rels and
+                    not path.scalar_rels):
+                    path.fetch_all_details = True
+                    log.warning(
+                        "query.empty_path_fallback_to_fetchall",
+                        query_text=query_text[:80] if query_text else None,
+                        reason="no_taxonomy_or_rels_matched",
+                        user_id=user_id
+                    )
                 if path.fetch_all_details or path.relationship_rels or path.scalar_rels:
-                    direct_query = """
-                        SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
-                        FROM facts
-                        WHERE subject_id = %s
-                          AND superseded_at IS NULL
-                          AND (valid_until IS NULL OR valid_until > now())
-                    """
-                    cur.execute(direct_query, (anchor_uuid,))
+                    if _direct_scope_rels:
+                        # D1: WHERE rel_type IN (...) — strict hierarchical scoping (no over-fetch)
+                        direct_query = """
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
+                            FROM facts
+                            WHERE subject_id = %s
+                              AND rel_type = ANY(%s)
+                              AND superseded_at IS NULL
+                              AND (valid_until IS NULL OR valid_until > now())
+                        """
+                        cur.execute(direct_query, (anchor_uuid, _direct_scope_rels))
+                    else:
+                        direct_query = """
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
+                            FROM facts
+                            WHERE subject_id = %s
+                              AND superseded_at IS NULL
+                              AND (valid_until IS NULL OR valid_until > now())
+                        """
+                        cur.execute(direct_query, (anchor_uuid,))
                     for row in cur.fetchall():
                         facts.append({
                             "subject": row[0],
@@ -10462,16 +11410,33 @@ def fetch_facts_from_anchor(
                 # llm_learn anchors (Class B, confidence 0.6) are invisible until promoted.
                 # Each query hit increments confirmed_count — 3 hits promotes to long-term.
                 if path.fetch_all_details or path.relationship_rels or path.scalar_rels:
-                    cur.execute(
-                        """
-                        SELECT id, subject_id, object_id, rel_type, confidence, fact_class
-                        FROM staged_facts
-                        WHERE subject_id = %s
-                          AND (expires_at IS NULL OR expires_at > now())
-                          AND promoted_at IS NULL
-                        """,
-                        (anchor_uuid,),
-                    )
+                    if _direct_scope_rels:
+                        # D1: strict scoping for staged direct facts. rel_type IS NULL rows are
+                        # rough/unclassified Class C memory anchored to this entity — always
+                        # surface them (they have no rel_type to scope on, and D4 rough-store
+                        # creates them deliberately).
+                        cur.execute(
+                            """
+                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class
+                            FROM staged_facts
+                            WHERE subject_id = %s
+                              AND (rel_type = ANY(%s) OR rel_type IS NULL)
+                              AND (expires_at IS NULL OR expires_at > now())
+                              AND promoted_at IS NULL
+                            """,
+                            (anchor_uuid, _direct_scope_rels),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class
+                            FROM staged_facts
+                            WHERE subject_id = %s
+                              AND (expires_at IS NULL OR expires_at > now())
+                              AND promoted_at IS NULL
+                            """,
+                            (anchor_uuid,),
+                        )
                     staged_rows = cur.fetchall()
                     staged_hit_ids = []
                     for row in staged_rows:
@@ -10504,15 +11469,34 @@ def fetch_facts_from_anchor(
                 # FIX 3: Invert rel_type for asymmetric relationships (dprompt-148 Phase 3)
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 # Issue #5: Include temporal columns for time-aware queries
+                # D1: inverse scope = relationship rels ∪ structural rels (D2). Scalar rels
+                # never appear as inverse facts (scalars have STRING objects, never UUIDs).
+                _inverse_scope_rels = None
+                if not path.fetch_all_details:
+                    _inverse_scope_rels = sorted(
+                        set(path.relationship_rels) | _get_structural_rels()
+                    )
                 if path.fetch_all_details or path.relationship_rels:
-                    inverse_query = """
-                        SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
-                        FROM facts
-                        WHERE object_id = %s
-                          AND superseded_at IS NULL
-                          AND (valid_until IS NULL OR valid_until > now())
-                    """
-                    cur.execute(inverse_query, (anchor_uuid,))
+                    if _inverse_scope_rels:
+                        # D1: WHERE rel_type IN (...) — strict scoping (no over-fetch)
+                        inverse_query = """
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
+                            FROM facts
+                            WHERE object_id = %s
+                              AND rel_type = ANY(%s)
+                              AND superseded_at IS NULL
+                              AND (valid_until IS NULL OR valid_until > now())
+                        """
+                        cur.execute(inverse_query, (anchor_uuid, _inverse_scope_rels))
+                    else:
+                        inverse_query = """
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until
+                            FROM facts
+                            WHERE object_id = %s
+                              AND superseded_at IS NULL
+                              AND (valid_until IS NULL OR valid_until > now())
+                        """
+                        cur.execute(inverse_query, (anchor_uuid,))
                     for row in cur.fetchall():
                         subject_id, object_id, rel_type_orig, confidence, fact_class, valid_from, valid_until = row
 
@@ -10571,12 +11555,23 @@ def fetch_facts_from_anchor(
                 # ─── Fetch SCALAR ATTRIBUTES: (anchor, attribute, value) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 if path.fetch_all_details or path.scalar_rels:
-                    attrs_query = """
-                        SELECT entity_id, attribute, value_text, value_int, value_float, value_date
-                        FROM entity_attributes
-                        WHERE entity_id = %s
-                    """
-                    cur.execute(attrs_query, (anchor_uuid,))
+                    if not path.fetch_all_details and path.scalar_rels:
+                        # D1: WHERE attribute IN (...) — strict scalar scoping (no over-fetch).
+                        # entity_attributes.attribute holds the scalar rel_type.
+                        attrs_query = """
+                            SELECT entity_id, attribute, value_text, value_int, value_float, value_date
+                            FROM entity_attributes
+                            WHERE entity_id = %s
+                              AND attribute = ANY(%s)
+                        """
+                        cur.execute(attrs_query, (anchor_uuid, sorted(set(path.scalar_rels))))
+                    else:
+                        attrs_query = """
+                            SELECT entity_id, attribute, value_text, value_int, value_float, value_date
+                            FROM entity_attributes
+                            WHERE entity_id = %s
+                        """
+                        cur.execute(attrs_query, (anchor_uuid,))
                     for row in cur.fetchall():
                         # Scalar facts have STRING objects (value_text is canonical)
                         value = row[2]  # value_text is primary
@@ -10595,8 +11590,8 @@ def fetch_facts_from_anchor(
                             "fact_class": "A",
                             "source": "attributes",
                             "category": _get_rel_type_category(row[1]),
-                            "valid_from": valid_from,
-                            "valid_until": valid_until,
+                            "valid_from": None,  # scalar attributes have no temporal validity
+                            "valid_until": None,
                         })
 
                 # ─── Fetch STAGED FACTS: Class B + C awaiting promotion ───
@@ -10737,6 +11732,120 @@ def fetch_facts_from_anchor(
                             log.info("fetch_facts_from_anchor.taxonomy_fetched",
                                      taxonomy=taxonomy, count=len(category_rels), facts_found=len(facts))
 
+                            # Entity-type-based discovery: fetch facts for all entities whose
+                            # entity_type is in this taxonomy's member_entity_types.
+                            # This reaches entities not directly anchored to the user — e.g.
+                            # webserver01 (Object) when user asks "what infrastructure do you know".
+                            # Growth: any entity typed as Object/Concept via hierarchy propagation
+                            # automatically appears here when computer_system taxonomy is queried.
+                            if member_types and member_types != ['ANY']:
+                                try:
+                                    cur.execute("""
+                                        SELECT DISTINCT e.id
+                                        FROM entities e
+                                        WHERE e.entity_type = ANY(%s)
+                                          AND e.id != %s
+                                    """, (member_types, anchor_uuid))
+                                    typed_entity_ids = [row[0] for row in cur.fetchall()]
+
+                                    for eid in typed_entity_ids:
+                                        # Relational facts
+                                        cur.execute("""
+                                            SELECT subject_id, object_id, rel_type, confidence, fact_class
+                                            FROM facts
+                                            WHERE (subject_id = %s OR object_id = %s)
+                                              AND superseded_at IS NULL
+                                        """, (eid, eid))
+                                        for row in cur.fetchall():
+                                            facts.append({
+                                                "subject": row[0],
+                                                "object": row[1],
+                                                "rel_type": row[2],
+                                                "confidence": float(row[3]) if row[3] else 0.8,
+                                                "fact_class": row[4] or "B",
+                                                "source": "db",
+                                                "category": _get_rel_type_category(row[2])
+                                            })
+                                        # Scalar attributes
+                                        cur.execute("""
+                                            SELECT entity_id, attribute, value_text
+                                            FROM entity_attributes
+                                            WHERE entity_id = %s
+                                        """, (eid,))
+                                        for row in cur.fetchall():
+                                            if row[2]:
+                                                facts.append({
+                                                    "subject": row[0],
+                                                    "rel_type": row[1],
+                                                    "object": row[2],
+                                                    "confidence": 1.0,
+                                                    "fact_class": "A",
+                                                    "source": "attributes",
+                                                    "category": _get_rel_type_category(row[1]),
+                                                    "valid_from": None,
+                                                    "valid_until": None,
+                                                })
+
+                                    if typed_entity_ids:
+                                        log.info("fetch_facts_from_anchor.taxonomy_type_discovery",
+                                                 taxonomy=taxonomy, entity_count=len(typed_entity_ids),
+                                                 member_types=member_types)
+                                except Exception as _tde:
+                                    log.warning("fetch_facts_from_anchor.taxonomy_type_discovery_failed",
+                                                taxonomy=taxonomy, error=str(_tde))
+
+                            # ─── A1 −1-DEPTH FOLD: transitive taxonomy members ───
+                            # D1: wire the (previously DEAD) _fetch_transitive_members() helper.
+                            # family → its transitive_rel_types (∋ has_pet in the live DB) → pets.
+                            # Metadata-driven: transitive_rel_types is read from the taxonomy row;
+                            # no hardcoded rel_type. This is the user's "pets in family" example —
+                            # the pet entity is not directly anchored to the user, it hangs off a
+                            # family member, so the fold reaches it.
+                            transitive_members = _fetch_transitive_members(conn, anchor_uuid, taxonomy)
+                            # Drop the anchor + already-handled direct entities; keep the −1-depth tail.
+                            transitive_members.discard(anchor_uuid)
+                            for tmid in transitive_members:
+                                cur.execute(
+                                    """
+                                    SELECT subject_id, object_id, rel_type, confidence, fact_class
+                                    FROM facts
+                                    WHERE (subject_id = %s OR object_id = %s)
+                                      AND superseded_at IS NULL
+                                    """,
+                                    (tmid, tmid),
+                                )
+                                for row in cur.fetchall():
+                                    facts.append({
+                                        "subject": row[0],
+                                        "object": row[1],
+                                        "rel_type": row[2],
+                                        "confidence": float(row[3]) if row[3] else 0.8,
+                                        "fact_class": row[4] or "B",
+                                        "source": "db",
+                                        "category": _get_rel_type_category(row[2]),
+                                    })
+                                # Scalar attributes of the transitive member (e.g. pet age/name)
+                                cur.execute(
+                                    "SELECT entity_id, attribute, value_text FROM entity_attributes WHERE entity_id = %s",
+                                    (tmid,),
+                                )
+                                for row in cur.fetchall():
+                                    if row[2]:
+                                        facts.append({
+                                            "subject": row[0],
+                                            "rel_type": row[1],
+                                            "object": row[2],
+                                            "confidence": 1.0,
+                                            "fact_class": "A",
+                                            "source": "attributes",
+                                            "category": _get_rel_type_category(row[1]),
+                                            "valid_from": None,
+                                            "valid_until": None,
+                                        })
+                            if transitive_members:
+                                log.info("fetch_facts_from_anchor.taxonomy_transitive_fold",
+                                         taxonomy=taxonomy, transitive_count=len(transitive_members))
+
                         except Exception as tax_e:
                             log.error("taxonomy_validation.failed", taxonomy=taxonomy, error=str(tax_e))
 
@@ -10813,11 +11922,22 @@ def apply_confidence_gate(
     # DB facts always pass — do not filter; staged Class C facts must surface for confirmation
     all_facts = list(db_facts)
 
-    # Qdrant facts are already floored upstream; append directly
+    # D3: Qdrant facts are RANK-DOWN (demoted), never excluded — append all of them.
     all_facts.extend(qdrant_facts)
 
-    # Order by confidence DESC (Class A first, then B, then C)
-    all_facts.sort(key=lambda f: f.get("confidence", 0.0), reverse=True)
+    # D3 ranking: A first, then B, then C (class is the PRIMARY sort key, never an exclusion).
+    # Within a class, order by `_rank` when set (Qdrant rank-down score) else by confidence.
+    # Class C is always present, it just lands last.
+    _class_priority = {"A": 0, "B": 1, "C": 2}
+
+    def _rank_key(f):
+        cls = (f.get("fact_class") or "C").upper()
+        cls_rank = _class_priority.get(cls, 3)
+        score = f.get("_rank", f.get("confidence", 0.0))
+        # Negative score so a higher score sorts earlier under ascending class_rank ordering.
+        return (cls_rank, -score)
+
+    all_facts.sort(key=_rank_key)
 
     return all_facts
 
@@ -10923,6 +12043,50 @@ def _get_active_alerts(schema_name: str) -> list[dict]:
         return []
 
 
+_SCAFFOLD_MARKERS = [
+    re.compile(r'\b(do\s+not|never|must\s+not|do\s+NOT)\b', re.IGNORECASE),
+    re.compile(r'\b(already\s+extracted|do\s+not\s+repeat|previously\s+seen)\b', re.IGNORECASE),
+    re.compile(r'\(do\s+not', re.IGNORECASE),
+    re.compile(r'\[staged\]', re.IGNORECASE),
+    re.compile(r'\[Class [ABC]\]', re.IGNORECASE),
+    re.compile(r'confidence=[\d.]+'),
+]
+_FACT_MARKERS = [
+    re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'),       # IP address
+    re.compile(r'\b([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b'),        # MAC address
+    re.compile(r'\b\d{4}-\d{2}-\d{2}\b'),                          # ISO date
+    re.compile(r'\b[a-z][a-z0-9\-]{2,30}\.[a-z]{2,}\b'),          # hostname/FQDN
+]
+
+
+def _content_quality_score(text: str) -> float:
+    """Score text [0.0, 1.0] to distinguish real facts from prompt scaffolding.
+    Used only for Qdrant recall re-ranking — does not affect stored confidence.
+    """
+    if not text:
+        return 0.0
+    t = text[:200]
+    score = 0.5
+    for pat in _SCAFFOLD_MARKERS:
+        if pat.search(t):
+            score -= 0.18
+    if t.count(':') >= 3:
+        score -= 0.15
+    elif t.count(':') >= 2:
+        score -= 0.05
+    if '\n-' in t or '\n•' in t:
+        score -= 0.10
+    for pat in _FACT_MARKERS:
+        if pat.search(t):
+            score += 0.15
+    n = len(t)
+    if 15 <= n <= 80:
+        score += 0.10
+    elif n > 150:
+        score -= 0.05
+    return max(0.0, min(1.0, score))
+
+
 def qdrant_semantic_search(
     query_text: str,
     conversation_history: list[dict] = None,
@@ -10995,15 +12159,23 @@ def qdrant_semantic_search(
         # Determine collection name: faultline-{user_id}
         collection = derive_collection(user_id)
 
-        # Search Qdrant
+        # Search Qdrant with native MMR diversity (Qdrant 1.15+, confirmed 1.17.1 on pre-prod).
+        # MMR collapses near-duplicate vectors server-side before the response crosses the network,
+        # preventing repeated scaffold variants from dominating recall results.
         response = httpx.post(
-            f"{qdrant_url}/collections/{collection}/points/search",
+            f"{qdrant_url}/collections/{collection}/points/query",
             json={
-                "vector": embedding,
+                "query": {
+                    "nearest": embedding,
+                    "mmr": {
+                        "diversity": 0.3,
+                        "candidates_limit": limit * 3
+                    }
+                },
                 "score_threshold": score_threshold,
                 "limit": limit,
                 "with_payload": True,
-                "with_vectors": False
+                "with_vectors": False,
             },
             timeout=10.0
         )
@@ -11025,8 +12197,8 @@ def qdrant_semantic_search(
         data = response.json()
         results = []
 
-        # Extract facts from search results
-        for result in data.get("result", []):
+        # Extract facts from search results (/query MMR returns result.points)
+        for result in data.get("result", {}).get("points", []):
             payload = result.get("payload", {})
             score = result.get("score", 0.0)
 
@@ -11037,6 +12209,11 @@ def qdrant_semantic_search(
                 "confidence": payload.get("confidence", 0.4),
                 "fact_class": payload.get("fact_class", "C"),  # Usually Class C from staging
                 "qdrant_score": score,
+                # D4: fact_id links a Class C Qdrant point back to its staged_facts row so a
+                # genuine query-scoped hit can increment hit_count. re_embedder writes fact_id
+                # into the payload of staged points; rough store_context rows have no fact_id
+                # (pure vector memory) — those simply never increment.
+                "fact_id": payload.get("fact_id"),
                 "source": "qdrant"
             }
             results.append(fact)
@@ -11380,57 +12557,114 @@ async def query(request: QueryRequest) -> QueryResponse:
         except Exception as expand_e:
             log.warning("query.phase5.entity_expansion_failed", error=str(expand_e))
 
-        # Coverage gate: compute max confidence across all DB facts collected in Phase 3.
-        # If the DB already has a confident answer, skip Phase 4 (Qdrant) to avoid noise.
+        # D3 coverage RANK (was: coverage SKIP). Compute max confidence across DB facts.
+        # If the DB already has a confident answer, Qdrant/Class C results are RANKED DOWN —
+        # NOT skipped or dropped. Class C rough memory is always part of full scope so it can
+        # be returned AND corrected (correction feedback loop).
         _db_max_confidence = max(
             (f.get("confidence", 0.0) for f in db_facts),
             default=0.0,
         )
-        _skip_qdrant = _db_max_confidence >= QUERY_SKIP_QDRANT_GATE
-        if _skip_qdrant:
-            log.info("query.qdrant_skipped_high_confidence",
+        _db_confident = _db_max_confidence >= QUERY_SKIP_QDRANT_GATE
+        if _db_confident:
+            log.info("query.qdrant_rankdown_high_confidence",
                      db_max_confidence=round(_db_max_confidence, 3),
                      gate=QUERY_SKIP_QDRANT_GATE,
+                     rankdown=QUERY_QDRANT_RANKDOWN,
                      db_facts_count=len(db_facts))
 
         # Step 4: Qdrant semantic search — surfaces Class C facts not directly anchor-connected.
         # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
-        # Skipped when DB facts already provide a confident answer (coverage gate above).
+        # D3: ALWAYS runs (no skip) so Class C is always part of full scope.
         qdrant_facts = []
-        if not _skip_qdrant:
-            try:
-                llm_url = _get_llm_url()
-                if llm_url:
-                    qdrant_facts = qdrant_semantic_search(
-                        query_text,
-                        conversation_history,
-                        user_id,
-                        qdrant_url,
-                        llm_url,
-                        score_threshold=0.3,
-                        limit=10,
-                        schema_name=schema_name,
-                    )
-                    if qdrant_facts:
-                        log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
-            except Exception as e:
-                log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
-        else:
-            log.info("query.phase4_skipped", reason="db_confidence_sufficient")
+        try:
+            llm_url = _get_llm_url()
+            if llm_url:
+                qdrant_facts = qdrant_semantic_search(
+                    query_text,
+                    conversation_history,
+                    user_id,
+                    qdrant_url,
+                    llm_url,
+                    score_threshold=0.3,
+                    limit=10,
+                    schema_name=schema_name,
+                )
+                if qdrant_facts:
+                    log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
+        except Exception as e:
+            log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
 
-        # Minimum confidence floor — applied to Qdrant results ONLY.
-        # DB facts (including staged_facts / Class B/C) are never floored — Class C
-        # facts (confidence 0.4) must surface so users can confirm or correct them,
-        # enabling the staged→promoted lifecycle. Qdrant can return semantic noise from
-        # unrelated contexts; floor that before merging.
+        # D3 rank-down (was: hard floor/exclusion). Low-relevance / low-confidence Qdrant
+        # facts are DEMOTED in rank, NEVER removed. The DB-confident case stacks an extra
+        # rank-down so authoritative A/B lead while rough Class C still surfaces last.
+        # We rank via a separate `_rank` score so the displayed `confidence` is preserved.
+        for f in qdrant_facts:
+            _base = f.get("confidence", 0.0)
+            _rank = _base
+            if _base < QUERY_MIN_CONFIDENCE:
+                # noise floor → demote (was an exclusion), keep in scope
+                _rank = _base * QUERY_QDRANT_RANKDOWN
+            if _db_confident:
+                # DB already answered → associative C ranks below DB facts
+                _rank = _rank * QUERY_QDRANT_RANKDOWN
+            # Blend content quality score: demotes scaffold, boosts real facts.
+            # QUERY_QUALITY_WEIGHT=0.25 → quality drives 25%, cosine drives 75%.
+            _quality = _content_quality_score(f.get("object") or "")
+            _rank = (1.0 - QUERY_QUALITY_WEIGHT) * _rank + QUERY_QUALITY_WEIGHT * _quality
+            f["_rank"] = _rank
         if qdrant_facts:
-            _before_floor = len(qdrant_facts)
-            qdrant_facts = [f for f in qdrant_facts if f.get("confidence", 0.0) >= QUERY_MIN_CONFIDENCE]
-            _dropped_floor = _before_floor - len(qdrant_facts)
-            if _dropped_floor:
-                log.info("query.qdrant_results_floored",
-                         dropped=_dropped_floor, min_confidence=QUERY_MIN_CONFIDENCE,
-                         remaining=len(qdrant_facts))
+            log.info("query.qdrant_results_rankdown",
+                     count=len(qdrant_facts), min_confidence=QUERY_MIN_CONFIDENCE,
+                     db_confident=_db_confident)
+
+        # ─── D4 (query half): genuine scoped HIT increments hit_count on Class C ───
+        # A Class C Qdrant fact is a HIT (not a mere bulk return) when:
+        #   • its cosine score >= QUERY_CLASSC_HIT_THRESHOLD (stricter than the 0.3 inclusion
+        #     threshold used to populate full scope), OR
+        #   • its subject/object is the resolved scope-anchor entity the query is about.
+        # On a hit, the backing staged_facts row (identified by payload fact_id) gets
+        # hit_count += 1 and expires_at reset to now()+30d. Bulk/peripheral returns: NO update
+        # (anti-noise guarantee). Promotion at hit_count>=3 is the re_embedder's job, not here.
+        try:
+            _hit_staged_ids = set()
+            for f in qdrant_facts:
+                if (f.get("fact_class") or "C") != "C":
+                    continue
+                _fid = f.get("fact_id") or f.get("_staged_id")
+                if _fid is None:
+                    continue  # rough store_context row with no Postgres backing → pure vector
+                _score = float(f.get("qdrant_score", 0.0) or 0.0)
+                _is_anchor_match = (
+                    f.get("subject") == anchor or f.get("object") == anchor
+                    or f.get("subject_id") == anchor or f.get("object_id") == anchor
+                )
+                if _score >= QUERY_CLASSC_HIT_THRESHOLD or _is_anchor_match:
+                    try:
+                        _hit_staged_ids.add(int(_fid))
+                    except (TypeError, ValueError):
+                        log.warning("query.classc_hit.bad_fact_id", fact_id=_fid)
+            if _hit_staged_ids:
+                with db.cursor() as _hit_cur:
+                    _hit_cur.execute(
+                        "UPDATE staged_facts"
+                        " SET hit_count = hit_count + 1,"
+                        "     expires_at = now() + INTERVAL '30 days'"
+                        " WHERE id = ANY(%s) AND fact_class = 'C' AND promoted_at IS NULL",
+                        (list(_hit_staged_ids),),
+                    )
+                    _hit_n = _hit_cur.rowcount
+                db.commit()
+                log.info("query.classc_hit_incremented",
+                         hits=_hit_n, threshold=QUERY_CLASSC_HIT_THRESHOLD)
+        except Exception as _hit_e:
+            # Fail loud but non-blocking — a hit-accounting failure must not break the query.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            log.error("query.classc_hit_increment_failed", error=str(_hit_e),
+                      error_type=type(_hit_e).__name__)
 
         # Step 5: Deduplicate DB facts, then apply confidence gate merging Qdrant results
         deduped_facts = deduplicate_facts(db_facts)
@@ -12046,7 +13280,7 @@ def correct_fact(req: FactCorrectionRequest):
                             rel_type=old_rel_type,
                             action=action,
                             user_id=req.user_id or "anonymous",
-                            llm_url=os.environ.get("QWEN_API_URL", "http://localhost:11434/v1/chat/completions"),
+                            llm_url=_get_llm_url(),
                             db_conn=db
                         )
 
@@ -12631,6 +13865,207 @@ def _parse_learn_statements(text: str) -> list[dict]:
     return edges
 
 
+def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
+                                      llm_text_excerpt: str = "") -> dict:
+    """Phase 4A (B.5): deliberate /expand seeds the OPERATIONAL ontology for a domain,
+    not just the instance_of/subclass_of/part_of hierarchy.
+
+    Generates — via the existing /expand LLM path — the domain's operational rel_types
+    WITH COMPLETE metadata (head_types, tail_types, natural_language, category,
+    is_symmetric, inverse_rel_type) and INSERTs them through `_create_rel_type_in_flow`
+    (the SAME INSERT shape Phase 2 established: engine_generated=true, fact_class='B',
+    ON CONFLICT backfills empties only). It also inserts/extends an `entity_taxonomies`
+    row for the domain (member_entity_types, rel_types_defining_group), then refreshes
+    `_REL_TYPE_META` so GLiNER2 picks up the new clean labels on the next message.
+
+    Returns {"rel_types_seeded": n, "taxonomy_seeded": bool, "rel_types": [...]}.
+    Fails loud; on any error returns a zeroed result so hierarchy generation still runs.
+    """
+    result = {"rel_types_seeded": 0, "taxonomy_seeded": False, "rel_types": []}
+    dsn = os.environ.get("POSTGRES_DSN", "")
+    if not dsn:
+        log.warning("learn_topic.operational_seed_skipped", reason="no POSTGRES_DSN")
+        return result
+
+    # Domain-grouped within the 25-label cap (consistent with Phase 4): keep the
+    # operational seed small so GLiNER2's per-message candidate set stays minimal.
+    _MAX_OPERATIONAL = 12
+
+    # ── One LLM call returns operational rel_types WITH complete metadata ──────────
+    prompt = (
+        f"You are defining the OPERATIONAL ontology for the domain: {topic}.\n"
+        f"List the core operational relationship types used to describe entities in "
+        f"this domain (NOT taxonomy/hierarchy like instance_of or subclass_of — those "
+        f"are handled separately). Examples of operational relations across domains: a "
+        f"server `runs` software, a device `connects_to` a network, a person "
+        f"`works_for` an organization.\n\n"
+        f"Return STRICT JSON only, no prose, in this exact shape:\n"
+        f'{{"rel_types": [\n'
+        f'  {{"rel_type": "snake_case_name", "natural_language": "X verbs Y",\n'
+        f'    "head_types": ["Object"], "tail_types": ["Object"],\n'
+        f'    "category": "system", "is_symmetric": false, "inverse_rel_type": null}}\n'
+        f"]}}\n\n"
+        f"Rules: rel_type is lowercase snake_case. head_types/tail_types are drawn from "
+        f"[Person, Animal, Organization, Location, Object, Concept] (or [\"SCALAR\"] when "
+        f"the object is a literal value like a version or port). natural_language uses the "
+        f"literal placeholders X and Y. inverse_rel_type is null unless a clear inverse "
+        f"exists. Provide at most {_MAX_OPERATIONAL} of the MOST important operational "
+        f"relations for {topic}."
+    )
+    if llm_text_excerpt:
+        prompt = (
+            f"Reference material about '{topic}':\n\n{llm_text_excerpt[:4000]}\n\n" + prompt
+        )
+
+    llm_text = None
+    try:
+        from src.api.llm_calls import (
+            _llm_http_client,
+            _llm_circuit_breaker,
+            _get_endpoint_list,
+            _parse_llm_response_robust,
+        )
+        if _llm_circuit_breaker.is_open():
+            log.warning("learn_topic.operational_seed_skipped",
+                        topic=topic, reason="llm_circuit_breaker_open")
+            return result
+        payload = build_llm_payload(
+            messages=[{"role": "user", "content": prompt}],
+            model=os.getenv("WGM_LLM_MODEL", "qwen2.5-coder"),
+            user_id=user_id,
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        for endpoint in _get_endpoint_list():
+            try:
+                resp = _llm_http_client.post(
+                    endpoint, json=payload, headers=get_llm_headers(),
+                    timeout=LLMTimeouts.get("EXTRACTION"),
+                )
+                resp.raise_for_status()
+                parsed = _parse_llm_response_robust(resp)
+                if parsed:
+                    llm_text = parsed.get("choices", [{}])[0].get(
+                        "message", {}).get("content", "").strip()
+                    if llm_text:
+                        _llm_circuit_breaker.record_success()
+                        break
+            except Exception as _ep_err:
+                log.warning("learn_topic.operational_seed_endpoint_failed",
+                            topic=topic, endpoint=endpoint, error=str(_ep_err))
+                continue
+    except Exception as e:
+        log.error("learn_topic.operational_seed_llm_failed", topic=topic, error=str(e))
+        return result
+
+    if not llm_text:
+        log.warning("learn_topic.operational_seed_no_content", topic=topic)
+        return result
+
+    # Parse JSON (tolerate code fences / surrounding prose).
+    import json as _json
+    import re as _re_json
+    rel_defs = []
+    try:
+        _m = _re_json.search(r'\{.*\}', llm_text, _re_json.DOTALL)
+        _raw = _m.group(0) if _m else llm_text
+        _parsed = _json.loads(_raw)
+        rel_defs = _parsed.get("rel_types", []) if isinstance(_parsed, dict) else []
+    except Exception as _pe:
+        log.error("learn_topic.operational_seed_parse_failed",
+                  topic=topic, error=str(_pe), text_preview=llm_text[:200])
+        return result
+
+    if not rel_defs:
+        log.warning("learn_topic.operational_seed_empty", topic=topic)
+        return result
+
+    seeded_rel_types: list[str] = []
+    member_types: set[str] = set()
+    try:
+        with psycopg2.connect(dsn) as _db:
+            for _d in rel_defs[:_MAX_OPERATIONAL]:
+                if not isinstance(_d, dict):
+                    continue
+                rt = (_d.get("rel_type") or "").strip().lower()
+                if not rt:
+                    continue
+                # Normalize metadata into the Phase 2 shape; reuse the in-flow creator
+                # so engine_generated=true, fact_class='B', ON CONFLICT backfills empties.
+                _norm = _normalize_novel_rel_metadata(_d, rt) or {}
+                # natural_language is required for GLiNER2 candidate inclusion (Phase 4
+                # scalar build skips NULL natural_language); ensure a clean short label.
+                if not _norm.get("natural_language"):
+                    _norm["natural_language"] = (_d.get("natural_language")
+                                                 or f"X {rt.replace('_', ' ')} Y")
+                ok = _create_rel_type_in_flow(
+                    _db, rt, _norm, confidence=0.6, source="expand_operational_seed")
+                if ok:
+                    seeded_rel_types.append(rt)
+                    for _h in (_norm.get("head_types") or []):
+                        if _h and _h != "ANY":
+                            member_types.add(_h)
+                    for _t in (_norm.get("tail_types") or []):
+                        if _t and _t not in ("ANY", "SCALAR"):
+                            member_types.add(_t)
+
+            # ── Seed entity_taxonomies for the domain (member_entity_types +
+            #    rel_types_defining_group). ON CONFLICT extends existing rows. ─────────
+            taxonomy_name = topic.strip().lower().replace(" ", "_")[:64]
+            if seeded_rel_types and taxonomy_name:
+                _members = sorted(member_types) if member_types else ["Object", "Concept"]
+                with _db.cursor() as _tc:
+                    _tc.execute(
+                        """
+                        INSERT INTO entity_taxonomies
+                            (taxonomy_name, description, member_entity_types,
+                             rel_types_defining_group, source)
+                        VALUES (%s, %s, %s, %s, 'expand')
+                        ON CONFLICT (taxonomy_name) DO UPDATE SET
+                            member_entity_types = (
+                                SELECT ARRAY(SELECT DISTINCT unnest(
+                                    entity_taxonomies.member_entity_types
+                                    || EXCLUDED.member_entity_types))),
+                            rel_types_defining_group = (
+                                SELECT ARRAY(SELECT DISTINCT unnest(
+                                    entity_taxonomies.rel_types_defining_group
+                                    || EXCLUDED.rel_types_defining_group)))
+                        """,
+                        (taxonomy_name, f"Operational ontology for {topic}",
+                         _members, seeded_rel_types),
+                    )
+                _db.commit()
+                result["taxonomy_seeded"] = True
+                log.info("learn_topic.taxonomy_seeded",
+                         taxonomy=taxonomy_name, members=_members,
+                         defining_rel_types=seeded_rel_types)
+    except Exception as e:
+        log.error("learn_topic.operational_seed_insert_failed", topic=topic, error=str(e))
+        return result
+
+    result["rel_types_seeded"] = len(seeded_rel_types)
+    result["rel_types"] = seeded_rel_types
+
+    # Refresh _REL_TYPE_META in-process so the new clean labels are visible to GLiNER2
+    # on the next message (Phase 3 mechanism). _create_rel_type_in_flow already refreshes
+    # per-insert, but call the consolidated refresh once more to be certain the scalar
+    # cache and routing cache are consistent after the taxonomy write.
+    try:
+        global _REL_TYPE_META
+        _REL_TYPE_META = _build_rel_type_meta(dsn)
+        _refresh_rel_type_cache()
+        _refresh_scalar_rel_types_cache()
+        log.info("learn_topic.operational_seed_cache_refreshed",
+                 rel_type_count=len(_REL_TYPE_META))
+    except Exception as _re:
+        log.warning("learn_topic.operational_seed_cache_refresh_failed", error=str(_re))
+
+    log.info("learn_topic.operational_seed_complete",
+             topic=topic, rel_types_seeded=result["rel_types_seeded"],
+             rel_types=seeded_rel_types)
+    return result
+
+
 @app.post("/learn")
 async def learn_topic(req: LearnTopicRequest):
     """
@@ -12814,8 +14249,28 @@ async def learn_topic(req: LearnTopicRequest):
         except Exception as _te:
             log.warning("learn_topic.entity_type_update_failed", topic=topic, error=str(_te))
 
-        log.info("learn_topic.complete", topic=topic, committed=committed, staged=staged)
-        return {"status": "learned", "topic": topic, "committed": committed, "staged": staged, "total": total}
+        # ── Phase 4A (B.5): seed the OPERATIONAL ontology for this domain ───────────
+        # Hierarchy (instance_of/subclass_of/part_of) above gives the taxonomy; this
+        # ADDS the domain's operational rel_types (e.g. networking → has_vlan,
+        # connects_to, has_port) WITH complete metadata + an entity_taxonomies row, so
+        # GLiNER2's Phase 4 candidate set can extract them on the next message. Best-
+        # effort: a failure here never blocks the hierarchy result (fail loud, degrade).
+        operational = {"rel_types_seeded": 0, "taxonomy_seeded": False, "rel_types": []}
+        try:
+            operational = _seed_domain_operational_ontology(
+                topic, user_id=user_id, llm_text_excerpt=llm_text)
+        except Exception as _seed_err:
+            log.error("learn_topic.operational_seed_unhandled", topic=topic, error=str(_seed_err))
+
+        log.info("learn_topic.complete", topic=topic, committed=committed, staged=staged,
+                 operational_rel_types=operational.get("rel_types_seeded", 0))
+        return {
+            "status": "learned", "topic": topic,
+            "committed": committed, "staged": staged, "total": total,
+            "operational_rel_types_seeded": operational.get("rel_types_seeded", 0),
+            "operational_rel_types": operational.get("rel_types", []),
+            "taxonomy_seeded": operational.get("taxonomy_seeded", False),
+        }
     except Exception as e:
         log.error("learn_topic.ingest_failed", topic=topic, error=str(e))
         return {"status": "error", "topic": topic, "detail": str(e), "committed": 0, "staged": 0, "total": 0}

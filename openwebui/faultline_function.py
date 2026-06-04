@@ -3281,6 +3281,17 @@ GRANULAR EXAMPLES (using recent facts context):
             # OpenWebUI's NoneType crash on missing chat_id (dBug-016 / openwebui#24550).
             # PHASE 2: user_id already extracted at inlet start (provisioning blocker) — reuse it here
 
+            # Skip FaultLine-internal prompts (re-embedder LLM calls, retraction extraction, etc.)
+            # that loop back through the Filter inlet. Must run BEFORE _classify_intent() to prevent
+            # internal prompts from consuming classification budget and triggering false RETRACTION
+            # via the negation pattern fallback (e.g. re-embedder prompts contain "is not", "wrong",
+            # "remove" → GLiNER2 returns QUERY 0.66 → gate 0.70 fails → Layer 2 fires → RETRACTION).
+            # NO RECURSIVE MATCHING — checked against pre-extracted text string only
+            if text.startswith(_FAULTLINE_INTERNAL_PREFIX):
+                if self.valves.ENABLE_DEBUG:
+                    print(f"[FaultLine Filter] skipping internal FaultLine prompt: {text[:80]!r}")
+                return body
+
             # REFACTORED DEDUP (dprompt-145): State-tracking + intent-aware (ATOMIC GATE SEMANTICS)
             # OLD: message_text hash → blocks legitimate corrections/retractions
             # NEW: idempotency_key from user_id + intent + payload fingerprint, with state tracking
@@ -3412,15 +3423,6 @@ GRANULAR EXAMPLES (using recent facts context):
                         print(f"[FaultLine Filter] /retract/correct error: {e}")
                     # Fall through to normal ingest if retraction fails
 
-            # Skip internal FaultLine prompts — marked to prevent recursive cascade (dprompt-128 surgical fix)
-            # When filter generates internal prompts (retraction detection, etc.), they're prefixed with
-            # _FAULTLINE_INTERNAL_PREFIX. If the prompt loops back through inlet, we skip it.
-            # NO RECURSIVE MATCHING — signals checked against pre-extracted text string only
-            if text.startswith(_FAULTLINE_INTERNAL_PREFIX):
-                if self.valves.ENABLE_DEBUG:
-                    print(f"[FaultLine Filter] skipping internal FaultLine prompt: {text[:80]!r}")
-                return body
-
             # Skip FaultLine memory injection feedback (existing mechanism)
             _FEEDBACK_MARKERS = (
                 "⊢ FaultLine Memory",
@@ -3533,6 +3535,12 @@ GRANULAR EXAMPLES (using recent facts context):
                                     entity_attributes = data.get("attributes", {})
                                     anchor = data.get("anchor")
                                     alerts = data.get("alerts", [])
+                                    # FIX-2: Log empty facts responses for visibility — helps diagnose
+                                    # query recall failures (no memory to inject).
+                                    if not facts and will_query:
+                                        print(f"[FaultLine Filter] WARNING: /query returned 200 OK but facts=[] "
+                                              f"(no memory block will be injected) user_text='{text[:60]}...'")
+
 
                                     # Backward compatibility: if facts are strings (prose-only format),
                                     # convert to simple dict wrappers so Filter code still works
@@ -3662,15 +3670,6 @@ GRANULAR EXAMPLES (using recent facts context):
 
                 else:  # STATEMENT or unknown
                     print(f"[FaultLine Filter] ROUTE_TAKEN: STATEMENT — calling /ingest", flush=True)
-                    # CRITICAL: Always cache raw text to Qdrant first, regardless of downstream validation.
-                    # This ensures no data loss — raw context is retrievable even if structured ingest fails.
-                    try:
-                        await self._fire_store_context(clean_text, user_id)
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] raw text cached to Qdrant (store_context)")
-                    except Exception as _e:
-                        if self.valves.ENABLE_DEBUG:
-                            print(f"[FaultLine Filter] store_context failed (non-critical): {_e}")
 
                     # Compute signals for skip_rewrite check
                     _has_self_id = bool(_IDENTITY_RE.search(clean_text))
@@ -3695,14 +3694,20 @@ GRANULAR EXAMPLES (using recent facts context):
                         and not _has_preference_signal
                         and not _is_attribute_question
                     )
+
+                    # _is_class_c tracks whether store_context should fire after ingest.
+                    # For _skip_rewrite=True (pure question, no ingest called), default True so
+                    # raw text is still cached for associative RAG recall.
+                    _is_class_c = True
+                    ingest_result = None
+
                     if _skip_rewrite:
                         typed_entities = []
                         raw_triples = []
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] skipping Qwen rewrite — pure question detected")
                         # dprompt-143: Skip /ingest entirely for pure questions.
-                        # store_context already cached the raw text. /ingest would trigger
-                        # a backend LLM extraction that returns 0 triples — wasted 30s timeout.
+                        # _is_class_c stays True — store_context will fire below to cache raw text.
                         if self.valves.ENABLE_DEBUG:
                             print(f"[FaultLine Filter] skipping /ingest — pure question, store_context sufficient")
                     else:
@@ -3724,6 +3729,20 @@ GRANULAR EXAMPLES (using recent facts context):
                             is_correction=is_correction_ingest,
                         )
 
+                        # Gate store_context: only fire when ingest produced no structured facts.
+                        # Class A (committed > 0) or Class B (staged > 0) or scalar
+                        # (scalar_committed > 0) are already persisted in PostgreSQL — do not
+                        # duplicate them to Qdrant as raw Class C context.
+                        _committed  = (ingest_result or {}).get("committed", 0)
+                        _staged     = (ingest_result or {}).get("staged", 0)
+                        _scalar     = (ingest_result or {}).get("scalar_committed", 0)
+                        _is_class_c = (_committed == 0 and _staged == 0 and _scalar == 0)
+                        if self.valves.ENABLE_DEBUG:
+                            if _is_class_c:
+                                print(f"[FaultLine Filter] ingest produced no structured facts — Class C, will store_context")
+                            else:
+                                print(f"[FaultLine Filter] Class A/B committed={_committed} staged={_staged} scalar={_scalar} — skipping store_context")
+
                         # Record result in dedup cache for duplicate requests (PART 1: Redis dedup state recording)
                         if ingest_result and ingest_result.get("status") not in ("error", None):
                             try:
@@ -3740,6 +3759,18 @@ GRANULAR EXAMPLES (using recent facts context):
                             except Exception as e:
                                 if self.valves.ENABLE_DEBUG:
                                     print(f"[FaultLine Filter] dedup result recording failed (non-critical): {e}")
+
+                    # Only store raw context to Qdrant when ingest produced no structured facts
+                    # (Class C result). Class A/B facts are already in PostgreSQL — do not
+                    # duplicate them as raw vectors.
+                    if _is_class_c:
+                        try:
+                            await self._fire_store_context(clean_text, user_id)
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] Class C: raw text cached to Qdrant (store_context)")
+                        except Exception as _e:
+                            if self.valves.ENABLE_DEBUG:
+                                print(f"[FaultLine Filter] store_context failed (non-critical): {_e}")
 
             # Build and inject memory block from retrieved facts
             if will_query and (facts or preferred_names or canonical_identity):

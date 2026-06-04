@@ -811,6 +811,270 @@ def expire_staged_facts(db_conn, qdrant_url: str, user_id: str = None) -> int:
     return expired
 
 
+def decay_class_c_hits(db_conn, qdrant_url: str, user_id: str = None, limit: int = 100) -> dict:
+    """
+    JOB 1 — Class C HIT-LIFECYCLE DECAY sweep (Part B state machine, Part D4).
+
+    Distinct from expire_staged_facts(): that decays the ingest-side `confirmed_count`.
+    THIS decays the query-side `hit_count` — the query-hit counter incremented by the
+    query path (other agent) on a genuine scoped relevance match. hit_count and
+    confirmed_count are NEVER conflated.
+
+    State-machine rule (IDLE 30d, no hit in the window):
+        hit_count = hit_count - 1
+        expires_at = now() + 30d      # decrement buys another 30-day window
+        if hit_count <= 0:  DROP (delete row + best-effort Qdrant point)
+
+    A hit (other agent) pushes expires_at forward, so any row whose expires_at <= now()
+    has gone a full window with no hit and is owed a decrement.
+
+    Bounded with LIMIT per cycle so the poll loop stays responsive.
+    Returns {"decremented": int, "dropped": int}.
+    Per-user schema context: user_id is passed as parameter (schema provides isolation).
+    """
+    stats = {"decremented": 0, "dropped": 0}
+    try:
+        # Step 1: Select the idle Class C rows (window elapsed, no hit), bounded.
+        # A row with hit_count <= 1 will hit zero on this decrement and must be dropped
+        # (need its id + qdrant point), so we select all eligible and branch per-row.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, hit_count
+                FROM staged_facts
+                WHERE fact_class  = 'C'
+                  AND expires_at <= now()
+                  AND promoted_at IS NULL
+                ORDER BY expires_at ASC
+                LIMIT %s
+                """,
+                (limit,)
+            )
+            idle_rows = cur.fetchall()
+
+        if not idle_rows:
+            return stats
+
+        collection = derive_collection(user_id) if user_id else os.getenv("QDRANT_COLLECTION", "faultline-test")
+
+        for staged_id, hit_count in idle_rows:
+            try:
+                new_hits = (hit_count if hit_count is not None else 1) - 1
+                if new_hits <= 0:
+                    # DROP — best-effort Qdrant delete first (match expiry pattern), then row.
+                    try:
+                        httpx.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
+                            json={"points": [staged_id]},
+                            timeout=10.0,
+                        )
+                    except Exception:
+                        pass  # Best-effort Qdrant cleanup
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM staged_facts WHERE id = %s",
+                            (staged_id,)
+                        )
+                    db_conn.commit()
+                    stats["dropped"] += 1
+                    log.info(
+                        f"re_embedder.class_c_dropped staged_id={staged_id} "
+                        f"reason=hit_count_zero user_id={user_id}"
+                    )
+                else:
+                    # Decrement hit_count, reset the 30-day window.
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE staged_facts
+                            SET hit_count   = %s,
+                                expires_at  = now() + interval '30 days'
+                            WHERE id = %s
+                            """,
+                            (new_hits, staged_id)
+                        )
+                    db_conn.commit()
+                    stats["decremented"] += 1
+            except Exception as e:
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+                log.error(f"re_embedder.class_c_decay_failed staged_id={staged_id}: {e}")
+
+        if stats["decremented"] or stats["dropped"]:
+            log.info(
+                f"re_embedder.class_c_decay_complete "
+                f"decremented={stats['decremented']} dropped={stats['dropped']} user_id={user_id}"
+            )
+
+    except Exception as e:
+        log.error(f"re_embedder.class_c_decay_error: {e}")
+
+    return stats
+
+
+def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: str = None,
+                         schema_name: str = None, hit_threshold: int = 3, limit: int = 50) -> int:
+    """
+    JOB 2 — Class C HIT-LIFECYCLE PROMOTION (Part B state machine, Part D4, default B-2).
+
+    When a Class C row reaches hit_count >= 3 (earned via genuine query-scoped hits, NOT
+    ingest confirmations), promote it to Class B and route it into the facts table using
+    the SAME mechanism as promote_staged_facts() (INSERT ... ON CONFLICT, set promoted_at,
+    enqueue Qdrant re-sync, best-effort delete the staged Qdrant point).
+
+    Default B-2 — an UNCLASSIFIED Class C row (rel_type IS NULL, rough memory) is FIRST
+    classified at this moment via the existing LLM metadata path
+    (_query_llm_for_rel_type_metadata) to derive a structured rel_type + metadata from the
+    fact's stored text/context. If classification fails we leave it as Class C and skip
+    promotion (do not promote a thing we cannot structure). An already-classified Class C
+    just flips to B.
+
+    Bounded with LIMIT per cycle. Fails loud per-row, continues the loop.
+    Returns count of rows promoted to facts.
+    Per-user schema context: user_id is passed as parameter (schema provides isolation).
+    """
+    promoted = 0
+    try:
+        # Optional per-user search_path (mirror promote_staged_facts house style).
+        if schema_name:
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}, public")
+                db_conn.commit()
+            except Exception as e:
+                log.warning(f"re_embedder.class_c_promote_search_path_failed schema={schema_name}: {e}")
+                # Continue with current search_path
+
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, subject_id, object_id, rel_type, provenance,
+                       confidence, hit_count, rel_type_definition
+                FROM staged_facts
+                WHERE fact_class = 'C'
+                  AND hit_count >= %s
+                  AND promoted_at IS NULL
+                ORDER BY hit_count DESC
+                LIMIT %s
+                """,
+                (hit_threshold, limit)
+            )
+            candidates = cur.fetchall()
+
+        if not candidates:
+            return promoted
+
+        for row in candidates:
+            sid, subject, obj, rel_type, prov, conf, hits, rel_def = row
+            required_classification = False
+            try:
+                # ── Default B-2: classify rough/unclassified memory before promotion ──
+                if not rel_type:
+                    required_classification = True
+                    # Build a candidate rel_type + snippet from stored text/context so the
+                    # existing LLM metadata path can derive a structured rel_type. We reuse
+                    # the same helper the ontology evaluator uses — no divergent path.
+                    resolved = resolve_display_names_for_facts(db_conn, [{
+                        "subject_id": subject, "object_id": obj,
+                    }])[0]
+                    subj_disp = resolved.get("subject_display", subject)
+                    obj_disp = resolved.get("object_display", obj)
+                    snippet = (rel_def or prov or f"{subj_disp} {obj_disp}").strip()
+                    candidate_rel = "related_to"  # rough seed; LLM infers the real rel_type metadata
+                    llm_md = _query_llm_for_rel_type_metadata(
+                        candidate_rel, "unknown", "unknown", snippet, qwen_api_url
+                    )
+                    if not llm_md or not llm_md.get("llm_natural_language"):
+                        # FAIL LOUD: cannot structure → leave as Class C, do not promote.
+                        log.warning(
+                            f"re_embedder.class_c_promote_classify_failed staged_id={sid} "
+                            f"hit_count={hits} reason=no_llm_metadata — left as Class C"
+                        )
+                        continue
+
+                    # Register the inferred rel_type into rel_types so the structured fact has
+                    # a real ontology entry (mirrors evaluate_ontology_candidates INSERT shape).
+                    natural_language = llm_md.get("llm_natural_language", "")
+                    is_symmetric = llm_md.get("llm_is_symmetric", False)
+                    inverse_rel_type = llm_md.get("llm_inverse_rel_type")
+                    category = llm_md.get("llm_category", "other")
+                    head_types = llm_md.get("llm_head_types") or ["ANY"]
+                    tail_types = llm_md.get("llm_tail_types") or ["ANY"]
+                    label = candidate_rel.replace('_', ' ').title()
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO rel_types"
+                            " (rel_type, label, natural_language, engine_generated, confidence, source,"
+                            "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category, fact_class)"
+                            " VALUES (%s, %s, %s, true, %s, 'class_c_promotion', %s, %s, false, %s, %s, %s, 'B')"
+                            " ON CONFLICT (rel_type) DO UPDATE SET"
+                            "  natural_language = EXCLUDED.natural_language,"
+                            "  category = EXCLUDED.category,"
+                            "  head_types = CASE WHEN (rel_types.head_types IS NULL"
+                            "                          OR rel_types.head_types = ARRAY[]::TEXT[])"
+                            "                    THEN EXCLUDED.head_types ELSE rel_types.head_types END,"
+                            "  tail_types = CASE WHEN (rel_types.tail_types IS NULL"
+                            "                          OR rel_types.tail_types = ARRAY[]::TEXT[])"
+                            "                    THEN EXCLUDED.tail_types ELSE rel_types.tail_types END",
+                            (candidate_rel, label, natural_language, 0.8, head_types, tail_types,
+                             is_symmetric, inverse_rel_type, category),
+                        )
+                    rel_type = candidate_rel
+
+                # ── Promote C → B via the SAME mechanism as promote_staged_facts() ──
+                promote_conf = max(conf if conf is not None else 0.0, 0.6)  # ensure >= 0.6 (Class B floor)
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO facts"
+                        " (subject_id, object_id, rel_type, provenance,"
+                        "  confidence, fact_class, fact_provenance, qdrant_synced)"
+                        " VALUES (%s, %s, %s, %s, %s, 'B', %s, false)"
+                        " ON CONFLICT (subject_id, object_id, rel_type)"
+                        " DO UPDATE SET"
+                        "   confirmed_count = facts.confirmed_count + 1,"
+                        "   last_seen_at    = now(),"
+                        "   updated_at      = now()",
+                        (subject, obj, rel_type, prov, promote_conf, prov)
+                    )
+                    cur.execute(
+                        "UPDATE staged_facts SET fact_class = 'B', promoted_at = now() WHERE id = %s",
+                        (sid,)
+                    )
+                db_conn.commit()
+                promoted += 1
+
+                # Best-effort: delete staged Qdrant point after promotion commits
+                # (match promote_staged_facts cleanup pattern). New facts-table point is
+                # re-synced next cycle via qdrant_synced=false above.
+                try:
+                    collection = derive_collection(user_id)
+                    httpx.post(
+                        f"{qdrant_url}/collections/{collection}/points/delete",
+                        json={"points": [sid]},
+                        timeout=5.0
+                    )
+                except Exception as e:
+                    log.warning(f"re_embedder.class_c_promote_qdrant_delete_failed staged_id={sid}: {e}")
+
+                log.info(
+                    f"re_embedder.class_c_promoted staged_id={sid} rel_type={rel_type} "
+                    f"hit_count={hits} required_classification={required_classification} user_id={user_id}"
+                )
+            except Exception as e:
+                try:
+                    db_conn.rollback()
+                except Exception as rollback_err:
+                    log.warning(f"re_embedder.class_c_promote_rollback_failed: {rollback_err}")
+                log.error(f"re_embedder.class_c_promote_failed staged_id={sid}: {e}")
+
+    except Exception as e:
+        log.error(f"re_embedder.class_c_promote_error: {e}")
+
+    return promoted
+
+
 def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     """
     Full reconciliation pass across all FaultLine Qdrant collections.
@@ -1026,7 +1290,9 @@ Respond with ONLY valid JSON (no markdown, no extra text):
   "natural_language": "X {candidate_rel.replace('_', ' ')} Y  ← MUST use X for subject and Y for object (e.g., 'X and Y are friends', 'X has IP address Y')",
   "is_symmetric": boolean,
   "inverse_rel_type": "opposite rel_type or null",
-  "category": "family|work|location|identity|temporal|behavioral|physical|social",
+  "category": "family|work|location|identity|temporal|behavioral|physical|social|network",
+  "head_types": ["entity types allowed as SUBJECT, e.g. Person or Object; use [\\"ANY\\"] if unconstrained, [\\"SCALAR\\"] never applies to subject"],
+  "tail_types": ["entity types allowed as OBJECT, e.g. Organization; use [\\"SCALAR\\"] if the object is a literal value (number/string/date), [\\"ANY\\"] if unconstrained"],
   "fact_class": "A|B|C",
   "confidence": 0.0-1.0,
   "examples": [{{"subject": "Person1", "object": "Person2"}}]
@@ -1053,11 +1319,26 @@ Respond with ONLY valid JSON (no markdown, no extra text):
 
         # Extract metadata directly from parsed result
         metadata = result
+
+        def _as_type_list(v):
+            # Normalize LLM type field (list | comma-string | single string) → list or None.
+            if v is None:
+                return None
+            if isinstance(v, str):
+                parts = [p.strip() for p in v.split(",") if p.strip()]
+                return parts or None
+            if isinstance(v, (list, tuple)):
+                parts = [str(p).strip() for p in v if str(p).strip()]
+                return parts or None
+            return None
+
         return {
             "llm_natural_language": metadata.get("natural_language", ""),
             "llm_is_symmetric": metadata.get("is_symmetric", False),
             "llm_inverse_rel_type": metadata.get("inverse_rel_type"),
             "llm_category": metadata.get("category", "other"),
+            "llm_head_types": _as_type_list(metadata.get("head_types")),
+            "llm_tail_types": _as_type_list(metadata.get("tail_types")),
             "llm_fact_class": metadata.get("fact_class", "B"),
             "llm_confidence": float(metadata.get("confidence", 0.6)),
             "llm_metadata_json": json.dumps(metadata),
@@ -1181,15 +1462,23 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     inverse_rel_type = llm_metadata.get("llm_inverse_rel_type")
                     category = llm_metadata.get("llm_category", "other")
 
-                    # Infer metadata from candidate's subject and object types (fallback)
-                    head_types = None
-                    tail_types = None
+                    # Type constraints (Severance #2): prefer the LLM-inferred head/tail types
+                    # from the metadata call. Fall back to observed entity types only when the
+                    # LLM was uncertain. NEVER persist NULL head/tail types when inference
+                    # succeeded — that is the mechanical cause of the 18 empty-head_types rows.
+                    head_types = llm_metadata.get("llm_head_types")
+                    tail_types = llm_metadata.get("llm_tail_types")
                     is_hierarchy = False
 
-                    if subj_type and subj_type != "unknown":
+                    if not head_types and subj_type and subj_type != "unknown":
                         head_types = [subj_type]
-                    if obj_type and obj_type != "unknown":
+                    if not tail_types and obj_type and obj_type != "unknown":
                         tail_types = [obj_type]
+                    # Last resort so WGM validation is not a silent no-op: unconstrained ANY.
+                    if not head_types:
+                        head_types = ["ANY"]
+                    if not tail_types:
+                        tail_types = ["ANY"]
 
                     # Heuristic: if rel_type suggests classification/taxonomy, mark as hierarchy
                     if any(keyword in candidate_rel.lower() for keyword in ("instance_of", "subclass_of", "member_of", "is_a", "part_of", "type_of")):
@@ -1202,6 +1491,8 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     llm_confidence = llm_metadata.get("llm_confidence", 0.6)
                     assigned_fact_class = "B" if llm_confidence >= 0.5 else "C"
 
+                    # Severance #2: backfill head/tail types only when currently empty —
+                    # never clobber existing good constraints (CASE guards in the UPDATE).
                     cur.execute(
                         "INSERT INTO rel_types"
                         " (rel_type, label, natural_language, engine_generated, confidence, source,"
@@ -1212,6 +1503,12 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  is_symmetric = EXCLUDED.is_symmetric,"
                         "  inverse_rel_type = EXCLUDED.inverse_rel_type,"
                         "  category = EXCLUDED.category,"
+                        "  head_types = CASE WHEN (rel_types.head_types IS NULL"
+                        "                          OR rel_types.head_types = ARRAY[]::TEXT[])"
+                        "                    THEN EXCLUDED.head_types ELSE rel_types.head_types END,"
+                        "  tail_types = CASE WHEN (rel_types.tail_types IS NULL"
+                        "                          OR rel_types.tail_types = ARRAY[]::TEXT[])"
+                        "                    THEN EXCLUDED.tail_types ELSE rel_types.tail_types END,"
                         "  fact_class = EXCLUDED.fact_class",
                         (candidate_rel, label, natural_language, 0.8, head_types, tail_types, is_hierarchy, is_symmetric, inverse_rel_type, category, assigned_fact_class),
                     )
@@ -1759,10 +2056,13 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
         # ────────────────────────────────────────────────────────────────
         with db_conn.cursor() as cur:
             cur.execute("""
-                SELECT id, entity_id_1, entity_name_1, entity_id_2, entity_name_2, disputed_name
-                FROM entity_name_conflicts
-                WHERE status = 'pending'
-                ORDER BY created_at ASC
+                SELECT c.id, c.entity_id_a, COALESCE(a1.alias, c.entity_id_a),
+                       c.entity_id_b, COALESCE(a2.alias, c.entity_id_b), c.alias
+                FROM entity_name_conflicts c
+                LEFT JOIN entity_aliases a1 ON a1.entity_id = c.entity_id_a AND a1.is_preferred = true
+                LEFT JOIN entity_aliases a2 ON a2.entity_id = c.entity_id_b AND a2.is_preferred = true
+                WHERE c.status = 'pending'
+                ORDER BY c.created_at ASC
                 LIMIT 20
             """)
             conflicts = cur.fetchall()
@@ -1943,8 +2243,7 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                         # Mark conflict as resolved
                         cur.execute(
                             "UPDATE entity_name_conflicts SET "
-                            "status = 'resolved', resolution_method = 'llm_context', "
-                            "resolution_detail = %s, resolved_at = NOW() "
+                            "status = 'resolved', resolved_by = %s, resolved_at = NOW() "
                             "WHERE id = %s",
                             (f"Winner: {winner_name}; Loser fallback: {fallback_alias if loser_alias_count == 1 else 'existing'}",
                              conflict_id)
@@ -2650,6 +2949,26 @@ def main():
                         if n_expired:
                             log.info(f"re_embedder.expiry_complete user_id={user_id[:8]} expired={n_expired}")
 
+                        # JOB 2 — Promote Class C rows that earned hit_count >= 3 (query-scoped
+                        # hits) to Class B. Classify-if-needed (default B-2). Run BEFORE the
+                        # hit-decay sweep so a row that just reached threshold promotes instead
+                        # of being decremented in the same cycle.
+                        n_c_promoted = promote_class_c_hits(
+                            db_per_user, qdrant_url, qwen_api_url,
+                            user_id=user_id, schema_name=schema_name
+                        )
+                        if n_c_promoted:
+                            log.info(f"re_embedder.class_c_promotion_complete user_id={user_id[:8]} promoted={n_c_promoted}")
+
+                        # JOB 1 — Decay Class C query-hit counter for idle rows (30d window
+                        # elapsed with no hit): hit_count -= 1, reset window, DROP at <= 0.
+                        c_decay = decay_class_c_hits(db_per_user, qdrant_url, user_id=user_id)
+                        if c_decay["decremented"] or c_decay["dropped"]:
+                            log.info(
+                                f"re_embedder.class_c_decay user_id={user_id[:8]} "
+                                f"decremented={c_decay['decremented']} dropped={c_decay['dropped']}"
+                            )
+
                         # Fetch and embed unsynced facts for this user
                         rows = fetch_unsynced(db_per_user, user_id, confidence_threshold)
                         if rows:
@@ -2850,11 +3169,93 @@ def main():
                                 f"rejected={ontology_stats['rejected']} "
                                 f"errors={ontology_stats['errors']}"
                             )
+                        # Phase 3 (Severance #3): newly-approved rel_types live in the DB but are
+                        # invisible to the backend uvicorn process (separate OS process) until it
+                        # reloads _REL_TYPE_META. Trigger the cross-process refresh endpoint.
+                        if ontology_stats.get("approved", 0) > 0 or ontology_stats.get("mapped", 0) > 0:
+                            try:
+                                _r = httpx.post(
+                                    "http://faultline:8000/internal/refresh-intent-pattern-caches",
+                                    timeout=5.0,
+                                )
+                                if _r.status_code == 200:
+                                    log.info("re_embedder.ontology_approval_cache_refresh_triggered")
+                                else:
+                                    log.warning(f"re_embedder.ontology_approval_cache_refresh_failed status={_r.status_code}")
+                            except Exception as _re:
+                                log.warning(f"re_embedder.ontology_approval_cache_refresh_error: {_re}")
                     else:
                         log.debug("re_embedder.no_pending_ontology_work")
                 except Exception as e:
                     log.error(f"re_embedder.ontology_eval_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if ontology eval fails
+
+                # Retroactive head_types/tail_types sweep (Severance #2, Phase 2): self-heal the
+                # existing rel_types rows that have NULL/empty head_types (32% of the ontology,
+                # including instance_of/subclass_of/member_of). Bounded batch per cycle (LIMIT 10).
+                # Uses the SAME LLM metadata call so type constraints come from inference, not guesswork.
+                try:
+                    with db.cursor() as cur:
+                        cur.execute(
+                            "SELECT rel_type, head_types, tail_types, natural_language"
+                            " FROM rel_types"
+                            " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
+                            "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                            " ORDER BY confidence DESC NULLS LAST"
+                            " LIMIT 10"
+                        )
+                        _sweep_rows = cur.fetchall()
+
+                    _sweep_updated = 0
+                    for _rt, _ht, _tt, _nl in _sweep_rows:
+                        try:
+                            _md = _query_llm_for_rel_type_metadata(
+                                _rt, "unknown", "unknown", _nl or "", qwen_api_url
+                            )
+                            _new_head = _md.get("llm_head_types")
+                            _new_tail = _md.get("llm_tail_types")
+                            # Only fill what is missing; do not overwrite existing non-empty values.
+                            _set_head = (not _ht) and bool(_new_head)
+                            _set_tail = (not _tt) and bool(_new_tail)
+                            if not (_set_head or _set_tail):
+                                continue
+                            with db.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE rel_types SET"
+                                    "  head_types = CASE WHEN (head_types IS NULL OR head_types = ARRAY[]::TEXT[])"
+                                    "                    THEN %s ELSE head_types END,"
+                                    "  tail_types = CASE WHEN (tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                                    "                    THEN %s ELSE tail_types END"
+                                    " WHERE rel_type = %s",
+                                    (_new_head if _set_head else None,
+                                     _new_tail if _set_tail else None,
+                                     _rt),
+                                )
+                            db.commit()
+                            _sweep_updated += 1
+                            log.info(f"re_embedder.head_tail_sweep_filled rel_type={_rt} "
+                                     f"head_types={_new_head if _set_head else _ht} "
+                                     f"tail_types={_new_tail if _set_tail else _tt}")
+                        except Exception as _sw_err:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            log.warning(f"re_embedder.head_tail_sweep_row_failed rel_type={_rt}: {_sw_err}")
+
+                    if _sweep_updated > 0:
+                        # Propagate updated type constraints to the backend uvicorn process (Phase 3).
+                        try:
+                            _r = httpx.post(
+                                "http://faultline:8000/internal/refresh-intent-pattern-caches",
+                                timeout=5.0,
+                            )
+                            if _r.status_code == 200:
+                                log.info(f"re_embedder.head_tail_sweep_cache_refreshed updated={_sweep_updated}")
+                        except Exception as _re:
+                            log.warning(f"re_embedder.head_tail_sweep_cache_refresh_failed: {_re}")
+                except Exception as e:
+                    log.warning(f"re_embedder.head_tail_sweep_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
                 # dprompt-065: Async taxonomy discovery for novel rel_types (deferred from ingest)
                 # Runs in poll loop — no blocking LLM call in ingest hot path
