@@ -22,7 +22,7 @@
 
 The MCP server runs as a child process of Claude Desktop on your workstation. It reaches the FaultLine backend over the network. No HTTP transport, no bearer token needed — the process is local and trusted.
 
-**When to use**: Claude Desktop on your local machine, FaultLine on TrueNAS or local Docker.
+**When to use**: Claude Desktop on your local machine, FaultLine on a server/NAS or local Docker.
 
 ```json
 {
@@ -32,7 +32,7 @@ The MCP server runs as a child process of Claude Desktop on your workstation. It
       "args": ["/path/to/FaultLine/tools/mcp_server.py"],
       "env": {
         "FAULTLINE_USER_ID": "YOUR-USER-UUID-HERE",
-        "FAULTLINE_API_URL": "http://YOUR-TRUENAS-IP:8001"
+        "FAULTLINE_API_URL": "http://YOUR-FAULTLINE-HOST:8000"
       }
     }
   }
@@ -75,7 +75,7 @@ If you want Claude Desktop to connect to the Docker sidecar directly rather than
 {
   "mcpServers": {
     "faultline": {
-      "url": "http://YOUR-TRUENAS-IP:8002/mcp",
+      "url": "http://YOUR-FAULTLINE-HOST:8002/mcp",
       "headers": {
         "Authorization": "Bearer YOUR-MCP-API-KEY-HERE"
       }
