@@ -99,8 +99,9 @@ class EntityRegistry:
             # Check if it's a known alias (but only if it points to a valid UUID)
             cur.execute(
                 "SELECT entity_id FROM entity_aliases "
-                "WHERE alias = %s",
-                (name,),
+                "WHERE alias = %s "
+                "ORDER BY CASE WHEN entity_id = %s THEN 0 ELSE 1 END, is_preferred DESC",
+                (name, user_id),
             )
             row = cur.fetchone()
             log.info("entity_registry.alias_query_executed", name=name, user_id=user_id, found=row is not None)
@@ -276,14 +277,13 @@ class EntityRegistry:
                         canonical_name = canonical_name_row[0] if canonical_name_row else canonical[:8]
 
                         # Stage collision for LLM resolution
+                        # Migration 051 per-user schema: entity_id_a, entity_id_b, alias
                         cur.execute(
                             "INSERT INTO entity_name_conflicts "
-                            "(entity_id_1, entity_name_1, entity_id_2, entity_name_2, "
-                            "disputed_name, conflict_type, status, created_at, updated_at) "
-                            "VALUES (%s, %s, %s, %s, %s, 'pref_name_collision', 'pending', NOW(), NOW()) "
-                            "ON CONFLICT (entity_id_1, entity_id_2, disputed_name) DO NOTHING",
-                            (collision_entity, collision_name, canonical, canonical_name,
-                             alias_lower),
+                            "(entity_id_a, entity_id_b, alias, status, created_at) "
+                            "VALUES (%s, %s, %s, 'pending', NOW()) "
+                            "ON CONFLICT (alias) DO NOTHING",
+                            (collision_entity, canonical, alias_lower),
                         )
                         self.db_conn.commit()
 

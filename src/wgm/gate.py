@@ -470,13 +470,15 @@ class WGMValidationGate:
         return SEED_ONTOLOGY
 
     def _is_user_correction(self, edge_dict: dict) -> bool:
-        """Check if edge is marked as user correction (high confidence or explicit flag)."""
-        # Explicit flag
-        if edge_dict.get("is_correction"):
-            return True
-        # High confidence (1.0 or 0.9+) implies user-stated
-        confidence = edge_dict.get("confidence", 0.5)
-        return (confidence or 0.0) >= 0.9
+        """Check if edge is an explicit user correction.
+
+        Only returns True when the caller has set is_correction=True.
+        High confidence alone does NOT make a fact a correction — a user
+        stating a new fact for the first time has confidence=1.0 but is
+        NOT correcting anything. The confidence bypass lives at the
+        validate_edge level (raw_confidence >= 0.95), not here.
+        """
+        return bool(edge_dict.get("is_correction"))
 
     def _find_conflicting_relationships(self, subject_id: str, new_rel_type: str) -> list[str]:
         """Find rel_types that conflict with the new relationship type for this subject.
@@ -1262,9 +1264,10 @@ class WGMValidationGate:
             with self.db_conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO rel_types"
-                    " (rel_type, label, engine_generated, confidence, source)"
-                    " VALUES (%s, %s, true, 0.7, 'engine')"
-                    " ON CONFLICT (rel_type) DO NOTHING",
+                    " (rel_type, label, engine_generated, confidence, source, fact_class)"
+                    " VALUES (%s, %s, true, 0.7, 'engine', 'B')"
+                    " ON CONFLICT (rel_type) DO UPDATE SET"
+                    "  fact_class = CASE WHEN rel_types.fact_class = 'C' THEN 'B' ELSE rel_types.fact_class END",
                     (rel_type, rel_type.replace('_', ' ').title()),
                 )
             self.db_conn.commit()
@@ -1328,13 +1331,15 @@ Respond with ONLY the JSON, no explanation."""
             )
 
             if result.get("valid") and result.get("confidence", 0) >= 0.7:
-                # Insert into rel_types with full metadata
+                # Insert into rel_types with full metadata.
+                # fact_class defaults to 'B' — gate-approved novel types enter the C→B→A
+                # promotion loop; never default to 'C' which routes to 30-day expiry.
                 with self.db_conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO rel_types"
                         " (rel_type, label, wikidata_pid, engine_generated, confidence,"
-                        "  is_symmetric, inverse_rel_type, head_types, tail_types, is_hierarchy_rel, category, source)"
-                        " VALUES (%s, %s, %s, true, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        "  is_symmetric, inverse_rel_type, head_types, tail_types, is_hierarchy_rel, category, source, fact_class)"
+                        " VALUES (%s, %s, %s, true, %s, %s, %s, %s, %s, %s, %s, %s, 'B')"
                         " ON CONFLICT (rel_type) DO UPDATE SET"
                         "  label = COALESCE(EXCLUDED.label, rel_types.label),"
                         "  is_symmetric = COALESCE(EXCLUDED.is_symmetric, rel_types.is_symmetric),"
@@ -1343,7 +1348,8 @@ Respond with ONLY the JSON, no explanation."""
                         "  tail_types = COALESCE(EXCLUDED.tail_types, rel_types.tail_types),"
                         "  is_hierarchy_rel = COALESCE(EXCLUDED.is_hierarchy_rel, rel_types.is_hierarchy_rel),"
                         "  category = COALESCE(EXCLUDED.category, rel_types.category),"
-                        "  confidence = GREATEST(rel_types.confidence, EXCLUDED.confidence)",
+                        "  confidence = GREATEST(rel_types.confidence, EXCLUDED.confidence),"
+                        "  fact_class = CASE WHEN rel_types.fact_class = 'C' THEN 'B' ELSE rel_types.fact_class END",
                         (
                             rel_type,
                             result.get("label", rel_type),

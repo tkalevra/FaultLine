@@ -94,24 +94,6 @@ FaultLine implements best practices for open-source security:
 - [ ] Annual security audit (planned for 2026 Q3)
 - [ ] Fuzzing harness for input validation
 
-## MCP Server Security
-
-### Bearer Token Authentication
-The HTTP MCP transport (`faultline-mcp` sidecar) requires a bearer token when `MCP_API_KEY` is set. Generate one with `openssl rand -hex 32`. Set it in your compose stack environment and in OpenWebUI's Integrations → Tools configuration.
-
-The `/health` endpoint is intentionally unauthenticated (required for Docker healthchecks). All `/mcp` requests require a valid token when `MCP_API_KEY` is configured.
-
-### Input Validation
-- All `user_id` values are validated as UUID format before schema name construction — prevents routing to unexpected schemas.
-- Entity names are capped at 256 characters — eliminates multi-word injection payload viability.
-- MCP tool inputs are scanned for prompt injection signals (instruction-override patterns) before reaching the backend.
-
-### Memory Context Protection
-Injected memory blocks include a structural closing tag (`[/FAULTLINE_MEMORY]`) to create a clear data boundary in LLM context.
-
-### Threat Model
-See `docs/` for the full MCP threat model covering prompt injection, cross-user data leakage, retraction abuse, and confused deputy risks.
-
 ## Contacts
 
 **Security:** security@faultline.local  

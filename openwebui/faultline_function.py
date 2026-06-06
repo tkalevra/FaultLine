@@ -1425,6 +1425,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": 400,
+            "stream": False,
             "thinking": {"type": "disabled"},
         }
         # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
@@ -1809,6 +1810,11 @@ class Filter:
             description="OpenWebUI internal LLM API endpoint (port 8080, not web port 3000). Docker Compose: http://open-webui:8080 (service name). Override in Valves for non-Docker deployments."
         )
 
+        LLM_CHAT_PATH: str = Field(
+            default="/api/chat/completions",
+            description="LLM chat completions path appended to OPENWEBUI_LLM_URL. Default /api/chat/completions works for OpenWebUI. Set to /v1/chat/completions for direct Ollama, LM Studio, or llama.cpp backends."
+        )
+
         ENABLED: bool = Field(
             default=True,
             description="Master switch. Set False to completely disable FaultLine Filter."
@@ -2072,9 +2078,10 @@ class Filter:
     ) -> list[dict]:
         """Call OpenWebUI LLM directly for triple extraction. Portable, reliable, no external dependencies."""
         try:
-            # Strip /api/chat/completions if already in URL (valve may include full endpoint)
-            if url.endswith("/api/chat/completions"):
-                url = url[:-len("/api/chat/completions")]
+            # Strip chat path suffix if already in URL (valve may include full endpoint)
+            _chat_path = self.valves.LLM_CHAT_PATH
+            if url.endswith(_chat_path):
+                url = url[:-len(_chat_path)]
 
             _EXTRACTION_PROMPT = """Extract ALL relationships and facts from text as JSON array of triples.
 Each triple: {"subject": string, "object": string, "rel_type": string, "definition": string}
@@ -2107,6 +2114,7 @@ Return valid JSON only. If no facts, return [].
                 "messages": messages,
                 "temperature": 0.0,
                 "max_tokens": 1200,
+                "stream": False,
                 "thinking": {"type": "disabled"},
             }
             # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
@@ -2115,7 +2123,7 @@ Return valid JSON only. If no facts, return [].
 
             async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS) as client:
                 resp = await client.post(
-                    f"{url}/api/chat/completions",
+                    f"{url}{self.valves.LLM_CHAT_PATH}",
                     json=request_data,
                     headers=headers,
                     timeout=self.valves.LLM_TIMEOUT_SECS,
@@ -2355,12 +2363,67 @@ Return valid JSON only. If no facts, return [].
             return []
 
 
+    async def _fetch_identity_facts(self, user_id: str) -> dict:
+        """Fetch user's preferred name and identity facts from backend /query.
+
+        Called only on the first message of a new conversation (len(messages) == 1)
+        to populate the identity grounding system message.
+
+        Returns: {"preferred_name": str, "also_known_as": list[str]}
+        Returns {} on any error — grounding is best-effort and non-fatal.
+
+        Uses the same HTTP pattern as _fetch_recent_facts() (POST /query, shared client).
+        Only runs AFTER provisioning status == "ready".
+        """
+        try:
+            await _initialize_http_client()
+            resp = await _http_client.post(
+                f"{self._get_faultline_url_cached()}/query",
+                json={"user_id": user_id, "text": "identity name", "top_k": 5},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = _parse_response_json_robust(resp.text, "fetch_identity_facts")
+            if not isinstance(data, dict):
+                return {}
+
+            preferred_name = ""
+            also_known_as = []
+
+            # Extract preferred_name and also_known_as from returned facts
+            for fact in data.get("facts", []):
+                rel = fact.get("rel_type", "")
+                obj = fact.get("object", "")
+                if not obj:
+                    continue
+                if rel == "pref_name" and not preferred_name:
+                    preferred_name = obj
+                elif rel == "also_known_as":
+                    if obj not in also_known_as:
+                        also_known_as.append(obj)
+
+            # Fall back to preferred_names map if facts didn't yield a name
+            if not preferred_name:
+                pn = data.get("preferred_names", {})
+                # "user" key holds the display name of the anchor entity
+                candidate = pn.get("user", "")
+                if candidate and not _UUID_RE.match(str(candidate)):
+                    preferred_name = candidate
+
+            return {"preferred_name": preferred_name, "also_known_as": also_known_as}
+
+        except Exception as _e:
+            if self.valves.ENABLE_DEBUG:
+                print(f"[FaultLine Filter] _fetch_identity_facts failed (non-fatal): {type(_e).__name__}: {_e}", file=sys.stderr)
+            return {}
+
     async def _extract_retraction(self, text: str, context: list[dict], model: str, url: str, auth_header: Optional[str] = None, user_uuid: Optional[str] = None) -> dict:
         """Call OpenWebUI LLM directly for retraction semantic detection. Reliable, portable, no external dependencies."""
         try:
-            # Strip /api/chat/completions if already in URL (valve may include full endpoint)
-            if url.endswith("/api/chat/completions"):
-                url = url[:-len("/api/chat/completions")]
+            # Strip chat path suffix if already in URL (valve may include full endpoint)
+            _chat_path = self.valves.LLM_CHAT_PATH
+            if url.endswith(_chat_path):
+                url = url[:-len(_chat_path)]
 
             # dprompt-131: Build fact context for granular retraction identification
             facts_context = ""
@@ -2416,6 +2479,7 @@ GRANULAR EXAMPLES (using recent facts context):
                 "messages": messages,
                 "temperature": 0.0,
                 "max_tokens": 200,
+                "stream": False,
                 "thinking": {"type": "disabled"},
             }
             # Inject user UUID as chat_id if not using backend LLM (dBug-016 fix)
@@ -2424,7 +2488,7 @@ GRANULAR EXAMPLES (using recent facts context):
 
             async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS) as client:
                 resp = await client.post(
-                    f"{url}/api/chat/completions",
+                    f"{url}{self.valves.LLM_CHAT_PATH}",
                     json=request_data,
                     headers=headers,
                     timeout=self.valves.LLM_TIMEOUT_SECS,
@@ -2738,8 +2802,11 @@ GRANULAR EXAMPLES (using recent facts context):
 
                 _rt_index = len(facts) + (alerts[0].get("shown", 0) if alerts else 0)
                 _rt_header = _rotate(_MEMORY_HEADERS, _rt_index)
+                # Append abbreviated user UUID (first 8 chars) to header for persistent LLM anchor.
+                # Abbreviated form is not a full UUID — survives _redact_uuids_from_body().
+                _rt_uid_tag = f" [user:{user_id[:8]}]" if user_id else ""
                 return (
-                    f"{_rt_header}\n"
+                    f"{_rt_header}{_rt_uid_tag}\n"
                     + "\n".join(f"- {l}" for l in lines)
                     + "\n⚠️ KNOWLEDGE GRAPH: You have verified facts about this user (location, relationships, preferences, history). Use them to inform your entire response—not just tool routing. Be confident and direct in leveraging verified information. Don't say 'I don't know' or 'I can't access' when the answer is in your facts. Route sensitive data to tools internally as needed; keep personal details private in responses but reason with them confidently. Provide personalized, grounded context naturally."
                     + "\n[/FAULTLINE_MEMORY]"
@@ -2751,8 +2818,11 @@ GRANULAR EXAMPLES (using recent facts context):
         # CONVERSATIONAL MODE (from is_realtime=False or fallthrough)
         _conv_index = len(facts) + (alerts[0].get("shown", 0) if alerts else 0)
         _conv_header = _rotate(_MEMORY_HEADERS, _conv_index)
+        # Append abbreviated user UUID (first 8 chars) to header for persistent LLM anchor.
+        # Abbreviated form is not a full UUID — survives _redact_uuids_from_body().
+        _conv_uid_tag = f" [user:{user_id[:8]}]" if user_id else ""
         lines = [
-            _conv_header,
+            f"{_conv_header}{_conv_uid_tag}",
         ]
 
         if identity:
@@ -3054,6 +3124,53 @@ GRANULAR EXAMPLES (using recent facts context):
                     })
                 return body  # Pass through without processing
 
+            # ── Fix C: Identity grounding on first message (dprompt-156) ────────────
+            # Inject a system message anchoring the LLM to the user's UUID and preferred
+            # name at conversation start. Only fires when len(messages) == 1 (new chat).
+            # Runs AFTER provisioning check (schema must exist before /query is callable).
+            # Non-fatal: if backend is unreachable, conversation continues without grounding.
+            # The grounding message role is "system" — never visible to the end user.
+            _is_first_message = len(body.get("messages", [])) == 1
+            if _is_first_message and user_id and user_id != "anonymous":
+                try:
+                    _identity = await self._fetch_identity_facts(user_id)
+                    _pref_name = _identity.get("preferred_name", "")
+                    _aka_list = _identity.get("also_known_as", [])
+
+                    # Build grounding message — UUID omitted from prose (redacted by
+                    # _redact_uuids_from_body before delivery). Preferred name is the anchor.
+                    _grounding_parts = [
+                        "[Identity context] The person you are speaking with has knowledge"
+                        f" graph anchor: {user_id[:8]} (abbreviated)."
+                    ]
+                    if _pref_name:
+                        _grounding_parts.append(f"They prefer to be called: {_pref_name}.")
+                    if _aka_list:
+                        _grounding_parts.append(f"Also known as: {', '.join(_aka_list)}.")
+                    _grounding_parts.append(
+                        "Use this anchor for all memory operations in this conversation."
+                        " Pronoun 'I/me/my' refers to this person."
+                    )
+                    _grounding_msg = " ".join(_grounding_parts)
+
+                    # Prepend as system message BEFORE the user's first message.
+                    # This grounding message is not guarded by [/FAULTLINE_MEMORY] so it
+                    # does not interfere with the memory block idempotency sentinel.
+                    body["messages"].insert(0, {"role": "system", "content": _grounding_msg})
+                    print(
+                        f"[FaultLine Filter] identity_grounding_injected:"
+                        f" user_id={user_id[:8]} has_pref_name={bool(_pref_name)}",
+                        flush=True,
+                    )
+                except Exception as _gi_err:
+                    # Non-fatal — conversation continues without grounding
+                    print(
+                        f"[FaultLine Filter] identity_grounding SKIPPED (non-fatal):"
+                        f" {type(_gi_err).__name__}: {_gi_err}",
+                        file=sys.stderr,
+                    )
+            # ── end Fix C ────────────────────────────────────────────────────────────
+
             text = self._last_message(body.get("messages", []), "user")
             if not text:
                 return body
@@ -3091,14 +3208,44 @@ GRANULAR EXAMPLES (using recent facts context):
             # It does NOT make the assistant an expert on the topic.
             _EXPAND_RE = re.compile(r'^/expand\s+', re.IGNORECASE)
             if _EXPAND_RE.match(clean_text):
-                topic = _EXPAND_RE.sub('', clean_text).strip()
+                _expand_input = _EXPAND_RE.sub('', clean_text).strip()
+                _source_text = None
+                _topic = _expand_input
+
+                # Detect /expand online <url> sub-command
+                if _expand_input.lower().startswith("online "):
+                    _url_part = _expand_input[len("online "):].strip()
+                    if _url_part.startswith("http://") or _url_part.startswith("https://"):
+                        try:
+                            import urllib.request as _urllib_request
+                            _req = _urllib_request.Request(
+                                _url_part,
+                                headers={"User-Agent": "FaultLine-Expand/1.0"}
+                            )
+                            with _urllib_request.urlopen(_req, timeout=15) as _resp:
+                                _raw = _resp.read(65536)  # cap at 64KB
+                                _source_text = _raw.decode("utf-8", errors="replace")
+                            _topic = _url_part
+                            print(f"[FaultLine Filter] /expand online: fetched url='{_url_part[:80]}' bytes={len(_raw)}", flush=True)
+                        except Exception as _fetch_err:
+                            # Fetch failed — fall through to topic-only expand using URL as topic
+                            print(f"[FaultLine Filter] /expand online url_fetch_failed: url='{_url_part[:80]}' error='{str(_fetch_err)[:120]}'", file=sys.stderr, flush=True)
+                            _topic = _url_part
+                    else:
+                        # "online" prefix but not a valid URL — treat whole string as topic
+                        _topic = _expand_input
+
+                topic = _topic  # keep existing variable name for status message
                 faultline_url = self._get_faultline_url_cached()
-                print(f"[FaultLine Filter] /expand topic='{topic[:60]}'", flush=True)
+                print(f"[FaultLine Filter] /expand topic='{topic[:60]}' online={_source_text is not None}", flush=True)
+                _learn_payload = {"topic": topic, "user_id": user_id}
+                if _source_text:
+                    _learn_payload["source_text"] = _source_text
                 try:
                     async with httpx.AsyncClient(timeout=60.0) as _lc:
                         _lr = await _lc.post(
                             f"{faultline_url}/learn",
-                            json={"topic": topic, "user_id": user_id},
+                            json=_learn_payload,
                         )
                     _ld = _lr.json() if _lr.status_code == 200 else {}
                     _total = _ld.get("total", 0)
