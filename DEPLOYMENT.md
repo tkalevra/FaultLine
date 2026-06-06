@@ -22,7 +22,7 @@ cp .env.example .env
 docker compose up -d --build
 
 # Verify health
-curl http://localhost:8001/health
+curl http://localhost:8000/health
 ```
 
 Expected response: `{"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}`
@@ -31,9 +31,11 @@ Expected response: `{"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}`
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| faultline | 8001 | FastAPI API — `/ingest`, `/query`, `/health` |
+| faultline | 8000 | FastAPI API — `/ingest`, `/query`, `/health` |
+| faultline-mcp | 8002 | MCP server — recall/store/retract/learn for MCP clients |
 | postgres | 5432 | PostgreSQL — fact storage |
 | qdrant | 6333 | Qdrant — vector index |
+| redis | 6379 | Redis — inlet dedup cache |
 
 ## Configuration
 
@@ -41,7 +43,9 @@ See `.env.example` for the full list. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `QWEN_API_URL` | `http://host.docker.internal:11434/v1/chat/completions` | LLM endpoint |
+| `LLM_BACKEND_TYPE` | `ollama` | LLM protocol: `openwebui`/`ollama`/`lm_studio`/`openai`/`anthropic`/… |
+| `LLM_BASE_URL` | `http://host.docker.internal:11434` | LLM host + port (path appended automatically) |
+| `LLM_API_KEY` | _(blank)_ | Bearer/API key for the LLM (blank for local servers) |
 | `POSTGRES_DSN` | Set in compose | PostgreSQL connection |
 | `QDRANT_URL` | `http://qdrant:6333` | Vector store |
 | `REEMBED_INTERVAL` | `10` | Background sync interval (seconds) |

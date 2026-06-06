@@ -164,7 +164,8 @@ git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
 
 cp .env.example .env
-# Open .env and point QWEN_API_URL at your Ollama or LM Studio endpoint
+# Set LLM_BACKEND_TYPE + LLM_BASE_URL to point at the LLM you already run
+# (Ollama, LM Studio, OpenWebUI, OpenAI, Anthropic, ...)
 
 docker compose up -d
 
@@ -172,7 +173,27 @@ curl http://localhost:8000/health
 # {"status": "ok", ...}
 ```
 
-The first start downloads the model used for extraction (~500 MB). Takes 3–5 minutes.
+FaultLine hooks into an LLM you already run — it doesn't host one. (If you
+*don't* have a model handy, `docker compose --profile ollama up -d` starts a
+bundled Ollama alongside the stack.)
+
+The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no
+GPU or CUDA required). Takes 3–5 minutes.
+
+### Connecting a client
+
+The backend is the same for every client — only a few env values change. Point
+`LLM_BACKEND_TYPE` / `LLM_BASE_URL` at whatever you run, and connect over HTTP
+(the OpenWebUI filter on `:8000`) or MCP (`:8002`). Any number of clients can
+share the one store at once.
+
+| Client | `LLM_BACKEND_TYPE` | `LLM_BASE_URL` (example) | How it connects |
+|---|---|---|---|
+| OpenWebUI | `openwebui` | `http://open-webui:8080` | Filter function → `:8000` |
+| LM Studio | `lm_studio` | `http://host.docker.internal:1234` | Filter function → `:8000` |
+| Ollama (direct) | `ollama` | `http://host.docker.internal:11434` | Filter function → `:8000` |
+| OpenAI / Anthropic | `openai` / `anthropic` | provider API base URL | Filter function → `:8000` |
+| Claude Desktop | *(n/a — Claude is the client)* | — | MCP → `:8002` |
 
 ### Connect to OpenWebUI
 
@@ -207,12 +228,17 @@ Four tools: recall memory, store facts, retract facts, learn topic hierarchies �
 ## Environment variables
 
 ```env
-# The two you'll almost certainly need to set
-POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
-QWEN_API_URL=http://host.docker.internal:11434/v1/chat/completions
+# The LLM hook — which model server FaultLine talks to.
+# LLM_BACKEND_TYPE selects the protocol; the API path is appended automatically.
+LLM_BACKEND_TYPE=ollama                       # openwebui | ollama | lm_studio | openai | anthropic | groq | localai | raw
+LLM_BASE_URL=http://host.docker.internal:11434  # host + port only, no path
+LLM_API_KEY=                                  # blank for local servers; token for hosted APIs
 
-# Everything else has sensible defaults
+# Storage
+POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
 QDRANT_URL=http://qdrant:6333
+
+# MCP server
 MCP_API_KEY=          # leave blank for no auth, or set a secret token
 FAULTLINE_USER_ID=    # optional — pins the MCP server to one user
 ```

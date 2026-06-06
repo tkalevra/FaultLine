@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — Compose consolidation + CPU-only image
+
+**Deployment simplification:**
+- Collapsed 7 overlapping compose files into one canonical `docker-compose.yml`
+  (base stack + optional `--profile ollama` for users without an existing LLM).
+- Kept `config/docker-compose-portainer.yml` (pre-built-image fork) and
+  `config/docker-compose-dev.yml` (host-networked local dev).
+- Removed: `docker-compose.local.internal.yml`, `docker-compose.local.external.yml`,
+  `config/docker-compose.yml`, `config/docker-compose-portainer-withoutqdrant.yml`,
+  and the orphaned `config/Dockerfile` / `config/docker-entrypoint.sh` / `config/pyproject.toml`.
+- Standardized on image `faultline:latest`, API port `8000`, and the
+  `LLM_BACKEND_TYPE` + `LLM_BASE_URL` + `LLM_API_KEY` hook across compose, README,
+  and DEPLOYMENT.md (was inconsistently `QWEN_API_URL` / `OPENWEBUI_URL` / port 8001).
+
+**Image size:**
+- Dockerfile now pre-installs CPU-only PyTorch, so the ~5 GB of `nvidia-cuda-*`
+  wheels GLiNER2 would otherwise pull are never downloaded. FaultLine hooks into
+  an external LLM and runs extraction on CPU — no GPU/CUDA required.
+
 ## v1.1.0 (2026-06-01) — MCP Native Server + Security Hardening
 
 **MCP Support:**
