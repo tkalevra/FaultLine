@@ -8,6 +8,13 @@ ENV PATH="/venv/bin:$PATH"
 
 RUN pip install --upgrade pip
 
+# Install CPU-only PyTorch FIRST, before anything that pulls it transitively.
+# GLiNER2 -> gliner/peft depend on torch; the default Linux wheel drags in
+# ~5 GB of nvidia-cuda-* packages we never use — extraction runs on CPU.
+# Pre-seeding the CPU build means the dependency resolver below is satisfied
+# and never fetches the CUDA wheels.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 COPY pyproject.toml .
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"

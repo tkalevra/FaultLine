@@ -44,7 +44,7 @@ Filter also calls:
 
 1. **Start the FaultLine backend:**
    ```bash
-   docker-compose up -d faultline-wgm faultline-postgres qdrant
+   docker compose up -d
    ```
 
 2. **Verify health:**
