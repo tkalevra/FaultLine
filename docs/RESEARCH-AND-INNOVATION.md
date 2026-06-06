@@ -176,7 +176,7 @@ if is_correction:
 **Implementation:**
 - src/api/main.py: correction detection in extract phase
 - src/api/main.py: correction path bypasses staging
-- Filter: openwebui/faultline_tool.py detects "actually", "wrong", etc.
+- Filter: openwebui/faultline_function.py detects "actually", "wrong", etc.
 
 ---
 

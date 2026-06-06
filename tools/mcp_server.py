@@ -11,7 +11,7 @@ FAULTLINE_API_URL env var or --api-url argument).
 
 Usage:
   python mcp_server.py
-  python mcp_server.py --api-url http://192.168.1.10:8000
+  python mcp_server.py --api-url http://faultline-host:8000
   python mcp_server.py --transport http --port 8002
   python mcp_server.py --transport http --host 0.0.0.0 --port 8002
 """

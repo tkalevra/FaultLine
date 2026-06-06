@@ -44,12 +44,15 @@ cd FaultLine
 cp .env.example .env
 ```
 
-Open `.env` and set the two values:
+Open `.env` and set the LLM hook:
 
 ```env
-# Point this at your local Qwen2.5 Coder server.
-# Use host.docker.internal instead of localhost so the container can reach the host.
-QWEN_API_URL=http://host.docker.internal:11434/v1/chat/completions
+# Point FaultLine at the LLM you already run. LLM_BACKEND_TYPE selects the
+# protocol; the API path is appended automatically. Use host.docker.internal
+# instead of localhost so the container can reach a server on the host.
+LLM_BACKEND_TYPE=ollama
+LLM_BASE_URL=http://host.docker.internal:11434
+LLM_API_KEY=
 
 # Only used when connecting directly (not via Compose). Compose sets its own DSN internally.
 POSTGRES_DSN=postgresql://faultline:faultline@localhost:5432/faultline_test
@@ -185,7 +188,7 @@ Expected response:
 ## Step 7 — Wire up the OpenWebUI tool
 
 1. In the OpenWebUI admin panel, go to **Workspace → Tools → Add Tool**.
-2. Paste the contents of `openwebui/faultline_tool.py`.
+2. Paste the contents of `openwebui/faultline_function.py`.
 3. Set the environment variable `FAULTLINE_URL` in OpenWebUI to point at the
    running FaultLine service:
    - If OpenWebUI is on the **same machine**: `http://localhost:8000`
@@ -280,7 +283,7 @@ docker compose logs faultline
 ```
 
 Common causes:
-- **`POSTGRES_DSN` not set`** — confirm `.env` exists and `QWEN_API_URL` is set
+- **`POSTGRES_DSN` not set`** — confirm `.env` exists and `LLM_BASE_URL` is set
 - **Migration failed** — run `docker compose exec postgres psql -U faultline -d faultline_test` and check for schema errors
 - **Port 8000 already in use** — change the host port in `docker-compose.yml` (`"8000:8000"`)
 
