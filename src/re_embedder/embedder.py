@@ -25,6 +25,27 @@ from src.api.llm_calls import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
+# Embedding model name — overridable via env var
+_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5")
+
+# Lazy-loaded local embedder — initialized on first use, None if fastembed not installed
+_local_embedder = None
+
+
+def _get_local_embedder():
+    global _local_embedder
+    if _local_embedder is not None:
+        return _local_embedder
+    try:
+        from fastembed import TextEmbedding
+        _local_embedder = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+        log.info("local_embedder.initialized model=nomic-embed-text-v1.5")
+    except ImportError:
+        log.warning("local_embedder.unavailable fastembed not installed")
+        _local_embedder = False   # sentinel: don't retry import
+    return _local_embedder
+
+
 # Global pooled HTTP client for embedding and Qdrant calls (dBug-051 fix)
 # Prevents connection churn from bare httpx.post() calls
 _http_client = httpx.Client(timeout=30.0, limits=httpx.Limits(max_connections=10))
@@ -302,7 +323,7 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
         if _http_client_sync:
             response = _http_client_sync.post(
                 embed_url,
-                json={"model": "text-embedding-nomic-embed-text-v1.5", "input": text},
+                json={"model": _EMBEDDING_MODEL, "input": text},
                 headers=get_llm_headers(),
                 timeout=timeout,
             )
@@ -310,7 +331,7 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
             # Use pooled client instead of bare httpx.post() (dBug-051: prevent connection churn)
             response = _http_client.post(
                 embed_url,
-                json={"model": "text-embedding-nomic-embed-text-v1.5", "input": text},
+                json={"model": _EMBEDDING_MODEL, "input": text},
                 headers=get_llm_headers(),
                 timeout=timeout,
             )
@@ -324,6 +345,16 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
 
     except Exception as e:
         if fallback:
+            # Try local CPU embedder before falling back to hash vector
+            local = _get_local_embedder()
+            if local:
+                try:
+                    vectors = list(local.embed([text]))
+                    if vectors:
+                        log.info("local_embedder.used text_preview={}", text[:50])
+                        return list(vectors[0])
+                except Exception as local_err:
+                    log.warning(f"local_embedder.failed: {local_err}")
             log.warning(f"re_embedder.embed_failed text_preview={text[:50]} falling back to hash vector: {e}")
             return hash_vector(text)
         log.error(f"re_embedder.embed_failed text_preview={text[:50]} no fallback: {e}")
@@ -1514,6 +1545,46 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     )
                     stats["approved"] += 1
                     log.info(f"re_embedder.ontology_approved rel_type={candidate_rel} category={category} is_symmetric={is_symmetric} natural_language={natural_language[:50]} {reason}")
+
+                    # Fix B (dprompt-156): propagate new rel_type to entity_taxonomies so
+                    # determine_path() can route queries through it immediately.
+                    # Category → taxonomy_name mapping is DB-driven: try exact match first,
+                    # then ILIKE fallback. No hardcoded category→taxonomy mappings.
+                    if category:
+                        try:
+                            with db_conn.cursor() as _tax_cur:
+                                _tax_cur.execute(
+                                    """
+                                    UPDATE entity_taxonomies
+                                    SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
+                                    WHERE taxonomy_name = %s
+                                      AND NOT (rel_types_defining_group @> ARRAY[%s]::TEXT[])
+                                    """,
+                                    (candidate_rel, category, candidate_rel),
+                                )
+                                if _tax_cur.rowcount > 0:
+                                    log.info("re_embedder.taxonomy_rel_type_appended",
+                                             rel_type=candidate_rel, taxonomy=category)
+                                else:
+                                    # Exact match found no row — try ILIKE fallback
+                                    _tax_cur.execute(
+                                        """
+                                        UPDATE entity_taxonomies
+                                        SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
+                                        WHERE taxonomy_name ILIKE %s
+                                          AND NOT (rel_types_defining_group @> ARRAY[%s]::TEXT[])
+                                        """,
+                                        (candidate_rel, category, candidate_rel),
+                                    )
+                                    if _tax_cur.rowcount > 0:
+                                        log.info("re_embedder.taxonomy_rel_type_appended_ilike",
+                                                 rel_type=candidate_rel, taxonomy_pattern=category)
+                                    else:
+                                        log.debug("re_embedder.taxonomy_no_match_for_category",
+                                                  rel_type=candidate_rel, category=category)
+                        except Exception as _tax_err:
+                            log.warning("re_embedder.taxonomy_append_failed",
+                                        rel_type=candidate_rel, error=str(_tax_err)[:100])
 
                     # Refresh unified metadata cache so the newly approved rel_type
                     # is immediately available to the ingest pipeline without waiting
@@ -2867,15 +2938,13 @@ def main():
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
-    # Auto-detect LLM endpoint: env var override, then Docker service names, then localhost
-    if os.getenv("QWEN_API_URL"):
-        qwen_api_url = os.getenv("QWEN_API_URL")
-    elif os.getenv("OPENWEBUI_URL"):
-        # OPENWEBUI_URL is base URL (e.g., http://open-webui:8080), append API path
-        base_url = os.getenv("OPENWEBUI_URL").rstrip("/")
-        qwen_api_url = f"{base_url}/api/chat/completions"
+    from src.api.llm_client import get_backend_endpoint, get_endpoint_list as _get_llm_endpoint_list
+    _typed_endpoint = get_backend_endpoint()
+    if _typed_endpoint:
+        qwen_api_url = _typed_endpoint
     else:
-        qwen_api_url = "http://qwen:11434/v1/chat/completions"
+        _endpoints = _get_llm_endpoint_list()
+        qwen_api_url = _endpoints[0] if _endpoints else "http://localhost:11434/v1/chat/completions"
     interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
@@ -3458,6 +3527,16 @@ def main():
                                 operation="natural_language_fill",
                             )
                             nl = result.get("natural_language", "").strip() if result else ""
+                            # CLAUDE.md constraint: natural_language templates MUST contain X placeholder.
+                            # Reject and log any LLM-generated value missing X — never store broken templates.
+                            if nl and 'X' not in nl:
+                                log.warning(
+                                    "re_embedder.natural_language_missing_placeholder",
+                                    rel_type=rt,
+                                    generated_value=nl,
+                                    reason="LLM response missing X subject placeholder — rejecting, will retry next cycle"
+                                )
+                                nl = ""  # Force retry on next poll cycle — do not commit broken state
                             if nl:
                                 with db.cursor() as cur:
                                     cur.execute(

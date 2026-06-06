@@ -146,19 +146,45 @@ class CircuitBreakerState:
 # FUNCTION: Parse LLM Response Robustly (dBug-016 Handling)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _parse_anthropic_response(data: dict) -> dict:
+    """
+    Parse Anthropic /v1/messages response format into a normalized dict.
+
+    Anthropic returns: {"content": [{"type": "text", "text": "..."}], ...}
+    This extracts the text and wraps it in a pseudo-choices structure so
+    callers can use the same content extraction pattern.
+
+    Args:
+        data: Parsed JSON response dict from Anthropic API.
+
+    Returns:
+        dict with "choices" key for uniform downstream handling, or {} on failure.
+    """
+    content_blocks = data.get("content", [])
+    if not content_blocks:
+        log.warning("parse_anthropic_response.empty_content", data_keys=list(data.keys()))
+        return {}
+    text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
+    text = "\n".join(text_parts).strip()
+    if not text:
+        log.warning("parse_anthropic_response.no_text_blocks", block_count=len(content_blocks))
+        return {}
+    # Normalize to OpenAI-compat shape so all callers work without changes
+    return {"choices": [{"message": {"content": text}}]}
+
+
 def _parse_llm_response_robust(response) -> dict:
     """
     Parse LLM HTTP response robustly, handling dBug-016 corruption.
 
-    OpenWebUI sometimes returns HTTP 200 with malformed JSON due to dBug-016
-    (NoneType crash on missing chat_id). This parser attempts three strategies:
+    Dispatches to backend-specific parser based on LLM_BACKEND_TYPE:
+    - anthropic: content[0].text (Anthropic /v1/messages format)
+    - all others: choices[0].message.content (OpenAI-compat format)
 
+    For OpenAI-compat backends, attempts three strategies:
     1. Standard JSON parsing (happy path)
     2. Line-delimited JSON (streaming format)
-    3. Regex extraction from corrupted JSON (dBug-016 case)
-
-    All three extraction methods validate for "choices" key to ensure we extract
-    actual LLM response object, not unrelated JSON fragments.
+    3. Brace-counter extraction from corrupted JSON (dBug-016 case)
 
     Args:
         response: httpx.Response object from LLM endpoint
@@ -166,6 +192,20 @@ def _parse_llm_response_robust(response) -> dict:
     Returns:
         dict: Parsed response with "choices" key, or {} on failure
     """
+    from src.api.llm_client import get_backend_response_format
+
+    # Anthropic dispatch: parse content[0].text before touching response.text
+    if get_backend_response_format() == "anthropic":
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                return _parse_anthropic_response(data)
+        except json.JSONDecodeError:
+            log.warning("parse_llm_response.anthropic_json_decode_failed",
+                       response_preview=response.text[:200])
+        return {}
+
+    # OpenAI-compat strategies (all non-Anthropic backends) — existing logic below
     try:
         # Strategy 1: Standard JSON parsing (most common)
         result = response.json()
@@ -316,75 +356,24 @@ _llm_circuit_breaker = CircuitBreakerState(
 
 def _get_endpoint_list() -> list[str]:
     """
-    Generate list of LLM endpoints to try, in priority order.
+    Priority-ordered list of LLM endpoint URLs.
 
-    This is the SINGLE PLACE where endpoint URLs are hardcoded. All other
-    code must use this function to get endpoints. This ensures:
-    - Centralized endpoint management
-    - Easy fallback chain maintenance
-    - No scattered hardcoding across modules
-
-    Priority Chain (Docker-aware):
-    1. OPENWEBUI_INTERNAL_URL env var (container-internal, port 8080)
-    2. OPENWEBUI_URL env var (external, user-configured)
-    3. QWEN_API_URL env var (direct LLM backend)
-    4. Hardcoded fallbacks (docker service names, localhost)
+    When LLM_BACKEND_TYPE + LLM_BASE_URL are both set, the type-resolved
+    endpoint is authoritative and returned alone (no legacy fallback chain).
+    Otherwise, delegates to src.api.llm_client.get_endpoint_list() for the
+    legacy priority chain (OPENWEBUI_INTERNAL_URL → OPENWEBUI_URL → QWEN_API_URL
+    → hardcoded fallbacks).
 
     Returns:
-        List of complete endpoint URLs, ready to POST to
+        list[str] — ordered endpoints, ready to POST to.
     """
-    endpoints = []
-
-    # PRIORITY 1: OPENWEBUI_INTERNAL_URL (container-internal OpenWebUI)
-    # When running inside Docker, use port 8080 (internal service port),
-    # NOT port 3000 (external host mapping)
-    openwebui_internal = os.environ.get("OPENWEBUI_INTERNAL_URL", "").strip()
-    if openwebui_internal:
-        if not openwebui_internal.startswith("http"):
-            openwebui_internal = f"http://{openwebui_internal}"
-        endpoints.append(f"{openwebui_internal.rstrip('/')}/api/chat/completions")
-
-    # PRIORITY 2: OPENWEBUI_URL (external OpenWebUI endpoint)
-    openwebui_external = os.environ.get("OPENWEBUI_URL", "").strip()
-    if openwebui_external:
-        if not openwebui_external.startswith("http"):
-            openwebui_external = f"http://{openwebui_external}"
-        endpoints.append(f"{openwebui_external.rstrip('/')}/api/chat/completions")
-
-    # PRIORITY 3: QWEN_API_URL (direct LLM backend, e.g., LM Studio, Ollama)
-    qwen_api = os.environ.get("QWEN_API_URL", "").strip()
-    if qwen_api:
-        if not qwen_api.startswith("http"):
-            qwen_api = f"http://{qwen_api}"
-        endpoints.append(qwen_api.rstrip('/'))
-
-    # PRIORITY 4: Hardcoded fallbacks — ONLY when no env vars are configured.
-    # If the operator set OPENWEBUI_INTERNAL_URL, OPENWEBUI_URL, or QWEN_API_URL,
-    # localhost fallbacks must NOT be appended. In production (Portainer, Docker Compose)
-    # these localhost addresses don't exist inside the container and burning retry
-    # time probing them adds 5-30s of ConnectError waste per failed call.
-    # Fallbacks are only useful for bare local dev where no env vars are set at all.
-    if not endpoints:
-        # Docker service name (docker compose): open-webui:8080
-        endpoints.append("http://open-webui:8080/api/chat/completions")
-        # Localhost development: port 8080 (OpenWebUI default)
-        endpoints.append("http://localhost:8080/api/chat/completions")
-        # Localhost LLM backend: port 11434 (Ollama default)
-        endpoints.append("http://localhost:11434/v1/chat/completions")
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_endpoints = []
-    for ep in endpoints:
-        if ep and ep not in seen:
-            unique_endpoints.append(ep)
-            seen.add(ep)
-
-    log.debug("llm_endpoints.resolved",
-             count=len(unique_endpoints),
-             endpoints=unique_endpoints[:3])  # Log only first 3 to avoid noise
-
-    return unique_endpoints
+    from src.api.llm_client import get_backend_endpoint, get_endpoint_list
+    typed = get_backend_endpoint()
+    if typed:
+        # LLM_BASE_URL is set — type-resolved endpoint is authoritative
+        return [typed]
+    # Legacy fallback chain (full backward compat when LLM_BASE_URL not set)
+    return get_endpoint_list()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
