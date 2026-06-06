@@ -1,251 +1,120 @@
 # FaultLine Environment Variable Specification
 
-## Overview
-This document specifies the exact environment variables required for FaultLine deployment, with bulletproof OpenWebUI integration.
+This document specifies the environment variables FaultLine reads, with the
+canonical LLM-backend configuration. For the full annotated list see
+[`.env.example`](../.env.example); for deployment walkthroughs see
+[`DEPLOYMENT.md`](./DEPLOYMENT.md).
 
-## Deployment Scenarios
+> All example values below are placeholders. Never commit real API keys,
+> hostnames, or tokens — keep them in your local `.env` / Portainer secrets.
 
-### Scenario 1: Docker Compose (Local Dev)
-**File:** `docker-compose.yml`  
-**Use Case:** Development and testing  
-**LLM Source:** QWEN_API_URL or localhost:11434
+## The LLM hook (canonical)
 
-**.env file (required):**
-```
-QWEN_API_URL=http://host.docker.internal:11434/v1/chat/completions
-POSTGRES_USER=faultline
-POSTGRES_PASSWORD=faultline
-POSTGRES_DB=faultline
-QDRANT_COLLECTION=faultline-test
-REEMBED_INTERVAL=5
-DB_POOL_SIZE=15
-```
+FaultLine connects to an LLM you already run; it does not host one. The endpoint
+is configured with three variables — `LLM_BACKEND_TYPE` selects the protocol and
+the correct API path is appended automatically:
 
-### Scenario 2: Portainer Stack (Production)
-**File:** `config/docker-compose-portainer.yml`  
-**Use Case:** Production deployment with external Qdrant  
-**LLM Source:** OPENWEBUI_URL (required, must be set)
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `LLM_BACKEND_TYPE` | Protocol: `openwebui` / `ollama` / `lm_studio` / `openai` / `anthropic` / `groq` / `localai` / `raw` | `ollama` |
+| `LLM_BASE_URL` | Host + port only, no path | `http://host.docker.internal:11434` |
+| `LLM_API_KEY` | Bearer/API key (blank for local servers that need none) | `sk-...` |
+| `WGM_LLM_MODEL` | Extraction model — must match a name the backend reports | `qwen2.5` |
+| `CATEGORY_LLM_MODEL` | Category-inference model | `qwen2.5` |
 
-**Portainer Environment Variables (required):**
-```
-OPENWEBUI_URL=https://example.com
-LLM_API_KEY=***REDACTED-API-KEY***
-FAULTLINE_MEMORY_CHAIN_UUID=550e8400-e29b-41d4-a716-446655440000
-FAULTLINE_URL=http://192.168.1.10:8000
-POSTGRES_PASSWORD=faultline
-WGM_LLM_MODEL=qwen/qwen3.5-9b
-CATEGORY_LLM_MODEL=qwen2.5-coder
-DB_POOL_SIZE=15
-```
+Path appended per backend type:
 
-## LLM Endpoint Configuration Pattern
+| `LLM_BACKEND_TYPE` | Appended path | Auth header |
+|--------------------|---------------|-------------|
+| `openwebui` | `/api/chat/completions` | `Authorization: Bearer` |
+| `ollama` / `lm_studio` / `openai` / `localai` | `/v1/chat/completions` | `Authorization: Bearer` |
+| `groq` | `/openai/v1/chat/completions` | `Authorization: Bearer` |
+| `anthropic` | `/v1/messages` | `x-api-key` + `anthropic-version` |
+| `raw` | none (full URL is taken from `LLM_BASE_URL`) | `Authorization: Bearer` |
 
-### Bulletproof Rule: OPENWEBUI_URL Takes Precedence
+> **Legacy fallback.** If `LLM_BASE_URL` is unset, the backend falls back to the
+> older `OPENWEBUI_INTERNAL_URL` → `OPENWEBUI_URL` → `QWEN_API_URL` chain
+> (`src/api/llm_client.py:get_endpoint_list`). New deployments should set
+> `LLM_BACKEND_TYPE` + `LLM_BASE_URL` and ignore the legacy variables.
 
-The FaultLine backend MUST follow this priority order for LLM endpoint resolution:
+## Deployment scenarios
 
-**Priority Chain (in src/api/main.py):**
-1. **OPENWEBUI_URL** — Explicit environment variable (external/HTTP endpoint)
-   - Used when explicitly set: `OPENWEBUI_URL=https://example.com`
-   - Endpoint format: `{OPENWEBUI_URL}/api/chat/completions`
-   - Required: `LLM_API_KEY` bearer token for authentication
-   
-2. **QWEN_API_URL** — Fallback for direct Qwen/Ollama access
-   - Used when OPENWEBUI_URL is not set
-   - Endpoint format: Direct connection to Qwen/Ollama API
-   - Example: `http://host.docker.internal:11434/v1/chat/completions`
-   
-3. **Hardcoded fallback** — Last resort (should never be used in production)
-   - `http://localhost:11434/v1/chat/completions`
+### Scenario 1 — Docker Compose (default)
 
-### Implementation: No Circular Calls
+**File:** [`docker-compose.yml`](../docker-compose.yml)
 
-**CRITICAL BUG TO FIX:**
-Current code in `src/api/main.py` lines 1445-1455 has circular dependency:
-```python
-# WRONG - circular
-def _get_llm_url() -> str:
-    openwebui_url = os.environ.get("OPENWEBUI_URL")
-    if openwebui_url:
-        return f"{openwebui_url}/api/chat/completions"
-    return _configured_llm_url()  # ← calls configured_llm_url
+```env
+LLM_BACKEND_TYPE=ollama
+LLM_BASE_URL=http://host.docker.internal:11434
+LLM_API_KEY=
+WGM_LLM_MODEL=qwen2.5
+CATEGORY_LLM_MODEL=qwen2.5
 
-def _configured_llm_url() -> str:
-    global _LLM_URL
-    return _LLM_URL or _get_llm_url()  # ← calls get_llm_url → infinite loop
-```
-
-**CORRECT Pattern (must be implemented):**
-```python
-def _get_llm_url() -> str:
-    """Get LLM endpoint URL with bulletproof priority chain."""
-    
-    # Priority 1: OPENWEBUI_URL (explicit, external)
-    openwebui_url = os.environ.get("OPENWEBUI_URL")
-    if openwebui_url:
-        if not openwebui_url.startswith("http"):
-            openwebui_url = f"https://{openwebui_url}"
-        endpoint = f"{openwebui_url}/api/chat/completions"
-        log.info("llm_endpoint.openwebui_detected", url=endpoint)
-        return endpoint
-    
-    # Priority 2: QWEN_API_URL (fallback)
-    qwen_url = os.environ.get("QWEN_API_URL")
-    if qwen_url:
-        log.info("llm_endpoint.qwen_fallback", url=qwen_url)
-        return qwen_url
-    
-    # Priority 3: Hardcoded fallback (development only)
-    fallback = "http://localhost:11434/v1/chat/completions"
-    log.warning("llm_endpoint.hardcoded_fallback", url=fallback)
-    return fallback
-```
-
-**Key Changes:**
-- ✅ NO circular calls
-- ✅ Clear priority chain (1 → 2 → 3)
-- ✅ Each endpoint selection is logged
-- ✅ OPENWEBUI_URL handling supports URL normalization (adds https:// if needed)
-
-## OpenWebUI Authentication
-
-### Required: LLM_API_KEY Bearer Token
-
-When using OPENWEBUI_URL, the FaultLine backend MUST include the bearer token:
-
-**In get_llm_headers():**
-```python
-def get_llm_headers() -> dict:
-    """Return headers for LLM API calls."""
-    headers = {"Content-Type": "application/json"}
-    
-    # Add bearer token if using OpenWebUI (OPENWEBUI_URL is set)
-    if os.environ.get("OPENWEBUI_URL"):
-        api_key = os.environ.get("LLM_API_KEY")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-    
-    return headers
-```
-
-## Model Name Configuration
-
-### WGM_LLM_MODEL vs CATEGORY_LLM_MODEL
-
-These must match model names available on the LLM backend:
-
-**For OpenWebUI (example.com):**
-```
-WGM_LLM_MODEL=qwen/qwen3.5-9b:2
-CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
-```
-
-**For Local Qwen/Ollama:**
-```
-WGM_LLM_MODEL=qwen/qwen3.5-9b
-CATEGORY_LLM_MODEL=qwen2.5-coder
-```
-
-**Validation at startup:**
-- FaultLine /health endpoint should echo the actual model names configured
-- If model name is invalid, extraction will fail with HTTP 400 Bad Request
-
-## Complete .env Template
-
-### For Portainer Production:
-```
-# OpenWebUI Integration (REQUIRED for production)
-OPENWEBUI_URL=https://example.com
-LLM_API_KEY=***REDACTED-API-KEY***
-
-# Database Configuration
-POSTGRES_PASSWORD=faultline
-POSTGRES_DSN=postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
-
-# FaultLine Backend
-FAULTLINE_URL=http://192.168.1.10:8000
-FAULTLINE_MEMORY_CHAIN_UUID=550e8400-e29b-41d4-a716-446655440000
-
-# LLM Model Selection
-WGM_LLM_MODEL=qwen/qwen3.5-9b:2
-CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
-
-# Qdrant Vector DB (external)
+POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
 QDRANT_URL=http://qdrant:6333
 QDRANT_COLLECTION=faultline-test
-
-# Redis (for distributed caching if needed)
 REDIS_URL=redis://redis:6379/0
-
-# Performance Tuning
-REEMBED_INTERVAL=5
-DB_POOL_SIZE=15
-HTTPX_TIMEOUT=30
-DB_TIMEOUT=30
-QDRANT_TIMEOUT=10
-RATE_LIMIT_PER_MIN=100
+REEMBED_INTERVAL=10
+DB_POOL_SIZE=10
 ```
 
-### For Docker Compose Dev:
-```
-# Direct LLM Backend (no OpenWebUI)
-QWEN_API_URL=http://host.docker.internal:11434/v1/chat/completions
+If you don't already run a model, start a bundled one with the `ollama` profile:
 
-# Database Configuration
-POSTGRES_USER=faultline
-POSTGRES_PASSWORD=faultline
-POSTGRES_DB=faultline
-
-# Local Qdrant
-QDRANT_URL=http://qdrant:6333
-QDRANT_COLLECTION=faultline-test
-
-# Performance Tuning
-REEMBED_INTERVAL=5
-DB_POOL_SIZE=15
+```bash
+docker compose --profile ollama up -d
 ```
 
-## Validation Checklist
+### Scenario 2 — Portainer Stack
+
+**File:** [`config/docker-compose-portainer.yml`](../config/docker-compose-portainer.yml)
+
+Build and tag the image on the Docker host first (`docker build -t faultline:latest .`),
+then set these in Portainer's **Environment variables** tab:
+
+```env
+LLM_BACKEND_TYPE=openwebui
+LLM_BASE_URL=http://open-webui:8080
+LLM_API_KEY=<your-bearer-token>
+WGM_LLM_MODEL=<model-name-the-backend-reports>
+CATEGORY_LLM_MODEL=<model-name-the-backend-reports>
+POSTGRES_PASSWORD=<strong-password>
+```
+
+## Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POSTGRES_DSN` | _(required)_ | `postgresql://user:pass@host:5432/db` |
+| `QDRANT_URL` | `http://qdrant:6333` | Vector index endpoint |
+| `QDRANT_COLLECTION` | `faultline-test` | Collection name |
+| `REDIS_URL` | `redis://redis:6379/0` | Inlet dedup cache (optional but recommended) |
+
+## MCP server
+
+The MCP server (`tools/mcp_server.py`, exposed on port 8002 in compose) gives
+MCP clients like Claude Desktop access to the same store.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FAULTLINE_API_URL` | `http://faultline:8000` | Backend the MCP server proxies to |
+| `MCP_API_KEY` | _(blank)_ | Bearer token required on HTTP transport (set one — port 8002 is network-accessible) |
+| `FAULTLINE_USER_ID` | _(blank)_ | Pins the MCP server to a single user (Claude Desktop single-user mode) |
+
+## Validation checklist
 
 Before deploying, verify:
 
-- [ ] OPENWEBUI_URL is set to the correct external URL
-- [ ] LLM_API_KEY is set and matches the OpenWebUI bearer token
-- [ ] WGM_LLM_MODEL matches an available model on the LLM backend
-- [ ] FaultLine /health endpoint returns 200 OK
-- [ ] FaultLine /extract/rewrite endpoint accepts POST requests
-- [ ] Database connections are healthy (POSTGRES_DSN works)
-- [ ] Qdrant is reachable at QDRANT_URL
-- [ ] Sample extraction returns valid JSON (not HTTP 400)
+- [ ] `LLM_BACKEND_TYPE` matches your backend and `LLM_BASE_URL` is reachable from the container
+- [ ] `LLM_API_KEY` is set when the backend requires auth
+- [ ] `WGM_LLM_MODEL` matches a model the backend actually serves (mismatch → HTTP 400)
+- [ ] `curl http://localhost:8000/health` returns `{"status":"ok",...}`
+- [ ] `POSTGRES_DSN` connects and `QDRANT_URL` is reachable
+- [ ] `MCP_API_KEY` is set if the MCP server is exposed on the network
 
-## Known Issues
+## Known issues
 
-### HTTP 400 Bad Request from /api/chat/completions
+### HTTP 400 from the LLM endpoint
 
-**Cause:** Usually one of:
-1. Model name doesn't exist on the LLM backend
-2. Request payload is malformed (missing required fields)
-3. Bearer token is invalid or missing
-
-**Debug:**
-1. Check WGM_LLM_MODEL against available models: `curl https://example.com/api/models`
-2. Test endpoint directly: `curl -H "Authorization: Bearer YOUR_KEY" https://example.com/api/chat/completions -d '{"model":"qwen/qwen3.5-9b:2","messages":[...]}'`
-3. Check FaultLine logs for the actual error: `docker logs faultline 2>&1 | grep -i "400\|error"`
-
-### Circular LLM Endpoint Resolution
-
-**Current Code Bug:** Lines 1445-1455 in src/api/main.py have circular dependency  
-**Status:** REQUIRES FIX (see Implementation section above)
-
-## Future: MCP Support
-
-This specification prepares for future MCP (Model Context Protocol) integration:
-
-When MCP support is added:
-```
-LLM_BACKEND=openwebui    # or "mcp", "qwen", "ollama"
-OPENWEBUI_URL=https://example.com
-MCP_SERVER_URL=...       # Future
-```
-
-The bulletproof priority chain pattern supports this evolution without breaking existing deployments.
+Usually a model-name mismatch — `WGM_LLM_MODEL` / `CATEGORY_LLM_MODEL` must match
+exactly what the backend reports. Check the available models (e.g.
+`curl $LLM_BASE_URL/v1/models`) and confirm `LLM_API_KEY` is valid.

@@ -56,7 +56,7 @@ Filter also calls:
 3. **Install the Filter in OpenWebUI:**
    - Go to OpenWebUI → Tools → Create new tool
    - Select "Filters"
-   - Paste content from `openwebui/faultline_tool.py`
+   - Paste content from `openwebui/faultline_function.py`
    - Click "Save"
 
 4. **Configure Filter (OpenWebUI → Tools → FaultLine Filter → Valves):**
@@ -110,14 +110,16 @@ Filter also calls:
 **Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 ### BACKEND_LLM_URL
-**DEPRECATED** — No longer used. FaultLine reads QWEN_API_URL from environment.  
+**DEPRECATED** — No longer used. FaultLine reads its LLM configuration from environment.  
 **Standard value:** **LEAVE EMPTY**  
 **Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 **New approach:**
-FaultLine backend now reads LLM configuration from environment variables:
-- `QWEN_API_URL`: LLM endpoint (e.g., `http://localhost:11434/v1/chat/completions`)
-- `WGM_LLM_MODEL`: Model name (e.g., `qwen/qwen3.5-9b`)
+FaultLine backend reads LLM configuration from environment variables:
+- `LLM_BACKEND_TYPE`: protocol (`openwebui` / `ollama` / `lm_studio` / `openai` / `anthropic` / …)
+- `LLM_BASE_URL`: host + port only (e.g. `http://host.docker.internal:11434`); the API path is appended automatically
+- `LLM_API_KEY`: bearer/API key (blank for local servers)
+- `WGM_LLM_MODEL`: Model name (e.g., `qwen2.5`)
 
 Set these in docker-compose.yml or kubernetes manifests, not in OpenWebUI valves.
 
@@ -179,7 +181,7 @@ LOG_LEVEL=DEBUG  # Verbose — every function call, every query, every decision
 
 ### Filter (OpenWebUI) Logging
 
-The Filter (`openwebui/faultline_tool.py`) has its own logging control via the `ENABLE_DEBUG` valve in OpenWebUI:
+The Filter (`openwebui/faultline_function.py`) has its own logging control via the `ENABLE_DEBUG` valve in OpenWebUI:
 
 ```
 OpenWebUI → Tools → FaultLine Filter → ENABLE_DEBUG = True
