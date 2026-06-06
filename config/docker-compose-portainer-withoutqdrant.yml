@@ -32,7 +32,7 @@ version: "3.8"
 #                               Used for external LLM calls; internal calls prefer OPENWEBUI_INTERNAL_URL
 #   LLM_API_KEY               - Bearer token for OpenWebUI authentication (sk-...)
 #   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection
-#   FAULTLINE_URL             - FaultLine backend endpoint (http://your-faultline-host:8001)
+#   FAULTLINE_URL             - FaultLine backend endpoint (http://your-faultline-host:8000)
 #   POSTGRES_PASSWORD         - Database password for 'faultline' user
 #   WGM_LLM_MODEL             - Extraction model name (qwen/qwen3.5-9b for full reasoning)
 #   CATEGORY_LLM_MODEL        - Category inference model (qwen2.5-coder-1.5b-instruct for speed)
@@ -46,7 +46,7 @@ version: "3.8"
 # HTTP 400 errors indicate model name mismatch (e.g., qwen-qwen3.5-9b vs qwen/qwen3.5-9b).
 #
 # NOTE: OpenWebUI Filter requires FAULTLINE_URL to be set in Portainer Function Valve settings
-# (FaultLine Filter → Configuration → FAULTLINE_URL = http://your-faultline-host:8001)
+# (FaultLine Filter → Configuration → FAULTLINE_URL = http://your-faultline-host:8000)
 #
 # KNOWN ISSUE: If extraction requests fail repeatedly (ingest.extraction_failed errors),
 # check FaultLine logs for traceback. Common causes:
@@ -61,9 +61,9 @@ services:
     container_name: faultline
     restart: unless-stopped
     ports:
-      - "8001:8000"
+      - "8000:8000"
     environment:
-      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
+      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_test
       OPENWEBUI_INTERNAL_URL: ${OPENWEBUI_INTERNAL_URL:-http://open-webui:8080}
       OPENWEBUI_URL: ${OPENWEBUI_URL:-http://open-webui:3000}
       LLM_API_KEY: ${LLM_API_KEY}
@@ -83,7 +83,7 @@ services:
       interval: "30s"
       timeout: "10s"
       retries: 3
-      start_period: "90s"
+      start_period: "240s"
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,7 +139,8 @@ services:
 
   faultline-mcp:
     image: faultline-wgm:latest
-    command: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    container_name: faultline-mcp
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "8002:8002"
     environment:
