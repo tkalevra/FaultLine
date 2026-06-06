@@ -201,7 +201,8 @@ CREATE TABLE IF NOT EXISTS rel_types (
     examples TEXT,
     value_distribution TEXT,
     approved_exceptions TEXT,
-    anomaly_threshold FLOAT
+    anomaly_threshold FLOAT,
+    mutually_exclusive_with TEXT[] DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_rel_types_engine_generated

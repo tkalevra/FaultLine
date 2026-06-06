@@ -282,7 +282,7 @@ docker compose logs faultline
 Common causes:
 - **`POSTGRES_DSN` not set`** — confirm `.env` exists and `QWEN_API_URL` is set
 - **Migration failed** — run `docker compose exec postgres psql -U faultline -d faultline_test` and check for schema errors
-- **Port 8000 already in use** — change the host port in `docker-compose.yml` (`"8001:8000"`)
+- **Port 8000 already in use** — change the host port in `docker-compose.yml` (`"8000:8000"`)
 
 ### `curl: (7) Failed to connect to localhost port 8000`
 

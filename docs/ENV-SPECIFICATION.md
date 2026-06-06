@@ -28,10 +28,10 @@ DB_POOL_SIZE=15
 
 **Portainer Environment Variables (required):**
 ```
-OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
-LLM_API_KEY=${BEARER_TOKEN}
+OPENWEBUI_URL=https://example.com
+LLM_API_KEY=***REDACTED-API-KEY***
 FAULTLINE_MEMORY_CHAIN_UUID=550e8400-e29b-41d4-a716-446655440000
-FAULTLINE_URL=http://${BACKEND_IP}:8001
+FAULTLINE_URL=http://192.168.1.10:8000
 POSTGRES_PASSWORD=faultline
 WGM_LLM_MODEL=qwen/qwen3.5-9b
 CATEGORY_LLM_MODEL=qwen2.5-coder
@@ -46,7 +46,7 @@ The FaultLine backend MUST follow this priority order for LLM endpoint resolutio
 
 **Priority Chain (in src/api/main.py):**
 1. **OPENWEBUI_URL** — Explicit environment variable (external/HTTP endpoint)
-   - Used when explicitly set: `OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}`
+   - Used when explicitly set: `OPENWEBUI_URL=https://example.com`
    - Endpoint format: `{OPENWEBUI_URL}/api/chat/completions`
    - Required: `LLM_API_KEY` bearer token for authentication
    
@@ -57,6 +57,55 @@ The FaultLine backend MUST follow this priority order for LLM endpoint resolutio
    
 3. **Hardcoded fallback** — Last resort (should never be used in production)
    - `http://localhost:11434/v1/chat/completions`
+
+### Implementation: No Circular Calls
+
+**CRITICAL BUG TO FIX:**
+Current code in `src/api/main.py` lines 1445-1455 has circular dependency:
+```python
+# WRONG - circular
+def _get_llm_url() -> str:
+    openwebui_url = os.environ.get("OPENWEBUI_URL")
+    if openwebui_url:
+        return f"{openwebui_url}/api/chat/completions"
+    return _configured_llm_url()  # ← calls configured_llm_url
+
+def _configured_llm_url() -> str:
+    global _LLM_URL
+    return _LLM_URL or _get_llm_url()  # ← calls get_llm_url → infinite loop
+```
+
+**CORRECT Pattern (must be implemented):**
+```python
+def _get_llm_url() -> str:
+    """Get LLM endpoint URL with bulletproof priority chain."""
+    
+    # Priority 1: OPENWEBUI_URL (explicit, external)
+    openwebui_url = os.environ.get("OPENWEBUI_URL")
+    if openwebui_url:
+        if not openwebui_url.startswith("http"):
+            openwebui_url = f"https://{openwebui_url}"
+        endpoint = f"{openwebui_url}/api/chat/completions"
+        log.info("llm_endpoint.openwebui_detected", url=endpoint)
+        return endpoint
+    
+    # Priority 2: QWEN_API_URL (fallback)
+    qwen_url = os.environ.get("QWEN_API_URL")
+    if qwen_url:
+        log.info("llm_endpoint.qwen_fallback", url=qwen_url)
+        return qwen_url
+    
+    # Priority 3: Hardcoded fallback (development only)
+    fallback = "http://localhost:11434/v1/chat/completions"
+    log.warning("llm_endpoint.hardcoded_fallback", url=fallback)
+    return fallback
+```
+
+**Key Changes:**
+- ✅ NO circular calls
+- ✅ Clear priority chain (1 → 2 → 3)
+- ✅ Each endpoint selection is logged
+- ✅ OPENWEBUI_URL handling supports URL normalization (adds https:// if needed)
 
 ## OpenWebUI Authentication
 
@@ -85,7 +134,7 @@ def get_llm_headers() -> dict:
 
 These must match model names available on the LLM backend:
 
-**For OpenWebUI (${OPENWEBUI_DOMAIN}):**
+**For OpenWebUI (example.com):**
 ```
 WGM_LLM_MODEL=qwen/qwen3.5-9b:2
 CATEGORY_LLM_MODEL=qwen/qwen3.5-9b:2
@@ -106,15 +155,15 @@ CATEGORY_LLM_MODEL=qwen2.5-coder
 ### For Portainer Production:
 ```
 # OpenWebUI Integration (REQUIRED for production)
-OPENWEBUI_URL=https://${OPENWEBUI_DOMAIN}
-LLM_API_KEY=${BEARER_TOKEN}
+OPENWEBUI_URL=https://example.com
+LLM_API_KEY=***REDACTED-API-KEY***
 
 # Database Configuration
 POSTGRES_PASSWORD=faultline
 POSTGRES_DSN=postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
 
 # FaultLine Backend
-FAULTLINE_URL=http://${BACKEND_IP}:8001
+FAULTLINE_URL=http://192.168.1.10:8000
 FAULTLINE_MEMORY_CHAIN_UUID=550e8400-e29b-41d4-a716-446655440000
 
 # LLM Model Selection
@@ -168,3 +217,35 @@ Before deploying, verify:
 - [ ] Database connections are healthy (POSTGRES_DSN works)
 - [ ] Qdrant is reachable at QDRANT_URL
 - [ ] Sample extraction returns valid JSON (not HTTP 400)
+
+## Known Issues
+
+### HTTP 400 Bad Request from /api/chat/completions
+
+**Cause:** Usually one of:
+1. Model name doesn't exist on the LLM backend
+2. Request payload is malformed (missing required fields)
+3. Bearer token is invalid or missing
+
+**Debug:**
+1. Check WGM_LLM_MODEL against available models: `curl https://example.com/api/models`
+2. Test endpoint directly: `curl -H "Authorization: Bearer YOUR_KEY" https://example.com/api/chat/completions -d '{"model":"qwen/qwen3.5-9b:2","messages":[...]}'`
+3. Check FaultLine logs for the actual error: `docker logs faultline 2>&1 | grep -i "400\|error"`
+
+### Circular LLM Endpoint Resolution
+
+**Current Code Bug:** Lines 1445-1455 in src/api/main.py have circular dependency  
+**Status:** REQUIRES FIX (see Implementation section above)
+
+## Future: MCP Support
+
+This specification prepares for future MCP (Model Context Protocol) integration:
+
+When MCP support is added:
+```
+LLM_BACKEND=openwebui    # or "mcp", "qwen", "ollama"
+OPENWEBUI_URL=https://example.com
+MCP_SERVER_URL=...       # Future
+```
+
+The bulletproof priority chain pattern supports this evolution without breaking existing deployments.

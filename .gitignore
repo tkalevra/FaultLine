@@ -33,3 +33,9 @@ Thumbs.db
 secrets.json
 .aider*
 .claude/settings.local.json
+
+# Test result artifacts (contain user IDs)
+TESTS/TESTS/results/*.json
+TESTS/results/*.json
+*.pyc
+__pycache__/

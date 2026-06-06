@@ -25,8 +25,8 @@ services:
       # Redis (local)
       REDIS_URL: ${REDIS_URL:-redis://faultline-redis:6379/0}
 
-      # LLM endpoint (OpenWebUI)
-      OPENWEBUI_LLM_URL: ${OPENWEBUI_LLM_URL:-http://open-webui:3000/api/chat/completions}
+      # LLM endpoint (OpenWebUI) — base URL only; backend appends /api/chat/completions
+      OPENWEBUI_INTERNAL_URL: ${OPENWEBUI_INTERNAL_URL:-http://open-webui:8080}
       QWEN_API_URL: ${QWEN_API_URL:-http://ollama:11434/v1/chat/completions}
 
       # FaultLine API self-reference
