@@ -290,8 +290,8 @@ Filter injects in returned order. No keyword-based re-scoring.
 Centralized auto-detection with fallback chain:
 
 **Priority chain (same everywhere — backend, filter, re-embedder):**
-1. Auto-detect OpenWebUI (Docker service name → localhost → explicit env)
-2. Environment variable (QWEN_API_URL or OPENWEBUI_URL if set)
+1. `LLM_BACKEND_TYPE` + `LLM_BASE_URL` (canonical — path appended per backend type)
+2. Legacy env fallback (`OPENWEBUI_INTERNAL_URL` → `OPENWEBUI_URL` → `QWEN_API_URL`)
 3. Hardcoded fallback (localhost only, absolute last resort)
 
 No scattered endpoint resolution logic. All modules resolve the same way.
@@ -402,9 +402,10 @@ POSTGRES_PASSWORD=faultline
 POSTGRES_DB=faultline
 
 # LLM (extraction, validation, category assignment)
-QWEN_API_URL=http://localhost:11434/v1/chat/completions
-WGM_LLM_MODEL=qwen/qwen3.5-9b
-CATEGORY_LLM_MODEL=qwen2.5-coder
+LLM_BACKEND_TYPE=ollama
+LLM_BASE_URL=http://host.docker.internal:11434
+WGM_LLM_MODEL=qwen2.5
+CATEGORY_LLM_MODEL=qwen2.5
 
 # Vector search
 QDRANT_URL=http://qdrant:6333
