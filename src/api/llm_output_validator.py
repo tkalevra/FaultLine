@@ -21,6 +21,7 @@ Provides:
 Ref: dBug-046 generalized — unified LLM output control across all modules
 """
 import logging
+import os
 from typing import Any, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -28,6 +29,9 @@ import httpx
 import structlog
 
 log = structlog.get_logger()
+
+# Embedding model name — overridable via env var
+_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5")
 
 
 @dataclass
@@ -362,10 +366,16 @@ class LLMOutputValidator:
             from src.api.llm_client import get_llm_headers
 
             base_url = self.llm_endpoint.rstrip('/')
-            embed_url = f"{base_url}/api/embeddings"
+            embed_url = os.getenv(
+                "EMBEDDING_API_URL",
+                base_url
+                .replace("/api/chat/completions", "")
+                .replace("/v1/chat/completions", "")
+                + "/api/embeddings"
+            )
 
             payload = {
-                "model": "text-embedding-nomic-embed-text-v1.5",
+                "model": _EMBEDDING_MODEL,
                 "input": text,
             }
 

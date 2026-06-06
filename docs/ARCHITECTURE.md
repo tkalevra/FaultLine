@@ -382,7 +382,7 @@ User corrections are authoritative and non-destructive:
 ```bash
 # Develop
 pip install -e ".[test]"
-uvicorn src.api.main:app --host 0.0.0.0 --port 8001 --reload
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 
 # Test
 pytest tests/ --ignore=tests/evaluation --ignore=tests/feature_extraction \
@@ -421,5 +421,5 @@ DB_POOL_SIZE=10
 RATE_LIMIT_PER_MIN=100
 
 # API (used by OpenWebUI Filter)
-FAULTLINE_API_URL=http://localhost:8001
+FAULTLINE_API_URL=http://localhost:8000
 ```

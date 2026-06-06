@@ -116,12 +116,13 @@ def reap_stale_provisioning_jobs(stale_minutes: int = 5) -> Dict[str, Any]:
                 SELECT user_id, schema_name
                 FROM public.user_provisioning
                 WHERE status = 'provisioning'
+                  AND created_at < NOW() - INTERVAL '%s minutes'
                   AND (
                     heartbeat_at IS NULL
                     OR (NOW() - heartbeat_at) > INTERVAL '%s minutes'
                   )
                 ORDER BY created_at ASC
-            """, (stale_minutes,))
+            """, (stale_minutes, stale_minutes))
 
             stale_jobs = cur.fetchall()
 

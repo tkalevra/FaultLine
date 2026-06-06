@@ -778,7 +778,7 @@ async def run_mcp_server() -> None:
                     "id": req_id,
                     "result": {
                         "protocolVersion": "2025-03-26",
-                        "capabilities": {"tools": {}},
+                        "capabilities": {"tools": {}, "prompts": {}},
                         "serverInfo": {"name": "faultline-mcp", "version": "1.0.0"},
                     },
                 })
@@ -813,6 +813,80 @@ async def run_mcp_server() -> None:
                     _log(f"Tool call: {tool_name} (user_id={arguments.get('user_id', '?')[:8]}...)")
                     result = await _call_tool(tool_name, arguments, progress_token=progress_token)
                     _send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+            elif method == "prompts/list":
+                if not _initialized:
+                    _send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32002, "message": "Server not initialized"},
+                    })
+                    continue
+                from .prompts import PROMPTS
+                _send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "prompts": [
+                            {
+                                "name": p["name"],
+                                "description": p.get("description", ""),
+                                "arguments": p.get("arguments", []),
+                            }
+                            for p in PROMPTS
+                        ]
+                    },
+                })
+
+            elif method == "prompts/get":
+                if not _initialized:
+                    _send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32002, "message": "Server not initialized"},
+                    })
+                    continue
+                from .prompts import PROMPTS
+                params = request.get("params", {})
+                prompt_name = params.get("name", "")
+                prompt_args = params.get("arguments", {})
+
+                prompt_def = next((p for p in PROMPTS if p["name"] == prompt_name), None)
+                if prompt_def is None:
+                    _send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": f"Prompt not found: {prompt_name}"},
+                    })
+                    continue
+
+                # Call the prompt function with any provided arguments
+                try:
+                    fn = prompt_def["fn"]
+                    import inspect
+                    sig = inspect.signature(fn)
+                    if sig.parameters:
+                        text = fn(**{k: v for k, v in prompt_args.items() if k in sig.parameters})
+                    else:
+                        text = fn()
+                except Exception as e:
+                    _send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32603, "message": f"Prompt execution failed: {e}"},
+                    })
+                    continue
+
+                _send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "description": prompt_def.get("description", ""),
+                        "messages": [
+                            {"role": "user", "content": {"type": "text", "text": text}}
+                        ],
+                    },
+                })
 
             else:
                 _log(f"Unknown method: {method}")

@@ -2,12 +2,12 @@
 
 ## Architecture: Write-Validated Knowledge Graph Pipeline
 
-FaultLine is the **single source of truth** (port 8001). Filter is intentionally dumb — all validation happens in the backend.
+FaultLine is the **single source of truth** (port 8000). Filter is intentionally dumb — all validation happens in the backend.
 
 ```
 OpenWebUI Filter (dumb)
   ├─ Extract corrections via regex (explicit user signals)
-  └─ Send {text, corrections} to FaultLine:8001
+  └─ Send {text, corrections} to FaultLine:8000
 
 FaultLine /ingest orchestrates the COMPLETE pipeline:
   1. Call /extract/rewrite (LLM-based triple inference)
@@ -49,7 +49,7 @@ Filter also calls:
 
 2. **Verify health:**
    ```bash
-   curl http://localhost:8001/health
+   curl http://localhost:8000/health
    ```
    Should return `"status": "ok"`
 
@@ -63,7 +63,7 @@ Filter also calls:
 
    **Step 1: Set FAULTLINE_URL (CRITICAL)**
    - **Docker setup:** Set `FAULTLINE_URL` to `http://faultline:8000` (service name)
-   - **Local setup:** Set `FAULTLINE_URL` to `http://localhost:8001`
+   - **Local setup:** Set `FAULTLINE_URL` to `http://localhost:8000`
    
    **Step 2: Enable features:**
    - `ENABLED`: ✓ True
@@ -77,10 +77,10 @@ Filter also calls:
 
 5. **Test it:**
    ```
-   User: "My name is ${USER}, I prefer ${USER}"
+   User: "My name is Christopher, I prefer Chris"
    System: [Extracts and stores facts]
    User: "What's my name?"
-   System: [Uses stored fact to respond with "${USER}, but you prefer ${USER}"]
+   System: [Uses stored fact to respond with "Christopher, but you prefer Chris"]
    ```
 
 ---
@@ -89,30 +89,30 @@ Filter also calls:
 
 ### FAULTLINE_URL
 **What it is:** The location of the FaultLine backend API  
-**Standard value:** `http://localhost:8001`  
+**Standard value:** `http://localhost:8000`  
 **Docker value:** `http://faultline:8000` (service name in docker-compose)  
-**Remote value:** `http://your-hostname:8001`  
+**Remote value:** `http://your-hostname:8000`  
 **When to change:** Only if FaultLine is on a different host/port
 
 ### LLM_URL
 **DEPRECATED** — No longer used. FaultLine calls LLM directly, not OpenWebUI.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
+**Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 ### LLM_MODEL
 **DEPRECATED** — No longer used. FaultLine reads WGM_LLM_MODEL from environment.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
+**Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 ### LLM_API_KEY
 **DEPRECATED** — No longer used. FaultLine manages LLM authentication internally.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
+**Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 ### BACKEND_LLM_URL
 **DEPRECATED** — No longer used. FaultLine reads QWEN_API_URL from environment.  
 **Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for bac${LOCATION}ards compatibility only. Can be safely ignored.
+**Note:** Kept for backwards compatibility only. Can be safely ignored.
 
 **New approach:**
 FaultLine backend now reads LLM configuration from environment variables:
@@ -305,7 +305,7 @@ LOG_LEVEL=DEBUG  # Global, easy to toggle
 The `/health` endpoint is designed to NOT spam logs. It returns status without logging for common cases:
 
 ```bash
-curl http://localhost:8001/health
+curl http://localhost:8000/health
 # Returns: {"status": "ok", "database": "ok", "qdrant": "ok", ...}
 # Logs nothing unless a component fails
 ```
@@ -337,7 +337,7 @@ Look for:
 
 **Check 3: Is FaultLine backend running?**
 ```bash
-curl http://localhost:8001/health
+curl http://localhost:8000/health
 # Should return: {"status": "ok"}
 ```
 
@@ -360,10 +360,10 @@ docker exec open-webui curl http://faultline:8000/health
 **Problem:** `FAULTLINE_URL` points to wrong host/port  
 
 **For Docker setups (most common):**
-- **Wrong:** `http://localhost:8001` ← OpenWebUI container cannot reach host localhost
+- **Wrong:** `http://localhost:8000` ← OpenWebUI container cannot reach host localhost
 - **Correct:** `http://faultline:8000` ← Use Docker service name
 
-**Why:** OpenWebUI runs in a container. When it tries to reach `localhost:8001`, it's looking for a service on the container itself, not the host machine. Use the service name from docker-compose (`faultline`).
+**Why:** OpenWebUI runs in a container. When it tries to reach `localhost:8000`, it's looking for a service on the container itself, not the host machine. Use the service name from docker-compose (`faultline`).
 
 **How to fix:**
 1. Go to OpenWebUI → Tools → FaultLine Filter → Valves
@@ -372,11 +372,11 @@ docker exec open-webui curl http://faultline:8000/health
 4. Save
 
 **For non-Docker (local) setups:**
-- `FAULTLINE_URL` should be `http://localhost:8001` (current host)
-- Ensure FaultLine backend is running: `curl http://localhost:8001/health`
+- `FAULTLINE_URL` should be `http://localhost:8000` (current host)
+- Ensure FaultLine backend is running: `curl http://localhost:8000/health`
 
 **For remote deployments:**
-- Use actual hostname: `http://faultline.example.com:8001`
+- Use actual hostname: `http://faultline.example.com:8000`
 - Ensure firewall allows OpenWebUI → FaultLine connection
 
 ### "Facts extracted but not injected into memory"
@@ -395,10 +395,10 @@ docker exec open-webui curl http://faultline:8000/health
 
 ## Standard Configuration Checklist
 
-- [ ] FaultLine backend running: `curl http://localhost:8001/health`
+- [ ] FaultLine backend running: `curl http://localhost:8000/health`
 - [ ] PostgreSQL + Qdrant running
 - [ ] Filter installed in OpenWebUI
-- [ ] `FAULTLINE_URL`: Set correctly (localhost:8001 or docker service name)
+- [ ] `FAULTLINE_URL`: Set correctly (localhost:8000 or docker service name)
 - [ ] `LLM_API_KEY`: Pasted from OpenWebUI Settings
 - [ ] `LLM_URL`: **EMPTY** (for standard setup)
 - [ ] `BACKEND_LLM_URL`: **EMPTY** (for standard setup)
@@ -433,7 +433,7 @@ networks:
 
 ### Remote Deployment
 If FaultLine runs on a different server (e.g., `faultline.internal.example.com`):
-- `FAULTLINE_URL`: `http://faultline.internal.example.com:8001`
+- `FAULTLINE_URL`: `http://faultline.internal.example.com:8000`
 - Ensure firewall allows OpenWebUI → FaultLine connection
 - Use static hostnames (not IPs)
 
@@ -479,6 +479,6 @@ OpenWebUI → Tools → FaultLine Filter → ENABLED = True
 1. Enable `ENABLE_DEBUG = True`
 2. Run the test: Message user facts, then ask about them
 3. Collect logs: `docker logs open-webui | grep "\[FaultLine\]"`
-4. Check `/health` endpoint: `curl http://localhost:8001/health`
+4. Check `/health` endpoint: `curl http://localhost:8000/health`
 
 **Common issue:** URL misconfiguration. Ensure all URLs have `http://` or `https://` prefix.

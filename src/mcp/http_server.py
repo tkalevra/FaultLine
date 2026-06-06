@@ -254,6 +254,11 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
     elif method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {}) or {}
+        # OpenWebUI forwards the authenticated user's UUID via X-OpenWebUI-User-Id.
+        # Inject it into arguments so _call_tool can resolve per-user schema.
+        owui_user_id = request.headers.get("X-OpenWebUI-User-Id", "")
+        if owui_user_id and not arguments.get("user_id"):
+            arguments = {**arguments, "user_id": owui_user_id}
         _log(f"tools/call name={tool_name!r} user_id={str(arguments.get('user_id', '?'))[:8]}...")
         result = await _mcp._call_tool(tool_name, arguments)
         return JSONResponse(_jsonrpc_result(req_id, result))

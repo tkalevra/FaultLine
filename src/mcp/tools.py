@@ -79,10 +79,13 @@ TOOLS = [
     },
     {
         "name": "retract_fact",
-        "description": "Remove or correct a previously stored fact. Use when the user says something "
-                       "was wrong, has changed, or should be forgotten. "
-                       "Accepts natural language (e.g., 'forget that Aurora is a computer', "
-                       "'Des is 13 now not 12'). Delegates semantic extraction to FaultLine backend.",
+        "description": "Remove or correct a previously stored fact. Use when the user says "
+                       "something was wrong, has changed, or should be forgotten. "
+                       "ALSO use for correction signals: 'I do not X', 'I don't X', "
+                       "'X is not a Y', 'that was wrong', 'I meant X not Y', "
+                       "'forget that X', 'actually X is Z', or any message prefixed "
+                       "'Correction:'. Accepts natural language — delegates semantic "
+                       "extraction to FaultLine backend.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -740,7 +740,9 @@ def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
 # select WHICH relational rel_types are domain-relevant to the entities GLiNER2's
 # NER pass actually found in THIS text — so grown RELATIONAL types get their
 # "second shot" without polluting the seed (Pitfall 11) or exceeding the cap.
-_GLINER2_RELATION_LABEL_CAP = 25
+_GLINER2_RELATION_LABEL_CAP = 25  # legacy — kept for backward compat; new split caps below
+_GLINER2_SCALAR_LABEL_CAP = int(os.environ.get("GLINER2_SCALAR_LABEL_CAP", "15"))
+_GLINER2_RELATIONAL_LABEL_CAP = int(os.environ.get("GLINER2_RELATIONAL_LABEL_CAP", "20"))
 
 
 def _gliner2_threshold_for(head_types, category) -> float:
@@ -927,7 +929,53 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
                  head_types=head_types, tail_types=tail_types,
                  is_hierarchy=is_hierarchy)
 
+        # Fix B (dprompt-156): propagate new rel_type to entity_taxonomies so
+        # determine_path() routes queries through it on the very same request.
+        # Category → taxonomy_name mapping is DB-driven: try exact match first,
+        # then ILIKE fallback. No hardcoded category→taxonomy mappings.
+        if category:
+            try:
+                with db.cursor() as _tax_cur:
+                    _tax_cur.execute(
+                        """
+                        UPDATE entity_taxonomies
+                        SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
+                        WHERE taxonomy_name = %s
+                          AND NOT (rel_types_defining_group @> ARRAY[%s]::TEXT[])
+                        """,
+                        (rt_lower, category, rt_lower),
+                    )
+                    if _tax_cur.rowcount > 0:
+                        log.info("ingest.taxonomy_rel_type_appended",
+                                 rel_type=rt_lower, taxonomy=category)
+                    else:
+                        # Exact match found no row — try ILIKE fallback
+                        _tax_cur.execute(
+                            """
+                            UPDATE entity_taxonomies
+                            SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
+                            WHERE taxonomy_name ILIKE %s
+                              AND NOT (rel_types_defining_group @> ARRAY[%s]::TEXT[])
+                            """,
+                            (rt_lower, category, rt_lower),
+                        )
+                        if _tax_cur.rowcount > 0:
+                            log.info("ingest.taxonomy_rel_type_appended_ilike",
+                                     rel_type=rt_lower, taxonomy_pattern=category)
+                        else:
+                            log.debug("ingest.taxonomy_no_match_for_category",
+                                      rel_type=rt_lower, category=category)
+                db.commit()
+            except Exception as _tax_err:
+                log.warning("ingest.taxonomy_append_failed",
+                            rel_type=rt_lower, error=str(_tax_err)[:100])
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
         # Phase 3: refresh in-process _REL_TYPE_META so the SAME request/session sees it.
+        # Also refresh _TAXONOMY_CACHE so determine_path() sees the new rel_type immediately.
         try:
             global _REL_TYPE_META
             _REL_TYPE_META = _build_rel_type_meta(os.environ.get("POSTGRES_DSN", ""))
@@ -936,6 +984,19 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
         except Exception as _refresh_err:
             log.warning("ingest.rel_type_in_flow_cache_refresh_failed",
                         rel_type=rt_lower, error=str(_refresh_err))
+
+        try:
+            _dsn = os.environ.get("POSTGRES_DSN", "")
+            if _dsn:
+                _tax_conn = psycopg2.connect(_dsn)
+                try:
+                    _load_taxonomy_cache(_tax_conn)
+                    log.info("ingest.taxonomy_cache_refreshed_in_flow", rel_type=rt_lower)
+                finally:
+                    _tax_conn.close()
+        except Exception as _tax_refresh_err:
+            log.warning("ingest.taxonomy_cache_refresh_in_flow_failed",
+                        rel_type=rt_lower, error=str(_tax_refresh_err)[:100])
 
         return True
 
@@ -2571,7 +2632,8 @@ def _refresh_rel_type_cache():
                 cur.execute(
                     "SELECT rel_type, storage_target, fact_class, "
                     "is_symmetric, inverse_rel_type, is_leaf_only, is_hierarchy_rel, "
-                    "correction_behavior "
+                    "correction_behavior, "
+                    "COALESCE(mutually_exclusive_with, '{}') "
                     "FROM rel_types"
                 )
                 _REL_TYPE_CACHE.clear()
@@ -2584,6 +2646,7 @@ def _refresh_rel_type_cache():
                         "is_leaf_only": row[5] if row[5] else False,
                         "is_hierarchy_rel": row[6] if row[6] else False,
                         "correction_behavior": row[7] if row[7] else "supersede",
+                        "mutually_exclusive_with": row[8] if row[8] else [],
                     }
         log.info("rel_type_cache.refreshed", count=len(_REL_TYPE_CACHE))
     except Exception as e:
@@ -2675,7 +2738,8 @@ def _get_rel_type_metadata(rel_type: str) -> dict:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT storage_target, fact_class, is_symmetric, inverse_rel_type, "
-                        "is_leaf_only, is_hierarchy_rel, correction_behavior FROM rel_types WHERE rel_type = %s",
+                        "is_leaf_only, is_hierarchy_rel, correction_behavior, "
+                        "COALESCE(mutually_exclusive_with, '{}') FROM rel_types WHERE rel_type = %s",
                         (rt,)
                     )
                     row = cur.fetchone()
@@ -2688,6 +2752,7 @@ def _get_rel_type_metadata(rel_type: str) -> dict:
                             "is_leaf_only": row[4] or False,
                             "is_hierarchy_rel": row[5] or False,
                             "correction_behavior": row[6] or "supersede",
+                            "mutually_exclusive_with": row[7] if row[7] else [],
                         }
                         # Cache it for next time
                         _REL_TYPE_CACHE[rt] = metadata
@@ -2704,6 +2769,7 @@ def _get_rel_type_metadata(rel_type: str) -> dict:
         "is_leaf_only": False,
         "is_hierarchy_rel": False,
         "correction_behavior": "supersede",
+        "mutually_exclusive_with": [],
     }
 
 
@@ -2864,6 +2930,41 @@ def _validate_bidirectional_relationships(
 
     meta = _get_rel_type_metadata(rt_lower)
     inverse = meta.get("inverse_rel_type") if meta else None
+
+    # ── BUG-B1: Mutual exclusion check (metadata-driven, migration 069) ──────────
+    # Query mutually_exclusive_with from rel_types — no hardcoded rel_type names.
+    # Checks both A→B and B→A directions since symmetric rels (spouse) exist in one row.
+    # Returns "supersede_new" to BLOCK the incoming fact — existing fact is preserved.
+    # Corrections (is_correction=True) bypass this via the Class A override path upstream.
+    exclusive_with = meta.get("mutually_exclusive_with") if meta else []
+    if exclusive_with:
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, rel_type FROM facts "
+                    "WHERE rel_type = ANY(%s) AND superseded_at IS NULL "
+                    "AND ("
+                    "  (subject_id = %s AND object_id = %s)"
+                    "  OR (subject_id = %s AND object_id = %s)"
+                    ") LIMIT 10",
+                    (exclusive_with, subject, obj, obj, subject),
+                )
+                conflicting_rows = cur.fetchall()
+                if conflicting_rows:
+                    for _cid, conflict_rel_type in conflicting_rows:
+                        log.info(
+                            "gate.mutual_exclusion_blocked",
+                            incoming_rel_type=rt_lower,
+                            existing_rel_type=conflict_rel_type,
+                            subject=subject,
+                            object=obj,
+                        )
+                    return "supersede_new"  # Block incoming; existing fact untouched
+        except Exception as e:
+            log.warning("ingest.mutual_exclusion_check_failed", error=str(e),
+                        rel_type=rt_lower, subject=subject, obj=obj)
+    # ── end BUG-B1 ───────────────────────────────────────────────────────────────
+
     if not inverse:
         return "keep"
 
@@ -2935,31 +3036,20 @@ def _validate_bidirectional_relationships(
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
 
 def _get_llm_url() -> str:
-    """Get LLM endpoint URL using centralized endpoint detection.
+    """Get LLM endpoint URL and cache the embedding URL.
 
-    Delegates to src/api/llm_calls._get_endpoint_list() which maintains
-    the single source of truth for all LLM endpoint URLs.
-
-    Returns first available endpoint from priority chain:
-    1. OPENWEBUI_INTERNAL_URL (container-internal, port 8080)
-    2. OPENWEBUI_URL (external, user-configured)
-    3. QWEN_API_URL (direct LLM backend)
-    4. Hardcoded fallbacks (docker service names, localhost:8080)
+    Delegates to llm_client canonical helpers. Return type (str) and
+    _EMBEDDING_API_URL side effect are unchanged — all callers unaffected.
     """
-    from src.api.llm_calls import _get_endpoint_list
+    from src.api.llm_client import get_llm_chat_url, get_embedding_url
 
-    endpoints = _get_endpoint_list()
-    if not endpoints:
-        log.critical("llm_endpoint.no_endpoints_available")
-        return "http://open-webui:8080/api/chat/completions"
+    endpoint = get_llm_chat_url()
 
-    endpoint = endpoints[0]
-    log.info("llm_endpoint.selected", endpoint=endpoint)
-
-    # Cache embedding endpoint (assume same base URL)
+    # Side effect preserved: _EMBEDDING_API_URL must still be set here
+    # so all callers in this module that read _EMBEDDING_API_URL continue
+    # to get the correct value.
     global _EMBEDDING_API_URL
-    base_url = endpoint.replace("/api/chat/completions", "")
-    _EMBEDDING_API_URL = f"{base_url}/api/embeddings"
+    _EMBEDDING_API_URL = get_embedding_url(endpoint)
 
     return endpoint
 
@@ -3102,14 +3192,13 @@ def _check_qdrant_health(url: str) -> bool:
 
 
 def _check_llm_health(url: str) -> bool:
+    from src.api.llm_client import get_health_check_url
     try:
         resp = httpx.get(
-            url.replace("/chat/completions", "/models"),
+            get_health_check_url(url),
             headers=get_llm_headers(),
             timeout=2.0,
         )
-        # 200/404: endpoint responded normally
-        # 401: server is up but auth required — our actual LLM calls send auth, so this is fine
         return resp.status_code in (200, 401, 404)
     except Exception:
         return False
@@ -3160,6 +3249,12 @@ QUERY_QDRANT_RANKDOWN = float(os.environ.get("QUERY_QDRANT_RANKDOWN", "0.5"))
 # Weight of content quality score in Qdrant rank-down blending. 0.25 = quality drives
 # 25% of rank, cosine confidence drives 75%. Tunable without rebuild.
 QUERY_QUALITY_WEIGHT = float(os.environ.get("QUERY_QUALITY_WEIGHT", "0.25"))
+
+# Minimum GLiNER2 confidence for taxonomy classification in determine_path().
+# Default 0.5 — avoids false positives (e.g. "Alex" firing on computer_system at 0.37).
+_DETERMINE_PATH_TAXONOMY_CONF_THRESHOLD = float(
+    os.environ.get("DETERMINE_PATH_TAXONOMY_CONF_THRESHOLD", "0.5")
+)
 
 # ── End dprompt-41 ──────────────────────────────────────────────────────────
 
@@ -3427,10 +3522,12 @@ async def lifespan(app: FastAPI):
 
         # dprompt-152: Load intent classification pattern caches
         # Patterns enhance GLiNER2 prompt with real examples from database
-        _load_negation_patterns_cache()
+        # NOTE: _load_negation_patterns_cache() removed — _NEGATION_PATTERNS_CACHE is never
+        # iterated for matching (dead in-memory path). The hot path reads intent_pattern_cache
+        # directly from DB on each classify-intent call. The load call was emitting a
+        # misleading "intent_pattern_caches_loaded" log with a stale count.
         _load_preference_patterns_cache()
         log.info("startup.intent_pattern_caches_loaded",
-                negation_patterns=len(_NEGATION_PATTERNS_CACHE),
                 preference_patterns=len(_PREFERENCE_PATTERNS_CACHE))
 
     log.info("startup.gliner2_loading")
@@ -4192,6 +4289,25 @@ async def refresh_intent_pattern_caches():
             log.error("refresh_intent_pattern_caches.rel_type_meta_reload_failed",
                       error=str(_rm_err)[:120])
 
+        # Fix B (dprompt-156): reload _TAXONOMY_CACHE so the new rel_type appended to
+        # entity_taxonomies.rel_types_defining_group is visible to determine_path() in
+        # the backend uvicorn process without a container restart.
+        taxonomy_count = None
+        try:
+            _dsn = os.environ.get("POSTGRES_DSN", "")
+            if _dsn:
+                _tax_conn = psycopg2.connect(_dsn)
+                try:
+                    _load_taxonomy_cache(_tax_conn)
+                    taxonomy_count = len(_TAXONOMY_CACHE)
+                    log.info("refresh_intent_pattern_caches.taxonomy_cache_reloaded",
+                             taxonomy_count=taxonomy_count)
+                finally:
+                    _tax_conn.close()
+        except Exception as _tax_err:
+            log.warning("refresh_intent_pattern_caches.taxonomy_cache_reload_failed",
+                        error=str(_tax_err)[:100])
+
         # Reset the dead-path extraction pattern cache if present (best-effort; not on the
         # self-growth path — kept only for backward compatibility of the existing import).
         try:
@@ -4203,13 +4319,15 @@ async def refresh_intent_pattern_caches():
         log.info("refresh_intent_pattern_caches.done",
                 negation_count=len(neg_patterns),
                 preference_count=len(pref_patterns),
-                rel_type_meta_count=rel_type_meta_count)
+                rel_type_meta_count=rel_type_meta_count,
+                taxonomy_count=taxonomy_count)
 
         return {
             "status": "ok",
             "negation_patterns_loaded": len(neg_patterns),
             "preference_patterns_loaded": len(pref_patterns),
             "rel_type_meta_loaded": rel_type_meta_count,
+            "taxonomy_cache_loaded": taxonomy_count,
             "extraction_patterns_cache": "reset"
         }
     except Exception as e:
@@ -4564,6 +4682,7 @@ def health():
     if not db_ok:
         status = "unhealthy"
 
+    from src.api.llm_client import get_llm_config
     _health_cache = {
         "status": status,
         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_now)),
@@ -4572,6 +4691,7 @@ def health():
         "llm": "ok" if llm_ok else "unreachable",
         "re_embedder": _embedder_stats,
         "model_loaded": True,
+        "llm_config": get_llm_config(),
     }
     _health_cache_ts = _now
     return _health_cache
@@ -5230,6 +5350,7 @@ def _learn_pattern_from_llm_fallback_async(
             try:
                 db_conn = psycopg2.connect(dsn)
                 with db_conn.cursor() as cur:
+                    # Belt-and-suspenders: retain negation_patterns write (secondary, per-user)
                     # INSERT with ON CONFLICT: if pattern exists, increment confidence asymptotically
                     cur.execute(f"""
                         INSERT INTO {schema_name}.negation_patterns (
@@ -5248,8 +5369,32 @@ def _learn_pattern_from_llm_fallback_async(
                         initial_confidence,
                         initial_confidence
                     ))
+
+                    # Issue 3 fix: primary write goes to public.intent_pattern_cache
+                    # This is the table the /classify-intent hot path reads from (Layer 2a).
+                    # Learned patterns start at confidence=0.55, TTL=14 days (2× bootstrap).
+                    # ON CONFLICT never downgrades confidence — GREATEST() guards it.
+                    cur.execute("""
+                        INSERT INTO public.intent_pattern_cache (
+                            pattern_text, intent_type, confidence,
+                            confirmed_count, hit_count, source,
+                            is_permanent, user_id,
+                            expires_at, created_at, updated_at
+                        ) VALUES (%s, %s, %s, 0, 0, 'llm_learned', false, '__global__',
+                                  now() + interval '14 days', now(), now())
+                        ON CONFLICT (pattern_text) DO UPDATE SET
+                            confirmed_count = intent_pattern_cache.confirmed_count + 1,
+                            confidence = GREATEST(EXCLUDED.confidence, intent_pattern_cache.confidence),
+                            updated_at = now()
+                    """, (trigger, intent.lower(), max(0.55, initial_confidence)))
+
                     db_conn.commit()
 
+                log.info("intent.pattern_learned",
+                        pattern=trigger,
+                        intent=intent,
+                        source="llm_fallback",
+                        initial_confidence=round(initial_confidence, 2))
                 log.info("learn_pattern_from_llm_fallback.success",
                         user_id=user_id[:8],
                         trigger=trigger,
@@ -5504,6 +5649,24 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                                            pattern_text=pattern_text,
                                            pattern_confidence=pattern_conf,
                                            source="intent_pattern_cache")
+                                    # Wire Issue 1: reinforce the matched pattern (fire-and-forget)
+                                    _pattern_text_hit = pattern_text
+                                    _intent_type_hit = intent_type
+                                    _user_id_hit = user_id
+                                    def _reinforce_pattern_cache():
+                                        _dsn = os.getenv("POSTGRES_DSN")
+                                        if not _dsn:
+                                            return
+                                        try:
+                                            _rc = psycopg2.connect(_dsn)
+                                            try:
+                                                _update_pattern_cache(_rc, _user_id_hit, _pattern_text_hit, _intent_type_hit, confirmed=True)
+                                            finally:
+                                                _rc.close()
+                                        except Exception as _e:
+                                            log.warning("pattern_cache.reinforce_failed", error=str(_e)[:80])
+                                    from threading import Thread as _Thread
+                                    _Thread(target=_reinforce_pattern_cache, daemon=True).start()
                                     return {
                                         "intent": intent,
                                         "confidence": confidence
@@ -7591,12 +7754,22 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             if model is not None:
                 ner_result = None
                 try:
+                    # Open a short-lived connection for entity label DB query — db is not yet
+                    # assigned at this point in the function (it's opened ~460 lines later).
+                    # Consistent with the _reinforce_pattern_cache daemon pattern.
+                    _ner_label_conn = None
+                    try:
+                        _ner_label_conn = psycopg2.connect(os.environ["POSTGRES_DSN"])
+                        _ner_labels = _gliner2_entity_labels(
+                            source=getattr(req, "source", "user"),
+                            db_conn=_ner_label_conn,
+                        )
+                    finally:
+                        if _ner_label_conn:
+                            _ner_label_conn.close()
                     ner_result = model.extract_entities(
                         req.text,
-                        _gliner2_entity_labels(
-                            source=getattr(req, "source", "user"),
-                            db_conn=None,  # db assigned 460 lines later; _gliner2_entity_labels guards with `if db_conn:`
-                        ),
+                        _ner_labels,
                         max_len=2048
                     )
                     for entity_type, entity_names in ner_result.get("entities", {}).items():
@@ -7708,29 +7881,61 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         if rt not in _scalar_relation_types
                     }
 
-                    # ── 25-LABEL CAP ENFORCEMENT (GLiREL training cap, arxiv:2501.03172) ──
-                    # Known scalars are the reliable, established seed → ALWAYS kept first.
-                    # Relational candidates fill the remaining budget, prioritized by:
-                    #   (1) direct head/tail type match to detected entities (most relevant),
-                    #   (2) then by per-type threshold ascending (cheaper-to-fire = more
-                    #       likely the intended domain relation).
-                    # Anything over the cap is TRUNCATED and logged LOUD (fail loud).
+                    # ── SPLIT-BUDGET CAP ENFORCEMENT (GLiREL training cap, arxiv:2501.03172) ──
+                    # Scalars and relational types each have their own independent budget so
+                    # 23 scalar rel_types no longer crowd out all relational candidates.
+                    # Scalar budget (_GLINER2_SCALAR_LABEL_CAP, default 15): established identity/
+                    #   attribute types — network/bootstrap types deprioritised (sort last).
+                    # Relational budget (_GLINER2_RELATIONAL_LABEL_CAP, default 20): taxonomy-scoped
+                    #   relational candidates, ranked by (type_match DESC, category priority from DB).
+                    # Category priority is DB-driven: query rel_types — work=1, family=2, location=3,
+                    # others=4. Zero hardcoding.
+
+                    # Scalar cap: deprioritise network-category types (sort last within scalar pool)
+                    _scalar_count_raw = len(_scalar_relation_types)
+                    if _scalar_count_raw > _GLINER2_SCALAR_LABEL_CAP:
+                        # Sort network/bootstrap types to end — DB-driven via category field
+                        _scalar_ranked = sorted(
+                            _scalar_relation_types.items(),
+                            key=lambda kv: (
+                                1 if kv[1].get("_is_network") else 0,  # network types last
+                                kv[1].get("threshold", 0.6),           # then by threshold asc
+                            ),
+                        )
+                        _truncated_scalar = _scalar_count_raw - _GLINER2_SCALAR_LABEL_CAP
+                        _scalar_relation_types = dict(_scalar_ranked[:_GLINER2_SCALAR_LABEL_CAP])
+                        log.warning("gliner2.scalar_cap_truncated",
+                                    scalar_raw=_scalar_count_raw,
+                                    scalar_kept=len(_scalar_relation_types),
+                                    scalar_truncated=_truncated_scalar,
+                                    scalar_cap=_GLINER2_SCALAR_LABEL_CAP)
                     _scalar_count = len(_scalar_relation_types)
-                    _relational_budget = _GLINER2_RELATION_LABEL_CAP - _scalar_count
+
+                    # Relational cap: rank by (type_match DESC, DB category priority ASC)
+                    # Category priority fetched from DB — no hardcoding.
+                    _cat_priority: dict = {}
+                    try:
+                        with psycopg2.connect(os.environ.get("POSTGRES_DSN", "")) as _cp_conn:
+                            with _cp_conn.cursor() as _cp_cur:
+                                _cp_cur.execute("SELECT rel_type, category FROM rel_types")
+                                for _cp_rt, _cp_cat in _cp_cur.fetchall():
+                                    _cat_priority[_cp_rt] = {
+                                        "work": 1, "family": 2, "location": 3,
+                                    }.get(_cp_cat or "", 4)
+                    except Exception as _cp_err:
+                        log.warning("gliner2.category_priority_fetch_failed", error=str(_cp_err))
+
                     _truncated_relational = 0
-                    if _relational_budget <= 0:
-                        # Scalars alone meet/exceed the cap — no room for relational types.
-                        _truncated_relational = len(_relational_candidates)
-                        _relational_candidates = {}
-                    elif len(_relational_candidates) > _relational_budget:
+                    if len(_relational_candidates) > _GLINER2_RELATIONAL_LABEL_CAP:
                         _ranked = sorted(
                             _relational_candidates.items(),
                             key=lambda kv: (
-                                0 if kv[1].get("_type_match") else 1,  # type match first
-                                kv[1].get("threshold", 0.6),            # then lower threshold
+                                0 if kv[1].get("_type_match") else 1,        # type match first
+                                _cat_priority.get(kv[0], 4),                 # then category priority
+                                kv[1].get("threshold", 0.6),                 # then lower threshold
                             ),
                         )
-                        _kept = dict(_ranked[:_relational_budget])
+                        _kept = dict(_ranked[:_GLINER2_RELATIONAL_LABEL_CAP])
                         _truncated_relational = len(_relational_candidates) - len(_kept)
                         _relational_candidates = _kept
 
@@ -7739,10 +7944,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     scalar_count=_scalar_count,
                                     relational_kept=len(_relational_candidates),
                                     relational_truncated=_truncated_relational,
-                                    cap=_GLINER2_RELATION_LABEL_CAP,
+                                    scalar_cap=_GLINER2_SCALAR_LABEL_CAP,
+                                    relational_cap=_GLINER2_RELATIONAL_LABEL_CAP,
                                     detected_types=sorted(
                                         {t.lower() for t in _detected_entity_types}),
-                                    note="relational candidate set exceeded 25-label GLiREL cap")
+                                    note="relational candidate set exceeded relational budget cap")
 
                     # Merge: scalars + selected relational, stripping the internal
                     # prioritization keys so GLiNER2 receives ONLY {description, threshold}.
@@ -7755,7 +7961,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                               scalar_count=_scalar_count,
                               relational_count=len(_relational_candidates),
                               total=len(_scalar_relation_types),
-                              cap=_GLINER2_RELATION_LABEL_CAP)
+                              scalar_cap=_GLINER2_SCALAR_LABEL_CAP,
+                              relational_cap=_GLINER2_RELATIONAL_LABEL_CAP)
 
                     gliner_relations = model.extract_relations(
                         req.text,
@@ -8877,6 +9084,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         if entity_type_for_alias == 'unknown':
                             entity_type_for_alias = _infer_entity_type_from_rel_type(edge.rel_type, position='head')
 
+                        # Guard: name-like scalars (pref_name, also_known_as) must be ≤2 words.
+                        # Reject before registering alias so rejected values never pollute entity_aliases.
+                        # Mirrors the name_like_scalar_rejected check in the scalar ingest path.
+                        if is_scalar_identity and len(edge.object.split()) > 2:
+                            log.warning("ingest.alias_registration_rejected_not_name_like",
+                                        subject=alias_subject,
+                                        rel_type=edge.rel_type,
+                                        value=edge.object,
+                                        reason="name-like scalars must be 1-2 words, not descriptive phrases")
+                            continue
+
                         registry.register_alias(
                             alias_subject,
                             edge.object.lower(),
@@ -8910,6 +9128,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     if req.source == "llm_learn":
                         is_user_stated = False
                         adjusted_confidence = min(adjusted_confidence or 0.6, 0.6)
+                    elif req.source == "mcp":
+                        # MCP remember_facts is user-driven — treat as user-stated for Class A routing.
+                        # (learn_facts uses source="llm_learn" which is already capped above)
+                        is_user_stated = True
+                        adjusted_confidence = max(adjusted_confidence or 0.8, 1.0)
 
                     log.info("ingest.fact_provenance_check",
                            rel_type=edge.rel_type.lower(),
@@ -8983,20 +9206,20 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 with db.cursor() as _oc:
                                     _oc.execute(
                                         "INSERT INTO ontology_evaluations"
-                                        " (candidate_rel_type, candidate_subject_type,"
+                                        " (user_id, candidate_rel_type, candidate_subject_type,"
                                         "  candidate_object_type, first_text_snippet,"
                                         "  extraction_confidence, extraction_method,"
                                         "  sample_subject_id, sample_object,"
                                         "  occurrence_count, last_seen_at,"
                                         "  re_embedder_decision, decision_timestamp,"
                                         "  decision_reason, created_rel_type)"
-                                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, now(),"
+                                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now(),"
                                         "         'created_in_flow', now(), %s, %s)"
-                                        " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                                        " ON CONFLICT (user_id, candidate_rel_type, sample_subject_id, sample_object)"
                                         " DO UPDATE SET"
                                         "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
                                         "   last_seen_at = now()",
-                                        (rel_type_lower,
+                                        (req.user_id, rel_type_lower,
                                          edge.subject_type, edge.object_type,
                                          req.text[:500], _inflow_conf, 'ingest_llm_miss',
                                          canonical_subject, _raw_object,
@@ -9015,8 +9238,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                             _r3.execute(f"SET search_path TO {schema_name}, public")
                                 except Exception:
                                     pass
-                                log.warning("ingest.inflow_ontology_eval_audit_failed",
-                                            rel_type=rel_type_lower, error=str(_oce))
+                                log.error("ingest.inflow_ontology_eval_audit_failed",
+                                          rel_type=rel_type_lower, error=str(_oce))
 
                     if rel_type_lower not in _REL_TYPE_META:  # Still unknown (no in-flow metadata)
                         if is_user_stated:
@@ -9135,17 +9358,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             with db.cursor() as _cur:
                                 _cur.execute(
                                     "INSERT INTO ontology_evaluations"
-                                    " (candidate_rel_type, candidate_subject_type,"
+                                    " (user_id, candidate_rel_type, candidate_subject_type,"
                                     "  candidate_object_type, first_text_snippet,"
                                     "  extraction_confidence, extraction_method,"
                                     "  sample_subject_id, sample_object,"
                                     "  occurrence_count, last_seen_at)"
-                                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
-                                    " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
+                                    " ON CONFLICT (user_id, candidate_rel_type, sample_subject_id, sample_object)"
                                     " DO UPDATE SET"
                                     "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
                                     "   last_seen_at = now()",
-                                    (edge.rel_type.lower(),
+                                    (req.user_id, edge.rel_type.lower(),
                                      edge.subject_type, edge.object_type,
                                      req.text[:500], 0.5, 'ingest',
                                      canonical_subject, _raw_object),
@@ -9157,8 +9380,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
                             except Exception:
                                 pass
-                            log.warning("ingest.ontology_eval_insert_failed",
-                                       rel_type=edge.rel_type.lower(), error=str(_e))
+                            log.error("ingest.ontology_eval_insert_failed",
+                                      rel_type=edge.rel_type.lower(), error=str(_e))
 
                         # Stage as Class C relational fact (re_embedder will evaluate)
                         rows.append((
@@ -9549,17 +9772,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             with db.cursor() as _cur:
                                 _cur.execute(
                                     "INSERT INTO ontology_evaluations"
-                                    " (candidate_rel_type, candidate_subject_type,"
+                                    " (user_id, candidate_rel_type, candidate_subject_type,"
                                     "  candidate_object_type, first_text_snippet,"
                                     "  extraction_confidence, extraction_method,"
                                     "  sample_subject_id, sample_object,"
                                     "  occurrence_count, last_seen_at)"
-                                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
-                                    " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, now())"
+                                    " ON CONFLICT (user_id, candidate_rel_type, sample_subject_id, sample_object)"
                                     " DO UPDATE SET"
                                     "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
                                     "   last_seen_at = now()",
-                                    (edge.rel_type.lower(),
+                                    (req.user_id, edge.rel_type.lower(),
                                      edge.subject_type, edge.object_type,
                                      req.text[:500], 0.5, 'ingest',
                                      fact_subject, canonical_object),
@@ -9569,13 +9792,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                      subject_type=edge.subject_type,
                                      object_type=edge.object_type)
                         except Exception as _e:
-                            # INTENTIONAL: Graceful degradation — ontology evaluation is async learning.
-                            # If recording fails, fact is still processed and committed.
-                            log.warning("ingest.ontology_eval_insert_failed",
-                                       rel_type=edge.rel_type.lower(),
-                                       error_type=type(_e).__name__,
-                                       error=str(_e),
-                                       note="Fact committed; ontology evaluation will be retried in re_embedder")
+                            # Growth-critical: ontology evaluation INSERT failures sever the self-growth loop.
+                            # Log at error level so failures are visible. Fact is still committed.
+                            log.error("ingest.ontology_eval_insert_failed",
+                                      rel_type=edge.rel_type.lower(),
+                                      error_type=type(_e).__name__,
+                                      error=str(_e),
+                                      note="Fact committed; ontology evaluation will be retried in re_embedder")
 
                     # Look up whether this rel_type is engine_generated
                     if not is_engine_generated:
@@ -9967,7 +10190,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     committed = 0
                     staged = 0
                     if class_a_rows:
-                        committed += manager.commit(class_a_rows)
+                        committed += manager.commit(class_a_rows, fact_class="A")
                         log.info("ingest.class_a_committed", count=len(class_a_rows))
 
                         # Hierarchy type propagation: after committing a hierarchical fact,
@@ -10963,7 +11186,8 @@ def resolve_anchor(
         # Rule 3: Direct entity name match (only if NOT preceded by identity keyword)
         # "Tell me about Aurora" → Aurora (NOT user, despite "me")
         # Skip if query contains identity keywords (covered by Rule 1)
-        has_identity_keyword = any(kw in query_lower for kw in identity_keywords)
+        _query_words_lower = {w.lower().strip('.,!?') for w in query_text.split()}
+        has_identity_keyword = bool(_query_words_lower & set(identity_keywords))
 
         if not has_identity_keyword:
             for word in words:
@@ -11073,13 +11297,21 @@ def _get_rels_by_taxonomy(db, taxonomy_name: str) -> list:
         return []
 
 
-def determine_path(query_text: str, db) -> QueryPath:
+def determine_path(query_text: str, db, user_id: str = None) -> QueryPath:
     """
     Phase 1: Determine What's Being Asked
 
-    Extracts keywords from query and matches against:
+    Phase 0 (entity-aware, runs first when user_id provided):
+        Matches query words against entity_aliases, fetches the rel_types of any
+        matched entities, then maps those rel_types to a taxonomy via
+        entity_taxonomies.rel_types_defining_group.  When a match is found the
+        taxonomy_groups list is pre-populated and the function falls through
+        directly to Component 1/2/3 expansion — GLiNER2 is skipped.
+
+    Phases 1+: Extracts keywords from query and matches against:
     1. rel_types.natural_language (semantic keyword match)
     2. entity_taxonomies.taxonomy_name (direct taxonomy match)
+    3. GLiNER2 zero-shot fallback against taxonomy descriptions
 
     Returns QueryPath with scalar_rels, relationship_rels, taxonomy_groups.
     If no matches, sets fetch_all_details=True.
@@ -11091,6 +11323,105 @@ def determine_path(query_text: str, db) -> QueryPath:
 
     path = QueryPath()
     query_lower = query_text.lower()
+
+    # ── Phase 0: entity-aware taxonomy routing ────────────────────────────────
+    # When user_id is present, check if any non-stopword query word is a known
+    # entity alias for this user.  If yes, map that entity's stored rel_types to
+    # a taxonomy via entity_taxonomies.rel_types_defining_group and pre-populate
+    # path.taxonomy_groups so the existing Component 1/2/3 expansion handles the
+    # rest.  GLiNER2 is not called when Phase 0 succeeds.
+    if user_id:
+        try:
+            _p0_stopwords = {
+                'what', 'who', 'where', 'when', 'how', 'do', 'you', 'know', 'about',
+                'tell', 'me', 'the', 'a', 'an', 'is', 'are', 'was', 'were', 'my', 'your',
+                'all', 'any', 'can', 'did', 'does', 'has', 'have', 'had', 'its', 'of',
+                'on', 'or', 'so', 'to', 'up',
+            }
+            _p0_words = [
+                w.lower().strip('?,!.')
+                for w in query_text.split()
+                if len(w.strip('?,!.')) >= 2 and w.lower().strip('?,!.') not in _p0_stopwords
+            ]
+
+            if _p0_words:
+                with db.cursor() as _c:
+                    _c.execute(
+                        "SELECT entity_id, alias FROM entity_aliases WHERE alias = ANY(%s) LIMIT 5",
+                        (_p0_words,)
+                    )
+                    _p0_matched = _c.fetchall()
+
+                if _p0_matched:
+                    _p0_entity_ids = [row[0] for row in _p0_matched]
+
+                    with db.cursor() as _c:
+                        _c.execute(
+                            """
+                            SELECT DISTINCT rel_type FROM facts
+                            WHERE subject_id = ANY(%s) OR object_id = ANY(%s)
+                            UNION
+                            SELECT DISTINCT rel_type FROM staged_facts
+                            WHERE subject_id = ANY(%s) OR object_id = ANY(%s)
+                            LIMIT 20
+                            """,
+                            (_p0_entity_ids, _p0_entity_ids, _p0_entity_ids, _p0_entity_ids)
+                        )
+                        _p0_rel_types = {row[0] for row in _c.fetchall()}
+
+                    if _p0_rel_types:
+                        with db.cursor() as _c:
+                            _c.execute(
+                                "SELECT taxonomy_name, rel_types_defining_group, member_entity_types "
+                                "FROM entity_taxonomies "
+                                "WHERE rel_types_defining_group && %s::text[]",
+                                (list(_p0_rel_types),)
+                            )
+                            _p0_tax_hits = _c.fetchall()
+
+                        if _p0_tax_hits:
+                            # Fetch entity types for matched entities so we can
+                            # reject taxonomies whose member_entity_types don't
+                            # include the queried entity (e.g. coffee→Concept
+                            # must not route to work taxonomy→Person/Organization)
+                            with db.cursor() as _c:
+                                _c.execute(
+                                    "SELECT entity_type FROM entities WHERE id = ANY(%s)",
+                                    (_p0_entity_ids,)
+                                )
+                                _p0_entity_types = {
+                                    row[0] for row in _c.fetchall()
+                                    if row[0] and row[0] != 'unknown'
+                                }
+
+                            _p0_taxonomy = None
+                            for _tax_name, _, _tax_member_types in _p0_tax_hits:
+                                # No member_type constraint → accept any entity
+                                if not _tax_member_types:
+                                    _p0_taxonomy = _tax_name
+                                    break
+                                # Unknown entity type → can't validate, skip
+                                if not _p0_entity_types:
+                                    continue
+                                # Accept only when entity type overlaps allowed types
+                                if set(_p0_entity_types) & set(_tax_member_types):
+                                    _p0_taxonomy = _tax_name
+                                    break
+
+                            if _p0_taxonomy:
+                                path.taxonomy_groups.append(_p0_taxonomy)
+                                log.info(
+                                    "determine_path.phase0_entity_routing",
+                                    entities=[row[1] for row in _p0_matched],
+                                    rel_types=list(_p0_rel_types)[:5],
+                                    taxonomy=_p0_taxonomy,
+                                    query=query_text[:50],
+                                )
+                                # Fall through — Component 1/2/3 below will expand
+                                # taxonomy_groups into scalar_rels / relationship_rels
+        except Exception as _p0_err:
+            log.warning("determine_path.phase0_failed", error=str(_p0_err)[:120])
+            # Non-fatal: fall through to keyword / GLiNER2 logic below
 
     # Extract keywords (words, remove common stopwords)
     keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
@@ -11107,8 +11438,14 @@ def determine_path(query_text: str, db) -> QueryPath:
     keywords -= noise_words
 
     if not keywords:
-        path.fetch_all_details = True
-        return path
+        # Phase 0 may have already populated taxonomy_groups — only fall back to
+        # fetch_all when Phase 0 also found nothing.
+        if not path.taxonomy_groups:
+            path.fetch_all_details = True
+            return path
+        # Phase 0 matched: skip keyword loop, jump straight into the try block
+        # where Component 1 will expand path.taxonomy_groups into rel_types.
+        keywords = set()
 
     try:
         with db.cursor() as cur:
@@ -11162,7 +11499,7 @@ def determine_path(query_text: str, db) -> QueryPath:
                             _g_hit = _g_result.get("taxonomy", {}) if isinstance(_g_result, dict) else {}
                             _g_label = _g_hit.get("label") if isinstance(_g_hit, dict) else None
                             _g_conf = float(_g_hit.get("confidence", 0.0)) if isinstance(_g_hit, dict) else 0.0
-                            if _g_label and _g_conf >= 0.3 and _g_label in _desc_to_tax:
+                            if _g_label and _g_conf >= _DETERMINE_PATH_TAXONOMY_CONF_THRESHOLD and _g_label in _desc_to_tax:
                                 path.taxonomy_groups.append(_desc_to_tax[_g_label])
                                 log.info("determine_path.gliner2_taxonomy",
                                          taxonomy=_desc_to_tax[_g_label],
@@ -11401,7 +11738,6 @@ def fetch_facts_from_anchor(
                     path.fetch_all_details = True
                     log.warning(
                         "query.empty_path_fallback_to_fetchall",
-                        query_text=query_text[:80] if query_text else None,
                         reason="no_taxonomy_or_rels_matched",
                         user_id=user_id
                     )
@@ -11590,9 +11926,12 @@ def fetch_facts_from_anchor(
                 # ─── Fetch SCALAR ATTRIBUTES: (anchor, attribute, value) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 if path.fetch_all_details or path.scalar_rels:
-                    if not path.fetch_all_details and path.scalar_rels:
-                        # D1: WHERE attribute IN (...) — strict scalar scoping (no over-fetch).
-                        # entity_attributes.attribute holds the scalar rel_type.
+                    if not path.fetch_all_details and path.scalar_rels and anchor_uuid == user_id:
+                        # D1: WHERE attribute IN (...) — strict scalar scoping for user anchor.
+                        # When anchor is a named entity (not user), fetch all its attributes
+                        # unconditionally — the anchor already scopes to the right entity and
+                        # scalar_rels may not match the stored attribute name exactly (e.g.
+                        # ip_address vs has_ip).
                         attrs_query = """
                             SELECT entity_id, attribute, value_text, value_int, value_float, value_date
                             FROM entity_attributes
@@ -11773,7 +12112,10 @@ def fetch_facts_from_anchor(
                             # webserver01 (Object) when user asks "what infrastructure do you know".
                             # Growth: any entity typed as Object/Concept via hierarchy propagation
                             # automatically appears here when computer_system taxonomy is queried.
-                            if member_types and member_types != ['ANY']:
+                            # Skip when anchor is a named entity (not user): the anchor is already
+                            # the specific entity we want — type-discovery would pull in all
+                            # same-type entities from the schema (e.g. the entire coffee ontology).
+                            if member_types and member_types != ['ANY'] and anchor_uuid == user_id:
                                 try:
                                     cur.execute("""
                                         SELECT DISTINCT e.id
@@ -12508,7 +12850,7 @@ async def query(request: QueryRequest) -> QueryResponse:
         log.info("query.phase5.anchor_resolved", anchor=anchor[:8] if anchor else "unknown", query=query_text[:50])
 
         # Step 2: Determine path (WHAT are we asking for?)
-        path = determine_path(query_text, db)
+        path = determine_path(query_text, db, user_id=user_id)
         log.info("query.phase5.path_determined",
                 scalars=len(path.scalar_rels), relationships=len(path.relationship_rels),
                 taxonomies=len(path.taxonomy_groups), fetch_all=path.fetch_all_details)
@@ -12591,6 +12933,59 @@ async def query(request: QueryRequest) -> QueryResponse:
                          hierarchy_facts=len(hier_facts))
         except Exception as expand_e:
             log.warning("query.phase5.entity_expansion_failed", error=str(expand_e))
+
+        # Step 3c: Downward hierarchy expansion — find instances of class entities in result set.
+        # If buddy is stored as (buddy, instance_of, dog) and dog is in the result set as a class
+        # node, traverse downward from dog to find all its instances (e.g., buddy).
+        # Uses _REL_TYPE_HIERARCHY (DB-driven at startup) — no hardcoded rel_type names.
+        try:
+            # Build the anchor's connected entity set (anchor + its 1-hop neighbours).
+            # Only hierarchy facts whose subject is in this set seed downward expansion —
+            # this prevents unrelated entities returned by Qdrant (e.g. coffee ontology
+            # when querying webserver01) from cascading into their full class hierarchies.
+            _anchor_connected: set[str] = {anchor}
+            for _hf in db_facts:
+                _s = _hf.get("subject") or _hf.get("_subject_id")
+                _o = _hf.get("object") or _hf.get("_object_id")
+                if _s == anchor or _o == anchor:
+                    if _s:
+                        _anchor_connected.add(_s)
+                    if _o:
+                        _anchor_connected.add(_o)
+
+            _class_entity_uuids: set[str] = set()
+            for _hf in db_facts:
+                if _REL_TYPE_META.get(_hf.get("rel_type", ""), {}).get("is_hierarchy_rel"):
+                    # Only expand from class nodes whose subject is in the anchor's subgraph
+                    _subj_id = _hf.get("subject") or _hf.get("_subject_id")
+                    if _subj_id not in _anchor_connected:
+                        continue
+                    # The object of a hierarchy fact is a class node — candidate for downward expansion
+                    _obj_id = _hf.get("_object_id") or _hf.get("object")
+                    if _obj_id and _obj_id != anchor:
+                        _class_entity_uuids.add(_obj_id)
+            if _class_entity_uuids and db:
+                _down_member_uuids: set[str] = set()
+                for _class_uuid in _class_entity_uuids:
+                    _down_set = _hierarchy_expand(
+                        db_conn=db,
+                        user_id=user_id,
+                        entity_id=_class_uuid,
+                        direction="down",
+                        max_depth=3,
+                    )
+                    # _hierarchy_expand returns set including the start node; exclude the class node itself
+                    _down_member_uuids.update(_down_set - {_class_uuid})
+                if _down_member_uuids:
+                    _down_hier_facts = _fetch_hierarchy_facts(db, user_id, _down_member_uuids)
+                    _down_entity_facts = _fetch_entity_facts(db, user_id, _down_member_uuids)
+                    db_facts = db_facts + _down_hier_facts + _down_entity_facts
+                    log.info("query.phase5.downward_hierarchy_expanded",
+                             class_nodes=len(_class_entity_uuids),
+                             member_uuids=len(_down_member_uuids),
+                             added_facts=len(_down_hier_facts) + len(_down_entity_facts))
+        except Exception as _down_e:
+            log.warning("query.phase5.downward_hierarchy_expansion_failed", error=str(_down_e))
 
         # D3 coverage RANK (was: coverage SKIP). Compute max confidence across DB facts.
         # If the DB already has a confident answer, Qdrant/Class C results are RANKED DOWN —
@@ -12718,6 +13113,102 @@ async def query(request: QueryRequest) -> QueryResponse:
                     before=len(gated_facts), after=len(temporal_filtered_facts))
         gated_facts = temporal_filtered_facts
 
+        # Step 5c: Taxonomy gate — filter merged facts when a taxonomy scope is active.
+        # Prevents Qdrant Phase 4 facts from bypassing the rel_type + entity_type constraints
+        # that Phase 3 PostgreSQL already enforces.
+        # Pass rule: edge gate (rel_type ∈ rel_types_defining_group) OR
+        #            node gate (other entity_type ∈ member_entity_types).
+        # Unknown entity type: always pass (never drop on type inference gap).
+        # Gate DB error: fail open — all facts pass through unchanged.
+        if path.taxonomy_groups and db:
+            _tax_edge_rels: set = set()
+            _tax_node_types: set = set()
+            try:
+                with db.cursor() as _tgcur:
+                    for _tname in path.taxonomy_groups:
+                        _tgcur.execute(
+                            "SELECT rel_types_defining_group, member_entity_types "
+                            "FROM entity_taxonomies WHERE taxonomy_name = %s",
+                            (_tname,),
+                        )
+                        _trow = _tgcur.fetchone()
+                        if _trow:
+                            if _trow[0]:
+                                _tax_edge_rels.update(r.lower() for r in _trow[0])
+                            if _trow[1]:
+                                _tax_node_types.update(t.lower() for t in _trow[1])
+            except Exception as _tge:
+                log.warning("query.taxonomy_gate.db_lookup_failed", error=str(_tge))
+                _tax_edge_rels = set()  # fail open — clear to prevent partial gate
+
+            if _tax_edge_rels or _tax_node_types:
+                # Collect UUIDs of non-edge-passing fact objects for batch entity type lookup.
+                _need_type: list = [
+                    _f for _f in gated_facts
+                    if (_f.get("rel_type") or "").lower() not in _tax_edge_rels
+                ]
+                _other_uuids: set = set()
+                for _f in _need_type:
+                    # Identify the non-anchor entity. For direct facts anchor is subject;
+                    # for inverse facts anchor is object. Always evaluate the foreign side.
+                    _f_subj = _f.get("subject") or _f.get("_subject_id") or ""
+                    _f_obj = _f.get("object") or _f.get("_object_id") or ""
+                    _foreign = _f_obj if _f_subj == anchor else _f_subj
+                    if _foreign and len(_foreign) == 36:  # UUID length check
+                        _other_uuids.add(_foreign)
+
+                _etype_map: dict = {}
+                if _other_uuids:
+                    try:
+                        with db.cursor() as _btcur:
+                            _btcur.execute(
+                                "SELECT id, entity_type FROM entities WHERE id = ANY(%s)",
+                                (list(_other_uuids),),
+                            )
+                            for _er, _et in _btcur.fetchall():
+                                if _et:
+                                    _etype_map[_er] = _et.lower()
+                    except Exception as _bte:
+                        log.warning("query.taxonomy_gate.batch_type_lookup_failed",
+                                    error=str(_bte))
+                        # fail open — leave _etype_map empty so unknown-type pass rule fires
+
+                _before_gate = len(gated_facts)
+                _gated: list = []
+                for _f in gated_facts:
+                    _rel = (_f.get("rel_type") or "").lower()
+                    # Edge gate: rel_type is a defining relationship for this taxonomy
+                    if _rel in _tax_edge_rels:
+                        _gated.append(_f)
+                        continue
+                    # Node gate: evaluate the non-anchor (foreign) entity's type.
+                    # Must not evaluate anchor's type — for inverse facts anchor is in
+                    # "object" position; anchor is always Person which would pass any
+                    # Person-typed taxonomy, letting coffee→user slip through as family.
+                    _f_subj = _f.get("subject") or _f.get("_subject_id") or ""
+                    _f_obj = _f.get("object") or _f.get("_object_id") or ""
+                    _foreign = _f_obj if _f_subj == anchor else _f_subj
+                    _etype = _etype_map.get(_foreign)  # None if not a UUID or type unknown
+                    if not _etype or _etype == "unknown" or _etype in _tax_node_types:
+                        # Unknown/missing type: pass (never drop on type inference gap)
+                        _gated.append(_f)
+                    else:
+                        log.debug(
+                            "query.taxonomy_gate.dropped",
+                            rel_type=_rel,
+                            entity_type=_etype,
+                            taxonomy=path.taxonomy_groups,
+                        )
+                gated_facts = _gated
+                log.info(
+                    "query.taxonomy_gate.applied",
+                    before=_before_gate,
+                    after=len(gated_facts),
+                    taxonomies=path.taxonomy_groups,
+                    edge_rels=len(_tax_edge_rels),
+                    node_types=len(_tax_node_types),
+                )
+
         # Step 6: Build preferred_names dict from facts
         preferred_names = {}
 
@@ -12779,6 +13270,13 @@ async def query(request: QueryRequest) -> QueryResponse:
                             preferred_names[user_id] = fallback[0]
             except Exception as e:
                 log.debug("query.owner_identity_lookup.failed", user_id=user_id[:8], error=str(e))
+
+        # Ensure user anchor is always resolvable — prevents facts where user is subject from being
+        # skipped when no named alias exists yet (e.g., fresh schema, user hasn't stated their name).
+        if user_id and user_id not in preferred_names:
+            preferred_names[user_id] = "user"
+        if "user" not in preferred_names:
+            preferred_names["user"] = "user"
 
         # FIX 1: UUID Fallback Removal (dprompt-148 Phase 1)
         # Removed: fallback that stored uuid → uuid mappings
@@ -13047,7 +13545,7 @@ def correct_fact(req: FactCorrectionRequest):
             try:
                 registry = EntityRegistry(db)
                 # Query DB: find entity by display name
-                subject_uuid = registry.resolve(subject_name, req.user_id)
+                subject_uuid = registry.resolve(req.user_id, subject_name)
                 log.info("correct_fact.entity_resolved",
                         subject_name=subject_name,
                         subject_uuid=subject_uuid)
@@ -13217,7 +13715,7 @@ def correct_fact(req: FactCorrectionRequest):
                 object_uuid = None
                 if old_value:
                     try:
-                        object_uuid = registry.resolve(old_value, req.user_id)
+                        object_uuid = registry.resolve(req.user_id, old_value)
                     except Exception as e:
                         log.warning("correct_fact.object_resolution_failed",
                                    old_value=old_value,
@@ -13275,6 +13773,38 @@ def correct_fact(req: FactCorrectionRequest):
                                old_value=old_value,
                                dimension=dimension,
                                found_via=found_via)
+                    # Record was_correct=False: intent was RETRACTION but no matching fact
+                    # existed to supersede. This feeds evaluate_retraction_outcomes() so the
+                    # re_embedder can learn which patterns produce false-positive retraction signals.
+                    if is_retraction:
+                        try:
+                            cur.execute("""
+                                INSERT INTO retraction_outcomes (
+                                    user_id, original_message, detected_as_retraction,
+                                    extracted_subject, extracted_rel_type, extracted_old_value,
+                                    retraction_method, detected_confidence, actually_retracted,
+                                    was_correct
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                req.user_id,
+                                req.text,
+                                True,
+                                subject_uuid,
+                                old_rel_type,
+                                old_value,
+                                f"surgical_{dimension.lower()}",
+                                confidence,
+                                False,   # actually_retracted=False: no fact found to supersede
+                                False    # was_correct=False: retraction intent, but no matching fact
+                            ))
+                            db.commit()
+                        except Exception as _ro_err:
+                            log.error("correct_fact.retraction_outcome_false_insert_failed",
+                                      error=str(_ro_err))
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
                     return FactCorrectionResponse(
                         status="failed",
                         message=f"Old {dimension.lower()} fact not found: {old_rel_type}"
@@ -13343,8 +13873,8 @@ def correct_fact(req: FactCorrectionRequest):
                     # CORRECTION: Create new fact with corrected value
                     # Resolve new_value to entity UUID (case-insensitive)
                     new_value_uuid = registry.resolve(
-                        new_value.lower().strip(),
-                        req.user_id
+                        req.user_id,
+                        new_value.lower().strip()
                     )
 
                     # If rel_type changed, validate new rel_type metadata
@@ -13599,8 +14129,9 @@ def correct_fact(req: FactCorrectionRequest):
                 INSERT INTO retraction_outcomes (
                     user_id, original_message, detected_as_retraction,
                     extracted_subject, extracted_rel_type, extracted_old_value,
-                    retraction_method, detected_confidence, actually_retracted
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    retraction_method, detected_confidence, actually_retracted,
+                    was_correct
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 req.user_id,
                 req.text,
@@ -13610,7 +14141,8 @@ def correct_fact(req: FactCorrectionRequest):
                 old_value,
                 f"surgical_{dimension.lower()}",
                 confidence,
-                True  # actually_retracted — we just did it in the transaction
+                True,   # actually_retracted — we just did it in the transaction
+                True    # was_correct=True: fact was found and superseded successfully
             ))
 
             db.commit()
