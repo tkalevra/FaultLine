@@ -22,7 +22,7 @@ DB_POOL_SIZE=15
 ```
 
 ### Scenario 2: Portainer Stack (Production)
-**File:** `docker-compose-portainer-withoutqdrant.yml`  
+**File:** `config/docker-compose-portainer.yml`  
 **Use Case:** Production deployment with external Qdrant  
 **LLM Source:** OPENWEBUI_URL (required, must be set)
 

@@ -1,52 +1,50 @@
-version: "3.8"
-
-# FaultLine WGM — Portainer Stack
+# FaultLine — Portainer Stack
 #
-# IMPORTANT: This compose file references a PRE-BUILT Docker image.
-# Before deploying this stack in Portainer, build the image on your Docker host:
+# This is the one intentional fork of the canonical ../docker-compose.yml:
+# Portainer deploys from a PRE-BUILT image (no build context), so build and
+# tag it on your Docker host first:
 #
 #   cd /path/to/FaultLine
-#   docker build -t faultline-wgm:latest .
-#   docker tag faultline-wgm:latest faultline-wgm:latest  # Ensure tag exists
+#   docker build -t faultline:latest .
 #
-# DEPLOYMENT OPTIONS:
-#   Option 1: Web Editor (Portainer UI)
-#     → Stacks → Add Stack → Web Editor → Paste this file → Deploy
+# DEPLOYMENT
+#   Stacks → Add Stack → Web Editor (paste this) or Git Repository
+#   (Compose path: config/docker-compose-portainer.yml)
 #
-#   Option 2: Git Repository (recommended for version control)
-#     → Stacks → Add Stack → Git Repository
-#     → Repository URL, Branch, Compose path: docker-compose-portainer.yml
+# LLM HOOK (set in Portainer's "Environment variables" tab) — FaultLine talks to
+# an LLM you already run; it does not host one:
+#   LLM_BACKEND_TYPE   openwebui | ollama | lm_studio | openai | anthropic | groq | localai | raw
+#   LLM_BASE_URL       host + port only, e.g. http://open-webui:8080 or http://192.168.1.x:1234
+#   LLM_API_KEY        bearer / api key (blank for local servers that need none)
+#   WGM_LLM_MODEL      extraction model name — must match what the backend reports
+#   CATEGORY_LLM_MODEL category inference model name
+#   POSTGRES_PASSWORD  database password for the 'faultline' user (optional)
 #
-# REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
-#   OPENWEBUI_URL             - LLM endpoint base URL, e.g. https://your-domain.com or http://192.168.1.x:8080
-#   LLM_API_KEY               - Bearer token for OpenWebUI authentication
-#   FAULTLINE_MEMORY_CHAIN_UUID - Fallback UUID for dBug-016 chat_id injection (prevents OpenWebUI NoneType crash)
-#   POSTGRES_PASSWORD         - Database password for 'faultline' user (optional, defaults to 'faultline')
-#
-# REQUIRED FOR OPENWEBUI FILTER (set as environment variables in OpenWebUI container):
-#   REDIS_URL                 - Redis connection URL for inlet dedup (redis://faultline-redis:6379/0)
-#                               This MUST be set for the FaultLine Filter to work properly.
-#                               If not set, deduplication will fail and duplicate embeddings will cascade.
+# Model name must match exactly what the backend's /v1/models reports.
+# HTTP 400 from the LLM usually means a model-name mismatch.
 
 services:
 
   faultline:
-    image: faultline-wgm:latest
-    container_name: faultline
+    image: faultline:latest
+    container_name: faultline-api
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline_test
-      OPENWEBUI_URL: ${OPENWEBUI_URL}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-}
+      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD:-faultline}@postgres:5432/faultline
+      POSTGRES_HOST: postgres
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: faultline-test
-      REDIS_URL: redis://faultline-redis:6379/0
-      REEMBED_INTERVAL: 5
-      DB_POOL_SIZE: 15
-      FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-faultline-test}
+      REDIS_URL: redis://redis:6379/0
+      LLM_BACKEND_TYPE: ${LLM_BACKEND_TYPE:-openwebui}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://open-webui:8080}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen2.5}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-qwen2.5}
+      FAULTLINE_API_URL: http://faultline:8000
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-5}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-15}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
@@ -69,6 +67,21 @@ services:
     networks:
       - faultline-net
 
+  faultline-mcp:
+    image: faultline:latest
+    container_name: faultline-mcp
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    ports:
+      - "8002:8002"
+    environment:
+      FAULTLINE_API_URL: http://faultline:8000
+      FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
+      MCP_API_KEY: ${MCP_API_KEY:-}
+    depends_on:
+      - faultline
+    networks:
+      - faultline-net
+
   postgres:
     image: postgres:16-alpine
     container_name: faultline-postgres
@@ -76,13 +89,13 @@ services:
     environment:
       POSTGRES_USER: faultline
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
-      POSTGRES_DB: faultline_test
+      POSTGRES_DB: faultline
       POSTGRES_MAX_CONNECTIONS: "200"
       POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test"]
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -120,8 +133,9 @@ services:
     image: redis:7-alpine
     container_name: faultline-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
     logging:
       driver: json-file
       options:
@@ -130,30 +144,15 @@ services:
     networks:
       - faultline-net
 
-  faultline-mcp:
-    image: faultline-wgm:latest
-    container_name: faultline-mcp
-    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
-    ports:
-      - "8002:8002"
-    environment:
-      FAULTLINE_API_URL: http://faultline:8000
-      FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
-      MCP_API_KEY: ${MCP_API_KEY:-}
-    depends_on:
-      - faultline
-    networks:
-      - faultline-net
-
 volumes:
   pg-data:
     name: faultline-pg-data
   qdrant-data:
     name: faultline-qdrant-data
+  redis-data:
+    name: faultline-redis-data
 
 networks:
   faultline-net:
     name: faultline-net
     driver: bridge
-    driver_opts:
-      com.docker.network.driver.mtu: 1500
