@@ -1,30 +1,66 @@
-# Standard FaultLine deployment
-# Usage: docker-compose up -d
-# For production with Portainer, see docker-compose-portainer.yml
-# For Portainer without Qdrant, see docker-compose-portainer-withoutqdrant.yml
+# ──────────────────────────────────────────────────────────────────────────────
+# FaultLine — canonical deployment
+#
+# FaultLine is a memory backend that hooks into an LLM you ALREADY run.
+# It does not host a model itself. Point it at whatever you have — OpenWebUI,
+# LM Studio, Ollama, OpenAI, Anthropic — with three variables:
+#
+#   LLM_BACKEND_TYPE   openwebui | ollama | lm_studio | openai | anthropic | groq | localai | raw
+#   LLM_BASE_URL       host + port only; the API path is appended automatically
+#   LLM_API_KEY        bearer / api key (blank for local servers that need none)
+#
+# Usage:
+#   docker compose up -d                    # backend + MCP, talking to your LLM
+#   docker compose --profile ollama up -d   # ALSO start a bundled local Ollama
+#                                           # (only if you don't already run a model)
+#
+# Verify:  curl http://localhost:8000/health
+# MCP:     http://localhost:8002/mcp        (Claude Desktop or any MCP client)
+#
+# Per-client setup lives in the README "Connecting a client" table — the only
+# thing that changes between OpenWebUI / LM Studio / Claude is these env values.
+# ──────────────────────────────────────────────────────────────────────────────
 
 services:
 
+  # ── FaultLine backend API ───────────────────────────────────────────────────
   faultline:
     build:
       context: .
-      network: host
+      dockerfile: Dockerfile
+    image: faultline:latest
+    container_name: faultline-api
     ports:
-      - "8001:8000"
+      - "8000:8000"
     environment:
-      OPENWEBUI_URL: ${OPENWEBUI_URL:-http://open-webui:8080}
+      # Storage (local services below)
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-faultline-test}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+
+      # LLM hook — point at your existing model server (see header).
+      # Default assumes Ollama/LM Studio on the host. Examples:
+      #   OpenWebUI:  LLM_BACKEND_TYPE=openwebui  LLM_BASE_URL=http://open-webui:8080
+      #   LM Studio:  LLM_BACKEND_TYPE=lm_studio  LLM_BASE_URL=http://host.docker.internal:1234
+      #   Ollama:     LLM_BACKEND_TYPE=ollama     LLM_BASE_URL=http://host.docker.internal:11434
+      LLM_BACKEND_TYPE: ${LLM_BACKEND_TYPE:-ollama}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      FAULTLINE_URL: ${FAULTLINE_URL:-http://localhost:8001}
-      FAULTLINE_MEMORY_CHAIN_UUID: ${FAULTLINE_MEMORY_CHAIN_UUID:-00000000-0000-0000-0000-000000000000}
-      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline}@postgres:5432/${POSTGRES_DB:-faultline}}
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: faultline-test
-      REDIS_URL: redis://redis:6379/0
-      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-60}
-      EMBEDDING_CACHE_TTL: ${EMBEDDING_CACHE_TTL:-86400}
-      EMBEDDING_MODEL_VERSION: ${EMBEDDING_MODEL_VERSION:-nomic-v1.5}
-      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
-      DB_POOL_SIZE: 15
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen2.5}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-qwen2.5}
+
+      # FaultLine self-reference + tuning
+      FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-10}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-100}
+      FAULTLINE_LOG_LEVEL: ${FAULTLINE_LOG_LEVEL:-INFO}
+    extra_hosts:
+      # Lets the container reach an LLM running on the Docker host.
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,10 +69,37 @@ services:
       redis:
         condition: service_healthy
     networks:
-      - faultline-test
+      - faultline-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
+  # ── MCP server — same memory, exposed to Claude Desktop / any MCP client ─────
+  faultline-mcp:
+    image: faultline:latest
+    container_name: faultline-mcp
+    entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
+    ports:
+      - "8002:8002"
+    environment:
+      FAULTLINE_API_URL: http://faultline:8000
+      FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
+      MCP_API_KEY: ${MCP_API_KEY:-}
+    depends_on:
+      - faultline
+    networks:
+      - faultline-net
+    restart: unless-stopped
+
+  # ── PostgreSQL — fact storage (migrations run from the API entrypoint) ───────
   postgres:
     image: postgres:16-alpine
+    container_name: faultline-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-faultline}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
@@ -44,40 +107,65 @@ services:
       POSTGRES_MAX_CONNECTIONS: "200"
       POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
-      - pg-test-data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline}"]
       interval: 5s
       timeout: 3s
       retries: 10
     networks:
-      - faultline-test
+      - faultline-net
+    restart: unless-stopped
 
+  # ── Qdrant — vector index ────────────────────────────────────────────────────
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: faultline-qdrant
     ports:
-      - "6334:6333"
+      - "6333:6333"
     volumes:
-      - qdrant-test-data:/qdrant/storage
+      - qdrant_data:/qdrant/storage
     networks:
-      - faultline-test
+      - faultline-net
+    restart: unless-stopped
 
+  # ── Redis — inlet dedup cache ────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    container_name: faultline-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
     networks:
-      - faultline-test
+      - faultline-net
+    restart: unless-stopped
+
+  # ── Optional bundled LLM — enable with `--profile ollama` ────────────────────
+  # Only for users who don't already run a model. When enabled, set
+  # LLM_BACKEND_TYPE=ollama and LLM_BASE_URL=http://ollama:11434.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: faultline-ollama
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - faultline-net
+    restart: unless-stopped
 
 volumes:
-  pg-test-data:
-  qdrant-test-data:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+  ollama_data:
 
 networks:
-  faultline-test:
+  faultline-net:
     driver: bridge

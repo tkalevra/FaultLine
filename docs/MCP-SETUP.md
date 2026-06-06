@@ -47,7 +47,7 @@ The `faultline-mcp` Docker service runs alongside the backend and exposes the MC
 
 #### Step 1 — Set env vars in Portainer stack
 
-In your Portainer stack for `docker-compose-portainer-withoutqdrant.yml`, add two environment variables:
+In your Portainer stack for `config/docker-compose-portainer.yml`, add two environment variables:
 
 ```
 FAULTLINE_USER_ID = YOUR-USER-UUID-HERE
