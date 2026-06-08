@@ -39,6 +39,13 @@ def _clean_for_mcp(text: str) -> str:
     return text.strip()
 
 
+# ── Identity pattern detection (ingest gating) ──────────────────────────────
+# Mirrors Filter ingest gate (faultline_function.py:3445-3449): messages matching
+# self-identification patterns bypass the word-count minimum.
+_IDENTITY_RE = _re.compile(
+    r"(?i)\b(?:my\s+name\s+is|i\s+am|call\s+me|i'm)\b"
+)
+
 # ── Injection signal detection ────────────────────────────────────────────────
 _INJECTION_PATTERNS = [
     _re.compile(
@@ -462,6 +469,7 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
             display[uid_slug] = name
 
     lines: list[str] = []
+    seen: set[str] = set()
 
     for fact in facts:
         # Skip raw store_context cache entries — transport tag, not structured knowledge.
@@ -476,21 +484,88 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
             continue
         for token, replacement in display.items():
             text = text.replace(token, replacement)
-        lines.append(text)
+        # Prose-level dedup: structurally different facts (DB vs Qdrant) can
+        # produce identical sentences after UUID→display_name substitution.
+        if text not in seen:
+            seen.add(text)
+            lines.append(text)
 
     for attr, value in attributes.items():
-        lines.append(f"{attr}: {value}")
+        line = f"{attr}: {value}"
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
 
     return {"memory": "\n".join(lines) if lines else "No relevant facts found."}
 
 
 async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
-    """Call /extract/rewrite then /ingest — full pipeline in one call."""
+    """Call /extract/rewrite then /ingest — full pipeline in one call.
+
+    Mirrors the OpenWebUI Filter intent classification pipeline:
+    1. Injection check (security gate — runs first)
+    2. GLiNER2 intent classification via /classify-intent
+    3. Per-user confidence gate via /confidence-gate
+    4. Route: QUERY → early return, RETRACTION/CORRECTION → retract_fact_tool,
+       STATEMENT → /extract/rewrite → /ingest
+    5. Ingest gating: word count >= 3 or identity pattern match
+    """
     # Pre-flight injection check — reject before any LLM or backend call.
     injection_signal = _check_injection_signals(text)
     if injection_signal:
         _log(f"SECURITY: injection signal rejected — {injection_signal[:80]}")
         return {"status": "rejected", "reason": "Input contains disallowed content", "committed": 0}
+
+    # ── Intent classification (Layer 1) ──────────────────────────────────────
+    # Non-fatal: default to STATEMENT if endpoint unavailable.
+    intent = "STATEMENT"
+    confidence = 0.0
+    try:
+        classify_resp = await _http_client.post(
+            f"{FAULTLINE_API_URL}/classify-intent",
+            params={"user_id": user_id},
+            json={"text": text},
+            timeout=10.0,
+        )
+        classify_resp.raise_for_status()
+        classify_data = classify_resp.json()
+        intent = classify_data.get("intent", "STATEMENT")
+        confidence = float(classify_data.get("confidence", 0.0))
+    except Exception as exc:
+        _log(f"intent_classify_fallback: {exc!r} — defaulting to STATEMENT")
+
+    # ── Per-user confidence gate (Layer 3) ───────────────────────────────────
+    # Non-fatal: default to 0.70 (same default as Filter).
+    gate = 0.70
+    try:
+        gate_resp = await _http_client.get(
+            f"{FAULTLINE_API_URL}/confidence-gate/{user_id}",
+            timeout=5.0,
+        )
+        gate_resp.raise_for_status()
+        gate = float(gate_resp.json().get("threshold", 0.70))
+    except Exception as exc:
+        _log(f"confidence_gate_fallback: {exc!r} — defaulting to 0.70")
+
+    _log(f"intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}")
+
+    # ── Confidence gating: low confidence → treat as STATEMENT ───────────────
+    if confidence < gate:
+        intent = "STATEMENT"
+
+    # ── Route by intent ──────────────────────────────────────────────────────
+    if intent == "QUERY":
+        return {"status": "query_detected", "message": "Use recall_memory for queries"}
+
+    if intent in ("RETRACTION", "CORRECTION"):
+        return await retract_fact_tool(text, user_id)
+
+    # intent == "STATEMENT" — proceed with ingest pipeline.
+
+    # ── Ingest gating (mirrors Filter faultline_function.py:3445-3449) ───────
+    word_count = len(text.split())
+    if word_count < 3 and not _IDENTITY_RE.search(text):
+        return {"status": "no_ingest", "message": "Text too short for fact extraction"}
 
     rewrite_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/extract/rewrite",
@@ -514,13 +589,27 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
 
 
 def _parse_ontological_statements(text: str) -> list[dict]:
-    """Parse 'X is a subclass/instance/part of Y' statements directly into edges.
+    """Parse 'X (Type) is a subclass/instance/part of Y (Type)' statements into edges.
 
     Bypasses /extract/rewrite — LLM-generated structured statements are already
     in the correct form and don't need LLM re-extraction. Handles singular/plural
-    and 'a/an' variants.
+    and 'a/an' variants. Captures optional (Type) annotations for entity typing.
     """
     import re as _re
+
+    _VALID_TYPES = {"person", "animal", "organization", "location", "object", "concept"}
+    _TYPE_RE = _re.compile(r'^(.+?)\s*(?:\((\w+)\))?\s*$')
+
+    def _extract_name_type(raw: str) -> tuple:
+        m = _TYPE_RE.match(raw.strip())
+        if not m:
+            return raw.strip().lower(), None
+        name = m.group(1).strip().lower()
+        etype = m.group(2)
+        if etype and etype.lower() in _VALID_TYPES:
+            return name, etype.title()
+        return name, None
+
     patterns = [
         (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?subclass(?:es)?\s+of\s+(.+)$', _re.I), 'subclass_of'),
         (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?instance(?:s)?\s+of\s+(.+)$', _re.I), 'instance_of'),
@@ -534,10 +623,15 @@ def _parse_ontological_statements(text: str) -> list[dict]:
         for pattern, rel_type in patterns:
             m = pattern.match(line)
             if m:
-                subject = m.group(1).strip().lower()
-                obj = m.group(2).strip().lower()
-                if subject and obj:
-                    edges.append({"subject": subject, "rel_type": rel_type, "object": obj})
+                subj, subj_type = _extract_name_type(m.group(1).strip())
+                obj, obj_type = _extract_name_type(m.group(2).strip())
+                if subj and obj:
+                    edge = {"subject": subj, "rel_type": rel_type, "object": obj}
+                    if subj_type:
+                        edge["subject_type"] = subj_type
+                    if obj_type:
+                        edge["object_type"] = obj_type
+                    edges.append(edge)
                 break
     return edges
 

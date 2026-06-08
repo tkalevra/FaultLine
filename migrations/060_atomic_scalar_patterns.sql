@@ -3,7 +3,7 @@
 -- These patterns are matched against input text BEFORE the LLM extraction call.
 -- Detected values are injected as type annotations into the extraction prompt,
 -- preventing the LLM from splitting structured values on their delimiters
--- (e.g., IP "192.168.1.10" split to "192" on the first octet).
+-- (e.g., IP "10.0.0.1" split to "10" on the first octet).
 --
 -- category = 'scalar_atomic' marks them as pre-flight detectors, not
 -- compound extraction patterns like category='identity' etc.
@@ -32,7 +32,7 @@ VALUES
   '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
   'has_ip',
   'IPv4 address',
-  '192.168.1.10',
+  '10.0.0.1',
   'scalar_atomic', 'bootstrap', 0.97
 ),
 
@@ -117,7 +117,7 @@ VALUES
   '\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b',
   'has_fqdn',
   'Fully-qualified domain name',
-  'mail.example.com',
+  'host.example.com',
   'scalar_atomic', 'bootstrap', 0.91
 ),
 
@@ -137,7 +137,7 @@ VALUES
   'https?://[^\s\)\"'']+',
   'has_url',
   'HTTP/HTTPS URL',
-  'https://example.com/api',
+  'https://app.example.com/api',
   'scalar_atomic', 'bootstrap', 0.95
 ),
 
