@@ -3,23 +3,23 @@
 TOOLS = [
     {
         "name": "recall_memory",
-        "description": "Query FaultLine knowledge graph to recall facts relevant to the conversation. "
-                       "Call this at the start of any turn where you need to remember things about the user. "
-                       "Returns prose facts from PostgreSQL (graph traversal + hierarchy) merged with "
-                       "Qdrant semantic search results.\n\n"
+        "description": "Recall what you know about the user or a topic from memory. "
+                       "Call this at the start of any turn where the user's message touches on "
+                       "something you might already know about them. The results are things you "
+                       "remember — speak about them naturally as your own knowledge, never as "
+                       "retrieved data.\n\n"
                        "To build a concept map for a topic, prefix with /expand:\n"
                        "  /expand networking\n"
                        "  /expand networking online\n"
                        "  /expand networking online https://example.com/networking-guide\n\n"
-                       "Note: /expand maps how concepts relate (e.g. router → network device → hardware) — "
-                       "it does not make the assistant an expert on the topic. Use it to help classify "
-                       "facts you plan to share about that domain.",
+                       "Note: /expand maps how concepts relate — it does not make you an expert "
+                       "on the topic. Use it to help classify facts the user shares about that domain.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What you want to recall (e.g., 'family', 'tell me about my pets', 'where does the user live')"
+                    "description": "What you want to recall (e.g., 'what do you know about X', 'tell me about Y')"
                 },
                 "user_id": {
                     "type": "string",
@@ -32,9 +32,11 @@ TOOLS = [
     {
         "name": "remember_facts",
         "description": "Store facts from the current conversation into the FaultLine knowledge graph. "
-                       "Call this when the user states something worth remembering: their name, family, "
-                       "preferences, relationships, or corrections to prior facts. "
-                       "Internally runs extract/rewrite → WGM validation → ingest. "
+                       "Call this when the user states something worth remembering about themselves, "
+                       "their world, or their relationships — OR when correcting/updating a prior fact. "
+                       "Correction signals: 'actually X is Y', 'X is now Y not Z', 'I meant X', "
+                       "'Correction: ...', any update to a previously stated value. "
+                       "Internally runs intent classification → extract → validate → ingest. "
                        "Returns the number of facts stored and their classification (Class A/B/C).",
         "inputSchema": {
             "type": "object",
@@ -79,19 +81,17 @@ TOOLS = [
     },
     {
         "name": "retract_fact",
-        "description": "Remove or correct a previously stored fact. Use when the user says "
-                       "something was wrong, has changed, or should be forgotten. "
-                       "ALSO use for correction signals: 'I do not X', 'I don't X', "
-                       "'X is not a Y', 'that was wrong', 'I meant X not Y', "
-                       "'forget that X', 'actually X is Z', or any message prefixed "
-                       "'Correction:'. Accepts natural language — delegates semantic "
-                       "extraction to FaultLine backend.",
+        "description": "Remove a previously stored fact from memory. Use ONLY when the user wants "
+                       "something forgotten or deleted — signals like 'forget that', 'remove', "
+                       "'erase', 'I don't have', 'that's not true', 'I'm not', 'X is not a Y'. "
+                       "Do NOT use for corrections or updates — use remember_facts instead. "
+                       "Accepts natural language — delegates extraction to FaultLine backend.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Natural language retraction statement"
+                    "description": "The statement to retract (e.g., 'forget that X is Y', 'X is not Z')"
                 },
                 "user_id": {
                     "type": "string",
