@@ -2921,7 +2921,7 @@ def _validate_bidirectional_relationships(
 
     Returns:
       - "keep": no inverse rel_type — proceed normally
-      - "create_inverse": no inverse fact found — auto-create needed
+      - "no_conflict": no conflicting inverse found — proceed normally
       - "supersede_new": existing inverse has higher confidence — skip new fact
     """
     rt_lower = rel_type.lower().strip() if rel_type else ""
@@ -2976,7 +2976,7 @@ def _validate_bidirectional_relationships(
                 "WHERE subject_id = %s AND object_id = %s "
                 "AND rel_type = %s AND superseded_at IS NULL "
                 "LIMIT 1",
-                (subject, obj, inverse),
+                (obj, subject, inverse),
             )
             inverse_fact = cur.fetchone()
 
@@ -2986,7 +2986,7 @@ def _validate_bidirectional_relationships(
                     "WHERE subject_id = %s AND object_id = %s "
                     "AND rel_type = %s "
                     "LIMIT 1",
-                    (subject, obj, inverse),
+                    (obj, subject, inverse),
                 )
                 inverse_fact = cur.fetchone()
 
@@ -3026,11 +3026,11 @@ def _validate_bidirectional_relationships(
 
     # Inverse rel_type exists but no inverse fact found — signal auto-creation
     log.info(
-        "ingest.bidirectional_inverse_needed",
+        "ingest.bidirectional_no_conflict",
         fact=f"{subject} {rt_lower} {obj}",
         inverse_rel=inverse,
     )
-    return "create_inverse"
+    return "no_conflict"
 
 
 # ── dprompt-41: Production Readiness ─────────────────────────────────────────
@@ -5863,7 +5863,7 @@ async def query_negation_patterns(req: dict, user_id: str = None):
         cursor = db.cursor()
 
         # Set search_path to user's schema
-        cursor.execute(f"SET search_path TO {schema_name}, public")
+        cursor.execute(f"SET search_path TO {schema_name}")
 
         # Query user's schema (NOT public)
         # No user_id filter needed — schema provides isolation
@@ -6357,6 +6357,19 @@ PATTERN 1 — RELATIONSHIPS (these define connectivity between entities):
     * "My wife is X" → (user, spouse, X)
     * "X works for Y" → (X, works_for, Y)
     * Do NOT invert relationships; system handles directionality from metadata
+  - CONJUNCTIVE SUBJECTS (CRITICAL — "X and Y have/own/etc Z"):
+    * When two entities appear as conjunctive subjects ("X and Y have Z", "X and Y own Z"),
+      BOTH X and Y hold the same relationship to Z. Do NOT extract X as related to Y.
+    * "X and Y have N [things]: A, B, C" → (X, rel, A), (X, rel, B), (X, rel, C), (Y, rel, A), (Y, rel, B), (Y, rel, C)
+    * The conjunction "and" between subjects means SHARED ROLE, not hierarchy between them.
+  - LIST ENUMERATION INFERENCE (CRITICAL — extract relationships for ALL listed entities):
+    * When multiple entities follow a group descriptor or possessive that implies a relationship,
+      extract that relationship for EVERY entity in the list — not just the first one.
+    * Pattern: "X's [group_noun]: A, B, C" or "X has N [group_noun]: A, B, C"
+      → infer the relationship between X and EACH of A, B, C from the group noun context.
+    * If entities in a list have inline attributes (e.g. parenthetical values), extract BOTH
+      the implied relationship AND the attribute for each entity.
+    * NEVER stop after the first entity in a list. If N entities are enumerated, emit N relationship triples.
 
 PATTERN 2 — SCALARS/ATTRIBUTES (these assign properties to entities):
   - Extract: age, height, weight (numeric measurements)
@@ -6386,6 +6399,7 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
 FIRST-PERSON RESOLUTION:
   - "I", "me", "my", "we" → always map to "user" entity (NEVER use pronouns literally)
   - "We have a dog" → (user, has_pet, dog_name)
+  - List enumeration applies equally to first-person: "my [group]: A, B, C" → relationship to user for each
 
 AMBIGUOUS PRONOUNS:
   - If "he", "she", "it", "they" appear, resolve from prior context IF POSSIBLE
@@ -6643,6 +6657,58 @@ def _track_correction_signal_candidate(
         log.warning("extract.correction_signal_tracking_failed", error=str(e))
 
 
+# === Chunked Extraction Helpers ===
+# Used by /extract/rewrite to split entity-dense text into parallel LLM calls.
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences. Conservative regex — no nltk dependency."""
+    parts = _SENTENCE_SPLIT_RE.split(text.strip())
+    # Merge fragments shorter than 15 chars back into previous sentence
+    merged = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if merged and len(part) < 15:
+            merged[-1] = merged[-1] + " " + part
+        else:
+            merged.append(part)
+    return merged if merged else [text.strip()]
+
+
+def _chunk_sentences(sentences: list[str], max_per_chunk: int = 3) -> list[list[str]]:
+    """Group sentences into chunks of max_per_chunk. Simple greedy grouping."""
+    if len(sentences) <= max_per_chunk:
+        return [sentences]
+    chunks = []
+    for i in range(0, len(sentences), max_per_chunk):
+        chunk = sentences[i:i + max_per_chunk]
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _build_context_header(preceding_text: str, typed_entities: list[dict] | None) -> str:
+    """Build a context header from preceding text for pronoun resolution."""
+    # Extract capitalized proper nouns from preceding text (simple heuristic)
+    names = set(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', preceding_text))
+    # Also include any typed_entities subjects/objects
+    if typed_entities:
+        for e in typed_entities:
+            if e.get("subject"):
+                names.add(e["subject"])
+            if e.get("object"):
+                names.add(e["object"])
+    if not names:
+        return ""
+    # Limit to 10 most recent names
+    name_list = ", ".join(sorted(names)[:10])
+    return f"[Context: Previously mentioned entities: {name_list}]\n"
+
+
 @app.post("/extract/rewrite", response_model=dict)
 async def extract_rewrite(req: RewriteRequest) -> dict:
     """
@@ -6763,55 +6829,253 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
 
         messages.append({"role": "user", "content": user_content})
 
-        # Call LLM using persistent pooled client with fallback chain
-        # dprompt-129: Try multiple endpoints (host IP, container name, Docker IP, reverse proxy)
-        # dBug-016: Use chat_id if provided, otherwise fall back to user_id
-        payload = build_llm_payload(
-            messages=messages,
-            model=llm_model,
-            user_id=req.chat_id or req.user_id,
-            temperature=0.0,
-            max_tokens=2048,
-            # NOTE: thinking parameter removed — Qwen doesn't support extended thinking
-        )
-
-        # DEBUG: Log what we're sending to LLM
-        log.info("extract_rewrite.llm_request",
-                 model=llm_model,
-                 text_preview=req.text[:150] if req.text else "",
-                 system_prompt_len=len(system_prompt) if system_prompt else 0,
-                 message_count=len(messages),
-                 has_typed_entities=bool(req.typed_entities))
-
-        # Use centralized LLM call with retry, circuit breaker, and proper timeout management
-        # Replaces manual endpoint fallback loop with llm_calls.py implementation
+        # === CHUNKED PARALLEL EXTRACTION ===
+        # Split text into sentence chunks and extract triples in parallel.
+        # This handles entity-dense paragraphs that overwhelm small LLMs.
+        # Only chunk when text is long enough to actually overwhelm — short texts
+        # lose relationship context when split across chunks.
         from .llm_calls import call_llm_with_retry_async
 
-        result = await call_llm_with_retry_async(
-            messages=messages,
-            model=llm_model,
-            user_id=req.user_id,
-            timeout=LLMTimeouts.get("EXTRACT"),
-            operation="EXTRACT",
-        )
+        _CHUNK_MIN_CHARS = 300  # Don't chunk texts shorter than this
+        sentences = _split_sentences(req.text)
+        if len(req.text) < _CHUNK_MIN_CHARS:
+            chunks = [sentences]  # Keep as single chunk for short texts
+        else:
+            chunks = _chunk_sentences(sentences, max_per_chunk=3)
 
-        # call_llm_with_retry_async() returns ALREADY-PARSED JSON (not the full OpenAI response)
-        # It extracts content from {"choices":[{"message":{"content":"..."}}]} and returns json.loads(content)
-        if result is None or not isinstance(result, (list, dict)):
+        log.info("extract_rewrite.chunking",
+                 user_id=req.user_id,
+                 sentence_count=len(sentences),
+                 chunk_count=len(chunks),
+                 text_len=len(req.text))
+
+        _EXTRACT_SEMAPHORE = asyncio.Semaphore(8)
+
+        async def _extract_chunk(chunk_sentences: list[str], chunk_idx: int) -> list[dict]:
+            """Extract triples from a single chunk."""
+            chunk_text = " ".join(chunk_sentences)
+
+            # Build context header for non-first chunks
+            context_header = ""
+            if chunk_idx > 0:
+                preceding = " ".join(
+                    s for c in chunks[:chunk_idx] for s in c
+                )
+                context_header = _build_context_header(preceding, req.typed_entities)
+
+            # Build chunk-specific messages (reuse system prompt from outer scope)
+            chunk_user_content = context_header + chunk_text
+            if req.typed_entities:
+                entity_lines = "\n".join(
+                    f"- {e.get('subject')} ({e.get('subject_type', 'unknown')}) "
+                    f"-- {e.get('object')} ({e.get('object_type', 'unknown')})"
+                    for e in req.typed_entities
+                    if e.get("subject") and e.get("object")
+                )
+                if entity_lines:
+                    chunk_user_content += f"\n\nDetected entities:\n{entity_lines}"
+
+            chunk_messages = [m for m in messages if m["role"] == "system"]
+            # Include conversation context for pronoun resolution
+            if req.messages:
+                ctx_msgs = [m for m in req.messages if m.get("role") in ("user", "assistant")]
+                for msg in ctx_msgs[-4:]:
+                    chunk_messages.append(msg)
+            chunk_messages.append({"role": "user", "content": chunk_user_content})
+
+            async with _EXTRACT_SEMAPHORE:
+                try:
+                    chunk_result = await call_llm_with_retry_async(
+                        messages=chunk_messages,
+                        model=llm_model,
+                        user_id=req.user_id,
+                        timeout=LLMTimeouts.get("EXTRACT"),
+                        operation="EXTRACT",
+                    )
+                    if chunk_result is None or not isinstance(chunk_result, (list, dict)):
+                        log.warning("extract_rewrite.chunk_failed",
+                                   chunk_idx=chunk_idx,
+                                   result_type=type(chunk_result).__name__ if chunk_result else "None")
+                        return []
+                    return chunk_result if isinstance(chunk_result, list) else [chunk_result]
+                except Exception as e:
+                    log.warning("extract_rewrite.chunk_error", chunk_idx=chunk_idx, error=str(e))
+                    return []
+
+        # Fan out chunks in parallel
+        if len(chunks) == 1:
+            # Single chunk — no parallelism overhead needed
+            all_chunk_triples = [await _extract_chunk(chunks[0], 0)]
+        else:
+            all_chunk_triples = await asyncio.gather(
+                *[_extract_chunk(chunk, idx) for idx, chunk in enumerate(chunks)]
+            )
+
+        # Merge and deduplicate edges across chunks
+        seen_keys: set = set()
+        triples: list = []
+        for chunk_edges in all_chunk_triples:
+            for edge in chunk_edges:
+                if not isinstance(edge, dict):
+                    continue
+                subj = (edge.get("subject") or "").strip().lower()
+                rel = (edge.get("rel_type") or "").strip().lower()
+                obj = (edge.get("object") or "").strip().lower()
+                if not (subj and rel and obj):
+                    continue
+                dedup_key = (subj, rel, obj)
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    triples.append(edge)
+
+        log.info("extract_rewrite.chunked_extraction_complete",
+                 user_id=req.user_id,
+                 chunks_processed=len(chunks),
+                 total_edges=len(triples),
+                 dedup_removed=sum(len(ct) for ct in all_chunk_triples) - len(triples))
+
+        # === COMPLETENESS PASS ===
+        # Detect entities with scalar attributes but no relational edges.
+        # Fire focused re-extraction for orphaned entities to fill relationship gaps.
+        if triples:
+            # Determine which rel_types are scalar vs relational using module-level cache
+            scalar_rel_types: set = set()
+            if _SCALAR_REL_TYPES_CACHE:
+                scalar_rel_types = _SCALAR_REL_TYPES_CACHE
+            else:
+                # Fallback: treat rel_types where object looks like a literal value as scalar
+                for t in triples:
+                    obj_val = (t.get("object") or "").strip()
+                    rel_val = (t.get("rel_type") or "").strip().lower()
+                    if obj_val.replace(".", "").replace("-", "").isdigit():
+                        scalar_rel_types.add(rel_val)
+
+            # Collect entities appearing in scalar vs relational triples
+            entities_in_scalars: set = set()
+            entities_in_relations: set = set()
+            for t in triples:
+                subj = (t.get("subject") or "").strip().lower()
+                obj = (t.get("object") or "").strip().lower()
+                rel = (t.get("rel_type") or "").strip().lower()
+                if rel in scalar_rel_types:
+                    if subj:
+                        entities_in_scalars.add(subj)
+                else:
+                    if subj:
+                        entities_in_relations.add(subj)
+                    if obj:
+                        entities_in_relations.add(obj)
+
+            # Orphaned = has scalar but no relational edge
+            orphaned = entities_in_scalars - entities_in_relations
+            # Exclude "user" — user entity often has scalars without explicit relational edges in same text
+            orphaned.discard("user")
+
+            if orphaned:
+                log.info("extract_rewrite.completeness_pass_triggered",
+                         orphaned_count=len(orphaned),
+                         orphaned_entities=list(orphaned)[:5],
+                         user_id=req.user_id)
+
+                # Build list of all entity names mentioned in triples for context
+                all_entities: set = set()
+                for t in triples:
+                    s = (t.get("subject") or "").strip()
+                    o = (t.get("object") or "").strip()
+                    if s:
+                        all_entities.add(s)
+                    if o and (t.get("rel_type") or "").lower() not in scalar_rel_types:
+                        all_entities.add(o)
+
+                # Focused re-extraction for each orphaned entity
+                async def _completeness_extract(entity_name: str) -> list[dict]:
+                    """Ask LLM specifically about one orphaned entity's relationships."""
+                    other_entities = [e for e in all_entities if e.lower() != entity_name]
+                    others_str = ", ".join(sorted(other_entities)[:10])
+
+                    focused_prompt = (
+                        f"The following text mentions '{entity_name}' and these other entities: {others_str}.\n"
+                        f"What is the relationship between '{entity_name}' and the other entities?\n"
+                        f"Return ONLY a JSON array of relationship triples involving '{entity_name}'.\n"
+                        f"Each triple: {{\"subject\": \"...\", \"object\": \"...\", \"rel_type\": \"...\", \"definition\": \"...\"}}\n"
+                        f"Do NOT extract scalar attributes (age, height, etc.) — only relationships between entities.\n"
+                        f"If no relationship exists, return an empty array [].\n\n"
+                        f"Text: {req.text}"
+                    )
+
+                    focused_messages = [m for m in messages if m["role"] == "system"]
+                    if req.messages:
+                        ctx = [m for m in req.messages if m.get("role") in ("user", "assistant")]
+                        for msg in ctx[-4:]:
+                            focused_messages.append(msg)
+                    focused_messages.append({"role": "user", "content": focused_prompt})
+
+                    try:
+                        result = await call_llm_with_retry_async(
+                            messages=focused_messages,
+                            model=llm_model,
+                            user_id=req.user_id,
+                            timeout=LLMTimeouts.get("EXTRACT"),
+                            operation="EXTRACT",
+                        )
+                        if result is None or not isinstance(result, (list, dict)):
+                            return []
+                        edges = result if isinstance(result, list) else [result]
+                        # Filter out negation rel_types (BUG-007: LLM invents not_X/non_X)
+                        edges = [e for e in edges if isinstance(e, dict)
+                                 and not (e.get("rel_type") or "").lower().startswith(("not_", "non_"))]
+                        return edges
+                    except Exception as e:
+                        log.warning("extract_rewrite.completeness_chunk_error",
+                                   entity=entity_name, error=str(e))
+                        return []
+
+                # Fan out completeness calls
+                completeness_results = await asyncio.gather(
+                    *[_completeness_extract(ent) for ent in orphaned]
+                )
+
+                # Merge completeness results with existing triples (same dedup)
+                completeness_added = 0
+                for edges in completeness_results:
+                    for edge in edges:
+                        if not isinstance(edge, dict):
+                            continue
+                        subj = (edge.get("subject") or "").strip().lower()
+                        rel = (edge.get("rel_type") or "").strip().lower()
+                        obj = (edge.get("object") or "").strip().lower()
+                        if not (subj and rel and obj):
+                            continue
+                        # Skip if rel_type is scalar (completeness pass is for relationships only)
+                        if rel in scalar_rel_types:
+                            continue
+                        # Filter out negation rel_types at merge level too
+                        if rel.startswith(("not_", "non_")):
+                            continue
+                        dedup_key = (subj, rel, obj)
+                        if dedup_key not in seen_keys:
+                            seen_keys.add(dedup_key)
+                            triples.append(edge)
+                            completeness_added += 1
+
+                log.info("extract_rewrite.completeness_pass_complete",
+                         orphaned_checked=len(orphaned),
+                         relationships_added=completeness_added,
+                         user_id=req.user_id)
+
+        # If chunked extraction produced nothing, log error
+        if not triples:
             log.error("extract_rewrite.llm_call_failed",
                      user_id=req.user_id,
                      text_preview=req.text[:150],
-                     result_type=type(result).__name__ if result is not None else "NoneType")
-            return {"status": "error", "detail": "LLM extraction failed after retries"}
-
-        # result is already parsed JSON — normalize to list for downstream processing
-        triples = result if isinstance(result, list) else [result]
+                     result_type="empty_after_chunking")
+            # Don't return error — fall through to empty triples handling below
 
         # Validate: at least one valid triple
         if not triples:
             log.warning("extract_rewrite.empty_triples_list",
                        user_id=req.user_id,
-                       result=result)
+                       chunk_count=len(chunks))
             triples = []
 
         # Validation: each triple must have subject, object, rel_type fields
@@ -7010,7 +7274,7 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                             # Must set search_path so ON CONFLICT (id) targets the per-user schema
                             # whose entities PK is (id) alone — not the public schema's (id, user_id).
                             with db_strengthen.cursor() as _sch_cur:
-                                _sch_cur.execute(f"SET search_path TO {_strengthen_schema}, public")
+                                _sch_cur.execute(f"SET search_path TO {_strengthen_schema}")
                             for entity_name, discovered_type in entity_types.items():
                                 if discovered_type and discovered_type != "SCALAR":
                                     try:
@@ -7674,7 +7938,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                 # Set search_path for this request's database operations
                 with _prov_db.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}, public")
+                    cur.execute(f"SET search_path TO {schema_name}")
                     _prov_db.commit()
 
                 log.info("ingest.schema_set", user_id=user_id[:8], schema=schema_name)
@@ -8497,7 +8761,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 if schema_name:
                     # Use schema_name derived from provisioning setup
                     with db.cursor() as cur:
-                        cur.execute(f"SET search_path TO {schema_name}, public")
+                        cur.execute(f"SET search_path TO {schema_name}")
                     log.info("ingest.schema_search_path_set", user_id=user_id[:8], schema=schema_name)
                 else:
                     # Fallback: Attempt to get schema context from provisioning table
@@ -8505,7 +8769,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         context = get_user_schema_context(user_id, db)
                         schema_name = context["schema_name"]
                         with db.cursor() as cur:
-                            cur.execute(f"SET search_path TO {schema_name}, public")
+                            cur.execute(f"SET search_path TO {schema_name}")
                         log.info("ingest.schema_context_fallback_set", user_id=user_id[:8], schema=schema_name)
                     except ValueError as e:
                         log.warning("ingest.schema_context_failed", user_id=user_id[:8], error=str(e))
@@ -8518,7 +8782,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             provisioning_status=prov_status
                         )
 
-                gate, manager = WGMValidationGate(db, _rel_type_registry), FactStoreManager(db)
+                gate, manager = WGMValidationGate(db, _rel_type_registry, schema_name=schema_name), FactStoreManager(db)
                 registry = EntityRegistry(db, auto_commit=False, schema_name=schema_name)  # ← Transaction managed by ingest
                 rows = []
                 has_preferred = _detect_preference_signal(req.text)
@@ -8719,6 +8983,23 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     if not _is_scalar_rel_type(edge.rel_type):
                         _canonical_to_display[canonical_object] = edge.object.lower()
 
+                    # Metadata-driven type inference fallback: when subject_type/object_type
+                    # are not provided (e.g., llm_learn edges without type annotations),
+                    # infer from rel_types.head_types/tail_types if unambiguous (single non-ANY type).
+                    if not edge.subject_type and canonical_subject != user_entity_id:
+                        _rel_meta = _REL_TYPE_META.get(edge.rel_type.lower(), {})
+                        _head_types = _rel_meta.get("head_types") or []
+                        _candidate_types = [t for t in _head_types if t and t not in ("ANY", "SCALAR")]
+                        if len(_candidate_types) == 1:
+                            edge.subject_type = _candidate_types[0]
+
+                    if not edge.object_type and not _is_scalar_rel_type(edge.rel_type):
+                        _rel_meta = _REL_TYPE_META.get(edge.rel_type.lower(), {})
+                        _tail_types = _rel_meta.get("tail_types") or []
+                        _candidate_types = [t for t in _tail_types if t and t not in ("ANY", "SCALAR")]
+                        if len(_candidate_types) == 1:
+                            edge.object_type = _candidate_types[0]
+
                     # Persist entity types to entities table if provided (only if currently unknown)
                     if edge.subject_type and canonical_subject != user_entity_id:
                         try:
@@ -8732,7 +9013,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.info("ingest.subject_type_update_skipped",
@@ -8753,7 +9034,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.info("ingest.object_type_update_skipped",
@@ -8801,7 +9082,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.info("ingest.inferred_subject_type_update_skipped",
@@ -8821,7 +9102,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.info("ingest.inferred_object_type_update_skipped",
@@ -9172,7 +9453,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             if schema_name:
                                 try:
                                     with db.cursor() as _sp:
-                                        _sp.execute(f"SET search_path TO {schema_name}, public")
+                                        _sp.execute(f"SET search_path TO {schema_name}")
                                 except Exception:
                                     pass
                             # Re-run 3D classification now that the rel_type is KNOWN with
@@ -9199,7 +9480,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     db.rollback()
                                     if schema_name:
                                         with db.cursor() as _r2:
-                                            _r2.execute(f"SET search_path TO {schema_name}, public")
+                                            _r2.execute(f"SET search_path TO {schema_name}")
                                 except Exception:
                                     pass
                             try:
@@ -9229,13 +9510,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 db.commit()
                                 if schema_name:
                                     with db.cursor() as _sp2:
-                                        _sp2.execute(f"SET search_path TO {schema_name}, public")
+                                        _sp2.execute(f"SET search_path TO {schema_name}")
                             except Exception as _oce:
                                 try:
                                     db.rollback()
                                     if schema_name:
                                         with db.cursor() as _r3:
-                                            _r3.execute(f"SET search_path TO {schema_name}, public")
+                                            _r3.execute(f"SET search_path TO {schema_name}")
                                 except Exception:
                                     pass
                                 log.error("ingest.inflow_ontology_eval_audit_failed",
@@ -9351,7 +9632,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 db.rollback()
                                 if schema_name:
                                     with db.cursor() as _reapply:
-                                        _reapply.execute(f"SET search_path TO {schema_name}, public")
+                                        _reapply.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                         try:
@@ -9377,7 +9658,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.error("ingest.ontology_eval_insert_failed",
@@ -9534,7 +9815,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             try:
                                 db.rollback()
                                 if schema_name:
-                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}, public")
+                                    with db.cursor() as _r: _r.execute(f"SET search_path TO {schema_name}")
                             except Exception:
                                 pass
                             log.warning("ingest.scalar_failed", error=str(_e))
@@ -9955,7 +10236,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             db.rollback()
                             if schema_name:
                                 with db.cursor() as _vr:
-                                    _vr.execute(f"SET search_path TO {schema_name}, public")
+                                    _vr.execute(f"SET search_path TO {schema_name}")
                         except Exception:
                             pass
 
@@ -9977,7 +10258,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 try:
                                     db.rollback()
                                     if schema_name:
-                                        with db.cursor() as _sr: _sr.execute(f"SET search_path TO {schema_name}, public")
+                                        with db.cursor() as _sr: _sr.execute(f"SET search_path TO {schema_name}")
                                 except Exception:
                                     pass
                                 continue
@@ -9999,7 +10280,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     try:
                                         db.rollback()
                                         if schema_name:
-                                            with db.cursor() as _or: _or.execute(f"SET search_path TO {schema_name}, public")
+                                            with db.cursor() as _or: _or.execute(f"SET search_path TO {schema_name}")
                                     except Exception:
                                         pass
                                     continue
@@ -10123,6 +10404,19 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # ── dprompt-62: Bidirectional validation ─────────────────────
                     # Prevent impossible bidirectional relationships (child_of + parent_of
                     # for same pair). Keep higher confidence, supersede lower.
+                    # Defensive: re-apply search_path — gate.validate_edge() commits/rollbacks
+                    # on shared db without re-applying, which can leave us on public schema.
+                    if schema_name:
+                        try:
+                            with db.cursor() as _sp_cur:
+                                _sp_cur.execute(f"SET search_path TO {schema_name}")
+                        except Exception:
+                            try:
+                                db.rollback()
+                                with db.cursor() as _sp_cur:
+                                    _sp_cur.execute(f"SET search_path TO {schema_name}")
+                            except Exception:
+                                pass
                     _bidir_rows = []
                     _bidir_count = 0
                     for row in rows:
@@ -10131,18 +10425,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         bidir_decision = _validate_bidirectional_relationships(
                             db, req.user_id, _subj, _rel, _obj, _conf,
                         )
-                        if bidir_decision == "create_inverse":
-                            # Auto-create missing inverse fact with same metadata
-                            _meta = _get_rel_type_metadata(_rel)
-                            _inv_rel = _meta.get("inverse_rel_type") if _meta else None
-                            if _inv_rel:
-                                _bidir_rows.append((
-                                    _uid, _obj, _subj, _inv_rel, f"auto-created inverse of {_src}",
-                                    False, _fclass, _conf, _eng, _defn
-                                ))
-                                log.info("ingest.bidirectional_inverse_created",
-                                         rel_type=_rel, inverse=_inv_rel,
-                                         subject=_subj, object=_obj, confidence=_conf)
+                        if bidir_decision == "no_conflict":
                             _bidir_rows.append(row)
                             continue
                         elif bidir_decision == "supersede_new":
@@ -10266,49 +10549,46 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             log.warning("ingest.entity_type_propagation_failed", error=str(_htp_err))
 
                         # Apply correction_behavior supersession for Class A facts
-                        # When a Class A user-stated fact is inserted, supersede contradictory existing facts
-                        try:
-                            with db.cursor() as cur:
-                                for user_id, subject, obj, rel_type, source, is_preferred, defn, storage_type, is_hierarchy_rel, taxonomies in class_a_rows:
-                                    rel_type_lower = (rel_type or "").lower()
+                        # ONLY when the ingest is an explicit user correction (is_correction=true).
+                        # Non-correction Class A facts (e.g., /expand seeding, user_stated multi-valued)
+                        # must NOT cross-supersede sibling facts in the same batch.
+                        _has_corrections = req.is_correction or (
+                            req.edges and any(getattr(e, 'is_correction', False) for e in req.edges)
+                        )
+                        if _has_corrections and class_a_rows:
+                            try:
+                                with db.cursor() as cur:
+                                    for user_id, subject, obj, rel_type, source, is_preferred, defn, storage_type, is_hierarchy_rel, taxonomies in class_a_rows:
+                                        rel_type_lower = (rel_type or "").lower()
 
-                                    # Query metadata for correction_behavior
-                                    metadata = _REL_TYPE_META.get(rel_type_lower, {})
-                                    behavior = metadata.get("correction_behavior", "supersede")
+                                        metadata = _REL_TYPE_META.get(rel_type_lower, {})
+                                        behavior = metadata.get("correction_behavior", "supersede")
 
-                                    log.info("ingest.class_a_supersession_check",
-                                           rel_type=rel_type_lower, subject=subject[:8], obj=obj[:8],
-                                           behavior=behavior, has_metadata=bool(metadata))
+                                        log.info("ingest.class_a_supersession_check",
+                                               rel_type=rel_type_lower, subject=subject[:8], obj=obj[:8],
+                                               behavior=behavior, has_metadata=bool(metadata))
 
-                                    # Only apply supersession if behavior is "supersede" (not "hard_delete", "immutable", etc.)
-                                    if behavior != "supersede":
-                                        log.info("ingest.class_a_supersession_skipped",
-                                               rel_type=rel_type_lower, reason=f"behavior={behavior}")
-                                        continue
+                                        if behavior != "supersede":
+                                            log.info("ingest.class_a_supersession_skipped",
+                                                   rel_type=rel_type_lower, reason=f"behavior={behavior}")
+                                            continue
 
-                                    # Supersede existing facts with same user, subject, rel_type (but different object or already existing)
-                                    # This handles: "I live at X" superseding old "I live at Y" facts
-                                    cur.execute(
-                                        "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
-                                        "WHERE subject_id = %s AND rel_type = %s "
-                                        "AND object_id != %s AND superseded_at IS NULL",
-                                        (subject, rel_type_lower, obj),
-                                    )
-                                    superseded_count = cur.rowcount
-                                    log.info("ingest.class_a_supersession_result",
-                                           rel_type=rel_type_lower, subject=subject[:8], new_obj=obj[:8],
-                                           superseded_count=superseded_count)
-                                    if superseded_count > 0:
-                                        log.info("ingest.class_a_superseded_contradictory",
-                                               rel_type=rel_type_lower, subject=subject[:8], new_object=obj[:8],
-                                               superseded_count=superseded_count, user_id=req.user_id)
-                        except Exception as _supersede_err:
-                            # INTENTIONAL: Graceful degradation — supersession is a consistency optimization.
-                            # If it fails, facts are still committed. This is non-critical path.
-                            log.warning("ingest.class_a_supersession_failed",
-                                       error_type=type(_supersede_err).__name__,
-                                       error=str(_supersede_err),
-                                       note="Class A facts committed despite supersession failure")
+                                        cur.execute(
+                                            "UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+                                            "WHERE subject_id = %s AND rel_type = %s "
+                                            "AND object_id != %s AND superseded_at IS NULL",
+                                            (subject, rel_type_lower, obj),
+                                        )
+                                        superseded_count = cur.rowcount
+                                        if superseded_count > 0:
+                                            log.info("ingest.class_a_superseded_contradictory",
+                                                   rel_type=rel_type_lower, subject=subject[:8], new_object=obj[:8],
+                                                   superseded_count=superseded_count, user_id=req.user_id)
+                            except Exception as _supersede_err:
+                                log.warning("ingest.class_a_supersession_failed",
+                                           error_type=type(_supersede_err).__name__,
+                                           error=str(_supersede_err),
+                                           note="Class A facts committed despite supersession failure")
 
                         # Trigger immediate Qdrant sync for Class A facts (don't wait for 10s re_embedder poll)
                         # This ensures attribute queries immediately after ingest get results from both PostgreSQL and Qdrant
@@ -10638,6 +10918,81 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 # === ATOMIC COMMIT: All writes committed in one transaction ===
                 # Facts, staged_facts, entity_aliases, corrections all commit together
                 db.commit()
+
+                # ── POST-EXTRACTION: instance_of linking via hierarchy alias match ──
+                # After GLiNER2 extraction + WGM validation, check if extracted entities
+                # match any hierarchy node aliases. If so, create instance_of edges to
+                # bridge specific entities to the hierarchy for traversal discovery.
+                # Follows _extract_prerequisites_from_text() pattern: Class B, 0.8 confidence.
+                try:
+                    _hierarchy_rels = ['subclass_of', 'instance_of', 'part_of']
+                    # Find all hierarchy node UUIDs in this schema (entities that ARE hierarchy nodes)
+                    with db.cursor() as _iof_cur:
+                        _iof_cur.execute("""
+                            SELECT DISTINCT object_id FROM facts
+                            WHERE rel_type = ANY(%s) AND superseded_at IS NULL
+                            UNION
+                            SELECT DISTINCT subject_id FROM staged_facts
+                            WHERE rel_type = ANY(%s) AND promoted_at IS NULL
+                        """, (_hierarchy_rels, _hierarchy_rels))
+                        _hierarchy_node_ids = {row[0] for row in _iof_cur.fetchall()}
+
+                    if _hierarchy_node_ids and _canonical_to_display:
+                        # Get aliases for hierarchy nodes
+                        with db.cursor() as _iof_cur:
+                            _iof_cur.execute("""
+                                SELECT entity_id, alias FROM entity_aliases
+                                WHERE entity_id = ANY(%s)
+                            """, (list(_hierarchy_node_ids),))
+                            _hierarchy_alias_map = {}  # alias -> entity_id
+                            for _ha_row in _iof_cur.fetchall():
+                                _hierarchy_alias_map[_ha_row[1].lower()] = _ha_row[0]
+
+                        if _hierarchy_alias_map:
+                            # Get entity types for all resolved entities in this batch
+                            _resolved_uuids = list(_canonical_to_display.keys())
+                            _entity_type_lookup = {}
+                            with db.cursor() as _iof_cur:
+                                _iof_cur.execute("""
+                                    SELECT id, entity_type FROM entities
+                                    WHERE id = ANY(%s) AND entity_type != 'unknown'
+                                """, (_resolved_uuids,))
+                                for _et_row in _iof_cur.fetchall():
+                                    _entity_type_lookup[_et_row[0]] = _et_row[1].lower()
+
+                            # Check each extracted entity's type against hierarchy aliases
+                            _instance_of_created = 0
+                            with db.cursor() as _iof_cur:
+                                for _entity_uuid, _entity_type_name in _entity_type_lookup.items():
+                                    if _entity_uuid in _hierarchy_node_ids:
+                                        continue  # Don't link a hierarchy node to itself
+                                    if _entity_type_name and _entity_type_name in _hierarchy_alias_map:
+                                        _target_node = _hierarchy_alias_map[_entity_type_name]
+                                        # Check not already linked
+                                        _iof_cur.execute("""
+                                            SELECT 1 FROM facts
+                                            WHERE subject_id = %s AND object_id = %s AND rel_type = 'instance_of'
+                                              AND superseded_at IS NULL
+                                            UNION
+                                            SELECT 1 FROM staged_facts
+                                            WHERE subject_id = %s AND object_id = %s AND rel_type = 'instance_of'
+                                              AND promoted_at IS NULL
+                                        """, (_entity_uuid, _target_node, _entity_uuid, _target_node))
+                                        if not _iof_cur.fetchone():
+                                            _iof_cur.execute("""
+                                                INSERT INTO staged_facts
+                                                    (subject_id, object_id, rel_type, fact_class, provenance, confidence, first_seen_at)
+                                                VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_alias_match', 0.8, now())
+                                                ON CONFLICT (subject_id, object_id, rel_type)
+                                                DO UPDATE SET last_seen_at = now(),
+                                                    confirmed_count = staged_facts.confirmed_count + 1
+                                            """, (_entity_uuid, _target_node))
+                                            _instance_of_created += 1
+                            if _instance_of_created:
+                                db.commit()
+                                log.info("ingest.instance_of_linking", created=_instance_of_created)
+                except Exception as _iof_err:
+                    log.warning("ingest.instance_of_linking_failed", error=str(_iof_err))
 
     except psycopg2.Error as err:
         db.rollback()
@@ -11136,12 +11491,19 @@ def resolve_anchor(
     words = query_text.split()
 
     try:
-        # Rule 1: Identity keywords (me, I, myself)
+        # Rule 1: Identity keywords — only when used as subject/possessive,
+        # NOT in dative "tell me about X" / "show me X" patterns where X is the real subject.
         identity_keywords = ["me", "i", "myself"]
-        for word in words:
-            if word.lower() in identity_keywords:
-                log.info("resolve_anchor.identity_keyword", keyword=word, anchor=user_id)
-                return user_id
+        _dative_prefixes = ("tell me", "show me", "explain to me", "teach me",
+                            "help me understand", "let me know", "remind me")
+        _is_dative = any(query_lower.startswith(p) or query_lower.startswith("can you " + p)
+                         or query_lower.startswith("could you " + p)
+                         for p in _dative_prefixes)
+        if not _is_dative:
+            for word in words:
+                if word.lower() in identity_keywords:
+                    log.info("resolve_anchor.identity_keyword", keyword=word, anchor=user_id)
+                    return user_id
 
         # Rule 2: Possessive + taxonomy keyword
         # "my family", "my job", "my location" → user (not entity)
@@ -11183,37 +11545,35 @@ def resolve_anchor(
                                 )
                                 return row[0]
 
-        # Rule 3: Direct entity name match (only if NOT preceded by identity keyword)
-        # "Tell me about Aurora" → Aurora (NOT user, despite "me")
-        # Skip if query contains identity keywords (covered by Rule 1)
+        # Rule 3: N-gram entity resolution (longest match wins)
+        # Handles multi-word entities: "prime minister", "house of commons", etc.
+        # Strips stop words from edges, tries progressively shorter n-grams.
         _query_words_lower = {w.lower().strip('.,!?') for w in query_text.split()}
-        has_identity_keyword = bool(_query_words_lower & set(identity_keywords))
+        has_identity_keyword = not _is_dative and bool(_query_words_lower & set(identity_keywords))
 
         if not has_identity_keyword:
-            for word in words:
-                # Skip if word is a rel_type, taxonomy, or common word
-                if len(word) < 2 or word.lower() in {"my", "me", "i", "you", "we", "about", "the", "a", "is", "are", "tell"}:
-                    continue
+            _stop = {"my", "me", "i", "you", "we", "about", "the", "a", "an",
+                     "is", "are", "tell", "show", "what", "who", "how", "do",
+                     "does", "can", "could", "would", "know"}
+            _clean_words = [w.lower().strip('.,!?') for w in words if w.lower().strip('.,!?') not in _stop and len(w) >= 2]
 
-                # Check if word matches an entity instance
-                # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
-                with db.cursor() as cur:
-                    cur.execute(
-                        "SELECT entity_id FROM entity_aliases "
-                        "WHERE alias = %s LIMIT 1",
-                        (word.lower(),)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        # Verify it's an entity instance, not a taxonomy
-                        semantic = _get_semantic_word_mappings(db, word)
-                        if semantic["category"] != "taxonomy":
-                            log.info(
-                                "resolve_anchor.direct_entity",
-                                entity=word,
-                                anchor=row[0]
-                            )
-                            return row[0]
+            # Try n-grams from longest to shortest (max 5-gram)
+            _max_n = min(5, len(_clean_words))
+            for n in range(_max_n, 0, -1):
+                for i in range(len(_clean_words) - n + 1):
+                    phrase = " ".join(_clean_words[i:i+n])
+                    with db.cursor() as cur:
+                        cur.execute(
+                            "SELECT entity_id FROM entity_aliases WHERE alias = %s LIMIT 1",
+                            (phrase,)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            semantic = _get_semantic_word_mappings(db, phrase)
+                            if semantic["category"] != "taxonomy":
+                                log.info("resolve_anchor.ngram_entity",
+                                         phrase=phrase, n=n, anchor=row[0])
+                                return row[0]
 
         # Rule 4: Pronoun resolution from conversation history
         pronouns = {
@@ -11295,6 +11655,36 @@ def _get_rels_by_taxonomy(db, taxonomy_name: str) -> list:
     except Exception as e:
         log.warning("get_rels_by_taxonomy.failed", taxonomy=taxonomy_name, error=str(e))
         return []
+
+
+def _detect_traversal_direction(query_text: str) -> str:
+    """Determine hierarchy traversal direction from query intent keywords.
+
+    Returns 'down' for containment queries, 'up' for classification queries,
+    'none' if no hierarchy-specific intent detected.
+    """
+    text_lower = query_text.lower().strip()
+
+    # UP patterns: "what is X", "what type/kind/genus", "classify"
+    _UP_PATTERNS = [
+        r'\bwhat\s+is\b', r'\bwhat\s+type\b', r'\bwhat\s+kind\b',
+        r'\bwhat\s+genus\b', r'\bwhat\s+species\b', r'\bwhat\s+class\b',
+        r'\bclassify\b', r'\bcategorize\b', r'\bwhat\s+category\b',
+    ]
+    # DOWN patterns: "tell me about", "what's in", "list", "show", "what does X have"
+    _DOWN_PATTERNS = [
+        r'\btell\s+me\s+about\b', r"\bwhat'?s?\s+in\b", r'\blist\b',
+        r'\bshow\b', r'\bwhat\s+does\s+\w+\s+have\b', r'\bwhat\s+are\s+the\b',
+        r'\bdescribe\b', r'\bdetails?\s+(about|of|on)\b',
+    ]
+
+    for pattern in _UP_PATTERNS:
+        if re.search(pattern, text_lower):
+            return "up"
+    for pattern in _DOWN_PATTERNS:
+        if re.search(pattern, text_lower):
+            return "down"
+    return "none"
 
 
 def determine_path(query_text: str, db, user_id: str = None) -> QueryPath:
@@ -11705,7 +12095,7 @@ def fetch_facts_from_anchor(
                 context = get_user_schema_context(user_id, conn)
                 schema_name = context["schema_name"]
                 with conn.cursor() as schema_cur:
-                    schema_cur.execute(f"SET search_path TO {schema_name}, public")
+                    schema_cur.execute(f"SET search_path TO {schema_name}")
                 conn.commit()
             except Exception as e:
                 log.warning("fetch_facts_from_anchor.schema_context_failed",
@@ -11995,27 +12385,11 @@ def fetch_facts_from_anchor(
                         "expires_at": expires_at,
                         "category": _get_rel_type_category(row[2])
                     })
-                # ─── COMPONENT 3: TAXONOMY MEMBERS with Hierarchy Validation ───
-                # If taxonomy is matched, fetch facts and validate entities by member_entity_types
+                # ─── COMPONENT 3: TAXONOMY-SCOPED GRAPH TRAVERSAL ───
+                # Graph connectivity via taxonomy's rel_types_defining_group IS the scoping.
                 if path.taxonomy_groups:
                     for taxonomy in path.taxonomy_groups:
                         try:
-                            # Get member_entity_types from this taxonomy
-                            cur.execute(
-                                "SELECT member_entity_types, rel_types_defining_group FROM entity_taxonomies WHERE taxonomy_name=%s",
-                                (taxonomy,)
-                            )
-                            tax_row = cur.fetchone()
-                            if not tax_row or not tax_row[0]:
-                                log.warning("taxonomy_validation.no_members", taxonomy=taxonomy)
-                                continue
-
-                            member_types = tax_row[0]  # Array from DB
-                            if isinstance(member_types, str):
-                                import json
-                                member_types = json.loads(member_types)
-
-                            # Get rel_types that define this taxonomy
                             category_rels = _get_rels_by_taxonomy(conn, taxonomy)
                             if not category_rels:
                                 log.warning("taxonomy_rels.empty", taxonomy=taxonomy)
@@ -12036,97 +12410,86 @@ def fetch_facts_from_anchor(
 
                             for row in cur.fetchall():
                                 subject_id, object_id, rel_type_orig, confidence, fact_class = row
-
-                                # Determine which entity to validate (the non-anchor one)
-                                other_entity = object_id if subject_id == anchor_uuid else subject_id
-
-                                # Get entity type via direct lookup
-                                entity_type = None
-                                try:
-                                    with conn.cursor() as type_cur:
-                                        type_cur.execute(
-                                            "SELECT entity_type FROM entities WHERE id=%s",
-                                            (other_entity,)
-                                        )
-                                        type_row = type_cur.fetchone()
-                                        entity_type = type_row[0] if type_row else None
-                                except Exception as type_e:
-                                    log.warning("taxonomy_validation.entity_type_lookup_failed",
-                                               entity=other_entity[:8] if other_entity else "unknown",
-                                               error=str(type_e))
-
-                                # If entity type unknown, walk hierarchy upward to find type
-                                if not entity_type or entity_type == 'unknown':
-                                    try:
-                                        ancestors = _hierarchy_expand(conn, user_id, other_entity, direction="up", max_depth=5)
-                                        for ancestor_id in ancestors:
-                                            try:
-                                                with conn.cursor() as anc_cur:
-                                                    anc_cur.execute(
-                                                        "SELECT entity_type FROM entities WHERE id=%s",
-                                                        (ancestor_id,)
-                                                    )
-                                                    anc_row = anc_cur.fetchone()
-                                                    if anc_row and anc_row[0] and anc_row[0] != 'unknown':
-                                                        entity_type = anc_row[0]
-                                                        break
-                                            except:
-                                                pass
-                                    except Exception as hier_e:
-                                        log.warning("taxonomy_validation.hierarchy_walk_failed",
-                                                   entity=other_entity[:8] if other_entity else "unknown",
-                                                   error=str(hier_e))
-
-                                # Only include if entity type matches taxonomy membership (if member_types is specific)
-                                # If member_types contains 'ANY', include all
-                                include_fact = False
-                                if member_types == ['ANY'] or 'ANY' in member_types:
-                                    include_fact = True
-                                elif entity_type and entity_type in member_types:
-                                    include_fact = True
-                                elif not entity_type or entity_type == 'unknown':
-                                    # Unknown entities: include with warning but don't filter
-                                    log.debug("taxonomy_validation.unknown_entity_type",
-                                             entity=other_entity[:8] if other_entity else "unknown",
-                                             taxonomy=taxonomy,
-                                             member_types=member_types)
-                                    include_fact = True
-
-                                if include_fact:
-                                    facts.append({
-                                        "subject": subject_id,
-                                        "object": object_id,
-                                        "rel_type": rel_type_orig,
-                                        "confidence": float(confidence) if confidence else 1.0,
-                                        "fact_class": fact_class or "A",
-                                        "source": "db",
-                                        "category": _get_rel_type_category(rel_type_orig)
-                                    })
+                                facts.append({
+                                    "subject": subject_id,
+                                    "object": object_id,
+                                    "rel_type": rel_type_orig,
+                                    "confidence": float(confidence) if confidence else 1.0,
+                                    "fact_class": fact_class or "A",
+                                    "source": "db",
+                                    "category": _get_rel_type_category(rel_type_orig)
+                                })
 
                             log.info("fetch_facts_from_anchor.taxonomy_fetched",
                                      taxonomy=taxonomy, count=len(category_rels), facts_found=len(facts))
 
-                            # Entity-type-based discovery: fetch facts for all entities whose
-                            # entity_type is in this taxonomy's member_entity_types.
-                            # This reaches entities not directly anchored to the user — e.g.
-                            # webserver01 (Object) when user asks "what infrastructure do you know".
-                            # Growth: any entity typed as Object/Concept via hierarchy propagation
-                            # automatically appears here when computer_system taxonomy is queried.
-                            # Skip when anchor is a named entity (not user): the anchor is already
-                            # the specific entity we want — type-discovery would pull in all
-                            # same-type entities from the schema (e.g. the entire coffee ontology).
-                            if member_types and member_types != ['ANY'] and anchor_uuid == user_id:
+                            # Domain-scoped fetch: per-user schema IS the scope. All facts
+                            # with taxonomy rel_types belong to this user — fetch them all.
+                            if category_rels:
                                 try:
                                     cur.execute("""
-                                        SELECT DISTINCT e.id
-                                        FROM entities e
-                                        WHERE e.entity_type = ANY(%s)
-                                          AND e.id != %s
-                                    """, (member_types, anchor_uuid))
-                                    typed_entity_ids = [row[0] for row in cur.fetchall()]
+                                        SELECT subject_id, object_id, rel_type, confidence, fact_class
+                                        FROM facts
+                                        WHERE rel_type = ANY(%s)
+                                          AND superseded_at IS NULL
+                                        ORDER BY confidence DESC
+                                        LIMIT 100
+                                    """, (category_rels,))
+                                    _domain_entity_ids = set()
+                                    for row in cur.fetchall():
+                                        _domain_entity_ids.add(row[0])
+                                        _domain_entity_ids.add(row[1])
+                                        facts.append({
+                                            "subject": row[0],
+                                            "object": row[1],
+                                            "rel_type": row[2],
+                                            "confidence": float(row[3]) if row[3] else 0.8,
+                                            "fact_class": row[4] or "A",
+                                            "source": "db",
+                                            "category": _get_rel_type_category(row[2])
+                                        })
+                                    # Scalar attributes for discovered domain entities
+                                    _domain_entity_ids.discard(anchor_uuid)
+                                    if _domain_entity_ids:
+                                        cur.execute("""
+                                            SELECT entity_id, attribute, value_text
+                                            FROM entity_attributes
+                                            WHERE entity_id = ANY(%s)
+                                        """, (list(_domain_entity_ids),))
+                                        for row in cur.fetchall():
+                                            if row[2]:
+                                                facts.append({
+                                                    "subject": row[0],
+                                                    "rel_type": row[1],
+                                                    "object": row[2],
+                                                    "confidence": 1.0,
+                                                    "fact_class": "A",
+                                                    "source": "attributes",
+                                                    "category": _get_rel_type_category(row[1]),
+                                                })
+                                    log.info("fetch_facts_from_anchor.domain_scoped",
+                                             taxonomy=taxonomy, facts_found=len(facts),
+                                             entities_discovered=len(_domain_entity_ids))
+                                except Exception as _dsf:
+                                    log.warning("fetch_facts_from_anchor.domain_scoped_failed",
+                                                taxonomy=taxonomy, error=str(_dsf))
 
-                                    for eid in typed_entity_ids:
-                                        # Relational facts
+                            # Graph-reachable discovery: fetch facts for entities connected
+                            # to the anchor via this taxonomy's rel_types_defining_group.
+                            # Graph connectivity IS the scoping — no entity_type filtering.
+                            if category_rels:
+                                try:
+                                    cur.execute("""
+                                        SELECT DISTINCT
+                                            CASE WHEN subject_id = %s THEN object_id ELSE subject_id END
+                                        FROM facts
+                                        WHERE (subject_id = %s OR object_id = %s)
+                                          AND rel_type = ANY(%s)
+                                          AND superseded_at IS NULL
+                                    """, (anchor_uuid, anchor_uuid, anchor_uuid, category_rels))
+                                    reachable_ids = [row[0] for row in cur.fetchall()]
+
+                                    for eid in reachable_ids:
                                         cur.execute("""
                                             SELECT subject_id, object_id, rel_type, confidence, fact_class
                                             FROM facts
@@ -12143,7 +12506,6 @@ def fetch_facts_from_anchor(
                                                 "source": "db",
                                                 "category": _get_rel_type_category(row[2])
                                             })
-                                        # Scalar attributes
                                         cur.execute("""
                                             SELECT entity_id, attribute, value_text
                                             FROM entity_attributes
@@ -12163,12 +12525,11 @@ def fetch_facts_from_anchor(
                                                     "valid_until": None,
                                                 })
 
-                                    if typed_entity_ids:
-                                        log.info("fetch_facts_from_anchor.taxonomy_type_discovery",
-                                                 taxonomy=taxonomy, entity_count=len(typed_entity_ids),
-                                                 member_types=member_types)
+                                    if reachable_ids:
+                                        log.info("fetch_facts_from_anchor.graph_reachable_discovery",
+                                                 taxonomy=taxonomy, reachable=len(reachable_ids))
                                 except Exception as _tde:
-                                    log.warning("fetch_facts_from_anchor.taxonomy_type_discovery_failed",
+                                    log.warning("fetch_facts_from_anchor.graph_reachable_discovery_failed",
                                                 taxonomy=taxonomy, error=str(_tde))
 
                             # ─── A1 −1-DEPTH FOLD: transitive taxonomy members ───
@@ -12331,7 +12692,7 @@ def _record_system_alert(schema_name: str, alert_type: str) -> None:
         import psycopg2 as _psycopg2_alert
         with _psycopg2_alert.connect(os.environ.get("POSTGRES_DSN")) as _db:
             with _db.cursor() as _cur:
-                _cur.execute(f"SET search_path TO {schema_name}, public")
+                _cur.execute(f"SET search_path TO {schema_name}")
                 _cur.execute("""
                     CREATE TABLE IF NOT EXISTS system_alerts (
                         id SERIAL PRIMARY KEY,
@@ -12371,7 +12732,7 @@ def _resolve_system_alert(schema_name: str, alert_type: str) -> None:
         import psycopg2 as _psycopg2_resolve
         with _psycopg2_resolve.connect(os.environ.get("POSTGRES_DSN")) as _db:
             with _db.cursor() as _cur:
-                _cur.execute(f"SET search_path TO {schema_name}, public")
+                _cur.execute(f"SET search_path TO {schema_name}")
                 _cur.execute("""
                     UPDATE system_alerts
                     SET resolved_at = now()
@@ -12395,7 +12756,7 @@ def _get_active_alerts(schema_name: str) -> list[dict]:
         import psycopg2 as _psycopg2_alerts
         with _psycopg2_alerts.connect(os.environ.get("POSTGRES_DSN")) as _db:
             with _db.cursor() as _cur:
-                _cur.execute(f"SET search_path TO {schema_name}, public")
+                _cur.execute(f"SET search_path TO {schema_name}")
                 # Check table exists before querying (resilient to pre-migration-062 schemas)
                 _cur.execute("""
                     SELECT to_regclass(%s)
@@ -12924,13 +13285,27 @@ async def query(request: QueryRequest) -> QueryResponse:
                                     entity_matches.add(row[0])
 
             if entity_matches:
-                entity_facts = _fetch_entity_facts(db, user_id, entity_matches)
-                hier_facts = _fetch_hierarchy_facts(db, user_id, entity_matches)
-                db_facts = db_facts + entity_facts + hier_facts
-                log.info("query.phase5.entity_centric_expanded",
-                         entities=len(entity_matches),
-                         entity_facts=len(entity_facts),
-                         hierarchy_facts=len(hier_facts))
+                # Exclude taxonomy root entities when that taxonomy already fired
+                # in the domain-scoped fetch — hierarchy is scaffolding, not content.
+                if path.taxonomy_groups and db:
+                    _tax_root_ids = set()
+                    with db.cursor() as _tr:
+                        for _tg in path.taxonomy_groups:
+                            _tr.execute(
+                                "SELECT entity_id FROM entity_aliases WHERE alias = %s LIMIT 1",
+                                (_tg.lower(),),
+                            )
+                            _row = _tr.fetchone()
+                            if _row:
+                                _tax_root_ids.add(_row[0])
+                    entity_matches -= _tax_root_ids
+
+                if entity_matches:
+                    entity_facts = _fetch_entity_facts(db, user_id, entity_matches)
+                    db_facts = db_facts + entity_facts
+                    log.info("query.phase5.entity_centric_expanded",
+                             entities=len(entity_matches),
+                             entity_facts=len(entity_facts))
         except Exception as expand_e:
             log.warning("query.phase5.entity_expansion_failed", error=str(expand_e))
 
@@ -13096,13 +13471,40 @@ async def query(request: QueryRequest) -> QueryResponse:
             log.error("query.classc_hit_increment_failed", error=str(_hit_e),
                       error_type=type(_hit_e).__name__)
 
-        # Step 5: Deduplicate DB facts, then apply confidence gate merging Qdrant results
-        deduped_facts = deduplicate_facts(db_facts)
-        log.info("query.phase5.deduplication", before=len(db_facts), after=len(deduped_facts))
+        # Graph-connectivity gate for Qdrant: only keep facts where at least one
+        # entity is graph-reachable (present in DB facts or is the anchor itself).
+        _known_entities = {anchor, user_id}
+        for _f in db_facts:
+            if _f.get("_subject_id"):
+                _known_entities.add(_f["_subject_id"])
+            if _f.get("_object_id"):
+                _known_entities.add(_f["_object_id"])
+            if _f.get("subject"):
+                _known_entities.add(_f["subject"])
+            if _f.get("object"):
+                _known_entities.add(_f["object"])
+        if qdrant_facts:
+            _before_q = len(qdrant_facts)
+            qdrant_facts = [
+                f for f in qdrant_facts
+                if f.get("_subject_id") in _known_entities
+                or f.get("_object_id") in _known_entities
+                or f.get("subject") in _known_entities
+                or f.get("object") in _known_entities
+            ]
+            if len(qdrant_facts) < _before_q:
+                log.info("query.qdrant_graph_gate_filtered",
+                         before=_before_q, after=len(qdrant_facts))
 
-        # apply_confidence_gate: DB facts (A+B+C by anchor) merged with Qdrant (associative C)
-        gated_facts = apply_confidence_gate(deduped_facts, qdrant_facts=qdrant_facts, min_confidence=min_confidence)
-        log.info("query.phase5.confidence_gate_applied", before=len(deduped_facts), after=len(gated_facts), threshold=min_confidence)
+        # Step 5: Apply confidence gate merging Qdrant results, THEN deduplicate
+        # Dedup must run AFTER merge — a synced fact exists in both PostgreSQL and
+        # Qdrant simultaneously, so merging before dedup would produce duplicates.
+        gated_facts = apply_confidence_gate(db_facts, qdrant_facts=qdrant_facts, min_confidence=min_confidence)
+        log.info("query.phase5.confidence_gate_merged", db_count=len(db_facts), qdrant_count=len(qdrant_facts) if qdrant_facts else 0, merged=len(gated_facts))
+
+        deduped_facts = deduplicate_facts(gated_facts)
+        log.info("query.phase5.deduplication", before=len(gated_facts), after=len(deduped_facts))
+        gated_facts = deduped_facts
 
         # Step 5b: Apply temporal scope filtering (Issue #5: Temporal Facts)
         # Filter facts to only those valid during specified time period (or current time if no scope)
@@ -13173,6 +13575,43 @@ async def query(request: QueryRequest) -> QueryResponse:
                                     error=str(_bte))
                         # fail open — leave _etype_map empty so unknown-type pass rule fires
 
+                # Resolve unknown entity types via hierarchy traversal before gating.
+                # Entities with type='unknown' walk instance_of/subclass_of chains upward
+                # to find their resolved type — same CTE as _resolve_entity_type_via_hierarchy().
+                _unknown_uuids = [
+                    uid for uid, etype in _etype_map.items()
+                    if etype == "unknown"
+                ]
+                if _unknown_uuids and _tax_node_types:
+                    try:
+                        with db.cursor() as _hcur:
+                            for _uid in _unknown_uuids:
+                                _hcur.execute("""
+                                    WITH RECURSIVE chain AS (
+                                        SELECT object_id AS ancestor, 1 AS depth
+                                        FROM facts
+                                        WHERE subject_id = %s
+                                          AND rel_type IN ('instance_of', 'subclass_of')
+                                          AND superseded_at IS NULL
+                                        UNION ALL
+                                        SELECT f.object_id, c.depth + 1
+                                        FROM facts f JOIN chain c ON f.subject_id = c.ancestor
+                                        WHERE f.rel_type = 'subclass_of'
+                                          AND f.superseded_at IS NULL
+                                          AND c.depth < 4
+                                    )
+                                    SELECT e.entity_type FROM chain c
+                                    JOIN entities e ON e.id = c.ancestor
+                                    WHERE e.entity_type IS NOT NULL AND e.entity_type != 'unknown'
+                                    LIMIT 1
+                                """, (_uid,))
+                                _hrow = _hcur.fetchone()
+                                if _hrow and _hrow[0]:
+                                    _etype_map[_uid] = _hrow[0].lower()
+                    except Exception as _hier_err:
+                        log.warning("query.taxonomy_gate.hierarchy_resolve_failed",
+                                    error=str(_hier_err))
+
                 _before_gate = len(gated_facts)
                 _gated: list = []
                 for _f in gated_facts:
@@ -13189,10 +13628,29 @@ async def query(request: QueryRequest) -> QueryResponse:
                     _f_obj = _f.get("object") or _f.get("_object_id") or ""
                     _foreign = _f_obj if _f_subj == anchor else _f_subj
                     _etype = _etype_map.get(_foreign)  # None if not a UUID or type unknown
-                    if not _etype or _etype == "unknown" or _etype in _tax_node_types:
-                        # Unknown/missing type: pass (never drop on type inference gap)
+                    if not _foreign or len(_foreign) != 36:
+                        # Non-UUID (scalar value or empty) — always pass
                         _gated.append(_f)
+                    elif _etype and _etype != "unknown" and _etype in _tax_node_types:
+                        # Known type matches taxonomy — pass
+                        _gated.append(_f)
+                    elif not _etype or _etype == "unknown":
+                        # Still unknown after hierarchy resolution — EXCLUDE from taxonomy-scoped queries.
+                        # This prevents cross-domain bleed (e.g., government facts in family queries).
+                        # User corrections (Class A) are never gated — they always pass through.
+                        _f_class = (_f.get("fact_class") or "").upper()
+                        _f_prov = (_f.get("fact_provenance") or (_f.get("provenance") or "")).lower()
+                        if _f_class == "A" or _f_prov == "user_stated":
+                            _gated.append(_f)
+                        else:
+                            log.debug(
+                                "query.taxonomy_gate.unknown_excluded",
+                                rel_type=_rel,
+                                foreign_entity=_foreign[:8] if _foreign else "",
+                                taxonomy=path.taxonomy_groups,
+                            )
                     else:
+                        # Known type but doesn't match taxonomy — drop
                         log.debug(
                             "query.taxonomy_gate.dropped",
                             rel_type=_rel,
@@ -13601,7 +14059,7 @@ def correct_fact(req: FactCorrectionRequest):
         # Stage 2: ATOMIC TRANSACTION (dimension-aware execution)
         with db.cursor() as cur:
             manager = FactStoreManager(db)
-            gate = WGMValidationGate(db)
+            gate = WGMValidationGate(db, schema_name=schema_name)
             registry = EntityRegistry(db)
 
             dimension = extraction.get("dimension", "RELATIONAL").upper()
@@ -13765,6 +14223,50 @@ def correct_fact(req: FactCorrectionRequest):
                     old_fact_row = cur.fetchone()
                     if old_fact_row:
                         found_via = f"subject_only({old_rel_type})"
+
+                # 4. Object-side lookup: treat extracted subject as the OBJECT
+                # (e.g., "Forget Spot is our pet" → LLM extracts subject=Spot,
+                #  but fact is stored as (user, has_pet, Spot) — Spot is the object)
+                if not old_fact_row:
+                    cur.execute("""
+                        SELECT id, subject_id FROM facts
+                        WHERE object_id = %s AND rel_type = %s
+                          AND superseded_at IS NULL
+                        LIMIT 1
+                    """, (subject_uuid, old_rel_type))
+                    row = cur.fetchone()
+                    if row:
+                        old_fact_row = (row[0], subject_uuid)
+                        found_via = f"object_side({old_rel_type})"
+                        subject_uuid = row[1]
+
+                # 5. Object-side lookup in staged_facts (Class B facts live here)
+                if not old_fact_row:
+                    cur.execute("""
+                        SELECT id, subject_id FROM staged_facts
+                        WHERE object_id = %s AND rel_type = %s
+                          AND promoted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > now())
+                        LIMIT 1
+                    """, (subject_uuid, old_rel_type))
+                    row = cur.fetchone()
+                    if row:
+                        old_fact_row = (row[0], subject_uuid)
+                        found_via = f"object_side_staged({old_rel_type})"
+                        subject_uuid = row[1]
+
+                # 6. Subject-side lookup in staged_facts
+                if not old_fact_row:
+                    cur.execute("""
+                        SELECT id, object_id FROM staged_facts
+                        WHERE subject_id = %s AND rel_type = %s
+                          AND promoted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > now())
+                        LIMIT 1
+                    """, (subject_uuid, old_rel_type))
+                    old_fact_row = cur.fetchone()
+                    if old_fact_row:
+                        found_via = f"subject_staged({old_rel_type})"
 
                 if not old_fact_row:
                     log.warning("correct_fact.old_fact_not_found",
@@ -14212,31 +14714,57 @@ def retract_fact(req: RetractRequest):
                 log.warning("retract.schema_derivation_failed", user_id=req.user_id, error=str(e))
                 schema_name = None
 
+        # User is truth — all user-initiated retractions are authoritative.
+        # No immutable gate: if the user said it, they can unsay it.
         mode = "supersede"
         note = None
         if req.rel_type:
             with db.cursor() as cur:
-                # Query rel_types from public schema (metadata, not per-user)
                 cur.execute(
                     "SELECT correction_behavior FROM public.rel_types WHERE rel_type = %s",
                     (req.rel_type.lower(),),
                 )
                 row = cur.fetchone()
-                if row:
-                    mode = row[0]
-            if mode == "immutable":
-                return RetractResponse(
-                    status="rejected", retracted=0, mode="immutable",
-                    note=f"{req.rel_type} is immutable and cannot be retracted",
-                )
+                if row and row[0] == "hard_delete":
+                    mode = "hard_delete"
 
         with db.cursor() as cur:
             # Set search_path to user's schema if provisioned
             if schema_name:
-                cur.execute(f"SET search_path TO {schema_name}, public")
+                cur.execute(f"SET search_path TO {schema_name}")
+
+            # Resolve display names to UUIDs — retract operates on fact IDs
+            resolved_subject = req.subject
+            resolved_object = req.old_value
+            if resolved_subject:
+                if resolved_subject.lower() in ("user", "me", "i", "myself"):
+                    resolved_subject = req.user_id
+                else:
+                    cur.execute(
+                        "SELECT entity_id FROM entity_aliases WHERE alias = %s LIMIT 1",
+                        (resolved_subject.lower(),)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        resolved_subject = row[0]
+            if resolved_object:
+                # Check if it's already a UUID
+                if len(resolved_object) == 36 and "-" in resolved_object:
+                    pass
+                else:
+                    cur.execute(
+                        "SELECT entity_id FROM entity_aliases WHERE alias = %s LIMIT 1",
+                        (resolved_object.lower(),)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        resolved_object = row[0]
+
+            log.info("retract.resolved", subject=resolved_subject, object=resolved_object,
+                     rel_type=req.rel_type, mode=mode)
 
             affected_ids = manager.retract(
-                cur, req.user_id, req.subject, req.rel_type, req.old_value, mode
+                cur, req.user_id, resolved_subject, req.rel_type, resolved_object, mode
             )
             db.commit()
 
@@ -14254,7 +14782,7 @@ def retract_fact(req: RetractRequest):
                 with db.cursor() as cur:
                     # Set search_path for per-user schema context
                     if schema_name:
-                        cur.execute(f"SET search_path TO {schema_name}, public")
+                        cur.execute(f"SET search_path TO {schema_name}")
 
                     cur.execute(
                         """
@@ -14406,11 +14934,30 @@ def store_context(req: StoreContextRequest):
 
 
 def _parse_learn_statements(text: str) -> list[dict]:
-    """Parse 'X is a subclass/instance/part of Y' statements into edges.
+    """Parse 'X (Type) is a subclass/instance/part of Y (Type)' statements into edges.
 
     Direct regex parse — no LLM re-extraction needed for structured input.
+    Captures optional (Type) annotations and passes them as subject_type/object_type.
+    Valid types: Person, Animal, Organization, Location, Object, Concept.
     """
     import re as _re
+
+    _VALID_ENTITY_TYPES = {"person", "animal", "organization", "location", "object", "concept"}
+
+    # Match: "entity name (Type)" — captures name and optional type separately
+    _TYPE_RE = _re.compile(r'^(.+?)\s*(?:\((\w+)\))?\s*$')
+
+    def _extract_name_type(raw: str) -> tuple[str, str | None]:
+        """Extract entity name and optional type from 'Name (Type)' format."""
+        m = _TYPE_RE.match(raw.strip())
+        if not m:
+            return raw.strip().lower(), None
+        name = m.group(1).strip().lower()
+        etype = m.group(2)
+        if etype and etype.lower() in _VALID_ENTITY_TYPES:
+            return name, etype.title()
+        return name, None
+
     patterns = [
         (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?subclass(?:es)?\s+of\s+(.+)$', _re.I), 'subclass_of'),
         (_re.compile(r'^(.+?)\s+(?:is|are)\s+(?:a\s+|an\s+)?instance(?:s)?\s+of\s+(.+)$', _re.I), 'instance_of'),
@@ -14424,10 +14971,17 @@ def _parse_learn_statements(text: str) -> list[dict]:
         for pattern, rel_type in patterns:
             m = pattern.match(line)
             if m:
-                subj = m.group(1).strip().lower()
-                obj = m.group(2).strip().lower()
+                subj_raw = m.group(1).strip()
+                obj_raw = m.group(2).strip()
+                subj, subj_type = _extract_name_type(subj_raw)
+                obj, obj_type = _extract_name_type(obj_raw)
                 if subj and obj:
-                    edges.append({"subject": subj, "rel_type": rel_type, "object": obj})
+                    edge = {"subject": subj, "rel_type": rel_type, "object": obj}
+                    if subj_type:
+                        edge["subject_type"] = subj_type
+                    if obj_type:
+                        edge["object_type"] = obj_type
+                    edges.append(edge)
                 break
     return edges
 
@@ -14448,6 +15002,7 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
     Returns {"rel_types_seeded": n, "taxonomy_seeded": bool, "rel_types": [...]}.
     Fails loud; on any error returns a zeroed result so hierarchy generation still runs.
     """
+    global _REL_TYPE_META
     result = {"rel_types_seeded": 0, "taxonomy_seeded": False, "rel_types": []}
     dsn = os.environ.get("POSTGRES_DSN", "")
     if not dsn:
@@ -14566,7 +15121,7 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
                     _norm["natural_language"] = (_d.get("natural_language")
                                                  or f"X {rt.replace('_', ' ')} Y")
                 ok = _create_rel_type_in_flow(
-                    _db, rt, _norm, confidence=0.6, source="expand_operational_seed")
+                    _db, rt, _norm, confidence=0.6, source="expand")
                 if ok:
                     seeded_rel_types.append(rt)
                     for _h in (_norm.get("head_types") or []):
@@ -14601,11 +15156,100 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
                         (taxonomy_name, f"Operational ontology for {topic}",
                          _members, seeded_rel_types),
                     )
+
+                    # Also merge into overlapping existing taxonomies whose
+                    # member_entity_types intersect with this domain's entity types.
+                    # This ensures that e.g. computer_system (Object, Concept) picks up
+                    # networking rels so GLiNER2 routing to computer_system still works.
+                    _tc.execute(
+                        """
+                        UPDATE entity_taxonomies
+                        SET rel_types_defining_group = (
+                            SELECT ARRAY(SELECT DISTINCT unnest(
+                                rel_types_defining_group || %s::text[])))
+                        WHERE taxonomy_name != %s
+                          AND member_entity_types && %s::text[]
+                        """,
+                        (seeded_rel_types, taxonomy_name, _members),
+                    )
+
                 _db.commit()
                 result["taxonomy_seeded"] = True
                 log.info("learn_topic.taxonomy_seeded",
                          taxonomy=taxonomy_name, members=_members,
                          defining_rel_types=seeded_rel_types)
+
+            # ── Write to user schema so determine_path (which queries per-user
+            #    search_path) can see the new taxonomy and expanded rels. ──────────
+            if seeded_rel_types and user_id and user_id != "anonymous":
+                try:
+                    from src.provisioning.schema_manager import (
+                        derive_user_slug_from_uuid, derive_schema_name,
+                    )
+                    _user_slug = derive_user_slug_from_uuid(user_id)
+                    _user_schema = derive_schema_name(_user_slug)
+                    with _db.cursor() as _uc:
+                        _uc.execute(f"SET search_path TO {_user_schema}")
+                        # Seed new taxonomy in user schema
+                        _uc.execute(
+                            """
+                            INSERT INTO entity_taxonomies
+                                (taxonomy_name, description, member_entity_types,
+                                 rel_types_defining_group)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (taxonomy_name) DO UPDATE SET
+                                member_entity_types = (
+                                    SELECT ARRAY(SELECT DISTINCT unnest(
+                                        entity_taxonomies.member_entity_types
+                                        || EXCLUDED.member_entity_types))),
+                                rel_types_defining_group = (
+                                    SELECT ARRAY(SELECT DISTINCT unnest(
+                                        entity_taxonomies.rel_types_defining_group
+                                        || EXCLUDED.rel_types_defining_group)))
+                            """,
+                            (taxonomy_name, f"Operational ontology for {topic}",
+                             _members, seeded_rel_types),
+                        )
+                        # Merge into overlapping taxonomies in user schema too
+                        _uc.execute(
+                            """
+                            UPDATE entity_taxonomies
+                            SET rel_types_defining_group = (
+                                SELECT ARRAY(SELECT DISTINCT unnest(
+                                    rel_types_defining_group || %s::text[])))
+                            WHERE taxonomy_name != %s
+                              AND member_entity_types && %s::text[]
+                            """,
+                            (seeded_rel_types, taxonomy_name, _members),
+                        )
+                        # Also seed the new rel_types into the user schema's rel_types table
+                        for _srt in seeded_rel_types:
+                            _meta = _REL_TYPE_META.get(_srt, {})
+                            _uc.execute(
+                                """
+                                INSERT INTO rel_types (rel_type, label, category, fact_class,
+                                    head_types, tail_types, is_symmetric, is_hierarchy_rel,
+                                    is_leaf_only, natural_language, source, engine_generated)
+                                VALUES (%s, %s, %s, 'B', %s, %s, %s, false, false, %s, 'expand', true)
+                                ON CONFLICT (rel_type) DO NOTHING
+                                """,
+                                (
+                                    _srt,
+                                    _meta.get("label", _srt.replace("_", " ").title()),
+                                    _meta.get("category", "system"),
+                                    _meta.get("head_types", ["ANY"]),
+                                    _meta.get("tail_types", ["ANY"]),
+                                    _meta.get("is_symmetric", False),
+                                    _meta.get("natural_language", f"X {_srt.replace('_', ' ')} Y"),
+                                ),
+                            )
+                    _db.commit()
+                    log.info("learn_topic.user_schema_taxonomy_seeded",
+                             schema=_user_schema, taxonomy=taxonomy_name,
+                             rel_types=seeded_rel_types)
+                except Exception as _us_err:
+                    log.warning("learn_topic.user_schema_seed_failed",
+                                error=str(_us_err)[:200])
     except Exception as e:
         log.error("learn_topic.operational_seed_insert_failed", topic=topic, error=str(e))
         return result
@@ -14618,7 +15262,6 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
     # per-insert, but call the consolidated refresh once more to be certain the scalar
     # cache and routing cache are consistent after the taxonomy write.
     try:
-        global _REL_TYPE_META
         _REL_TYPE_META = _build_rel_type_meta(dsn)
         _refresh_rel_type_cache()
         _refresh_scalar_rel_types_cache()
@@ -14645,6 +15288,17 @@ async def learn_topic(req: LearnTopicRequest):
     topic = req.topic.strip()
     user_id = req.user_id
 
+    _type_instruction = (
+        "ENTITY TYPING: Every entity MUST have a type annotation in parentheses. "
+        "Types are drawn from: Person, Animal, Organization, Location, Object, Concept. "
+        "Place the type immediately after the entity name.\n"
+        "Examples:\n"
+        "  Parliament of Canada (Organization) is a part of Government of Canada (Organization)\n"
+        "  dog (Concept) is a subclass of animal (Concept)\n"
+        "  Spot (Animal) is an instance of dog (Concept)\n"
+        "  CPU (Object) is a part of computer (Object)\n"
+    )
+
     if req.source_text:
         # Truncate to 6000 chars to avoid LLM context overflow
         source_excerpt = req.source_text[:6000].strip()
@@ -14653,9 +15307,10 @@ async def learn_topic(req: LearnTopicRequest):
             f"{source_excerpt}\n\n"
             f"Generate a complete ontological hierarchy. "
             f"Use ONLY these exact forms, one per line:\n"
-            f"  X is a subclass of Y\n"
-            f"  X is an instance of Y\n"
-            f"  X is a part of Y\n"
+            f"  X (Type) is a subclass of Y (Type)\n"
+            f"  X (Type) is an instance of Y (Type)\n"
+            f"  X (Type) is a part of Y (Type)\n\n"
+            f"{_type_instruction}"
             f"Go as deep as possible. No prose. No headers. No explanations. Statements only."
         )
         log.info("learn_topic.using_source_text",
@@ -14665,9 +15320,10 @@ async def learn_topic(req: LearnTopicRequest):
         prompt = (
             f"Generate the complete ontological hierarchy for: {topic}\n"
             f"Use ONLY these exact forms, one per line:\n"
-            f"  X is a subclass of Y\n"
-            f"  X is an instance of Y\n"
-            f"  X is a part of Y\n"
+            f"  X (Type) is a subclass of Y (Type)\n"
+            f"  X (Type) is an instance of Y (Type)\n"
+            f"  X (Type) is a part of Y (Type)\n\n"
+            f"{_type_instruction}"
             f"Go as deep as possible. No prose. No headers. No explanations. Statements only."
         )
 
@@ -14748,6 +15404,8 @@ async def learn_topic(req: LearnTopicRequest):
 
     edges = [
         EdgeInput(subject=e["subject"], rel_type=e["rel_type"], object=e["object"],
+                  subject_type=e.get("subject_type"),
+                  object_type=e.get("object_type"),
                   fact_provenance="llm_inferred")
         for e in raw_edges
     ]
@@ -14791,28 +15449,40 @@ async def learn_topic(req: LearnTopicRequest):
         except Exception as anchor_err:
             log.warning("learn_topic.anchor_failed", topic=topic, error=str(anchor_err))
 
-        # Mark topic entity as Concept so entity-centric query expansion can type-filter it.
-        # entity_type='Concept' is the correct semantic type for a topic/domain entity.
-        # Only updates if currently unknown — never overwrites a more specific type.
-        # Schema must be resolved to scope the UPDATE to the correct per-user schema.
+        # Type ALL hierarchy entities using their LLM-extracted types (from edge subject_type/object_type).
+        # The root topic entity defaults to 'Concept' (it IS a concept/domain).
+        # Intermediate nodes use their extracted type (Object for devices, Person for people, etc.)
+        # Only updates entity_type='unknown' — never overwrites user-stated types.
         try:
             from src.provisioning.schema_manager import derive_user_slug_from_uuid, derive_schema_name
             _user_slug = derive_user_slug_from_uuid(user_id)
             _schema = derive_schema_name(_user_slug)
             _dsn = os.environ.get("POSTGRES_DSN")
             if _dsn and _schema:
+                # Collect all entity->type mappings from edges
+                _entity_type_map = {topic.lower(): "Concept"}  # root topic is always Concept
+                for _e in edges:
+                    if _e.subject_type and _e.subject_type != "unknown":
+                        _entity_type_map[_e.subject.lower()] = _e.subject_type
+                    if _e.object_type and _e.object_type != "unknown":
+                        _entity_type_map[_e.object.lower()] = _e.object_type
+                # Root topic override: always Concept regardless of edge types
+                _entity_type_map[topic.lower()] = "Concept"
+
                 with psycopg2.connect(_dsn) as _tdb:
                     with _tdb.cursor() as _tc:
-                        _tc.execute(f"SET search_path TO {_schema}, public")
-                        _tc.execute("""
-                            UPDATE entities SET entity_type = 'Concept'
-                            WHERE id = (
-                                SELECT entity_id FROM entity_aliases
-                                WHERE alias = %s LIMIT 1
-                            ) AND entity_type = 'unknown'
-                        """, (topic.lower(),))
+                        _tc.execute(f"SET search_path TO {_schema}")
+                        for _ename, _etype in _entity_type_map.items():
+                            _tc.execute("""
+                                UPDATE entities SET entity_type = %s
+                                WHERE id = (
+                                    SELECT entity_id FROM entity_aliases
+                                    WHERE alias = %s LIMIT 1
+                                ) AND entity_type = 'unknown'
+                            """, (_etype, _ename))
                     _tdb.commit()
-                    log.info("learn_topic.entity_typed_as_concept", topic=topic)
+                    log.info("learn_topic.entities_typed", topic=topic,
+                             count=len(_entity_type_map))
         except Exception as _te:
             log.warning("learn_topic.entity_type_update_failed", topic=topic, error=str(_te))
 

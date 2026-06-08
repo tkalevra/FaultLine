@@ -40,6 +40,7 @@ HARD CONSTRAINTS (violations will cause Phase 2 rejection):
 import asyncio
 import json
 import os
+import re as _re
 import structlog
 import time
 from datetime import datetime, timedelta
@@ -48,6 +49,19 @@ from typing import Optional, Any
 import httpx
 
 log = structlog.get_logger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# THINK-TAG STRIPPING: Qwen3 models wrap reasoning in <think>...</think> tags
+# before the actual JSON output.  Strip these before JSON parsing.
+# Defense-in-depth Layer 2 — Layer 1 (chat_template_kwargs in llm_client.py)
+# prevents thinking at the request level; this catches leakage from weak models.
+# ──────────────────────────────────────────────────────────────────────────────
+_THINK_RE = _re.compile(r'<think>.*?</think>', _re.DOTALL)
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from LLM output."""
+    return _THINK_RE.sub('', text).strip()
 
 # Module-level sync HTTP client — initialized at import time so it is available
 # in both the FastAPI process and the re_embedder subprocess without depending
@@ -387,6 +401,7 @@ def call_llm_with_retry_sync(
     timeout: Optional[float] = None,
     max_retries: int = 3,
     operation: str = "DEFAULT",
+    max_tokens: int = 500,
 ) -> dict:
     """
     Synchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -452,7 +467,7 @@ def call_llm_with_retry_sync(
         model=model,
         user_id=user_id,
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=max_tokens,
     )
 
     endpoints = _get_endpoint_list()
@@ -501,6 +516,8 @@ def call_llm_with_retry_sync(
                     continue
 
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                # Strip <think>...</think> reasoning blocks (Qwen3 models)
+                content = _strip_think_tags(content)
 
                 if not content:
                     return {}
@@ -508,9 +525,9 @@ def call_llm_with_retry_sync(
                 try:
                     return json.loads(content)
                 except json.JSONDecodeError:
-                    # Try to extract JSON from text
-                    import re
-                    match = re.search(r'\{.*\}', content, re.DOTALL)
+                    match = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, _re.DOTALL)
+                    if not match:
+                        match = _re.search(r'\{.*\}', content, _re.DOTALL)
                     if match:
                         return json.loads(match.group())
                     else:
@@ -523,6 +540,12 @@ def call_llm_with_retry_sync(
             except Exception as e:
                 last_error = e
                 elapsed = time.time() - start_time
+                response_body = ""
+                if isinstance(e, httpx.HTTPStatusError) and hasattr(e, 'response'):
+                    try:
+                        response_body = e.response.text[:500]
+                    except Exception:
+                        pass
                 log.warning("llm_call.attempt_failed",
                            user_id=user_id,
                            operation=operation,
@@ -530,7 +553,8 @@ def call_llm_with_retry_sync(
                            endpoint_index=endpoint_idx,
                            elapsed_seconds=round(elapsed, 2),
                            error_type=type(e).__name__,
-                           error_message=str(e)[:200])
+                           error_message=str(e)[:200],
+                           response_body=response_body or "(unavailable)")
 
         # All endpoints failed for this attempt
         if attempt < max_retries:
@@ -568,6 +592,7 @@ async def call_llm_with_retry_async(
     timeout: Optional[float] = None,
     max_retries: int = 3,
     operation: str = "DEFAULT",
+    max_tokens: int = 500,
 ) -> dict:
     """
     Asynchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -620,7 +645,7 @@ async def call_llm_with_retry_async(
         model=model,
         user_id=user_id,
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=max_tokens,
     )
 
     endpoints = _get_endpoint_list()
@@ -671,6 +696,8 @@ async def call_llm_with_retry_async(
                     continue
 
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                # Strip <think>...</think> reasoning blocks (Qwen3 models)
+                content = _strip_think_tags(content)
 
                 if not content:
                     return {}
@@ -678,8 +705,9 @@ async def call_llm_with_retry_async(
                 try:
                     return json.loads(content)
                 except json.JSONDecodeError:
-                    import re
-                    match = re.search(r'\{.*\}', content, re.DOTALL)
+                    match = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, _re.DOTALL)
+                    if not match:
+                        match = _re.search(r'\{.*\}', content, _re.DOTALL)
                     if match:
                         return json.loads(match.group())
                     else:
@@ -692,6 +720,12 @@ async def call_llm_with_retry_async(
             except Exception as e:
                 last_error = e
                 elapsed = time.time() - start_time
+                response_body = ""
+                if isinstance(e, httpx.HTTPStatusError) and hasattr(e, 'response'):
+                    try:
+                        response_body = e.response.text[:500]
+                    except Exception:
+                        pass
                 log.warning("llm_call_async.attempt_failed",
                            user_id=user_id,
                            operation=operation,
@@ -699,7 +733,8 @@ async def call_llm_with_retry_async(
                            endpoint_index=endpoint_idx,
                            elapsed_seconds=round(elapsed, 2),
                            error_type=type(e).__name__,
-                           error_message=str(e)[:200])
+                           error_message=str(e)[:200],
+                           response_body=response_body or "(unavailable)")
 
         # All endpoints failed for this attempt
         if attempt < max_retries:
@@ -736,6 +771,7 @@ def call_llm_no_retry_sync(
     user_id: str = "anonymous",
     timeout: Optional[float] = None,
     operation: str = "DEFAULT",
+    max_tokens: int = 500,
 ) -> Optional[dict]:
     """
     Single-attempt LLM call with graceful failure (no retry).
@@ -777,7 +813,7 @@ def call_llm_no_retry_sync(
             model=model,
             user_id=user_id,
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=max_tokens,
         )
 
         endpoints = _get_endpoint_list()
@@ -821,6 +857,8 @@ def call_llm_no_retry_sync(
             return None
 
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        # Strip <think>...</think> reasoning blocks (Qwen3 models)
+        content = _strip_think_tags(content)
 
         if not content:
             return None
@@ -828,8 +866,9 @@ def call_llm_no_retry_sync(
         try:
             return json.loads(content)
         except json.JSONDecodeError:
-            import re
-            match = re.search(r'\{.*\}', content, re.DOTALL)
+            match = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, _re.DOTALL)
+            if not match:
+                match = _re.search(r'\{.*\}', content, _re.DOTALL)
             if match:
                 return json.loads(match.group())
             else:
@@ -840,11 +879,18 @@ def call_llm_no_retry_sync(
                 return None
 
     except Exception as e:
+        response_body = ""
+        if isinstance(e, httpx.HTTPStatusError) and hasattr(e, 'response'):
+            try:
+                response_body = e.response.text[:500]
+            except Exception:
+                pass
         log.warning("llm_call_no_retry.failed_gracefully",
                    user_id=user_id,
                    operation=operation,
                    error_type=type(e).__name__,
-                   error_message=str(e)[:200])
+                   error_message=str(e)[:200],
+                   response_body=response_body or "(unavailable)")
         return None
 
 

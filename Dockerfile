@@ -8,19 +8,16 @@ ENV PATH="/venv/bin:$PATH"
 
 RUN pip install --upgrade pip
 
-# Install CPU-only PyTorch FIRST, before anything that pulls it transitively.
-# GLiNER2 -> gliner/peft depend on torch; the default Linux wheel drags in
-# ~5 GB of nvidia-cuda-* packages we never use — extraction runs on CPU.
-# Pre-seeding the CPU build means the dependency resolver below is satisfied
-# and never fetches the CUDA wheels.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
 COPY pyproject.toml .
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 
 # Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
 RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
+
+# Pre-download the fastembed nomic model for local CPU embeddings (avoids hitting external LLM)
+ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+RUN python -c "import os; os.environ['FASTEMBED_CACHE_PATH']='/root/.cache/fastembed'; from fastembed import TextEmbedding; TextEmbedding('nomic-ai/nomic-embed-text-v1.5')"
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
@@ -40,11 +37,16 @@ COPY migrations/ ./migrations/
 COPY tools/     ./tools/
 COPY docker-entrypoint.sh ./
 
-RUN chmod +x docker-entrypoint.sh
+RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh
 
 ENV PATH="/venv/bin:$PATH"
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
+ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
+# Model is pre-cached in the image — prevent HuggingFace update checks at runtime.
+# Without this, from_pretrained() blocks startup for ~3 minutes in restricted networks.
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 

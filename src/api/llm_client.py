@@ -149,6 +149,20 @@ def build_llm_payload(
             payload["thinking"] = thinking
         # else: silently drop — unsupported by this backend
 
+    # ── Reasoning/thinking suppression ───────────────────────────────────────
+    # FaultLine uses LLMs exclusively for structured JSON extraction — thinking
+    # mode wastes tokens, adds latency, and breaks JSON parsing.  Disable it
+    # across ALL backends unconditionally.
+    #
+    # Qwen3.5 ≤9B should default to thinking-off, but serving frameworks
+    # (LM Studio, llama.cpp) have known bugs where the default is ignored.
+    # Explicit suppression is required.  See BUGS/qwen3-thinking-mode/.
+    #
+    # chat_template_kwargs is the Qwen3.5 / vLLM / OpenAI-compat mechanism.
+    # Unknown fields are silently ignored by backends that don't support them.
+    if backend not in ("anthropic", "openwebui"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
     # Anthropic-specific request shape adjustments
     if backend == "anthropic":
         # Extract system message from messages array into top-level system field
@@ -188,6 +202,7 @@ def get_endpoint_list() -> list[str]:
     logic lives in one module. llm_calls._get_endpoint_list() delegates here.
 
     Priority (Docker-aware):
+    0. LLM_BACKEND_TYPE + LLM_BASE_URL → backend-typed endpoint (highest priority)
     1. OPENWEBUI_INTERNAL_URL  → appends /api/chat/completions
     2. OPENWEBUI_URL           → appends /api/chat/completions
     3. QWEN_API_URL            → used as-is
@@ -197,6 +212,14 @@ def get_endpoint_list() -> list[str]:
         Ordered list of complete endpoint URLs, deduplicated, ready to POST to.
     """
     endpoints = []
+
+    # Priority 0: typed backend (LLM_BACKEND_TYPE + LLM_BASE_URL) — always wins
+    typed = get_backend_endpoint()
+    if typed:
+        endpoints.append(typed)
+        # Return immediately — typed backend is authoritative; no legacy fallthrough
+        log.debug("llm_endpoints.resolved", count=1, first=typed)
+        return endpoints
 
     openwebui_internal = os.environ.get("OPENWEBUI_INTERNAL_URL", "").strip()
     if openwebui_internal:

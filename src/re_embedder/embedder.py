@@ -38,11 +38,16 @@ def _get_local_embedder():
         return _local_embedder
     try:
         from fastembed import TextEmbedding
-        _local_embedder = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
-        log.info("local_embedder.initialized model=nomic-embed-text-v1.5")
+        _cache = os.getenv("FASTEMBED_CACHE_PATH")
+        _local_embedder = TextEmbedding("nomic-ai/nomic-embed-text-v1.5",
+                                        cache_dir=_cache) if _cache else TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+        log.info(f"local_embedder.initialized model=nomic-embed-text-v1.5 cache_dir={_cache or 'default'}")
     except ImportError:
-        log.warning("local_embedder.unavailable fastembed not installed")
-        _local_embedder = False   # sentinel: don't retry import
+        log.warning("local_embedder.unavailable reason=fastembed_not_installed")
+        _local_embedder = False
+    except Exception as e:
+        log.warning(f"local_embedder.init_failed error={e}")
+        _local_embedder = False
     return _local_embedder
 
 
@@ -304,22 +309,32 @@ def resolve_display_names_for_facts(db_conn, rows: list[dict]) -> list[dict]:
 
 def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bool = True, embedding_url: str = None) -> list[float] | None:
     """
-    Embed text using the nomic-embed-text model via the Ollama/Qwen API.
+    Embed text using nomic-embed-text-v1.5.
 
+    Priority: local CPU fastembed first (zero network cost), external API as fallback.
     fallback=True  (default, used by re_embedder): returns a hash vector on failure so
                    the re_embedder loop keeps running.
     fallback=False (used by /query):               returns None on failure so the caller
                    can skip the Qdrant search rather than searching with a meaningless vector.
     embedding_url: Explicit embedding endpoint (optional, overrides inferred path).
     """
-    # Use explicit embedding URL if provided, fallback to inferring from chat URL
+    # LOCAL CPU FIRST: fastembed nomic-embed-text (pre-cached in Docker image)
+    local = _get_local_embedder()
+    if local:
+        try:
+            vectors = list(local.embed([text]))
+            if vectors:
+                return list(vectors[0])
+        except Exception as local_err:
+            log.warning(f"local_embedder.failed: {local_err}")
+
+    # EXTERNAL FALLBACK: hit LLM backend /v1/embeddings
     if embedding_url:
         embed_url = embedding_url
     else:
         embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
 
     try:
-        # Use persistent pooled client if available, fallback to httpx.post() for bac${LOCATION}ard compatibility
         if _http_client_sync:
             response = _http_client_sync.post(
                 embed_url,
@@ -328,7 +343,6 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
                 timeout=timeout,
             )
         else:
-            # Use pooled client instead of bare httpx.post() (dBug-051: prevent connection churn)
             response = _http_client.post(
                 embed_url,
                 json={"model": _EMBEDDING_MODEL, "input": text},
@@ -345,16 +359,6 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
 
     except Exception as e:
         if fallback:
-            # Try local CPU embedder before falling back to hash vector
-            local = _get_local_embedder()
-            if local:
-                try:
-                    vectors = list(local.embed([text]))
-                    if vectors:
-                        log.info("local_embedder.used text_preview={}", text[:50])
-                        return list(vectors[0])
-                except Exception as local_err:
-                    log.warning(f"local_embedder.failed: {local_err}")
             log.warning(f"re_embedder.embed_failed text_preview={text[:50]} falling back to hash vector: {e}")
             return hash_vector(text)
         log.error(f"re_embedder.embed_failed text_preview={text[:50]} no fallback: {e}")
@@ -588,6 +592,109 @@ def promote_facts(db_conn) -> None:
     db_conn.commit()
 
 
+def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
+    """Post-expand reconciliation: create missing instance_of links for entities
+    whose entity_type matches a hierarchy node alias.
+
+    Called periodically by re_embedder. Finds entities that should be linked
+    to hierarchy nodes but aren't yet (because they were ingested before /expand).
+
+    Returns count of new instance_of facts created.
+    """
+    created = 0
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {schema_name}")
+
+                # Find hierarchy node IDs (things that appear as objects of subclass_of/instance_of)
+                cur.execute("""
+                    SELECT DISTINCT object_id FROM facts
+                    WHERE rel_type IN ('subclass_of', 'instance_of', 'part_of')
+                      AND superseded_at IS NULL
+                    UNION
+                    SELECT DISTINCT object_id FROM staged_facts
+                    WHERE rel_type IN ('subclass_of', 'instance_of', 'part_of')
+                      AND promoted_at IS NULL
+                """)
+                hierarchy_node_ids = {row[0] for row in cur.fetchall()}
+                if not hierarchy_node_ids:
+                    return 0
+
+                # Get hierarchy node aliases
+                cur.execute("""
+                    SELECT entity_id, alias FROM entity_aliases
+                    WHERE entity_id = ANY(%s)
+                """, (list(hierarchy_node_ids),))
+                alias_to_node = {}
+                for row in cur.fetchall():
+                    alias_to_node[row[1].lower()] = row[0]
+
+                if not alias_to_node:
+                    return 0
+
+                # Find entities whose entity_type (lowercased) matches a hierarchy alias
+                # but don't already have an instance_of to that node
+                for type_name, node_id in alias_to_node.items():
+                    cur.execute("""
+                        SELECT e.id FROM entities e
+                        WHERE LOWER(e.entity_type) = %s
+                          AND e.id != %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM facts f
+                              WHERE f.subject_id = e.id AND f.object_id = %s
+                                AND f.rel_type = 'instance_of' AND f.superseded_at IS NULL
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM staged_facts sf
+                              WHERE sf.subject_id = e.id AND sf.object_id = %s
+                                AND sf.rel_type = 'instance_of' AND sf.promoted_at IS NULL
+                          )
+                    """, (type_name, node_id, node_id, node_id))
+
+                    for (entity_id,) in cur.fetchall():
+                        cur.execute("""
+                            INSERT INTO staged_facts
+                                (subject_id, object_id, rel_type, fact_class, provenance, confidence, first_seen_at)
+                            VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_reconciliation', 0.6, now())
+                            ON CONFLICT (subject_id, object_id, rel_type)
+                            DO UPDATE SET last_seen_at = now(),
+                                confirmed_count = staged_facts.confirmed_count + 1
+                        """, (entity_id, node_id))
+                        created += 1
+
+                if created:
+                    conn.commit()
+    except Exception as e:
+        log.warning(f"reconcile_hierarchy.failed schema={schema_name} error={e}")
+
+    return created
+
+
+def _upgrade_staged_facts_with_known_rels(dsn: str, schema_name: str) -> int:
+    """Upgrade Class C staged_facts to Class B when their rel_type now exists in rel_types table."""
+    upgraded = 0
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {schema_name}")
+                cur.execute("""
+                    UPDATE staged_facts sf
+                    SET fact_class = 'B', confidence = GREATEST(confidence, 0.6)
+                    FROM public.rel_types rt
+                    WHERE sf.rel_type = rt.rel_type
+                      AND sf.fact_class = 'C'
+                      AND sf.promoted_at IS NULL
+                      AND (sf.expires_at IS NULL OR sf.expires_at > now())
+                """)
+                upgraded = cur.rowcount
+                if upgraded:
+                    conn.commit()
+    except Exception as e:
+        log.warning(f"upgrade_staged.failed schema={schema_name} error={e}")
+    return upgraded
+
+
 def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_name: str = None, promotion_threshold: int = 3) -> int:
     """
     Promote Class B staged facts to facts table when confirmed_count >= threshold.
@@ -647,7 +754,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         if schema_name:
             try:
                 with db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}, public")
+                    cur.execute(f"SET search_path TO {schema_name}")
             except Exception as e:
                 log.warning(f"re_embedder.search_path_setup_failed schema={schema_name}: {e}")
                 # Continue with current search_path
@@ -972,7 +1079,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
         if schema_name:
             try:
                 with db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}, public")
+                    cur.execute(f"SET search_path TO {schema_name}")
                 db_conn.commit()
             except Exception as e:
                 log.warning(f"re_embedder.class_c_promote_search_path_failed schema={schema_name}: {e}")
@@ -1171,6 +1278,7 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             log.info(f"re_embedder.reconcile_scroll collection={collection} count={len(all_points)}")
 
             # Step 3: Batch fetch PostgreSQL ground truth
+            # Derive user schema from collection name (faultline-{user_id})
             fact_ids = [
                 p["payload"]["fact_id"] for p in all_points
                 if "fact_id" in p.get("payload", {})
@@ -1179,33 +1287,47 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             if not fact_ids:
                 continue
 
+            # Set search_path to user's schema derived from collection name
+            # Collection format: "faultline-{user_id}" or "faultline-test"
+            _collection_user_id = collection.replace("faultline-", "", 1)
+            _schema_name = None
+            if _collection_user_id and _collection_user_id != "test" and _collection_user_id != "main":
+                try:
+                    from src.provisioning.schema_manager import derive_schema_name, derive_user_slug_from_uuid
+                    _user_slug = derive_user_slug_from_uuid(_collection_user_id)
+                    _schema_name = derive_schema_name(_user_slug)
+                except Exception as _e:
+                    log.warning(f"re_embedder.reconcile_schema_derivation_failed collection={collection} error={_e}")
+
             pg_facts = {}
             with db_conn.cursor() as cur:
+                if _schema_name:
+                    cur.execute(f"SET search_path TO {_schema_name}, public")
+
                 placeholders = ",".join(["%s"] * len(fact_ids))
+                # Query BOTH facts and staged_facts (Class B/C live in staged_facts)
                 cur.execute(
                     f"""
-                    SELECT id, user_id, subject_id, object_id, rel_type, provenance,
-                           confidence, confirmed_count, last_seen_at, contradicted_by,
-                           hard_delete_flag, superseded_at
+                    SELECT id, subject_id, object_id, rel_type,
+                           confidence, superseded_at
                     FROM facts
                     WHERE id IN ({placeholders})
+                    UNION ALL
+                    SELECT id, subject_id, object_id, rel_type,
+                           confidence, NULL as superseded_at
+                    FROM staged_facts
+                    WHERE id IN ({placeholders}) AND promoted_at IS NULL
                     """,
-                    fact_ids
+                    fact_ids + fact_ids
                 )
                 for row in cur.fetchall():
                     pg_facts[row[0]] = {
                         "id": row[0],
-                        "user_id": row[1],
-                        "subject_id": row[2],
-                        "object_id": row[3],
-                        "rel_type": row[4],
-                        "provenance": row[5],
-                        "confidence": row[6],
-                        "confirmed_count": row[7],
-                        "last_seen_at": row[8],
-                        "contradicted_by": row[9],
-                        "hard_delete_flag": row[10],
-                        "superseded_at": row[11],
+                        "subject_id": row[1],
+                        "object_id": row[2],
+                        "rel_type": row[3],
+                        "confidence": row[4],
+                        "superseded_at": row[5],
                     }
 
             # Step 4: Reconcile each point
@@ -1228,53 +1350,43 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
 
                     pg_row = pg_facts[fact_id]
 
-                    # 4b: Check if fact is superseded or hard-deleted
-                    if pg_row["superseded_at"] is not None or pg_row["hard_delete_flag"]:
+                    # 4b: Check if fact is superseded — delete from Qdrant
+                    if pg_row.get("superseded_at") is not None:
                         httpx.post(
                             f"{qdrant_url}/collections/{collection}/points/delete",
                             json={"points": [point_id]},
                             timeout=10.0
                         )
                         stats["deleted"] += 1
-                        reason = "hard_deleted" if pg_row["hard_delete_flag"] else "superseded"
-                        log.info(f"re_embedder.reconcile_deleted point_id={point_id} reason={reason} collection={collection}")
+                        log.info(f"re_embedder.reconcile_deleted point_id={point_id} reason=superseded collection={collection}")
                         continue
 
-                    # 4c: Build expected payload from PostgreSQL ground truth
-                    resolved_rows = resolve_display_names_for_facts(db_conn, [pg_row])
-                    resolved_row = resolved_rows[0]
+                    # 4c: Fact exists and is active — check payload drift
+                    expected_rel_type = pg_row.get("rel_type")
+                    expected_confidence = float(pg_row.get("confidence") or 0.8)
 
-                    expected_payload = {
-                        "subject": resolved_row.get("subject_display", pg_row["subject_id"]),
-                        "object": resolved_row.get("object_display", pg_row["object_id"]),
-                        "rel_type": pg_row["rel_type"],
-                        "confidence": pg_row["confidence"],
-                        "confirmed_count": pg_row["confirmed_count"],
-                        "contradicted": pg_row["contradicted_by"] is not None,
-                    }
-
-                    # 4d: Compare payloads (exclude last_seen_at and other fields)
-                    # Use tolerance for confidence (JSON float round-trip drift)
                     payload_matches = (
-                        payload.get("subject") == expected_payload["subject"]
-                        and payload.get("object") == expected_payload["object"]
-                        and payload.get("rel_type") == expected_payload["rel_type"]
-                        and abs((payload.get("confidence") or 0.0) - expected_payload["confidence"]) <= 0.001
-                        and payload.get("confirmed_count") == expected_payload["confirmed_count"]
-                        and payload.get("contradicted") == expected_payload["contradicted"]
+                        payload.get("rel_type") == expected_rel_type
+                        and abs((payload.get("confidence") or 0.0) - expected_confidence) <= 0.01
                     )
 
                     if not payload_matches:
-                        # 4e: Re-embed and re-upsert
-                        text = f"{expected_payload['subject']} {expected_payload['rel_type']} {expected_payload['object']}"
+                        # 4d: Re-embed and re-upsert with corrected payload
+                        text = f"{payload.get('subject', '')} {expected_rel_type} {payload.get('object', '')}"
                         vector = embed_text(text, qwen_api_url, timeout=30.0, fallback=True)
-                        if upsert_to_qdrant(resolved_row, vector, collection, qdrant_url):
+                        _reupsert_payload = {**payload, "rel_type": expected_rel_type, "confidence": expected_confidence}
+                        try:
+                            httpx.put(
+                                f"{qdrant_url}/collections/{collection}/points",
+                                json={"points": [{"id": point_id, "vector": vector, "payload": _reupsert_payload}]},
+                                timeout=10.0
+                            )
                             stats["reupserted"] += 1
                             log.info(f"re_embedder.reconcile_reupserted point_id={point_id} fact_id={fact_id} collection={collection}")
-                        else:
+                        except Exception as _re:
+                            log.warning(f"re_embedder.reconcile_reupsert_failed point_id={point_id}: {_re}")
                             stats["errors"] += 1
                     else:
-                        # 4f: Payload matches
                         stats["ok"] += 1
 
                 except Exception as e:
@@ -3005,7 +3117,7 @@ def main():
                 try:
                     with psycopg2.connect(postgres_dsn) as db_per_user:
                         with db_per_user.cursor() as cur:
-                            cur.execute(f"SET search_path TO {schema_name}, public")
+                            cur.execute(f"SET search_path TO {schema_name}")
                         db_per_user.commit()
 
                         # Promote staged facts for this user
@@ -3081,6 +3193,24 @@ def main():
                                         log.info(f"re_embedder.staged_synced staged_id={row['staged_id']} user_id={user_id[:8]}")
                                 except Exception as e:
                                     log.error(f"re_embedder.staged_row_error staged_id={row['staged_id']} user_id={user_id[:8]}: {e}")
+
+                        # Post-expand reconciliation: create missing instance_of links
+                        # for entities whose entity_type matches a hierarchy node alias.
+                        try:
+                            n_reconciled = _reconcile_hierarchy_links(postgres_dsn, schema_name)
+                            if n_reconciled:
+                                log.info(f"re_embedder.hierarchy_reconciled user_id={user_id[:8]} schema={schema_name} created={n_reconciled}")
+                        except Exception as _recon_err:
+                            log.warning(f"re_embedder.hierarchy_reconcile_error user_id={user_id[:8]}: {_recon_err}")
+
+                        # Upgrade Class C staged_facts to Class B when their rel_type
+                        # now exists in the rel_types table (approved by ontology eval).
+                        try:
+                            n_upgraded = _upgrade_staged_facts_with_known_rels(postgres_dsn, schema_name)
+                            if n_upgraded:
+                                log.info(f"re_embedder.staged_upgraded_c_to_b user_id={user_id[:8]} schema={schema_name} upgraded={n_upgraded}")
+                        except Exception as _upg_err:
+                            log.warning(f"re_embedder.staged_upgrade_error user_id={user_id[:8]}: {_upg_err}")
 
                 except Exception as e:
                     log.error(f"re_embedder.per_user_promotion_failed user_id={user_id[:8] if user_id else 'unknown'} schema={schema_name}: {e}")
