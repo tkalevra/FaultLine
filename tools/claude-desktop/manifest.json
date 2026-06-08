@@ -28,19 +28,19 @@
   "tools": [
     {
       "name": "recall_memory",
-      "description": "Query FaultLine knowledge graph to recall facts relevant to the conversation."
+      "description": "Recall what you know about the user or a topic from memory. Call this at the start of any turn where the user's message touches on something you might already know about them."
     },
     {
       "name": "remember_facts",
-      "description": "Store new facts extracted from the conversation into the knowledge graph."
+      "description": "Store facts from the conversation OR correct/update a prior fact. Correction signals: 'actually X is Y', 'X is now Y not Z', 'I meant X', any update to a previously stated value."
     },
     {
       "name": "learn_facts",
-      "description": "Ingest structured fact edges directly into the knowledge graph."
+      "description": "Ingest structured ontological statements — 'X is a subclass of Y', 'X is an instance of Y', 'X is a part of Y'. Maps how concepts relate."
     },
     {
       "name": "retract_fact",
-      "description": "Remove a fact from the knowledge graph."
+      "description": "Remove a fact from memory. Use ONLY for deletions — 'forget that', 'remove', 'erase'. Do NOT use for corrections — use remember_facts instead."
     }
   ],
   "tools_generated": true,
