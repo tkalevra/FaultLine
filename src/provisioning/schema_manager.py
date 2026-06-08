@@ -337,6 +337,21 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
             """)
             log.info("bootstrapped_retraction_signals", schema=schema_name, count=10)
 
+            # Seed user identity anchor — allows first-person references from GLiNER2
+            # (subject="user") to normalize to the user UUID immediately on first ingest.
+            # Overwritable: when user later says "my name is Chris", pref_name updates the alias.
+            cur.execute("""
+                INSERT INTO entities (id, entity_type)
+                VALUES (%s, 'Person')
+                ON CONFLICT (id) DO NOTHING
+            """, (user_id,))
+            cur.execute("""
+                INSERT INTO entity_aliases (entity_id, alias, is_preferred)
+                VALUES (%s, 'user', TRUE)
+                ON CONFLICT (entity_id, alias) DO UPDATE SET is_preferred = TRUE
+            """, (user_id,))
+            log.info("bootstrapped_user_anchor", schema=schema_name, user_id=user_id)
+
             db.commit()
             return True
 
@@ -545,6 +560,39 @@ def _validate_schema_structure(schema_name: str, user_id: str, db: psycopg2.exte
     }
 
 
+def _flush_user_idempotency_cache(user_id: str) -> None:
+    """Flush Redis idempotency keys that reference this user_id.
+
+    Called once during schema provisioning — NOT on every request.
+    Idempotency keys encode user_id in the hash input, so we can't
+    selectively delete by user.  SCAN for the `idempotent:` prefix
+    and delete all; the 1-hour TTL means the set is small.
+    Best-effort: Redis unavailability must not block provisioning.
+    """
+    try:
+        redis_url = os.environ.get("REDIS_URL", "redis://faultline-redis:6379/0")
+        import redis as _redis
+        r = _redis.from_url(redis_url, decode_responses=True)
+        r.ping()
+
+        deleted = 0
+        for prefix in ("idempotent:", "lock:"):
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor, match=f"{prefix}*", count=100)
+                if keys:
+                    r.delete(*keys)
+                    deleted += len(keys)
+                if cursor == 0:
+                    break
+
+        log.info("provisioning.redis_idempotency_flushed",
+                 user_id=user_id[:8], keys_deleted=deleted)
+    except Exception as e:
+        log.warning("provisioning.redis_flush_failed",
+                    user_id=user_id[:8], error=str(e))
+
+
 def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.extensions.connection] = None) -> Tuple[str, str]:
     """Create a new user schema and bootstrap metadata.
 
@@ -609,7 +657,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                 return schema_name, f"Failed to verify schema existence: {str(e)}"
 
             # Apply template schema via psql (handles dollar-quoted strings correctly)
-            template_path = Path(__file__).parent.parent.parent / "migrations" / "051_template_user_schema.sql"
+            template_path = Path(__file__).parent / "templates" / "user_schema.sql"
             if not template_path.exists():
                 return schema_name, f"Template file not found: {template_path}"
 
@@ -762,6 +810,12 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
             except Exception as e:
                 log.error("schema_verification_failed", schema=schema_name, user_id=user_id[:8], error=str(e))
                 return schema_name, f"Schema verification failed: {str(e)}"
+
+            # Flush stale Redis idempotency keys for this user.
+            # On fresh schema creation, cached ingest/extract responses from a
+            # prior schema are stale — the data they reference no longer exists.
+            # One-shot: only fires during provisioning, never on normal requests.
+            _flush_user_idempotency_cache(user_id)
 
             # Update user_provisioning status to ready (in public schema)
             try:

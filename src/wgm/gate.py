@@ -143,9 +143,10 @@ _UUID_RE = re.compile(
 )
 
 class WGMValidationGate:
-    def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None):
+    def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None, schema_name: str = None):
         self.db_conn = db_conn
         self.registry = registry
+        self._schema_name = schema_name
         # Initialize unified LLM output validator (dBug-046 Phase 2a)
         # If not provided, create instance with auto-detected LLM endpoint via centralized logic
         if validator is None:
@@ -159,6 +160,15 @@ class WGMValidationGate:
         # Every validation query gets fresh ontology via self.get_current_ontology()
         # This ensures rel_types learned by re_embedder are immediately available
         # See get_current_ontology() for fallback chain
+
+    def _reapply_search_path(self):
+        """Re-apply per-user search_path after rollback to prevent public schema fallthrough."""
+        if self._schema_name:
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {self._schema_name}")
+            except Exception:
+                pass
 
     def _check_type_constraints(
         self,
@@ -441,6 +451,11 @@ class WGMValidationGate:
             self.db_conn.commit()
             return updated
         except Exception as e:
+            try:
+                self.db_conn.rollback()
+                self._reapply_search_path()
+            except Exception:
+                pass
             log.warning("wgm.entity_type_infer_failed", entity_id=entity_id, error=str(e))
             return False
 
@@ -521,6 +536,7 @@ class WGMValidationGate:
         except Exception as e:
             try:
                 self.db_conn.rollback()
+                self._reapply_search_path()
             except Exception:
                 pass
             log.error(
@@ -602,6 +618,7 @@ class WGMValidationGate:
                     error=str(e),
                 )
                 self.db_conn.rollback()
+                self._reapply_search_path()
 
             return {
                 "action": "supersede",
@@ -958,6 +975,7 @@ class WGMValidationGate:
                     except Exception as e:
                         try:
                             self.db_conn.rollback()
+                            self._reapply_search_path()
                         except Exception:
                             pass
                         log.warning("wgm.pending_types_insert_failed", rel_type=rt, error=str(e))
@@ -1544,4 +1562,5 @@ Respond with ONLY the JSON, no explanation."""
                 error=str(e),
             )
             self.db_conn.rollback()
+            self._reapply_search_path()
             return False

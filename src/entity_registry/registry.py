@@ -85,6 +85,9 @@ class EntityRegistry:
             log.info("entity_registry.resolve_user_special_case", entity_id=entity_id)
             # Ensure the user entity exists (per-user schema, no user_id column needed)
             with self.db_conn.cursor() as cur:
+                # Re-assert search_path WITHOUT public fallback before write
+                if self.schema_name:
+                    cur.execute(f"SET search_path TO {self.schema_name}")
                 cur.execute(
                     "INSERT INTO entities (id, entity_type) "
                     "VALUES (%s, 'Person') "
@@ -139,6 +142,7 @@ class EntityRegistry:
 
             # HARD CONSTRAINT: Reject rel_type names from being registered as entities
             # Check if this name is a known rel_type (prevents parent_of, instance_of, etc. from becoming entities)
+            # rel_types exists in both per-user schema and public; search_path resolves correctly
             cur.execute(
                 "SELECT rel_type FROM rel_types WHERE LOWER(rel_type) = %s",
                 (name,),
@@ -159,8 +163,11 @@ class EntityRegistry:
                     cur.execute("SELECT 1")
                 except Exception:
                     self.db_conn.rollback()
-                    if self.schema_name:
-                        cur.execute(f"SET search_path TO {self.schema_name}, public")
+                # Re-assert search_path WITHOUT public fallback before write operations
+                # This prevents writes from falling through to public schema tables
+                # which have different unique constraints (user_id, alias) vs (entity_id, alias)
+                if self.schema_name:
+                    cur.execute(f"SET search_path TO {self.schema_name}")
                 cur.execute(
                     "INSERT INTO entities (id, entity_type) "
                     "VALUES (%s, 'unknown') "
@@ -224,6 +231,9 @@ class EntityRegistry:
 
         try:
             with self.db_conn.cursor() as cur:
+                # Re-assert search_path WITHOUT public fallback before write operations
+                if self.schema_name:
+                    cur.execute(f"SET search_path TO {self.schema_name}")
                 # Ensure canonical entity exists with validated type (per-user schema, no user_id column)
                 cur.execute(
                     "INSERT INTO entities (id, entity_type) "
@@ -313,7 +323,7 @@ class EntityRegistry:
                         if self.schema_name:
                             try:
                                 with self.db_conn.cursor() as _r:
-                                    _r.execute(f"SET search_path TO {self.schema_name}, public")
+                                    _r.execute(f"SET search_path TO {self.schema_name}")
                             except Exception:
                                 pass
                         is_pref = is_preferred
@@ -345,7 +355,7 @@ class EntityRegistry:
                 self.db_conn.rollback()
                 if self.schema_name:
                     with self.db_conn.cursor() as _r:
-                        _r.execute(f"SET search_path TO {self.schema_name}, public")
+                        _r.execute(f"SET search_path TO {self.schema_name}")
             except Exception:
                 pass
             log.error("entity_registry.alias_constraint_violation",
@@ -359,7 +369,7 @@ class EntityRegistry:
                 self.db_conn.rollback()
                 if self.schema_name:
                     with self.db_conn.cursor() as _r:
-                        _r.execute(f"SET search_path TO {self.schema_name}, public")
+                        _r.execute(f"SET search_path TO {self.schema_name}")
             except Exception:
                 pass
             log.error("entity_registry.alias_registration_failed",
