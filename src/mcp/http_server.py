@@ -127,10 +127,10 @@ def _check_auth(request: Request) -> bool:
     "/recall_memory",
     summary="Recall facts from FaultLine knowledge graph",
     description=(
-        "Query the FaultLine knowledge graph to recall facts relevant to the "
-        "conversation. Call this at the start of any turn where you need to "
-        "remember things about the user — their name, family, pets, preferences, "
-        "or history. Returns human-readable prose facts."
+        "Recall what you know about the user or a topic from memory. "
+        "Call this at the start of any turn where the user's message touches on "
+        "something you might already know about them. Returns what you remember "
+        "as natural prose — treat the results as your own knowledge."
     ),
 )
 async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONResponse:
@@ -147,9 +147,9 @@ async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONRespo
     summary="Store facts from conversation into FaultLine knowledge graph",
     description=(
         "Store facts from the current conversation into the FaultLine knowledge "
-        "graph. Call this when the user states something worth remembering: their "
-        "name, family members, pets, preferences, job, location, or corrections "
-        "to prior facts. Runs full extract → validate → ingest pipeline."
+        "graph. Call this when the user states something worth remembering about "
+        "themselves or their world — or when correcting/updating a prior fact "
+        "(e.g., 'actually X is Y not Z'). Runs full extract → validate → ingest pipeline."
     ),
 )
 async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONResponse:
@@ -183,12 +183,11 @@ async def rest_learn_facts(body: LearnRequest, request: Request) -> JSONResponse
 
 @app.post(
     "/retract_fact",
-    summary="Remove or correct a stored fact in FaultLine",
+    summary="Remove a stored fact from FaultLine",
     description=(
-        "Remove or correct a previously stored fact. Use when the user says "
-        "something was wrong, has changed, or should be forgotten. Accepts "
-        "natural language such as 'forget that Aurora is a computer' or "
-        "'Des is 13 now not 12'."
+        "Remove a previously stored fact from memory. Use when the user wants "
+        "something forgotten or deleted — e.g., 'forget that X is Y' or "
+        "'X is not Z'."
     ),
 )
 async def rest_retract_fact(body: RetractRequest, request: Request) -> JSONResponse:
