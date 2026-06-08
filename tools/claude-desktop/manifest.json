@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.3",
+  "name": "faultline",
+  "display_name": "FaultLine Memory",
+  "version": "1.0.0",
+  "description": "Private AI memory system — stores facts in a knowledge graph and recalls them across conversations.",
+  "author": {
+    "name": "tkalevra",
+    "url": "https://github.com/tkalevra/FaultLine"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tkalevra/FaultLine"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "server/faultline_proxy.py",
+    "mcp_config": {
+      "command": "python",
+      "args": ["${__dirname}/server/faultline_proxy.py"],
+      "env": {
+        "FAULTLINE_API_URL": "${user_config.api_url}",
+        "FAULTLINE_USER_ID": "${user_config.user_id}",
+        "MCP_API_KEY": "${user_config.mcp_api_key}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "recall_memory",
+      "description": "Query FaultLine knowledge graph to recall facts relevant to the conversation."
+    },
+    {
+      "name": "remember_facts",
+      "description": "Store new facts extracted from the conversation into the knowledge graph."
+    },
+    {
+      "name": "learn_facts",
+      "description": "Ingest structured fact edges directly into the knowledge graph."
+    },
+    {
+      "name": "retract_fact",
+      "description": "Remove a fact from the knowledge graph."
+    }
+  ],
+  "tools_generated": true,
+  "user_config": {
+    "api_url": {
+      "type": "string",
+      "title": "FaultLine MCP URL",
+      "description": "HTTP endpoint for the FaultLine MCP server. Default: http://localhost:8002. Change the host if FaultLine runs on another machine (e.g., http://192.168.1.50:8002).",
+      "required": true
+    },
+    "user_id": {
+      "type": "string",
+      "title": "User ID",
+      "description": "Your FaultLine user UUID. This isolates your memory from other users. Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx. Generate one with: python -c \"import uuid; print(uuid.uuid4())\". If you also use OpenWebUI, use the same UUID from OpenWebUI Settings > Account so both clients share one memory store.",
+      "required": true
+    },
+    "mcp_api_key": {
+      "type": "string",
+      "title": "MCP API Key",
+      "description": "Bearer token for MCP authentication. Must match the MCP_API_KEY value in your Docker .env file.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"]
+  }
+}

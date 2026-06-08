@@ -121,32 +121,69 @@ class FactStoreManager:
         Behavior is controlled by mode: 'hard_delete' (DELETE), 'supersede' (set superseded_at).
         subject and old_value are pre-resolved UUIDs (already lowercase).
 
+        Searches both subject-side and object-side: if "forget marla" is issued,
+        marla's UUID may be the object (user → spouse → marla). Searches subject
+        first, falls back to object-side if no match.
+
         CLAUDE.md Compliance: Per-user schema isolation means NO user_id column.
         Caller must set search_path to user's schema before calling this method.
-        This method only filters on subject_id/object_id/rel_type (no user_id).
         """
-        conditions = ["subject_id = %s", "superseded_at IS NULL"]
-        params = [subject]
+        ids = []
 
-        if rel_type:
-            conditions.append("rel_type = %s")
-            params.append(rel_type.lower())
-        if old_value:
-            conditions.append("object_id = %s")
-            params.append(old_value)
+        # Try subject-side match first
+        if subject:
+            conditions = ["subject_id = %s", "superseded_at IS NULL"]
+            params = [subject]
+            if rel_type:
+                conditions.append("rel_type = %s")
+                params.append(rel_type.lower())
+            if old_value:
+                conditions.append("object_id = %s")
+                params.append(old_value)
+            where = " AND ".join(conditions)
+            cur.execute(f"SELECT id FROM facts WHERE {where}", params)
+            ids = [r[0] for r in cur.fetchall()]
 
-        where = " AND ".join(conditions)
+        # Fallback: object-side match (entity being retracted is the object)
+        if not ids and subject:
+            conditions = ["object_id = %s", "superseded_at IS NULL"]
+            params = [subject]
+            if rel_type:
+                conditions.append("rel_type = %s")
+                params.append(rel_type.lower())
+            where = " AND ".join(conditions)
+            cur.execute(f"SELECT id FROM facts WHERE {where}", params)
+            ids = [r[0] for r in cur.fetchall()]
 
-        cur.execute(f"SELECT id FROM facts WHERE {where}", params)
-        ids = [r[0] for r in cur.fetchall()]
+        # Also check staged_facts for Class B/C
+        if not ids and subject:
+            conditions = ["(subject_id = %s OR object_id = %s)", "promoted_at IS NULL"]
+            params = [subject, subject]
+            if rel_type:
+                conditions.append("rel_type = %s")
+                params.append(rel_type.lower())
+            where = " AND ".join(conditions)
+            cur.execute(f"SELECT id FROM staged_facts WHERE {where}", params)
+            ids = [r[0] for r in cur.fetchall()]
+            if ids:
+                if mode == "hard_delete":
+                    cur.execute(f"DELETE FROM staged_facts WHERE id = ANY(%s)", (ids,))
+                else:
+                    cur.execute(
+                        "UPDATE staged_facts SET promoted_at = now() WHERE id = ANY(%s)", (ids,)
+                    )
+                return ids
+
         if not ids:
             return []
 
         if mode == "hard_delete":
-            cur.execute(f"DELETE FROM facts WHERE {where}", params)
-        else:  # supersede
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(f"DELETE FROM facts WHERE id IN ({placeholders})", ids)
+        else:
+            placeholders = ",".join(["%s"] * len(ids))
             cur.execute(
-                f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE {where}",
-                params,
+                f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE id IN ({placeholders})",
+                ids,
             )
         return ids
