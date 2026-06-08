@@ -717,8 +717,9 @@ async def retract_fact_tool(
 
         _log(f"retract_fact intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}")
 
-        # Low confidence → fall back to RETRACTION (LLM chose this tool for a reason)
-        if confidence < gate:
+        # STATEMENT or low confidence → fall back to RETRACTION (LLM chose this tool for a reason).
+        # Only CORRECTION should override the tool choice.
+        if intent == "STATEMENT" or confidence < gate:
             intent = "RETRACTION"
 
     # Use a dedicated 90s timeout: /retract/correct invokes LLM extraction which takes 14–55s
