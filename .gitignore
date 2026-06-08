@@ -24,6 +24,9 @@ htmlcov/
 .idea/
 *.swp
 
+# Build artifacts
+*.mcpb
+
 # OS
 .DS_Store
 Thumbs.db
@@ -32,10 +35,18 @@ Thumbs.db
 .env.local
 secrets.json
 .aider*
-.claude/settings.local.json
 
-# Test result artifacts (contain user IDs)
-TESTS/TESTS/results/*.json
-TESTS/results/*.json
+# Claude Code (dev-only, contains session data and skills)
+.claude/
+
+# Dev-only documentation (internal topology, operational prompts, bug reports)
+DEV/
+BUGS/
+
+# Test suites (contain internal URLs, user IDs, test fixtures)
+TESTS/
+tests/
+
+# Test result artifacts
 *.pyc
 __pycache__/

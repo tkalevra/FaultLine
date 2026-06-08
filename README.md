@@ -151,8 +151,7 @@ Expand once and every future conversation in that domain benefits automatically.
 ## Requirements
 
 - Docker and Docker Compose
-- [OpenWebUI](https://openwebui.com/) v0.9.5 or newer
-- A local LLM via [Ollama](https://ollama.ai/) or [LM Studio](https://lmstudio.ai/) — Qwen2.5 recommended
+- An LLM backend — [Ollama](https://ollama.ai/), [LM Studio](https://lmstudio.ai/), [OpenWebUI](https://openwebui.com/), or a hosted API (OpenAI, Anthropic, Groq)
 - 8 GB RAM minimum, 16 GB recommended
 
 ---
@@ -173,19 +172,13 @@ curl http://localhost:8000/health
 # {"status": "ok", ...}
 ```
 
-FaultLine hooks into an LLM you already run — it doesn't host one. (If you
-*don't* have a model handy, `docker compose --profile ollama up -d` starts a
-bundled Ollama alongside the stack.)
+FaultLine hooks into an LLM you already run — it doesn't host one. (If you *don't* have a model handy, `docker compose --profile ollama up -d` starts a bundled Ollama alongside the stack.)
 
-The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no
-GPU or CUDA required). Takes 3–5 minutes.
+The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no GPU or CUDA required). Takes 3–5 minutes.
 
 ### Connecting a client
 
-The backend is the same for every client — only a few env values change. Point
-`LLM_BACKEND_TYPE` / `LLM_BASE_URL` at whatever you run, and connect over HTTP
-(the OpenWebUI filter on `:8000`) or MCP (`:8002`). Any number of clients can
-share the one store at once.
+The backend is the same for every client — only a few env values change. Point `LLM_BACKEND_TYPE` / `LLM_BASE_URL` at whatever you run, and connect over HTTP (the OpenWebUI filter on `:8000`) or MCP (`:8002`). Any number of clients can share the one store at once.
 
 | Client | `LLM_BACKEND_TYPE` | `LLM_BASE_URL` (example) | How it connects |
 |---|---|---|---|
@@ -208,7 +201,40 @@ Start a conversation — FaultLine begins learning immediately.
 
 ## Claude Desktop (MCP)
 
-FaultLine's MCP server makes the same memory available to Claude Desktop or any MCP-capable client.
+FaultLine ships a `.mcpb` extension for one-click installation in Claude Desktop.
+
+### Install the extension
+
+1. Build the extension (requires Python):
+   ```bash
+   cd tools/claude-desktop
+   python build_mcpb.py
+   # → produces faultline.mcpb
+   ```
+
+2. In Claude Desktop: **Settings → Extensions → Advanced settings → Install Extension** → select `faultline.mcpb`
+
+3. Claude Desktop prompts for three values:
+
+   | Field | What it is | How to get it |
+   |---|---|---|
+   | **FaultLine MCP URL** | HTTP endpoint for the MCP server | Default: `http://localhost:8002`. Change the host if FaultLine runs on another machine. |
+   | **User ID** | UUID that isolates your memory store | Generate one: `python -c "import uuid; print(uuid.uuid4())"`. If you also use OpenWebUI, use the same UUID from **OpenWebUI → Settings → Account** so both clients share one memory store. |
+   | **MCP API Key** | Bearer token for authentication | Must match `MCP_API_KEY` in your `.env`. Generate one: `python -c "import secrets; print(secrets.token_hex(32))"` |
+
+4. Make sure your Docker stack is running (`docker compose up -d`) — the extension connects to the MCP server at port 8002.
+
+### How it works
+
+The extension is a thin stdio-to-HTTP proxy. Claude Desktop spawns it as a local process; it forwards JSON-RPC messages to your Docker MCP server. No SDK dependencies — just Python stdlib.
+
+```
+Claude Desktop (stdio) → faultline_proxy.py → HTTP → localhost:8002/mcp → Docker
+```
+
+### Alternative: direct HTTP (Streamable HTTP clients)
+
+MCP clients that support HTTP transport directly (no stdio needed) can connect without the extension:
 
 ```json
 {
@@ -221,7 +247,16 @@ FaultLine's MCP server makes the same memory available to Claude Desktop or any 
 }
 ```
 
-Four tools: recall memory, store facts, retract facts, learn topic hierarchies — all backed by the same local store your OpenWebUI conversations write to.
+### Tools available
+
+| Tool | Description |
+|---|---|
+| `recall_memory` | Query the knowledge graph — retrieves facts relevant to the conversation |
+| `remember_facts` | Extract and store facts from conversation text |
+| `learn_facts` | Ingest structured fact triples directly |
+| `retract_fact` | Remove a fact from the knowledge graph |
+
+All four tools are backed by the same store your OpenWebUI conversations write to.
 
 ---
 
@@ -230,9 +265,9 @@ Four tools: recall memory, store facts, retract facts, learn topic hierarchies �
 ```env
 # The LLM hook — which model server FaultLine talks to.
 # LLM_BACKEND_TYPE selects the protocol; the API path is appended automatically.
-LLM_BACKEND_TYPE=ollama                       # openwebui | ollama | lm_studio | openai | anthropic | groq | localai | raw
+LLM_BACKEND_TYPE=ollama                         # openwebui | ollama | lm_studio | openai | anthropic | groq | localai | raw
 LLM_BASE_URL=http://host.docker.internal:11434  # host + port only, no path
-LLM_API_KEY=                                  # blank for local servers; token for hosted APIs
+LLM_API_KEY=                                    # blank for local servers; token for hosted APIs
 
 # Storage
 POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
@@ -242,6 +277,8 @@ QDRANT_URL=http://qdrant:6333
 MCP_API_KEY=          # leave blank for no auth, or set a secret token
 FAULTLINE_USER_ID=    # optional — pins the MCP server to one user
 ```
+
+See [`.env.example`](.env.example) for the full list with descriptions.
 
 ---
 
