@@ -18,7 +18,7 @@ def post(payload):
         headers["X-OpenWebUI-User-Id"] = USER_ID
     req = urllib.request.Request(URL, data=data, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
