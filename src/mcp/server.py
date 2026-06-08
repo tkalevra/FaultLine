@@ -496,7 +496,16 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
             seen.add(line)
             lines.append(line)
 
-    return {"memory": "\n".join(lines) if lines else "No relevant facts found."}
+    if not lines:
+        return {"memory": "No relevant facts found."}
+
+    preamble = (
+        "The following is what you know from previous conversations. "
+        "Treat these as things you personally remember — weave them into "
+        "your response naturally, as your own knowledge. Never list them, "
+        "never say 'according to my records', never quote them verbatim."
+    )
+    return {"memory": f"{preamble}\n\n" + "\n".join(lines)}
 
 
 async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
@@ -558,7 +567,7 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         return {"status": "query_detected", "message": "Use recall_memory for queries"}
 
     if intent in ("RETRACTION", "CORRECTION"):
-        return await retract_fact_tool(text, user_id)
+        return await retract_fact_tool(text, user_id, classified_intent=intent)
 
     # intent == "STATEMENT" — proceed with ingest pipeline.
 
@@ -662,14 +671,62 @@ async def learn_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     }
 
 
-async def retract_fact_tool(text: str, user_id: str) -> dict[str, Any]:
-    """Call FaultLine /retract/correct endpoint."""
+async def retract_fact_tool(
+    text: str, user_id: str, *, classified_intent: str | None = None
+) -> dict[str, Any]:
+    """Call FaultLine /retract/correct endpoint with GLiNER2 intent classification.
+
+    When called directly by the LLM (classified_intent is None), runs the same
+    /classify-intent + /confidence-gate pipeline used by remember_facts_tool().
+    When called from remember_facts_tool() (classified_intent provided), skips
+    classification to avoid double-classifying.
+    """
+    intent = classified_intent
+
+    if intent is None:
+        # ── Intent classification (Layer 1) ─────────────────────────────────
+        # Non-fatal: default to RETRACTION since the LLM chose retract_fact.
+        intent = "RETRACTION"
+        confidence = 0.0
+        try:
+            classify_resp = await _http_client.post(
+                f"{FAULTLINE_API_URL}/classify-intent",
+                params={"user_id": user_id},
+                json={"text": text},
+                timeout=10.0,
+            )
+            classify_resp.raise_for_status()
+            classify_data = classify_resp.json()
+            intent = classify_data.get("intent", "RETRACTION")
+            confidence = float(classify_data.get("confidence", 0.0))
+        except Exception as exc:
+            _log(f"retract_fact intent_classify_fallback: {exc!r} — defaulting to RETRACTION")
+
+        # ── Per-user confidence gate (Layer 3) ──────────────────────────────
+        # Non-fatal: default to 0.70 (same default as Filter).
+        gate = 0.70
+        try:
+            gate_resp = await _http_client.get(
+                f"{FAULTLINE_API_URL}/confidence-gate/{user_id}",
+                timeout=5.0,
+            )
+            gate_resp.raise_for_status()
+            gate = float(gate_resp.json().get("threshold", 0.70))
+        except Exception as exc:
+            _log(f"retract_fact confidence_gate_fallback: {exc!r} — defaulting to 0.70")
+
+        _log(f"retract_fact intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}")
+
+        # Low confidence → fall back to RETRACTION (LLM chose this tool for a reason)
+        if confidence < gate:
+            intent = "RETRACTION"
+
     # Use a dedicated 90s timeout: /retract/correct invokes LLM extraction which takes 14–55s
     # under load. The shared _http_client is 30s which is insufficient.
     async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(
             f"{FAULTLINE_API_URL}/retract/correct",
-            json={"text": text, "user_id": user_id, "intent": "RETRACTION"},
+            json={"text": text, "user_id": user_id, "intent": intent},
         )
     resp.raise_for_status()
     return resp.json()
