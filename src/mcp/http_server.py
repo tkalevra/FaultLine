@@ -207,11 +207,7 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer ") or auth_header[7:] != MCP_API_KEY:
             _log("SECURITY: rejected request — missing or invalid Bearer token")
-            return JSONResponse(
-                {"error": "Unauthorized"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     # Parse JSON body — return parse error on malformed input.
     try:
