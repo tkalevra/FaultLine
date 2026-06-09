@@ -83,6 +83,7 @@ class FactStoreManager:
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now(),"
+                        "   superseded_at   = NULL,"
                         "   unified_confidence = EXCLUDED.unified_confidence,"
                         "   rel_type_definition = EXCLUDED.rel_type_definition,"
                         "   storage_type = COALESCE(EXCLUDED.storage_type, facts.storage_type),"
