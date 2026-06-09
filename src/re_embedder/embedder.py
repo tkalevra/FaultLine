@@ -1360,6 +1360,11 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                     payload = point.get("payload", {})
                     fact_id = payload.get("fact_id")
 
+                    # store_context facts have no Postgres backing — intentionally Qdrant-only, never orphans
+                    if payload.get("rel_type") == "context":
+                        stats["ok"] += 1
+                        continue
+
                     # 4a: Check if fact exists in PostgreSQL
                     if fact_id not in pg_facts:
                         httpx.post(
