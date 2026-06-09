@@ -680,7 +680,7 @@ def _upgrade_staged_facts_with_known_rels(dsn: str, schema_name: str) -> int:
                 cur.execute(f"SET search_path TO {schema_name}")
                 cur.execute("""
                     UPDATE staged_facts sf
-                    SET fact_class = 'B', confidence = GREATEST(confidence, 0.6)
+                    SET fact_class = 'B', confidence = GREATEST(sf.confidence, 0.6)
                     FROM public.rel_types rt
                     WHERE sf.rel_type = rt.rel_type
                       AND sf.fact_class = 'C'
