@@ -258,6 +258,19 @@ MCP clients that support HTTP transport directly (no stdio needed) can connect w
 
 All four tools are backed by the same store your OpenWebUI conversations write to.
 
+### System prompt (important)
+
+FaultLine works best when the model is explicitly told to use the MCP tools for all memory operations. Without a system prompt, some clients (notably Claude Desktop) will use their own built-in memory instead of FaultLine.
+
+Ready-to-paste prompts are in the [`prompts/`](prompts/) folder:
+
+| File | When to use |
+|---|---|
+| [`strong-model-prompt.md`](prompts/strong-model-prompt.md) | Claude, GPT-4o, Gemini Pro — models with reliable tool-calling |
+| [`weak-model-prompt.md`](prompts/weak-model-prompt.md) | Qwen, Llama, Mistral, Phi — smaller models that need explicit step-by-step instructions |
+
+Pick the one that matches your model, copy the prompt block, and paste it into your client's system prompt field.
+
 ---
 
 ## Environment variables
