@@ -1,0 +1,82 @@
+# Evaluation build — all services use host network mode to avoid Docker bridge
+# routing issues on Fedora (firewalld + bridge-nf).
+# Ports are offset to avoid conflicts with existing config-* stack:
+#   postgres:  25432 (config-postgres uses 5432)
+#   redis:     26379 (config-redis uses 6379)
+#   qdrant:    26333 (config-qdrant uses 6333)
+#   faultline: 8000  (direct on host)
+
+services:
+  faultline:
+    build:
+      context: .
+      network: host
+    network_mode: host
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      LLM_BACKEND_TYPE: lm_studio
+      LLM_BASE_URL: http://192.168.40.20:1234
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-}
+      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      FAULTLINE_API_URL: http://localhost:8000
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "25432"
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-faultline}:${POSTGRES_PASSWORD:-faultline_eval}@localhost:25432/${POSTGRES_DB:-faultline_eval}
+      QDRANT_URL: http://localhost:26333
+      QDRANT_COLLECTION: faultline-eval
+      REDIS_URL: redis://localhost:26379/0
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-30}
+      EMBEDDING_CACHE_TTL: 86400
+      EMBEDDING_MODEL_VERSION: nomic-v1.5
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      DB_POOL_SIZE: 15
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    network_mode: host
+    command: -p 25432
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-faultline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline_eval}
+      POSTGRES_DB: ${POSTGRES_DB:-faultline_eval}
+      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_SHARED_BUFFERS: "256MB"
+    volumes:
+      - pg-eval-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 25432 -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline_eval}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    network_mode: host
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "26333"
+      QDRANT__SERVICE__GRPC_PORT: "26334"
+    volumes:
+      - qdrant-eval-data:/qdrant/storage
+
+  redis:
+    image: redis:7-alpine
+    network_mode: host
+    command: redis-server --port 26379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pg-eval-data:
+  qdrant-eval-data:

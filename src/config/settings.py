@@ -314,15 +314,6 @@ class Settings:
         return os.environ.get("LLM_API_KEY", "")
 
     @property
-    def FAULTLINE_MEMORY_CHAIN_UUID(self) -> Optional[str]:
-        """Optional OpenWebUI chat ID for system memory storage.
-
-        If set, system can store persistent memory in OpenWebUI.
-        Default: Not set
-        """
-        return os.environ.get("FAULTLINE_MEMORY_CHAIN_UUID", None)
-
-    @property
     def DEBUG_LM_STUDIO_STATS(self) -> bool:
         """Enable debug logging for LM Studio statistics (development only).
 
