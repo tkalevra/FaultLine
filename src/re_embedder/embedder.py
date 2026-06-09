@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -3839,7 +3840,7 @@ Respond with ONLY the JSON, no explanation."""
             messages=messages,
             model=os.getenv("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
             user_id=user_id,
-            timeout=LLMTimeouts.get("ENRICHMENT", 30),
+            timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="pattern_extraction",
         )
 
@@ -3857,8 +3858,7 @@ Respond with ONLY the JSON, no explanation."""
         pattern_text = pattern_text.strip('_')  # Strip leading/trailing underscores
 
         if not pattern_text or len(pattern_text) < 3:
-            log.warning("re_embedder.pattern_text_invalid_after_normalization",
-                       original=result.get("pattern_text"))
+            log.warning(f"re_embedder.pattern_text_invalid_after_normalization original={result.get('pattern_text')}")
             return None
 
         result["pattern_text"] = pattern_text
