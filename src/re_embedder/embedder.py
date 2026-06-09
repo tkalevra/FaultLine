@@ -1227,11 +1227,15 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     try:
         with db_conn.cursor() as _cur:
             _cur.execute(
-                "SELECT user_id FROM public.user_provisioning WHERE provisioned_at IS NOT NULL"
+                "SELECT user_id FROM public.user_provisioning WHERE status = 'ready'"
             )
             active_user_ids = {row[0] for row in _cur.fetchall()}
     except Exception as e:
         log.warning(f"re_embedder.reconcile_active_users_failed (using all collections): {e}")
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
         active_user_ids = None
 
     try:
