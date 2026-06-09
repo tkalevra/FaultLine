@@ -1222,15 +1222,34 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     """
     stats = {"deleted": 0, "reupserted": 0, "ok": 0, "errors": 0}
 
-    # Step 1: Discover all FaultLine collections
+    # Step 1: Discover active FaultLine collections only — skip stale/test collections
+    # that have no provisioned users to avoid scrolling dead data every cycle.
+    try:
+        with db_conn.cursor() as _cur:
+            _cur.execute(
+                "SELECT user_id FROM public.user_provisioning WHERE provisioned_at IS NOT NULL"
+            )
+            active_user_ids = {row[0] for row in _cur.fetchall()}
+    except Exception as e:
+        log.warning(f"re_embedder.reconcile_active_users_failed (using all collections): {e}")
+        active_user_ids = None
+
     try:
         response = httpx.get(f"{qdrant_url}/collections", timeout=10.0)
         response.raise_for_status()
         data = response.json()
-        collections = [
+        all_collections = [
             c["name"] for c in data.get("result", {}).get("collections", [])
             if c["name"].startswith("faultline-")
         ]
+        if active_user_ids is not None:
+            active_collection_names = {derive_collection(uid) for uid in active_user_ids}
+            collections = [c for c in all_collections if c in active_collection_names]
+            skipped = len(all_collections) - len(collections)
+            if skipped:
+                log.debug(f"re_embedder.reconcile_skipped_inactive collections={skipped}")
+        else:
+            collections = all_collections
     except Exception as e:
         log.error(f"re_embedder.reconcile_discover_failed: {e}")
         return stats
@@ -3568,7 +3587,12 @@ def main():
                 # Phase 3c: Wrap in error isolation to prevent background loop crash
                 try:
                     pattern_stats = evaluate_extraction_patterns(db)
-                    if any(v > 0 for v in pattern_stats.values()):
+                    _mutations = (
+                        pattern_stats.get("archived", 0)
+                        + pattern_stats.get("promoted", 0)
+                        + pattern_stats.get("confidence_updates", 0)
+                    )
+                    if _mutations > 0:
                         log.info(
                             f"re_embedder.extraction_pattern_eval "
                             f"evaluated={pattern_stats['evaluated']} "
@@ -3577,7 +3601,7 @@ def main():
                             f"confidence_updates={pattern_stats['confidence_updates']} "
                             f"errors={pattern_stats['errors']}"
                         )
-                        # Signal backend to reload pattern caches (critical: ensures updates propagate)
+                        # Signal backend to reload pattern caches only when something actually changed.
                         try:
                             refresh_resp = httpx.post(
                                 f"http://faultline:8000/internal/refresh-intent-pattern-caches",
