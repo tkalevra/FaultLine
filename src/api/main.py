@@ -3235,6 +3235,10 @@ _QDRANT_TIMEOUT = int(os.environ.get("QDRANT_TIMEOUT", "10"))
 QUERY_SKIP_QDRANT_GATE = float(os.environ.get("QUERY_SKIP_QDRANT_GATE", "0.75"))
 QUERY_MIN_CONFIDENCE = float(os.environ.get("QUERY_MIN_CONFIDENCE", "0.35"))
 
+# When false, /store_context is a no-op (no Qdrant write). Disables the Class C
+# unstructured fallback path entirely. Default true (enabled).
+_SHORT_TERM_MEMORY = os.environ.get("SHORT_TERM_MEMORY", "true").strip().lower() not in ("false", "0", "no")
+
 # D4: Class C query-scoped HIT threshold. A Qdrant Class C fact is a genuine HIT (→ hit_count+1,
 # expiry reset, promote-at-3 by re_embedder) only when its cosine score >= this STRICTER
 # threshold (higher than the loose 0.3 inclusion threshold used to populate full scope) OR its
@@ -11818,7 +11822,7 @@ def determine_path(query_text: str, db, user_id: str = None) -> QueryPath:
     keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
 
     noise_words = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+        'the', 'a', 'an', 'i', 'is', 'are', 'was', 'were', 'be', 'been',
         'what', 'how', 'when', 'where', 'why', 'who', 'which', 'that',
         'and', 'or', 'not', 'but', 'if', 'to', 'of', 'in', 'on', 'at',
         'by', 'for', 'with', 'from', 'up', 'about', 'as', 'can', 'will',
@@ -11840,8 +11844,12 @@ def determine_path(query_text: str, db, user_id: str = None) -> QueryPath:
 
     try:
         with db.cursor() as cur:
-            # Match against rel_types.natural_language
+            # Match against rel_types.natural_language.
+            # Skip short tokens: single/double-char matches hit every row containing
+            # a common letter (e.g. '%i%' matches almost all natural_language strings).
             for keyword in keywords:
+                if len(keyword) < 3:
+                    continue
                 cur.execute(
                     "SELECT rel_type, tail_types FROM rel_types "
                     "WHERE natural_language ILIKE %s LIMIT 1",
@@ -13488,7 +13496,8 @@ async def query(request: QueryRequest) -> QueryResponse:
             _before_q = len(qdrant_facts)
             qdrant_facts = [
                 f for f in qdrant_facts
-                if f.get("_subject_id") in _known_entities
+                if f.get("rel_type") == "context"   # store_context facts: scoped to user's collection + cosine-filtered
+                or f.get("_subject_id") in _known_entities
                 or f.get("_object_id") in _known_entities
                 or f.get("subject") in _known_entities
                 or f.get("object") in _known_entities
@@ -14861,6 +14870,10 @@ def store_context(req: StoreContextRequest):
     No WGM gate, no Postgres write, direct Qdrant upsert only.
     """
     try:
+        if not _SHORT_TERM_MEMORY:
+            log.info("store_context.disabled", user_id=req.user_id)
+            return StoreContextResponse(status="disabled", point_id="")
+
         qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
         qwen_api_url = _LLM_URL
 
