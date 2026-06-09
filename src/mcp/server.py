@@ -587,7 +587,8 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         if not e.get("low_confidence", False)
     ]
     if not edges:
-        return {"status": "no_facts", "message": "No confident facts extracted from text"}
+        # No structured triples extracted — store raw text as Class C context in Qdrant.
+        return await store_context_tool(text=text, user_id=user_id)
     ingest_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/ingest",
         json={"text": text, "user_id": user_id, "edges": edges, "source": "mcp"},
