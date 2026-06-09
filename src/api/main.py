@@ -9807,6 +9807,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                      } else "public", _scalar_category,
                                      getattr(edge, 'valid_until', None)),
                                 )
+                            db.commit()
                             log.info("ingest.scalar_stored", entity=actual_subject, user_id=req.user_id,
                                      attribute=edge.rel_type, value_int=val_int, value_text=val_text,
                                      raw_input=_raw_object)
