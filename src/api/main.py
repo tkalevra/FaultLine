@@ -11963,9 +11963,12 @@ def determine_path(query_text: str, db, user_id: str = None) -> QueryPath:
                         expanded.add(inverse.lower())
                 path.relationship_rels = list(expanded)
 
-        # If no matches found, fetch all details
+        # fetch_all only when there is truly no signal — vague/empty query.
+        # If keywords existed but matched nothing in the ontology (topic not yet in the knowledge graph),
+        # return the empty path so Qdrant semantic search handles it without a DB fact flood.
         if not path.scalar_rels and not path.relationship_rels and not path.taxonomy_groups:
-            path.fetch_all_details = True
+            if not keywords:
+                path.fetch_all_details = True
 
         log.info(
             "determine_path",
