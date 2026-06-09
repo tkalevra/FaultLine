@@ -3847,8 +3847,7 @@ Respond with ONLY the JSON, no explanation."""
         required = ["pattern_text", "pattern_type", "negation_type", "confidence"]
         for field in required:
             if field not in result:
-                log.warning("re_embedder.pattern_extraction_missing_field",
-                           field=field, rel_type=rel_type)
+                log.warning(f"re_embedder.pattern_extraction_missing_field field={field} rel_type={rel_type}")
                 return None
 
         # Normalize pattern_text
@@ -3866,8 +3865,7 @@ Respond with ONLY the JSON, no explanation."""
         return result
 
     except Exception as e:
-        log.warning("re_embedder.pattern_extraction_failed",
-                   rel_type=rel_type, error=str(e))
+        log.warning(f"re_embedder.pattern_extraction_failed rel_type={rel_type} error={e}")
         return None
 
 
