@@ -476,14 +476,19 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     seen: set[str] = set()
 
     for fact in facts:
-        # Skip raw store_context cache entries — transport tag, not structured knowledge.
-        # "context" is set at /store_context write time and confirmed absent from rel_types table.
         if fact.get("rel_type") == "context":
-            continue
-        definition = fact.get("definition", "")
-        if not definition:
-            continue
-        text = _clean_for_mcp(definition)
+            # store_context facts carry unstructured prose in the `object` field.
+            # Use it directly — the `definition` field contains internal annotations
+            # ([staged] user context ...) that are not suitable for injection.
+            raw_text = fact.get("object", "")
+            if not raw_text:
+                continue
+            text = _clean_for_mcp(raw_text)
+        else:
+            definition = fact.get("definition", "")
+            if not definition:
+                continue
+            text = _clean_for_mcp(definition)
         if not text:
             continue
         for token, replacement in display.items():
