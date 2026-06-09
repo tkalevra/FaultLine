@@ -135,11 +135,9 @@ def build_llm_payload(
     backend = get_backend_type()
 
     # dBug-016 fix: chat_id is OpenWebUI-specific — only inject when talking to OpenWebUI.
-    # Priority chain: user_id → FAULTLINE_MEMORY_CHAIN_UUID → dynamic timestamp fallback.
+    # Priority chain: user_id → FAULTLINE_USER_ID → dynamic timestamp fallback.
     if backend == "openwebui":
-        chat_id = user_id or os.environ.get("FAULTLINE_MEMORY_CHAIN_UUID")
-        if not chat_id:
-            chat_id = f"local:faultline-{int(time.time() * 1000)}"
+        chat_id = user_id or os.environ.get("FAULTLINE_USER_ID") or f"faultline-{int(time.time())}"
         payload["chat_id"] = chat_id
 
     # thinking field: OpenWebUI/Anthropic only — strip for all other backends to avoid
@@ -229,6 +227,7 @@ def get_endpoint_list() -> list[str]:
 
     openwebui_external = os.environ.get("OPENWEBUI_URL", "").strip()
     if openwebui_external:
+        log.warning("OPENWEBUI_URL is deprecated — use LLM_BACKEND_TYPE + LLM_BASE_URL instead")
         if not openwebui_external.startswith("http"):
             openwebui_external = f"http://{openwebui_external}"
         endpoints.append(f"{openwebui_external.rstrip('/')}/api/chat/completions")
