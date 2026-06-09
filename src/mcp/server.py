@@ -88,6 +88,10 @@ from .tools import (
 FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
 FAULTLINE_USER_ID = os.environ.get("FAULTLINE_USER_ID", "").strip()
 
+# When false, the store_context fallback in remember_facts_tool() is suppressed — no
+# Class C Qdrant-only write happens when GLiNER2 produces no structured edges.
+SHORT_TERM_MEMORY = os.environ.get("SHORT_TERM_MEMORY", "true").strip().lower() not in ("false", "0", "no")
+
 # Candidate URLs probed in order when the configured URL is unreachable.
 # Docker container IPs shift on rebuild; the bridge gateway (172.16.0.1) is
 # stable and reachable from sibling containers on the same Docker network.
@@ -587,6 +591,8 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         if not e.get("low_confidence", False)
     ]
     if not edges:
+        if not SHORT_TERM_MEMORY:
+            return {"status": "no_facts", "message": "No structured facts could be extracted. Short-term memory is disabled."}
         # No structured triples extracted — store raw text as Class C context in Qdrant.
         return await store_context_tool(text=text, user_id=user_id)
     ingest_resp = await _http_client.post(
