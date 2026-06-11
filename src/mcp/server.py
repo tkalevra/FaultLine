@@ -79,11 +79,11 @@ def _check_injection_signals(text: str) -> str | None:
 
 from .tools import (
     TOOLS,
-    validate_edges,
     validate_query,
     validate_text,
     validate_user_id,
 )
+from src.wgm.gate import WGMValidationGate
 
 FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
 FAULTLINE_USER_ID = os.environ.get("FAULTLINE_USER_ID", "").strip()
@@ -465,7 +465,13 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     display: dict[str, str] = {}
     for uid, name in preferred_names.items():
         uid_slug = uid.replace("-", "_")
-        if uid == canonical_identity or uid_slug == slug or uid == "user":
+        # Fix A: the literal "user" key is a legacy identity anchor for the
+        # querying human — it is NOT a third-party entity, so it must resolve
+        # to "you", never to their proper name. Mapping user→christopher here
+        # is what rewrote "The user is..." into "The christopher is...".
+        # Chosen over excluding the key entirely so the pronoun still renders
+        # in first person ("you") for any structured fact that carries it.
+        if uid == "user" or uid == canonical_identity or uid_slug == slug:
             display[uid] = "you"
             display[uid_slug] = "you"
         elif name and name != uid and name != uid_slug:
@@ -477,13 +483,25 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
 
     for fact in facts:
         if fact.get("rel_type") == "context":
-            # store_context facts carry unstructured prose in the `object` field.
-            # Use it directly — the `definition` field contains internal annotations
-            # ([staged] user context ...) that are not suitable for injection.
+            # store_context facts carry unstructured prose in the `object` field
+            # (stored verbatim as req.text[:120] by /store_context — never UUIDs
+            # or canonical slugs). Use it directly — the `definition` field
+            # contains internal annotations ([staged] user context ...) that are
+            # not suitable for injection.
             raw_text = fact.get("object", "")
             if not raw_text:
                 continue
             text = _clean_for_mcp(raw_text)
+            # Fix B: context prose is arbitrary human/assistant text. It is NOT
+            # built from UUIDs/slugs, so it needs no token resolution — and
+            # running the substitution loop over free prose is exactly what
+            # produced "The christopher" (the word "user" inside "The user
+            # is..." was rewritten). Emit context facts as-is, skipping the
+            # identity-token substitution that structured facts require below.
+            if text and text not in seen:
+                seen.add(text)
+                lines.append(text)
+            continue
         else:
             definition = fact.get("definition", "")
             if not definition:
@@ -492,7 +510,7 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
         if not text:
             continue
         for token, replacement in display.items():
-            text = text.replace(token, replacement)
+            text = _re.sub(r'\b' + _re.escape(token) + r'\b', replacement, text)
         # Prose-level dedup: structurally different facts (DB vs Qdrant) can
         # produce identical sentences after UUID→display_name substitution.
         if text not in seen:
@@ -789,7 +807,7 @@ def _validate_tool_input(tool_name: str, arguments: dict) -> dict | None:
             return {"error": f"Invalid text: {err}"}
 
     if tool_name == "ingest":
-        err = validate_edges(arguments.get("edges", []))
+        err = WGMValidationGate.validate_edge_inputs(arguments.get("edges", []))
         if err:
             return {"error": f"Invalid edges: {err}"}
 

@@ -71,6 +71,10 @@ def _log(msg: str) -> None:
 async def lifespan(app: FastAPI):
     _mcp._http_client = httpx.AsyncClient(timeout=30.0)
     _log(f"HTTP transport started. FaultLine API: {_mcp.FAULTLINE_API_URL}")
+    if MCP_API_KEY:
+        _log(f"Auth ENABLED — MCP_API_KEY set ({len(MCP_API_KEY)} chars, first8={MCP_API_KEY[:8]}…)")
+    else:
+        _log("Auth DISABLED — MCP_API_KEY not set (unauthenticated mode)")
     try:
         yield
     finally:
@@ -120,7 +124,16 @@ def _check_auth(request: Request) -> bool:
     if not MCP_API_KEY:
         return True
     auth = request.headers.get("Authorization", "")
-    return auth.startswith("Bearer ") and auth[7:] == MCP_API_KEY
+    ok = auth.startswith("Bearer ") and auth[7:] == MCP_API_KEY
+    if not ok:
+        client = request.client.host if request.client else "unknown"
+        if not auth:
+            _log(f"REST 401 from {client} — no Authorization header sent")
+        elif not auth.startswith("Bearer "):
+            _log(f"REST 401 from {client} — bad prefix (got {auth[:20]!r}…)")
+        else:
+            _log(f"REST 401 from {client} — key mismatch (got {len(auth[7:])} chars)")
+    return ok
 
 
 @app.post(
@@ -206,7 +219,15 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
     if MCP_API_KEY:
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer ") or auth_header[7:] != MCP_API_KEY:
-            _log("SECURITY: rejected request — missing or invalid Bearer token")
+            client = request.client.host if request.client else "unknown"
+            if not auth_header:
+                reason = "no Authorization header sent"
+            elif not auth_header.startswith("Bearer "):
+                reason = f"bad prefix (got {auth_header[:20]!r}…)"
+            else:
+                got = auth_header[7:]
+                reason = f"key mismatch (got {len(got)} chars, first8={got[:8]}…, expect first8={MCP_API_KEY[:8]}…)"
+            _log(f"SECURITY: 401 from {client} — {reason}")
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     # Parse JSON body — return parse error on malformed input.

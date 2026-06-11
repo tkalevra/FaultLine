@@ -278,11 +278,29 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
     """
     try:
         with db.cursor() as cur:
-            # Bootstrap rel_types: copy from public schema (not hard-coded) to ensure natural_language templates are identical
+            # Bootstrap rel_types: copy from public schema (not hard-coded) to ensure natural_language templates are identical.
+            # DO UPDATE propagates critical metadata columns so per-user schemas stay in sync
+            # with public schema constraint fixes (e.g., migration 075 head_types/tail_types).
+            # Columns NOT overwritten: source, engine_generated — those may differ per-schema
+            # for user-created rel_types.
             cur.execute("""
                 INSERT INTO rel_types
                 SELECT * FROM public.rel_types
-                ON CONFLICT (rel_type) DO NOTHING
+                ON CONFLICT (rel_type) DO UPDATE SET
+                    head_types = EXCLUDED.head_types,
+                    tail_types = EXCLUDED.tail_types,
+                    is_symmetric = EXCLUDED.is_symmetric,
+                    inverse_rel_type = EXCLUDED.inverse_rel_type,
+                    is_hierarchy_rel = EXCLUDED.is_hierarchy_rel,
+                    is_leaf_only = EXCLUDED.is_leaf_only,
+                    allows_leaf_rels = EXCLUDED.allows_leaf_rels,
+                    category = EXCLUDED.category,
+                    fact_class = EXCLUDED.fact_class,
+                    natural_language = EXCLUDED.natural_language,
+                    correction_behavior = EXCLUDED.correction_behavior,
+                    label = EXCLUDED.label,
+                    wikidata_pid = EXCLUDED.wikidata_pid,
+                    storage_target = EXCLUDED.storage_target
             """)
             log.info("bootstrapped_rel_types", schema=schema_name, note="copied from public schema")
 
@@ -317,6 +335,20 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
                 ON CONFLICT (pattern_text, negation_type) DO NOTHING
             """)
             log.info("bootstrapped_negation_patterns", schema=schema_name, count=20)
+
+            # Bootstrap correction_patterns (pre-GLiNER2 intent detection for negation-correction phrases)
+            # These patterns fire BEFORE GLiNER2 to catch sentences GLiNER2 misclassifies as QUERY.
+            # Patterns are subject-agnostic regex — they detect sentence structure, not entity names.
+            cur.execute("""
+                INSERT INTO correction_patterns (pattern_text, confidence)
+                VALUES
+                    ('is .+, not (a |an )?', 0.9),
+                    ('is (actually|really) .+ not', 0.9),
+                    ('does not have', 0.85),
+                    ('is not (a |an )', 0.9)
+                ON CONFLICT (pattern_text) DO NOTHING
+            """)
+            log.info("bootstrapped_correction_patterns", schema=schema_name, count=4)
 
             # Bootstrap retraction_signals (growth engine: learned signals for intent improvement)
             # Per-user table: no user_id column (schema isolation provides scope)
@@ -788,6 +820,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                     'retraction_signals',  # FIX #2: NEW — Layer 2b pattern matching
                     'intent_confidence_feedback',  # FIX #2: NEW — adaptive gate learning
                     'entity_taxonomies',  # FIX #2: NEW — query filtering
+                    'correction_patterns',  # pre-GLiNER2 negation-correction intent detection
                 ]
                 missing_tables = []
                 for table_name in required_tables:

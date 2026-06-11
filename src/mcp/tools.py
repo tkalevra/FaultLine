@@ -122,19 +122,6 @@ def validate_user_id(user_id: str) -> str | None:
     return None
 
 
-def validate_edges(edges: list) -> str | None:
-    """Return error message if edges array is invalid, None if valid."""
-    if not isinstance(edges, list):
-        return "edges must be an array"
-    if len(edges) == 0:
-        return "edges must not be empty"
-    for i, edge in enumerate(edges):
-        if not isinstance(edge, dict):
-            return f"edges[{i}] must be an object"
-        if "subject" not in edge or "object" not in edge or "rel_type" not in edge:
-            return f"edges[{i}] missing required field (subject, object, rel_type)"
-    return None
-
 
 def validate_query(query: str) -> str | None:
     """Return error message if query is invalid, None if valid."""

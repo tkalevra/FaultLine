@@ -18,6 +18,29 @@ _ENTITY_NAME_MAX_LEN = 256
 _FAULTLINE_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 
 
+# Alias preference provenance trust ordering (ALIAS-PROVENANCE-DESIGN).
+# Higher rank = more trusted. A newly-preferred alias may only demote an
+# incumbent preferred alias when its source rank is >= the incumbent's.
+_PREFERENCE_RANK = {
+    "user_stated": 5,
+    "rel_default": 4,
+    "inferred": 3,
+    "merge": 2,
+    "provisioned": 1,
+    "unspecified": 0,
+}
+
+
+def preference_rank(source: str) -> int:
+    """Map an alias preference_source to its trust rank (higher = more trusted).
+
+    Unknown sources and None map to 0 (lowest trust). Pure helper — no DB access.
+    """
+    if not source:
+        return 0
+    return _PREFERENCE_RANK.get(source, 0)
+
+
 def _make_surrogate(user_id: str, name: str) -> str:
     """Generate deterministic UUID v5 surrogate for an entity.
 
@@ -194,6 +217,7 @@ class EntityRegistry:
         alias: str,
         is_preferred: bool = False,
         entity_type: str = 'unknown',
+        preference_source: str = 'unspecified',
     ) -> None:
         """
         Register an alias for a canonical entity (UUID).
@@ -202,6 +226,12 @@ class EntityRegistry:
         If is_preferred=True, clears other preferred aliases for this entity.
         entity_type: Entity type (e.g., "Person", "Animal", "Organization")
                     Default 'unknown' for backward compatibility
+        preference_source: Provenance of the preference (ALIAS-PROVENANCE-DESIGN).
+                    One of user_stated/rel_default/inferred/merge/provisioned/unspecified.
+                    A newly-preferred alias may only DEMOTE an existing preferred alias
+                    when preference_rank(new) >= preference_rank(incumbent). If the
+                    incoming preference is weaker, the incumbent keeps is_preferred=true
+                    and the new alias is stored as is_preferred=false (never lost).
 
         User-authoritative: if the alias already exists pointing to a corrupted
         (string) entity_id, delete it first so the correct UUID registration wins.
@@ -331,6 +361,38 @@ class EntityRegistry:
                     # No collision: use requested preference
                     is_pref = is_preferred
 
+                # ──────────────────────────────────────────────────────────────
+                # Provenance-aware demotion guard (ALIAS-PROVENANCE-DESIGN).
+                # A new preferred alias may only demote the incumbent preferred
+                # alias when its source rank is >= the incumbent's. A weaker
+                # source (e.g. rel_default) can no longer clobber a stronger one
+                # (e.g. user_stated) — this is the wren-over-chris poisoning,
+                # prevented at the source. The new alias is still stored (never
+                # lost), just as is_preferred=false.
+                # ──────────────────────────────────────────────────────────────
+                if is_pref:
+                    cur.execute(
+                        "SELECT alias, preference_source FROM entity_aliases "
+                        "WHERE entity_id = %s AND is_preferred = true "
+                        "AND alias != %s LIMIT 1",
+                        (canonical, alias),
+                    )
+                    incumbent_row = cur.fetchone()
+                    if incumbent_row:
+                        incumbent_alias, incumbent_source = incumbent_row
+                        if preference_rank(preference_source) < preference_rank(incumbent_source):
+                            log.info(
+                                "entity_registry.alias_preference_kept_incumbent",
+                                canonical=canonical,
+                                incumbent_alias=incumbent_alias,
+                                incumbent_source=incumbent_source,
+                                new_alias=alias,
+                                new_source=preference_source,
+                            )
+                            # Incoming preference is weaker — keep incumbent, store
+                            # the new alias as non-preferred.
+                            is_pref = False
+
                 if is_pref:
                     # Clear other preferred aliases for this entity
                     cur.execute(
@@ -339,13 +401,33 @@ class EntityRegistry:
                         (canonical, alias),
                     )
 
-                # Insert/update with proper constraint (per-user schema: unique on entity_id, alias)
+                # Ratchet preference_source UP only — never downgrade an alias's own
+                # provenance (ALIAS-PROVENANCE-DESIGN). Re-registering the SAME alias via
+                # a weaker path (e.g. a later rel_default re-extraction of a name the user
+                # originally stated) must not erode its user_stated trust, or a legal/dead
+                # name could later demote it. A genuine downgrade only ever arrives through
+                # the correction/retraction path, not normal re-encounter, so max-by-rank
+                # is the correct merge of old and new provenance for the same alias.
                 cur.execute(
-                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
-                    "VALUES (%s, %s, %s) "
+                    "SELECT preference_source FROM entity_aliases "
+                    "WHERE entity_id = %s AND alias = %s",
+                    (canonical, alias),
+                )
+                _existing_src_row = cur.fetchone()
+                effective_source = preference_source
+                if _existing_src_row and preference_rank(_existing_src_row[0]) > preference_rank(preference_source):
+                    effective_source = _existing_src_row[0]
+
+                # Insert/update with proper constraint (per-user schema: unique on entity_id, alias)
+                # Persist preference_source so downstream consumers (merge, re-embedder,
+                # query) can read WHY this alias is preferred instead of guessing.
+                cur.execute(
+                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, preference_source) "
+                    "VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT (entity_id, alias) DO UPDATE SET "
-                    "is_preferred = EXCLUDED.is_preferred",
-                    (canonical, alias, is_pref),
+                    "is_preferred = EXCLUDED.is_preferred, "
+                    "preference_source = EXCLUDED.preference_source",
+                    (canonical, alias, is_pref, effective_source),
                 )
                 log.info("entity_registry.alias_registered",
                          canonical=canonical, alias=alias, preferred=is_pref)

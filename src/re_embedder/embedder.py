@@ -22,6 +22,7 @@ from src.api.llm_calls import (
     close_llm_http_client,
     LLMTimeouts,
 )
+from src.entity_registry.registry import preference_rank
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
@@ -495,13 +496,32 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
         return False
 
 
-def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url: str) -> bool:
+def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url: str, source_table: str = "facts") -> bool:
     """
     Upsert fact embedding to Qdrant collection.
+
+    Args:
+        source_table: Which DB table this row came from — "facts" or "staged_facts".
+            Stored in the Qdrant payload so filtered deletes can target the correct
+            source without risking ID collisions (both tables share independent SERIAL
+            sequences; integer ID=N can exist in both tables simultaneously).
     Returns True on success, False on failure.
     """
+    payload = {
+        "subject": row.get("subject_display", row["subject_id"]),
+        "object": row.get("object_display", row["object_id"]),
+        "rel_type": row["rel_type"],
+        "provenance": row["provenance"],
+        "user_id": row["user_id"],
+        "fact_id": int(row["id"]),
+        "source_table": source_table,
+        "confidence": row.get("confidence", 1.0),
+        "confirmed_count": row.get("confirmed_count", 0),
+        "last_seen_at": row["last_seen_at"].isoformat() if row.get("last_seen_at") else None,
+        "contradicted": row.get("contradicted_by") is not None,
+    }
     try:
-        # Use persistent pooled client if available, fallback to httpx.put() for bac${LOCATION}ard compatibility
+        # Use persistent pooled client if available, fallback to httpx.put() for backward compatibility
         if _http_client_sync:
             response = _http_client_sync.put(
                 f"{qdrant_url}/collections/{collection}/points",
@@ -510,18 +530,7 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                         {
                             "id": int(row["id"]),
                             "vector": vector,
-                            "payload": {
-                                "subject": row.get("subject_display", row["subject_id"]),
-                                "object": row.get("object_display", row["object_id"]),
-                                "rel_type": row["rel_type"],
-                                "provenance": row["provenance"],
-                                "user_id": row["user_id"],
-                                "fact_id": int(row["id"]),
-                                "confidence": row.get("confidence", 1.0),
-                                "confirmed_count": row.get("confirmed_count", 0),
-                                "last_seen_at": row["last_seen_at"].isoformat() if row.get("last_seen_at") else None,
-                                "contradicted": row.get("contradicted_by") is not None,
-                            }
+                            "payload": payload,
                         }
                     ]
                 },
@@ -535,18 +544,7 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                         {
                             "id": int(row["id"]),
                             "vector": vector,
-                            "payload": {
-                                "subject": row.get("subject_display", row["subject_id"]),
-                                "object": row.get("object_display", row["object_id"]),
-                                "rel_type": row["rel_type"],
-                                "provenance": row["provenance"],
-                                "user_id": row["user_id"],
-                                "fact_id": int(row["id"]),
-                                "confidence": row.get("confidence", 1.0),
-                                "confirmed_count": row.get("confirmed_count", 0),
-                                "last_seen_at": row["last_seen_at"].isoformat() if row.get("last_seen_at") else None,
-                                "contradicted": row.get("contradicted_by") is not None,
-                            }
+                            "payload": payload,
                         }
                     ]
                 },
@@ -635,34 +633,57 @@ def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
                     return 0
 
                 # Find entities whose entity_type (lowercased) matches a hierarchy alias
-                # but don't already have an instance_of to that node
+                # but don't already have an instance_of to that node, and haven't had
+                # that classification explicitly retracted by the user (superseded_at IS NOT NULL
+                # on an instance_of fact means the user corrected/retracted it — skip those).
                 for type_name, node_id in alias_to_node.items():
-                    cur.execute("""
-                        SELECT e.id FROM entities e
-                        WHERE LOWER(e.entity_type) = %s
-                          AND e.id != %s
-                          AND NOT EXISTS (
-                              SELECT 1 FROM facts f
-                              WHERE f.subject_id = e.id AND f.object_id = %s
-                                AND f.rel_type = 'instance_of' AND f.superseded_at IS NULL
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM staged_facts sf
-                              WHERE sf.subject_id = e.id AND sf.object_id = %s
-                                AND sf.rel_type = 'instance_of' AND sf.promoted_at IS NULL
-                          )
-                    """, (type_name, node_id, node_id, node_id))
+                    try:
+                        cur.execute("""
+                            SELECT e.id FROM entities e
+                            WHERE LOWER(e.entity_type) = %s
+                              AND e.id != %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM facts f
+                                  WHERE f.subject_id = e.id AND f.object_id = %s
+                                    AND f.rel_type = 'instance_of' AND f.superseded_at IS NULL
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM staged_facts sf
+                                  WHERE sf.subject_id = e.id AND sf.object_id = %s
+                                    AND sf.rel_type = 'instance_of' AND sf.promoted_at IS NULL
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM facts f2
+                                  WHERE f2.subject_id = e.id
+                                    AND f2.rel_type = 'instance_of'
+                                    AND f2.superseded_at IS NOT NULL
+                              )
+                        """, (type_name, node_id, node_id, node_id))
+                    except Exception as _qe:
+                        log.error("reconcile_hierarchy.candidate_query_failed",
+                                  schema=schema_name, type_name=type_name, error=str(_qe))
+                        continue
 
                     for (entity_id,) in cur.fetchall():
-                        cur.execute("""
-                            INSERT INTO staged_facts
-                                (subject_id, object_id, rel_type, fact_class, provenance, confidence, first_seen_at)
-                            VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_reconciliation', 0.6, now())
-                            ON CONFLICT (subject_id, object_id, rel_type)
-                            DO UPDATE SET last_seen_at = now(),
-                                confirmed_count = staged_facts.confirmed_count + 1
-                        """, (entity_id, node_id))
-                        created += 1
+                        try:
+                            cur.execute("""
+                                INSERT INTO staged_facts
+                                    (subject_id, object_id, rel_type, fact_class, provenance, confidence,
+                                     first_seen_at, expires_at)
+                                VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_reconciliation', 0.6,
+                                        now(), now() + interval '30 days')
+                                ON CONFLICT (subject_id, object_id, rel_type)
+                                DO UPDATE SET last_seen_at = now(),
+                                    confirmed_count = staged_facts.confirmed_count + 1,
+                                    expires_at = COALESCE(staged_facts.expires_at,
+                                                          now() + interval '30 days')
+                            """, (entity_id, node_id))
+                            created += 1
+                        except Exception as _ie:
+                            log.error("reconcile_hierarchy.insert_failed",
+                                      schema=schema_name, entity_id=entity_id, node_id=node_id,
+                                      error=str(_ie))
+                            continue
 
                 if created:
                     conn.commit()
@@ -793,7 +814,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
             cur.execute(
                 """
                 SELECT id, subject_id, object_id, rel_type,
-                       provenance, confidence
+                       provenance, COALESCE(fact_provenance, 'llm_inferred'), confidence
                 FROM staged_facts
                 WHERE fact_class = 'B'
                   AND confirmed_count >= %s
@@ -804,7 +825,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
             candidates = cur.fetchall()
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, conf = row
+            sid, subject, obj, rel_type, prov, fact_prov, conf = row
             # user_id is implicit in per-user schema context (set by SET search_path)
             try:
                 log.info(
@@ -824,7 +845,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now()",
-                        (subject, obj, rel_type, prov, conf, prov)
+                        (subject, obj, rel_type, prov, conf, fact_prov)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET promoted_at = now() WHERE id = %s",
@@ -1090,6 +1111,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
             cur.execute(
                 """
                 SELECT id, subject_id, object_id, rel_type, provenance,
+                       COALESCE(fact_provenance, 'llm_inferred'),
                        confidence, hit_count, rel_type_definition
                 FROM staged_facts
                 WHERE fact_class = 'C'
@@ -1106,7 +1128,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
             return promoted
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, conf, hits, rel_def = row
+            sid, subject, obj, rel_type, prov, fact_prov, conf, hits, rel_def = row
             required_classification = False
             try:
                 # ── Default B-2: classify rough/unclassified memory before promotion ──
@@ -1147,7 +1169,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                             "INSERT INTO rel_types"
                             " (rel_type, label, natural_language, engine_generated, confidence, source,"
                             "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category, fact_class)"
-                            " VALUES (%s, %s, %s, true, %s, 'class_c_promotion', %s, %s, false, %s, %s, %s, 'B')"
+                            " VALUES (%s, %s, %s, true, %s, 'engine', %s, %s, false, %s, %s, %s, 'B')"
                             " ON CONFLICT (rel_type) DO UPDATE SET"
                             "  natural_language = EXCLUDED.natural_language,"
                             "  category = EXCLUDED.category,"
@@ -1175,7 +1197,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now()",
-                        (subject, obj, rel_type, prov, promote_conf, prov)
+                        (subject, obj, rel_type, prov, promote_conf, fact_prov)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET fact_class = 'B', promoted_at = now() WHERE id = %s",
@@ -1525,24 +1547,56 @@ Respond with ONLY valid JSON (no markdown, no extra text):
 def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     """
     dprompt-17: Evaluate novel rel_type candidates from ontology_evaluations.
-    Runs each poll cycle. Decisions:
-      - 'approved': occurrence_count >= 3 → INSERT into rel_types
-      - 'mapped':   similarity to existing type > 0.85 → rewrite staged_facts
-      - 'rejected': neither → leave as Class C, let expiry handle it
+    Runs each poll cycle. Decisions are made ONCE PER candidate_rel_type per cycle:
+      - 'approved': SUM(occurrence_count) over undecided sibling rows >= 3 → INSERT rel_types
+      - 'mapped':   cached-embedding cosine similarity to existing type > 0.85 → rewrite staged_facts
+      - (sub-threshold, no match): LEFT UNDECIDED — re_embedder_decision stays NULL so the
+        candidate keeps accruing on re-sighting OR is forgotten by decay_ontology_candidates().
+
+    Per-rel_type aggregation (Frequency Analysis, DEV/SELF-GROWTH-ENGINE.md): the live
+    UNIQUE constraint is the 3-column (candidate_rel_type, sample_subject_id, sample_object),
+    so each distinct sample triple is its own row. Approval must use the AGGREGATE frequency
+    across all sibling rows of the same rel_type, not any single row's occurrence_count.
+
+    Cost guard: the LLM metadata call fires ONLY on an actual approval. Sub-threshold
+    candidates never trigger an LLM call (and are never frozen as terminal 'rejected').
+    Mapping uses the embedding cache (cheap cosine), not the LLM.
+
+    Decisions for approved/mapped are written to ALL undecided sibling rows of the rel_type.
 
     Returns: {"approved": int, "mapped": int, "rejected": int, "errors": int}
     """
     stats = {"approved": 0, "mapped": 0, "rejected": 0, "errors": 0}
 
     try:
+        # Aggregate per rel_type: SUM(occurrence_count) is the approval signal, not any
+        # single sample triple. Pick a representative sample (highest-occurrence row) for
+        # the LLM metadata snippet/types via DISTINCT ON ordering inside the subquery.
         with db_conn.cursor() as cur:
             cur.execute(
-                "SELECT id, user_id, candidate_rel_type, candidate_subject_type,"
-                "       candidate_object_type, first_text_snippet, occurrence_count,"
-                "       sample_subject_id, sample_object"
-                " FROM ontology_evaluations"
-                " WHERE re_embedder_decision IS NULL"
-                " ORDER BY occurrence_count DESC, last_seen_at DESC"
+                "SELECT agg.candidate_rel_type,"
+                "       rep.candidate_subject_type,"
+                "       rep.candidate_object_type,"
+                "       rep.first_text_snippet,"
+                "       agg.total_occ,"
+                "       rep.sample_subject_id,"
+                "       rep.sample_object"
+                " FROM ("
+                "   SELECT candidate_rel_type, SUM(occurrence_count) AS total_occ"
+                "   FROM ontology_evaluations"
+                "   WHERE re_embedder_decision IS NULL"
+                "   GROUP BY candidate_rel_type"
+                " ) agg"
+                " JOIN LATERAL ("
+                "   SELECT candidate_subject_type, candidate_object_type,"
+                "          first_text_snippet, sample_subject_id, sample_object"
+                "   FROM ontology_evaluations oe"
+                "   WHERE oe.candidate_rel_type = agg.candidate_rel_type"
+                "     AND oe.re_embedder_decision IS NULL"
+                "   ORDER BY oe.occurrence_count DESC, oe.last_seen_at DESC"
+                "   LIMIT 1"
+                " ) rep ON true"
+                " ORDER BY agg.total_occ DESC"
             )
             candidates = cur.fetchall()
     except Exception as e:
@@ -1563,17 +1617,19 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
         existing_types = []
 
     for row in candidates:
-        eval_id, user_id, candidate_rel, subj_type, obj_type, snippet, occ, subj_id, obj = row
+        candidate_rel, subj_type, obj_type, snippet, occ, subj_id, obj = row
         try:
             decision = None
             reason = ""
             best_fit = None
             best_score = 0.0
 
-            # ── Decision 1: Pattern frequency ──────────────────────────
+            # ── Decision 1: Pattern frequency (per-rel_type aggregate) ──
+            # occ is SUM(occurrence_count) over all undecided sibling rows of this
+            # rel_type — the aggregate frequency, not a single sample triple's count.
             if occ >= 3:
                 decision = "approved"
-                reason = f"occurrence_count={occ} >= 3"
+                reason = f"aggregate_occurrence={occ} >= 3"
 
             # ── Decision 2: Semantic similarity ─────────────────────────
             if not decision and existing_types:
@@ -1614,10 +1670,20 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         decision = "mapped"
                         reason = f"similarity={best_score:.3f} to '{best_fit}'"
 
-            # ── Decision 3: Reject ──────────────────────────────────────
+            # ── Decision 3: Defer (NOT a terminal reject) ───────────────
+            # Sub-threshold candidates with no strong semantic match are LEFT UNDECIDED
+            # (re_embedder_decision stays NULL). This is the key behavioural change: a
+            # one-off relationship word is no longer frozen as 'rejected'. Instead it
+            # remains a live candidate that either keeps accruing on re-sighting (the
+            # ingest ON CONFLICT bumps occurrence_count/last_seen_at) or is eventually
+            # forgotten by decay_ontology_candidates(). No DB write, no LLM call here.
             if not decision:
-                decision = "rejected"
-                reason = f"occ={occ} < 3, no strong match (best={best_fit}:{best_score:.3f})" if best_fit else "no match"
+                stats["rejected"] += 1  # counted as "deferred this cycle" for visibility
+                log.debug(
+                    f"re_embedder.ontology_deferred rel_type={candidate_rel} "
+                    f"aggregate_occ={occ} best={best_fit}:{best_score:.3f}"
+                )
+                continue
 
             # ── Apply decision ──────────────────────────────────────────
             with db_conn.cursor() as cur:
@@ -1669,7 +1735,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "INSERT INTO rel_types"
                         " (rel_type, label, natural_language, engine_generated, confidence, source,"
                         "  head_types, tail_types, is_hierarchy_rel, is_symmetric, inverse_rel_type, category, fact_class)"
-                        " VALUES (%s, %s, %s, true, %s, 'llm_evaluated', %s, %s, %s, %s, %s, %s, %s)"
+                        " VALUES (%s, %s, %s, true, %s, 'engine', %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (rel_type) DO UPDATE SET"
                         "  natural_language = EXCLUDED.natural_language,"
                         "  is_symmetric = EXCLUDED.is_symmetric,"
@@ -1691,7 +1757,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     # determine_path() can route queries through it immediately.
                     # Category → taxonomy_name mapping is DB-driven: try exact match first,
                     # then ILIKE fallback. No hardcoded category→taxonomy mappings.
-                    if category:
+                    # Guard: hierarchy rel_types (is_hierarchy=True) must never appear in
+                    # rel_types_defining_group — they classify types, not define group membership.
+                    if category and not is_hierarchy:
                         try:
                             with db_conn.cursor() as _tax_cur:
                                 _tax_cur.execute(
@@ -1726,6 +1794,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         except Exception as _tax_err:
                             log.warning("re_embedder.taxonomy_append_failed",
                                         rel_type=candidate_rel, error=str(_tax_err)[:100])
+                    elif is_hierarchy:
+                        log.debug("re_embedder.taxonomy_append_skipped_hierarchy",
+                                  rel_type=candidate_rel)
 
                     # Refresh unified metadata cache so the newly approved rel_type
                     # is immediately available to the ingest pipeline without waiting
@@ -1752,11 +1823,12 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         f"rewritten={n_rewritten} score={best_score:.3f}"
                     )
 
-                else:
-                    stats["rejected"] += 1
-                    log.info(f"re_embedder.ontology_rejected rel_type={candidate_rel} {reason}")
+                # Reject is no longer a terminal decision reached here — sub-threshold
+                # candidates `continue` before this apply block (left undecided). Only
+                # 'approved' and 'mapped' reach this point.
 
-                # Update evaluation record (including LLM metadata if approved)
+                # Write the decision to ALL undecided sibling rows of this rel_type
+                # (not a single id) so the whole candidate group is resolved together.
                 if decision == "approved":
                     cur.execute(
                         "UPDATE ontology_evaluations SET"
@@ -1772,7 +1844,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  llm_fact_class = %s,"
                         "  llm_confidence = %s,"
                         "  llm_metadata_json = %s"
-                        " WHERE id = %s",
+                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL",
                         (decision, 0.8, reason, candidate_rel,
                          llm_metadata.get("llm_natural_language", ""),
                          llm_metadata.get("llm_is_symmetric", False),
@@ -1781,9 +1853,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                          llm_metadata.get("llm_fact_class", "B"),
                          llm_metadata.get("llm_confidence", 0.6),
                          llm_metadata.get("llm_metadata_json", "{}"),
-                         eval_id),
+                         candidate_rel),
                     )
-                else:
+                else:  # mapped
                     cur.execute(
                         "UPDATE ontology_evaluations SET"
                         "  re_embedder_decision = %s,"
@@ -1793,12 +1865,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  best_fit_rel_type = %s,"
                         "  best_fit_score = %s,"
                         "  created_rel_type = %s"
-                        " WHERE id = %s",
-                        (decision,
-                         best_score if decision == "mapped" else 0.3,
-                         reason, best_fit, best_score,
-                         best_fit if decision == "mapped" else None,
-                         eval_id),
+                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL",
+                        (decision, best_score, reason, best_fit, best_score,
+                         best_fit, candidate_rel),
                     )
 
             db_conn.commit()
@@ -1806,7 +1875,97 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
         except Exception as e:
             db_conn.rollback()
             stats["errors"] += 1
-            log.error(f"re_embedder.ontology_eval_error eval_id={eval_id} rel_type={candidate_rel}: {e}")
+            log.error(f"re_embedder.ontology_eval_error rel_type={candidate_rel}: {e}")
+
+    return stats
+
+
+def decay_ontology_candidates(db_conn, user_id: str = None) -> dict:
+    """
+    Reinforce-or-decay sweep for NOVEL rel_type candidates in ontology_evaluations.
+
+    Mirrors expire_staged_facts() (the Class C score-decay model) but keyed on the
+    candidate ledger's own counters: `occurrence_count` + `last_seen_at`. Uses the
+    partial index idx_ontology_eval_decision (re_embedder_decision, last_seen_at)
+    WHERE re_embedder_decision IS NULL — the orphaned aging index this sweep exists for.
+
+    State machine (same 30-day window as the staged-fact decay, literal interval — the
+    fact model uses a literal `interval '30 days'`, so we mirror it; no env override):
+
+      Decay (window elapsed, score remaining):
+        re_embedder_decision IS NULL
+        AND last_seen_at   <= now() - interval '30 days'
+        AND occurrence_count > 0
+          → occurrence_count -= 1, last_seen_at = now()   (buys another 30-day window)
+
+      Forget (window elapsed, score at zero — a one-off never reinforced):
+        re_embedder_decision IS NULL
+        AND last_seen_at   <= now() - interval '30 days'
+        AND occurrence_count <= 0
+          → DELETE  (forgotten; no Qdrant point for candidates — DB delete only)
+
+    Reinforcement is automatic and lives in the ingest path: a re-sighting bumps
+    occurrence_count and sets last_seen_at = now() (ON CONFLICT), pushing the window
+    forward so a recurring candidate never decays.
+
+    This is internal vocabulary hygiene only — candidates are NOT recalled to the user
+    (the underlying fact lives in staged_facts and decays on its own track). Decayed/
+    forgotten candidates are NEVER frozen as terminal 'rejected'; an undecided candidate
+    that keeps recurring can still reach the aggregate-frequency approval threshold.
+
+    Per-user schema context: search_path is set by the caller (loop sets it before this
+    call). Per-user error isolation: one tenant's failure must not crash the sweep.
+    Returns {"decayed": int, "forgotten": int}.
+    """
+    stats = {"decayed": 0, "forgotten": 0}
+    try:
+        # Step 1: Decay — undecided candidates past their window with remaining score.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ontology_evaluations
+                SET occurrence_count = occurrence_count - 1,
+                    last_seen_at     = now()
+                WHERE re_embedder_decision IS NULL
+                  AND last_seen_at <= now() - interval '30 days'
+                  AND occurrence_count > 0
+                """
+            )
+            stats["decayed"] = cur.rowcount
+        db_conn.commit()
+        if stats["decayed"]:
+            log.info(
+                f"re_embedder.ontology_candidates_decayed "
+                f"count={stats['decayed']} user_id={user_id}"
+            )
+
+        # Step 2: Forget — undecided candidates at score zero AND past the window.
+        # Fresh rows start at occurrence_count=1 with last_seen_at=now(), so a brand-new
+        # candidate is never eligible here; only one decremented to <= 0 a full window
+        # ago (i.e. never reinforced) is forgotten. No Qdrant point — DB delete only.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM ontology_evaluations
+                WHERE re_embedder_decision IS NULL
+                  AND last_seen_at <= now() - interval '30 days'
+                  AND occurrence_count <= 0
+                """
+            )
+            stats["forgotten"] = cur.rowcount
+        db_conn.commit()
+        if stats["forgotten"]:
+            log.info(
+                f"re_embedder.ontology_candidates_forgotten "
+                f"count={stats['forgotten']} reason=score_zero user_id={user_id}"
+            )
+
+    except Exception as e:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        log.error(f"re_embedder.ontology_candidate_decay_error user_id={user_id}: {e}")
 
     return stats
 
@@ -1864,7 +2023,7 @@ def evaluate_correction_signal_candidates(db_conn, qwen_api_url: str) -> dict:
                         ON CONFLICT (pattern) DO UPDATE SET
                           occurrence_count = correction_signals.occurrence_count + 1,
                           updated_at = NOW()
-                    """, (candidate_pattern, pattern_type, 2, 0.7, user_id, snippet))
+                    """, (candidate_pattern, pattern_type, 2, 0.7, pattern_type, snippet))
                     log.info(f"re_embedder.correction_signal_approved pattern={candidate_pattern[:50]} type={pattern_type}")
 
             # ── Decision 2: Reject (wait for more occurrences) ──────────
@@ -1938,6 +2097,55 @@ def has_pending_name_conflicts(db_conn) -> bool:
     except Exception as e:
         log.warning("re_embedder.pending_conflicts_check_failed", error=str(e))
         return False
+
+
+def flag_suspect_preferred_names(db_conn) -> dict:
+    """Flag preferred aliases that nobody ever chose (ALIAS-PROVENANCE-DESIGN §3).
+
+    A preferred name whose provenance is weak ('inferred', 'provisioned', 'merge',
+    'unspecified') is suspect — it became the display name without a user choosing it,
+    which is exactly how dead/legal/placeholder names surface. We FLAG ONLY here — we
+    never auto-mutate names (non-destructive; the LLM/review path decides).
+
+    The existing entity_name_conflicts review queue expects TWO entity ids disputing the
+    SAME alias. A suspect preferred name is a different shape (one entity, low-trust
+    preferred alias) — feeding it into entity_name_conflicts would be a brittle misuse
+    of that schema. So we log the suspects at WARNING with a clear event name for review.
+
+    TODO(ALIAS-PROVENANCE-DESIGN §3): combine with the embedding the re-embedder already
+    computes — if a suspect preferred alias is also a vector outlier among the entity's
+    other aliases, confidence it is wrong is high. Until that vector-outlier signal is
+    wired in, this stays flag-only to avoid inventing a brittle auto-resolution mechanism.
+
+    Per-user schema context: entity_aliases is per-user; search_path set by caller.
+    Do NOT add user_id filtering.
+
+    Returns dict: {"flagged": int}.
+    """
+    stats = {"flagged": 0}
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT entity_id, alias, preference_source FROM entity_aliases "
+                "WHERE is_preferred = true "
+                "AND preference_source IN ('inferred', 'provisioned', 'merge', 'unspecified')"
+            )
+            suspects = cur.fetchall()
+        for entity_id, alias, source in suspects:
+            stats["flagged"] += 1
+            log.warning(
+                "re_embedder.suspect_preferred_name "
+                f"entity_id={str(entity_id)[:16]} alias={alias} preference_source={source} "
+                "reason=preferred_alias_never_user_chosen (flag-only, see ALIAS-PROVENANCE-DESIGN)"
+            )
+    except Exception as e:
+        # Column may not exist yet on a schema that missed migration 076 — non-fatal.
+        log.warning(f"re_embedder.suspect_preferred_names_check_failed error={str(e)[:200]}")
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+    return stats
 
 
 def has_pending_retraction_outcomes(db_conn) -> bool:
@@ -2461,6 +2669,7 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                              conflict_id)
                         )
 
+                    # Commit alias resolution first — guaranteed safe even if merge fails
                     db_conn.commit()
                     stats["resolved"] += 1
 
@@ -2471,6 +2680,231 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                         f"winner={winner_name} "
                         f"loser={loser_name}"
                     )
+
+                    # ────────────────────────────────────────────────────────────────
+                    # dBug-076: Entity merge — repoint all loser references to winner.
+                    # Runs in a SEPARATE transaction after alias resolution commits,
+                    # so merge failures cannot roll back the alias fix.
+                    # ────────────────────────────────────────────────────────────────
+                    try:
+                        with db_conn.cursor() as _mcur:
+                            # Step 1: Repoint facts from loser to winner (subject_id)
+                            # Handle UNIQUE constraint (subject_id, object_id, rel_type):
+                            # delete loser rows that would conflict, then update the rest.
+                            _mcur.execute(
+                                "DELETE FROM facts WHERE subject_id = %s "
+                                "AND EXISTS ("
+                                "  SELECT 1 FROM facts f2 "
+                                "  WHERE f2.subject_id = %s "
+                                "  AND f2.object_id = facts.object_id "
+                                "  AND f2.rel_type = facts.rel_type"
+                                ")",
+                                (loser_id, winner_id),
+                            )
+                            _mcur.execute(
+                                "UPDATE facts SET subject_id = %s "
+                                "WHERE subject_id = %s",
+                                (winner_id, loser_id),
+                            )
+                            _repointed_subj = _mcur.rowcount
+
+                            # Step 2: Repoint facts from loser to winner (object_id)
+                            _mcur.execute(
+                                "DELETE FROM facts WHERE object_id = %s "
+                                "AND EXISTS ("
+                                "  SELECT 1 FROM facts f2 "
+                                "  WHERE f2.object_id = %s "
+                                "  AND f2.subject_id = facts.subject_id "
+                                "  AND f2.rel_type = facts.rel_type"
+                                ")",
+                                (loser_id, winner_id),
+                            )
+                            _mcur.execute(
+                                "UPDATE facts SET object_id = %s "
+                                "WHERE object_id = %s",
+                                (winner_id, loser_id),
+                            )
+                            _repointed_obj = _mcur.rowcount
+
+                            # Step 3: Repoint staged_facts (same pattern)
+                            _mcur.execute(
+                                "DELETE FROM staged_facts WHERE subject_id = %s "
+                                "AND EXISTS ("
+                                "  SELECT 1 FROM staged_facts sf2 "
+                                "  WHERE sf2.subject_id = %s "
+                                "  AND sf2.object_id = staged_facts.object_id "
+                                "  AND sf2.rel_type = staged_facts.rel_type"
+                                ")",
+                                (loser_id, winner_id),
+                            )
+                            _mcur.execute(
+                                "UPDATE staged_facts SET subject_id = %s "
+                                "WHERE subject_id = %s",
+                                (winner_id, loser_id),
+                            )
+                            _mcur.execute(
+                                "DELETE FROM staged_facts WHERE object_id = %s "
+                                "AND EXISTS ("
+                                "  SELECT 1 FROM staged_facts sf2 "
+                                "  WHERE sf2.object_id = %s "
+                                "  AND sf2.subject_id = staged_facts.subject_id "
+                                "  AND sf2.rel_type = staged_facts.rel_type"
+                                ")",
+                                (loser_id, winner_id),
+                            )
+                            _mcur.execute(
+                                "UPDATE staged_facts SET object_id = %s "
+                                "WHERE object_id = %s",
+                                (winner_id, loser_id),
+                            )
+
+                            # Step 4: Move entity_attributes from loser to winner
+                            # Skip attributes that already exist on the winner
+                            _mcur.execute(
+                                "UPDATE entity_attributes SET entity_id = %s "
+                                "WHERE entity_id = %s "
+                                "AND NOT EXISTS ("
+                                "  SELECT 1 FROM entity_attributes ea2 "
+                                "  WHERE ea2.entity_id = %s "
+                                "  AND ea2.attribute = entity_attributes.attribute"
+                                ")",
+                                (winner_id, loser_id, winner_id),
+                            )
+                            # Delete remaining loser attributes (conflicting keys kept on winner)
+                            _mcur.execute(
+                                "DELETE FROM entity_attributes WHERE entity_id = %s",
+                                (loser_id,),
+                            )
+
+                            # Step 5: Move aliases from loser to winner (dead-name safe).
+                            #
+                            # ALIAS-PROVENANCE-DESIGN: decouple "which UUID survives"
+                            # (structural, decided above by fact density) from "which
+                            # alias is preferred." Moved aliases keep their ORIGINAL
+                            # preference_source — we do NOT blanket-force them. Only
+                            # the single is_preferred flag is recomputed across the
+                            # UNION of both entities' aliases by preference_rank, so a
+                            # user_stated chosen name always beats a rel_default/legal/
+                            # dead name regardless of which entity "won." All alias rows
+                            # are preserved (non-destructive); only duplicate rows that
+                            # already exist on the winner are deduped.
+                            #
+                            # Move loser aliases (preserving preference_source). Clear
+                            # is_preferred on move to avoid a transient two-preferred
+                            # state; the correct single preferred is set below.
+                            _mcur.execute(
+                                "UPDATE entity_aliases SET entity_id = %s, is_preferred = false "
+                                "WHERE entity_id = %s "
+                                "AND alias NOT IN ("
+                                "  SELECT alias FROM entity_aliases WHERE entity_id = %s"
+                                ")",
+                                (winner_id, loser_id, winner_id),
+                            )
+                            # Delete remaining loser aliases (already exist on winner — dedup, not history loss)
+                            _mcur.execute(
+                                "DELETE FROM entity_aliases WHERE entity_id = %s",
+                                (loser_id,),
+                            )
+
+                            # Recompute the single preferred alias across the winner's
+                            # now-unified alias set. Highest preference_rank wins; ties
+                            # break by recency (valid_from, then created_at). An alias
+                            # whose source rank is below the winner is never promoted.
+                            _mcur.execute(
+                                "SELECT alias, preference_source FROM entity_aliases "
+                                "WHERE entity_id = %s",
+                                (winner_id,),
+                            )
+                            _winner_aliases = _mcur.fetchall()
+                            if _winner_aliases:
+                                # Refetch with recency columns so we can break rank ties.
+                                _mcur.execute(
+                                    "SELECT alias, preference_source, valid_from, created_at "
+                                    "FROM entity_aliases WHERE entity_id = %s",
+                                    (winner_id,),
+                                )
+                                _rows = _mcur.fetchall()
+
+                                def _sort_key(r):
+                                    _alias, _src, _vf, _ca = r
+                                    return (
+                                        preference_rank(_src),
+                                        _vf or _ca,  # recency tie-break
+                                    )
+
+                                # Highest rank, then most recent.
+                                _best = max(_rows, key=_sort_key)
+                                _best_alias = _best[0]
+                                _best_src = _best[1]
+
+                                # Clear all, then set exactly one preferred.
+                                _mcur.execute(
+                                    "UPDATE entity_aliases SET is_preferred = false "
+                                    "WHERE entity_id = %s",
+                                    (winner_id,),
+                                )
+                                # If the chosen alias was only ever non-preferred and has
+                                # no better source available, it is preferred purely by the
+                                # merge structure → record provenance as 'merge'. Otherwise
+                                # keep its original source (e.g. a user_stated name stays
+                                # user_stated). rel_default/inferred/etc. keep their source.
+                                if preference_rank(_best_src) <= preference_rank('merge'):
+                                    _mcur.execute(
+                                        "UPDATE entity_aliases "
+                                        "SET is_preferred = true, preference_source = 'merge' "
+                                        "WHERE entity_id = %s AND alias = %s",
+                                        (winner_id, _best_alias),
+                                    )
+                                    _final_src = 'merge'
+                                else:
+                                    _mcur.execute(
+                                        "UPDATE entity_aliases SET is_preferred = true "
+                                        "WHERE entity_id = %s AND alias = %s",
+                                        (winner_id, _best_alias),
+                                    )
+                                    _final_src = _best_src
+                                log.info(
+                                    f"re_embedder.merge_preferred_recomputed "
+                                    f"winner={str(winner_id)[:16]} "
+                                    f"preferred_alias={_best_alias} "
+                                    f"preference_source={_final_src}"
+                                )
+
+                            # Step 6: Delete the loser entity record
+                            _mcur.execute(
+                                "DELETE FROM entities WHERE id = %s",
+                                (loser_id,),
+                            )
+
+                            # Step 7: Mark merged facts for Qdrant re-sync
+                            _mcur.execute(
+                                "UPDATE facts SET qdrant_synced = false "
+                                "WHERE subject_id = %s OR object_id = %s",
+                                (winner_id, winner_id),
+                            )
+
+                        db_conn.commit()
+                        log.info(
+                            f"re_embedder.entity_merge_complete "
+                            f"winner={str(winner_id)[:16]} "
+                            f"loser={str(loser_id)[:16]} "
+                            f"repointed_facts={_repointed_subj + _repointed_obj}"
+                        )
+
+                    except Exception as _merge_err:
+                        # Merge failed — alias resolution already committed above.
+                        # Rollback the failed merge transaction and continue.
+                        try:
+                            db_conn.rollback()
+                        except Exception:
+                            pass
+                        log.error(
+                            f"re_embedder.entity_merge_failed "
+                            f"conflict_id={conflict_id} "
+                            f"winner={str(winner_id)[:16]} "
+                            f"loser={str(loser_id)[:16]} "
+                            f"error={str(_merge_err)}"
+                        )
 
                 except Exception as e:
                     db_conn.rollback()
@@ -3064,6 +3498,115 @@ def evaluate_extraction_patterns(db_conn) -> dict:
     return stats
 
 
+def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) -> int:
+    """One-time startup sweep: delete pre-existing inverted staged_facts hierarchy rows.
+
+    These are rows where the subject_id is a generic ontology token
+    (person, organization, location, etc.) rather than a real entity UUID.
+    They were created by mis-extracted triples with subject/object swapped, e.g.:
+        person instance_of christopher
+        organization instance_of company
+
+    Runs once per re_embedder startup — not every poll cycle.  The function is
+    idempotent; running it a second time with no matching rows is safe.
+
+    SQL uses aliases lookup to find entity IDs whose canonical alias is an ontology
+    token — these are the UUID-form subject_ids stored in staged_facts.
+
+    Returns total number of rows deleted across all user schemas.
+    """
+    _SYSTEM_ALIASES = (
+        "person", "organization", "animal", "location",
+        "concept", "object", "thing", "entity",
+    )
+    total_deleted = 0
+
+    try:
+        with psycopg2.connect(postgres_dsn) as admin_db:
+            with admin_db.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id, schema_name FROM public.user_provisioning
+                    WHERE status = 'ready'
+                    ORDER BY ready_at ASC
+                """)
+                ready_schemas = [(row[0], row[1]) for row in cur.fetchall()]
+    except Exception as e:
+        log.error(f"re_embedder.inverted_sweep.schema_list_failed error={e}")
+        return 0
+
+    for user_id, schema_name in ready_schemas:
+        try:
+            with psycopg2.connect(postgres_dsn) as db:
+                with db.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}")
+                db.commit()
+
+                with db.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM staged_facts
+                        WHERE rel_type IN ('instance_of', 'subclass_of', 'part_of', 'is_a', 'member_of')
+                          AND subject_id IN (
+                              SELECT ea.entity_id FROM entity_aliases ea
+                              WHERE ea.alias = ANY(%s)
+                          )
+                          AND promoted_at IS NULL
+                        RETURNING id
+                        """,
+                        (_SYSTEM_ALIASES,),
+                    )
+                    deleted_ids = [r[0] for r in cur.fetchall()]
+                db.commit()
+
+                if deleted_ids:
+                    log.info(
+                        f"re_embedder.inverted_sweep.deleted "
+                        f"user_id={user_id[:8]} schema={schema_name} count={len(deleted_ids)}"
+                    )
+                    total_deleted += len(deleted_ids)
+
+                    # Best-effort Qdrant cleanup for deleted rows
+                    try:
+                        collection = derive_collection(user_id)
+                        for _did in deleted_ids:
+                            _http_client.post(
+                                f"{qdrant_url}/collections/{collection}/points/delete",
+                                json={
+                                    "filter": {
+                                        "must": [
+                                            {"key": "source_table", "match": {"value": "staged_facts"}},
+                                            {"key": "fact_id",     "match": {"value": _did}},
+                                        ]
+                                    }
+                                },
+                                timeout=5.0,
+                            )
+                        # Fallback by point ID for old points without source_table payload
+                        _http_client.delete(
+                            f"{qdrant_url}/collections/{collection}/points",
+                            json={"points": deleted_ids},
+                            timeout=5.0,
+                        )
+                    except Exception as qe:
+                        log.warning(
+                            f"re_embedder.inverted_sweep.qdrant_failed "
+                            f"user_id={user_id[:8]} error={qe}"
+                        )
+
+        except Exception as e:
+            log.error(
+                f"re_embedder.inverted_sweep.per_user_failed "
+                f"user_id={user_id[:8] if user_id else 'unknown'} schema={schema_name} error={e}"
+            )
+
+    if total_deleted:
+        log.info(f"re_embedder.inverted_sweep.complete total_deleted={total_deleted}")
+    else:
+        log.info("re_embedder.inverted_sweep.complete total_deleted=0 (nothing to clean)")
+
+    return total_deleted
+
+
 def main():
     """Main poll loop."""
     global _http_client_sync
@@ -3106,6 +3649,16 @@ def main():
 
     log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
     log.info("re_embedder.entering_main_loop")
+
+    # One-time startup sweep: remove pre-existing inverted staged_facts hierarchy rows
+    # (e.g. "person instance_of christopher") that were created before the ingest-path
+    # cleanup was in place.  Gated here so it runs once per process start, not every
+    # 60-second poll cycle.
+    try:
+        _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url)
+    except Exception as _sweep_err:
+        # Never block startup — sweep failure is non-fatal.
+        log.warning(f"re_embedder.inverted_sweep.startup_error error={_sweep_err}")
 
     # Initialize Redis client for event queue
     redis_url = os.getenv("REDIS_URL")
@@ -3193,7 +3746,7 @@ def main():
                                 try:
                                     text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
                                     vector = embed_text(text, qwen_api_url)
-                                    if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                    if upsert_to_qdrant(row, vector, collection, qdrant_url, source_table="facts"):
                                         mark_synced(db_per_user, row["id"])
                                         log.info(f"re_embedder.synced fact_id={row['id']} user_id={user_id[:8]}")
                                 except Exception as e:
@@ -3212,7 +3765,7 @@ def main():
                                 try:
                                     text = f"{row['subject_display']} {row['rel_type']} {row['object_display']}"
                                     vector = embed_text(text, qwen_api_url)
-                                    if upsert_to_qdrant(row, vector, collection, qdrant_url):
+                                    if upsert_to_qdrant(row, vector, collection, qdrant_url, source_table="staged_facts"):
                                         with db_per_user.cursor() as cur:
                                             cur.execute(
                                                 "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
@@ -3386,104 +3939,153 @@ def main():
 
                 # dprompt-121: Event-driven ontology evaluation (skip if no pending work)
                 # Phase 3c: Wrap in error isolation to prevent background loop crash
-                try:
-                    if has_pending_ontology_work(db):
-                        ontology_stats = evaluate_ontology_candidates(db, qwen_api_url)
-                        if any(v > 0 for v in ontology_stats.values()):
-                            log.info(
-                                f"re_embedder.ontology_eval "
-                                f"approved={ontology_stats['approved']} "
-                                f"mapped={ontology_stats['mapped']} "
-                                f"rejected={ontology_stats['rejected']} "
-                                f"errors={ontology_stats['errors']}"
-                            )
-                        # Phase 3 (Severance #3): newly-approved rel_types live in the DB but are
-                        # invisible to the backend uvicorn process (separate OS process) until it
-                        # reloads _REL_TYPE_META. Trigger the cross-process refresh endpoint.
-                        if ontology_stats.get("approved", 0) > 0 or ontology_stats.get("mapped", 0) > 0:
+                #
+                # PER-USER ONTOLOGY GROWTH (authoritative architecture decision 2026-06-10):
+                # ontology_evaluations and rel_types live in the USER's schema (faultline_<slug>),
+                # which has NO user_id column — schema = scope. The public.* copies are SEED
+                # TEMPLATES ONLY and must NEVER receive growth data. Ingest correctly writes
+                # candidates to the per-user ontology_evaluations; therefore the evaluator MUST
+                # run with search_path set to each user's schema. Running it on the public `db`
+                # connection (the prior bug) read public.ontology_evaluations — always empty —
+                # so has_pending_ontology_work() returned False and the loop was permanently
+                # severed. We iterate ready_schemas on dedicated per-user connections.
+                _approved_any = False
+                _sweep_updated_total = 0
+                # Per-tenant overlay coordination: collect the schemas whose rel_types
+                # actually changed so the refresh endpoint invalidates ONLY those
+                # tenants' overlays (isolation + minimal rebuild cost). Empty set →
+                # endpoint falls back to a full overlay reset (backward-compatible).
+                _changed_schemas: set = set()
+                for _user_id, _schema in ready_schemas:
+                    try:
+                        with psycopg2.connect(postgres_dsn) as _ont_db:
+                            with _ont_db.cursor() as _spc:
+                                _spc.execute(f"SET search_path TO {_schema}")
+                            _ont_db.commit()
+
+                            # ── Ontology candidate evaluation (per-user schema) ──
                             try:
-                                _r = httpx.post(
-                                    "http://faultline:8000/internal/refresh-intent-pattern-caches",
-                                    timeout=5.0,
-                                )
-                                if _r.status_code == 200:
-                                    log.info("re_embedder.ontology_approval_cache_refresh_triggered")
+                                if has_pending_ontology_work(_ont_db):
+                                    ontology_stats = evaluate_ontology_candidates(_ont_db, qwen_api_url)
+                                    if any(v > 0 for v in ontology_stats.values()):
+                                        log.info(
+                                            f"re_embedder.ontology_eval "
+                                            f"schema={_schema} "
+                                            f"approved={ontology_stats['approved']} "
+                                            f"mapped={ontology_stats['mapped']} "
+                                            f"rejected={ontology_stats['rejected']} "
+                                            f"errors={ontology_stats['errors']}"
+                                        )
+                                    if ontology_stats.get("approved", 0) > 0 or ontology_stats.get("mapped", 0) > 0:
+                                        _approved_any = True
+                                        _changed_schemas.add(_schema)
                                 else:
-                                    log.warning(f"re_embedder.ontology_approval_cache_refresh_failed status={_r.status_code}")
-                            except Exception as _re:
-                                log.warning(f"re_embedder.ontology_approval_cache_refresh_error: {_re}")
-                    else:
-                        log.debug("re_embedder.no_pending_ontology_work")
-                except Exception as e:
-                    log.error(f"re_embedder.ontology_eval_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
-                    # Continue with next subsystem even if ontology eval fails
+                                    log.debug(f"re_embedder.no_pending_ontology_work schema={_schema}")
+                            except Exception as e:
+                                log.error(f"re_embedder.ontology_eval_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
-                # Retroactive head_types/tail_types sweep (Severance #2, Phase 2): self-heal the
-                # existing rel_types rows that have NULL/empty head_types (32% of the ontology,
-                # including instance_of/subclass_of/member_of). Bounded batch per cycle (LIMIT 10).
-                # Uses the SAME LLM metadata call so type constraints come from inference, not guesswork.
-                try:
-                    with db.cursor() as cur:
-                        cur.execute(
-                            "SELECT rel_type, head_types, tail_types, natural_language"
-                            " FROM rel_types"
-                            " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
-                            "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
-                            " ORDER BY confidence DESC NULLS LAST"
-                            " LIMIT 10"
-                        )
-                        _sweep_rows = cur.fetchall()
-
-                    _sweep_updated = 0
-                    for _rt, _ht, _tt, _nl in _sweep_rows:
-                        try:
-                            _md = _query_llm_for_rel_type_metadata(
-                                _rt, "unknown", "unknown", _nl or "", qwen_api_url
-                            )
-                            _new_head = _md.get("llm_head_types")
-                            _new_tail = _md.get("llm_tail_types")
-                            # Only fill what is missing; do not overwrite existing non-empty values.
-                            _set_head = (not _ht) and bool(_new_head)
-                            _set_tail = (not _tt) and bool(_new_tail)
-                            if not (_set_head or _set_tail):
-                                continue
-                            with db.cursor() as cur:
-                                cur.execute(
-                                    "UPDATE rel_types SET"
-                                    "  head_types = CASE WHEN (head_types IS NULL OR head_types = ARRAY[]::TEXT[])"
-                                    "                    THEN %s ELSE head_types END,"
-                                    "  tail_types = CASE WHEN (tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
-                                    "                    THEN %s ELSE tail_types END"
-                                    " WHERE rel_type = %s",
-                                    (_new_head if _set_head else None,
-                                     _new_tail if _set_tail else None,
-                                     _rt),
-                                )
-                            db.commit()
-                            _sweep_updated += 1
-                            log.info(f"re_embedder.head_tail_sweep_filled rel_type={_rt} "
-                                     f"head_types={_new_head if _set_head else _ht} "
-                                     f"tail_types={_new_tail if _set_tail else _tt}")
-                        except Exception as _sw_err:
+                            # ── Reinforce-or-decay sweep for novel rel_type candidates ──
+                            # Mirrors expire_staged_facts (Class C score-decay), keyed on
+                            # ontology_evaluations.occurrence_count + last_seen_at. Runs every
+                            # cycle (NOT gated by has_pending_ontology_work) so un-reinforced
+                            # one-off candidates age out even when nothing is at threshold.
+                            # Per-user schema context: search_path already set above.
                             try:
-                                db.rollback()
-                            except Exception:
-                                pass
-                            log.warning(f"re_embedder.head_tail_sweep_row_failed rel_type={_rt}: {_sw_err}")
+                                _ont_decay = decay_ontology_candidates(_ont_db, user_id=_user_id)
+                                if _ont_decay["decayed"] or _ont_decay["forgotten"]:
+                                    log.info(
+                                        f"re_embedder.ontology_candidate_decay schema={_schema} "
+                                        f"decayed={_ont_decay['decayed']} forgotten={_ont_decay['forgotten']}"
+                                    )
+                            except Exception as e:
+                                log.error(f"re_embedder.ontology_candidate_decay_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
-                    if _sweep_updated > 0:
-                        # Propagate updated type constraints to the backend uvicorn process (Phase 3).
-                        try:
-                            _r = httpx.post(
-                                "http://faultline:8000/internal/refresh-intent-pattern-caches",
-                                timeout=5.0,
-                            )
-                            if _r.status_code == 200:
-                                log.info(f"re_embedder.head_tail_sweep_cache_refreshed updated={_sweep_updated}")
-                        except Exception as _re:
-                            log.warning(f"re_embedder.head_tail_sweep_cache_refresh_failed: {_re}")
-                except Exception as e:
-                    log.warning(f"re_embedder.head_tail_sweep_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                            # ── Retroactive head_types/tail_types sweep (per-user schema) ──
+                            # Severance #2, Phase 2: self-heal rel_types rows with NULL/empty
+                            # head_types/tail_types. Bounded batch per cycle (LIMIT 10). Uses the
+                            # SAME LLM metadata call so type constraints come from inference.
+                            try:
+                                with _ont_db.cursor() as cur:
+                                    cur.execute(
+                                        "SELECT rel_type, head_types, tail_types, natural_language"
+                                        " FROM rel_types"
+                                        " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
+                                        "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                                        " ORDER BY confidence DESC NULLS LAST"
+                                        " LIMIT 10"
+                                    )
+                                    _sweep_rows = cur.fetchall()
+
+                                for _rt, _ht, _tt, _nl in _sweep_rows:
+                                    try:
+                                        _md = _query_llm_for_rel_type_metadata(
+                                            _rt, "unknown", "unknown", _nl or "", qwen_api_url
+                                        )
+                                        _new_head = _md.get("llm_head_types")
+                                        _new_tail = _md.get("llm_tail_types")
+                                        # Only fill what is missing; never overwrite existing non-empty values.
+                                        _set_head = (not _ht) and bool(_new_head)
+                                        _set_tail = (not _tt) and bool(_new_tail)
+                                        if not (_set_head or _set_tail):
+                                            continue
+                                        with _ont_db.cursor() as cur:
+                                            cur.execute(
+                                                "UPDATE rel_types SET"
+                                                "  head_types = CASE WHEN (head_types IS NULL OR head_types = ARRAY[]::TEXT[])"
+                                                "                    THEN %s ELSE head_types END,"
+                                                "  tail_types = CASE WHEN (tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                                                "                    THEN %s ELSE tail_types END"
+                                                " WHERE rel_type = %s",
+                                                (_new_head if _set_head else None,
+                                                 _new_tail if _set_tail else None,
+                                                 _rt),
+                                            )
+                                        _ont_db.commit()
+                                        _sweep_updated_total += 1
+                                        _changed_schemas.add(_schema)
+                                        log.info(f"re_embedder.head_tail_sweep_filled schema={_schema} rel_type={_rt} "
+                                                 f"head_types={_new_head if _set_head else _ht} "
+                                                 f"tail_types={_new_tail if _set_tail else _tt}")
+                                    except Exception as _sw_err:
+                                        try:
+                                            _ont_db.rollback()
+                                            # search_path is reset by rollback (psycopg2) — re-apply
+                                            # so the next sweep row targets the user schema, not public.
+                                            with _ont_db.cursor() as _spc2:
+                                                _spc2.execute(f"SET search_path TO {_schema}")
+                                        except Exception:
+                                            pass
+                                        log.warning(f"re_embedder.head_tail_sweep_row_failed schema={_schema} rel_type={_rt}: {_sw_err}")
+                            except Exception as e:
+                                log.warning(f"re_embedder.head_tail_sweep_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    except Exception as e:
+                        log.error(f"re_embedder.ontology_per_user_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+
+                # Phase 3 (Severance #3): newly-approved/mapped rel_types or filled type
+                # constraints live in the DB but are invisible to the backend uvicorn process
+                # (separate OS process) until it reloads _REL_TYPE_META. Trigger the cross-process
+                # refresh endpoint ONCE per cycle if anything changed across any user schema.
+                if _approved_any or _sweep_updated_total > 0:
+                    try:
+                        # Pass the changed schemas so the backend invalidates ONLY those
+                        # tenants' rel_type overlays (isolation; minimal rebuild). If the
+                        # set is somehow empty, omit it → backend does a full reset.
+                        _refresh_body = (
+                            {"schemas": sorted(_changed_schemas)} if _changed_schemas else None
+                        )
+                        _r = httpx.post(
+                            "http://faultline:8000/internal/refresh-intent-pattern-caches",
+                            json=_refresh_body,
+                            timeout=5.0,
+                        )
+                        if _r.status_code == 200:
+                            log.info(f"re_embedder.ontology_growth_cache_refresh_triggered "
+                                     f"approved_any={_approved_any} sweep_updated={_sweep_updated_total} "
+                                     f"changed_schemas={sorted(_changed_schemas)}")
+                        else:
+                            log.warning(f"re_embedder.ontology_growth_cache_refresh_failed status={_r.status_code}")
+                    except Exception as _re:
+                        log.warning(f"re_embedder.ontology_growth_cache_refresh_error: {_re}")
 
                 # dprompt-065: Async taxonomy discovery for novel rel_types (deferred from ingest)
                 # Runs in poll loop — no blocking LLM call in ingest hot path
@@ -3591,6 +4193,20 @@ def main():
                 except Exception as e:
                     log.error(f"re_embedder.name_conflict_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                     # Continue with next subsystem even if name conflict resolution fails
+
+                # ALIAS-PROVENANCE-DESIGN §3: Flag suspect preferred names (preferred
+                # aliases nobody ever chose). Flag-only — never auto-mutates names.
+                # Phase 3c: Wrap in error isolation to prevent background loop crash.
+                try:
+                    suspect_stats = flag_suspect_preferred_names(db)
+                    if suspect_stats["flagged"] > 0:
+                        log.info(
+                            f"re_embedder.suspect_preferred_names_flagged "
+                            f"count={suspect_stats['flagged']}"
+                        )
+                except Exception as e:
+                    log.error(f"re_embedder.suspect_preferred_names_subsystem_error (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                    # Continue with next subsystem even if suspect flagging fails
 
                 # Job 6: Evaluate extraction patterns for accuracy and bootstrap confidence
                 # Scoring phase: analyze user feedback on extraction patterns, update confidence scores
