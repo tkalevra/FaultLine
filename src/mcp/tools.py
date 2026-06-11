@@ -3,9 +3,10 @@
 TOOLS = [
     {
         "name": "recall_memory",
-        "description": "Recall what you know about the user or a topic from memory. "
-                       "Call this at the start of any turn where the user's message touches on "
-                       "something you might already know about them. The results are things you "
+        "description": "Call at the START of a turn to look up what you already know when the user "
+                       "asks about or references something you may know about them, their people, or "
+                       "their world. This only READS memory — it never saves; to SAVE a new fact the "
+                       "user states, use remember_facts instead. The results are things you "
                        "remember — speak about them naturally as your own knowledge, never as "
                        "retrieved data.\n\n"
                        "To build a concept map for a topic, prefix with /expand:\n"
@@ -31,13 +32,14 @@ TOOLS = [
     },
     {
         "name": "remember_facts",
-        "description": "Store facts from the current conversation into the FaultLine knowledge graph. "
-                       "Call this when the user states something worth remembering about themselves, "
-                       "their world, or their relationships — OR when correcting/updating a prior fact. "
-                       "Correction signals: 'actually X is Y', 'X is now Y not Z', 'I meant X', "
-                       "'Correction: ...', any update to a previously stated value. "
-                       "Internally runs intent classification → extract → validate → ingest. "
-                       "Returns the number of facts stored and their classification (Class A/B/C).",
+        "description": "ALWAYS call this whenever the user states ANY fact about themselves, another "
+                       "person, their preferences, relationships, possessions, work, or location — "
+                       "even said in passing and even if it seems minor. Default to calling it; only "
+                       "skip pure questions, greetings, or chitchat with no fact. Examples that MUST "
+                       "trigger it: 'My favorite language is Rust', 'I work at Guelph', 'My coworker "
+                       "Zelda got promoted', 'My office is on the 3rd floor'. Also call it to correct "
+                       "or update a prior fact (e.g. 'actually X is Y not Z'). Pass the user's "
+                       "sentence as text. Do NOT ask permission first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -81,10 +83,10 @@ TOOLS = [
     },
     {
         "name": "retract_fact",
-        "description": "Remove a previously stored fact from memory. Use ONLY when the user wants "
-                       "something forgotten or deleted — signals like 'forget that', 'remove', "
-                       "'erase', 'I don't have', 'that's not true', 'I'm not', 'X is not a Y'. "
-                       "Do NOT use for corrections or updates — use remember_facts instead. "
+        "description": "Use ONLY when the user explicitly wants something deleted or forgotten — "
+                       "signals like 'forget that', 'delete', 'erase', 'remove that'. For corrections "
+                       "or updated values (the user giving a NEW value for something), use "
+                       "remember_facts instead, NOT this. "
                        "Accepts natural language — delegates extraction to FaultLine backend.",
         "inputSchema": {
             "type": "object",
