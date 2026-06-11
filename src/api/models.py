@@ -11,7 +11,7 @@ class EdgeInput(BaseModel):
     is_preferred_label: bool = False
     is_correction: bool = False
     confidence: Optional[float] = None  # User corrections: 1.0. Default: None (ingest computes based on provenance)
-    fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | confirmed
+    fact_provenance: str = "llm_inferred"  # user_stated | llm_inferred | llm_learned
     subject_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     object_type: Optional[str] = None  # Person, Animal, Organization, Location, Object, Concept (from GLiNER2)
     definition: Optional[str] = None  # semantic definition of rel_type, LLM-generated at extraction time (dprompt-85)
@@ -66,6 +66,7 @@ class IngestResponse(BaseModel):
     staged: int = 0  # Facts written to staged_facts (Class B + C)
     entities: list[EntityResult]
     facts: list[FactResult]
+    error: Optional[str] = None  # Error message when status != "ok"
 
 
 class RelTypeRequest(BaseModel):

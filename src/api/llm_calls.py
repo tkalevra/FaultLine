@@ -446,7 +446,7 @@ def call_llm_with_retry_sync(
         error_msg = {
             "error": "circuit_breaker_open",
             "message": f"Language model not responding. Wait {max(1, int(time_until_reset))}s or restart backend.",
-            "debug": "Check logs: docker logs faultline --tail=50 | grep circuit_breaker"
+            "debug": "Check logs: ssh truenas -x 'sudo docker logs faultline --tail=50' | grep circuit_breaker"
         }
         log.warning("call_llm.circuit_breaker_open",
                    user_id=user_id,
@@ -625,7 +625,7 @@ async def call_llm_with_retry_async(
         error_msg = {
             "error": "circuit_breaker_open",
             "message": f"Language model not responding. Wait {max(1, int(time_until_reset))}s or restart backend.",
-            "debug": "Check logs: docker logs faultline --tail=50 | grep circuit_breaker"
+            "debug": "Check logs: ssh truenas -x 'sudo docker logs faultline --tail=50' | grep circuit_breaker"
         }
         log.warning("call_llm_async.circuit_breaker_open",
                    user_id=user_id,

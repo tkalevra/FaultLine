@@ -5,6 +5,11 @@ URL = API_URL.rstrip("/") + "/mcp"
 KEY = os.environ.get("MCP_API_KEY", "")
 USER_ID = os.environ.get("FAULTLINE_USER_ID", "")
 
+def _dbg(msg):
+    print(f"[faultline-proxy] {msg}", file=sys.stderr, flush=True)
+
+_dbg(f"target={URL} key={'set('+str(len(KEY))+'chars)' if KEY else 'EMPTY'} user={USER_ID[:8]+'...' if USER_ID else 'EMPTY'}")
+
 def post(payload):
     if USER_ID and "params" in payload and "arguments" in payload.get("params", {}):
         args = payload["params"]["arguments"]

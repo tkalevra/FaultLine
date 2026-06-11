@@ -104,36 +104,45 @@ class RelTypeRegistry:
 # See migrations/006_split_is_a.sql for standards alignment details.
 # dprompt-064 Phase 1: Added correction_behavior, inverse_rel_type, is_symmetric fields
 SEED_ONTOLOGY = {
-    "is_a":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
-    "instance_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
-    "subclass_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
-    "part_of":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None},
-    "created_by":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "works_for":      {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
-    "parent_of":      {"correction_behavior": "immutable", "inverse_rel_type": "child_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family"},
-    "child_of":       {"correction_behavior": "immutable", "inverse_rel_type": "parent_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family"},
-    "spouse":         {"correction_behavior": "supersede", "inverse_rel_type": "spouse", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
-    "sibling_of":     {"correction_behavior": "immutable", "inverse_rel_type": "sibling_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
-    "also_known_as":  {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity"},
-    "pref_name":      {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity"},
-    "same_as":        {"correction_behavior": "supersede", "inverse_rel_type": "same_as", "is_symmetric": True, "is_hierarchy_rel": False, "category": "identity"},
-    "related_to":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "likes":          {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "dislikes":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "prefers":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "owns":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "located_in":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
-    "educated_at":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
-    "nationality":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "occupation":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work"},
-    "born_on":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "age":            {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
-    "knows":          {"correction_behavior": "supersede", "inverse_rel_type": "knows", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
-    "friend_of":      {"correction_behavior": "supersede", "inverse_rel_type": "friend_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family"},
-    "met":            {"correction_behavior": "supersede", "inverse_rel_type": "met", "is_symmetric": True, "is_hierarchy_rel": False, "category": None},
-    "lives_in":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
-    "born_in":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location"},
-    "has_gender":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None},
+    # Hierarchy rel_types — head_types/tail_types are ANY (classification is unconstrained)
+    "is_a":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "instance_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "subclass_of":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "part_of":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "member_of":      {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": True, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    # Relational rel_types — constrained head_types/tail_types
+    "created_by":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "works_for":      {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["Person", "Organization"]},
+    "parent_of":      {"correction_behavior": "immutable", "inverse_rel_type": "child_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "child_of":       {"correction_behavior": "immutable", "inverse_rel_type": "parent_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "spouse":         {"correction_behavior": "supersede", "inverse_rel_type": "spouse", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "sibling_of":     {"correction_behavior": "immutable", "inverse_rel_type": "sibling_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "also_known_as":  {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["SCALAR"]},
+    "pref_name":      {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["SCALAR"]},
+    "same_as":        {"correction_behavior": "supersede", "inverse_rel_type": "same_as", "is_symmetric": True, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "related_to":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "likes":          {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "dislikes":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "prefers":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
+    "owns":           {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person", "Organization"], "tail_types": ["Animal", "Object", "Organization"]},
+    "has_pet":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Animal"]},
+    "located_in":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["ANY"], "tail_types": ["Location"]},
+    "educated_at":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["Organization"]},
+    "lives_in":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location"]},
+    "lives_at":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location", "SCALAR"]},
+    "born_in":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location"]},
+    # Scalar rel_types
+    "nationality":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    "occupation":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    "born_on":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    "age":            {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    "height":         {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["SCALAR"]},
+    "weight":         {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["SCALAR"]},
+    "has_gender":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    # Symmetric social rel_types
+    "knows":          {"correction_behavior": "supersede", "inverse_rel_type": "knows", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "friend_of":      {"correction_behavior": "supersede", "inverse_rel_type": "friend_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "met":            {"correction_behavior": "supersede", "inverse_rel_type": "met", "is_symmetric": True, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
 }
 
 
@@ -143,6 +152,27 @@ _UUID_RE = re.compile(
 )
 
 class WGMValidationGate:
+    @staticmethod
+    def validate_edge_inputs(edges: list) -> str | None:
+        """
+        Pre-flight shape validation for edge inputs. No DB required.
+        Checks structural requirements before edges reach full ontology validation.
+        Returns error message string if invalid, None if valid.
+
+        This is the FIRST validation layer. Full ontology validation happens
+        in validate_edge() which requires a DB connection.
+        """
+        if not isinstance(edges, list):
+            return "edges must be an array"
+        if len(edges) == 0:
+            return "edges must not be empty"
+        for i, edge in enumerate(edges):
+            if not isinstance(edge, dict):
+                return f"edges[{i}] must be an object"
+            if "subject" not in edge or "object" not in edge or "rel_type" not in edge:
+                return f"edges[{i}] missing required field (subject, object, rel_type)"
+        return None
+
     def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None, schema_name: str = None):
         self.db_conn = db_conn
         self.registry = registry
@@ -476,13 +506,50 @@ class WGMValidationGate:
 
     def get_current_ontology(self) -> dict:
         """
-        Get fresh ontology from registry (bypasses WGMValidationGate-level caching).
-        RelTypeRegistry handles its own 5s TTL cache, so this is lightweight.
-        Always returns current state (picks up rel_types added by re_embedder).
+        Get fresh ontology resolved as PER-TENANT OVERLAY: public seed ∪ this gate's
+        tenant schema rel_types (grown/curated), tenant rows overriding the seed.
+
+        This closes the per-tenant ontology loop on the validation side: a rel_type
+        approved into the tenant's own schema is now "valid" (not novel_unapproved)
+        without a backend restart. Isolation holds — we only read self._schema_name's
+        schema; growth never writes to public.
+
+        Cache-hit path is DB-FREE (overlay module caches the seed globally and the
+        tenant delta per schema, both TTL-refreshed and explicitly invalidated on
+        approval). Falls back to the schema-blind RelTypeRegistry (then SEED_ONTOLOGY)
+        if the overlay is unavailable, preserving prior behaviour.
         """
+        try:
+            from src.api import rel_type_overlay
+            dsn = os.environ.get("POSTGRES_DSN", "")
+            if dsn and self._schema_name:
+                merged = rel_type_overlay.resolve_meta(dsn, self._schema_name)
+                if merged:
+                    return merged
+        except Exception as e:
+            log.warning(f"gate.overlay_ontology_resolve_failed (falling back): {e}")
         if self.registry:
             return self.registry.get_ontology()
         return SEED_ONTOLOGY
+
+    def _invalidate_overlay(self) -> None:
+        """Drop this tenant's rel_type overlay after an in-flow write so the SAME
+        request (and subsequent ones) see the freshly approved/created rel_type
+        without waiting for the TTL. Tenant-scoped: only this schema is invalidated."""
+        try:
+            from src.api import rel_type_overlay
+            if self._schema_name:
+                rel_type_overlay.invalidate(self._schema_name)
+        except Exception:
+            pass
+
+    def _valid_types(self) -> set:
+        """Known rel_types for THIS gate's tenant (public seed ∪ tenant overlay).
+
+        Derived from get_current_ontology() so the per-tenant overlay drives the
+        'valid vs novel_unapproved' decision. Lowercased set; cache-hit = DB-free.
+        """
+        return {rt.lower() for rt in self.get_current_ontology().keys()}
 
     def _is_user_correction(self, edge_dict: dict) -> bool:
         """Check if edge is an explicit user correction.
@@ -644,6 +711,166 @@ class WGMValidationGate:
 
     # ── end dprompt-90 ──────────────────────────────────────────────────
 
+    # ── Staged-facts hierarchy conflict cleanup ───────────────────────────
+    # Mirrors _SYSTEM_ENTITY_NAMES from main.py — any name that is a generic
+    # ontology token rather than a real entity.  Kept as a local frozenset to
+    # avoid circular imports (gate.py ← main.py).
+    _SYSTEM_ENTITY_NAMES: frozenset = frozenset({
+        "faultline",
+        "knowledgegraph", "knowledge graph", "knowledge_graph",
+        "node", "edge", "entitynode", "entity node",
+        "relationshipedge", "relationship edge",
+        "object", "concept", "thing", "entity",
+        "organization", "person", "location", "group", "place",
+    })
+
+    def _delete_conflicting_staged_hierarchy_facts(
+        self,
+        subject_id: str,
+        rel_type: str,
+        object_id: str,
+        qdrant_url: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        """Delete staged_facts rows that contradict an incoming hierarchy fact.
+
+        Fires when a hierarchy rel_type (is_hierarchy_rel=true, e.g. instance_of,
+        subclass_of, part_of) is being ingested.  Two classes of rows are removed:
+
+        1. Conflicting type rows — same subject, same rel_type, different object
+           (e.g. "university instance_of person" when "university instance_of
+           organization" is arriving).  Staged_facts has no superseded_at column;
+           hard-delete is the correct action.
+
+        2. Inverted rows — subject is a generic ontology token (matches
+           _SYSTEM_ENTITY_NAMES) and rel_type is a hierarchy rel.  These are
+           mis-extracted facts that have subject/object swapped (e.g. "person
+           instance_of christopher").
+
+        Qdrant cleanup is best-effort: a failed delete does not affect the gate
+        decision or the DB operation.
+
+        Returns the total number of staged_facts rows deleted.
+        """
+        rt_lower = rel_type.lower().strip()
+
+        # Only act on hierarchy rel_types — check current ontology (metadata-driven).
+        ontology = self.get_current_ontology()
+        rel_meta = ontology.get(rt_lower, {})
+        if not rel_meta.get("is_hierarchy_rel"):
+            return 0
+
+        deleted_ids: list[int] = []
+
+        try:
+            with self.db_conn.cursor() as cur:
+                # --- Pass 1: conflicting type rows (same subject+rel, different object) ---
+                cur.execute(
+                    """
+                    SELECT id FROM staged_facts
+                    WHERE subject_id = %s
+                      AND rel_type   = %s
+                      AND object_id != %s
+                      AND promoted_at IS NULL
+                    """,
+                    (subject_id, rt_lower, object_id),
+                )
+                conflict_rows = [r[0] for r in cur.fetchall()]
+
+                # --- Pass 2: inverted rows (subject is a system entity token) ---
+                subj_lower = str(subject_id).lower().strip()
+                if subj_lower in self._SYSTEM_ENTITY_NAMES:
+                    # The incoming fact itself is inverted — log and let the caller
+                    # decide, but also purge any pre-existing inverted rows.
+                    cur.execute(
+                        """
+                        SELECT id FROM staged_facts
+                        WHERE subject_id = %s
+                          AND rel_type   = %s
+                          AND promoted_at IS NULL
+                        """,
+                        (subject_id, rt_lower),
+                    )
+                    inverted_rows = [r[0] for r in cur.fetchall()]
+                else:
+                    # Purge previously-written inverted rows (subject is a system token).
+                    # These rows have the subject and object swapped; delete them regardless
+                    # of which object_id the new fact carries.
+                    cur.execute(
+                        """
+                        SELECT sf.id FROM staged_facts sf
+                        WHERE sf.rel_type = %s
+                          AND sf.promoted_at IS NULL
+                          AND lower(sf.subject_id) = ANY(%s)
+                        """,
+                        (rt_lower, list(self._SYSTEM_ENTITY_NAMES)),
+                    )
+                    inverted_rows = [r[0] for r in cur.fetchall()]
+
+                all_to_delete = list(set(conflict_rows + inverted_rows))
+                if not all_to_delete:
+                    return 0
+
+                # Hard-delete: staged_facts has no superseded_at column.
+                cur.execute(
+                    "DELETE FROM staged_facts WHERE id = ANY(%s)",
+                    (all_to_delete,),
+                )
+                deleted_count = cur.rowcount
+
+            self.db_conn.commit()
+            deleted_ids = all_to_delete
+
+            log.info(
+                "wgm.staged_hierarchy_conflicts_deleted",
+                subject_id=str(subject_id)[:16],
+                rel_type=rt_lower,
+                incoming_object=str(object_id)[:16],
+                conflict_rows=len(conflict_rows),
+                inverted_rows=len(inverted_rows),
+                deleted_count=deleted_count,
+            )
+
+        except Exception as e:
+            log.error(
+                "wgm.staged_hierarchy_conflict_delete_failed",
+                subject_id=str(subject_id)[:16],
+                rel_type=rt_lower,
+                error=str(e),
+            )
+            try:
+                self.db_conn.rollback()
+                self._reapply_search_path()
+            except Exception:
+                pass
+            return 0
+
+        # Best-effort Qdrant cleanup — never affects gate decision.
+        if deleted_ids and qdrant_url and user_id:
+            try:
+                from src.re_embedder.embedder import derive_collection
+                import httpx as _httpx
+                collection = derive_collection(user_id)
+                _httpx.post(
+                    f"{qdrant_url}/collections/{collection}/points/delete",
+                    json={"points": deleted_ids},
+                    timeout=5.0,
+                )
+                log.info(
+                    "wgm.staged_hierarchy_qdrant_cleanup",
+                    collection=collection,
+                    deleted_ids=deleted_ids,
+                )
+            except Exception as qe:
+                log.warning(
+                    "wgm.staged_hierarchy_qdrant_cleanup_failed",
+                    error=str(qe),
+                )
+
+        return deleted_count
+
+    # ── end staged-facts hierarchy conflict cleanup ───────────────────────
+
     # ── dprompt-119: INGEST Strengthening — Ontology, Hierarchy, Category ──
     # Metadata-driven routing using rel_types columns
 
@@ -656,8 +883,8 @@ class WGMValidationGate:
         """
         rt_lower = rel_type.lower().strip()
 
-        # First check if rel_type exists directly
-        if self.registry and rt_lower in [r.lower() for r in self.registry.get_valid_types()]:
+        # First check if rel_type exists directly (per-tenant: seed ∪ tenant overlay)
+        if rt_lower in self._valid_types():
             return rt_lower
 
         # Check if inverse exists
@@ -937,7 +1164,7 @@ class WGMValidationGate:
 
         # dprompt-119: Check for inverse rel_type mapping
         # If rel_type not found, try to find canonical form via inverse relationship
-        valid_types = self.registry.get_valid_types() if self.registry else set(SEED_ONTOLOGY.keys())
+        valid_types = self._valid_types()
         if rt not in valid_types:
             canonical = self._find_inverse_rel_type(rt)
             if canonical:
@@ -997,6 +1224,24 @@ class WGMValidationGate:
                     "reason": correction_result["reason"],
                     "committed": 0,
                 }
+
+        # Staged-facts hierarchy conflict cleanup:
+        # For any hierarchy rel_type (is_hierarchy_rel=true), delete staged_facts rows
+        # that contradict the incoming fact before we proceed with validation or bypass.
+        # This fires unconditionally — not just on corrections — because staged_facts
+        # accumulate contradictions from prior incomplete extraction passes.
+        # Also purges inverted rows (system-token subjects) left from before the
+        # inversion guard was added to the ingest path.
+        # qdrant_url and user_id passed via edge_args when available.
+        _qdrant_url = edge_args.get("qdrant_url") or os.environ.get("QDRANT_URL")
+        _user_id_for_qdrant = edge_args.get("user_id")
+        self._delete_conflicting_staged_hierarchy_facts(
+            subject_id=subject_id,
+            rel_type=rt,
+            object_id=object_id,
+            qdrant_url=_qdrant_url,
+            user_id=_user_id_for_qdrant,
+        )
 
         # CONFIDENCE-GATED BYPASS LOGIC (dprompt-124):
         # High-confidence facts (>= 0.95) bypass validation gates entirely.
@@ -1289,6 +1534,9 @@ class WGMValidationGate:
                     (rel_type, rel_type.replace('_', ' ').title()),
                 )
             self.db_conn.commit()
+            # Per-tenant overlay: drop this schema's overlay so the freshly written
+            # rel_type is visible to get_current_ontology() within THIS request.
+            self._invalidate_overlay()
             # Registry cache will refresh automatically (5s TTL)
             # No need to manually refresh — get_current_ontology() queries fresh
             if self.registry:
@@ -1383,6 +1631,8 @@ Respond with ONLY the JSON, no explanation."""
                         )
                     )
                 self.db_conn.commit()
+                # Per-tenant overlay invalidation (see _invalidate_overlay).
+                self._invalidate_overlay()
                 # Refresh cache so updated metadata is available immediately
                 if hasattr(self, 'registry') and hasattr(self.registry, '_refresh'):
                     self.registry._refresh()
@@ -1509,7 +1759,7 @@ Respond with ONLY the JSON, no explanation."""
                        (rel_type, label, natural_language, is_symmetric, inverse_rel_type,
                         head_types, tail_types, is_hierarchy_rel, category, confidence,
                         engine_generated, source)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'wgm_gate_inference')
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'engine')
                        ON CONFLICT (rel_type) DO UPDATE SET
                            is_symmetric      = EXCLUDED.is_symmetric,
                            inverse_rel_type  = EXCLUDED.inverse_rel_type,
@@ -1535,6 +1785,9 @@ Respond with ONLY the JSON, no explanation."""
                 )
 
             self.db_conn.commit()
+
+            # Per-tenant overlay invalidation (see _invalidate_overlay).
+            self._invalidate_overlay()
 
             # Refresh metadata cache
             if hasattr(self, 'registry') and hasattr(self.registry, '_refresh'):

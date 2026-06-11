@@ -26,12 +26,16 @@ version: "3.8"
 #     → Repository URL, Branch, Compose path: docker-compose-portainer-withoutqdrant.yml
 #
 # REQUIRED ENVIRONMENT VARIABLES (set in Portainer's "Environment variables" tab):
-#   OPENWEBUI_URL             - LLM endpoint URL (internal: http://192.168.40.10:3000)
+#   LLM_BASE_URL              - LLM base URL (internal: http://open-webui:8080)
+#   LLM_BACKEND_TYPE          - Backend type: openwebui (default), ollama, openai, raw
 #   LLM_API_KEY               - Bearer token for OpenWebUI authentication (sk-...)
 #   FAULTLINE_URL             - FaultLine backend endpoint (http://192.168.40.10:8001)
 #   POSTGRES_PASSWORD         - Database password for 'faultline' user
 #   WGM_LLM_MODEL             - Extraction model name (qwen/qwen3.5-9b for full reasoning)
 #   CATEGORY_LLM_MODEL        - Category inference model (qwen2.5-coder-1.5b-instruct for speed)
+#   REEMBED_INTERVAL          - Re-embedder poll interval in seconds (default: 300)
+#   REDIS_URL                 - Redis URL for inlet dedup (default: redis://redis:6379/0)
+#   SHORT_TERM_MEMORY         - Enable short-term memory via Qdrant store_context (default: true)
 #   FAULTLINE_USER_ID         - Default user UUID for MCP server (optional)
 #   MCP_API_KEY               - API key for MCP server authentication (optional)
 #
@@ -62,13 +66,15 @@ services:
       - "8001:8000"
     environment:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
-      OPENWEBUI_URL: ${OPENWEBUI_URL}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://open-webui:8080}
+      LLM_BACKEND_TYPE: ${LLM_BACKEND_TYPE:-openwebui}
       LLM_API_KEY: ${LLM_API_KEY}
       FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
-      REDIS_URL: redis://redis:6379/0
-      REEMBED_INTERVAL: 5
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-300}
+      SHORT_TERM_MEMORY: ${SHORT_TERM_MEMORY:-true}
       WGM_LLM_MODEL: ${WGM_LLM_MODEL}
       CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-15}
