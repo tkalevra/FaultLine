@@ -5,7 +5,7 @@ class FactStoreManager:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A") -> int:
+    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A", fact_provenance: str = "llm_inferred") -> int:
         """
         Insert edges into facts with temporal metadata.
         connections: list of tuples with varying length:
@@ -71,8 +71,8 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (subject_id, object_id, rel_type, provenance, confidence, unified_confidence, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, valid_from, valid_until, fact_class)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " (subject_id, object_id, rel_type, provenance, confidence, unified_confidence, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, valid_from, valid_until, fact_class, fact_provenance)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   fact_class = CASE"
@@ -89,8 +89,9 @@ class FactStoreManager:
                         "   storage_type = COALESCE(EXCLUDED.storage_type, facts.storage_type),"
                         "   taxonomies = COALESCE(EXCLUDED.taxonomies, facts.taxonomies),"
                         "   valid_from = COALESCE(EXCLUDED.valid_from, facts.valid_from),"
-                        "   valid_until = COALESCE(EXCLUDED.valid_until, facts.valid_until)",
-                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class),
+                        "   valid_until = COALESCE(EXCLUDED.valid_until, facts.valid_until),"
+                        "   fact_provenance = EXCLUDED.fact_provenance",
+                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class, fact_provenance),
                     )
                     count += 1
             self.db_conn.commit()

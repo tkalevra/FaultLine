@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS facts (
     object_id TEXT NOT NULL,
     rel_type TEXT NOT NULL,
     provenance TEXT,
-    fact_provenance TEXT,
+    fact_provenance TEXT NOT NULL DEFAULT 'llm_inferred',
     fact_class TEXT DEFAULT 'B',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS facts (
     archived_at TIMESTAMPTZ,
     valid_from TIMESTAMPTZ,
     valid_until TIMESTAMPTZ,
-    UNIQUE(subject_id, object_id, rel_type)
+    UNIQUE(subject_id, object_id, rel_type),
+    CONSTRAINT chk_facts_fact_provenance CHECK (fact_provenance IN ('user_stated', 'llm_inferred', 'llm_learned'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_pair
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS staged_facts (
     rel_type TEXT,
     fact_class TEXT DEFAULT 'B',
     provenance TEXT,
-    fact_provenance TEXT,
+    fact_provenance TEXT NOT NULL DEFAULT 'llm_inferred',
     confidence FLOAT NOT NULL DEFAULT 0.6,
     unified_confidence DOUBLE PRECISION DEFAULT 0.8,
     confirmed_count INT DEFAULT 0,
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS staged_facts (
     storage_type TEXT,
     is_hierarchy_rel BOOLEAN DEFAULT false,
     taxonomies TEXT[] DEFAULT '{}',
-    UNIQUE(subject_id, object_id, rel_type)
+    UNIQUE(subject_id, object_id, rel_type),
+    CONSTRAINT chk_staged_facts_fact_provenance CHECK (fact_provenance IN ('user_stated', 'llm_inferred', 'llm_learned'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_staged_facts_pair
@@ -130,6 +132,7 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
     entity_id TEXT NOT NULL,
     alias TEXT NOT NULL,
     is_preferred BOOLEAN NOT NULL DEFAULT false,
+    preference_source TEXT NOT NULL DEFAULT 'unspecified',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     valid_from TIMESTAMP WITH TIME ZONE DEFAULT now(),
     valid_until TIMESTAMP WITH TIME ZONE,
@@ -202,7 +205,8 @@ CREATE TABLE IF NOT EXISTS rel_types (
     value_distribution TEXT,
     approved_exceptions TEXT,
     anomaly_threshold FLOAT,
-    mutually_exclusive_with TEXT[] DEFAULT '{}'
+    mutually_exclusive_with TEXT[] DEFAULT '{}',
+    CONSTRAINT rel_types_source_check CHECK (source = ANY (ARRAY['wikidata', 'builtin', 'engine', 'user', 'expand']))
 );
 
 CREATE INDEX IF NOT EXISTS idx_rel_types_engine_generated
@@ -305,6 +309,22 @@ CREATE TABLE IF NOT EXISTS intent_confidence_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_intent_confidence_feedback_bin
     ON intent_confidence_feedback (confidence_bin);
+
+-- Correction patterns: regex patterns for pre-GLiNER2 correction intent detection (per-schema)
+-- Checked BEFORE GLiNER2 runs to catch negation-correction phrases that GLiNER2 misclassifies
+-- as QUERY (e.g. "X is a computer, not an animal"). Patterns are subject-agnostic structure
+-- detectors — they match sentence shape, not specific entity names.
+CREATE TABLE IF NOT EXISTS correction_patterns (
+    id SERIAL PRIMARY KEY,
+    pattern_text TEXT NOT NULL,
+    confidence FLOAT DEFAULT 0.9,
+    active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT now(),
+    UNIQUE(pattern_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_correction_patterns_active
+    ON correction_patterns (active) WHERE active = TRUE;
 
 -- Retraction signals: learned signals for improving intent classification (per-schema)
 -- Growth engine: learned from successful retractions, strengthens GLiNER2 over time
