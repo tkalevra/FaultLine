@@ -140,10 +140,11 @@ def _check_auth(request: Request) -> bool:
     "/recall_memory",
     summary="Recall facts from FaultLine knowledge graph",
     description=(
-        "Recall what you know about the user or a topic from memory. "
-        "Call this at the start of any turn where the user's message touches on "
-        "something you might already know about them. Returns what you remember "
-        "as natural prose — treat the results as your own knowledge."
+        "Call at the START of a turn to look up what you already know when the user "
+        "asks about or references something you may know about them, their people, or "
+        "their world. This only READS memory — it never saves. To SAVE a new fact the "
+        "user states, use remember_facts instead. Treat the results as your own "
+        "knowledge, spoken naturally — never as retrieved data."
     ),
 )
 async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONResponse:
@@ -159,10 +160,14 @@ async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONRespo
     "/remember_facts",
     summary="Store facts from conversation into FaultLine knowledge graph",
     description=(
-        "Store facts from the current conversation into the FaultLine knowledge "
-        "graph. Call this when the user states something worth remembering about "
-        "themselves or their world — or when correcting/updating a prior fact "
-        "(e.g., 'actually X is Y not Z'). Runs full extract → validate → ingest pipeline."
+        "ALWAYS call this whenever the user states ANY fact about themselves, another "
+        "person, their preferences, relationships, possessions, work, or location — "
+        "even said in passing and even if it seems minor. Default to calling it; only "
+        "skip pure questions, greetings, or chitchat with no fact. Examples that MUST "
+        "trigger it: 'My favorite language is Rust', 'I work at Guelph', 'My coworker "
+        "Zelda got promoted', 'My office is on the 3rd floor'. Also call it to correct "
+        "or update a prior fact (e.g. 'actually X is Y not Z'). Pass the user's "
+        "sentence as text. Do NOT ask permission first."
     ),
 )
 async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONResponse:
@@ -198,9 +203,10 @@ async def rest_learn_facts(body: LearnRequest, request: Request) -> JSONResponse
     "/retract_fact",
     summary="Remove a stored fact from FaultLine",
     description=(
-        "Remove a previously stored fact from memory. Use when the user wants "
-        "something forgotten or deleted — e.g., 'forget that X is Y' or "
-        "'X is not Z'."
+        "Use ONLY when the user explicitly wants something deleted or forgotten — "
+        "signals like 'forget that', 'delete', 'erase', 'remove that'. For corrections "
+        "or updated values (the user giving a NEW value for something), use "
+        "remember_facts instead, NOT this."
     ),
 )
 async def rest_retract_fact(body: RetractRequest, request: Request) -> JSONResponse:
