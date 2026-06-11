@@ -20,7 +20,7 @@ TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What you want to recall (e.g., 'what do you know about X', 'tell me about Y')"
+                    "description": "A short topic from the user's message to look up. Required — never leave empty."
                 },
                 "user_id": {
                     "type": "string",
@@ -32,20 +32,17 @@ TOOLS = [
     },
     {
         "name": "remember_facts",
-        "description": "ALWAYS call this whenever the user states ANY fact about themselves, another "
-                       "person, their preferences, relationships, possessions, work, or location — "
-                       "even said in passing and even if it seems minor. Default to calling it; only "
-                       "skip pure questions, greetings, or chitchat with no fact. Examples that MUST "
-                       "trigger it: 'My favorite language is Rust', 'I work at Guelph', 'My coworker "
-                       "Zelda got promoted', 'My office is on the 3rd floor'. Also call it to correct "
-                       "or update a prior fact (e.g. 'actually X is Y not Z'). Pass the user's "
-                       "sentence as text. Do NOT ask permission first.",
+        "description": "Save something the user just told you. Call this whenever the user states a "
+                       "fact about themselves, another person, or their world — a name, relationship, "
+                       "preference, job, possession, or location — even mentioned in passing, and also "
+                       "when they correct a prior fact. Default to calling it; skip only pure questions "
+                       "or chitchat. Do not ask permission first.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "The sentence or passage containing the fact(s) to remember"
+                    "description": "The user's own sentence(s) containing the fact(s), copied verbatim. Required — never leave empty."
                 },
                 "user_id": {
                     "type": "string",

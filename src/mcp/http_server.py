@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
 import src.mcp.server as _mcp
@@ -34,12 +34,12 @@ import src.mcp.server as _mcp
 # ── OpenWebUI OpenAPI tool request/response models ────────────────────────────
 
 class RecallRequest(BaseModel):
-    query: str
+    query: str = Field(..., description="A short topic from the user's message to look up. Required — never leave empty.")
     user_id: str = ""
 
 
 class RememberRequest(BaseModel):
-    text: str
+    text: str = Field(..., description="The user's own sentence(s) containing the fact(s), copied verbatim. Required — never leave empty.")
     user_id: str = ""
 
 
@@ -160,14 +160,11 @@ async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONRespo
     "/remember_facts",
     summary="Store facts from conversation into FaultLine knowledge graph",
     description=(
-        "ALWAYS call this whenever the user states ANY fact about themselves, another "
-        "person, their preferences, relationships, possessions, work, or location — "
-        "even said in passing and even if it seems minor. Default to calling it; only "
-        "skip pure questions, greetings, or chitchat with no fact. Examples that MUST "
-        "trigger it: 'My favorite language is Rust', 'I work at Guelph', 'My coworker "
-        "Zelda got promoted', 'My office is on the 3rd floor'. Also call it to correct "
-        "or update a prior fact (e.g. 'actually X is Y not Z'). Pass the user's "
-        "sentence as text. Do NOT ask permission first."
+        "Save something the user just told you. Call this whenever the user states a "
+        "fact about themselves, another person, or their world — a name, relationship, "
+        "preference, job, possession, or location — even mentioned in passing, and also "
+        "when they correct a prior fact. Default to calling it; skip only pure questions "
+        "or chitchat. Do not ask permission first."
     ),
 )
 async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONResponse:
