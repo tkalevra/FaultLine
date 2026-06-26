@@ -24,15 +24,15 @@ FaultLine solves this by **actually remembering things you say** and using those
 
 When you say something to the assistant, FaultLine listens for facts.
 
-**Example:** "My son Theo is 12, and my wife is Elena."
+**Example:** "My son Alex is 12, and my wife is Jordan."
 
 FaultLine identifies:
-- **Fact 1:** Theo is a son (relationship: parent_of)
-- **Fact 2:** Elena is a wife (relationship: spouse)
-- **Fact 3:** Theo's age is 12 (attribute)
+- **Fact 1:** Alex is a son (relationship: parent_of)
+- **Fact 2:** Jordan is a wife (relationship: spouse)
+- **Fact 3:** Alex's age is 12 (attribute)
 
 **But wait, you might correct yourself:**
-- "Actually, Theo is 14, not 12"
+- "Actually, Alex is 14, not 12"
 
 FaultLine notices the correction word "Actually" and marks it as an override. Your correction wins over any AI guess.
 
@@ -52,28 +52,28 @@ Now FaultLine validates these facts before storing them.
   - YES? Use what we know about it
   - NO? Learn it as something new
   
-- "Is Theo a known type of person?"
+- "Is Alex a known type of person?"
   - YES? Skip
-  - NO? Remember Theo is a person
+  - NO? Remember Alex is a person
 
 - "Does this conflict with anything we know?"
-  - Example: Can't have "Theo is a type of dog" AND "Theo is your son" at the same time
+  - Example: Can't have "Alex is a type of dog" AND "Alex is your son" at the same time
 
 **Then it stores the fact with a confidence level:**
-- **High confidence (you said it directly):** "My son Theo" → stored immediately ✓
-- **Medium confidence (AI inferred it):** "Based on context, Theo is probably 14" → ask for confirmation ⚠️
-- **Low confidence (AI guessed something new):** "Theo might be a Gemini zodiac sign" → hold for later evaluation ❓
+- **High confidence (you said it directly):** "My son Alex" → stored immediately ✓
+- **Medium confidence (AI inferred it):** "Based on context, Alex is probably 14" → ask for confirmation ⚠️
+- **Low confidence (AI guessed something new):** "Alex might be a Gemini zodiac sign" → hold for later evaluation ❓
 
 ---
 
 ### Step 3: Use It (Recall)
 
-Later, you ask: "How old is Theo?"
+Later, you ask: "How old is Alex?"
 
 FaultLine:
-1. **Finds all relevant facts** about Theo
-   - Direct facts: Theo is your son, age is 14
-   - Connections: Theo is connected to you, to Elena
+1. **Finds all relevant facts** about Alex
+   - Direct facts: Alex is your son, age is 14
+   - Connections: Alex is connected to you, to Jordan
    - Context: Related to family memories
 
 2. **Checks for consistency**
@@ -81,12 +81,12 @@ FaultLine:
    - Is the source trustworthy? Yes (you said it)
 
 3. **Tells the AI**
-   - Adds to context: "You have a son named Theo who is 14"
+   - Adds to context: "You have a son named Alex who is 14"
    - The AI sees this before answering
 
 4. **AI responds naturally**
-   - "Theo is 14 years old. How is he doing?"
-   - No guessing, no forgetting, no asking "who is Theo?"
+   - "Alex is 14 years old. How is he doing?"
+   - No guessing, no forgetting, no asking "who is Alex?"
 
 ---
 
@@ -137,12 +137,12 @@ Facts get stored in different places depending on what they are:
 | Type | Example | Storage | Purpose |
 |------|---------|---------|---------|
 | **Attributes** | "age = 14" | Single value table | Quick lookup |
-| **Relationships** | "spouse → Elena" | Connection graph | Find connected people |
-| **Classifications** | "Theo is a Person" | Hierarchy | Understand what things are |
+| **Relationships** | "spouse → Jordan" | Connection graph | Find connected people |
+| **Classifications** | "Alex is a Person" | Hierarchy | Understand what things are |
 
 This matters because the system can answer different questions efficiently:
-- "How old is Theo?" → Quick attribute lookup
-- "Who is Theo connected to?" → Graph traversal
+- "How old is Alex?" → Quick attribute lookup
+- "Who is Alex connected to?" → Graph traversal
 - "What am I?" → Hierarchy traversal
 
 ---
@@ -174,7 +174,7 @@ Not all facts are equal.
 ## Example: Full Cycle
 
 ### Day 1
-**You say:** "My son Theo is 12, and my wife is Elena"
+**You say:** "My son Alex is 12, and my wife is Jordan"
 
 FaultLine:
 - Extracts facts
@@ -183,7 +183,7 @@ FaultLine:
 - Learns: parent_of relationship, spouse relationship
 
 ### Day 2
-**You say:** "Actually Theo is 14 now"
+**You say:** "Actually Alex is 14 now"
 
 FaultLine:
 - Detects the correction
@@ -194,10 +194,10 @@ FaultLine:
 **You ask:** "Tell me about my family"
 
 FaultLine:
-- Retrieves: Theo (son, age 14), Elena (spouse)
-- Formats naturally: "Your son Theo is 14 and your wife is Elena"
+- Retrieves: Alex (son, age 14), Jordan (spouse)
+- Formats naturally: "Your son Alex is 14 and your wife is Jordan"
 - Injects into AI context
-- AI responds: "You have a son Theo who is 14 and a wife Elena. That's a nice family! How are they doing?"
+- AI responds: "You have a son Alex who is 14 and a wife Jordan. That's a nice family! How are they doing?"
 
 **No guessing. No forgetting. Just remembering.**
 
@@ -211,7 +211,7 @@ FaultLine:
 - Hallucinations: "Your son is probably named John" (just guessing)
 
 **FaultLine-Enhanced AI:**
-- "Your son Theo is 14 and your wife is Elena"
+- "Your son Alex is 14 and your wife is Jordan"
 - Remembers across conversations
 - Never guesses about your personal facts
 - Asks for clarification if unsure
