@@ -1,484 +1,205 @@
 # FaultLine Deployment Guide
 
-## Architecture: Write-Validated Knowledge Graph Pipeline
+This is the full deployment walkthrough. For a 30-second start see the root
+[`DEPLOYMENT.md`](../DEPLOYMENT.md); for the architecture see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-FaultLine is the **single source of truth** (port 8000). Filter is intentionally dumb — all validation happens in the backend.
+## Architecture in one paragraph
+
+FaultLine is a **per-tenant, write-validated, deterministic knowledge-graph
+memory**. PostgreSQL is the authoritative store; a Qdrant vector index holds only
+the short-term Class-C tier. The **live integration path is the MCP server**
+(`recall_memory`, `remember_facts`, `learn_facts`, `retract_fact`) on port `:8002`.
+The legacy OpenWebUI Filter in `openwebui/` is intentionally disabled and is **not**
+the production path — do not treat its being off as a fault.
 
 ```
-OpenWebUI Filter (dumb)
-  ├─ Extract corrections via regex (explicit user signals)
-  └─ Send {text, corrections} to FaultLine:8000
-
-FaultLine /ingest orchestrates the COMPLETE pipeline:
-  1. Call /extract/rewrite (LLM-based triple inference)
-  2. Merge with provided corrections (user overrides LLM)
-  3. Validate through WGMValidationGate (ontological mapping)
-  4. Detect semantic conflicts (auto-supersede type/ownership)
-  5. Validate bidirectional relationships (prevent child_of + parent_of)
-  6. Classify as A/B/C (identity, behavioral, ephemeral)
-  7. Commit to PostgreSQL + Qdrant
-
-Filter also calls:
-  ├─ /query (before LLM sees message, inject facts)
-  └─ /retract (handle "forget", "delete", etc.)
+client (Claude Desktop / OpenWebUI MCP) ──MCP──▶ faultline-mcp :8002 ──▶ backend :8000
+                                                                            │
+                                          PostgreSQL :5432 (authoritative, per-tenant)
+                                                  + Qdrant :6333 (Class-C short-term)
 ```
 
-**Benefits:**
-- All ontological validation in one place (/ingest), not scattered
-- Filter has no direct LLM dependency
-- Corrections properly override LLM inference
-- Follows CLAUDE.md principle: "Filter is dumb, backend is smart"
-- No OpenWebUI internal API dependency (brittleness eliminated)
+The backend orchestrates the complete ingest pipeline — extraction, the WGM
+validation gate, conflict/directionality checks, Class A/B/C assignment, and commit
+to the per-tenant PostgreSQL schema. All validation lives in the backend; nothing is
+scattered into the client.
 
 ---
 
-## Quick Start (5 minutes)
+## Quick start
 
 ### Prerequisites
-- Docker & Docker Compose installed
-- PostgreSQL 16+
-- Qdrant vector database
-- OpenWebUI v0.9.5+
+- Docker & Docker Compose v2+
+- PostgreSQL 16+ and Qdrant (both come up via the compose file)
+- An LLM backend you already run
 
-### Standard Setup (Recommended)
+### Steps
 
-1. **Start the FaultLine backend:**
+1. **Configure and start the stack:**
    ```bash
-   docker-compose up -d faultline-wgm faultline-postgres qdrant
+   cp .env.example .env
+   # Set LLM_BACKEND_TYPE + LLM_BASE_URL, and MCP_API_KEY for any networked deploy.
+   docker compose up -d --build
    ```
 
-2. **Verify health:**
+2. **Verify the backend:**
    ```bash
    curl http://localhost:8000/health
+   # → {"status": "ok", "database": "ok", "qdrant": "ok", "llm": "ok"}
    ```
-   Should return `"status": "ok"`
 
-3. **Install the Filter in OpenWebUI:**
-   - Go to OpenWebUI → Tools → Create new tool
-   - Select "Filters"
-   - Paste content from `openwebui/faultline_tool.py`
-   - Click "Save"
+3. **Connect a client over MCP** — see [`MCP-SETUP.md`](MCP-SETUP.md) for the
+   Claude Desktop and OpenWebUI MCP configuration. The MCP server listens on
+   `:8002`; set `MCP_API_KEY` and use it as the bearer token.
 
-4. **Configure Filter (OpenWebUI → Tools → FaultLine Filter → Valves):**
-
-   **Step 1: Set FAULTLINE_URL (CRITICAL)**
-   - **Docker setup:** Set `FAULTLINE_URL` to `http://faultline:8000` (service name)
-   - **Local setup:** Set `FAULTLINE_URL` to `http://localhost:8000`
-   
-   **Step 2: Enable features:**
-   - `ENABLED`: ✓ True
-   - `INGEST_ENABLED`: ✓ True (learn facts)
-   - `QUERY_ENABLED`: ✓ True (use facts in conversation)
-   
-   **Step 3: Leave everything else at default:**
-   - **All LLM settings (LLM_URL, LLM_MODEL, LLM_API_KEY, BACKEND_LLM_URL):** LEAVE EMPTY
-   - FaultLine now handles LLM selection internally (reads from environment variables)
-   - All other settings: Use defaults
-
-5. **Test it:**
+4. **Test end to end:**
    ```
-   User: "My name is Christopher, I prefer Chris"
-   System: [Extracts and stores facts]
-   User: "What's my name?"
-   System: [Uses stored fact to respond with "Christopher, but you prefer Chris"]
+   You:  "My name is Sam, I prefer to go by Sammy."
+        → the model calls remember_facts; the fact is validated and stored.
+   You:  "What's my name?"
+        → the model calls recall_memory; the stored fact is returned.
    ```
 
 ---
 
-## Configuration Reference
+## Configuration reference
 
-### FAULTLINE_URL
-**What it is:** The location of the FaultLine backend API  
-**Standard value:** `http://localhost:8000`  
-**Docker value:** `http://faultline:8000` (service name in docker-compose)  
-**Remote value:** `http://your-hostname:8000`  
-**When to change:** Only if FaultLine is on a different host/port
+The full annotated list is in [`.env.example`](../.env.example); a summary table is
+in [`ENV-REFERENCE.md`](ENV-REFERENCE.md). The essentials:
 
-### LLM_URL
-**DEPRECATED** — No longer used. FaultLine calls LLM directly, not OpenWebUI.  
-**Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_DSN` | PostgreSQL connection (authoritative store). |
+| `LLM_BACKEND_TYPE` / `LLM_BASE_URL` | Which LLM you talk to and where. |
+| `LLM_API_KEY` | Bearer token for hosted backends; blank for local. |
+| `WGM_LLM_MODEL` | Model name as it appears on your backend. |
+| `MCP_API_KEY` | Bearer token enforced on the MCP transport (`:8002`). **Set this for any networked deploy.** |
+| `FAULTLINE_USER_ID` | Single-user fallback for MCP; omit in multi-user. |
+| `QDRANT_URL` | Vector index endpoint (Class-C short-term tier only). |
+| `REEMBED_INTERVAL` | Re-embedder poll interval (seconds). |
 
-### LLM_MODEL
-**DEPRECATED** — No longer used. FaultLine reads WGM_LLM_MODEL from environment.  
-**Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
-
-### LLM_API_KEY
-**DEPRECATED** — No longer used. FaultLine manages LLM authentication internally.  
-**Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
-
-### BACKEND_LLM_URL
-**DEPRECATED** — No longer used. FaultLine reads QWEN_API_URL from environment.  
-**Standard value:** **LEAVE EMPTY**  
-**Note:** Kept for backwards compatibility only. Can be safely ignored.
-
-**New approach:**
-FaultLine backend now reads LLM configuration from environment variables:
-- `QWEN_API_URL`: LLM endpoint (e.g., `http://localhost:11434/v1/chat/completions`)
-- `WGM_LLM_MODEL`: Model name (e.g., `qwen/qwen3.5-9b`)
-
-Set these in docker-compose.yml or kubernetes manifests, not in OpenWebUI valves.
-
-### ENABLE_DEBUG
-**What it is:** Detailed logging for troubleshooting  
-**When to enable:** If facts aren't being extracted or injected  
-**Where logs appear:** `docker logs open-webui` (search for `[FaultLine]`)
-
-### MAX_MEMORY_SENTENCES
-**What it is:** Maximum facts to inject per conversation  
-**Default:** 20  
-**When to reduce:** If hitting token limits or slowing down responses
-
-### MIN_INJECT_CONFIDENCE
-**What it is:** Minimum quality threshold for facts (0.0–1.0)  
-**Default:** 0.5 (medium confidence)  
-**Increase to:** 0.7–0.9 for stricter, higher-quality facts  
-**Decrease to:** 0.3–0.4 for more inclusive, lower-quality facts
+Set LLM configuration through environment variables (compose `environment:` or
+Kubernetes manifests), not inside any client UI.
 
 ---
 
-## Logging Levels & Troubleshooting Configuration
+## Logging & troubleshooting
 
-FaultLine uses Python's standard `logging` module with `structlog` for structured output. All logging is controlled via environment variables, making it easy to adjust verbosity without code changes.
+FaultLine uses `structlog` for structured output, controlled entirely by
+environment variables.
 
-### Global Log Level
-
-Set the `LOG_LEVEL` environment variable in docker-compose.yml or your deployment configuration:
+### Log level
 
 ```yaml
 # docker-compose.yml
 services:
   faultline:
     environment:
-      LOG_LEVEL: INFO  # or DEBUG, WARNING, ERROR, CRITICAL
+      FAULTLINE_LOG_LEVEL: INFO   # DEBUG | INFO | WARNING | ERROR | CRITICAL
 ```
 
-**Standard Levels (in order of verbosity):**
+| Level | Use case |
+|---|---|
+| `DEBUG` | Development, deep troubleshooting — function entry/exit, query plans. |
+| `INFO` | Production default — extraction success, ingest completion, promotion, errors. |
+| `WARNING` | Only unexpected conditions (failed retries, fallbacks). |
+| `ERROR` / `CRITICAL` | Failures only. |
 
-| Level | Use Case | What Gets Logged |
-|-------|----------|-----------------|
-| `DEBUG` | Development, deep troubleshooting | Everything including function entry/exit, variable inspection, query plans |
-| `INFO` | Production (default) | Major milestones (extraction success, ingest completion, promotion, errors) |
-| `WARNING` | Strict deployments | Only unexpected conditions (failed retries, fallbacks, missing optional data) |
-| `ERROR` | Silent operation | Only critical failures (crashes, data loss, validation failures) |
-| `CRITICAL` | Hardened production | Only system-breaking failures (database unavailable, essential service down) |
+Performance overhead: `INFO` ~2–5%, `DEBUG` ~5–15%. Use `INFO` in production,
+`DEBUG` for incident investigation.
 
-### Default Production Setting
+### Reading backend logs
 
 ```bash
-LOG_LEVEL=INFO  # Balanced — logs important events without spam
-```
-
-### Development & Troubleshooting Setting
-
-```bash
-LOG_LEVEL=DEBUG  # Verbose — every function call, every query, every decision
-```
-
-### Filter (OpenWebUI) Logging
-
-The Filter (`openwebui/faultline_tool.py`) has its own logging control via the `ENABLE_DEBUG` valve in OpenWebUI:
-
-```
-OpenWebUI → Tools → FaultLine Filter → ENABLE_DEBUG = True
-```
-
-When enabled, Filter logs appear in OpenWebUI logs:
-```bash
-docker logs open-webui | grep "\[FaultLine\]"
-```
-
-### Backend Logging Output
-
-**All FaultLine backend logs go to:**
-```bash
-docker logs faultline  # Standard output from FastAPI/uvicorn
-```
-
-**Search for specific events:**
-```bash
-# Extraction events
-docker logs faultline | grep "extract_rewrite"
-
-# Ingest pipeline
-docker logs faultline | grep "extract_rewrite\|wgm_gate\|fact_store\|commit"
-
-# Query operations
-docker logs faultline | grep "query_user_facts"
-
-# GLiNER2 operations
-docker logs faultline | grep "gliner2"
-
-# Re-embedder operations
-docker logs faultline | grep "re_embedder"
-
-# Type validation
-docker logs faultline | grep "validate_triple\|entity_type"
-
-# Errors only
+docker logs faultline                                  # all backend logs
+docker logs faultline | grep "extract_rewrite"         # extraction
+docker logs faultline | grep "wgm_gate\|fact_store\|commit"   # ingest pipeline
+docker logs faultline | grep "query_user_facts"        # query
+docker logs faultline | grep "gliner2"                 # entity typing
+docker logs faultline | grep "re_embedder"             # background loop
 docker logs faultline | grep "ERROR\|CRITICAL\|Exception"
 ```
 
-### Key Log Patterns (Debug Mode)
+### Key pipeline log patterns (DEBUG)
 
-When `LOG_LEVEL=DEBUG`, watch for these patterns to understand pipeline flow:
-
-**Extraction Phase:**
-```
-extract_rewrite: entities_needing_types_check
-  └─ entities_to_type=5, triples_count=3
-gliner2_entity_extraction: entities_extracted=4
-  └─ entities_needed=5, entities_extracted=4 (1 miss)
-extract_rewrite: types_enriched
-  └─ entity_count=4, scalar_rel_types=12
-```
-
-**Validation Phase:**
-```
-validate_triple_against_metadata: matched_rel_type
-  └─ rel_type=has_pet, confidence=0.8
-_validate_hierarchy_membership: check_passed
-  └─ entity_type=Animal matches taxonomy member_entity_types
-```
-
-**Ingest Phase:**
-```
-fact_classification: assigned_class
-  └─ class=B, confidence=0.8, rel_type=has_pet
-FactStoreManager.commit: fact_stored
-  └─ id=uuid, rel_type=has_pet, status=committed
-```
-
-**Query Phase:**
-```
-query_user_facts: found_facts
-  └─ count=5, includes_staged=true
-_graph_traverse: traversal_result
-  └─ rel_type=spouse, hops=1, matches=1
-_hierarchy_expand: expansion_result
-  └─ rel_type=instance_of, direction=up, chain_length=3
-```
-
-**Re-Embedder Phase:**
-```
-re_embedder.promote_staged_facts: promoted
-  └─ count=2, new_facts=2
-re_embedder.evaluate_ontology_candidates: approved
-  └─ rel_type=friend_of, frequency=4
-```
-
-### Module-Specific Debugging (Advanced)
-
-To log ONLY specific modules (Python):
-
-```python
-# In src/api/main.py or src/re_embedder/embedder.py
-import logging
-logging.getLogger("src.api.main").setLevel(logging.DEBUG)
-logging.getLogger("src.wgm.gate").setLevel(logging.DEBUG)
-logging.getLogger("src.re_embedder.embedder").setLevel(logging.INFO)
-```
-
-But simpler to use environment variable (recommended):
-
-```bash
-LOG_LEVEL=DEBUG  # Global, easy to toggle
-```
-
-### Performance Impact
-
-**Log Level Performance Overhead:**
-- `ERROR`: <1% (production standard)
-- `WARNING`: <2% (slightly more checks)
-- `INFO`: ~2-5% (default balance)
-- `DEBUG`: ~5-15% (verbose, slower for high-volume)
-
-**Recommendation:**
-- **Production:** `INFO` or `WARNING` (balanced)
-- **Development:** `DEBUG` (full visibility)
-- **Incident investigation:** `DEBUG` then `INFO` after resolution
-
-### Health Check Logging
-
-The `/health` endpoint is designed to NOT spam logs. It returns status without logging for common cases:
-
-```bash
-curl http://localhost:8000/health
-# Returns: {"status": "ok", "database": "ok", "qdrant": "ok", ...}
-# Logs nothing unless a component fails
-```
-
-This keeps logs clean even in high-volume deployments.
+**Extraction:** `gliner2_entity_extraction: entities_extracted=N`,
+`extract_rewrite: types_enriched`.
+**Validation:** `validate_triple_against_metadata: matched_rel_type`,
+`_validate_hierarchy_membership: check_passed`.
+**Ingest:** `fact_classification: assigned_class` (A/B/C),
+`FactStoreManager.commit: fact_stored`.
+**Query:** `query_user_facts: found_facts`, `_hierarchy_expand: expansion_result`.
+**Re-embedder:** `re_embedder.promote_staged_facts: promoted`,
+`re_embedder.evaluate_ontology_candidates: approved`.
 
 ---
 
-## Troubleshooting
+## Common issues
 
-### "Facts aren't being extracted"
+### MCP tools don't appear / calls fail
 
-**Check 1: Is the Filter enabled?**
-```
-OpenWebUI → Tools → FaultLine Filter → ENABLED = True
-```
+- Confirm the backend is healthy: `curl http://localhost:8000/health`.
+- Confirm the MCP server is reachable on `:8002` and the bearer token matches
+  `MCP_API_KEY`.
+- Confirm the per-request user id is being set (the `X-OpenWebUI-User-Id` header,
+  or `FAULTLINE_USER_ID` in single-user mode). Without a resolvable user id, calls
+  land in the wrong (or no) tenant schema.
 
-**Check 2: Enable debug logging**
-```
-OpenWebUI → Tools → FaultLine Filter → ENABLE_DEBUG = True
-docker logs open-webui | grep "\[FaultLine\]"
-```
+### "Facts aren't being stored"
 
-Look for:
-- `inlet CALLED` — Filter started
-- `/query status=200` — Backend responding
-- `raw_triples=[]` — LLM not extracting (problem!)
-- `rewrite_to_triples configuration error` — URL misconfigured
+- A pure question or short chit-chat correctly does **not** ingest. Send a
+  declarative statement with substance.
+- Enable `FAULTLINE_LOG_LEVEL=DEBUG` and look for `entities_extracted=0` — that is
+  an extraction miss, not a model under-firing.
+- After wiping a tenant, restart the MCP container so its in-memory
+  provisioning cache re-fires.
 
-**Check 3: Is FaultLine backend running?**
-```bash
-curl http://localhost:8000/health
-# Should return: {"status": "ok"}
-```
+### Backend can't reach the LLM
 
-**Check 4: Can OpenWebUI reach FaultLine?**
-```bash
-# From inside OpenWebUI container:
-docker exec open-webui curl http://faultline:8000/health
-# If error: Check docker network, hostnames, firewall
-```
-
-### "URL missing protocol" error
-
-**Problem:** `BACKEND_LLM_URL` set to value like `ollama:11434/v1/chat/completions` (missing `http://`)  
-**Fix:** Either:
-- Set `BACKEND_LLM_URL` to **EMPTY** (standard), OR
-- Set it to complete URL: `http://ollama:11434/v1/chat/completions`
-
-### "Connection refused" to FaultLine (Most Common Issue)
-
-**Problem:** `FAULTLINE_URL` points to wrong host/port  
-
-**For Docker setups (most common):**
-- **Wrong:** `http://localhost:8000` ← OpenWebUI container cannot reach host localhost
-- **Correct:** `http://faultline:8000` ← Use Docker service name
-
-**Why:** OpenWebUI runs in a container. When it tries to reach `localhost:8000`, it's looking for a service on the container itself, not the host machine. Use the service name from docker-compose (`faultline`).
-
-**How to fix:**
-1. Go to OpenWebUI → Tools → FaultLine Filter → Valves
-2. Find `FAULTLINE_URL`
-3. Change to: `http://faultline:8000`
-4. Save
-
-**For non-Docker (local) setups:**
-- `FAULTLINE_URL` should be `http://localhost:8000` (current host)
-- Ensure FaultLine backend is running: `curl http://localhost:8000/health`
-
-**For remote deployments:**
-- Use actual hostname: `http://faultline.example.com:8000`
-- Ensure firewall allows OpenWebUI → FaultLine connection
-
-### "Facts extracted but not injected into memory"
-
-**Problem:** Filter gets facts from `/query` but doesn't pass them to LLM  
-**Cause 1:** `QUERY_ENABLED = False` — Enable it  
-**Cause 2:** `MIN_INJECT_CONFIDENCE` too high — Lower to 0.3–0.5  
-**Cause 3:** Facts don't meet confidence threshold — Check debug logs
-
-### "LLM extraction timeout"
-
-**Problem:** Fact extraction takes >10 seconds  
-**Fix:** Increase `QWEN_TIMEOUT` to 15–30 seconds
+- Verify `LLM_BACKEND_TYPE` + `LLM_BASE_URL` point at a running model server.
+- For Docker-internal LLMs use the service name; for host LLMs use
+  `host.docker.internal`.
+- `WGM_LLM_MODEL` must match a model the backend actually serves.
 
 ---
 
-## Standard Configuration Checklist
+## Production configuration
 
-- [ ] FaultLine backend running: `curl http://localhost:8000/health`
-- [ ] PostgreSQL + Qdrant running
-- [ ] Filter installed in OpenWebUI
-- [ ] `FAULTLINE_URL`: Set correctly (localhost:8000 or docker service name)
-- [ ] `LLM_API_KEY`: Pasted from OpenWebUI Settings
-- [ ] `LLM_URL`: **EMPTY** (for standard setup)
-- [ ] `BACKEND_LLM_URL`: **EMPTY** (for standard setup)
-- [ ] `ENABLED`: ✓ True
-- [ ] `INGEST_ENABLED`: ✓ True
-- [ ] `QUERY_ENABLED`: ✓ True
-- [ ] Test extraction: Send a message with facts, check logs for `[FaultLine]` output
+### Docker network
 
----
-
-## Production Configuration
-
-### Docker Network
 ```yaml
-# docker-compose.yml
 services:
   faultline:
     container_name: faultline
-    networks:
-      - faultline-net
-  open-webui:
-    container_name: open-webui
-    networks:
-      - faultline-net
+    networks: [faultline-net]
+  faultline-mcp:
+    container_name: faultline-mcp
+    networks: [faultline-net]
 networks:
   faultline-net:
     driver: bridge
 ```
 
-**Then set:**
-- `FAULTLINE_URL`: `http://faultline:8000` (service name)
+### Hardening checklist
 
-### Remote Deployment
-If FaultLine runs on a different server (e.g., `faultline.internal.example.com`):
-- `FAULTLINE_URL`: `http://faultline.internal.example.com:8000`
-- Ensure firewall allows OpenWebUI → FaultLine connection
-- Use static hostnames (not IPs)
-
-### High-Volume Setup
-- Increase `QWEN_TIMEOUT` to 15–30 seconds
-- Increase `FAULTLINE_TIMEOUT` to 45–60 seconds
-- Set `MAX_MEMORY_SENTENCES` to 10–15 (reduce memory overhead)
-- Monitor: `docker logs faultline | tail -100`
+- [ ] `curl http://localhost:8000/health` returns `ok`
+- [ ] PostgreSQL + Qdrant running with external volumes
+- [ ] `MCP_API_KEY` set to a strong secret (and used by clients)
+- [ ] `LLM_BACKEND_TYPE` / `LLM_BASE_URL` / `WGM_LLM_MODEL` correct for your backend
+- [ ] `FAULTLINE_LOG_LEVEL=INFO`
+- [ ] `DB_POOL_SIZE` tuned to concurrency
 
 ---
 
-## What Gets Stored?
+## What gets stored
 
-FaultLine extracts and stores:
-- **Identity facts:** Names, aliases, pronouns, dates of birth
-- **Relationships:** Family, colleagues, friends
-- **Attributes:** Job, location, education, preferences
-- **Behaviors:** Likes, dislikes, habits
+FaultLine extracts and stores, per tenant:
 
-Facts stored in PostgreSQL. Searchable via vector embeddings in Qdrant.
+- **Identity:** names, aliases, preferred names, dates of birth.
+- **Relationships:** family, colleagues, friends (graph edges).
+- **Attributes (scalars):** age, location, occupation, IPs, MACs, hostnames.
+- **Classifications:** entity types and hierarchy membership.
 
----
-
-## Disabling FaultLine (Temporarily)
-
-If you need to pause FaultLine without uninstalling:
-```
-OpenWebUI → Tools → FaultLine Filter → ENABLED = False
-```
-
-Conversation continues normally; facts aren't learned or recalled.
-
-To re-enable:
-```
-OpenWebUI → Tools → FaultLine Filter → ENABLED = True
-```
-
----
-
-## Support
-
-**For issues:**
-1. Enable `ENABLE_DEBUG = True`
-2. Run the test: Message user facts, then ask about them
-3. Collect logs: `docker logs open-webui | grep "\[FaultLine\]"`
-4. Check `/health` endpoint: `curl http://localhost:8000/health`
-
-**Common issue:** URL misconfiguration. Ensure all URLs have `http://` or `https://` prefix.
+Authoritative facts (Class A/B) live in PostgreSQL. Class C short-term material is
+mirrored to Qdrant until it is promoted or expires.

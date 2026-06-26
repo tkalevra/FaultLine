@@ -28,9 +28,11 @@ Everything runs on your machine. Your conversations, your memories, your data �
 
 FaultLine exposes an MCP server. That means the same memory store is available to OpenWebUI, Claude Desktop, or any other MCP-capable endpoint. Change your server IP in one conversation, every model sees the update.
 
-### 3. Write-validated facts — not RAG guesswork
+### 3. Deterministic recall — not RAG guesswork
 
-RAG retrieves documents and asks the LLM to interpret them. The answer depends on wording, context, and luck. FaultLine validates facts before storing them and rejects hallucinations at the gate. Your AI knows "AlphaNode's IP is 192.0.2.20" — not "a document mentioned something about a server."
+RAG ranks document chunks by similarity and asks the LLM to interpret them. The answer depends on wording, context, and luck. FaultLine is different all the way down: facts are validated before storage (hallucinations rejected at the gate), stored in a **PostgreSQL knowledge graph**, and recalled by a **deterministic walk** of that graph — not a vector similarity search. Ask the same question twice and you get the same rows. Your AI knows "AlphaNode's IP is 192.0.2.20" because it resolved the `AlphaNode` entity and read its IP attribute — not because "a document mentioned something about a server."
+
+The vector index is still there, but it's a **short-term scratchpad** for facts the engine hasn't classified yet — a backstop behind the authoritative graph, never the source of truth. (For the full mechanical contrast, see [docs/ARCHITECTURE.md → "Why this isn't RAG"](docs/ARCHITECTURE.md#why-this-isnt-rag-mechanically), and a candid note on how this was previously mis-described in [HONESTY.md](HONESTY.md).)
 
 ### 4. Correctable, relational data
 
@@ -73,11 +75,16 @@ AI:   "Your firewall OPNsense is a networking device — I have that from earlie
 
 ## How it works (briefly)
 
-- Every message is scanned for facts worth keeping
-- Facts go through a validation gate before storage — hallucinated details are rejected
-- Relevant facts are injected into the conversation before the AI responds
+- Your AI calls FaultLine's **MCP tools** — `remember_facts` to store, `recall_memory` to retrieve, `retract_fact` to correct
+- Every statement is scanned for facts worth keeping (strong, deterministic-first extraction)
+- Facts pass a **validation gate** before storage — hallucinated details are rejected, not stored
+- Authoritative facts live in a **PostgreSQL knowledge graph**; recall is a **deterministic walk** of that graph, not a similarity search
 - Memories strengthen with confirmation; corrections archive the old value cleanly
 - `/expand <topic>` teaches FaultLine how a domain is structured so facts about it land correctly
+
+> **Strong ingest, lean query.** All the work happens at ingest — extraction, validation, classification, building the hierarchy. The query side just walks what ingest laid down and returns the rows it finds. If a fact isn't there, it says so rather than guessing.
+
+More depth: [Architecture](docs/ARCHITECTURE.md) · [Core concepts](docs/CONCEPTS.md) · [Plain-English flow](docs/FLOW-BRIEF.md) · [MCP setup](docs/MCP-SETUP.md) · [Deployment](docs/DEPLOYMENT.md)
 
 ---
 
