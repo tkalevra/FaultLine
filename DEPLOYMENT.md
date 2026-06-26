@@ -1,69 +1,66 @@
 # FaultLine Deployment Guide
 
+For the full, annotated deployment walkthrough see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+This is the quick start.
+
 ## Prerequisites
 
 - Docker & Docker Compose v2+
-- 4GB RAM recommended
-- PostgreSQL data volume (~1GB)
-- Qdrant data volume (~500MB)
-- LLM endpoint (Ollama, LM Studio, or OpenAI-compatible API)
+- ~4 GB RAM (8 GB recommended)
+- An LLM backend you already run (Ollama, LM Studio, OpenWebUI, or an
+  OpenAI-compatible API)
 
-## Quick Start
+## Quick start
 
 ```bash
 git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
 
-# Copy and edit environment
 cp .env.example .env
-# Edit .env with your LLM endpoint and any overrides
+# Set LLM_BACKEND_TYPE + LLM_BASE_URL to point at the LLM you already run.
 
-# Build and start all services
 docker compose up -d --build
 
-# Verify health
-curl http://localhost:8001/health
+# Verify the backend
+curl http://localhost:8000/health
+# {"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}
 ```
 
-Expected response: `{"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}`
-
-## Services
+## Services & ports
 
 | Service | Port | Purpose |
-|---------|------|---------|
-| faultline | 8001 | FastAPI API — `/ingest`, `/query`, `/health` |
-| postgres | 5432 | PostgreSQL — fact storage |
-| qdrant | 6333 | Qdrant — vector index |
+|---|---|---|
+| `faultline` | **8000** | Backend API — `/ingest`, `/query`, `/health` |
+| `faultline-mcp` | **8002** | MCP server — `recall_memory`, `remember_facts`, `learn_facts`, `retract_fact` (the live integration path) |
+| `postgres` | 5432 | PostgreSQL — authoritative fact storage (per-tenant schemas) |
+| `qdrant` | 6333 | Qdrant — Class-C short-term vector index |
+
+The **MCP server on `:8002`** is the production integration path. The OpenWebUI
+Filter in `openwebui/` is intentionally disabled and is not the live path.
 
 ## Configuration
 
-See `.env.example` for the full list. Key variables:
+See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary and
+[`.env.example`](.env.example) for the full annotated list. The three you must set:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QWEN_API_URL` | `http://host.docker.internal:11434/v1/chat/completions` | LLM endpoint |
-| `POSTGRES_DSN` | Set in compose | PostgreSQL connection |
-| `QDRANT_URL` | `http://qdrant:6333` | Vector store |
-| `REEMBED_INTERVAL` | `10` | Background sync interval (seconds) |
-| `RATE_LIMIT_PER_MIN` | `100` | Max requests per user per minute |
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_DSN` | PostgreSQL connection |
+| `LLM_BACKEND_TYPE` | LLM protocol (`ollama` / `lm_studio` / `openwebui` / `openai` / …) |
+| `LLM_BASE_URL` | Host + port of your LLM (no path) |
 
-## Production Notes
+## Production notes
 
-- Use external volumes for PostgreSQL and Qdrant data persistence
-- Configure `DB_POOL_SIZE` based on expected concurrency
-- Set `LOG_LEVEL=INFO` for production
-- Monitor `/health` endpoint for dependency status
-- Re-embedder syncs facts every `REEMBED_INTERVAL` seconds
+- Use external volumes for PostgreSQL and Qdrant data persistence.
+- Set `MCP_API_KEY` to a secret token (the MCP HTTP transport on `:8002` is
+  network-accessible — leaving it blank is dev-only).
+- Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
+- Monitor `/health` for dependency status.
 
 ## Troubleshooting
 
 ```bash
-# View logs
 docker compose logs faultline
-
-# Restart a service
 docker compose restart faultline
-
-# Check database connectivity
 docker compose exec postgres psql -U faultline -d faultline -c "SELECT 1"
 ```

@@ -69,7 +69,7 @@
 
 **Query path:** `/query` deduplicates facts by `(subject_uuid, rel_type, object_uuid)` after merge, keeping highest confidence per triple. `_aliases` metadata attached to each fact with all entity names and `is_preferred` flag.
 
-**Effect:** No more duplicate facts from alias redundancy (sam spouse ellie + sam spouse ellie → single deduplicated fact). Filter gets clean results.
+**Effect:** No more duplicate facts from alias redundancy (e.g. "samuel spouse jordan" + "sam spouse jordan" → single deduplicated fact). Filter gets clean results.
 
 **Fixes:** dBug-report-005 (alias redundancy in query results)
 
