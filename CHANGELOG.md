@@ -49,7 +49,7 @@
 
 ## v1.0.7 (2026-05-14) — Query Deduplication Fix
 
-**Query path:** pg_keys dedup uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Fixes duplicate facts when same entity has multiple aliases (chris/user → single deduplicated fact).
+**Query path:** pg_keys dedup uses UUIDs (`_subject_id`/`_object_id`) instead of display names. Fixes duplicate facts when same entity has multiple aliases (sam/user → single deduplicated fact).
 
 **Fixes:** dBug-report-008
 
@@ -69,7 +69,7 @@
 
 **Query path:** `/query` deduplicates facts by `(subject_uuid, rel_type, object_uuid)` after merge, keeping highest confidence per triple. `_aliases` metadata attached to each fact with all entity names and `is_preferred` flag.
 
-**Effect:** No more duplicate facts from alias redundancy (christopher spouse mars + chris spouse mars → single deduplicated fact). Filter gets clean results.
+**Effect:** No more duplicate facts from alias redundancy (e.g. "samuel spouse jordan" + "sam spouse jordan" → single deduplicated fact). Filter gets clean results.
 
 **Fixes:** dBug-report-005 (alias redundancy in query results)
 

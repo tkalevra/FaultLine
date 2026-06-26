@@ -22,7 +22,7 @@
 
 The MCP server runs as a child process of Claude Desktop on your workstation. It reaches the FaultLine backend over the network. No HTTP transport, no bearer token needed — the process is local and trusted.
 
-**When to use**: Claude Desktop on your local machine, FaultLine on TrueNAS or local Docker.
+**When to use**: Claude Desktop on your local machine, FaultLine on a server or local Docker.
 
 ```json
 {
@@ -32,7 +32,7 @@ The MCP server runs as a child process of Claude Desktop on your workstation. It
       "args": ["/path/to/FaultLine/tools/mcp_server.py"],
       "env": {
         "FAULTLINE_USER_ID": "YOUR-USER-UUID-HERE",
-        "FAULTLINE_API_URL": "http://YOUR-TRUENAS-IP:8001"
+        "FAULTLINE_API_URL": "http://your-server-host:8000"
       }
     }
   }
@@ -65,7 +65,7 @@ In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server**
 | URL | `http://faultline-mcp:8002/mcp` (Docker-internal) |
 | Bearer Token | `<your MCP_API_KEY value>` |
 
-OpenWebUI will call `tools/list`, discover `recall_memory`, `remember_facts`, `retract_fact`, and surface them as native tools in every conversation. The Filter (`faultline_function.py`) continues to handle automatic memory injection in parallel.
+OpenWebUI will call `tools/list`, discover `recall_memory`, `remember_facts`, `retract_fact`, and surface them as native tools in every conversation. The MCP tools are the live integration path; the legacy OpenWebUI Filter in `openwebui/` is intentionally disabled.
 
 #### Step 2b — Claude Desktop over HTTP (remote MCP server)
 
@@ -75,7 +75,7 @@ If you want Claude Desktop to connect to the Docker sidecar directly rather than
 {
   "mcpServers": {
     "faultline": {
-      "url": "http://YOUR-TRUENAS-IP:8002/mcp",
+      "url": "http://your-server-host:8002/mcp",
       "headers": {
         "Authorization": "Bearer YOUR-MCP-API-KEY-HERE"
       }
