@@ -24,7 +24,7 @@
 -- problem/fault state from a neutral occurrence, so a small bounded NOUN class is unavoidable. It is
 -- firewalled downstream by the parse the SAME way the others are: the state reading fires ONLY when
 -- (a) the head is in this `problem_noun` class AND (b) a with-PP supplies an affected entity — a
--- non-problem "have + with-PP" ("I had a meeting with Sarah", "I had lunch with Tom", "I had a call
+-- non-problem "have + with-PP" ("I had a meeting with Taylor", "I had lunch with Tom", "I had a call
 -- with the team") is UNTOUCHED (head ∉ problem_noun). DB-HELD + per-tenant + GROWABLE (category=
 -- 'problem_noun') so a tenant grows its own problem heads (freq-gated) without code edits. The in-code
 -- `linguistic_cue_overlay._BOOTSTRAP_PROBLEM_NOUNS` frozenset REMAINS only as the DB-DOWN code-fallback

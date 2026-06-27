@@ -1754,7 +1754,7 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
                 # CRATER participated_in (the GPS-as-Event tail-type veto) and picks has_state. The
                 # affected entity keeps its part_of/owns grounding from the other chains (untouched here).
                 # THE DISCRIMINATOR: problem_head (cue class ∧ with-PP) — a non-problem "have + with-PP"
-                # ("had a meeting with Sarah") never sets problem_head, so this lane never fires there.
+                # ("had a meeting with Taylor") never sets problem_head, so this lane never fires there.
                 if _promote_arg and getattr(ev, "problem_head", False):
                     _state_obj = event  # the bland head TYPE ("issue"/"problem") = the reusable state
                     _state = {"subject": _flat_object, "rel_type": "has_state", "object": _state_obj,
@@ -10351,7 +10351,7 @@ RULES:
 2. RELATIONAL dimension (spouse, parent_of, has_pet, works_for):
    - old_value and new_value are ENTITY NAMES (resolve to UUID)
    - Update facts.object_id
-   - Example: spouse of old_entity → Sarah
+   - Example: spouse of old_entity → Taylor
 
 3. HIERARCHICAL dimension (instance_of, member_of, part_of):
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
@@ -14551,7 +14551,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             if SPINE_NAMING_CHAIN:
                 try:
                     from src.extraction.linguistics import (
-                        analyze_named_instance as _ani, analyze_naming as _an,
+                        analyze_named_instance as _ani, analyze_naming_all as _an_all,
                     )
                     _ni = _ani(_sent)
                     if _ni is not None and not _ni.negated:
@@ -14591,8 +14591,17 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     else:
                         # NAMING-VERB only ("I have a dog named Rex"): bind the proper name to the
                         # head noun via also_known_as + ground the possession at the NAMED instance.
-                        _na = _an(_sent)
-                        if _na is not None and not _na.negated:
+                        # MULTI-CONSTRUCTION RECOVERY: a comma-and enumeration ("a dog named Rex,
+                        # a snake named Noodle, and a cat named Biscuit") carries ONE naming construction
+                        # per conjunct, each modifying its OWN head noun. The atomizer drops the subject
+                        # on conjuncts 2+ → the guardrail collapses each back to the whole raw sentence,
+                        # so we must bind EVERY construction in this clause, not just the first. The
+                        # per-construction binding below is identical to the single-pet path (the loop
+                        # is the ONLY change) — subject-agnostic, each relation type-resolved off its
+                        # own kind via the SAME metadata path.
+                        for _na in (_an_all(_sent) or []):
+                            if _na is None or _na.negated:
+                                continue
                             _named = (_na.named or "").strip().lower()
                             _proper = (_na.proper_name or "").strip()
                             _proper_key = _proper.lower()
@@ -14967,9 +14976,31 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 _er = (_e.get("rel_type") or "").strip().lower()
                 _eo = (_e.get("object") or "").strip().lower()
                 _es = (_e.get("subject") or "").strip().lower()
-                if (_er in ("owns", "has_pet") and _es == "user"
-                        and _eo in _seam_kinds and _eo not in _seam_names):
-                    continue   # re-homed onto the named instance; kind kept only as the L4 parent
+                # (a) BARE-KIND POSSESSION re-homed onto the named instance: a user→KIND possessive
+                # edge ("I have a dog" → user/have|owns|has_pet → dog) the seam already re-routed to
+                # the NAMED instance (user→Rex). Dropped for ANY possessive rel the deriver may
+                # have emitted (raw "have"/"has" OR a normalized owns/has_pet) — we identify it by the
+                # SUBJECT being the user and the OBJECT being a re-homed kind, NOT by a rel literal. The
+                # kind survives in L4 as the instance_of/subclass_of parent (it is only removed as an
+                # ownership OBJECT). Guarded ``_eo not in _seam_names`` so a name is never suppressed.
+                if (_es == "user" and _eo in _seam_kinds and _eo not in _seam_names
+                        and _er not in ("instance_of", "subclass_of", "also_known_as")):
+                    continue
+                # (b) CROSS-CONJUNCT COLLAPSE JUNK: a comma-and enumeration collapses to the whole raw
+                # sentence, so the deriver mis-binds one conjunct's NAME (or its bare KIND) to a LATER
+                # conjunct's KIND as a stray role ("(rex, has_role, snake)", "(cat, has_role,
+                # server)"). The OBJECT is a re-homed seam KIND that the seam ALREADY places correctly
+                # (as the instance_of parent of its own name); any OTHER non-user edge pointing AT that
+                # bare kind is provably the enumeration misfire — drop it. The seam's own instance_of/
+                # subclass_of placements are in _ni_seam_edges/_naming_seam_edges (re-appended below),
+                # never in ``edges`` here, so this never drops a correct binding. Subject-agnostic:
+                # keyed on seam membership, not on the rel_type or any kind literal.
+                if (_es != "user" and _eo in _seam_kinds and _es not in _seam_names
+                        and _er not in ("instance_of", "subclass_of", "also_known_as")):
+                    continue
+                # A seam NAME mis-bound to a seam KIND as a role is the same collapse misfire.
+                if (_es in _seam_names and _eo in _seam_kinds):
+                    continue
                 _kept.append(_e)
             if len(_kept) != len(edges):
                 edges = _kept
@@ -20811,7 +20842,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                             if match:
                                 relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                                entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
+                                entity_name = match.group(2).lower()  # alice, Noodle, Spot, etc.
 
                                 # Resolve the mentioned entity to its canonical ID
                                 resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -27829,7 +27860,7 @@ def determine_path(
                     # anchor to a same-named entity (e.g. a stray `owns family` → injects `owns` →
                     # leaks every `owns web server`/`owns firewall` into the family answer) is exactly
                     # the cross-domain bleed. So we exclude taxonomy-keyword matches from the
-                    # connectivity pull; a real named-entity match (anxious, sarah) still connects.
+                    # connectivity pull; a real named-entity match (anxious, taylor) still connects.
                     # Checked against entity_taxonomies.taxonomy_name (per-tenant overlay seed∪tenant).
                     _p0_tax_names: set[str] = set()
                     try:
@@ -30458,6 +30489,199 @@ def _negate_prose(prose: str) -> str:
         return prose
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# STRUCTURE-DRIVEN OBJECT-CLAUSE COMPOSER (lean-query render)
+#
+# The recall prose IS the product — it is woven by the consuming LLM, so it must
+# read like a person for ARBITRARY install data. The composer computes each fact's
+# OBJECT-SHAPE from metadata ALREADY on the walked fact (is_hierarchy_rel,
+# tail_types, category, the presence of an instance_of type + a name on the object)
+# and renders the natural clause. ZERO kind/subject literals: nothing here keys on
+# "dog"/"server"/"pet" or any domain token — the shape is purely structural. It
+# PRESENTS already-walked facts (lean query); it does not re-validate or re-fetch
+# beyond the existing deterministic instance_of fallback the caller passes in.
+#
+# Returns the COMPLETE prose string for shapes 1–4, or None to fall through to the
+# existing template path (shape 5: ENTITY/DEFAULT — spouse/friend_of/feels/
+# favourite_colour already read clean and must NOT be disturbed).
+# ──────────────────────────────────────────────────────────────────────────────
+def _extract_template_verb(template: str | None, subject_placeholder: str = "X") -> str | None:
+    """Parse the head VERB generically from a rel's natural_language template/label.
+
+    The verb is the first token AFTER the subject placeholder:
+      'X has a pet that is Y' → 'has'      'You have a pet that is Y' → 'have'
+      'X owns Y'             → 'owns'      'You own Y'                → 'own'
+
+    Person agreement falls out for free: pass the 2p template ('You …') when the
+    subject rendered as "you" and the 3p template ('X …') otherwise — the parsed
+    verb then already agrees. ZERO per-rel hardcoding; purely positional. Returns
+    None when no verb can be parsed (caller falls back to the template path)."""
+    if not template:
+        return None
+    import re as _re
+    s = template.strip()
+    # Anchor on the subject token (X for 3p, You/Your for 2p), take the next word.
+    m = _re.search(r'\b' + _re.escape(subject_placeholder) + r'\b\s+([A-Za-z\']+)', s)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _compose_object_clause(
+    *,
+    rel_type: str,
+    rel_meta: dict,
+    subject_name: str,
+    object_name: str | None,
+    object_id,
+    object_is_uuid: bool,
+    named_type_name: str | None,
+    template: str | None,
+    template_2p: str | None,
+    subject_is_you: bool,
+) -> str | None:
+    """Compute OBJECT-SHAPE from metadata and render the natural clause (shapes 1–4).
+
+    All inputs are ALREADY resolved by the caller (names, the instance_of type word,
+    the metadata dict from the per-tenant overlay). The selector reads ONLY structural
+    metadata — is_hierarchy_rel, tail_types, category — plus whether the object has a
+    type word AND a name. Returns the full prose string, or None to fall through to
+    the existing template path (ENTITY/DEFAULT).
+
+    Subject-agnostic: NO kind literals, NO rel allow-list. Fail-safe on any miss.
+    """
+    try:
+        tail_types = [str(t).upper() for t in (rel_meta.get("tail_types") or [])]
+        is_hier = bool(rel_meta.get("is_hierarchy_rel"))
+        category = (rel_meta.get("category") or "").lower()
+        label = (rel_meta.get("label") or rel_type.replace("_", " "))
+
+        # ── Shape 4: SCALAR (tail_types == {SCALAR}) ────────────────────────────
+        # Object is a verbatim STRING value (not a UUID): "X's <attr> is <value>".
+        # The label is the attribute NOUN; some scalar labels bake the predicate verb
+        # in ("Has IP Address", "has age") which would read "X's has ip address is Y".
+        # Strip a leading copula/possession predicate so the noun reads as a possessed
+        # attribute ("X's ip address is Y"). The stripped set is the closed-class English
+        # predicate inventory (has/have/is/are/was/were) — a grammar primitive, NOT a
+        # domain word-list (same justification as _NEGATE_AUX). Value kept verbatim.
+        if tail_types == ["SCALAR"] and object_name is not None:
+            import re as _re
+            attr = _re.sub(r'^(?:has|have|had|is|are|was|were)\b\s*', '',
+                           label.lower(), flags=_re.IGNORECASE).strip() or label.lower()
+            poss = "your" if subject_is_you else "%s's" % subject_name
+            return "%s %s is %s" % (poss, attr, object_name)
+
+        # ── Shape 2: BARE-TYPE (hierarchy rel: instance_of / subclass_of) ───────
+        # The type-cast (instance_of) reads canonically "<subj> is a/an <Type>" with
+        # the "(type)" parenthetical DROPPED ("Rex is a dog"). The classification
+        # ladder (subclass_of, "X is a subclass of Y") already reads clean, so it
+        # KEEPS its parsed connector. We distinguish the two by the template's OWN
+        # content — the "(type)" parenthetical marks the type-cast — NOT a rel literal.
+        if is_hier and object_name is not None:
+            import re as _re
+            _src = template_2p if (subject_is_you and template_2p) else template
+            _has_type_paren = bool(_src and _re.search(r'\(\s*type\s*\)', _src, flags=_re.IGNORECASE))
+            if _has_type_paren or not _src:
+                # Type-cast canonical reading: article by leading vowel, parenthetical gone.
+                _art = "an" if object_name[:1].lower() in "aeiou" else "a"
+                return "%s is %s %s" % (subject_name, _art, object_name)
+            # Non type-cast hierarchy (subclass_of/part_of/member_of): parse the
+            # connector between the placeholders verbatim (drop any parenthetical).
+            _mid = _re.sub(r'\(.*?\)', '', _src)
+            _mid = _re.sub(r'^\s*(?:X|You|Your)\b', '', _mid).strip()
+            _mid = _re.sub(r'\bY\b.*$', '', _mid).strip()
+            connector = _mid or "is a"
+            return "%s %s %s" % (subject_name, connector, object_name)
+
+        # ── Shape 3: STATE (has_state / category == 'state') ────────────────────
+        # "<subj> is <State>" (NOT "in state <State>").
+        if (category == "state") and object_name is not None and object_is_uuid:
+            cop = "are" if subject_is_you else "is"
+            return "%s %s %s" % (subject_name, cop, object_name)
+
+        # ── Shape 1: NAMED-INSTANCE ────────────────────────────────────────────
+        # Object UUID-resolved, has an instance_of TYPE and a NAME, rel is
+        # non-hierarchy, object≠"you", and type≠name: "<subj> <verb> a <Type> named
+        # <Name>". The verb is parsed GENERICALLY from the template (person-correct
+        # via the 2p/3p choice).
+        if (object_is_uuid and object_name and object_name != "you"
+                and not is_hier and named_type_name
+                and named_type_name.lower() != object_name.lower()):
+            verb = (_extract_template_verb(template_2p, "You") if (subject_is_you and template_2p)
+                    else _extract_template_verb(template, "X"))
+            if verb:
+                return "%s %s a %s named %s" % (subject_name, verb, named_type_name, object_name)
+
+        # ── Shape 5: ENTITY/DEFAULT → fall through to the existing template path.
+        return None
+    except Exception:  # noqa: BLE001 — presentation fail-safe: never break prose
+        return None
+
+
+def _titlecase_display_slots(prose: str, name_slots: list[str]) -> str:
+    """POST-PASS (a): titlecase the resolved DISPLAY-NAME slots in the rendered prose.
+
+    Only the supplied resolved alias slots (e.g. "rex" → "Rex") are titled,
+    matched as WHOLE words, case-insensitively. "you" and scalar VALUES are never in
+    name_slots, so they stay verbatim. The det-scorer is case-insensitive, so this is
+    safe (no gold token is dropped — the token text is identical modulo case)."""
+    if not prose or not name_slots:
+        return prose
+    import re as _re
+    out = prose
+    for raw in sorted({s for s in name_slots if s and s.strip()}, key=len, reverse=True):
+        slot = raw.strip()
+        if not slot or slot.lower() == "you":
+            continue
+        titled = " ".join(w[:1].upper() + w[1:] if w else w for w in slot.split())
+        if titled == slot:
+            continue
+        out = _re.sub(r'\b' + _re.escape(slot) + r'\b', titled, out, flags=_re.IGNORECASE)
+    return out
+
+
+def _dedup_inverse_pairs(rendered: list[dict], overlay_meta: dict) -> list[str]:
+    """POST-PASS (b): drop one side of an inverse-rel pair over the SAME UUID pair.
+
+    `rendered` is a list of {prose, subj_id, obj_id, rel_type, subject_is_you}. When a
+    rel and its `inverse_rel_type` (overlay metadata) both appear for the same
+    (subject, object) UUID pair — in either order — emit ONE: prefer the row whose
+    SUBJECT is the querying user ("you"), else the first seen. Keyed on UUIDs (never
+    display names), metadata-driven (inverse_rel_type from the overlay). Fail-safe:
+    rows without a clean UUID pair are always kept."""
+    try:
+        # First pass: assign each row a collapse key (None = always-keep, no inverse).
+        # An inverse pair collapses on the UNORDERED UUID pair + the {rel, inverse}
+        # rel-set so both directions land on the same key.
+        out: list[str] = []
+        # key → index-in-`out` of the row currently chosen for that key.
+        chosen_idx: dict = {}
+        # key → whether the currently-chosen row is the user-as-subject direction.
+        chosen_is_you: dict = {}
+        for r in rendered:
+            rt = (r.get("rel_type") or "").lower()
+            sid = r.get("subj_id")
+            oid = r.get("obj_id")
+            inv = ((overlay_meta.get(rt) or {}).get("inverse_rel_type") or "").lower()
+            if not (inv and sid and oid):
+                out.append(r["prose"])  # no inverse → always kept, in place
+                continue
+            pair_key = (frozenset((str(sid), str(oid))), frozenset((rt, inv)))
+            if pair_key not in chosen_idx:
+                chosen_idx[pair_key] = len(out)
+                chosen_is_you[pair_key] = bool(r.get("subject_is_you"))
+                out.append(r["prose"])
+            else:
+                # Already emitted one side. Prefer the user-as-subject direction:
+                # if THIS row is user-subject and the kept one was not, swap it in.
+                if r.get("subject_is_you") and not chosen_is_you.get(pair_key):
+                    out[chosen_idx[pair_key]] = r["prose"]
+                    chosen_is_you[pair_key] = True
+        return out
+    except Exception:  # noqa: BLE001 — presentation fail-safe
+        return [r.get("prose", "") for r in rendered]
+
+
 def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = None,
                      preferred_alias_map: dict = None,
                      anchor_matched_term: str = None) -> list[str]:
@@ -30493,6 +30717,14 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         Facts with missing natural_language template are skipped with warning logged
     """
     prose_list = []
+    # POST-PASS accumulators (applied once, after the per-fact loop):
+    #  • _rendered carries each emitted line WITH its UUID pair + rel_type +
+    #    subject-is-you flag so the inverse-pair dedup can collapse a rel and its
+    #    inverse over the SAME UUID pair (UUID-keyed, metadata-driven — never names).
+    #  • _name_slots collects the resolved DISPLAY-NAME tokens (aliases only — never
+    #    "you" or a scalar value) so the titlecase pass can title ONLY those.
+    _rendered: list[dict] = []
+    _name_slots: list[str] = []
 
     if not facts:
         return prose_list
@@ -30581,6 +30813,21 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
             log.debug("convert_to_prose.occurrence_about_index_failed", error=str(_smi)[:120])
             occurrence_about_id = {}
 
+        # NAMED-INSTANCE TYPE INDEX (lean-query rendering, generalized): the SAME
+        # (<entity>, instance_of, <type>) machinery that lets a participated_in occurrence
+        # render with its type word ("…webinar") also lets a RELATIONAL named instance render
+        # with its kind. "I have a dog named Rex" stores (user, has_pet, rex) +
+        # (rex, instance_of, dog); the relational render substitutes only the NAME
+        # ("…that is rex") and DROPS the type "dog" that the family question keys on — even
+        # though the instance_of edge is in this same fact set. This index is BUILT from that
+        # same edge so the relational render can compose "<type> named <Name>". It is the
+        # `occurrence_type_id` index already populated above (it keys EVERY instance_of edge's
+        # subject→type, not only occurrences), so we reuse it directly — no second pass.
+        # Purely structural (object has an instance_of type AND a name); ZERO kind literals,
+        # NO rel allow-list — the only metadata read is "is this rel a hierarchy rel" (so we
+        # never compose for instance_of/subclass_of themselves). Fail-safe: no type → unchanged.
+        named_instance_type_id: dict = occurrence_type_id
+
         # Convert each fact to prose
         for fact in facts:
             try:
@@ -30650,6 +30897,52 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                     # Subject slot only; the stored fact is untouched.
                     subject_name = anchor_matched_term
 
+                # NAMED-INSTANCE TYPE WORD (lean-query render): resolve the object's
+                # instance_of TYPE name (e.g. "dog" for rex) from the index already built
+                # from the in-set instance_of edges, with the existing deterministic DB fallback
+                # (the companion instance_of edge is not always pre-fetched). This is the type
+                # word the STRUCTURE-DRIVEN COMPOSER consumes to render shape 1 (NAMED-INSTANCE,
+                # "<subj> <verb> a <Type> named <Name>"). Resolved here (UUID object only, non-
+                # hierarchy rel — never on instance_of/subclass_of themselves so we don't compose
+                # "a dog named dog"); the composer applies the type≠name guard. Presentation of an
+                # already-walked classification, not re-validation. Fail-safe → None (composer
+                # falls through to the template path). The OBJECT IS-UUID test is what separates a
+                # real entity object (named instance) from a SCALAR string value.
+                named_type_name = None
+                try:
+                    object_is_uuid = bool(object_id and _UUID_PATTERN.match(str(object_id)))
+                except Exception:
+                    object_is_uuid = False
+                if (object_is_uuid and object_name and not is_unbound
+                        and rel_type != "participated_in"
+                        and object_name != "you"):
+                    try:
+                        _is_hier_obj = bool((_overlay_meta.get(rel_type) or {}).get("is_hierarchy_rel"))
+                    except Exception:
+                        _is_hier_obj = False
+                    if not _is_hier_obj:
+                        _ni_type_id = (named_instance_type_id or {}).get(object_id)
+                        if not _ni_type_id and db is not None:
+                            try:
+                                with db.cursor() as _nicur:
+                                    _nicur.execute(
+                                        "SELECT object_id FROM facts WHERE subject_id::text = %s "
+                                        "AND rel_type = 'instance_of' AND archived_at IS NULL "
+                                        "ORDER BY confidence DESC NULLS LAST LIMIT 1",
+                                        (str(object_id),))
+                                    _nirow = _nicur.fetchone()
+                                if _nirow and _nirow[0]:
+                                    _ni_type_id = _nirow[0]
+                            except Exception as _niex:
+                                log.debug("convert_to_prose.named_instance_type_db_fallback_failed",
+                                          error=str(_niex)[:120])
+                        if _ni_type_id and _ni_type_id != object_id:
+                            try:
+                                named_type_name = resolve_entity_display(
+                                    _ni_type_id, identity_set, preferred_alias_map, db)
+                            except Exception:
+                                named_type_name = None
+
                 # Perspective-aware template selection. When the SUBJECT rendered as
                 # "you" (the querying user) AND a second-person template exists, use it:
                 # the subject is baked in, so we substitute ONLY the object into Y.
@@ -30715,6 +31008,31 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                     log.warning("convert_to_prose.template_format_error",
                                rel_type=rel_type, template=template, error=str(e))
                     continue
+
+                # STRUCTURE-DRIVEN OBJECT-CLAUSE COMPOSER (lean-query render): for the
+                # four metadata-shaped clauses (NAMED-INSTANCE / BARE-TYPE / STATE / SCALAR)
+                # OVERRIDE the template prose with the natural composed clause. The composer
+                # reads ONLY structural metadata already on the walked fact (is_hierarchy_rel,
+                # tail_types, category, the resolved instance_of type word + a name) — ZERO
+                # kind/subject literals. Shape 5 (ENTITY/DEFAULT) returns None → keep the
+                # template prose above untouched (spouse/friend_of/feels/favourite_colour read
+                # clean already). participated_in is excluded by the composer's own shape gates
+                # (its occurrence/date appends below are preserved). Fail-safe: None → template.
+                if not is_unbound:
+                    _composed = _compose_object_clause(
+                        rel_type=rel_type,
+                        rel_meta=(_overlay_meta.get(rel_type) or {}),
+                        subject_name=subject_name,
+                        object_name=object_name,
+                        object_id=object_id,
+                        object_is_uuid=object_is_uuid,
+                        named_type_name=named_type_name,
+                        template=rel_type_templates.get(rel_type) or template,
+                        template_2p=rel_type_templates_2p.get(rel_type),
+                        subject_is_you=subject_is_you,
+                    )
+                    if _composed:
+                        prose = _composed
 
                 # ASSERTION POLARITY (Q1): a NEGATED genuine state must read back NEGATED, never as
                 # its positive opposite. Presentation-only, keyed on the `polarity` column the walk
@@ -30825,13 +31143,57 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 # prefix leaked an internal token to the user-facing string. The
                 # softening is shaped downstream by the recall preamble using the
                 # fact's `fact_class` field (which survives on the fact dict).
-                prose_list.append(prose)
+                # Accumulate for the post-passes (inverse-dedup keyed on UUIDs +
+                # rel_type; titlecase keyed on the resolved DISPLAY-NAME aliases —
+                # entity names only, never "you" or a SCALAR value/type word).
+                _rendered.append({
+                    "prose": prose,
+                    "subj_id": subject_id,
+                    "obj_id": object_id if object_is_uuid else None,
+                    "rel_type": rel_type,
+                    "subject_is_you": subject_is_you,
+                })
+                # Subject alias → titlecase ONLY when it is the resolver's own
+                # single-token alias (skip a question-framed override / anchor-term
+                # phrase like "your dog" — that is rendered verbatim, not a name).
+                if (subject_name and subject_name != "you"
+                        and not _subj_override
+                        and len(subject_name.split()) == 1):
+                    _name_slots.append(subject_name)
+                # Object alias → titlecase ONLY a clean SINGLE-TOKEN entity NAME on a
+                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Atlas/Biscuit). A
+                # hierarchy object is a TYPE word ("dog"/"animal"), a participated_in object
+                # is an occurrence TITLE/handle, and a STATE object is a state word ("down")
+                # — none are proper names, all read naturally lowercase and must NOT be titled
+                # (it would case-shift the type/state word the question keys on). Subject-
+                # agnostic, structural — the gate is metadata (is_hierarchy_rel / category).
+                _obj_meta = _overlay_meta.get(rel_type) or {}
+                try:
+                    _obj_is_hier_slot = bool(_obj_meta.get("is_hierarchy_rel"))
+                    _obj_is_state_slot = (_obj_meta.get("category") or "").lower() == "state"
+                except Exception:
+                    _obj_is_hier_slot = False
+                    _obj_is_state_slot = False
+                if (object_is_uuid and object_name and object_name != "you"
+                        and rel_type != "participated_in"
+                        and not _obj_is_hier_slot and not _obj_is_state_slot
+                        and len(object_name.split()) == 1):
+                    _name_slots.append(object_name)
 
             except Exception as e:
                 log.warning("convert_to_prose.fact_error",
                            rel_type=fact.get("rel_type"), error=str(e))
                 continue
 
+        # POST-PASS (b): inverse-pair dedup (UUID + metadata inverse_rel_type keyed,
+        # prefer the user-as-subject direction). Returns the deduped prose list in
+        # original order.
+        prose_list = _dedup_inverse_pairs(_rendered, _overlay_meta)
+        # POST-PASS (a): titlecase resolved display-name slots (rex → Rex);
+        # "you" and scalar values/type words are NOT in _name_slots so stay verbatim.
+        # Case-insensitive det-scorer → titling drops no gold token.
+        if _name_slots:
+            prose_list = [_titlecase_display_slots(p, _name_slots) for p in prose_list]
         return prose_list
 
     except Exception as e:
@@ -34203,8 +34565,8 @@ def correct_fact(req: FactCorrectionRequest):
                         new_rel_type=new_rel_type)
 
                 # Verify old fact exists. The resolved correction subject may be either side
-                # of the stored edge: "Sarah is my cousin, not my sister" resolves the subject
-                # to SARAH, but the grounded edge is (user, sibling_of, sarah) — Sarah is the
+                # of the stored edge: "Taylor is my cousin, not my sister" resolves the subject
+                # to TAYLOR, but the grounded edge is (user, sibling_of, taylor) — Taylor is the
                 # OBJECT. A subject-only lookup (the historical path) misses it and the user's
                 # correction is silently lost. We therefore look up BOTH orientations (the
                 # resolved entity as subject, then as object) and carry the matched edge's REAL

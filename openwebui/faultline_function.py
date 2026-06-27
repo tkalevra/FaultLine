@@ -2456,7 +2456,7 @@ RESPOND WITH VALID JSON ONLY (no markdown, no extra text):
 SCOPE LEVELS:
 - granular: Retracting a specific fact about a person (e.g., "Robert is not my son")
 - categorical: Retracting all facts in a domain (e.g., "I don't have any pets")
-- relational: Retracting all facts with someone (e.g., "I'm not married to Sarah anymore")
+- relational: Retracting all facts with someone (e.g., "I'm not married to Taylor anymore")
 
 RULES: If is_retraction=false, set all other fields to null. For categorical, populate category (domain: family, pets, work, location, health, etc). For granular, populate subject and optionally rel_type. For relational, populate subject and rel_type.
 
