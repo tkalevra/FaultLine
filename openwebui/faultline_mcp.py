@@ -79,7 +79,7 @@ RULES:
 
 ENTITY NAMING RULES (strictly enforced):
 - NEVER use "i", "me", "my", "we", "our", "myself" as subject or object in ANY triple regardless of rel_type. This is an absolute rule with zero exceptions.
-- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Marla, who prefers to be called emma", the subject is "marla" not "i".
+- If the subject of a fact is ambiguous due to pronouns, resolve it to the nearest named entity in the sentence. For "Jordan, who prefers to be called emma", the subject is "jordan" not "i".
 - For preference patterns ("X prefers Y", "X goes by Y", "X is called Y"), the subject is always the person being described, never the speaker.
 - Entity names must be proper nouns or named entities only. Never common nouns, pronouns, or role labels (e.g. not "user", "person", "speaker").
 
@@ -116,10 +116,10 @@ RELATIONSHIP RULES (strictly enforced):
 12. For age patterns ("X age 12", "X, age 12", "X who is 12"):
     emit {"subject":"x","object":"12","rel_type":"age"} where object is the NUMBER only.
     NEVER use a nickname or name as the age value.
-    If the sentence contains both an age AND a nickname (e.g. "Desmonde age 12, goes by des"),
+    If the sentence contains both an age AND a nickname (e.g. "Sampson age 12, goes by sam"),
     emit TWO separate triples:
-    {"subject":"desmonde","object":"12","rel_type":"age"}
-    {"subject":"desmonde","object":"des","rel_type":"also_known_as"}
+    {"subject":"sampson","object":"12","rel_type":"age"}
+    {"subject":"sampson","object":"sam","rel_type":"also_known_as"}
 13. For height patterns ("X is 6ft tall", "X height 6’", "X stands 6 feet", "X is 6’ tall"):
     emit {"subject":"x","object":"6ft","rel_type":"height"} where object is the height in feet (e.g. "6ft", "5'10\"").
     Normalize units to feet/inches format. Use ' for feet, \" for inches.

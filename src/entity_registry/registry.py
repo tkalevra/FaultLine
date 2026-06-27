@@ -18,6 +18,16 @@ _ENTITY_NAME_MAX_LEN = 256
 _FAULTLINE_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 
 
+# First-person pronouns (and the possessive "my") always denote the REQUESTING
+# user — never a distinct entity. They must resolve to the request's user_id, never
+# mint a surrogate. This is the single resolution seam every ingest path flows
+# through (subject AND object), so grounding here is subject-agnostic and complete.
+# Deterministic, bounded language primitive (a closed pronoun set, not a domain list).
+# Upstream main.py normalizers also rewrite these to "user"; this is the backstop
+# that catches any path/object position they miss (the phantom "i" entity bug).
+_FIRST_PERSON_PRONOUNS = frozenset({"i", "me", "my", "myself", "mine"})
+
+
 # Alias preference provenance trust ordering (ALIAS-PROVENANCE-DESIGN).
 # Higher rank = more trusted. A newly-preferred alias may only demote an
 # incumbent preferred alias when its source rank is >= the incumbent's.
@@ -100,10 +110,14 @@ class EntityRegistry:
         if not name:
             raise ValueError("Entity name cannot be empty")
 
-        # Special case: 'user' resolves to the canonical user entity ID.
+        # Special case: 'user' and any first-person pronoun ("i"/"me"/"my"/"myself"/
+        # "mine") resolve to the canonical user entity ID — never a fresh surrogate.
+        # This is the deterministic grounding seam for first-person reference: the
+        # pronoun "I" is the requesting user, so it must ground to user_id and never
+        # mint a phantom "i" entity (subject-agnostic — applies in object position too).
         # If user_id is a valid UUID, use it directly.
         # If not (e.g., test user strings), derive a deterministic UUID surrogate.
-        if name == "user":
+        if name == "user" or name in _FIRST_PERSON_PRONOUNS:
             entity_id = user_id if self._is_valid_uuid(user_id) else _make_surrogate(user_id, user_id)
             log.info("entity_registry.resolve_user_special_case", entity_id=entity_id)
             # Ensure the user entity exists (per-user schema, no user_id column needed)
@@ -366,7 +380,7 @@ class EntityRegistry:
                 # A new preferred alias may only demote the incumbent preferred
                 # alias when its source rank is >= the incumbent's. A weaker
                 # source (e.g. rel_default) can no longer clobber a stronger one
-                # (e.g. user_stated) — this is the wren-over-chris poisoning,
+                # (e.g. user_stated) — this is the wren-over-alex poisoning,
                 # prevented at the source. The new alias is still stored (never
                 # lost), just as is_preferred=false.
                 # ──────────────────────────────────────────────────────────────

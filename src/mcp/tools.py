@@ -20,7 +20,7 @@ TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "A short topic from the user's message to look up. Required — never leave empty."
+                    "description": "The user's current message copied VERBATIM and in full — do NOT summarize, shorten, or reduce it to a keyword or topic. Keep every word, especially 'not', 'no', 'now', 'actually', 'instead' and any names/values. The backend extracts the search topic AND decides intent (recall vs correction) from the whole sentence itself. Required — never leave empty."
                 },
                 "user_id": {
                     "type": "string",
@@ -98,6 +98,42 @@ TOOLS = [
                 }
             },
             "required": ["text"]
+        }
+    },
+    {
+        "name": "forget_fact",
+        "description": "Use ONLY when the user EXPLICITLY and deliberately asks to forget or delete "
+                       "ONE specific fact about a NAMED target — e.g. 'forget my email address', "
+                       "'delete that I have a dog named Rex', 'forget that Jordan is my spouse'. "
+                       "Tombstones exactly the one named fact (recoverable, not a hard wipe). You MUST "
+                       "name the target via 'subject' (use 'me' for the user) and, to pin it, "
+                       "'rel_type' and/or 'old_value'. NEVER call for a broad/bulk request ('forget "
+                       "everything', 'wipe my memory') — there is no bulk forget. For a CORRECTION "
+                       "(a NEW value) use remember_facts instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "WHOSE fact to forget — 'me' for the user, or the named person/thing. "
+                                   "Required: a forget MUST name exactly one target, never a bulk wipe."
+                },
+                "rel_type": {
+                    "type": "string",
+                    "description": "Optional: the relationship of the specific fact (e.g. occupation, "
+                                   "has_pet, has_email) to narrow the forget to one fact."
+                },
+                "old_value": {
+                    "type": "string",
+                    "description": "Optional: the specific value/object of the fact (e.g. the email "
+                                   "address, the pet's name) to pin the forget to exactly one fact."
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
+                }
+            },
+            "required": ["subject"]
         }
     }
 ]

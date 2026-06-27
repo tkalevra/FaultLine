@@ -91,7 +91,7 @@ def derive_user_slug_from_uuid(user_id: str) -> str:
     - Schema names are URL-safe (compatible with psql queries)
 
     Args:
-        user_id: UUID in standard format, e.g., "00000000-0000-0000-0000-000000000000"
+        user_id: UUID in standard format, e.g., "550e8400-e29b-41d4-a716-446655440000"
 
     Returns:
         URL-safe slug, e.g., "550e8400_e29b_41d4_a716_446655440000"
@@ -100,10 +100,10 @@ def derive_user_slug_from_uuid(user_id: str) -> str:
         ValueError: If user_id is empty or None
 
     Examples:
-        >>> derive_user_slug_from_uuid("00000000-0000-0000-0000-000000000000")
+        >>> derive_user_slug_from_uuid("550e8400-e29b-41d4-a716-446655440000")
         "550e8400_e29b_41d4_a716_446655440000"
 
-        >>> derive_user_slug_from_uuid("00000000-0000-0000-0000-000000000000")
+        >>> derive_user_slug_from_uuid("550e8400-e29b-41d4-a716-446655440000")
         "550e8400_e29b_41d4_a716_446655440000"
 
     CLAUDE.md Compliance:
@@ -244,17 +244,17 @@ def derive_schema_name(user_slug: str) -> str:
     """Derive PostgreSQL schema name from user slug (never hardcode).
 
     Args:
-        user_slug: Human-readable slug from users.slug (e.g., "christopher")
+        user_slug: Human-readable slug from users.slug (e.g., "alexander")
 
     Returns:
-        Schema name (e.g., "faultline_christopher")
+        Schema name (e.g., "faultline_alexander")
 
     Examples:
-        >>> derive_schema_name("christopher")
-        'faultline_christopher'
+        >>> derive_schema_name("alexander")
+        'faultline_alexander'
 
-        >>> derive_schema_name("marla")
-        'faultline_marla'
+        >>> derive_schema_name("jordan")
+        'faultline_jordan'
     """
     # Sanitize slug: lowercase, alphanumeric + underscore only
     safe_slug = "".join(c if c.isalnum() or c == "_" else "_" for c in user_slug.lower())
@@ -297,12 +297,54 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
                     category = EXCLUDED.category,
                     fact_class = EXCLUDED.fact_class,
                     natural_language = EXCLUDED.natural_language,
+                    natural_language_2p = EXCLUDED.natural_language_2p,
                     correction_behavior = EXCLUDED.correction_behavior,
                     label = EXCLUDED.label,
                     wikidata_pid = EXCLUDED.wikidata_pid,
-                    storage_target = EXCLUDED.storage_target
+                    storage_target = EXCLUDED.storage_target,
+                    temporal_class = EXCLUDED.temporal_class
             """)
             log.info("bootstrapped_rel_types", schema=schema_name, note="copied from public schema")
+
+            # Bootstrap rel_type_aliases: copy from public TEMPLATE into the tenant schema.
+            # Maps relationship variations AND role-nouns (mother→parent_of, boss→works_for)
+            # to canonical rel_types. Read UNQUALIFIED at runtime on the tenant search_path
+            # (no public) by possessive-relationship anchor resolution. public is the SEED
+            # SOURCE only. CREATE TABLE IF NOT EXISTS defends older tenant schemas whose
+            # template predates this table; explicit columns keep the copy aligned with
+            # migrations 030 + 031. ON CONFLICT (alias) DO NOTHING — idempotent/re-runnable.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rel_type_aliases (
+                    id SERIAL PRIMARY KEY,
+                    canonical_rel_type VARCHAR(255) NOT NULL,
+                    alias VARCHAR(255) NOT NULL UNIQUE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    source VARCHAR(50) DEFAULT 'ontology',
+                    confidence FLOAT DEFAULT 1.0,
+                    requires_inversion BOOLEAN DEFAULT FALSE,
+                    is_symmetric BOOLEAN DEFAULT FALSE,
+                    inverse_alias VARCHAR(255),
+                    FOREIGN KEY (canonical_rel_type) REFERENCES rel_types(rel_type) ON DELETE CASCADE
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rel_type_aliases_alias ON rel_type_aliases(alias)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rel_type_aliases_canonical "
+                "ON rel_type_aliases(canonical_rel_type)"
+            )
+            cur.execute("""
+                INSERT INTO rel_type_aliases
+                    (canonical_rel_type, alias, source, confidence,
+                     requires_inversion, is_symmetric, inverse_alias)
+                SELECT canonical_rel_type, alias, source, confidence,
+                       requires_inversion, is_symmetric, inverse_alias
+                FROM public.rel_type_aliases
+                WHERE canonical_rel_type IN (SELECT rel_type FROM rel_types)
+                ON CONFLICT (alias) DO NOTHING
+            """)
+            log.info("bootstrapped_rel_type_aliases", schema=schema_name, note="copied from public template")
 
             # NOTE: entity_taxonomies seeded separately via _seed_entity_taxonomies()
             # (Moved to dedicated function for clarity and to copy from public schema)
@@ -369,9 +411,115 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
             """)
             log.info("bootstrapped_retraction_signals", schema=schema_name, count=10)
 
+            # Bootstrap deterministic extraction/intent/preference/correction layer.
+            # These 5 data-bearing tables are read UNQUALIFIED on the request-scoped
+            # connection (search_path = {schema} WITHOUT public, per 31580f6), so they
+            # MUST be seeded INTO the tenant schema. public is the seed source only —
+            # never read at runtime. Explicit column lists (NOT SELECT *) so a future
+            # public column add can't silently mis-align the copy. ON CONFLICT DO NOTHING
+            # keeps this idempotent and re-runnable on existing schemas.
+
+            # extraction_patterns (~53 rows): metadata-driven regex extraction patterns
+            cur.execute("""
+                INSERT INTO extraction_patterns
+                    (pattern_regex, rel_type, frequency, confirmed_count, rejected_count,
+                     correction_count, global_confidence, description, example_text,
+                     category, source, is_active, archived_at, last_matched_at)
+                SELECT pattern_regex, rel_type, frequency, confirmed_count, rejected_count,
+                       correction_count, global_confidence, description, example_text,
+                       category, source, is_active, archived_at, last_matched_at
+                FROM public.extraction_patterns
+                ON CONFLICT (pattern_regex, rel_type) DO NOTHING
+            """)
+
+            # temporal_patterns (~50 rows): metadata-driven GROWABLE date-cue inventory — relative
+            # cues (migration 103) + the FORMAL-ABSOLUTE class (migration 104: month names / numeric
+            # shapes / 4-digit year). Read via temporal_pattern_overlay by linguistics
+            # _classify_span_anchor (relative classify) AND text_has_date_cue (the latency GATE that
+            # skips the whole date pipeline on a no-cue turn). Blanket SELECT copies BOTH classes.
+            cur.execute("""
+                INSERT INTO temporal_patterns
+                    (pattern_regex, anchor_type, frequency, confirmed_count, rejected_count,
+                     correction_count, global_confidence, description, example_text,
+                     category, source, is_active, archived_at, last_matched_at)
+                SELECT pattern_regex, anchor_type, frequency, confirmed_count, rejected_count,
+                       correction_count, global_confidence, description, example_text,
+                       category, source, is_active, archived_at, last_matched_at
+                FROM public.temporal_patterns
+                ON CONFLICT (pattern_regex, anchor_type) DO NOTHING
+            """)
+
+            # linguistic_cues (~28 rows): metadata-driven GROWABLE linguistic verb/particle cue
+            # inventory read via linguistic_cue_overlay. Categories: 'naming_verb' (migration 105,
+            # analyze_naming / _event_title / is_naming_predicate), 'lvc_support_verb' (migration 108,
+            # analyze_event / analyze_svo_relations — have/go/attend/…), 'svo_particle' (migration
+            # 108, _svo_predicate_token / _svo_object_head — to/for/with/…), 'inchoative_verb'
+            # (migration 112, analyze_inchoative — start/begin/… ingressive START verbs), and
+            # 'aspectual_control_verb' (migration 113, _aspectual_activity_xcomp — start/begin/keep/
+            # continue/resume/finish/stop phase verbs licensing the split-SVO xcomp descent). The
+            # relations stay in code; only the verb-LEMMA / particle-SURFACE VOCABULARY is DB data that grows
+            # (freq-gated, tenant-only). Blanket SELECT copies ALL seeded categories.
+            cur.execute("""
+                INSERT INTO linguistic_cues
+                    (cue, category, frequency, confirmed_count, rejected_count,
+                     correction_count, global_confidence, description, example_text,
+                     source, is_active, archived_at, last_matched_at)
+                SELECT cue, category, frequency, confirmed_count, rejected_count,
+                       correction_count, global_confidence, description, example_text,
+                       source, is_active, archived_at, last_matched_at
+                FROM public.linguistic_cues
+                ON CONFLICT (cue, category) DO NOTHING
+            """)
+
+            # intent_classes (4 rows): GLiNER2 zero-shot intent label descriptions
+            cur.execute("""
+                INSERT INTO intent_classes
+                    (intent_name, description, priority, version, is_active, refined_by)
+                SELECT intent_name, description, priority, version, is_active, refined_by
+                FROM public.intent_classes
+                ON CONFLICT (intent_name) DO NOTHING
+            """)
+
+            # preference_patterns (8 rows): Layer 2c preference signal patterns
+            cur.execute("""
+                INSERT INTO preference_patterns
+                    (pattern_text, signal_type, intent_name, base_confidence, is_active, created_by)
+                SELECT pattern_text, signal_type, intent_name, base_confidence, is_active, created_by
+                FROM public.preference_patterns
+                ON CONFLICT (pattern_text) DO NOTHING
+            """)
+
+            # correction_signals (~12 rows): implicit correction-signal patterns
+            cur.execute("""
+                INSERT INTO correction_signals
+                    (pattern, pattern_type, applicable_rel_types, priority, confidence,
+                     category, example_usage, notes, user_id, success_count, last_applied_at,
+                     extraction_hints, seed_confidence, semantics, occurrence_count)
+                SELECT pattern, pattern_type, applicable_rel_types, priority, confidence,
+                       category, example_usage, notes, user_id, success_count, last_applied_at,
+                       extraction_hints, seed_confidence, semantics, occurrence_count
+                FROM public.correction_signals
+                ON CONFLICT (pattern) DO NOTHING
+            """)
+
+            # intent_pattern_cache (~15 rows): Layer 2a TTL intent-pattern cache (global seeds)
+            cur.execute("""
+                INSERT INTO intent_pattern_cache
+                    (user_id, pattern_text, intent_type, negation_type, confidence,
+                     confirmed_count, contradicted_count, last_fired_at, expires_at,
+                     is_permanent, min_context_chars, requires_replacement_clause, learned_from)
+                SELECT user_id, pattern_text, intent_type, negation_type, confidence,
+                       confirmed_count, contradicted_count, last_fired_at, expires_at,
+                       is_permanent, min_context_chars, requires_replacement_clause, learned_from
+                FROM public.intent_pattern_cache
+                ON CONFLICT (user_id, pattern_text, intent_type) DO NOTHING
+            """)
+            log.info("bootstrapped_deterministic_layer", schema=schema_name,
+                     tables="extraction_patterns,temporal_patterns,linguistic_cues,intent_classes,preference_patterns,correction_signals,intent_pattern_cache")
+
             # Seed user identity anchor — allows first-person references from GLiNER2
             # (subject="user") to normalize to the user UUID immediately on first ingest.
-            # Overwritable: when user later says "my name is Chris", pref_name updates the alias.
+            # Overwritable: when user later says "my name is Alex", pref_name updates the alias.
             cur.execute("""
                 INSERT INTO entities (id, entity_type)
                 VALUES (%s, 'Person')
@@ -424,14 +572,39 @@ def _seed_entity_taxonomies(user_id: str, schema_name: str, db: psycopg2.extensi
 
             # Copy taxonomies from public schema to per-user schema
             # ON CONFLICT ensures idempotency (can be retried safely)
+            # Phase 2 (2C): carry `source` so seeded vs user-corrected scope rows
+            # are distinguishable in the tenant schema (Phase 3 corrections rely
+            # on it). The tenant `source` column is guaranteed present by the
+            # template DDL (ADD COLUMN IF NOT EXISTS).
+            # member_taxonomies (migration 087): nesting refs (family ⊃ pets ⊃ animal).
+            # Copied from public so the animal/pets demo groups and any nested rows land
+            # in the tenant. The tenant column is guaranteed present by the template DDL
+            # (ADD COLUMN IF NOT EXISTS).
             cur.execute("""
                 INSERT INTO entity_taxonomies
                 (taxonomy_name, description, member_entity_types, rel_types_defining_group,
-                 has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, created_at)
+                 has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type,
+                 member_taxonomies, severed_taxonomies, source, created_at)
                 SELECT taxonomy_name, description, member_entity_types, rel_types_defining_group,
-                       has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type, NOW()
+                       has_transitivity, transitive_rel_types, is_hierarchical, parent_rel_type,
+                       COALESCE(member_taxonomies, '{}'),
+                       COALESCE(severed_taxonomies, '{}'),
+                       COALESCE(source, 'seeded'), NOW()
                 FROM public.entity_taxonomies
                 ON CONFLICT (taxonomy_name) DO NOTHING
+            """)
+
+            # Guarded family nesting (migration 087): make family hierarchical and nest
+            # pets under it, without clobbering a user-corrected row. The INSERT above is
+            # ON CONFLICT DO NOTHING, so a pre-existing flat `family` would not pick up the
+            # nesting from the public copy — wire it explicitly here.
+            cur.execute("""
+                UPDATE entity_taxonomies
+                   SET member_taxonomies = ARRAY['pets']::TEXT[],
+                       is_hierarchical   = true
+                 WHERE taxonomy_name = 'family'
+                   AND COALESCE(source, 'seeded') <> 'user_corrected'
+                   AND (member_taxonomies IS NULL OR member_taxonomies = '{}')
             """)
             db.commit()
 
@@ -527,7 +700,7 @@ def _validate_schema_structure(schema_name: str, user_id: str, db: psycopg2.exte
         'facts', 'staged_facts', 'entities', 'entity_aliases', 'entity_attributes',
         'rel_types', 'entity_taxonomies', 'ontology_evaluations', 'negation_patterns',
         'intent_confidence_feedback', 'retraction_signals', 'pending_types',
-        'entity_name_conflicts', 'retraction_outcomes'
+        'entity_name_conflicts', 'retraction_outcomes', 'entity_synonyms'
     ]
 
     errors = []
@@ -640,10 +813,10 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
 
     Examples:
         >>> schema_name, status = create_user_schema(
-        ...     user_id="00000000-0000-0000-0000-000000000000",
-        ...     user_slug="christopher"
+        ...     user_id="550e8400-e29b-41d4-a716-446655440000",
+        ...     user_slug="alexander"
         ... )
-        >>> assert schema_name == "faultline_christopher"
+        >>> assert schema_name == "faultline_alexander"
         >>> assert status == "ready"
     """
     schema_name = derive_schema_name(user_slug)
@@ -821,6 +994,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                     'intent_confidence_feedback',  # FIX #2: NEW — adaptive gate learning
                     'entity_taxonomies',  # FIX #2: NEW — query filtering
                     'correction_patterns',  # pre-GLiNER2 negation-correction intent detection
+                    'entity_synonyms',  # referential-term → entity/relationship linguistic layer (IMPL-1)
                 ]
                 missing_tables = []
                 for table_name in required_tables:
@@ -895,7 +1069,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
     Args:
         user_id: UUID of user (for logging)
-        schema_name: Schema to delete (e.g., "faultline_christopher")
+        schema_name: Schema to delete (e.g., "faultline_alexander")
         db: Optional psycopg2 connection. Creates new if not provided.
 
     Returns:
@@ -903,8 +1077,8 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
     Examples:
         >>> success = delete_user_schema(
-        ...     user_id="00000000-0000-0000-0000-000000000000",
-        ...     schema_name="faultline_christopher"
+        ...     user_id="550e8400-e29b-41d4-a716-446655440000",
+        ...     schema_name="faultline_alexander"
         ... )
         >>> assert success
     """

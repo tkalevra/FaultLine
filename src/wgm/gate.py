@@ -8,7 +8,7 @@ import logging
 import structlog
 from src.fact_store.store import FactStoreManager
 from src.api.llm_output_validator import LLMOutputValidator
-from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts
+from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts, LLMModels
 
 log = structlog.get_logger()
 
@@ -24,6 +24,30 @@ except ImportError:
 
 # Marker for internal FaultLine prompts (dprompt-128) — prevents context bloat if looped back
 _FAULTLINE_INTERNAL_PREFIX = "[FaultLine-Internal]"
+
+
+def _flag_on(name: str, default: str = "true") -> bool:
+    """Truthy env flag (mirrors src.api.main._flag_on so the gate has no import cycle)."""
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+# TAIL/HEAD-TYPE MISMATCH VETO (lowest-risk slice of the spine strength-gating design):
+# A high-confidence edge whose OBJECT (or SUBJECT) entity_type GENUINELY does NOT satisfy
+# the rel's tail_types/head_types — after the legitimate hierarchy-reachability check (a
+# true subtype IS allowed) — must NOT be enthroned as durable Class A. The pre-existing
+# Fix-B pregate only consulted the GROUND-TRUTH (entities-table / hierarchy) type, which is
+# edge-ORDER dependent: a freshly-minted object is still 'unknown' when its own
+# participated_in edge validates (the co-extracted owns/part_of edge that types it may not
+# have run yet), so the mismatch escapes the bypass and commits as A 1.0 — poisoning L4
+# (e.g. a car's GPS filed in the event graph, unwalkable from the car). With this flag ON
+# (default), the pregate ALSO honors the caller-passed GLiNER2 type (present at validate
+# time, order-independent): a CONCRETE passed type that is genuinely incompatible craters
+# the cast to Class C (we don't forget — couldn't-classify-yet, reclassify later) rather
+# than admitting it as A. Metadata-driven (head_types/tail_types from the live ontology);
+# subject-agnostic (no rel/type/name literal). A type-SATISFYING object (Event/Concept for
+# participated_in — the reified-event lane) is UNAFFECTED.
+def _typecheck_veto_on() -> bool:
+    return _flag_on("WGM_TYPE_MISMATCH_VETO", "true")
 
 
 # DEAD CODE REMOVED: _detect_llm_endpoint()
@@ -94,7 +118,7 @@ class RelTypeRegistry:
         return sorted(self.get_valid_types())
 
     def get(self, rel_type: str, default=None):
-        """Get ontology entry for a rel_type (inclualice head_types, tail_types, engine_generated)."""
+        """Get ontology entry for a rel_type (includes head_types, tail_types, engine_generated)."""
         self.get_valid_types()  # ensure cache is fresh
         return self._ontology.get(rel_type.lower(), default or {})
 
@@ -238,8 +262,19 @@ class WGMValidationGate:
         if is_scalar:
             # Still validate head_types for subject
             if head_types and not (len(head_types) == 1 and head_types[0].lower() == "any"):
+                # STRONG-INGEST ENTITY GROUNDING: consult the GLiNER2 batch type the
+                # caller passed (subject_type) FIRST; only fall back to the DB type, then
+                # to the hierarchy chain, when the caller gave us nothing authoritative.
+                # A passed literal 'unknown' is treated as "no type" (DB default sentinel).
+                if subject_type is not None and subject_type.lower() == "unknown":
+                    subject_type = None
                 if subject_type is None:
                     subject_type = self._resolve_entity_type(subject_id)
+                if subject_type is None or (isinstance(subject_type, str) and subject_type.lower() == "unknown"):
+                    # Walk instance_of/subclass_of upward (e.g. Rex → poodle → Animal)
+                    # before giving up — the GLiNER2 root may live one hop away.
+                    hierarchy_type = self._resolve_entity_type_via_hierarchy(subject_id)
+                    subject_type = hierarchy_type or None
                 if subject_type is None:
                     log.warning(
                         "wgm.type_check_skipped",
@@ -371,6 +406,36 @@ class WGMValidationGate:
 
         return (True, "ok")
 
+    def _passed_type_is_genuine_mismatch(
+        self, passed_type: str, allowed_types, entity_id: str = None
+    ) -> bool:
+        """A CONCRETE caller-passed (GLiNER2) type genuinely violates the constraint when it
+        is non-empty / non-'unknown', NOT in the allowed set, and the constraint is real
+        (no 'any'). Hierarchy-reachability (a true subtype IS allowed) is honored: if the
+        entity already carries hierarchy facts whose resolved type satisfies the constraint,
+        it is NOT a mismatch. Metadata-only; subject-agnostic; no rel/type literal.
+
+        Returns True ⇒ crater (genuine incompatible type); False ⇒ leave alone (allowed,
+        unknown, hierarchy-reachable, or unconstrained — no new drops)."""
+        pt = (passed_type or "").strip().lower()
+        if not pt or pt == "unknown":
+            return False  # no concrete signal → fail-safe, never crater
+        allowed = [str(t).strip().lower() for t in (allowed_types or []) if t and str(t).strip()]
+        if not allowed or "any" in allowed:
+            return False  # unconstrained role
+        if pt in allowed:
+            return False  # directly satisfies
+        # Hierarchy-reachability: a true subtype IS allowed. If the entity's hierarchy chain
+        # resolves to an allowed type (e.g. Rex → poodle → Animal), it is NOT a mismatch.
+        if entity_id is not None:
+            try:
+                resolved = self._resolve_entity_type_via_hierarchy(entity_id)
+                if resolved and resolved.strip().lower() in allowed:
+                    return False
+            except Exception:
+                pass  # fail-safe → fall through to mismatch=True only on a concrete conflict
+        return True  # concrete, constrained, not allowed, not hierarchy-reachable → genuine
+
     def _resolve_entity_type(self, entity_id: str) -> str:
         """
         Resolve entity type from entities table. Returns None if not found.
@@ -391,6 +456,85 @@ class WGMValidationGate:
                 extra={"entity_id": entity_id, "error": str(e)},
             )
             return None
+
+    def _recheck_type_authoritative(
+        self,
+        rel_type: str,
+        subject_id: str,
+        object_id: str,
+        subject_type: str = None,
+        object_type: str = None,
+    ) -> tuple[bool, str]:
+        """Re-validate head/tail type constraints by reading the rel_type row DIRECTLY
+        from this gate's OWN db_conn (read-your-own-write) instead of the TTL overlay
+        cache. Used ONLY by the post-expansion re-check so a just-committed constraint
+        widening is seen DETERMINISTICALLY — the cache path is racy under concurrency
+        (a concurrent in-flight read can keep the cache on the pre-widening snapshot,
+        making the re-check intermittently still fail and silently DROP the edge).
+
+        Returns (valid, reason). Same semantics as _check_type_constraints' type gate:
+        ANY/SCALAR/empty → unconstrained-pass; otherwise the actual subject/object type
+        must be in head_types/tail_types (case-insensitive). Fail-safe: on ANY error,
+        fall back to the cache-based _check_type_constraints (prior behaviour).
+        """
+        try:
+            subject_type = subject_type if subject_type and subject_type.strip() else None
+            object_type = object_type if object_type and object_type.strip() else None
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT head_types, tail_types FROM rel_types WHERE rel_type = %s",
+                    (rel_type.lower(),),
+                )
+                row = cur.fetchone()
+            if not row:
+                # No row to read authoritatively — defer to the cache-based check.
+                return self._check_type_constraints(
+                    rel_type, subject_id, object_id,
+                    subject_type=subject_type, object_type=object_type)
+            head_types, tail_types = row[0], row[1]
+
+            def _is_any(types) -> bool:
+                return types is None or (len(types) == 1 and str(types[0]).lower() == "any")
+
+            def _is_scalar(types) -> bool:
+                return types is not None and len(types) == 1 and str(types[0]).lower() == "scalar"
+
+            # Resolve actual types (caller-passed GLiNER2 type first, then DB, then hierarchy).
+            if subject_type is None or subject_type.lower() == "unknown":
+                subject_type = self._resolve_entity_type(subject_id) or subject_type
+            if (subject_type is None or subject_type.lower() == "unknown"):
+                subject_type = self._resolve_entity_type_via_hierarchy(subject_id) or subject_type
+            if object_type is None or object_type.lower() == "unknown":
+                object_type = self._resolve_entity_type(object_id) or object_type
+            if (object_type is None or object_type.lower() == "unknown"):
+                object_type = self._resolve_entity_type_via_hierarchy(object_id) or object_type
+
+            # HEAD (subject) constraint
+            if not _is_any(head_types):
+                ht = [str(t).lower() for t in head_types]
+                st = subject_type.lower() if subject_type else None
+                if st and st != "unknown" and st not in ht and "any" not in ht:
+                    return (False,
+                            f"subject_type '{subject_type}' not allowed for '{rel_type}' (allowed: {head_types})")
+
+            # TAIL (object) constraint — SCALAR tail skips the object-type check entirely.
+            if not _is_any(tail_types) and not _is_scalar(tail_types):
+                tt = [str(t).lower() for t in tail_types]
+                ot = object_type.lower() if object_type else None
+                if ot and ot != "unknown" and ot not in tt and "any" not in tt:
+                    return (False,
+                            f"object_type '{object_type}' not allowed for '{rel_type}' (allowed: {tail_types})")
+
+            return (True, "ok_authoritative")
+        except Exception as e:  # noqa: BLE001 — fail-safe to the existing cache-based check
+            log.warning("wgm.authoritative_recheck_failed",
+                        extra={"rel_type": rel_type, "error": str(e)})
+            try:
+                return self._check_type_constraints(
+                    rel_type, subject_id, object_id,
+                    subject_type=subject_type, object_type=object_type)
+            except Exception:
+                return (True, "type_unknown")
 
     def _resolve_entity_type_via_hierarchy(self, entity_id: str) -> str | None:
         """Walk hierarchy facts upward to find effective entity type.
@@ -745,7 +889,7 @@ class WGMValidationGate:
         2. Inverted rows — subject is a generic ontology token (matches
            _SYSTEM_ENTITY_NAMES) and rel_type is a hierarchy rel.  These are
            mis-extracted facts that have subject/object swapped (e.g. "person
-           instance_of christopher").
+           instance_of alexander").
 
         Qdrant cleanup is best-effort: a failed delete does not affect the gate
         decision or the DB operation.
@@ -846,14 +990,33 @@ class WGMValidationGate:
             return 0
 
         # Best-effort Qdrant cleanup — never affects gate decision.
+        # Collision-safe: facts and staged_facts share a per-user collection with
+        # independent BIGSERIAL sequences, so a bare-id delete could nuke the WRONG
+        # table's point. These ids are staged_facts rows. Pass 1 deletes by the
+        # (source_table, fact_id) payload filter (covers payload-tagged points);
+        # Pass 2 deletes the deterministic derived point id (new-scheme points).
+        # Legacy bare-int points are cleaned by re_embedder reconcile / re-sync.
         if deleted_ids and qdrant_url and user_id:
             try:
-                from src.re_embedder.embedder import derive_collection
+                from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id
                 import httpx as _httpx
                 collection = derive_collection(user_id)
+                for _did in deleted_ids:
+                    _httpx.post(
+                        f"{qdrant_url}/collections/{collection}/points/delete",
+                        json={
+                            "filter": {
+                                "must": [
+                                    {"key": "source_table", "match": {"value": "staged_facts"}},
+                                    {"key": "fact_id", "match": {"value": _did}},
+                                ]
+                            }
+                        },
+                        timeout=5.0,
+                    )
                 _httpx.post(
                     f"{qdrant_url}/collections/{collection}/points/delete",
-                    json={"points": deleted_ids},
+                    json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
                     timeout=5.0,
                 )
                 log.info(
@@ -1249,7 +1412,125 @@ class WGMValidationGate:
         # trusted and skip type constraints, hierarchy, and category validation.
         raw_confidence = edge_args.get("confidence", 0.8) or 0.0
         is_user_correction = self._is_user_correction(edge_args)
-        if raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9):
+        # Fix B — TYPE-CONSISTENCY PRE-GATE on the confidence bypass.
+        # A high-confidence LLM-extracted edge (e.g. a false `(user, parent_of, Rex)`
+        # minted by /extract/rewrite) must NOT skip type constraints when its rel_type
+        # carries CONCRETE type constraints (non-ANY, non-SCALAR) and the actual entity
+        # types RESOLVE to a CONFLICT (Rex → beagle → Animal vs parent_of tail=Person).
+        # Such an edge is type-inconsistent and must be type-checked/quarantined (routed to
+        # the hierarchy_type_mismatch → Class C staged lane below), never written as Class A.
+        #
+        # Metadata-driven (reads head_types/tail_types from the live ontology, NO rel-name
+        # literal); subject-agnostic (any kinship/typed rel whose object resolves to a
+        # conflicting concrete type is gated identically). NEVER applies to a genuine USER
+        # CORRECTION (user-is-truth: corrections are authoritative and grounding) — only the
+        # non-correction high-confidence extraction path is type-pre-gated. Fail-safe: any
+        # resolution miss / unknown type leaves the bypass intact (no new drops).
+        _bypass_type_conflict = False
+        if raw_confidence >= 0.95 and not is_user_correction:
+            try:
+                _ont = self.get_current_ontology().get(rt, {})
+                _ht = _ont.get("head_types") or []
+                _tt = _ont.get("tail_types") or []
+                _ht_l = [t.lower() for t in _ht]
+                _tt_l = [t.lower() for t in _tt]
+                _head_any = (not _ht) or ("any" in _ht_l)
+                _tail_any = (not _tt) or ("any" in _tt_l)
+                _tail_scalar = (len(_tt_l) == 1 and _tt_l[0] == "scalar")
+                # Only when the rel_type actually CONSTRAINS the offending role.
+                if (not _head_any and _ht_l) or (not _tail_any and not _tail_scalar and _tt_l):
+                    # GROUND-TRUTH TYPE CHECK: pass subject_type/object_type=None so the
+                    # check resolves the AUTHORITATIVE stored/hierarchy type (entities table
+                    # ∪ instance_of/subclass_of walk), NOT the extraction-provided type.
+                    # This is load-bearing: a false `(user, parent_of, Rex)` is often
+                    # CO-EXTRACTED with Rex mistyped as 'Person' (circularly inferred
+                    # from the bad rel itself) and that wrong type is threaded straight into
+                    # validation — which then "passes". Re-resolving from ground truth
+                    # (Rex.entity_type='Animal', set by the real `has_pet`/`instance_of`
+                    # edges) exposes the conflict the extraction type masked. A genuinely
+                    # unknown object → "type_unknown" (no conflict) keeps the fast path.
+                    _ty_ok, _ty_reason = self._check_type_constraints(
+                        rt, subject_id, object_id,
+                        subject_type=None,
+                        object_type=None,
+                    )
+                    # A RESOLVED type conflict blocks the bypass so the normal path below
+                    # routes it to the type-check / Class-C quarantine. TWO resolution
+                    # shapes both count as a real conflict (subject-agnostic, metadata-only):
+                    #   • "hierarchy_type_mismatch" — the object's REAL type was discovered
+                    #     by walking instance_of/subclass_of (Rex → beagle → Animal) and
+                    #     it contradicts the rel's tail constraint → routed to the documented
+                    #     Class-C downgrade.
+                    #   • "... not allowed for ..." — the object's REAL type was already
+                    #     stored on the entity (e.g. Rex.entity_type='Animal', set when
+                    #     the co-extracted `has_pet` edge typed it) and conflicts directly.
+                    #     This is the LIVE ordering: the false `(user, parent_of, Rex)`
+                    #     is co-extracted with `has_pet`, which types Rex as Animal first.
+                    # We DELIBERATELY exclude "type_unknown"/"unconstrained"/"ok" (no real
+                    # type → keep the fast path, no new drops). A genuine USER CORRECTION is
+                    # already excluded above (is_user_correction guard). The downstream lane
+                    # handles each reason (hierarchy → Class C; direct → growth/inference).
+                    if (not _ty_ok) and (
+                        _ty_reason == "hierarchy_type_mismatch"
+                        or (isinstance(_ty_reason, str) and "not allowed for" in _ty_reason)
+                    ):
+                        # DETERMINISTIC QUARANTINE: return the documented
+                        # hierarchy_type_mismatch signal so the ingest loop downgrades this
+                        # type-inconsistent high-confidence edge to Class C (conf ≤0.3) —
+                        # the SAME lane the normal hierarchy-resolved mismatch uses. We do
+                        # NOT merely fall through to the normal type-check, because the
+                        # direct "not allowed for" reason there routes to LLM constraint-
+                        # inference → type_mismatch, which the ingest loop then OVERRIDES
+                        # back to valid for user-provided edges ("user edges override type
+                        # constraints"). That override would re-admit the false edge. The
+                        # quarantine keeps the false `(user, parent_of, Rex)` out of the
+                        # authoritative Class-A facts while remaining non-destructive
+                        # (Class C, user-correctable). Metadata-driven, no rel-name literal.
+                        _bypass_type_conflict = True
+                        log.info("wgm.confidence_bypass_type_pregate",
+                                 rel_type=rt, confidence=raw_confidence,
+                                 reason=_ty_reason,
+                                 note="type-inconsistent high-confidence edge quarantined to "
+                                      "Class C (bypass denied)")
+                        return {"status": "valid", "hierarchy_type_mismatch": True}
+
+                    # PASSED-TYPE VETO (WGM_TYPE_MISMATCH_VETO, default ON): the ground-truth
+                    # check above is edge-ORDER dependent — a freshly-minted object is still
+                    # 'unknown' in the entities table when its OWN constrained edge validates
+                    # (the co-extracted edge that GLiNER2-types it may not have committed yet),
+                    # so a genuine mismatch escapes as "type_unknown" and the bypass enthrones
+                    # it as durable Class A 1.0 (e.g. (user, participated_in, gps_system) where
+                    # gps_system=Object ∉ participated_in.tail={Concept,Event} — poisoning L4).
+                    # Honor the GLiNER2 type the CALLER passed (present at validate time, order-
+                    # independent): a CONCRETE passed type that genuinely violates the constraint
+                    # (not allowed, not hierarchy-reachable to an allowed subtype) is a confidence-
+                    # KILLER → crater to Class C (we don't forget). A type-SATISFYING object
+                    # (Event/Concept for participated_in — the reified-event lane) is UNTOUCHED:
+                    # _passed_type_is_genuine_mismatch returns False for allowed/unknown/reachable.
+                    elif _ty_ok and _typecheck_veto_on():
+                        _tail_bad = (
+                            (not _tail_any and not _tail_scalar and _tt_l)
+                            and self._passed_type_is_genuine_mismatch(object_type, _tt, object_id)
+                        )
+                        _head_bad = (
+                            (not _head_any and _ht_l)
+                            and self._passed_type_is_genuine_mismatch(subject_type, _ht, subject_id)
+                        )
+                        if _tail_bad or _head_bad:
+                            _bypass_type_conflict = True
+                            log.info("wgm.confidence_bypass_passed_type_veto",
+                                     rel_type=rt, confidence=raw_confidence,
+                                     subject_type=subject_type, object_type=object_type,
+                                     head_types=_ht, tail_types=_tt,
+                                     role=("tail" if _tail_bad else "head"),
+                                     note="GLiNER2-passed type genuinely violates constraint; "
+                                          "durable-A cast craters to Class C (bypass denied)")
+                            return {"status": "valid", "hierarchy_type_mismatch": True}
+            except Exception as _pge:
+                log.warning("wgm.confidence_bypass_pregate_failed",
+                            rel_type=rt, error=str(_pge)[:120])
+        if (raw_confidence >= 0.95 or (is_user_correction and raw_confidence >= 0.9)) \
+                and not _bypass_type_conflict:
             # Growth engine: for bypassed high-confidence facts, still infer entity types
             # from rel_type constraints. Prevents entities staying 'unknown' forever.
             ontology = self.get_current_ontology()
@@ -1322,10 +1603,17 @@ class WGMValidationGate:
                         _refresh_rel_type_cache()
                     except Exception:
                         pass
-                    type_ok2, type_reason2 = self._check_type_constraints(
+                    # DETERMINISM: re-validate against the row we JUST committed, read from
+                    # our OWN db_conn (read-your-own-write), NOT the TTL overlay cache. The
+                    # cache round-trip is racy under concurrency — a concurrent in-flight read
+                    # could keep the cache on the pre-expansion snapshot, so the cache-based
+                    # re-check (_check_type_constraints → get_current_ontology → overlay) would
+                    # intermittently still report type_mismatch and DROP a just-admitted edge
+                    # (the same input → fact flickers). The authoritative DB re-read is immune.
+                    # Fail-safe: any error → fall back to the cache-based re-check.
+                    type_ok2, type_reason2 = self._recheck_type_authoritative(
                         rt, subject_id, object_id,
-                        subject_type=subject_type,
-                        object_type=object_type,
+                        subject_type=subject_type, object_type=object_type,
                     )
                     if type_ok2:
                         log.info("wgm.type_constraint_expanded_by_llm",
@@ -1479,16 +1767,48 @@ class WGMValidationGate:
                     result["hierarchy_violation"] = edge_args["hierarchy_violation"]
                 return result
 
+            # TEMPORAL MODEL: stamp the conflict-path facts INSERT with the request-level
+            # temporal carried in edge_args (threaded from /ingest, already temporal_class-gated
+            # per edge). Without this, a conflict-superseding fact (e.g. a SECOND `feels`) lands
+            # here UNDATED ('now'/NULL) while the same triple is staged DATED elsewhere in the
+            # ingest split — two copies of one fact, the undated facts row shadowing the dated
+            # staged row at recall. Stamp here so the facts copy is consistently dated.
+            # NEVER-DOWNGRADE on conflict (mirrors _commit_staged, main.py:3383): a NULL incoming
+            # date must not clobber an existing stamp; a bare 'now' must not overwrite a real
+            # past/future. Defaults preserve today's behaviour when no temporal is supplied.
+            _tstatus = edge_args.get("temporal_status") or "now"
+            if _tstatus not in ("now", "past", "future"):
+                _tstatus = "now"
+            _tevent = edge_args.get("event_date")
+            _tgran = edge_args.get("event_date_granularity")
+            # ASSERTION POLARITY (Q1): carry the edge's polarity onto the conflict-path facts INSERT
+            # so a negated state superseding a prior fact stays NEGATED here too (parity with the
+            # temporal stamp). EXCLUDED wins on conflict — the latest assertion's polarity. Defaults
+            # 'affirmed' (today's behavior) when not supplied.
+            _polarity = edge_args.get("polarity") or "affirmed"
+            if _polarity not in ("affirmed", "negated"):
+                _polarity = "affirmed"
             cur.execute(
-                "INSERT INTO facts (subject_id, object_id, rel_type, provenance)"
-                " VALUES (%s, %s, %s, %s)"
-                " ON CONFLICT (subject_id, object_id, rel_type) DO NOTHING"
+                "INSERT INTO facts"
+                " (subject_id, object_id, rel_type, provenance,"
+                "  temporal_status, event_date, event_date_granularity, polarity)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject_id, object_id, rel_type) DO UPDATE SET"
+                "   temporal_status = CASE WHEN EXCLUDED.temporal_status = 'now'"
+                "     THEN facts.temporal_status ELSE EXCLUDED.temporal_status END,"
+                "   event_date = COALESCE(EXCLUDED.event_date, facts.event_date),"
+                "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity,"
+                "     facts.event_date_granularity),"
+                "   polarity = EXCLUDED.polarity"
                 " RETURNING id",
-                (subject_id, object_id, rt, provenance or ""),
+                (subject_id, object_id, rt, provenance or "",
+                 _tstatus, _tevent, _tgran, _polarity),
             )
             row = cur.fetchone()
-            # If the fact already exists (ON CONFLICT DO NOTHING returned no row),
-            # we still mark old conflicting facts as contradicted.
+            # ON CONFLICT DO UPDATE always RETURNS the row, so `row` is normally truthy
+            # (insert or conflict-update). The SELECT fallback below is retained as a
+            # belt-and-suspenders path to still mark old conflicting facts as contradicted
+            # should RETURNING ever yield nothing.
             if row:
                 new_id = row[0]
             else:
@@ -1590,7 +1910,7 @@ Respond with ONLY the JSON, no explanation."""
 
             result = call_llm_with_retry_sync(
                 messages=messages,
-                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                model=LLMModels.get("rel_type_enrichment"),
                 user_id=getattr(self, '_user_id', None),
                 timeout=LLMTimeouts.get("ENRICHMENT"),
                 operation="rel_type_enrichment",
@@ -1712,7 +2032,7 @@ Respond with ONLY the JSON, no explanation."""
 
             result = call_llm_with_retry_sync(
                 messages=messages,
-                model=os.getenv("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
+                model=LLMModels.get("novel_rel_type_inference"),
                 user_id=getattr(self, '_user_id', None),
                 timeout=LLMTimeouts.get("ENRICHMENT"),
                 operation="novel_rel_type_inference",
@@ -1754,6 +2074,19 @@ Respond with ONLY the JSON, no explanation."""
         """
         try:
             with self.db_conn.cursor() as cur:
+                # CONSTRAINT EXPANSION IS WIDEN-ONLY, NEVER NARROW (subject-agnostic, metadata-driven).
+                # This path exists to ADMIT an edge a constraint rejected — i.e. WIDEN head/tail to
+                # include the new types. Blindly assigning EXCLUDED.{head,tail}_types REPLACES the
+                # existing constraint and can NARROW a UNIVERSAL rel: a /expand batch emitting
+                # `<concept> subclass_of <concept>` drove instance_of/subclass_of (seeded ANY = "classify
+                # ANYTHING") down to {Concept}, after which the ingest type-fallback stamped every
+                # instance_of OBJECT (e.g. an Animal "dog") as Concept — cross-domain typing bleed.
+                # On UPDATE we therefore:
+                #   • PRESERVE UNIVERSAL: if the existing OR incoming side is ANY / empty / NULL, the
+                #     result is {ANY} — a universal classifier (instance_of/subclass_of/part_of) can
+                #     never be narrowed by an inference event.
+                #   • else UNION existing ∪ incoming (genuine widening for a constrained rel).
+                # INSERT (brand-new rel) is unaffected — it takes the inferred constraint as-is.
                 cur.execute(
                     """INSERT INTO rel_types
                        (rel_type, label, natural_language, is_symmetric, inverse_rel_type,
@@ -1763,8 +2096,26 @@ Respond with ONLY the JSON, no explanation."""
                        ON CONFLICT (rel_type) DO UPDATE SET
                            is_symmetric      = EXCLUDED.is_symmetric,
                            inverse_rel_type  = EXCLUDED.inverse_rel_type,
-                           head_types        = EXCLUDED.head_types,
-                           tail_types        = EXCLUDED.tail_types,
+                           head_types        = CASE
+                               WHEN rel_types.head_types IS NULL
+                                    OR rel_types.head_types = ARRAY[]::TEXT[]
+                                    OR 'ANY' = ANY(rel_types.head_types)
+                                    OR EXCLUDED.head_types IS NULL
+                                    OR EXCLUDED.head_types = ARRAY[]::TEXT[]
+                                    OR 'ANY' = ANY(EXCLUDED.head_types)
+                                   THEN ARRAY['ANY']::TEXT[]
+                               ELSE ARRAY(SELECT DISTINCT unnest(rel_types.head_types || EXCLUDED.head_types))
+                           END,
+                           tail_types        = CASE
+                               WHEN rel_types.tail_types IS NULL
+                                    OR rel_types.tail_types = ARRAY[]::TEXT[]
+                                    OR 'ANY' = ANY(rel_types.tail_types)
+                                    OR EXCLUDED.tail_types IS NULL
+                                    OR EXCLUDED.tail_types = ARRAY[]::TEXT[]
+                                    OR 'ANY' = ANY(EXCLUDED.tail_types)
+                                   THEN ARRAY['ANY']::TEXT[]
+                               ELSE ARRAY(SELECT DISTINCT unnest(rel_types.tail_types || EXCLUDED.tail_types))
+                           END,
                            is_hierarchy_rel  = EXCLUDED.is_hierarchy_rel,
                            category          = EXCLUDED.category,
                            confidence        = EXCLUDED.confidence,

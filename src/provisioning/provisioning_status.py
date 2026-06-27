@@ -27,9 +27,9 @@ def check_provisioning_status(user_id: str, db: Optional[psycopg2.extensions.con
             ready_at: str (if status='ready')
 
     Examples:
-        >>> result = check_provisioning_status("00000000-0000-0000-0000-000000000000")
+        >>> result = check_provisioning_status("550e8400-e29b-41d4-a716-446655440000")
         >>> assert result['status'] == 'ready'
-        >>> assert result['schema_name'] == 'faultline_christopher'
+        >>> assert result['schema_name'] == 'faultline_alexander'
     """
     close_conn = False
 
@@ -99,9 +99,9 @@ def ensure_user_provisioned(user_id: str, user_slug: str = None, db: Optional[ps
 
     Examples:
         >>> is_ready = ensure_user_provisioned(
-        ...     user_id="00000000-0000-0000-0000-000000000000",
-        ...     user_slug="christopher",
-        ...     user_name="Christopher"
+        ...     user_id="550e8400-e29b-41d4-a716-446655440000",
+        ...     user_slug="alexander",
+        ...     user_name="Alexander"
         ... )
     """
     close_conn = False

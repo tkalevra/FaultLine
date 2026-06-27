@@ -1080,7 +1080,7 @@ RELATIONSHIP RULES:
 - NEVER emit child_of with the speaker as subject. Use parent_of instead.
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
-- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Marla" → (user, spouse, marla) AND (marla, also_known_as, marla) if needed.
+- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Jordan" → (user, spouse, jordan) AND (jordan, also_known_as, jordan) if needed.
 - BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, alice), you MUST also emit (alice, child_of, user). If you emit (user, spouse, emma), you MUST also emit (emma, spouse, user). If you emit (alice, sibling_of, charlie), you MUST also emit (charlie, sibling_of, alice). Example: "I have a son named alice, my husband emma" → (user, parent_of, alice) + (alice, child_of, user) + (user, spouse, emma) + (emma, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
@@ -1089,21 +1089,21 @@ REL_TYPE REFERENCE:
 - has_pet: person owns an animal (NEVER a person).
 
 HIERARCHY RELATIONSHIPS — extract these whenever you see type/classification/part-of patterns. They appear in every domain and are as important as family relationships:
-- instance_of: entity IS a specific type or breed ("Fraggle is a morkie" → fraggle instance_of morkie)
+- instance_of: entity IS a specific type or breed ("Rex is a morkie" → rex instance_of morkie)
 - subclass_of: type IS a subclass of another ("a morkie is a kind of dog" → morkie subclass_of dog)
 - member_of: entity belongs to a group or taxonomy ("my pets are family" → pets member_of family)
 - part_of: entity is a component of a larger whole ("Engineering dept of TechCorp" → engineering part_of techcorp)
 - is_a: type or category (deprecated; prefer instance_of or subclass_of).
 
 Hierarchy chains across domains (extract EVERY link in the chain):
-- Taxonomic: "I have a dog named Fraggle, a morkie" → fraggle instance_of morkie, morkie subclass_of dog, dog subclass_of animal
+- Taxonomic: "I have a dog named Rex, a morkie" → rex instance_of morkie, morkie subclass_of dog, dog subclass_of animal
 - Organizational: "Alice is an engineer in Engineering at TechCorp" → alice instance_of engineer, engineer member_of engineering, engineering part_of techcorp
 - Infrastructure: "Server 192.168.1.1 is in subnet 192.168.1.0/24 on the main network" → 192.168.1.1 part_of subnet_192_168_1, subnet_192_168_1 part_of network_main
 - Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
 - Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
 - Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
 
-HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Fraggle, a morkie" → extract fraggle instance_of morkie AND user has_pet fraggle, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
+HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Rex, a morkie" → extract rex instance_of morkie AND user has_pet rex, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
 
 Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.
@@ -1333,7 +1333,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 falls back to simple formatting.
 
                 Example outputs:
-                - "Marla is your spouse (Class A, confidence 1.0)"
+                - "Jordan is your spouse (Class A, confidence 1.0)"
                 - "You are the parent of alice (Class B, awaiting confirmation)"
                 - "You are 12 years old (Class A)"
                 """

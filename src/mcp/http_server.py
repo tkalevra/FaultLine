@@ -17,14 +17,16 @@ Auth:
 - Claude Desktop: add "Authorization": "Bearer <key>" to headers in config
 """
 
+import hmac
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
@@ -34,7 +36,7 @@ import src.mcp.server as _mcp
 # ── OpenWebUI OpenAPI tool request/response models ────────────────────────────
 
 class RecallRequest(BaseModel):
-    query: str = Field(..., description="A short topic from the user's message to look up. Required — never leave empty.")
+    query: str = Field(..., description="The user's current message copied VERBATIM and in full — do NOT summarize, shorten, or reduce it to a keyword or topic. Keep every word, especially 'not', 'no', 'now', 'actually', 'instead' and any names/values. The backend extracts the search topic AND decides intent (recall vs correction) from the whole sentence itself; a reduced query strips the meaning. Required — never leave empty.")
     user_id: str = ""
 
 
@@ -48,12 +50,27 @@ class RetractRequest(BaseModel):
     user_id: str = ""
 
 
+class ForgetRequest(BaseModel):
+    subject: str = Field(..., description="WHOSE fact to forget — the named subject of the single fact the user explicitly asked you to forget (e.g. their own name via 'me'/'I', or a specific named person/thing). Required — a forget MUST name exactly one target; never a broad/everything wipe.")
+    rel_type: Optional[str] = Field(None, description="OPTIONAL: the relationship of the specific fact to forget (e.g. occupation, has_pet, has_email). Narrows the forget to one fact about the subject. Omit only when the subject identifies a single fact unambiguously.")
+    old_value: Optional[str] = Field(None, description="OPTIONAL: the specific value/object of the fact to forget (e.g. the email address, the pet's name). Pins the forget to exactly one fact.")
+    user_id: str = ""
+
+
 class LearnRequest(BaseModel):
     text: str
     user_id: str = ""
 
 # If set, all POST /mcp requests must present: Authorization: Bearer <MCP_API_KEY>
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip()
+
+# Comma-separated browser-origin allowlist for CORS. Default empty → no cross-origin
+# browser access. The OpenWebUI → :8002 tool call is server-to-server and is NOT
+# browser CORS-gated, so an empty allowlist does not break the live path. Operators
+# set MCP_ALLOWED_ORIGINS=https://<openwebui-host> only if browser-origin access is needed.
+MCP_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -72,9 +89,13 @@ async def lifespan(app: FastAPI):
     _mcp._http_client = httpx.AsyncClient(timeout=30.0)
     _log(f"HTTP transport started. FaultLine API: {_mcp.FAULTLINE_API_URL}")
     if MCP_API_KEY:
-        _log(f"Auth ENABLED — MCP_API_KEY set ({len(MCP_API_KEY)} chars, first8={MCP_API_KEY[:8]}…)")
+        _log(f"Auth ENABLED — MCP_API_KEY set ({len(MCP_API_KEY)} chars)")
     else:
-        _log("Auth DISABLED — MCP_API_KEY not set (unauthenticated mode)")
+        _log(
+            "WARNING: Auth DISABLED — MCP_API_KEY not set; running OPEN. "
+            "This is an unauthenticated write path into every tenant's knowledge "
+            "graph — dev/localhost ONLY, never a deployment posture."
+        )
     try:
         yield
     finally:
@@ -89,7 +110,7 @@ app = FastAPI(title="FaultLine MCP", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=MCP_ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
     expose_headers=["Mcp-Session-Id"],
@@ -120,20 +141,76 @@ async def health() -> JSONResponse:
 # and calls them directly. Auth enforced via the shared MCP_API_KEY check.
 
 
-def _check_auth(request: Request) -> bool:
+# Declared security scheme → FastAPI auto-emits it into /openapi.json
+# (components.securitySchemes.HTTPBearer + per-operation security). auto_error=False
+# lets unauthenticated requests reach require_auth so we keep our own fail-loud
+# logging and 401 (with WWW-Authenticate) instead of FastAPI's generic 403.
+_bearer = HTTPBearer(auto_error=False, description="MCP_API_KEY bearer token")
+
+
+def _resolve_principal(credentials: str | None) -> str | None:
+    """Map a presented bearer credential to a principal.
+
+    Today: single shared key → returns 'shared' on match, None on miss.
+    Forward-compat (DEV/SECURITY-multiuser-tenant-isolation.md remediation #1):
+    swap this body for a token→user_id lookup and return the user_id, without
+    touching require_auth's call sites.
+    """
     if not MCP_API_KEY:
-        return True
-    auth = request.headers.get("Authorization", "")
-    ok = auth.startswith("Bearer ") and auth[7:] == MCP_API_KEY
-    if not ok:
+        return "anonymous"  # unauthenticated mode (dev/localhost only)
+    if credentials is None:
+        return None
+    if hmac.compare_digest(credentials, MCP_API_KEY):
+        return "shared"
+    return None
+
+
+def require_auth(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> str:
+    """FastAPI dependency enforcing the bearer scheme; returns the principal.
+
+    Returns a principal id (threaded so the tenant-isolation follow-up can bind
+    principal→user_id here). Raises 401 on failure. Logs only length + reason —
+    never any prefix of the secret.
+    """
+    if not MCP_API_KEY:
+        return "anonymous"
+    presented = creds.credentials if creds is not None else None
+    principal = _resolve_principal(presented)
+    if principal is None:
         client = request.client.host if request.client else "unknown"
-        if not auth:
-            _log(f"REST 401 from {client} — no Authorization header sent")
-        elif not auth.startswith("Bearer "):
-            _log(f"REST 401 from {client} — bad prefix (got {auth[:20]!r}…)")
+        if creds is None:
+            _log(f"REST 401 from {client} — no/blank bearer credential")
+        elif creds.scheme.lower() != "bearer":
+            _log(f"REST 401 from {client} — non-bearer scheme {creds.scheme!r}")
         else:
-            _log(f"REST 401 from {client} — key mismatch (got {len(auth[7:])} chars)")
-    return ok
+            _log(f"REST 401 from {client} — key mismatch ({len(presented)} chars)")
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return principal
+
+
+def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | None) -> str:
+    """Resolve the tenant for a REST shorthand call via the SAME identity seam as /mcp.
+
+    Reads X-OpenWebUI-User-Id (which OpenWebUI stamps on the REST path too — previously
+    dropped here, DEV/SECURITY-multiuser-tenant-isolation.md Finding 1), falling back to
+    body.user_id, then runs it through bind_tenant() (spoof-guard + UUID validation +
+    FAULTLINE_USER_ID single-user fallback). Translates a spoof/malformed rejection into
+    the matching HTTP status — fail loud, never silently route to a wrong/shared tenant.
+    """
+    claimed = request.headers.get("X-OpenWebUI-User-Id", "") or body_user_id
+    try:
+        return _mcp.bind_tenant(principal, claimed)
+    except _mcp.TenantSpoofError as exc:
+        client = request.client.host if request.client else "unknown"
+        _log(f"REST {exc.status_code} from {client} — {exc.message}")
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
 @app.post(
@@ -144,13 +221,15 @@ def _check_auth(request: Request) -> bool:
         "asks about or references something you may know about them, their people, or "
         "their world. This only READS memory — it never saves. To SAVE a new fact the "
         "user states, use remember_facts instead. Treat the results as your own "
-        "knowledge, spoken naturally — never as retrieved data."
+        "knowledge, spoken naturally — never as retrieved data. "
+        "Pass the user's message VERBATIM and in full as `query` — never reduce it to a "
+        "keyword or topic; the backend extracts the topic and detects corrections itself."
     ),
 )
-async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONResponse:
-    if not _check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    user_id = _mcp.FAULTLINE_USER_ID or body.user_id
+async def rest_recall_memory(
+    request: Request, body: RecallRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST recall_memory user_id={user_id[:8]}...")
     result = await _mcp.recall_memory_tool(query=body.query, user_id=user_id)
     return JSONResponse(result)
@@ -167,10 +246,10 @@ async def rest_recall_memory(body: RecallRequest, request: Request) -> JSONRespo
         "or chitchat. Do not ask permission first."
     ),
 )
-async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONResponse:
-    if not _check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    user_id = _mcp.FAULTLINE_USER_ID or body.user_id
+async def rest_remember_facts(
+    request: Request, body: RememberRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST remember_facts user_id={user_id[:8]}...")
     result = await _mcp.remember_facts_tool(text=body.text, user_id=user_id)
     return JSONResponse(result)
@@ -187,10 +266,10 @@ async def rest_remember_facts(body: RememberRequest, request: Request) -> JSONRe
         "Facts are staged as Class B (llm_learn provenance) and confirmed over time."
     ),
 )
-async def rest_learn_facts(body: LearnRequest, request: Request) -> JSONResponse:
-    if not _check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    user_id = _mcp.FAULTLINE_USER_ID or body.user_id
+async def rest_learn_facts(
+    request: Request, body: LearnRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST learn_facts user_id={user_id[:8]}...")
     result = await _mcp.learn_facts_tool(text=body.text, user_id=user_id)
     return JSONResponse(result)
@@ -206,33 +285,49 @@ async def rest_learn_facts(body: LearnRequest, request: Request) -> JSONResponse
         "remember_facts instead, NOT this."
     ),
 )
-async def rest_retract_fact(body: RetractRequest, request: Request) -> JSONResponse:
-    if not _check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    user_id = _mcp.FAULTLINE_USER_ID or body.user_id
+async def rest_retract_fact(
+    request: Request, body: RetractRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST retract_fact user_id={user_id[:8]}...")
     result = await _mcp.retract_fact_tool(text=body.text, user_id=user_id)
     return JSONResponse(result)
 
 
-@app.post("/mcp")
-async def mcp_endpoint(request: Request) -> JSONResponse:
-    """Stateless MCP JSON-RPC dispatcher."""
-    # Bearer token auth — enforced when MCP_API_KEY is set.
-    if MCP_API_KEY:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer ") or auth_header[7:] != MCP_API_KEY:
-            client = request.client.host if request.client else "unknown"
-            if not auth_header:
-                reason = "no Authorization header sent"
-            elif not auth_header.startswith("Bearer "):
-                reason = f"bad prefix (got {auth_header[:20]!r}…)"
-            else:
-                got = auth_header[7:]
-                reason = f"key mismatch (got {len(got)} chars, first8={got[:8]}…, expect first8={MCP_API_KEY[:8]}…)"
-            _log(f"SECURITY: 401 from {client} — {reason}")
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+@app.post(
+    "/forget_fact",
+    summary="Permanently forget ONE specific named fact from FaultLine",
+    description=(
+        "Use ONLY when the user EXPLICITLY and deliberately asks you to forget or delete "
+        "ONE specific fact about a NAMED target — e.g. 'forget my email address', "
+        "'delete that I have a dog named Rex', 'forget that Jordan is my spouse'. This "
+        "tombstones exactly the one fact you name (it is recoverable, not a hard wipe). "
+        "You MUST name the target: pass `subject` (whose fact — 'me' for the user, or the "
+        "named person/thing) and, to pin it, `rel_type` and/or `old_value`. "
+        "NEVER call this for a broad or bulk request ('forget everything', 'delete all my "
+        "data', 'wipe my memory') — there is no bulk forget; refuse and ask which single "
+        "fact. For a CORRECTION (the user giving a NEW value) use remember_facts instead."
+    ),
+)
+async def rest_forget_fact(
+    request: Request, body: ForgetRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    _log(f"REST forget_fact user_id={user_id[:8]}... subject={body.subject!r} rel_type={body.rel_type!r}")
+    result = await _mcp.forget_fact_tool(
+        user_id=user_id,
+        subject=body.subject,
+        rel_type=body.rel_type,
+        old_value=body.old_value,
+    )
+    return JSONResponse(result)
 
+
+@app.post("/mcp")
+async def mcp_endpoint(
+    request: Request, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    """Stateless MCP JSON-RPC dispatcher. Bearer auth via require_auth dependency."""
     # Parse JSON body — return parse error on malformed input.
     try:
         body = await request.json()
@@ -273,12 +368,22 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
     elif method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {}) or {}
-        # OpenWebUI forwards the authenticated user's UUID via X-OpenWebUI-User-Id.
-        # Inject it into arguments so _call_tool can resolve per-user schema.
-        owui_user_id = request.headers.get("X-OpenWebUI-User-Id", "")
-        if owui_user_id and not arguments.get("user_id"):
-            arguments = {**arguments, "user_id": owui_user_id}
-        _log(f"tools/call name={tool_name!r} user_id={str(arguments.get('user_id', '?'))[:8]}...")
+        # Resolve tenant identity ONCE via the shared bind_tenant() seam (brain not
+        # transport). OpenWebUI forwards the authenticated user's UUID via
+        # X-OpenWebUI-User-Id; an explicit arguments.user_id takes precedence over it.
+        # bind_tenant validates the claimed id (well-formed UUID, spoof-guard against
+        # _principal) and applies FAULTLINE_USER_ID only as a single-user fallback.
+        claimed = request.headers.get("X-OpenWebUI-User-Id", "") or arguments.get("user_id", "")
+        try:
+            resolved_user_id = _mcp.bind_tenant(_principal, claimed)
+        except _mcp.TenantSpoofError as exc:
+            _log(f"tools/call name={tool_name!r} REJECT: {exc.message}")
+            return JSONResponse(
+                _jsonrpc_error(req_id, -32602, exc.message),
+                status_code=exc.status_code,
+            )
+        arguments = {**arguments, "user_id": resolved_user_id}
+        _log(f"tools/call name={tool_name!r} user_id={resolved_user_id[:8]}...")
         result = await _mcp._call_tool(tool_name, arguments)
         return JSONResponse(_jsonrpc_result(req_id, result))
 

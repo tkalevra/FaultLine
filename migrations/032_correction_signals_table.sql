@@ -24,13 +24,13 @@ INSERT INTO correction_signals
 (pattern, pattern_type, priority, confidence, category, example_usage, notes)
 VALUES
   -- Negation patterns: "X is Y not Z"
-  ('is .+ not', 'negation', 1, 0.9, 'family', 'Desmonde is 14 not 12', 'Covers age, height, weight corrections'),
+  ('is .+ not', 'negation', 1, 0.9, 'family', 'Sampson is 14 not 12', 'Covers age, height, weight corrections'),
   ('are .+ not', 'negation', 1, 0.9, 'family', 'They are X not Y', 'Plural form of negation'),
 
   -- Reclarification patterns: "Actually/Wait/Sorry + fact"
   ('actually', 'reclarification', 1, 0.85, NULL, 'Actually, I work for Acme', 'Explicit reclarification marker'),
-  ('wait,', 'reclarification', 2, 0.75, NULL, 'Wait, my name is Christopher', 'User catches own error mid-conversation'),
-  ('wait ', 'reclarification', 2, 0.75, NULL, 'Wait my name is Christopher', 'Wait without comma'),
+  ('wait,', 'reclarification', 2, 0.75, NULL, 'Wait, my name is Alexander', 'User catches own error mid-conversation'),
+  ('wait ', 'reclarification', 2, 0.75, NULL, 'Wait my name is Alexander', 'Wait without comma'),
   ('sorry,', 'reclarification', 2, 0.75, NULL, 'Sorry, we don''t have pets', 'User apologizes while correcting'),
   ('sorry ', 'reclarification', 2, 0.75, NULL, 'Sorry we don''t have pets', 'Sorry without comma'),
   ('i meant', 'reclarification', 1, 0.8, NULL, 'I meant to say Cyrus', 'Explicit intention marker'),

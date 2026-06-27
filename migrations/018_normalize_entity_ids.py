@@ -3,7 +3,7 @@
 Migration: Normalize string entity_ids to UUID v5 surrogates.
 
 This migration handles the case where facts were stored with string entity_ids
-(e.g., "marla", "fraggle") instead of proper UUID v5 surrogates. The migration:
+(e.g., "jordan", "rex") instead of proper UUID v5 surrogates. The migration:
 
 1. Identifies all string entity_ids (non-UUID format) in facts/staged_facts
 2. Generates proper surrogates using EntityRegistry._make_surrogate()

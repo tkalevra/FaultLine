@@ -38,6 +38,27 @@ _BACKEND_RESPONSE_FORMAT: dict[str, str] = {
 }
 
 
+# ── Per-user intent confidence gate bounds (single source of truth) ───────────
+# CANONICAL DEFINITION. The re_embedder writer (src/re_embedder/embedder.py) and
+# the /classify-intent + /confidence-gate readers (src/api/main.py) ALL import
+# these — do not redefine the literals anywhere else.
+#
+# The gate is the GLiNER2 intent-confidence threshold above which /classify-intent
+# trusts GLiNER2 directly (skipping pattern-match escalation). The re_embedder
+# self-tunes it from correction feedback and may bias it DOWNWARD toward GATE_MIN
+# where GLiNER2 is proven reliable (cheaper, less escalation, trust GLiNER2 more).
+# That downward bias is a deliberate PRODUCT DECISION — a human may revisit the
+# direction, but code must not flip it.
+GATE_MIN = 0.50
+GATE_MAX = 0.75
+GATE_DEFAULT = 0.70
+
+
+def clamp_gate(value: float) -> float:
+    """Clamp an intent confidence gate to [GATE_MIN, GATE_MAX]."""
+    return max(GATE_MIN, min(GATE_MAX, value))
+
+
 def get_backend_type() -> str:
     """Return normalised LLM_BACKEND_TYPE, defaulting to 'openwebui'."""
     return os.environ.get("LLM_BACKEND_TYPE", "openwebui").lower().strip()
@@ -150,7 +171,9 @@ def build_llm_payload(
     # ── Reasoning/thinking suppression ───────────────────────────────────────
     # FaultLine uses LLMs exclusively for structured JSON extraction — thinking
     # mode wastes tokens, adds latency, and breaks JSON parsing.  Disable it
-    # across ALL backends unconditionally.
+    # across ALL backends unconditionally (openwebui included — qwen3.5-9b served
+    # behind OpenWebUI otherwise spends the completion budget reasoning, which
+    # truncates extraction output mid-array).
     #
     # Qwen3.5 ≤9B should default to thinking-off, but serving frameworks
     # (LM Studio, llama.cpp) have known bugs where the default is ignored.
@@ -158,7 +181,11 @@ def build_llm_payload(
     #
     # chat_template_kwargs is the Qwen3.5 / vLLM / OpenAI-compat mechanism.
     # Unknown fields are silently ignored by backends that don't support them.
-    if backend not in ("anthropic", "openwebui"):
+    #
+    # anthropic is the ONLY exclusion: its API has no chat_template_kwargs and
+    # handles thinking via the dedicated `thinking` field, normalized in the
+    # anthropic-specific block below (disabled == field absent).
+    if backend != "anthropic":
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     # Anthropic-specific request shape adjustments
@@ -364,7 +391,7 @@ def get_llm_config() -> dict:
 
     Returns:
         dict with keys: chat_endpoint, embedding_endpoint, health_check_url,
-        model, category_model, auth_type, api_key_set, endpoint_source,
+        model, pattern_extraction_model, auth_type, api_key_set, endpoint_source,
         backend_type (forward-compat field, always "legacy" until Phase 2).
     """
     chat_url = get_llm_chat_url()
@@ -387,8 +414,14 @@ def get_llm_config() -> dict:
         "chat_endpoint": chat_url,
         "embedding_endpoint": embed_url or "(none — fastembed fallback)",
         "health_check_url": health_url,
-        "model": os.environ.get("WGM_LLM_MODEL", "qwen/qwen3.5-9b"),
-        "category_model": os.environ.get("CATEGORY_LLM_MODEL", "qwen2.5-coder"),
+        # Model identity is pure config — report the raw env value, never a
+        # guessed literal. "(unset)" surfaces a misconfiguration loudly in /health.
+        "model": os.environ.get("WGM_LLM_MODEL") or "(unset)",
+        "pattern_extraction_model": (
+            os.environ.get("PATTERN_EXTRACTION_MODEL")
+            or os.environ.get("WGM_LLM_MODEL")
+            or "(unset)"
+        ),
         "auth_type": "bearer" if api_key else "none",
         "api_key_set": bool(api_key),
         "endpoint_source": source,
