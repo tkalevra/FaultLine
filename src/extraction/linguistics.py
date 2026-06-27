@@ -104,7 +104,7 @@ TEMPORAL_DATE_LAYER: bool = os.environ.get(
 #     possession shape lives at the caller, mirroring _detect_named_instance_states).
 #   • Part 2 (this module): the copula-appositive / genitive ROLE↔NAME collapse chains
 #     (``_chain_copula_name``; the role-alias leg of ``_chain_genitive_name``) — so "My sister is
-#     Sarah" / "My mother's name is Robin" bind the kin rel to the NAMED person and register the ROLE
+#     Taylor" / "My mother's name is Robin" bind the kin rel to the NAMED person and register the ROLE
 #     (sister/mother) as an alias/role-slot of that person, never a parallel role entity.
 # DEFAULT OFF so the commit is dormant and the temporal first-10 path is byte-for-byte unchanged
 # until validated ON. Fail-safe: flag OFF or any failure → today's behavior exactly.
@@ -668,6 +668,92 @@ def list_conjuncts(text: str, head_phrase: str) -> list:
         return []
 
 
+def analyze_naming_all(text: str) -> list:
+    r"""Deterministic reading of EVERY naming/dubbing construction in ``text``. Returns a list of
+    ``NamingAnalysis`` (possibly empty) — the multi-construction sibling of ``analyze_naming``.
+
+    A comma-and enumeration ("I have a dog named Rex, a snake named Noodle, and a cat named
+    Biscuit") contains ONE naming verb ("named"/"called") per conjunct, each modifying its OWN head
+    noun. The single-result ``analyze_naming`` returned only the FIRST, dropping Noodle/Biscuit. This
+    walks the SAME per-verb grammar (identical recovery rules), collecting one (head-noun, proper-
+    name) pair for every naming verb that yields a valid pair. Subject-agnostic — the KIND is whatever
+    common noun the verb modifies; this function makes NO entity-typing or rel-type decision.
+
+    Deterministic, fail-safe: parse miss / any failure → ``[]``. Order is source order (first verb
+    first), so ``analyze_naming`` == ``analyze_naming_all()[0]`` when any construction is present."""
+    doc = _parse(text)
+    if doc is None:
+        return []
+    out: list = []
+    try:
+        _naming = _naming_verbs()  # per-tenant grown set (overlay) ∪ code-fallback; resolved once
+        _seen_pairs: set = set()
+        for tok in doc:
+            res = _analyze_naming_at(tok, _naming)
+            if res is None:
+                continue
+            _pair = (res.named, res.proper_name.lower())
+            if _pair in _seen_pairs:
+                continue
+            _seen_pairs.add(_pair)
+            out.append(res)
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        log.warning("linguistics.analyze_naming_all_failed", error=str(e)[:160])
+        return []
+    return out
+
+
+def _analyze_naming_at(tok, _naming):
+    r"""Recover a single naming construction headed by the naming verb ``tok`` (or ``None``).
+
+    This is the per-verb body lifted verbatim out of ``analyze_naming`` so BOTH the single-result
+    (``analyze_naming``) and the multi-result (``analyze_naming_all``) callers share ONE grammar —
+    no behavioral drift. ``_naming`` is the resolved per-tenant naming-verb set. Subject-agnostic;
+    makes no typing/rel decision; returns a (head-noun, proper-name) ``NamingAnalysis`` or ``None``."""
+    if (tok.lemma_ or "").strip().lower() not in _naming:
+        return None
+    if tok.pos_ not in ("VERB", "AUX"):
+        return None
+
+    # ── Recover the HEAD NOUN being named ──────────────────────────────────────────
+    # Reduced relative ("a dog named Rex"): the verb is an ``acl``/``relcl`` whose
+    # HEAD is the noun. Passive copular ("my dog is named Rex"): the verb is ROOT
+    # with an ``nsubjpass`` noun. Subject-agnostic: ANY noun head qualifies.
+    head_noun = None
+    if tok.dep_ in ("acl", "relcl", "vfin") and tok.head.pos_ in ("NOUN", "PROPN"):
+        head_noun = tok.head
+    if head_noun is None:
+        for c in tok.children:
+            if c.dep_ in ("nsubjpass", "nsubj") and c.pos_ in ("NOUN", "PROPN"):
+                head_noun = c
+                break
+    if head_noun is None:
+        return None
+
+    # ── Recover the PROPER NAME assigned ──────────────────────────────────────────
+    # The name is the verb's nominal complement (``oprd``/``attr``/``dobj``) that is a
+    # proper noun. ``oprd`` (object predicate) is spaCy's tag for the naming complement;
+    # ``attr`` covers the passive ("is named X"); ``dobj`` is a fallback. PROPN only so
+    # we never bind a common-noun complement as a name.
+    proper = None
+    for c in tok.children:
+        if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN":
+            proper = c
+            break
+    if proper is None:
+        return None
+
+    # A naming construction whose "head noun" is itself the proper name (e.g. parse
+    # quirks) is not a useful (thing, name) pair — require them distinct.
+    named = _np_phrase(head_noun)
+    proper_name = (proper.text or "").strip()
+    if not named or not proper_name or named == proper_name.lower():
+        return None
+
+    negated = any(c.dep_ == "neg" for c in tok.children)
+    return NamingAnalysis(named=named, proper_name=proper_name, negated=negated)
+
+
 def analyze_naming(text: str):
     r"""Deterministic first-cut for a naming/dubbing construction. Returns ``NamingAnalysis`` | None.
 
@@ -696,48 +782,9 @@ def analyze_naming(text: str):
     try:
         _naming = _naming_verbs()  # per-tenant grown set (overlay) ∪ code-fallback; resolved once
         for tok in doc:
-            if (tok.lemma_ or "").strip().lower() not in _naming:
-                continue
-            if tok.pos_ not in ("VERB", "AUX"):
-                continue
-
-            # ── Recover the HEAD NOUN being named ──────────────────────────────────────────
-            # Reduced relative ("a dog named Rex"): the verb is an ``acl``/``relcl`` whose
-            # HEAD is the noun. Passive copular ("my dog is named Rex"): the verb is ROOT
-            # with an ``nsubjpass`` noun. Subject-agnostic: ANY noun head qualifies.
-            head_noun = None
-            if tok.dep_ in ("acl", "relcl", "vfin") and tok.head.pos_ in ("NOUN", "PROPN"):
-                head_noun = tok.head
-            if head_noun is None:
-                for c in tok.children:
-                    if c.dep_ in ("nsubjpass", "nsubj") and c.pos_ in ("NOUN", "PROPN"):
-                        head_noun = c
-                        break
-            if head_noun is None:
-                continue
-
-            # ── Recover the PROPER NAME assigned ──────────────────────────────────────────
-            # The name is the verb's nominal complement (``oprd``/``attr``/``dobj``) that is a
-            # proper noun. ``oprd`` (object predicate) is spaCy's tag for the naming complement;
-            # ``attr`` covers the passive ("is named X"); ``dobj`` is a fallback. PROPN only so
-            # we never bind a common-noun complement as a name.
-            proper = None
-            for c in tok.children:
-                if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN":
-                    proper = c
-                    break
-            if proper is None:
-                continue
-
-            # A naming construction whose "head noun" is itself the proper name (e.g. parse
-            # quirks) is not a useful (thing, name) pair — require them distinct.
-            named = _np_phrase(head_noun)
-            proper_name = (proper.text or "").strip()
-            if not named or not proper_name or named == proper_name.lower():
-                continue
-
-            negated = any(c.dep_ == "neg" for c in tok.children)
-            return NamingAnalysis(named=named, proper_name=proper_name, negated=negated)
+            res = _analyze_naming_at(tok, _naming)
+            if res is not None:
+                return res  # FIRST construction — byte-identical to the pre-refactor behavior
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.analyze_naming_failed", error=str(e)[:160])
         return None
@@ -1222,7 +1269,7 @@ def _aspectual_activity_xcomp(verb_tok):
         activity-on-a-thing, so it is rejected here (and the matrix would in any case carry an
         infinitival ``to`` → ``_verb_has_clausal_complement``); AND
       • the matrix lemma is NOT a CATENATIVE / MENTAL-STATE verb (``predicate_span._CATENATIVE`` /
-        ``_MENTAL_STATE``) — intent/opinion/cognition verbs ("I considered hiring Sarah", "I like
+        ``_MENTAL_STATE``) — intent/opinion/cognition verbs ("I considered hiring Taylor", "I like
         working with Rachel") take an ``-ing`` complement too but predicate an UNREALIZED desire /
         habitual preference, NOT a stated occurrence; reusing those existing closed sets is the
         belt-and-suspenders INTENT firewall ("user is truth": an intention is not a thing the user did).
@@ -1822,7 +1869,7 @@ class EventAnalysis:
     #                    candidate (the structural twin of ``feels``) alongside the participated_in
     #                    candidate, and Stage-2 arbitration picks the strong state reading over the
     #                    cratered participation. The discriminator is the cue class ∧ the with-PP — a
-    #                    non-problem head ("had a meeting WITH Sarah") leaves this False (untouched).
+    #                    non-problem head ("had a meeting WITH Taylor") leaves this False (untouched).
     problem_head: bool = False
 
 
@@ -2455,7 +2502,7 @@ def _build_event_analysis(event_noun, tok, text: str):
         # This is the "I had an issue WITH my car's GPS system" shape: the meaning lives in the affected
         # entity, not the empty head. Flag it so the caller emits a competing ``(<concerns>, has_state,
         # <problem-state>)`` candidate (the structural twin of ``feels``). THE DISCRIMINATOR is the cue
-        # class ∧ the with-PP — both must hold, so "had a meeting WITH Sarah" (meeting ∉ problem_noun)
+        # class ∧ the with-PP — both must hold, so "had a meeting WITH Taylor" (meeting ∉ problem_noun)
         # and "had an issue" with NO affected entity both leave problem_head False (untouched). The cue
         # class is DB-grown (NO noun literal in this logic); fail-safe: any resolve miss → code-fallback
         # set, never an empty gate. Read against the bare HEAD LEMMA, not the modified phrase.
@@ -3661,7 +3708,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue   # (a) possessor leg of "my mother's name is Robin"
             if _is_name_copula_nsubj(head):
                 continue   # (b) naming leg — head IS "name"; never (name, related_to, role)
-            # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Sarah" is owned by the
+            # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Taylor" is owned by the
             # COPULA-NAME chain (it binds the kin rel to the named person + registers the role as an
             # alias). The possessive chain must stay OUT of it, else it would mint (sister, sibling_of,
             # user) — the very parallel role entity Part 2 collapses. Detected grammatically: the
@@ -3673,7 +3720,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if any(_c.dep_ in ("attr", "oprd", "dobj", "obj") and _c.pos_ == "PROPN"
                        and not any(_g.dep_ == "det" for _g in _c.children)
                        for _c in head.head.children):
-                    continue   # the copula-name chain owns "my sister is Sarah"
+                    continue   # the copula-name chain owns "my sister is Taylor"
             head_phrase = _np_phrase(head)
             if not head_phrase or len(head_phrase) < 2:
                 continue
@@ -3816,18 +3863,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                   tentative=False, negated=_neg)
 
     def _chain_copula_name(doc):
-        # COPULA-APPOSITIVE ROLE↔NAME (Fix B, Part 2). "My sister is Sarah" / "My colleague is Bob" /
+        # COPULA-APPOSITIVE ROLE↔NAME (Fix B, Part 2). "My sister is Taylor" / "My colleague is Bob" /
         # "My server is Atlas" — a copular clause whose nsubj is a 1st-person-POSSESSED ROLE noun and
         # whose attr complement is a PROPER NAME. spaCy parses it as:
         #     My      poss   -> sister     (Person=1, Poss=Yes)
         #     sister  nsubj  -> is         (the ROLE noun)
         #     is      ROOT (AUX, lemma be)
-        #     Sarah   attr   -> is         (the PROPER NAME)
-        # THE HARD LINE: the NAMED person (Sarah) is the entity; the ROLE (sister) is a slot/alias on
+        #     Taylor   attr   -> is         (the PROPER NAME)
+        # THE HARD LINE: the NAMED person (Taylor) is the entity; the ROLE (sister) is a slot/alias on
         # it — NEVER a parallel "sister" entity. We bind the kin/role relation to the NAMED person and
         # register the role surface as an ``also_known_as`` alias of that person, so a later atom
-        # ("My sister is 28") resolves sister→sarah and the scalar lands on the named person.
-        #   • KINSHIP role  → (name, <kin>, user)        e.g. (sarah, sibling_of, user)
+        # ("My sister is 28") resolves sister→taylor and the scalar lands on the named person.
+        #   • KINSHIP role  → (name, <kin>, user)        e.g. (taylor, sibling_of, user)
         #   • NON-kin role  → (name, has_role, role)     e.g. (bob, has_role, colleague) — a generic
         #                      role-slot the walk resolves; still binds the name as the entity.
         # PLUS the role-alias leg: (name, also_known_as, role) so the role resolves to the person.
@@ -3883,7 +3930,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             role_lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not proper_name or not role_lemma or proper_name == role_lemma:
                 continue
-            # NEGATION ("my sister is not Sarah") → absence; skip (parity with the other chains).
+            # NEGATION ("my sister is not Taylor") → absence; skip (parity with the other chains).
             if any(c.dep_ == "neg" for c in head.children):
                 continue
             # BIND the kin/role relation to the NAMED person. Kinship role → its specific kin rel
@@ -3895,7 +3942,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             else:
                 _emit(proper_name, "has_role", role_lemma, obj_tok=None, subj_tok=proper)
             # ROLE-ALIAS leg: register the ROLE surface as an alias of the NAMED person so a later
-            # atom ("My sister is 28") resolves sister→sarah and the scalar lands on the named person.
+            # atom ("My sister is 28") resolves sister→taylor and the scalar lands on the named person.
             # THE HARD LINE: the role is a slot/alias ON the named instance, not a second entity.
             _emit(proper_name, "also_known_as", role_lemma, obj_tok=None, subj_tok=proper)
             # COLLAPSE the role noun: claim it so the residue guard never flags it as a dropped entity.
@@ -4029,14 +4076,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         return None
 
     def _chain_copula_measure(doc):
-        # COPULA MEASUREMENT / SCALAR (Fix 3). "she is 62 years old", "Sarah is 28", "he is 6 feet
+        # COPULA MEASUREMENT / SCALAR (Fix 3). "she is 62 years old", "Taylor is 28", "he is 6 feet
         # tall" → a SCALAR edge (subject, <scalar_rel>, value). The rel_type is metadata-driven via the
         # unit→rel_type map (unit_scalar cue class: year→age, foot→height, …); a BARE NUM with no unit
-        # ("Sarah is 28") resolves to ``age`` (the default bare-number person scalar). The value is the
+        # ("Taylor is 28") resolves to ``age`` (the default bare-number person scalar). The value is the
         # NUM surface as a STRING → routes to entity_attributes downstream (these rels carry
         # tail_types={SCALAR}). Subject-agnostic: any "X is N <unit>"; NO age token list, NO number
         # zoo — the NUM is detected grammatically (pos NUM / nummod) and the unit via the cue map.
-        # Subject via the existing intra-turn coref ("she"→nearest named person; "Sarah"→the PROPN).
+        # Subject via the existing intra-turn coref ("she"→nearest named person; "Taylor"→the PROPN).
         _units = _unit_scalar_map()
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
@@ -4100,7 +4147,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 num_tok = _num
                 break
             # (b) BARE NUM person-scalar: a NUM directly as the copula complement (attr/acomp/attr-num)
-            #     with no unit → age. "Sarah is 28".
+            #     with no unit → age. "Taylor is 28".
             if rel is None:
                 for c in head.children:
                     if c.pos_ == "NUM" and c.dep_ in ("attr", "acomp", "dobj", "obj"):
@@ -4119,7 +4166,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # GLiNER2 type is not admitted by the scalar rel's head_types: emit NOTHING here and do NOT
             # claim the subject, leaving ``_chain_copula_state`` to capture the entity relationally
             # (it survives the gate, head_types={ANY}). The Person cases the family fix added (she/he/
-            # Sarah — untyped pronoun or Person PROPN) are ADMITTED → unchanged. Metadata-driven
+            # Taylor — untyped pronoun or Person PROPN) are ADMITTED → unchanged. Metadata-driven
             # (overlay head_types), grammatical (GLiNER2 ent_type), subject-agnostic, NO word list.
             try:
                 _subj_et = (tok.ent_type_ or "").strip()

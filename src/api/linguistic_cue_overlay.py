@@ -151,7 +151,7 @@ _BOOTSTRAP_ACQUISITION_VERBS: frozenset[str] = frozenset({
 # problem/fault state from a neutral occurrence. So a small bounded NOUN class is unavoidable here,
 # EXACTLY as for the naming / LVC / inchoative / aspectual / acquisition classes. It is firewalled
 # downstream by the parse the SAME way: the state reading fires ONLY when the head is in THIS class AND
-# a with-PP supplies the affected entity — a non-problem "have + with-PP" ("had a meeting with Sarah",
+# a with-PP supplies the affected entity — a non-problem "have + with-PP" ("had a meeting with Taylor",
 # "had lunch with Tom", "had a call with the team") is UNTOUCHED (head ∉ problem_noun). DB-HELD + per-
 # tenant + GROWABLE on the SAME rail (category='problem_noun'); this in-code set is the DB-DOWN code-
 # fallback seed only, NOT the authority. Mirrors migration 116's public seed.
@@ -244,7 +244,7 @@ _BOOTSTRAP_KINSHIP_REL_MAP: dict[str, str] = {
 # A MAP (measurement-unit head lemma → the SCALAR rel_type it measures) for the copula measurement
 # chain: "she is 62 years old" → unit "year" → age; "he is 6 feet tall" → unit "foot" → height; "it
 # weighs 80 kilograms" → unit "kilogram" → weight. These rel_types carry tail_types={SCALAR} so the
-# value routes to entity_attributes. The bare-age fallback ("Sarah is 28" — a NUM attr with no unit)
+# value routes to entity_attributes. The bare-age fallback ("Taylor is 28" — a NUM attr with no unit)
 # resolves to `age` via the deriver's grammatical age-shape, NOT this map. A unit OUTSIDE this map →
 # no scalar minted (we never guess a measurement). Stored on the SAME (cue, category) rail: `cue` =
 # the unit lemma, `description` = the scalar rel_type. DB-DOWN code-fallback seed only.
