@@ -33,7 +33,7 @@ VALUES
   ('wait ', 'reclarification', 2, 0.75, NULL, 'Wait my name is Alexander', 'Wait without comma'),
   ('sorry,', 'reclarification', 2, 0.75, NULL, 'Sorry, we don''t have pets', 'User apologizes while correcting'),
   ('sorry ', 'reclarification', 2, 0.75, NULL, 'Sorry we don''t have pets', 'Sorry without comma'),
-  ('i meant', 'reclarification', 1, 0.8, NULL, 'I meant to say Cyrus', 'Explicit intention marker'),
+  ('i meant', 'reclarification', 1, 0.8, NULL, 'I meant to say Quinn', 'Explicit intention marker'),
 
   -- Contradiction patterns: "I was wrong about X"
   ('was wrong', 'contradiction', 1, 0.85, NULL, 'I was wrong about that', 'Explicit contradiction'),

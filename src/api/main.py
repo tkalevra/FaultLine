@@ -1858,6 +1858,108 @@ def _reified_event_manifest(reified_edges: list[dict]) -> dict:
             "event_dates": event_dates}
 
 
+def _spine_bound_surfaces(edges, is_edgeinput: bool = False) -> set[str]:
+    r"""The set of entity SURFACES the deterministic spine already bound with a CONTENTFUL relation.
+
+    BRAIN-NOT-TRANSPORT / STRONG-DETERMINISTIC-INGEST: when the spine (the edges already in
+    ``edges_dict`` from ``req.edges`` / the deterministic harvest) has bound an entity surface as a
+    real participant of a contentful fact — ``(alvin, child_of, user)``, ``(sam, friend_of, user)``,
+    ``(robin, age, 10)`` — that surface IS authoritative. A COMPETING parallel/inferred cast that
+    re-files the SAME surface as something else (the reified-event seam casting "a son Alvin 19" as a
+    ``participated_in`` occurrence whose NAME is "alvin") must NOT win. This returns the surfaces the
+    spine owns so the reified-event lane can drop any occurrence that re-claims one of them.
+
+    "Contentful" = any relation EXCEPT the reified event-occurrence relation itself. The occurrence
+    rel is the ONE the competing lane mints; every other rel (kinship, friendship, scalar, typing,
+    ownership, …) is a genuine binding that claims the surface. This is the SAME "a span the spine
+    already bound is authoritative" structural pattern the suppressor uses for bare nouns — keyed on
+    the structural fact that the spine bound the surface, NOT on any entity/domain/construction list.
+
+    Subject-agnostic, deterministic (no LLM/cosine, no entity/rel allowlist — the only rel named is
+    the canonical occurrence rel ``participated_in``, which is exactly the offending parallel cast and
+    is metadata-justified as the occurrence backbone). Fail-safe: any error → empty set (no
+    suppression → today's behavior)."""
+    surfaces: set[str] = set()
+    try:
+        for e in (edges or []):
+            _r = (getattr(e, "rel_type", None) if is_edgeinput else e.get("rel_type"))
+            _r = (_r or "").strip().lower()
+            # The occurrence rel is the parallel cast itself — a surface bound ONLY by it is NOT a
+            # contentful spine binding (it would self-exempt the very cast we want to suppress).
+            if _r == "participated_in":
+                continue
+            _s = (getattr(e, "subject", None) if is_edgeinput else e.get("subject"))
+            _o = (getattr(e, "object", None) if is_edgeinput else e.get("object"))
+            for _surf in (_s, _o):
+                _surf = (_surf or "").strip().lower()
+                # "user" is the universal speaking subject, not a captured entity surface — never let
+                # it gate a real occurrence (e.g. (user, participated_in, <handle>)).
+                if _surf and _surf != "user":
+                    surfaces.add(_surf)
+    except Exception:  # noqa: BLE001 — fail-safe: no surface set → no suppression (legacy behavior)
+        return set()
+    return surfaces
+
+
+def _drop_reified_occurrences_for_bound_surfaces(reified_edges, bound_surfaces: set[str]):
+    r"""Drop the reified-occurrence edges whose NAME/title/object surface the spine already bound
+    with a contentful rel (``_spine_bound_surfaces``). STRONG-DETERMINISTIC-INGEST: the spine is
+    authoritative, so a competing reified cast of the SAME surface is a mis-cast and is removed
+    WHOLE — the ``participated_in`` hinge, the ``instance_of`` filing, and the ``also_known_as``
+    naming for that occurrence — so its title never reaches the manifest and never purges the
+    spine's correct ``child_of``/``friend_of``/scalar edges for that entity.
+
+    The reified-event set groups edges by a per-occurrence ``occurrence: …`` handle. We first find
+    the COLLIDING handles: a handle whose ``also_known_as`` title surface, OR whose ``participated_in``
+    object surface (when the seam emitted the flat ``(user, participated_in, <name>)`` shape), is in
+    ``bound_surfaces``. Then drop every edge belonging to a colliding handle. A legitimate event the
+    spine did NOT bind (e.g. "I attended the Python webinar on May 3" — the spine never bound
+    "webinar"/the webinar occurrence) has NO colliding handle → its occurrence is fully preserved.
+
+    Deterministic, subject-agnostic, no LLM/cosine, no entity/rel allowlist. Fail-safe: any error →
+    the input edges unchanged (never lose the legitimate event capture)."""
+    if not reified_edges or not bound_surfaces:
+        return reified_edges
+    try:
+        # Pass 1 — identify the handles whose occurrence re-claims a spine-bound surface.
+        _colliding_handles: set[str] = set()
+        _flat_collision = False  # a flat (user, participated_in, <bound-name>) with no handle
+        for _e in reified_edges:
+            _rel = (_e.get("rel_type") or "").strip().lower()
+            _subj = (_e.get("subject") or "").strip().lower()
+            _obj = (_e.get("object") or "").strip().lower()
+            if _rel == "also_known_as" and _obj in bound_surfaces and _subj:
+                # (<handle>) also_known_as (<bound-name>): the occurrence is NAMED for a spine entity.
+                _colliding_handles.add(_subj)
+            elif _rel == "participated_in" and _obj in bound_surfaces:
+                # FLAT shape (user, participated_in, <bound-name>) — the object IS the spine entity
+                # surface (no reified handle). Mark it for a direct drop.
+                _flat_collision = True
+        if not _colliding_handles and not _flat_collision:
+            return reified_edges
+        # Pass 2 — drop every edge belonging to a colliding occurrence.
+        _kept = []
+        for _e in reified_edges:
+            _rel = (_e.get("rel_type") or "").strip().lower()
+            _subj = (_e.get("subject") or "").strip().lower()
+            _obj = (_e.get("object") or "").strip().lower()
+            # The handle is the occurrence node: it is the SUBJECT of instance_of/also_known_as and
+            # the OBJECT of the participated_in hinge. Drop the edge if EITHER endpoint is a colliding
+            # handle, or it is the flat (user, participated_in, <bound-name>) cast itself.
+            if _subj in _colliding_handles or _obj in _colliding_handles:
+                log.info("ingest.reified_occurrence_dropped_spine_bound",
+                         reason="spine_bound_surface", rel=_rel, subject=_subj[:48], object=_obj[:48])
+                continue
+            if _rel == "participated_in" and _obj in bound_surfaces:
+                log.info("ingest.reified_occurrence_dropped_spine_bound",
+                         reason="flat_bound_object", rel=_rel, subject=_subj[:48], object=_obj[:48])
+                continue
+            _kept.append(_e)
+        return _kept
+    except Exception:  # noqa: BLE001 — fail-safe: any error → unchanged (never drop legit events)
+        return reified_edges
+
+
 def _suppress_flat_event_duplicates(edges, manifest: dict, is_edgeinput: bool = False):
     r"""Drop the FLAT-lane duplicates of a reified event so the occurrence is the ONE canonical
     capture (keystone A — brain-not-transport: one event, one capture, not three competing).
@@ -14550,9 +14652,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             # type. Fail-safe: flag off / no construction / any error → nothing added (today's spine).
             if SPINE_NAMING_CHAIN:
                 try:
-                    from src.extraction.linguistics import (
-                        analyze_named_instance as _ani, analyze_naming_all as _an_all,
-                    )
+                    from src.extraction.linguistics import analyze_named_instance as _ani
                     _ni = _ani(_sent)
                     if _ni is not None and not _ni.negated:
                         _kind = (_ni.kind or "").strip().lower()
@@ -14588,48 +14688,20 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                                 _ni_seam_edges.append(
                                     {"subject": "user", "rel_type": _poss_rel,
                                      "object": _name_key, "fact_provenance": "user_stated"})
-                    else:
-                        # NAMING-VERB only ("I have a dog named Rex"): bind the proper name to the
-                        # head noun via also_known_as + ground the possession at the NAMED instance.
-                        # MULTI-CONSTRUCTION RECOVERY: a comma-and enumeration ("a dog named Rex,
-                        # a snake named Noodle, and a cat named Biscuit") carries ONE naming construction
-                        # per conjunct, each modifying its OWN head noun. The atomizer drops the subject
-                        # on conjuncts 2+ → the guardrail collapses each back to the whole raw sentence,
-                        # so we must bind EVERY construction in this clause, not just the first. The
-                        # per-construction binding below is identical to the single-pet path (the loop
-                        # is the ONLY change) — subject-agnostic, each relation type-resolved off its
-                        # own kind via the SAME metadata path.
-                        for _na in (_an_all(_sent) or []):
-                            if _na is None or _na.negated:
-                                continue
-                            _named = (_na.named or "").strip().lower()
-                            _proper = (_na.proper_name or "").strip()
-                            _proper_key = _proper.lower()
-                            if (_named and _proper and len(_proper) >= 2
-                                    and _proper_key != _named):
-                                # the NAME is the alias of the NAMED instance (the proper name is the
-                                # entity surface; the head noun is its TYPE). THE HARD LINE: name=instance.
-                                _naming_seam_edges.append(
-                                    {"subject": _proper_key, "rel_type": "also_known_as",
-                                     "object": _proper, "fact_provenance": "user_stated"})
-                                # the named instance is an instance_of its head-noun TYPE (Rex
-                                # instance_of dog) — so the kind is the PLACE, not the user's pet.
-                                _naming_seam_edges.append(
-                                    {"subject": _proper_key, "rel_type": "instance_of",
-                                     "object": _named, "fact_provenance": "user_stated"})
-                                # the possession rel binds to the NAMED instance, metadata-driven by
-                                # the head-noun type (has_pet for animal, owns for object).
-                                _named_type = _subj_types.get(_named) or _subj_types.get(
-                                    (_named.split()[-1] if _named else ""))
-                                # fall back to the NAMED instance's NER type (the proper name
-                                # types reliably; the bare head noun "dog" usually does not) +
-                                # the grounded head-noun type — NO GLiNER2 injection, no literal.
-                                _inst_type = _subj_types.get(_proper_key)
-                                _poss_rel = _possession_rel_for_head_type(
-                                    _named_type, head_name=_named, instance_type=_inst_type)
-                                _naming_seam_edges.append(
-                                    {"subject": "user", "rel_type": _poss_rel,
-                                     "object": _proper_key, "fact_provenance": "user_stated"})
+                    # NAMING-VERB / APPOSITION / COPULA bindings ("I have a dog named Rex", "a son
+                    # Alex 19", "my friend is Sam") are now OWNED by the UNIFIED ``_chain_named_instance``
+                    # deriver chain (the ONE connector-agnostic detector). Its edges — instance_of,
+                    # also_known_as, the kin/social/possession relation (each metadata-resolved off the
+                    # type's category), the age scalar, the gender, the nickname — ALREADY flowed into
+                    # ``edges`` from the per-sentence ``_facts`` loop above (the deriver runs on the same
+                    # typed Doc, so it has GLiNER2 types for the possession-by-type resolution and gates
+                    # possession on grammatical self-possession — never minting ``owns`` for a non-
+                    # possessed pet). The retired legacy ``analyze_naming_all`` else-branch double-bound
+                    # them (and emitted an UNconditional possession even when not self-possessed), so it
+                    # was removed — the deriver chain is the single binding owner. The ``analyze_named_
+                    # instance`` branch above is KEPT because it adds the ORTHOGONAL specific-type rung
+                    # (instance_of <subtype> + <subtype> subclass_of <kind>, e.g. Rex instance_of
+                    # poodle, poodle subclass_of dog) the deriver chain does not produce.
                 except Exception as _nse:  # noqa: BLE001 — fail-safe: seam miss never breaks harvest
                     log.debug("sentence_pipeline.naming_seam_failed", error=str(_nse)[:120])
 
@@ -18424,6 +18496,26 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         # analyze_event (no date-as-event) and attaches it to the participated_in edge.
         if not _reified_event_edges:
             _reified_event_edges = _detect_event_states(_evt_text, _evt_reference)
+        # STRONG-DETERMINISTIC-INGEST / BRAIN-NOT-TRANSPORT — the spine is authoritative. The
+        # reified-event seam runs on the RAW text as a SECOND lane (even when req.edges were provided
+        # by the spine), so it can MIS-CAST a clause the spine already bound — "a son Alvin 19" /
+        # "a friend Sam" cast as a participated_in occurrence whose NAME is "alvin"/"sam". That
+        # occurrence's title then enters the suppression manifest and PURGES the spine's correct
+        # (alvin, child_of, user) / (sam, friend_of, user) + scalar edges (the "title_leak" clause).
+        # FIX: before the manifest is built, drop any reified occurrence whose name/title/object
+        # surface the spine ALREADY bound with a contentful rel — the spine wins, the competing cast
+        # is dropped WHOLE. Subject-agnostic, structural ("did the spine bind this surface"), no
+        # entity/construction list. Fail-safe: a genuine event the spine did NOT bind (no colliding
+        # surface) is fully preserved, so legitimate participated_in capture is untouched.
+        _spine_bound = _spine_bound_surfaces(list(edges_dict.values()), is_edgeinput=True)
+        if _spine_bound and _reified_event_edges:
+            _pre = len(_reified_event_edges)
+            _reified_event_edges = _drop_reified_occurrences_for_bound_surfaces(
+                _reified_event_edges, _spine_bound)
+            if len(_reified_event_edges) != _pre:
+                log.info("ingest.reified_event_spine_bound_filtered",
+                         user_id=str(req.user_id)[:8],
+                         dropped=_pre - len(_reified_event_edges))
         # KEYSTONE A — one canonical event capture: the upstream lanes (LLM /extract/rewrite +
         # GLiNER2, already in edges_dict from inferred_relations/req.edges) ALSO emitted flat edges
         # for the SAME event — the title classified into L4 (BUG 2 hard-line violation:
@@ -29080,12 +29172,12 @@ def fetch_facts_from_anchor(
                         inverse_rel_type = rel_type_meta.get("inverse_rel_type")
 
                         # For asymmetric relationships, fully invert: swap subject/object
-                        # AND use the inverse rel_type. This transforms (cyrus, child_of, user)
-                        # → (user, parent_of, cyrus), matching the anchor's perspective.
+                        # AND use the inverse rel_type. This transforms (quinn, child_of, user)
+                        # → (user, parent_of, quinn), matching the anchor's perspective.
                         # The dedup step will merge this with any lower-confidence direct
                         # counterpart and keep the higher-confidence version.
                         # Half-inversion (flip rel_type only, no subject/object swap) produces
-                        # semantically wrong facts like "cyrus is the parent of user".
+                        # semantically wrong facts like "quinn is the parent of user".
                         rel_type_final = rel_type_orig
                         if not is_symmetric and inverse_rel_type:
                             facts.append({
