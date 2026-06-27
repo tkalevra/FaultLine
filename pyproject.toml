@@ -13,6 +13,19 @@ dependencies = [
     "httpx",
     "structlog",
     "redis>=5.0",
+    # Deterministic LINGUISTIC LAYER (src/extraction/linguistics.py): spaCy CNN tagger/parser.
+    # NO torch, NO GPU — a self-contained 15 MB CNN model (en_core_web_sm, baked into the image
+    # by the Dockerfile). spaCy is SEPARATE from GLiNER2/qwen (grammar ≠ entity-typing).
+    # The en_core_web_sm MODEL is NOT a PyPI package — it is a pinned GitHub-release wheel
+    # installed explicitly in the Dockerfile so it is BAKED IN (no runtime `spacy download`).
+    # If the model is ever absent at runtime, linguistics.py fail-safes to a no-op (today's path).
+    "spacy>=3.7,<3.9",
+    # Deterministic, rule-based DATE normalization for the temporal ingest layer
+    # (src/extraction/linguistics.py::extract_event_date). Pure-Python, BSD-3, no ML/GPU.
+    # spaCy DATE spans + a numeric-date regex propose candidate spans; dateparser normalizes +
+    # VALIDATES each against a reference (RELATIVE_BASE) — a non-date span → None → dropped.
+    # NO date guessing: a miss yields NULL event_date, never a fabricated "today".
+    "dateparser>=1.2,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -46,3 +59,6 @@ faultline-mcp = "src.mcp.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "live: test calls live services (LLM/GLiNER2/DB) — skipped unless RUN_LIVE=1",
+]

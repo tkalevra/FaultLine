@@ -97,4 +97,4 @@ FaultLine implements best practices for open-source security:
 ## Contacts
 
 **Security:** security@faultline.local  
-**Issue Reports:** [GitHub Issues](https://github.com/tkalevra/FaultLine-dev/issues)
+**Issue Reports:** [GitHub Issues](https://github.com/tkalevra/FaultLine/issues)

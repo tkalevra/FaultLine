@@ -12,7 +12,7 @@ Each concept below links to where it shows up mechanically.
 
 This is the distinction everything else hangs on.
 
-- **A memory** is *what the user told you*: a pet named Fraggle, "my favourite colour
+- **A memory** is *what the user told you*: a pet named Rex, "my favourite colour
   is red," an IP address, a person's name. It is **user truth — grounded, never
   modified by the engine**. It lives as captured values in the entity/alias/
   attribute/fact rows.
@@ -22,7 +22,7 @@ This is the distinction everything else hangs on.
 
 You *file* a memory **at** a place and *walk* the place to **retrieve** it. A name or
 value never becomes a place; a place is never user content. Classifying a *name*
-(Fraggle) into the type hierarchy is a category error — names live in the naming
+(Rex) into the type hierarchy is a category error — names live in the naming
 layer (`also_known_as` / `pref_name`); only *types* (dog, canine) are classified.
 
 This line is the **truth firewall**: because a memory is grounded user content *filed

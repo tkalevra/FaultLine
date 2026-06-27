@@ -30,8 +30,10 @@ import structlog
 
 log = structlog.get_logger()
 
-# Embedding model name — overridable via env var
-_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5")
+# Embedding model name — PURE CONFIG, read from env (no code literal). Default lives in
+# .env.example. Empty when unset → the embed call fail-safes (logs + returns no vector), it
+# never crashes the validator.
+_EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "").strip()
 
 
 @dataclass
