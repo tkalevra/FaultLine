@@ -63,7 +63,7 @@ UPDATE rel_types SET is_hierarchy_rel = TRUE
 WHERE rel_type IN ('instance_of', 'subclass_of', 'member_of', 'part_of', 'is_a');
 
 -- Hierarchy rels: which leaf relationships can apply to their objects
--- (e.g., if fraggle instance_of dog → has_pet dog is allowed, but owns morkie is not
+-- (e.g., if rex instance_of dog → has_pet dog is allowed, but owns morkie is not
 --  because morkie itself is a type defined by instance_of)
 UPDATE rel_types SET allows_leaf_rels = ARRAY['has_pet', 'owns', 'works_for', 'lives_in', 'lives_at']
 WHERE rel_type IN ('instance_of', 'subclass_of', 'member_of', 'part_of', 'is_a');

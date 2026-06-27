@@ -194,17 +194,27 @@ def extract_compound_facts(text: str) -> list[dict]:
             # This logic mirrors the original hardcoded patterns but is generic
             try:
                 if rel_type in ("also_known_as", "pref_name"):
-                    # Most preference patterns capture subject and object
-                    # e.g., "my name is X" → group 0 = X, subject = "user"
-                    # e.g., "Marla prefers emma" → group 0 = Marla, group 1 = emma
+                    # Naming/preference patterns. The SUBJECT is taken from the pattern's
+                    # capture groups — never hardcoded — EXCEPT the first-person self-identity
+                    # single-group patterns ("my name is X", "I am X"), where the only captured
+                    # token IS the name and the subject is the first-person speaker.
+                    #   1 group  → first-person self-identity: group 0 = name, subject = "user".
+                    #   2 groups → subject AND object both captured:
+                    #              e.g. "Jordan goes by emma"        → (jordan, emma)
+                    #              e.g. "a dog named Rex"       → (dog,   rex)   [RC2]
+                    #     group 0 is the HEAD NOUN being named (subject-agnostic: any common
+                    #     noun — dog/cat/server/boat — captured by the naming construction in
+                    #     migration 099), group 1 is the proper name. The subject is the captured
+                    #     head noun, NOT "user". No capitalization gate on the subject here, so a
+                    #     lowercase common-noun head ("dog") is honored.
                     if len(groups) == 1:
-                        # Single-group pattern (subject implied as "user")
+                        # Single-group pattern (first-person self-identity → subject is the speaker)
                         obj = groups[0]
                         if obj and not _is_stopword(obj) and len(obj) > 1:
                             is_pref = rel_type == "pref_name"
                             _add("user", obj.lower(), rel_type, is_pref=is_pref)
                     elif len(groups) == 2:
-                        # Two-group pattern (subject and object both captured)
+                        # Two-group pattern: honor the captured subject (head noun), never "user".
                         subj, obj = groups[0], groups[1]
                         if subj and obj and not _is_stopword(subj) and not _is_stopword(obj):
                             if len(subj) > 1 and len(obj) > 1:

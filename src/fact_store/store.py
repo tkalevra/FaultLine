@@ -117,25 +117,70 @@ class FactStoreManager:
         self.db_conn.commit()
 
     def retract(self, cur, user_id: str, subject: str, rel_type: str | None,
-                old_value: str | None, mode: str) -> list[int]:
+                old_value: str | None, mode: str) -> tuple[list[int], str]:
         """
-        Retract facts matching the given criteria. Returns list of affected fact IDs.
-        Behavior is controlled by mode: 'hard_delete' (DELETE), 'supersede' (set superseded_at).
+        Retract facts matching the given criteria. Returns (affected fact IDs,
+        source_table) where source_table is 'facts', 'staged_facts', or 'both'.
+        The source_table is REQUIRED for collision-safe Qdrant cleanup: facts and
+        staged_facts share a per-user Qdrant collection and use independent
+        BIGSERIAL sequences, so an integer id can exist in both tables. The
+        caller must filter Qdrant deletes by (source_table, fact_id), not bare
+        point ids — see _delete_from_qdrant / /retract/correct cleanup. A 'both'
+        label tells the caller to run the collision-safe per-table filtered
+        delete for BOTH labels over the returned union of ids (each pass is
+        conjunctive on (fact_id, source_table), so a colliding id is only removed
+        from the table whose payload actually matches — see _delete_from_qdrant).
+        Empty id list returns ([], 'facts') by convention (no points to delete).
+
+        DUAL-WRITE NOTE (hard_delete / unforget only): a single fact can be LIVE
+        in BOTH `facts` AND `staged_facts` (the known feeling dual-write). For the
+        TOMBSTONE modes ('hard_delete' = forget, 'unforget' = restore) we must hit
+        BOTH copies or recall can still surface a "forgotten" fact (or unforget can
+        leave a stale tombstone). These two modes therefore accumulate facts ids
+        AND staged ids and apply the tombstone/restore UPDATE to BOTH tables. ALL
+        OTHER modes (supersede/promote — ordinary correction/retraction) keep the
+        EXACT first-match behavior: facts-first, staged only if facts matched
+        nothing — correction semantics are unchanged.
+        Behavior is controlled by mode:
+          'hard_delete' — FORGET via TOMBSTONE (set archived_at + deleted_at; NOT a physical
+                          DELETE). Recoverable for the grace window; the physical purge of
+                          aged tombstones is a separate background phase. Sets qdrant_synced
+                          = false so the re-embedder reconciles the Qdrant point away.
+          'supersede'   — soft delete (set superseded_at).
+          'unforget'    — UN-FORGET: clear the tombstone (archived_at = NULL, deleted_at =
+                          NULL, qdrant_synced = false) on a SPECIFIC tombstoned target, within
+                          the grace window. Restores the fact to the live view.
         subject and old_value are pre-resolved UUIDs (already lowercase).
 
-        Searches both subject-side and object-side: if "forget marla" is issued,
-        marla's UUID may be the object (user → spouse → marla). Searches subject
+        Searches both subject-side and object-side: if "forget jordan" is issued,
+        jordan's UUID may be the object (user → spouse → jordan). Searches subject
         first, falls back to object-side if no match.
+
+        BOUNDED TARGET ONLY: a forget/un-forget operates on the SPECIFIC resolved
+        (subject_id, rel_type[, object_id]) target — there is no wildcard / "delete all" verb.
 
         CLAUDE.md Compliance: Per-user schema isolation means NO user_id column.
         Caller must set search_path to user's schema before calling this method.
         """
         ids = []
 
+        # TOMBSTONE modes (forget/unforget) must reconcile the known feeling dual-write
+        # where one fact is LIVE in BOTH `facts` AND `staged_facts`. For these modes we
+        # process BOTH tables; every other mode keeps the original first-match behavior
+        # (facts-first, staged only if facts matched nothing) so correction semantics are
+        # untouched.
+        _dual = mode in ("hard_delete", "unforget")
+
+        # un-forget hunts for ALREADY-tombstoned rows; forget/supersede hunt for LIVE rows.
+        # A tombstone sets deleted_at, so the live-row filter is `deleted_at IS NULL`.
+        _live_facts_filter = "deleted_at IS NOT NULL" if mode == "unforget" else "deleted_at IS NULL"
+
         # Try subject-side match first
         if subject:
-            conditions = ["subject_id = %s", "superseded_at IS NULL"]
+            conditions = ["subject_id = %s", _live_facts_filter]
             params = [subject]
+            if mode != "unforget":
+                conditions.append("superseded_at IS NULL")
             if rel_type:
                 conditions.append("rel_type = %s")
                 params.append(rel_type.lower())
@@ -148,8 +193,10 @@ class FactStoreManager:
 
         # Fallback: object-side match (entity being retracted is the object)
         if not ids and subject:
-            conditions = ["object_id = %s", "superseded_at IS NULL"]
+            conditions = ["object_id = %s", _live_facts_filter]
             params = [subject]
+            if mode != "unforget":
+                conditions.append("superseded_at IS NULL")
             if rel_type:
                 conditions.append("rel_type = %s")
                 params.append(rel_type.lower())
@@ -157,35 +204,85 @@ class FactStoreManager:
             cur.execute(f"SELECT id FROM facts WHERE {where}", params)
             ids = [r[0] for r in cur.fetchall()]
 
-        # Also check staged_facts for Class B/C
-        if not ids and subject:
-            conditions = ["(subject_id = %s OR object_id = %s)", "promoted_at IS NULL"]
+        facts_ids = ids
+
+        # Also check staged_facts for Class B/C.
+        #   • non-dual modes: ONLY when facts matched nothing (original first-match).
+        #   • dual modes (forget/unforget): ALWAYS, so the dual-write second copy is
+        #     reconciled even when a `facts` copy already matched.
+        staged_ids = []
+        if subject and (_dual or not facts_ids):
+            # staged_facts has no archived_at; it leaves the live view via promoted_at.
+            # A tombstoned staged row sets deleted_at (frozen from lifecycle bumps).
+            _staged_filter = "deleted_at IS NOT NULL" if mode == "unforget" else \
+                             "promoted_at IS NULL AND deleted_at IS NULL"
+            conditions = ["(subject_id = %s OR object_id = %s)", _staged_filter]
             params = [subject, subject]
             if rel_type:
                 conditions.append("rel_type = %s")
                 params.append(rel_type.lower())
+            # SCOPE TO THE NAMED OBJECT (mirror the facts query above): without this the
+            # staged match was subject+rel only, so forget(feels, drained) tombstoned EVERY
+            # staged feeling, not just drained. When a specific object is resolved, bound to it.
+            if old_value:
+                conditions.append("object_id = %s")
+                params.append(old_value)
             where = " AND ".join(conditions)
             cur.execute(f"SELECT id FROM staged_facts WHERE {where}", params)
-            ids = [r[0] for r in cur.fetchall()]
-            if ids:
-                if mode == "hard_delete":
-                    cur.execute(f"DELETE FROM staged_facts WHERE id = ANY(%s)", (ids,))
-                else:
-                    cur.execute(
-                        "UPDATE staged_facts SET promoted_at = now() WHERE id = ANY(%s)", (ids,)
-                    )
-                return ids
+            staged_ids = [r[0] for r in cur.fetchall()]
 
-        if not ids:
-            return []
+        # Apply the staged-table UPDATE (tombstone/restore/promote).
+        if staged_ids:
+            if mode == "hard_delete":
+                # TOMBSTONE (recoverable) — NOT a physical DELETE.
+                cur.execute(
+                    "UPDATE staged_facts SET deleted_at = now(), qdrant_synced = false "
+                    "WHERE id = ANY(%s)", (staged_ids,)
+                )
+            elif mode == "unforget":
+                # Clear the tombstone — restore to the live view.
+                cur.execute(
+                    "UPDATE staged_facts SET deleted_at = NULL, qdrant_synced = false "
+                    "WHERE id = ANY(%s)", (staged_ids,)
+                )
+            else:
+                cur.execute(
+                    "UPDATE staged_facts SET promoted_at = now() WHERE id = ANY(%s)", (staged_ids,)
+                )
 
-        if mode == "hard_delete":
-            placeholders = ",".join(["%s"] * len(ids))
-            cur.execute(f"DELETE FROM facts WHERE id IN ({placeholders})", ids)
-        else:
-            placeholders = ",".join(["%s"] * len(ids))
-            cur.execute(
-                f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE id IN ({placeholders})",
-                ids,
-            )
-        return ids
+        # Apply the facts-table UPDATE (tombstone/restore/supersede).
+        if facts_ids:
+            placeholders = ",".join(["%s"] * len(facts_ids))
+            if mode == "hard_delete":
+                # FORGET via TOMBSTONE — set archived_at + deleted_at (recoverable). Existing
+                # `archived_at IS NULL` read filters hide it immediately; the distinct deleted_at
+                # marks it forgotten (vs superseded) and is the eventual purge target. NOT a DELETE.
+                cur.execute(
+                    f"UPDATE facts SET archived_at = now(), deleted_at = now(), qdrant_synced = false "
+                    f"WHERE id IN ({placeholders})",
+                    facts_ids,
+                )
+            elif mode == "unforget":
+                # UN-FORGET — clear the tombstone, restore to the live view.
+                cur.execute(
+                    f"UPDATE facts SET archived_at = NULL, deleted_at = NULL, qdrant_synced = false "
+                    f"WHERE id IN ({placeholders})",
+                    facts_ids,
+                )
+            else:
+                cur.execute(
+                    f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE id IN ({placeholders})",
+                    facts_ids,
+                )
+
+        # Return (union ids, source_table). 'both' tells the caller to run the
+        # collision-safe per-table filtered Qdrant delete for BOTH labels over the
+        # union — each pass is conjunctive on (fact_id, source_table) so a colliding
+        # id is only removed from the table whose payload matches.
+        if facts_ids and staged_ids:
+            return facts_ids + staged_ids, "both"
+        if facts_ids:
+            return facts_ids, "facts"
+        if staged_ids:
+            return staged_ids, "staged_facts"
+        return [], "facts"

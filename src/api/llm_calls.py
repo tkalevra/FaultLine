@@ -312,13 +312,20 @@ class LLMTimeouts:
     # These are the fallbacks used if environment variables not set
     _DEFAULTS = {
         "INTENT_CLASSIFICATION": 5.0,    # Fast — no context needed
+        "INTENT_ADJUDICATION": 4.0,      # Sub-gate binary CORRECTION/STATEMENT — fail open fast to STATEMENT
+        "INTENT_PRECLASSIFY": 4.0,       # Confident-GLiNER2 DB-weighted correction/omission supersede — fail open fast
+        "OCCURRENCE_CLASSIFY": 4.0,      # Dateful-but-hostless residue → "what occurred here?" verbatim-span classify — fail open fast
+        "SPAN_DETECT": 6.0,              # Buried fact-bearing clause DETECTION — return verbatim spans that assert a user fact; fail open fast to deterministic-only span-finding
+        "REFRAME": 6.0,                  # De-ramble/atomize one short turn before segmentation — cheap restructuring, fail open fast
         "EXTRACTION": 30.0,              # Standard extraction calls
         "VALIDATION": 20.0,              # WGM ontology validation
         "ENRICHMENT": 15.0,              # Metadata inference for new rel_types
+        "CLASSIFY_CHAIN": 20.0,          # One-shot FULL is-a ladder for one concept — a few rungs of JSON, longer than a single ENRICHMENT rung
         "CORRECTION": 25.0,              # User correction extraction
         "RETRACTION_EXTRACTION": 60.0,   # Retraction LLM extraction — longer due to context loading
         "EMBEDDING": 10.0,               # Text embedding operations
         "TAXONOMY_DISCOVERY": 20.0,      # Discover new taxonomies
+        "NATURAL_LANGUAGE_FILL": 10.0,   # Ontology phrasing (3p+2p) for a grown rel_type — short single-rel JSON
         "DEFAULT": 30.0,                 # Fallback for unknown operations
     }
 
@@ -351,6 +358,260 @@ class LLMTimeouts:
                            using_default=True)
 
         return cls._DEFAULTS.get(operation, cls._DEFAULTS["DEFAULT"])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLASS: LLMMaxTokens
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LLMMaxTokens:
+    """
+    Centralized max_tokens (completion budget) configuration for LLM operations.
+
+    Mirrors LLMTimeouts. All values are configurable via environment variables.
+    Never hardcode max_tokens values in logic — always use this class.
+
+    Why EXTRACT/EXTRACTION default to 2048:
+    The 2048 budget was deliberately chosen (e0e78c0 / dprompt-139) so that
+    qwen3.5-9b's extraction output is not truncated mid-array — dense passages
+    yield many triples and a 500-token cap silently cuts the JSON, collapsing
+    rich passages to ~1 triple. Regression bf699ae dropped this back to the
+    500 default, re-introducing the truncation. This class restores 2048 for
+    extraction while leaving every other operation at the safe 500 default.
+
+    Operations:
+    - EXTRACT / EXTRACTION: Entity/relationship extraction — needs large budget
+    - DEFAULT: Fallback for all other operations (unchanged 500)
+
+    Override via environment, e.g.:
+    - LLM_MAX_TOKENS_EXTRACT=2048
+    - LLM_MAX_TOKENS_EXTRACTION=2048
+    """
+
+    # Default completion budgets (in tokens) for each operation type.
+    # Only EXTRACT/EXTRACTION deviate from the safe 500 default — do NOT
+    # regress other operations by raising their budgets here.
+    _DEFAULTS = {
+        "EXTRACT": 2048,      # Dense triple extraction — must not truncate JSON array
+        "EXTRACTION": 2048,   # Alias of EXTRACT for callers using the long form
+        "INTENT_ADJUDICATION": 16,  # Tiny JSON route answer e.g. {"route":"STATEMENT"} — keep latency/cost bounded
+        "INTENT_PRECLASSIFY": 32,   # JSON route+confidence e.g. {"route":"CORRECTION","confidence":0.93} — bounded
+        "OCCURRENCE_CLASSIFY": 48,  # Tiny JSON {"occurrence":"<verbatim noun phrase>"} | {"occurrence":"none"} — verbatim span only, NOT a triple array
+        "SPAN_DETECT": 384,         # JSON list of VERBATIM fact-bearing sentences copied from the turn (segmentation/flagging, NOT triples) — a few clauses, never a dense triple array
+        "CLASSIFY_CHAIN": 256,      # One-shot FULL is-a ladder: short JSON {entity_type, chain:[...]} of snake_case tokens up to a general root — bigger than a single rung, far smaller than dense EXTRACT
+        "REFRAME": 256,             # Short JSON list of short atomic statements — restructuring, NOT dense triple generation; do NOT reuse 2048 EXTRACT budget
+        "NATURAL_LANGUAGE_FILL": 200,  # Small JSON {natural_language, natural_language_2p} for ONE rel_type
+        "DEFAULT": 500,       # Safe fallback for every other operation
+    }
+
+    @classmethod
+    def get(cls, operation: str = "DEFAULT") -> int:
+        """
+        Get max_tokens budget for a specific operation.
+
+        Checks environment variables first (LLM_MAX_TOKENS_<OPERATION>),
+        then falls back to defaults.
+
+        Args:
+            operation: Operation type (e.g., "EXTRACT", "EXTRACTION")
+                      Case-insensitive
+
+        Returns:
+            max_tokens budget (int)
+        """
+        operation = operation.upper()
+        env_var = f"LLM_MAX_TOKENS_{operation}"
+        env_value = os.environ.get(env_var)
+
+        if env_value is not None:
+            try:
+                return int(env_value)
+            except ValueError:
+                log.warning("llm_max_tokens.invalid_env_value",
+                           env_var=env_var,
+                           value=env_value,
+                           using_default=True)
+
+        return cls._DEFAULTS.get(operation, cls._DEFAULTS["DEFAULT"])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLASS: LLMModels
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LLMModels:
+    """
+    Centralized MODEL-NAME resolution for LLM operations.
+
+    Mirrors LLMTimeouts / LLMMaxTokens EXACTLY: a per-operation map points each
+    operation at the ENV VAR that supplies its model name. Model identity is pure
+    configuration — it lives ONLY in the environment (.env), NEVER as a literal in
+    code. There is intentionally NO hardcoded model-name fallback: an unset model
+    var is a LOUD config error (log_crit + raise), never a silent guess.
+
+    This is the model analogue of the timeout/max_tokens resolvers. Before this
+    class, ~21 call sites each hardcoded the model env read with an inline
+    fallback literal, and those literals DISAGREED (most pointed at one model, a
+    stray few at another, for the SAME env var) — so the same operation could
+    silently split across two models if the var was unset. One resolver → one
+    answer per operation.
+
+    Resolution order for an operation:
+      1. Per-op override env  LLM_MODEL_<OPERATION>   (parallel to LLM_TIMEOUT_<OP>)
+      2. The operation's mapped base env var (_OP_ENV_VAR, default WGM_LLM_MODEL)
+      3. If neither is set → log_crit + raise RuntimeError (fail loud, no literal)
+
+    Env vars (VALUES live in .env, documented in .env.example):
+    - WGM_LLM_MODEL          : base model for all standard operations
+    - PATTERN_EXTRACTION_MODEL: model for the deterministic pattern-extraction op
+                               (formerly the misnamed CATEGORY_LLM_MODEL); falls
+                               back to WGM_LLM_MODEL when its own var is unset.
+    - LLM_MODEL_<OPERATION>  : optional per-operation override
+    """
+
+    # Base env var every operation reads unless mapped otherwise.
+    _BASE_ENV_VAR = "WGM_LLM_MODEL"
+
+    # Operations that read a DIFFERENT base env var than WGM_LLM_MODEL.
+    # Only the pattern-extraction op is distinct; it still falls back to the base
+    # var when its own var is unset (so a single WGM_LLM_MODEL drives everything).
+    _OP_ENV_VAR = {
+        "PATTERN_EXTRACTION": "PATTERN_EXTRACTION_MODEL",
+    }
+
+    @classmethod
+    def get(cls, operation: str = "DEFAULT") -> str:
+        """
+        Resolve the model name for a specific operation.
+
+        Checks the per-op override (LLM_MODEL_<OPERATION>) first, then the
+        operation's mapped base env var (default WGM_LLM_MODEL, with a final
+        fallback to WGM_LLM_MODEL for ops that map to their own var). If nothing
+        resolves to a non-empty value → log_crit + raise (fail loud, NO literal).
+
+        Args:
+            operation: Operation type (e.g., "EXTRACTION", "PATTERN_EXTRACTION").
+                      Case-insensitive.
+
+        Returns:
+            Model name string from the environment.
+
+        Raises:
+            RuntimeError: if no model env var is set for the operation.
+        """
+        operation = operation.upper()
+
+        # 1. Per-operation override.
+        override = os.environ.get(f"LLM_MODEL_{operation}")
+        if override and override.strip():
+            return override.strip()
+
+        # 2. Mapped base env var (op-specific var, then WGM_LLM_MODEL).
+        primary_var = cls._OP_ENV_VAR.get(operation, cls._BASE_ENV_VAR)
+        value = os.environ.get(primary_var)
+        if (not value or not value.strip()) and primary_var != cls._BASE_ENV_VAR:
+            # Op-specific var unset → fall back to the base model var.
+            value = os.environ.get(cls._BASE_ENV_VAR)
+        if value and value.strip():
+            return value.strip()
+
+        # 3. Fail loud — model identity is config; an unset model is never guessed.
+        from src.api.logging_config import log_crit
+        log_crit(
+            log,
+            "llm_model.unresolved",
+            operation=operation,
+            checked_env_vars=[f"LLM_MODEL_{operation}", primary_var,
+                              cls._BASE_ENV_VAR],
+            remediation="set WGM_LLM_MODEL (and/or the per-op LLM_MODEL_<OP> / "
+                        "PATTERN_EXTRACTION_MODEL) in the environment",
+        )
+        raise RuntimeError(
+            f"LLMModels.get({operation!r}): no model env var set — refusing to "
+            f"guess a model name. Set WGM_LLM_MODEL in the environment."
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED HELPER: generate_rel_type_phrasing()
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_rel_type_phrasing(rel_type: str,
+                               label: Optional[str] = None,
+                               user_id: str = "engine") -> dict:
+    """Generate 3p + 2p natural-language render templates for a grown rel_type.
+
+    SINGLE SOURCE OF TRUTH for ontology render-phrasing generation. Both the
+    ingest orphan-stub mint (strong-ingest, in-flow) and the re_embedder Job 7
+    backfill (async safety-net) call THIS function so the prompt + validation
+    live in exactly one place (transport-parity — no divergent copies).
+
+    This is purely an LLM ontology-phrasing task (call_llm_with_retry_sync,
+    operation NATURAL_LANGUAGE_FILL). It NEVER touches GLiNER2 and never inspects
+    or alters any GLiNER2 label — it only asks the centralized LLM for human
+    render strings for an already-decided rel_type.
+
+    Returns a dict with whichever of these keys validated:
+      {"natural_language": "...", "natural_language_2p": "..."}
+    Empty / missing keys mean "could not generate cleanly" — callers MUST treat
+    that as fail-safe (keep the NULL-template stub; backfill later). This helper
+    NEVER raises; on any error it returns {} so ingest is never blocked.
+
+    Placeholder contract (enforced here, same as the original Job 7 guard):
+      * natural_language: third-person, MUST contain X (subject placeholder).
+      * natural_language_2p: second-person, subject baked as "you"/"your",
+        MUST contain Y and MUST NOT contain X.
+    A value failing its contract is dropped (key omitted) — never returned broken.
+    """
+    rt = (rel_type or "").strip()
+    if not rt:
+        return {}
+
+    try:
+        messages = [
+            {"role": "system", "content":
+             "You are an ontology expert. Respond with ONLY a JSON object, no markdown."},
+            {"role": "user", "content":
+             f'Generate human-readable phrases for the relationship type "{rt}".\n'
+             f'1. "natural_language": third-person, use X for subject and Y for object.\n'
+             f'   Example: "parent_of" → "X is the parent of Y", "has_ip" → "X has IP address Y", "spouse" → "X and Y are spouses"\n'
+             f'2. "natural_language_2p": SECOND-PERSON, subject baked in as "you"/"your", keep ONLY Y for the object. MUST contain Y, MUST NOT contain X.\n'
+             f'   Example: "parent_of" → "You are the parent of Y", "has_ip" → "You have IP address Y", "spouse" → "You and Y are spouses"\n'
+             f'Respond with ONLY: {{"natural_language": "...", "natural_language_2p": "..."}}'},
+        ]
+        result = call_llm_with_retry_sync(
+            messages=messages,
+            model=LLMModels.get("NATURAL_LANGUAGE_FILL"),
+            user_id=user_id,
+            operation="NATURAL_LANGUAGE_FILL",
+        )
+    except Exception as e:
+        # Fail-safe: phrasing generation must NEVER block/abort the caller.
+        log.warning("rel_type_phrasing.generation_failed",
+                    rel_type=rt, error=str(e)[:200])
+        return {}
+
+    nl = (result.get("natural_language") or "").strip() if result else ""
+    nl_2p = (result.get("natural_language_2p") or "").strip() if result else ""
+
+    out: dict = {}
+    # natural_language MUST contain the X subject placeholder — never store broken.
+    if nl:
+        if "X" in nl:
+            out["natural_language"] = nl
+        else:
+            log.warning("rel_type_phrasing.natural_language_missing_placeholder",
+                        rel_type=rt, generated_value=nl,
+                        reason="LLM response missing X subject placeholder — dropping")
+    # 2p must keep Y and must NOT reintroduce X.
+    if nl_2p:
+        if "Y" in nl_2p and "X" not in nl_2p:
+            out["natural_language_2p"] = nl_2p
+        else:
+            log.warning("rel_type_phrasing.natural_language_2p_invalid",
+                        rel_type=rt, generated_value=nl_2p,
+                        reason="2p missing Y or contains X — dropping")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -401,7 +662,7 @@ def call_llm_with_retry_sync(
     timeout: Optional[float] = None,
     max_retries: int = 3,
     operation: str = "DEFAULT",
-    max_tokens: int = 500,
+    max_tokens: Optional[int] = None,
 ) -> dict:
     """
     Synchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -421,7 +682,7 @@ def call_llm_with_retry_sync(
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
-        model: Model name string (e.g., "qwen/qwen3.5-9b")
+        model: Model name string (resolved via LLMModels.get(operation))
         user_id: User UUID for logging and context (default "anonymous")
         timeout: Request timeout in seconds (default from LLMTimeouts)
         max_retries: Number of retries across different endpoints (default 3)
@@ -457,6 +718,9 @@ def call_llm_with_retry_sync(
     # Select timeout based on operation type
     if timeout is None:
         timeout = LLMTimeouts.get(operation)
+
+    if max_tokens is None:
+        max_tokens = LLMMaxTokens.get(operation)
 
     # Lazy import to avoid circular dependencies
     from src.api.llm_client import build_llm_payload, get_llm_headers
@@ -592,7 +856,7 @@ async def call_llm_with_retry_async(
     timeout: Optional[float] = None,
     max_retries: int = 3,
     operation: str = "DEFAULT",
-    max_tokens: int = 500,
+    max_tokens: Optional[int] = None,
 ) -> dict:
     """
     Asynchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -636,6 +900,9 @@ async def call_llm_with_retry_async(
     # Select timeout based on operation type
     if timeout is None:
         timeout = LLMTimeouts.get(operation)
+
+    if max_tokens is None:
+        max_tokens = LLMMaxTokens.get(operation)
 
     # Lazy import to avoid circular dependencies
     from src.api.llm_client import build_llm_payload, get_llm_headers
@@ -771,7 +1038,7 @@ def call_llm_no_retry_sync(
     user_id: str = "anonymous",
     timeout: Optional[float] = None,
     operation: str = "DEFAULT",
-    max_tokens: int = 500,
+    max_tokens: Optional[int] = None,
 ) -> Optional[dict]:
     """
     Single-attempt LLM call with graceful failure (no retry).
@@ -803,6 +1070,9 @@ def call_llm_no_retry_sync(
 
     if timeout is None:
         timeout = LLMTimeouts.get(operation)
+
+    if max_tokens is None:
+        max_tokens = LLMMaxTokens.get(operation)
 
     try:
         # Lazy import to avoid circular dependencies

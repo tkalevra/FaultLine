@@ -138,19 +138,23 @@ class Settings:
     def WGM_LLM_MODEL(self) -> str:
         """LLM model name for the WGM (validation/ontology) endpoint.
 
-        Used when validating facts against ontology rules.
-        Default: qwen/qwen3.5-9b
+        Model identity is pure configuration — the VALUE lives ONLY in the
+        environment (.env), never as a code literal. Authoritative resolution is
+        src.api.llm_calls.LLMModels (per-operation, fail-loud on unset). This
+        accessor just surfaces the raw env value; empty string means unset.
         """
-        return os.environ.get("WGM_LLM_MODEL", "qwen/qwen3.5-9b")
+        return os.environ.get("WGM_LLM_MODEL", "")
 
     @property
-    def CATEGORY_LLM_MODEL(self) -> str:
-        """LLM model name for category/taxonomy classification.
+    def PATTERN_EXTRACTION_MODEL(self) -> str:
+        """LLM model name for the deterministic pattern-extraction op.
 
-        Used when assigning facts to categories.
-        Default: qwen2.5-coder
+        Formerly the misnamed CATEGORY_LLM_MODEL (category inference is
+        deterministic; no model). Falls back to WGM_LLM_MODEL when unset.
+        Authoritative resolution is LLMModels.get("PATTERN_EXTRACTION").
         """
-        return os.environ.get("CATEGORY_LLM_MODEL", "qwen2.5-coder")
+        return os.environ.get("PATTERN_EXTRACTION_MODEL", "") or \
+            os.environ.get("WGM_LLM_MODEL", "")
 
     @property
     def OPENWEBUI_URL(self) -> Optional[str]:
@@ -176,12 +180,12 @@ class Settings:
 
     @property
     def EMBEDDING_MODEL_VERSION(self) -> str:
-        """Name of the embedding model for semantic search.
+        """Embedding model VERSION tag for semantic search (Redis cache-invalidation key).
 
-        Used to create vector embeddings for facts.
-        Default: nomic-v1.5 (recommended)
+        PURE CONFIG — read from env (no code literal); the shipped default lives in
+        .env.example (``EMBEDDING_MODEL_VERSION``). Empty when unset.
         """
-        return os.environ.get("EMBEDDING_MODEL_VERSION", "nomic-v1.5")
+        return (os.environ.get("EMBEDDING_MODEL_VERSION") or "").strip()
 
     @property
     def EMBEDDING_CACHE_TTL(self) -> int:
