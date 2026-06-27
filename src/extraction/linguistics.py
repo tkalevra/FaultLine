@@ -1156,24 +1156,34 @@ def _type_is_self_possessed(type_tok):
     r"""Does the TYPE noun belong to the speaker — "my son" / "I have a son …" / "we have a daughter"?
 
     True when (a) the type noun carries a 1st-person possessive determiner ("my"/"our" — Person=1 ∧
-    Poss=Yes), OR (b) it is governed (dobj / appos-chain / npadvmod) by a 1st-person ``have`` clause
-    ("I have a son Alex", "we have a daughter Robin" — the enumerated members all hang off the
-    ``have`` object). Grammatical (morphology + the ``have`` lemma + a 1st-person personal-pronoun
-    subject), NOT a token list. Fail-safe → False (no possession edge minted; the type/name structure
-    still stands)."""
+    Poss=Yes), OR (b) it is governed (dobj / appos-chain / npadvmod) by a 1st-person POSSESSION clause
+    ("I have a son Alex", "I own a motorcycle named Bolt", "I acquired a server named Atlas", "we have a
+    daughter Robin" — the enumerated members all hang off the possession verb's object). Grammatical
+    (morphology + a 1st-person personal-pronoun subject), with the POSSESSION-VERB decision delegated to
+    GROWABLE cue-class metadata, NOT an in-code verb literal: the STATIVE-possession class
+    (``_possession_verbs()`` — have/own/possess/keep/hold; ``have`` lives there too) UNIONED with the
+    transfer-of-possession ACQUISITION class (``_acquisition_verbs()`` — got/bought/acquired/received).
+    Both denote the speaker possessing the object, which is exactly the question this gate asks; each
+    class grows on its own rail and the gate reads both. The clause does the GRAMMAR (the head-climb);
+    metadata decides what the verb MEANS. Fail-safe → False (no possession edge minted; the type/name
+    structure still stands)."""
     try:
         for c in type_tok.children:
             if (c.dep_ == "poss" and c.morph.get("Person") == ["1"]
                     and "Yes" in c.morph.get("Poss")):
                 return True
-        # climb to a governing ``have`` whose subject is a 1st-person personal pronoun.
+        # climb to a governing POSSESSION verb whose subject is a 1st-person personal pronoun. The
+        # possession-verb membership is GROWABLE METADATA (the possession_verb cue class ∪ the
+        # acquisition_verb transfer class), NOT a hardcoded verb literal — grammar identifies WHICH verb
+        # governs the clause; the cue classes decide whether that verb means "possesses/comes-to-possess".
+        _poss_verbs = _possession_verbs() | _acquisition_verbs()
         cur = type_tok
         hops = 0
         while cur is not None and hops < 8:
             h = cur.head
             if h is None or h.i == cur.i:
                 break
-            if (h.lemma_ or "").strip().lower() == "have" and h.pos_ in ("VERB", "AUX"):
+            if (h.lemma_ or "").strip().lower() in _poss_verbs and h.pos_ in ("VERB", "AUX"):
                 subj = next((s for s in h.children if s.dep_ in ("nsubj", "nsubjpass")), None)
                 if subj is not None and _is_first_person_personal_pronoun(subj):
                     return True
@@ -1923,6 +1933,45 @@ def _acquisition_verbs() -> frozenset[str]:
     except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
         log.warning("linguistics.acquisition_verbs_resolve_failed", error=str(e)[:160])
         return _ACQUISITION_VERB_LEMMAS
+
+
+# DB-HELD + per-tenant + GROWABLE (linguistic_cue_overlay, category='possession_verb'). ⚠️ FLAGGED
+# BOUNDED LEXICAL CLASS — the STATIVE possession verb class used by the named-instance self-possession
+# gate (`_type_is_self_possessed`, clause (b)) to decide whether a named instance's TYPE belongs to the
+# speaker before the (user, owns/has_pet, <name>) edge is minted. This REPLACES the retired single
+# hardcoded `== "have"` verb literal: a `=="have"` box only fit have-shaped sentences and silently
+# dropped "I OWN a motorcycle named Bolt" / "I POSSESS a painting named Dawn" / "I KEEP a hamster named
+# Nibbles". DISTINCT from `_ACQUISITION_VERB_LEMMAS` (stative CURRENTLY-possessing — have/own/possess/
+# keep/hold — vs transfer COMING-to-possess — got/bought/acquired). Like acquisition, the possession
+# signal cannot be made purely structural ("I have a dog" vs "I have a meeting" share verb→dobj); only
+# the verb's lexical semantics distinguishes it, so a small bounded verb class is unavoidable — EXACTLY
+# as for the naming / LVC / inchoative / aspectual / acquisition classes. It is firewalled by the gate's
+# grammar (1st-person-personal-pronoun subject + a ProperName↔Type binding under the governing verb).
+# `have` is INCLUDED so the existing family/pet self-possession path keeps working — now AS METADATA,
+# not an in-code literal. The frozenset below is the DB-DOWN CODE-FALLBACK seed only; membership checks
+# call `_possession_verbs()`, NOT this frozenset directly.
+_POSSESSION_VERB_LEMMAS: frozenset[str] = frozenset(
+    {"have", "own", "possess", "keep", "hold"}
+)
+
+
+def _possession_verbs() -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE STATIVE-POSSESSION verb lemma set via the overlay (ContextVar-bound
+    to the request's tenant schema — the SAME binding the acquisition/naming/inchoative overlays use).
+    Returns a frozenset of lowercased verb lemmas. ⚠️ FLAGGED bounded lexical class (see
+    ``_POSSESSION_VERB_LEMMAS``). Fail-safe: any import/read failure / unbound schema / empty resolution
+    → the in-code ``_POSSESSION_VERB_LEMMAS`` code-fallback seed. Never empty. Mirrors
+    ``_acquisition_verbs()`` exactly."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        cues = linguistic_cue_overlay.resolve_possession_verbs(dsn)
+        if cues:
+            return cues
+        return _POSSESSION_VERB_LEMMAS
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.possession_verbs_resolve_failed", error=str(e)[:160])
+        return _POSSESSION_VERB_LEMMAS
 
 
 def _inchoative_verbs() -> frozenset[str]:

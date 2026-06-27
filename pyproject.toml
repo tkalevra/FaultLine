@@ -26,6 +26,13 @@ dependencies = [
     # VALIDATES each against a reference (RELATIVE_BASE) — a non-date span → None → dropped.
     # NO date guessing: a miss yields NULL event_date, never a fabricated "today".
     "dateparser>=1.2,<2.0",
+    # Phonetic a/an article selection for the recall prose composer (convert_to_prose →
+    # _indefinite_article). Pure-Python, MIT, no ML/GPU. Handles the OPEN lexical class
+    # correctly (hour/honest→an, university/unicorn/one→a, X-ray→an); the CLOSED 26-letter
+    # initialism rule (IP/SSD/FQDN→an, URL/UID→a) runs BEFORE inflect in code since inflect
+    # mis-reads spoken initialisms. Optional at runtime: absent → initialism rule + vowel-
+    # letter fallback (prose polish only — the article is NOT a det-scorer gold token).
+    "inflect>=7.0,<8.0",
 ]
 
 [project.optional-dependencies]
