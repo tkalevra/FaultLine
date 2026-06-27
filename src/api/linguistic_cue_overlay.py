@@ -240,11 +240,50 @@ _BOOTSTRAP_KINSHIP_REL_MAP: dict[str, str] = {
     "grandma": "related_to", "grandpa": "related_to",
 }
 
+# ── BOOTSTRAP KINSHIP-NOUN → GENDER MAP — DB-DOWN SAFETY NET ONLY ────────────────────
+# A MAP (kinship noun lemma → the gender the role intrinsically carries) for the named-instance
+# binding chain: "a son Alex" → son is intrinsically MALE → (alex, has_gender, male); "a daughter
+# Robin" → female. This is the SAME (cue, category) rail as the kinship_noun → rel_type map, in a
+# DISTINCT category ('kinship_gender') so one row class carries the rel and another carries the gender
+# (a single noun can be in both — the binding chain consults each map independently). ONLY the
+# gendered kin roles appear; a GENDER-NEUTRAL kin role (child / parent / sibling / spouse / partner /
+# cousin) is INTENTIONALLY ABSENT so no gender is fabricated where the language does not state one. The
+# value is a STRING gender token routed to the SCALAR ``has_gender`` rel (tail_types={SCALAR}). Stored
+# on the SAME rail: `cue` = the kinship noun, `description` = the gender. DB-DOWN code-fallback seed
+# only — mirrors migration 117's public seed. A noun OUTSIDE this map → no gender minted (never guessed).
+_BOOTSTRAP_KINSHIP_GENDER_MAP: dict[str, str] = {
+    "son": "male", "daughter": "female",
+    "mother": "female", "father": "male", "mom": "female", "dad": "male",
+    "sister": "female", "brother": "male",
+    "wife": "female", "husband": "male",
+    "uncle": "male", "aunt": "female",
+    "grandmother": "female", "grandfather": "male",
+    "grandma": "female", "grandpa": "male",
+}
+
+# ── BOOTSTRAP SOCIAL-ROLE-NOUN → REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ──────────────
+# A MAP (social-relational PERSON-role noun lemma → the social rel_type it carries toward the
+# possessor/speaker) for the named-instance binding chain. "a friend Sam" / "my friend is Sam" →
+# friend → (sam, friend_of, user); "my colleague Sam" → knows. This is the PERSON-relational
+# counterpart of kinship: a role that links two PEOPLE socially (NOT kinship, NOT a possession). It is
+# a DISTINCT category ('social_role') so a person introduced by a social role binds to a social rel
+# (friend_of / knows) rather than the generic ``has_role`` slot or — worse — ``owns`` (a person is
+# never owned). A role OUTSIDE this map falls to ``has_role`` (a generic role slot the walk resolves),
+# never a fabricated social tie. Stored on the SAME (cue, category) rail: `cue` = the role noun,
+# `description` = the rel_type. DB-DOWN code-fallback seed only — mirrors migration 117's public seed.
+_BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {
+    "friend": "friend_of",
+    "colleague": "knows", "coworker": "knows", "co-worker": "knows",
+    "neighbour": "knows", "neighbor": "knows",
+    "acquaintance": "knows", "classmate": "knows", "roommate": "knows",
+    "boss": "knows", "manager": "knows",
+}
+
 # ── BOOTSTRAP MEASUREMENT-UNIT → SCALAR REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ───────
 # A MAP (measurement-unit head lemma → the SCALAR rel_type it measures) for the copula measurement
 # chain: "she is 62 years old" → unit "year" → age; "he is 6 feet tall" → unit "foot" → height; "it
 # weighs 80 kilograms" → unit "kilogram" → weight. These rel_types carry tail_types={SCALAR} so the
-# value routes to entity_attributes. The bare-age fallback ("Taylor is 28" — a NUM attr with no unit)
+# value routes to entity_attributes. The bare-age fallback ("Robin is 28" — a NUM attr with no unit)
 # resolves to `age` via the deriver's grammatical age-shape, NOT this map. A unit OUTSIDE this map →
 # no scalar minted (we never guess a measurement). Stored on the SAME (cue, category) rail: `cue` =
 # the unit lemma, `description` = the scalar rel_type. DB-DOWN code-fallback seed only.
@@ -292,6 +331,13 @@ THIN_TYPE_CATEGORY = "thin_type"
 # SET — the SET is resolve_kinship_nouns, the MAP is resolve_kinship_rel_map). No separate category.
 # unit_scalar is its OWN keyed class (unit-lemma → scalar rel_type) for the copula measurement chain.
 UNIT_SCALAR_CATEGORY = "unit_scalar"
+# kinship_gender is a KEYED class (kinship-noun → gender) on the SAME rail (cue=noun, description=
+# gender), resolved by resolve_kinship_gender_map() into a {noun: gender} dict. Distinct category from
+# kinship_noun so the rel-map and the gender-map ride separate rows for the same noun.
+KINSHIP_GENDER_CATEGORY = "kinship_gender"
+# social_role is a KEYED class (person-social-role noun → rel_type) on the SAME rail (cue=noun,
+# description=rel), resolved by resolve_social_role_map() into a {noun: rel_type} dict.
+SOCIAL_ROLE_CATEGORY = "social_role"
 
 # Per-category DB-DOWN fallback seed. resolve_cues consults this when a category resolves empty / the
 # read fails, so EVERY category fails safe to its own evidenced floor (never the wrong class, never
@@ -671,6 +717,25 @@ def resolve_unit_scalar_map(dsn: str) -> dict[str, str]:
     entity_attributes). Same contract as resolve_thin_type. Fail-safe: bootstrap floor
     (`_BOOTSTRAP_UNIT_SCALAR_MAP`)."""
     return _resolve_keyed_map(dsn, UNIT_SCALAR_CATEGORY, _BOOTSTRAP_UNIT_SCALAR_MAP)
+
+
+def resolve_kinship_gender_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE kinship-noun → gender MAP for the ContextVar-bound current
+    request schema. Reads the kinship_gender rows ({noun: gender}). Used by the named-instance binding
+    chain so "a son Alex" → son → male → (alex, has_gender, male). Metadata-driven (NOT an in-code
+    literal); a noun OUTSIDE the map mints no gender (a gender-neutral kin role like child/parent/
+    sibling is absent → no fabricated gender). Same contract as resolve_unit_scalar_map. Fail-safe:
+    bootstrap floor (`_BOOTSTRAP_KINSHIP_GENDER_MAP`)."""
+    return _resolve_keyed_map(dsn, KINSHIP_GENDER_CATEGORY, _BOOTSTRAP_KINSHIP_GENDER_MAP)
+
+
+def resolve_social_role_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE social-role-noun → rel_type MAP for the ContextVar-bound current
+    request schema. Reads the social_role rows ({noun: rel_type}). Used by the named-instance binding
+    chain so "a friend Sam" → friend → friend_of (a PERSON social tie, never ``owns``). Metadata-
+    driven; a role OUTSIDE the map falls to a generic role slot (never a fabricated social tie). Same
+    contract as resolve_kinship_gender_map. Fail-safe: bootstrap floor (`_BOOTSTRAP_SOCIAL_ROLE_MAP`)."""
+    return _resolve_keyed_map(dsn, SOCIAL_ROLE_CATEGORY, _BOOTSTRAP_SOCIAL_ROLE_MAP)
 
 
 def invalidate(schema_name=None) -> None:

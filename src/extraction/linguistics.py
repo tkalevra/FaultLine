@@ -954,6 +954,297 @@ def analyze_named_instance(text: str):
     return None
 
 
+# ── UNIFIED NAME↔TYPE BINDING — the ONE connector-agnostic named-instance detector ────────────────
+# THE WHY (the THIRD named-instance wall): "a dog named Rex", "a son Alex 19", "my friend Sam",
+# "a server Atlas", "my friend is Sam" are ONE thing — a PROPER NAME is introduced and classified
+# as a common-noun TYPE. ONLY the CONNECTOR varies (the naming verb "named", bare apposition, the
+# copula "is"). Extraction had grown CHAIN-PER-CONSTRUCTION: ``analyze_naming`` keyed on the verb
+# "named"; the appositive/copula forms fell through to garbage (an enumeration "a son Alex, a daughter
+# Robin" yielded the bare role nouns ``son``/``daughter`` as entities, ZERO child_of, ZERO ages,
+# the proper names never created). This detector keys on the (ProperName ↔ common-noun Type) BINDING
+# ITSELF, connector-agnostic, so ALL three forms bind through ONE path — and the DOMAIN (pet vs kid vs
+# server) lives ENTIRELY in METADATA (the kinship cue class + the possession-by-type overlay), never in
+# code. To teach a new connector you ADD a structural shape here; to teach a new domain you GROW a cue
+# row — never a code branch.
+#
+# THE HARD LINE: the PROPER NAME is the INSTANCE (its own entity, filed via also_known_as, NEVER
+# classified into L4); the common noun is its TYPE/classification (instance_of). The relation the
+# instance plays (child_of for a kid, has_pet for a pet, owns for an object, friend/knows for a person)
+# is resolved FROM THE TYPE'S CATEGORY via metadata — the ONLY place domains differ.
+#
+# Subject-agnostic + dependency/morphology-driven. The ONLY closed sets consulted are universal
+# grammatical primitives already used here (the naming-verb cue class for the "named" connector, the
+# ``appos``/``acl``/copula dependencies, the determiner ``det``, the wh-interrogative morphology) plus
+# the DB-grown kinship/possession metadata. It makes NO entity-typing decision (GLiNER2 owns that) and
+# NO final rel choice for non-kin domains (the caller/deriver resolves possession-by-type) — it hands
+# back the grammatical (name, type, connector, age, nickname) roles.
+
+
+@dataclass(frozen=True)
+class NameTypeBinding:
+    """A deterministic reading of ONE (ProperName ↔ common-noun Type) binding, connector-agnostic.
+
+    - ``name``      : the PROPER NAME introduced (surface form, e.g. "Rex", "Alex", "Sam").
+                      The INSTANCE — filed via also_known_as, NEVER classified into L4 (THE HARD LINE).
+    - ``type_noun`` : the common-noun TYPE the name is classified as, lowercased ("dog", "son",
+                      "friend", "server") — its head plus left ``compound``/``amod`` modifiers.
+    - ``connector`` : which grammatical shape bound them — "named" (naming verb), "appos" (bare
+                      apposition), or "copula" ("my friend is Sam"). Diagnostic only; the emitted
+                      edges are identical across connectors.
+    - ``age``       : the bare cardinal NUM in the binding's span, as a STRING ("19"), or ``None``.
+                      Routes to the ``age`` scalar (the unit_scalar bare-number person default).
+    - ``nickname``  : a "<who> goes by <Nick>" nickname run bound to THIS name, surface form
+                      ("Jay"), or ``None``. Registers as a second also_known_as of the instance.
+    - ``possessor_is_self`` : True when the TYPE noun carries a 1st-person possessive ("my son",
+                      "my friend") OR is the object of a 1st-person ``have`` clause ("I have a son
+                      Alex", "we have a daughter Robin") → the relation binds to the user.
+    - ``negated``   : True when a ``neg`` hangs off the binding's clause.
+    """
+    name: str
+    type_noun: str
+    connector: str
+    age: str | None
+    nickname: str | None
+    possessor_is_self: bool
+    negated: bool
+
+
+def _binding_own_relcl(name_tok, type_tok):
+    r"""The relative clause that belongs to THIS binding's NAME ("Jamie who goes by Jay"), or None.
+
+    CRITICAL SCOPING (the sibling-bleed bug): in an enumeration "a son Alex 19, a son Jamie who
+    goes by Jay 12" spaCy nests the 2nd member ("son Jamie …") as an ``appos`` UNDER the 1st
+    member's type head, so the whole subtree of Alex's "son" ALSO contains Jamie's relcl. Scanning
+    that subtree mis-attached Jamie's nickname/age to Alex. The relcl belongs to a binding ONLY
+    when its ``relcl``/``acl`` head IS this binding's own ``type_tok`` (the head the NAME is the
+    appositive of). Returns the relcl verb token whose head == type_tok, else None. Structural."""
+    try:
+        for c in type_tok.children:
+            if c.dep_ in ("relcl", "acl") and c.pos_ == "VERB":
+                return c
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _binding_age_string(name_tok, type_tok):
+    r"""The bare cardinal NUM that scopes THIS named-instance binding ("a son Alex 19" → "19"), or
+    None. SCOPED to the binding's own region (never a sibling's number — see ``_binding_own_relcl``):
+    the age is a ``nummod`` whose head is the NAME ("Alex 19"), or — in the nickname construction
+    ("Jamie who goes by Jay 12") — a ``nummod`` inside THIS binding's OWN relcl (head=type_tok),
+    typically on the nickname pobj. A NUM that quantifies the TYPE head itself ("three children") is a
+    count, not an age, and is excluded. Structural, no number zoo. Fail-safe → None."""
+    try:
+        # (a) direct: a cardinal nummod of the NAME token ("Alex 19").
+        for d in name_tok.children:
+            if d.pos_ == "NUM" and d.dep_ == "nummod":
+                txt = (d.text or "").strip()
+                if txt:
+                    return txt
+        # (b) nickname case: a cardinal nummod inside THIS binding's own relcl (head=type_tok),
+        #     e.g. "Jay 12" where 12 is nummod of the nickname pobj — scoped to the OWN relcl only.
+        relcl = _binding_own_relcl(name_tok, type_tok)
+        if relcl is not None:
+            for d in relcl.subtree:
+                if d.pos_ == "NUM" and d.dep_ == "nummod" and (
+                        d.head is None or d.head.i != type_tok.i):
+                    txt = (d.text or "").strip()
+                    if txt:
+                        return txt
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _binding_nickname(name_tok, type_tok):
+    r"""A "<who> goes by <Nick>" nickname bound to THIS named instance ("Jamie who goes by Jay"), or
+    None. SCOPED to the binding's OWN relcl (head=type_tok — see ``_binding_own_relcl``) so a sibling's
+    nickname never bleeds onto this name. spaCy parses the relative clause's ``go`` verb with head =
+    the TYPE noun the NAME is the appositive of; the nickname is the ``pobj`` of the ``by`` prep. We
+    accept it when THIS binding's own relcl is a ``go``-lemma verb governing a ``by`` prep with a
+    PROPN/NOUN pobj that is NOT the bound name. Structural (dependency + the surface preposition "by"),
+    NO nickname word-list. Fail-safe → None."""
+    try:
+        relcl = _binding_own_relcl(name_tok, type_tok)
+        if relcl is None or (relcl.lemma_ or "").strip().lower() != "go":
+            return None
+        for c in relcl.children:
+            if c.dep_ == "prep" and (c.text or "").strip().lower() == "by":
+                pobj = next((g for g in c.children
+                             if g.dep_ == "pobj" and g.pos_ in ("PROPN", "NOUN")), None)
+                if pobj is not None:
+                    nick = (pobj.text or "").strip()
+                    if nick and nick.lower() != (name_tok.text or "").strip().lower():
+                        return nick
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _bound_name_for_type(type_tok, _naming):
+    r"""Find the PROPER NAME bound to a common-noun TYPE head via ANY connector. Returns
+    ``(name_tok, connector)`` or ``(None, None)``. THE ONE connector-agnostic binding rule:
+
+      (1) APPOSITION   — a ``appos`` child that is a PROPN (or a NOUN the sm model mis-tagged) with NO
+                         determiner of its own ("a son Alex", "a dog Rex", "my friend Sam").
+                         A determiner-introduced appositive ("a son, a doctor") is a TYPE apposition,
+                         not a name → rejected.
+      (2) NAMING VERB  — an ``acl``/``relcl`` naming-verb child ("dog named Rex") whose
+                         ``oprd``/``attr``/``dobj`` is a PROPN ("Rex").
+      (3) COPULA       — the type is the ``nsubj`` of a copula ``be`` whose ``attr``/``oprd`` is a
+                         PROPN with no determiner ("my friend is Sam").
+
+    A determiner-introduced common-noun complement is never a name (it's a type); the wh-interrogative
+    is excluded. Structural + the naming-verb cue class only; subject-agnostic, no name word-list."""
+    # (1) apposition
+    for c in type_tok.children:
+        if c.dep_ != "appos" or c.pos_ not in ("PROPN", "NOUN"):
+            continue
+        if any(g.dep_ == "det" for g in c.children):
+            continue  # "a son, a doctor" — type apposition, not a name
+        try:
+            if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        return c, "appos"
+    # (2) naming verb (reduced relative "dog named Rex")
+    for c in type_tok.children:
+        if c.dep_ not in ("acl", "relcl", "vfin"):
+            continue
+        if (c.lemma_ or "").strip().lower() not in _naming or c.pos_ not in ("VERB", "AUX"):
+            continue
+        proper = next((g for g in c.children
+                       if g.dep_ in ("oprd", "attr", "dobj", "obj") and g.pos_ == "PROPN"), None)
+        if proper is not None:
+            return proper, "named"
+    # (3) copula "my friend is Sam" — the type is the nsubj of a copula whose complement is a NAME.
+    #     Casing-robust: the sm model may tag a person name as NOUN ("Sam" → NOUN); we accept a
+    #     NOUN complement as a NAME *only* when (a) the subject role is 1st-person POSSESSED ("my
+    #     friend"/"my sister" — a user-anchored role, the same gate _chain_copula_name uses) AND (b)
+    #     the complement is NOT determiner-introduced (a det → "is a poodle" is a TYPE, owned
+    #     elsewhere). A bare PROPN complement is always accepted. This never over-captures "the printer
+    #     is Atlas"-style non-possessed subjects (no 1st-person poss → NOUN complement rejected).
+    if type_tok.dep_ in ("nsubj", "nsubjpass"):
+        head = type_tok.head
+        if head is not None and head.lemma_ == "be" and head.pos_ == "AUX":
+            _self_poss = any(
+                c.dep_ == "poss" and c.morph.get("Person") == ["1"] and "Yes" in c.morph.get("Poss")
+                for c in type_tok.children
+            )
+            for c in head.children:
+                if c.dep_ not in ("attr", "oprd", "dobj", "obj"):
+                    continue
+                if c.pos_ == "PROPN":
+                    pass
+                elif c.pos_ == "NOUN" and _self_poss:
+                    pass  # casing-robust: a possessed-role copula's NOUN complement is the name
+                else:
+                    continue
+                if any(g.dep_ == "det" for g in c.children):
+                    continue  # "is a poodle" — det-introduced type, not a name
+                try:
+                    if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                return c, "copula"
+    return None, None
+
+
+def _type_is_self_possessed(type_tok):
+    r"""Does the TYPE noun belong to the speaker — "my son" / "I have a son …" / "we have a daughter"?
+
+    True when (a) the type noun carries a 1st-person possessive determiner ("my"/"our" — Person=1 ∧
+    Poss=Yes), OR (b) it is governed (dobj / appos-chain / npadvmod) by a 1st-person ``have`` clause
+    ("I have a son Alex", "we have a daughter Robin" — the enumerated members all hang off the
+    ``have`` object). Grammatical (morphology + the ``have`` lemma + a 1st-person personal-pronoun
+    subject), NOT a token list. Fail-safe → False (no possession edge minted; the type/name structure
+    still stands)."""
+    try:
+        for c in type_tok.children:
+            if (c.dep_ == "poss" and c.morph.get("Person") == ["1"]
+                    and "Yes" in c.morph.get("Poss")):
+                return True
+        # climb to a governing ``have`` whose subject is a 1st-person personal pronoun.
+        cur = type_tok
+        hops = 0
+        while cur is not None and hops < 8:
+            h = cur.head
+            if h is None or h.i == cur.i:
+                break
+            if (h.lemma_ or "").strip().lower() == "have" and h.pos_ in ("VERB", "AUX"):
+                subj = next((s for s in h.children if s.dep_ in ("nsubj", "nsubjpass")), None)
+                if subj is not None and _is_first_person_personal_pronoun(subj):
+                    return True
+                break
+            cur = h
+            hops += 1
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def analyze_name_type_bindings(text):
+    r"""Deterministic reading of EVERY (ProperName ↔ common-noun Type) binding in ``text``, across ALL
+    connectors (naming verb / apposition / copula). Returns ``list[NameTypeBinding]`` (possibly empty).
+
+    THE ONE connector-agnostic detector (replaces the chain-per-construction sprawl): for each common-
+    noun TYPE head, ``_bound_name_for_type`` recovers the PROPER NAME bound to it by ANY connector; then
+    the age (a cardinal in the binding's span), the nickname ("goes by Jay"), the possessor (self via
+    "my"/"I have"), and negation are read structurally. A comma-and enumeration ("a son Alex 19, a
+    daughter Robin 10, a dog named Rex, a friend Sam") yields ONE binding per member — every
+    construction binds, never just the first.
+
+    ``text`` may be a ``str`` OR an already-parsed (and possibly GLiNER2-typed) spaCy ``Doc`` — the
+    deriver passes its built Doc so the detector reads the SAME parse (and ``token.ent_type_``); a
+    ``str`` is parsed internally. Subject-agnostic, GLiNER2-pure, metadata-driven. Makes NO entity-
+    typing or final rel choice for non-kin domains; the caller maps roles → instance_of / also_known_as
+    / kin-or-possession / scalar. Deterministic, fail-safe: parse miss / any failure → ``[]``."""
+    if text is None:
+        return []
+    if isinstance(text, str):
+        doc = _parse(text)
+    else:
+        doc = text  # already a parsed (typed) Doc
+    if doc is None:
+        return []
+    out: list = []
+    try:
+        _naming = _naming_verbs()
+        _seen: set = set()
+        for type_tok in doc:
+            if type_tok.pos_ != "NOUN":
+                continue  # the TYPE is a common noun (son/dog/friend); a PROPN head is itself a name
+            name_tok, connector = _bound_name_for_type(type_tok, _naming)
+            if name_tok is None:
+                continue
+            type_noun = _np_phrase(type_tok)
+            name = (name_tok.text or "").strip()
+            if not type_noun or not name or name.lower() == type_noun:
+                continue
+            _key = (name.lower(), type_noun)
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            negated = (any(c.dep_ == "neg" for c in type_tok.children)
+                       or (type_tok.head is not None
+                           and any(c.dep_ == "neg" for c in type_tok.head.children)))
+            out.append(NameTypeBinding(
+                name=name,
+                type_noun=type_noun,
+                connector=connector,
+                age=_binding_age_string(name_tok, type_tok),
+                nickname=_binding_nickname(name_tok, type_tok),
+                possessor_is_self=_type_is_self_possessed(type_tok),
+                negated=bool(negated),
+            ))
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        log.warning("linguistics.analyze_name_type_bindings_failed", error=str(e)[:160])
+        return []
+    return out
+
+
 # ── SVO MERGE GRAMMAR — the assembly-line backbone (GLiNER2 entity + spaCy verb + self-ref) ──
 # THE WHY (the diagnosed capture wall, 1/10): the three good components run SEPARATELY and never
 # MERGE. GLiNER2 cleanly TYPES the object entity ("Samsung Galaxy S22"); spaCy cleanly parses the
@@ -3071,6 +3362,116 @@ def _unit_scalar_map() -> dict:
             return {}
 
 
+def _kinship_gender_map() -> dict:
+    """Resolve the per-tenant kinship-noun → gender MAP via the overlay (the kinship_gender rows'
+    ``description`` column: {noun: gender}). The gender a kin role INTRINSICALLY carries ("son" →
+    male, "daughter" → female); a GENDER-NEUTRAL role (child/parent/sibling/spouse/partner/cousin) is
+    ABSENT so no gender is fabricated. Metadata-driven, NOT an in-code literal. Used by the unified
+    named-instance binding chain to mint the SCALAR ``has_gender`` edge. Fail-safe: any failure /
+    empty → the ``_BOOTSTRAP_KINSHIP_GENDER_MAP`` code-fallback seed. Mirrors ``_unit_scalar_map()``."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        m = linguistic_cue_overlay.resolve_kinship_gender_map(dsn)
+        if m:
+            return m
+        return dict(linguistic_cue_overlay._BOOTSTRAP_KINSHIP_GENDER_MAP)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.kinship_gender_map_resolve_failed", error=str(e)[:160])
+        try:
+            from src.api import linguistic_cue_overlay
+            return dict(linguistic_cue_overlay._BOOTSTRAP_KINSHIP_GENDER_MAP)
+        except Exception:  # noqa: BLE001
+            return {}
+
+
+def _social_role_map() -> dict:
+    """Resolve the per-tenant social-role-noun → rel_type MAP via the overlay (the social_role rows'
+    ``description``: {noun: rel_type}). A PERSON social role (friend → friend_of, colleague → knows)
+    the named-instance binding chain uses so a person introduced by a social role binds to a SOCIAL
+    rel, never ``owns`` (a person is not owned) nor a bare ``has_role``. Metadata-driven, NOT an
+    in-code literal. Fail-safe: any failure / empty → the ``_BOOTSTRAP_SOCIAL_ROLE_MAP`` code-fallback
+    seed. Mirrors ``_kinship_gender_map()``."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        m = linguistic_cue_overlay.resolve_social_role_map(dsn)
+        if m:
+            return m
+        return dict(linguistic_cue_overlay._BOOTSTRAP_SOCIAL_ROLE_MAP)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.social_role_map_resolve_failed", error=str(e)[:160])
+        try:
+            from src.api import linguistic_cue_overlay
+            return dict(linguistic_cue_overlay._BOOTSTRAP_SOCIAL_ROLE_MAP)
+        except Exception:  # noqa: BLE001
+            return {}
+
+
+def _possession_rel_for_type(type_lemma: str | None, instance_type_tag: str | None = None) -> str:
+    """Resolve the POSSESSION rel_type that fits a common-noun TYPE, metadata-driven — the deriver-side
+    twin of ``main._possession_rel_for_head_type`` (the SAME selection-by-metadata-specificity, reading
+    the SAME rel_types overlay), kept here so the deriver stays self-contained (it cannot import main).
+
+    "a dog named Rex" → the TYPE "dog" is an ANIMAL → the pet relation (``has_pet``); "a server
+    Atlas" → "server" is an OBJECT → generic ownership (``owns``). We do NOT hardcode ``if
+    type=='Animal'``: we scan the rel_types overlay for an ownership-CLASS rel (head admits Person/ANY)
+    whose ``tail_types`` ADMIT this type, and pick the MOST SPECIFIC (a concrete tail match beats an
+    ANY catch-all; among concretes the narrowest tail_types wins, so ``has_pet={Animal}`` beats
+    ``owns={Animal,Object,…}`` for an animal). The TYPE's entity-class is recovered WITHOUT a GLiNER2
+    injection: ``instance_type_tag`` (the NER label the binding's PROPER NAME carried — a named Animal
+    instance ⟹ its kind is an animal kind), else the thin-type slot tag. Default → ``owns`` (the
+    generic possession the WGM gate itself upgrades to has_pet if the object grounds Animal). Fail-safe:
+    unknown type / metadata unreadable / any failure → ``owns``. Subject-agnostic, NO type list."""
+    et = (instance_type_tag or "").strip().upper()
+    if not et and type_lemma:
+        # the thin-type slot tag for the bare type noun (gps system→device); a weak fallback only.
+        et = (_thin_type_map().get((type_lemma or "").strip().lower()) or "").strip().upper()
+    if not et:
+        return "owns"
+    try:
+        from src.api import rel_type_overlay
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        if not dsn:
+            return "owns"
+        meta = rel_type_overlay.resolve_current(dsn)
+        if not isinstance(meta, dict):
+            return "owns"
+        # POSSESSION-CLASS ANCHOR (class identification by canonical membership — NOT domain logic):
+        # we choose AMONG possession rels, so the class is named by its canonical seed members. This
+        # keeps affective/preference rels whose tail merely overlaps out of the running.
+        _POSSESSION_CLASS = ("owns", "has_pet")
+        _best = None
+        _best_specific = False
+        _best_tail_width = None
+        for _rt, _row in meta.items():
+            if not isinstance(_row, dict) or _rt not in _POSSESSION_CLASS:
+                continue
+            if _row.get("is_hierarchy_rel"):
+                continue
+            _ht = [(_h or "").strip().upper() for _h in (_row.get("head_types") or [])]
+            _tt = [(_t or "").strip().upper() for _t in (_row.get("tail_types") or [])]
+            if not _tt:
+                continue
+            if not ((not _ht) or "ANY" in _ht or "PERSON" in _ht):
+                continue
+            _tail_specific = et in _tt
+            _tail_any = "ANY" in _tt
+            if not (_tail_specific or _tail_any):
+                continue
+            _tail_width = len([_t for _t in _tt if _t != "ANY"]) or len(_tt)
+            if _tail_specific:
+                if (not _best_specific) or (_best_tail_width is None or _tail_width < _best_tail_width):
+                    _best, _best_specific, _best_tail_width = _rt, True, _tail_width
+            elif _best is None:
+                _best, _best_tail_width = _rt, _tail_width
+        if _best:
+            return _best
+    except Exception as e:  # noqa: BLE001 — fail-safe: never break the deriver
+        log.warning("linguistics.possession_rel_for_type_failed", error=str(e)[:160])
+    return "owns"
+
+
 def _inherent_relation_for_noun(noun_lemma: str) -> str:
     """Pick the inherent relation a RELATIONAL noun carries: kinship → the SPECIFIC kin rel_type from
     the per-tenant ``kinship_noun`` cue-class METADATA (the row's ``description``: mother→parent_of,
@@ -3502,6 +3903,47 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             return None
         return None
 
+    # ── NAMED-INSTANCE SUPPRESSION SET (the unified binding chain OWNS these spans) ───────────────
+    # When the unified name↔type binding chain owns a clause ("a son Alex 19", "a dog named Rex"),
+    # the bare TYPE noun (son/dog/friend), the enclosing COLLECTIVE governing it ("children" in "we
+    # have three children …"), and the nickname relative-clause ("who goes by Jay") are all CONSUMED by
+    # that chain — they must NOT also be read by the SVO / appositive / intransitive chains as their own
+    # facts (else "(user, have, children)", "(son, has_role, daughter)", "(who, has_state, go)" junk).
+    # We compute the suppressed token-index set ONCE here (flag-gated, fail-safe → empty) so every other
+    # chain can skip a token whose ``.i`` is in it. Structural + the bindings; subject-agnostic.
+    _ni_suppress: set = set()
+    if SPINE_NAMING_CHAIN:
+        try:
+            _binds = analyze_name_type_bindings(doc)
+            if _binds:
+                _bound_type_heads = {(_b.type_noun.split()[-1] if _b.type_noun else "")
+                                     for _b in _binds if _b and not _b.negated}
+                _bound_type_heads.discard("")
+                for _t in doc:
+                    _tl = (_t.text or "").strip().lower()
+                    # the bare TYPE noun (each occurrence in an enumeration)
+                    if _t.pos_ == "NOUN" and _tl in _bound_type_heads:
+                        _ni_suppress.add(_t.i)
+                    # a 1st-person ``have`` clause's verb + its collective dobj that heads the members
+                    if (_t.lemma_ or "").strip().lower() == "have" and _t.pos_ in ("VERB", "AUX"):
+                        _sj = next((s for s in _t.children
+                                    if s.dep_ in ("nsubj", "nsubjpass")), None)
+                        if _sj is not None and _is_first_person_personal_pronoun(_sj):
+                            _ni_suppress.add(_t.i)  # the "have" verb (SVO would mint user-have-X)
+                            for _c in _t.children:
+                                if _c.dep_ in ("dobj", "obj") and _c.pos_ == "NOUN" and (
+                                        any(_g.dep_ in ("appos", "conj") for _g in _c.children)):
+                                    _ni_suppress.add(_c.i)
+                    # the nickname relative clause "who goes by Sam" (the ``go`` verb + its subtree)
+                    if (_t.lemma_ or "").strip().lower() == "go" and _t.pos_ == "VERB" and \
+                            _t.dep_ in ("relcl", "acl"):
+                        if any(_c.dep_ == "prep" and (_c.text or "").strip().lower() == "by"
+                               for _c in _t.children):
+                            for _d in _t.subtree:
+                                _ni_suppress.add(_d.i)
+        except Exception:  # noqa: BLE001 — fail-safe: suppression is best-effort, never blocks capture
+            _ni_suppress = set()
+
     # ── CAPTURE CHAINS (gap-2 §10.1) ─────────────────────────────────────────────────────────────
     # The deriver is NOT a fixed sequence of capture rules. Each capture chain is a self-contained
     # match-condition + builder: it walks the parse and, wherever its GRAMMATICAL SHAPE (and/or a
@@ -3523,6 +3965,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.pos_ != "VERB":
                 continue
+            if tok.i in _ni_suppress:
+                continue  # the named-instance chain owns this clause's verb ("we have a son …")
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -3566,6 +4010,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if obj_tok is None:
                 continue
             for _ct in _np_conjuncts(obj_tok):  # conjunct/dash-list distribution
+                if _ct.i in _ni_suppress:
+                    continue  # a named-instance collective/type the binding chain owns
                 obj_phrase = _np_phrase(_ct)
                 if not obj_phrase or len(obj_phrase) < 2:
                     continue
@@ -3601,6 +4047,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.pos_ != "VERB":
                 continue
+            if tok.i in _ni_suppress:
+                continue  # the named-instance nickname relcl ("who goes by Sam") — not a state
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -3688,6 +4136,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             head = tok.head
             if head is None or head.pos_ not in ("NOUN", "PROPN"):
+                continue
+            # NAMED-INSTANCE GUARD: "My dog Rex is a poodle" — "dog" is a bound TYPE (Rex is its
+            # appositive name) owned by the named-instance chain, NOT an ``owns`` of a bare type. Skip a
+            # possessed head whose token the named-instance chain suppressed (else "(user, owns, dog)").
+            if head.i in _ni_suppress:
                 continue
             # INTERPLAY GUARD (Fix 2): the "X's name is Y" naming construction is owned by the
             # GENITIVE-NAME chain (it binds Y as the person + attaches the kin relation there). The
@@ -4370,9 +4823,160 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _emit(subject, predicate, obj_phrase,
                       verb_tok=svo_head, obj_tok=member, subj_tok=subj_tok)
 
+    def _chain_named_instance(doc):
+        # UNIFIED NAME↔TYPE BINDING (the ONE connector-agnostic named-instance chain). For EACH
+        # (ProperName ↔ common-noun Type) binding the detector finds — across ALL connectors (naming
+        # verb / apposition / copula) — emit the SAME canonical edge set, with the RELATION resolved
+        # FROM THE TYPE'S CATEGORY via METADATA (the ONLY place domains differ):
+        #   1. (name, instance_of, type)            — the name IS-AN-INSTANCE of its type (THE HARD LINE
+        #                                              files the name AT the type place; never the
+        #                                              reverse, never the name into L4).
+        #   2. (name, also_known_as, <Name>)        — the proper name in the NAMING layer (user memory).
+        #   3a. KINSHIP type → (name, <kin>, user)  — the specific kin rel from the kinship_noun cue map
+        #       + (name, has_gender, <gender>)         + the gender from the kinship_gender cue map
+        #                                              (son→child_of+male, daughter→child_of+female).
+        #   3b. NON-kin self-possessed → (user, <poss>, name) — the possession rel that fits the type
+        #                                              (has_pet for an animal, owns for an object) via
+        #                                              the rel_types overlay (_possession_rel_for_type).
+        #   3c. NON-kin, NOT self-possessed person/role → (name, has_role, type) — a generic role slot.
+        #   4. age scalar (name, age, "19")         — the bare cardinal in the binding's span.
+        #   5. nickname (name, also_known_as, Sam)  — a "goes by Sam" run.
+        #   6. SUPPRESS the bare TYPE noun (son/daughter/dog/children) from becoming a standalone entity
+        #      (claim it) once the named instance binds — the role is a CLASSIFICATION, not a thing.
+        # Gated behind SPINE_NAMING_CHAIN (parity with the sibling naming chains); subject-agnostic,
+        # kin/gender/possession all metadata-driven, grammatical. The proper name BECOMES the subject
+        # surface (lowercased) so every edge hangs off the ONE instance entity the registry grounds.
+        if not SPINE_NAMING_CHAIN:
+            return
+        try:
+            _bindings = analyze_name_type_bindings(doc)
+        except Exception:  # noqa: BLE001 — fail-safe
+            _bindings = []
+        _kin_set = _kinship_nouns()
+        _gender_map = _kinship_gender_map()
+        _social_map = _social_role_map()
+        for b in (_bindings or []):
+            if b is None or b.negated:
+                continue
+            name_key = (b.name or "").strip().lower()
+            type_noun = (b.type_noun or "").strip().lower()
+            type_head = (type_noun.split()[-1] if type_noun else "")
+            if not name_key or not type_noun or name_key == type_noun:
+                continue
+            # Object-type tag for the instance: the GLiNER2 type seeded onto the proper-name token
+            # (native), else None — passed to the possession resolver (NO GLiNER2 injection).
+            _name_ner = None
+            try:
+                for _ent in getattr(doc, "ents", []) or []:
+                    if (_ent.text or "").strip().lower() == name_key and _ent.label_:
+                        _name_ner = _ent.label_.upper()
+                        break
+            except Exception:  # noqa: BLE001
+                _name_ner = None
+            # 1. the name IS-AN-INSTANCE of its type. (name as subject surface; THE HARD LINE.)
+            _emit(name_key, "instance_of", type_noun, subj_tok=None, obj_tok=None)
+            # 2. the proper name in the naming layer (also_known_as). A self-edge (subj==obj) is
+            #    rejected by _emit, so we register the SURFACE-cased name as the alias via the subject
+            #    surface itself (the registry files it at ingest) — emit only when it adds an alias arc.
+            if b.name and b.name.strip().lower() != name_key:
+                _emit(name_key, "also_known_as", b.name.strip(), subj_tok=None, obj_tok=None)
+            # 3. the relation from the TYPE'S CATEGORY (the only place domains differ) — metadata.
+            #    Resolution order (each layer is DB-grown metadata, NO domain literal in code):
+            #      (a) KINSHIP type → the specific kin rel + the intrinsic gender (son→child_of+male).
+            #      (b) SOCIAL person-role type → the social rel (friend→friend_of) — a PERSON is never
+            #          ``owns``; the social tie binds to the speaker (the self-ref).
+            #      (c) self-possessed NON-person type → the possession rel that fits the type
+            #          (animal→has_pet, object→owns) via the rel_types overlay.
+            #      (d) else → a generic ``has_role`` slot anchored at the named instance.
+            _social_rel = _social_map.get(type_head)
+            if type_head in _kin_set:
+                _kin = _inherent_relation_for_noun(type_head)
+                _emit(name_key, _kin, "user", subj_tok=None, obj_tok=None)
+                _gender = _gender_map.get(type_head)
+                if _gender:
+                    # has_gender carries tail_types={SCALAR} → routes to entity_attributes (STRING).
+                    _emit(name_key, "has_gender", _gender, subj_tok=None, obj_tok=None)
+            elif _social_rel:
+                # a PERSON social role → the social tie to the speaker (friend_of / knows). Never owns.
+                _emit(name_key, _social_rel, "user", subj_tok=None, obj_tok=None)
+            elif b.possessor_is_self:
+                _poss = _possession_rel_for_type(type_head, instance_type_tag=_name_ner)
+                _emit("user", _poss, name_key, subj_tok=None, obj_tok=None)
+            # ELSE (non-kin, non-social, NOT self-possessed — "a server named Atlas" stated
+            # without a possessor): the ``instance_of`` classification already files the instance; we
+            # mint NO possession/role edge (there is no stated relation to bind). A determiner-
+            # introduced person-role apposition ("Rachel, a doctor") never reaches THIS chain (it is a
+            # TYPE apposition, rejected by the binding detector) — it is owned by ``_chain_appositive``
+            # which mints its ``has_role``. So no generic role slot is fabricated here.
+            # 4. age scalar (the bare cardinal in the binding's span) → the age rel (tail_types=SCALAR).
+            if b.age:
+                _emit(name_key, "age", b.age, subj_tok=None, obj_tok=None)
+            # 5. nickname → a second also_known_as of the instance ("Jamie … goes by Jay").
+            if b.nickname and b.nickname.strip().lower() != name_key:
+                _emit(name_key, "also_known_as", b.nickname.strip(), subj_tok=None, obj_tok=None)
+            # 6. SUPPRESS the bare TYPE noun + CLAIM the PROPER NAME so neither leaks/false-flags. The
+            #    type role is a CLASSIFICATION the named instance is filed at, not a thing (claim the
+            #    type head token[s] by surface match — an enumeration repeats "son", claiming all is
+            #    correct). The PROPER NAME tokens are CONSUMED by this binding (instance_of/alias/rel)
+            #    so the residue guard must not log_crit them as uncovered content. The enclosing
+            #    collective ("children") is claimed by _claim_named_instance_collectives.
+            try:
+                for _t in doc:
+                    _tl = (_t.text or "").strip().lower()
+                    if _t.pos_ == "NOUN" and _tl == type_head:
+                        _claim(_t)
+                    if _t.pos_ in ("PROPN", "NOUN") and _tl == name_key:
+                        _claim(_t)
+                    # the nickname proper noun (also consumed by the alias edge)
+                    if b.nickname and _t.pos_ in ("PROPN", "NOUN") and \
+                            _tl == b.nickname.strip().lower():
+                        _claim(_t)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _claim_named_instance_collectives(doc):
+        # Companion to _chain_named_instance: once at least one named instance has bound, SUPPRESS a
+        # bare COLLECTIVE head ("children" in "We have three children together, a son …") that is the
+        # dobj of a 1st-person ``have`` and whose appositive members are the bound named instances — so
+        # the collective never leaks as a standalone entity. Structural (have + dobj + appos members),
+        # NO collective-noun word-list. Only runs when SPINE_NAMING_CHAIN and a binding exists.
+        if not SPINE_NAMING_CHAIN:
+            return
+        try:
+            if not analyze_name_type_bindings(doc):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        for tok in doc:
+            if (tok.lemma_ or "").strip().lower() != "have" or tok.pos_ not in ("VERB", "AUX"):
+                continue
+            subj = next((s for s in tok.children if s.dep_ in ("nsubj", "nsubjpass")), None)
+            if subj is None or not _is_first_person_personal_pronoun(subj):
+                continue
+            for c in tok.children:
+                if c.dep_ in ("dobj", "obj") and c.pos_ == "NOUN":
+                    # the collective is suppressed only if it heads an appositive named instance
+                    # (its members are the bound names) — otherwise "I have a car" stays a real object.
+                    if any(g.dep_ == "appos" and g.pos_ in ("PROPN", "NOUN") for g in c.children) or \
+                       any(g.dep_ in ("appos", "conj") for g in c.children):
+                        _claim(c)
+
     def _chain_appositive(doc):
         # APPOSITIVE → has_role. "Rachel, a real estate agent" → (rachel, has_role, real estate agent).
         # COMMON-noun role only (NOUN appos head); a PROPN appositive is an alias, not a role.
+        # NAMED-INSTANCE GUARD (flag-gated): when the unified named-instance chain OWNS this clause (a
+        # ProperName↔Type binding is present), the appositive role-noun ("son"/"daughter") is the TYPE
+        # the named instance is filed at — NOT a standalone "X has_role son" fact. Skip an appos whose
+        # HEAD is the bound PROPER NAME (the named-instance chain already minted instance_of/kin), so we
+        # never double-capture the role as a generic has_role. Structural, subject-agnostic.
+        _owned_name_keys = set()
+        if SPINE_NAMING_CHAIN:
+            try:
+                for _b in (analyze_name_type_bindings(doc) or []):
+                    if _b and not _b.negated and _b.name:
+                        _owned_name_keys.add(_b.name.strip().lower())
+            except Exception:  # noqa: BLE001
+                _owned_name_keys = set()
         for tok in doc:
             if tok.dep_ != "appos":
                 continue
@@ -4381,9 +4985,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if tok.pos_ != "NOUN":
                 continue
+            # the named-instance chain owns the bound TYPE nouns (son/daughter/dog) — an appos whose
+            # HEAD or whose own token is a suppressed bound type is NOT a generic has_role fact
+            # ("a son Alex, a daughter …" parses daughter as appos of son: both are bound types).
+            if tok.i in _ni_suppress or head.i in _ni_suppress:
+                continue
             role = _np_phrase(tok)
             named = (head.text or head.lemma_ or "").strip().lower()
             if not role or not named or role == named or len(role) < 2:
+                continue
+            # the named-instance chain owns "a son Alex" (Alex is the appos PROPN of son); here we
+            # only reach a NOUN appos. If the HEAD is a bound proper name, the role is its type — skip.
+            if named in _owned_name_keys:
                 continue
             _emit(named, "has_role", role, obj_tok=tok, subj_tok=head)
 
@@ -4402,7 +5015,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         (_chain_dash_specifier,) if dash_specifier_only else
         (_chain_svo, _chain_intransitive, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
-         _chain_copula_measure, _chain_dash_specifier, _chain_appositive)
+         _chain_copula_measure, _chain_dash_specifier,
+         _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
 
     try:
