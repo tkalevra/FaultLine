@@ -30597,6 +30597,61 @@ def _negate_prose(prose: str) -> str:
 # existing template path (shape 5: ENTITY/DEFAULT — spouse/friend_of/feels/
 # favourite_colour already read clean and must NOT be disturbed).
 # ──────────────────────────────────────────────────────────────────────────────
+_INFLECT_ENGINE = None
+try:  # pragma: no cover — optional, correct-by-library when present
+    import inflect as _inflect_mod
+    _INFLECT_ENGINE = _inflect_mod.engine()
+except Exception:  # noqa: BLE001 — not installed → deterministic letter-phonetics fallback
+    _INFLECT_ENGINE = None
+
+
+def _indefinite_article(word: str | None) -> str:
+    """Pick "a"/"an" for `word`. Prefers `inflect` (correct phonetic ruleset) when it is
+    installed; otherwise applies ONE genuine rule: an INITIALISM read letter-by-letter
+    takes its article from the FIRST LETTER's NAME sound (a closed, finite property of
+    the 26 letters — not a word-zoo), and everything else falls back to the vowel-LETTER
+    test.
+
+    The rule is needed because FaultLine's networking domain is acronym-soup: a bare
+    vowel-LETTER test gives "a IP"/"a SSD"/"a FQDN" — wrong, because the LETTER-NAMES
+    (eye-pee, ess-ess-dee, eff-…) start with a vowel SOUND. The 26 letter-names are a
+    fixed alphabet property, so this is a rule, not an enumerated lexicon. We do NOT try
+    to hand-roll the silent-h / /juː/ ordinary-word exceptions (hour, university, …) —
+    those are genuinely lexical and belong to `inflect`, not a brittle in-code list; the
+    vowel-letter fallback is the honest best-effort there. Article is prose polish only —
+    it is NOT a det-scorer gold token (type + name carry the score).
+    """
+    if not word:
+        return "a"
+    w = word.strip()
+    if not w:
+        return "a"
+
+    import re as _re
+    # ── (1) INITIALISM rule FIRST (authoritative for FaultLine's acronym-soup) ──
+    # An all-caps token read letter-by-letter (FQDN, IP, SSD, SLA, URL, 5G, A-record,
+    # optionally with digits/dots/hyphens). Article = the SOUND of the FIRST LETTER's
+    # NAME, a closed property of the 26-letter alphabet (a rule, not a word-zoo). This
+    # MUST precede inflect, which mis-reads spoken initialisms ("an URL"/"a SLA"):
+    #   vowel-SOUND letter-names → "an":  E(ee) F(eff) H(aitch) I(eye) L(ell) M(em)
+    #                                     N(en) O(oh) R(ar) S(ess) X(ex)
+    #   consonant-SOUND letter-names → "a": A(ay /eɪ/), U(you /juː/), and the rest
+    #                                       (B,C,D,G,J,K,P,Q,T,V,W,Y,Z).
+    if _re.fullmatch(r'[A-Z][A-Z0-9.\-]*', w) and len(_re.sub(r'[^A-Za-z]', '', w)) >= 1:
+        first = w[0].lower()
+        return "an" if first in {"e", "f", "h", "i", "l", "m", "n",
+                                 "o", "r", "s", "x"} else "a"
+
+    # ── (2) ORDINARY WORD → inflect (correct phonetic ruleset: hour/honest→an,
+    # university/unicorn/one→a, X-ray→an) when installed; else vowel-LETTER fallback.
+    if _INFLECT_ENGINE is not None:
+        try:
+            return _INFLECT_ENGINE.a(w).split(" ", 1)[0].lower()
+        except Exception:  # noqa: BLE001 — fall through to vowel-letter
+            pass
+    return "an" if w[0].lower() in "aeiou" else "a"
+
+
 def _extract_template_verb(template: str | None, subject_placeholder: str = "X") -> str | None:
     """Parse the head VERB generically from a rel's natural_language template/label.
 
@@ -30674,8 +30729,8 @@ def _compose_object_clause(
             _src = template_2p if (subject_is_you and template_2p) else template
             _has_type_paren = bool(_src and _re.search(r'\(\s*type\s*\)', _src, flags=_re.IGNORECASE))
             if _has_type_paren or not _src:
-                # Type-cast canonical reading: article by leading vowel, parenthetical gone.
-                _art = "an" if object_name[:1].lower() in "aeiou" else "a"
+                # Type-cast canonical reading: sound-aware article, parenthetical gone.
+                _art = _indefinite_article(object_name)
                 return "%s is %s %s" % (subject_name, _art, object_name)
             # Non type-cast hierarchy (subclass_of/part_of/member_of): parse the
             # connector between the placeholders verbatim (drop any parenthetical).
@@ -30699,14 +30754,105 @@ def _compose_object_clause(
         if (object_is_uuid and object_name and object_name != "you"
                 and not is_hier and named_type_name
                 and named_type_name.lower() != object_name.lower()):
+            # SYMMETRIC guard: a symmetric rel (spouse/sibling_of/…) has no possessive
+            # reading — "you have a wife named Jordan" / the verb-less "you and a wife
+            # named Jordan" both read wrong. Render the relationship NATURALLY anchor-
+            # first using the object's OWN type word as the role noun: "<Name> is your
+            # <Type>" ("Jordan is your wife"). ZERO kin literals — the role is the
+            # object's instance_of TYPE (data). Only when the subject is the anchor
+            # ("you"); otherwise fall through to the possessive shape below.
+            if bool(rel_meta.get("is_symmetric")) and subject_is_you:
+                return "%s is your %s" % (object_name, named_type_name)
             verb = (_extract_template_verb(template_2p, "You") if (subject_is_you and template_2p)
                     else _extract_template_verb(template, "X"))
             if verb:
-                return "%s %s a %s named %s" % (subject_name, verb, named_type_name, object_name)
+                # POSSESSIVE-VERB normalization: the named-instance shape ("a <Type>
+                # named <Name>") is a POSSESSIVE construction. A rel whose template verb
+                # is a copula (parent_of → "You ARE the parent of Y") would render the
+                # WRONG perspective here — "you are a son named Quinn" makes the USER the
+                # son. When the named instance is on the OBJECT side and the parsed verb
+                # is a copula, substitute the closed-class possessive primitive (have/has)
+                # so it reads "you have a son named Quinn". Grammar primitive, NOT a domain
+                # token (same justification as Shape 4's predicate inventory). Non-copula
+                # rel verbs (has_pet→have, owns→own) are kept verbatim.
+                if verb in ("is", "are", "was", "were", "be", "am"):
+                    verb = "have" if subject_is_you else "has"
+                _art = _indefinite_article(named_type_name)
+                return "%s %s %s %s named %s" % (subject_name, verb, _art, named_type_name, object_name)
 
         # ── Shape 5: ENTITY/DEFAULT → fall through to the existing template path.
         return None
     except Exception:  # noqa: BLE001 — presentation fail-safe: never break prose
+        return None
+
+
+def _compose_inverse_anchor_clause(
+    *,
+    rel_type: str,
+    rel_meta: dict,
+    anchor_name: str,
+    anchor_is_you: bool,
+    instance_name: str,
+    instance_type_name: str | None,
+) -> str | None:
+    """SUBJECT-SIDE NAMED-INSTANCE flip (perspective-correct render of an inverse rel).
+
+    The structure-driven NAMED-INSTANCE composer was built for POSSESSION — the named
+    instance on the OBJECT side ((user, has_pet, rex) → "you have a dog named
+    Rex"). When the SAME shape appears MIRRORED — the named instance on the SUBJECT
+    side and the query anchor ("you") on the OBJECT side ((quinn, child_of, you)) — the
+    object-side composer's gate (object≠"you") rightly declines, and the bare template
+    path renders it from the WRONG perspective ("you are a son named Quinn": it makes the
+    USER the son). This composer re-frames such a fact FROM THE ANCHOR'S perspective by
+    FLIPPING along the rel's ``inverse_rel_type`` (overlay metadata):
+
+      (quinn, child_of, you)  --inverse-->  (you, parent_of, quinn)
+        → "you have a son named Quinn"   (Type=son from quinn's instance_of, Name=Quinn)
+
+    Detection is purely STRUCTURAL (caller guarantees: named instance on subject side,
+    anchor on object side) + the rel having an ``inverse_rel_type`` in metadata. ZERO
+    kin/role literals — the Type ("son"/"daughter") and Name come from the entity's OWN
+    data; the only verbs used are the closed-class English possessive primitive
+    (have/has) and copula (is/are), the SAME grammar-primitive justification as Shape 4's
+    predicate inventory — never a domain/kin word-list.
+
+    Two forms:
+      • ASYMMETRIC inverse (parent_of ≠ child_of): the anchor POSSESSES a typed-and-named
+        instance → "<anchor> have/has a <Type> named <Name>" (Shape-1 possessive reading,
+        mirrored). Falls through (None) when no instance_of TYPE is known, so we never
+        fabricate "you have a named Quinn".
+      • SYMMETRIC rel (spouse: inverse == self): no possession reading — render the
+        relationship naturally, anchor-first → "<Name> is your <role>" using the rel's
+        own label as the role noun. (e.g. spouse → "Jordan is your spouse"; if a cleaner
+        2p relation template exists the caller keeps that instead — see wiring.)
+
+    Returns the full prose string, or None to leave the existing render untouched.
+    """
+    try:
+        inv = ((rel_meta.get("inverse_rel_type") or "").strip().lower())
+        if not inv:
+            return None  # no metadata inverse → not a flippable relationship
+        is_symmetric = bool(rel_meta.get("is_symmetric")) or inv == rel_type.lower()
+
+        if is_symmetric:
+            # Symmetric (spouse/sibling_of/…): no possessive reading. Render anchor-first
+            # using the rel's own label as the role noun. The label is the relationship
+            # NOUN from metadata (spouse → "spouse"); de-snake a bare rel_type fallback.
+            role = (rel_meta.get("label") or rel_type.replace("_", " ")).strip().lower()
+            poss = "your" if anchor_is_you else ("%s's" % anchor_name)
+            # "<Name> is your <role>"  (e.g. "Jordan is your spouse")
+            return "%s is %s %s" % (instance_name, poss, role)
+
+        # ASYMMETRIC inverse — the anchor POSSESSES a typed, named instance.
+        # Mirror Shape 1 ("<anchor> <have/has> a <Type> named <Name>"). The possessive
+        # verb is the closed-class English primitive (have/has) — grammar, not a domain
+        # token. Require a TYPE word (instance_of) so we never emit "a named <Name>".
+        if not (instance_type_name and instance_type_name.lower() != instance_name.lower()):
+            return None
+        have = "have" if anchor_is_you else "has"
+        art = _indefinite_article(instance_type_name)
+        return "%s %s %s %s named %s" % (anchor_name, have, art, instance_type_name, instance_name)
+    except Exception:  # noqa: BLE001 — presentation fail-safe
         return None
 
 
@@ -31111,20 +31257,82 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 # clean already). participated_in is excluded by the composer's own shape gates
                 # (its occurrence/date appends below are preserved). Fail-safe: None → template.
                 if not is_unbound:
-                    _composed = _compose_object_clause(
-                        rel_type=rel_type,
-                        rel_meta=(_overlay_meta.get(rel_type) or {}),
-                        subject_name=subject_name,
-                        object_name=object_name,
-                        object_id=object_id,
-                        object_is_uuid=object_is_uuid,
-                        named_type_name=named_type_name,
-                        template=rel_type_templates.get(rel_type) or template,
-                        template_2p=rel_type_templates_2p.get(rel_type),
-                        subject_is_you=subject_is_you,
-                    )
-                    if _composed:
-                        prose = _composed
+                    # SUBJECT-SIDE NAMED-INSTANCE flip (perspective fix): when the named
+                    # instance is on the SUBJECT side and the query anchor ("you") is the
+                    # OBJECT — (quinn, child_of, you) — the object-side composer declines
+                    # (object=="you") and the bare template renders the WRONG perspective
+                    # ("you are a son named Quinn"). Re-frame anchor-first by FLIPPING along
+                    # the rel's inverse_rel_type (overlay metadata): (quinn, child_of, you)
+                    # → you-parent_of-quinn → "you have a son named Quinn". The Type ("son")
+                    # is quinn's instance_of (resolved here, mirroring the object-side block),
+                    # the Name is quinn's alias — ZERO kin literals. Detection is STRUCTURAL:
+                    # object is the anchor (UUID), subject is a UUID named instance, rel has a
+                    # metadata inverse. Symmetric rels (spouse) render naturally. Runs BEFORE
+                    # the object-side composer; takes priority for this mirrored shape.
+                    _object_is_anchor = bool(
+                        object_is_uuid and anchor and object_id and str(object_id) == str(anchor))
+                    _subj_is_uuid = False
+                    try:
+                        _subj_is_uuid = bool(subject_id and _UUID_PATTERN.match(str(subject_id)))
+                    except Exception:
+                        _subj_is_uuid = False
+                    _inverse_composed = None
+                    _rmeta = _overlay_meta.get(rel_type) or {}
+                    if (_object_is_anchor and _subj_is_uuid and subject_name
+                            and subject_name != "you"
+                            and not bool(_rmeta.get("is_hierarchy_rel"))
+                            and (_rmeta.get("inverse_rel_type"))):
+                        # Resolve the SUBJECT's instance_of TYPE word (mirror of the object
+                        # block above): index first, deterministic DB fallback otherwise.
+                        _subj_type_name = None
+                        _st_id = (named_instance_type_id or {}).get(subject_id)
+                        if not _st_id and db is not None:
+                            try:
+                                with db.cursor() as _stcur:
+                                    _stcur.execute(
+                                        "SELECT object_id FROM facts WHERE subject_id::text = %s "
+                                        "AND rel_type = 'instance_of' AND archived_at IS NULL "
+                                        "ORDER BY confidence DESC NULLS LAST LIMIT 1",
+                                        (str(subject_id),))
+                                    _strow = _stcur.fetchone()
+                                if _strow and _strow[0]:
+                                    _st_id = _strow[0]
+                            except Exception as _stex:
+                                log.debug("convert_to_prose.subject_instance_type_db_fallback_failed",
+                                          error=str(_stex)[:120])
+                        if _st_id and _st_id != subject_id:
+                            try:
+                                _subj_type_name = resolve_entity_display(
+                                    _st_id, identity_set, preferred_alias_map, db)
+                            except Exception:
+                                _subj_type_name = None
+                        # The anchor object renders as "you" when it is the querying user.
+                        _anchor_name = object_name if object_name else "you"
+                        _inverse_composed = _compose_inverse_anchor_clause(
+                            rel_type=rel_type,
+                            rel_meta=_rmeta,
+                            anchor_name=_anchor_name,
+                            anchor_is_you=(_anchor_name == "you"),
+                            instance_name=subject_name,
+                            instance_type_name=_subj_type_name,
+                        )
+                    if _inverse_composed:
+                        prose = _inverse_composed
+                    else:
+                        _composed = _compose_object_clause(
+                            rel_type=rel_type,
+                            rel_meta=_rmeta,
+                            subject_name=subject_name,
+                            object_name=object_name,
+                            object_id=object_id,
+                            object_is_uuid=object_is_uuid,
+                            named_type_name=named_type_name,
+                            template=rel_type_templates.get(rel_type) or template,
+                            template_2p=rel_type_templates_2p.get(rel_type),
+                            subject_is_you=subject_is_you,
+                        )
+                        if _composed:
+                            prose = _composed
 
                 # ASSERTION POLARITY (Q1): a NEGATED genuine state must read back NEGATED, never as
                 # its positive opposite. Presentation-only, keyed on the `polarity` column the walk

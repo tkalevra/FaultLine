@@ -139,6 +139,29 @@ _BOOTSTRAP_ACQUISITION_VERBS: frozenset[str] = frozenset({
     "get", "buy", "purchase", "acquire", "obtain", "receive", "grab", "pick",
 })
 
+# ── BOOTSTRAP STATIVE-POSSESSION verb set — DB-DOWN SAFETY NET ONLY ──────────────────
+# The bounded LEXICAL class of STATIVE possession verbs: a verb whose lexical semantics is the subject
+# CURRENTLY POSSESSING its direct object ("I HAVE a dog", "I OWN a motorcycle", "I POSSESS a painting",
+# "I KEEP a hamster", "I HOLD a property"). Used by the named-instance self-possession gate
+# (`linguistics._type_is_self_possessed`, clause (b)) to decide whether a named instance's TYPE belongs
+# to the speaker before the possession edge ((user, owns/has_pet, <name>)) is minted. This is the
+# STATIVE (currently-possessing) counterpart of the ACQUISITION (coming-to-possess — got/bought/…)
+# class above — a DISTINCT lexical-semantic class: the self-possession gate is about a STANDING
+# possession relation, not a transfer event. ⚠️ FLAGGED BOUNDED CLASS (the self-possession-verb-gate
+# brief): the possession signal cannot be made purely structural — "I have a dog" (stative possession)
+# and "I have a meeting" (light-verb occurrence) share the SAME verb→dobj dep shape; only the verb's
+# lexical semantics distinguishes a possession reading. So a small bounded verb class is unavoidable
+# here, EXACTLY as for the naming / LVC / inchoative / aspectual / acquisition classes. It is
+# firewalled downstream by the parse the SAME way: the gate climbs only to a 1st-person-personal-
+# pronoun-subject governing verb, and the named-instance binding already requires a ProperName↔Type
+# binding under that verb. ``have`` is INCLUDED so the existing family/pet self-possession path keeps
+# working — now AS METADATA, not as the retired in-code ``== "have"`` literal. DB-HELD + per-tenant +
+# GROWABLE on the SAME rail (category='possession_verb'); this in-code set is the DB-DOWN code-fallback
+# seed only, NOT the authority. Mirrors migration 118's public seed.
+_BOOTSTRAP_POSSESSION_VERBS: frozenset[str] = frozenset({
+    "have", "own", "possess", "keep", "hold",
+})
+
 # ── BOOTSTRAP PROBLEM-NOUN (bland eventive head) set — DB-DOWN SAFETY NET ONLY ───────
 # The bounded LEXICAL class of SEMANTICALLY-EMPTY PROBLEM / FAULT eventive heads — the bland nouns
 # that head an LVC "I had an <issue/problem/trouble> with X" construction where the MEANING lives in
@@ -318,6 +341,7 @@ LVC_SUPPORT_VERB_CATEGORY = "lvc_support_verb"
 INCHOATIVE_VERB_CATEGORY = "inchoative_verb"
 ASPECTUAL_CONTROL_VERB_CATEGORY = "aspectual_control_verb"
 ACQUISITION_VERB_CATEGORY = "acquisition_verb"
+POSSESSION_VERB_CATEGORY = "possession_verb"
 PROBLEM_NOUN_CATEGORY = "problem_noun"
 SVO_PARTICLE_CATEGORY = "svo_particle"
 RELATIONAL_NOUN_CATEGORY = "relational_noun"
@@ -348,6 +372,7 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     INCHOATIVE_VERB_CATEGORY: _BOOTSTRAP_INCHOATIVE_VERBS,
     ASPECTUAL_CONTROL_VERB_CATEGORY: _BOOTSTRAP_ASPECTUAL_CONTROL_VERBS,
     ACQUISITION_VERB_CATEGORY: _BOOTSTRAP_ACQUISITION_VERBS,
+    POSSESSION_VERB_CATEGORY: _BOOTSTRAP_POSSESSION_VERBS,
     PROBLEM_NOUN_CATEGORY: _BOOTSTRAP_PROBLEM_NOUNS,
     SVO_PARTICLE_CATEGORY: _BOOTSTRAP_SVO_PARTICLES,
     RELATIONAL_NOUN_CATEGORY: _BOOTSTRAP_RELATIONAL_NOUNS,
@@ -506,6 +531,18 @@ def resolve_acquisition_verbs(dsn: str) -> frozenset[str]:
     EXPOSED as an inferred, dated edge. ⚠️ FLAGGED bounded lexical class (see
     ``_BOOTSTRAP_ACQUISITION_VERBS``). Fail-safe: never empty (the acquisition_verb bootstrap floor)."""
     return resolve_cues(dsn, rel_type_overlay.get_current_schema(), ACQUISITION_VERB_CATEGORY)
+
+
+def resolve_possession_verbs(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE STATIVE-POSSESSION verb lemma set for the ContextVar-bound current
+    request schema (tenant-only), via the SAME binding as the naming/lvc/acquisition/temporal
+    resolvers. Used by ``linguistics._type_is_self_possessed`` (the named-instance self-possession
+    gate) to decide whether a named instance's TYPE belongs to the speaker — "I own a motorcycle named
+    Bolt" / "I have a dog named Rex" — before the possession edge is minted. DISTINCT from the
+    ACQUISITION class (stative CURRENTLY-possessing vs transfer COMING-to-possess). ⚠️ FLAGGED bounded
+    lexical class (see ``_BOOTSTRAP_POSSESSION_VERBS``). Fail-safe: never empty (the possession_verb
+    bootstrap floor)."""
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), POSSESSION_VERB_CATEGORY)
 
 
 def resolve_problem_nouns(dsn: str) -> frozenset[str]:
