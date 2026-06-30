@@ -11834,6 +11834,118 @@ def _learn_pattern_from_llm_fallback_async(
 # dprompt-144: Intent Classification Endpoint
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKEND-AUTHORITATIVE provisioning readiness guard (brain not transport)
+# ──────────────────────────────────────────────────────────────────────────────
+# THE BUG it closes: a brand-new tenant's FIRST call used to run extraction/overlays
+# (rel_type_overlay, linguistic_cue_overlay, entity inserts) against a schema that did
+# not exist yet — async provisioning (~22s) outran the MCP poll (~18s), so the backend
+# extracted BLIND and cascaded `relation "<schema>.rel_types/linguistic_cues/entities"
+# does not exist`, returning a degraded/empty ingest until a retry committed ~22s later.
+#
+# THE FIX lives BACKEND-side (not just in the transport poll): every tenant-schema entry
+# blocks until the schema is provisioned-AND-ready — or returns a clean 503 retry signal —
+# BEFORE touching the schema. NEVER runs extraction against a missing schema; NEVER drops a
+# fact (a wait timeout is a retry, not a drop). Idempotent + near-zero once ready: a confirmed
+# tenant lives in the process cache and the common path pays a single set lookup.
+_TENANT_READY_CACHE: set[str] = set()
+
+
+def _provisioning_retry_503() -> HTTPException:
+    """Clean 'provisioning in progress, retry' signal — never a blind degraded run."""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "status": "provisioning",
+            "message": "Memory is being set up — please retry in a moment.",
+            "committed": 0,
+        },
+    )
+
+
+async def _ensure_tenant_ready(user_id: str, endpoint: str) -> None:
+    """ASYNC block-until-provisioned guard for tenant-schema endpoints.
+
+    anonymous / already-ready (cached) → returns immediately. Otherwise enqueues
+    provisioning (ensure_user_provisioned) and BLOCKS on wait_for_schema_ready until
+    user_provisioning.ready_at is set, capped at PROVISIONING_TIMEOUT_SEC (default 60s).
+    Still not ready at the cap → raises 503 {"status":"provisioning"} (clean retry).
+    Fail-safe: any error grounds to the same 503 — we NEVER fall through to run against a
+    schema we could not confirm exists.
+    """
+    if not user_id or user_id == "anonymous" or user_id in _TENANT_READY_CACHE:
+        return
+    try:
+        from src.provisioning.schema_manager import derive_user_slug_from_uuid
+        from src.provisioning.provisioning_status import ensure_user_provisioned
+        user_slug = derive_user_slug_from_uuid(user_id)
+        _prov_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        try:
+            ensure_user_provisioned(user_id, user_slug, _prov_db)
+            is_ready = await wait_for_schema_ready(
+                user_id=user_id, user_slug=user_slug, db=_prov_db, timeout_sec=60,
+            )
+        finally:
+            try:
+                _prov_db.close()
+            except Exception:
+                pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_crit(log, "ensure_tenant_ready.error", endpoint=endpoint, user_id=user_id[:8], error=str(e))
+        raise _provisioning_retry_503()
+    if not is_ready:
+        log_crit(log, "ensure_tenant_ready.timeout", endpoint=endpoint, user_id=user_id[:8])
+        raise _provisioning_retry_503()
+    _TENANT_READY_CACHE.add(user_id)
+
+
+def _ensure_tenant_ready_sync(user_id: str, endpoint: str) -> None:
+    """SYNC counterpart of _ensure_tenant_ready (for sync endpoints: retract / correct).
+
+    Same contract: anonymous / cached → return; else enqueue + block until ready (capped at
+    PROVISIONING_TIMEOUT_SEC, default 60s) or raise 503. Fail-safe: never touches a missing
+    schema. Polls public.user_provisioning directly with exponential backoff (no asyncio).
+    """
+    if not user_id or user_id == "anonymous" or user_id in _TENANT_READY_CACHE:
+        return
+    import time as _time
+    cap = int(os.environ.get("PROVISIONING_TIMEOUT_SEC", 60))
+    try:
+        from src.provisioning.schema_manager import derive_user_slug_from_uuid
+        from src.provisioning.provisioning_status import (
+            ensure_user_provisioned,
+            check_provisioning_status,
+        )
+        user_slug = derive_user_slug_from_uuid(user_id)
+        _prov_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        try:
+            ensure_user_provisioned(user_id, user_slug, _prov_db)
+            deadline = time_now() + cap
+            backoff = 0.05
+            while True:
+                if check_provisioning_status(user_id, _prov_db).get("status") == "ready":
+                    _TENANT_READY_CACHE.add(user_id)
+                    return
+                if time_now() >= deadline:
+                    break
+                _time.sleep(backoff)
+                backoff = min(backoff * 2, 0.5)
+        finally:
+            try:
+                _prov_db.close()
+            except Exception:
+                pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_crit(log, "ensure_tenant_ready_sync.error", endpoint=endpoint, user_id=user_id[:8], error=str(e))
+        raise _provisioning_retry_503()
+    log_crit(log, "ensure_tenant_ready_sync.timeout", endpoint=endpoint, user_id=user_id[:8])
+    raise _provisioning_retry_503()
+
+
 @app.post("/classify-intent")
 @rate_limit(calls_per_minute=60)
 async def classify_intent(req: dict, user_id: str = None, model=Depends(get_gliner_model)):
@@ -11853,15 +11965,10 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         log.warning("classify_intent.invalid_user_id", user_id_len=len(user_id or ""))
         return {"intent": "STATEMENT", "confidence": 0.0}
 
-    # === PHASE 2: Ensure user provisioned ===
-    if user_id != "anonymous":
-        try:
-            from src.provisioning.provisioning_status import ensure_user_provisioned
-            from src.provisioning.schema_manager import derive_user_slug_from_uuid
-            user_slug = derive_user_slug_from_uuid(user_id)
-            ensure_user_provisioned(user_id, user_slug)  # Auto-provision if needed
-        except Exception as e:
-            log.warning("classify_intent.provisioning_failed", user_id=user_id[:8], error=str(e))
+    # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready ===
+    # First tenant-schema touch of every turn — the original cascade origin. Block here
+    # (or 503 retry) so the GLiNER2 DB pattern lookups below never hit a missing schema.
+    await _ensure_tenant_ready(user_id, "/classify-intent")
 
     if model is None:
         return {"intent": "STATEMENT", "confidence": 0.0}
@@ -16133,6 +16240,9 @@ async def harvest_spans(req: RewriteRequest) -> dict:
     standalone so the recall path can fire it without the (expensive) LLM extraction pass.
     """
     user_id = _require_resolvable_user_id(req.user_id, "/harvest-spans")
+    # BLOCK until the tenant schema is provisioned-AND-ready — the spine deriver reads the
+    # linguistic_cue overlay and inserts entities; it must never run against a missing schema.
+    await _ensure_tenant_ready(user_id, "/harvest-spans")
     if not TURN_FACT_HARVEST or not (req.text or "").strip():
         return {"edges": [], "spans": 0}
     # SENTENCE PIPELINE (flag-gated, default OFF) — "feed it the clean sentence". Replaces the
@@ -16785,15 +16895,9 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool path).
     user_id = _require_resolvable_user_id(req.user_id, "/extract/rewrite")
 
-    # === PHASE 2: Ensure user provisioned ===
-    if user_id != "anonymous":
-        try:
-            from src.provisioning.provisioning_status import ensure_user_provisioned
-            from src.provisioning.schema_manager import derive_user_slug_from_uuid
-            user_slug = derive_user_slug_from_uuid(user_id)
-            ensure_user_provisioned(user_id, user_slug)  # Auto-provision if needed
-        except Exception as e:
-            log.warning("extract_rewrite.provisioning_failed", user_id=user_id[:8], error=str(e))
+    # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready ===
+    # The rel_types overlay drives the extraction prompt — must not read a missing schema.
+    await _ensure_tenant_ready(user_id, "/extract/rewrite")
 
     # === IDEMPOTENCY CHECK: Prevent duplicate LLM calls with distributed locking ===
     # When Filter streams the response and connection drops, it retries the request.
@@ -18405,7 +18509,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     # === PHASE 2: Ensure user provisioned and set search_path ===
     schema_name = None
-    if user_id != "anonymous":
+    if user_id != "anonymous" and user_id in _TENANT_READY_CACHE:
+        # Already confirmed ready this process (e.g. /classify-intent guarded the turn) —
+        # skip the redundant connect+poll; just resolve the schema name.
+        from src.provisioning.schema_manager import derive_schema_name
+        schema_name = derive_schema_name(user_slug)
+    elif user_id != "anonymous":
         try:
             from src.provisioning.provisioning_status import ensure_user_provisioned
             from src.provisioning.schema_manager import derive_schema_name
@@ -18426,9 +18535,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 )
 
                 if not is_ready:
-                    log.crit("ingest.schema_not_ready_timeout",
-                            user_id=user_id[:8],
-                            waited_sec=30)
+                    log_crit(log, "ingest.schema_not_ready_timeout",
+                             user_id=user_id[:8],
+                             waited_sec=30)
                     raise HTTPException(
                         status_code=503,
                         detail="User schema initialization timeout. Provisioning job may be slow or stalled."
@@ -18442,6 +18551,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     cur.execute(f"SET search_path TO {schema_name}")
                     _prov_db.commit()
 
+                _TENANT_READY_CACHE.add(user_id)
                 log.info("ingest.schema_set", user_id=user_id[:8], schema=schema_name)
             finally:
                 _prov_db.close()
@@ -32441,15 +32551,9 @@ async def query(request: QueryRequest) -> QueryResponse:
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool read).
     user_id = _require_resolvable_user_id(request.user_id, "/query")
 
-    # === PHASE 2: Ensure user provisioned ===
-    if user_id != "anonymous":
-        try:
-            from src.provisioning.provisioning_status import ensure_user_provisioned
-            from src.provisioning.schema_manager import derive_user_slug_from_uuid
-            user_slug = derive_user_slug_from_uuid(user_id)
-            ensure_user_provisioned(user_id, user_slug)  # Auto-provision if needed
-        except Exception as e:
-            log.warning("query.provisioning_failed", user_id=user_id[:8], error=str(e))
+    # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready ===
+    # The recall walk reads tenant rel_types/taxonomies/facts — never read a missing schema.
+    await _ensure_tenant_ready(user_id, "/query")
     query_text = request.text
     conversation_history = request.conversation_history or []
     min_confidence = float(os.environ.get("MIN_INJECT_CONFIDENCE", 0.4))
@@ -34462,15 +34566,9 @@ def correct_fact(req: FactCorrectionRequest):
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool write).
     user_id = _require_resolvable_user_id(req.user_id, "/retract/correct")
 
-    # === PHASE 2: Ensure user provisioned ===
-    if user_id != "anonymous":
-        try:
-            from src.provisioning.provisioning_status import ensure_user_provisioned
-            from src.provisioning.schema_manager import derive_user_slug_from_uuid
-            user_slug = derive_user_slug_from_uuid(user_id)
-            ensure_user_provisioned(user_id, user_slug)  # Auto-provision if needed
-        except Exception as e:
-            log.warning("correct_fact.provisioning_failed", user_id=user_id[:8], error=str(e))
+    # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready (sync) ===
+    # A correction supersedes/re-ingests authoritative rows — never run against a missing schema.
+    _ensure_tenant_ready_sync(user_id, "/retract/correct")
 
     db = None
     try:
@@ -36391,6 +36489,9 @@ def correct_fact(req: FactCorrectionRequest):
 
 @app.post("/retract", response_model=RetractResponse)
 def retract_fact(req: RetractRequest):
+    # BLOCK until the tenant schema is provisioned-AND-ready (sync) before touching
+    # {schema}.rel_types / facts — never run a retraction against a missing schema.
+    _ensure_tenant_ready_sync(req.user_id, "/retract")
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         manager = FactStoreManager(db)

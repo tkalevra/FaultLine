@@ -364,8 +364,13 @@ async def _ensure_provisioned(user_id: str) -> bool:
         if just_enqueued:
             await asyncio.sleep(6.0)
 
-        # ── Poll loop: up to 6 × 2 s = 12 s additional wait ─────────────────────
-        for attempt in range(6):
+        # ── Poll loop: up to 27 × 2 s = 54 s additional wait ────────────────────
+        # Provisioning now takes ~22 s (was <18 s), so the old 12 s budget timed out and the
+        # MCP fired the backend call anyway against a not-yet-ready schema. Wait it out instead
+        # (~60 s total with the 6 s pre-sleep) so the transport never dispatches a doomed call.
+        # COURTESY ONLY: the BACKEND _ensure_tenant_ready guard is the real fix — even if this
+        # poll were to time out, the backend blocks-or-503s rather than running blind.
+        for attempt in range(27):
             try:
                 resp = await client.get(
                     f"{FAULTLINE_API_URL}/provisioning/status",
