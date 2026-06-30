@@ -363,6 +363,43 @@ def _is_first_person_personal_pronoun(tok) -> bool:
         return False
 
 
+def _is_third_person_pronoun(tok) -> bool:
+    """True iff ``tok`` is a 3rd-person *personal/possessive* pronoun (he/she/it/they/his/her/its/their/him/them).
+
+    Decided from morphology, NOT a token/lemma word-list (subject-agnostic, language-general):
+      - ``Person == ["3"]``    — 3rd person
+      - ``"Prs" in PronType``  — a personal pronoun (covers possessive ``Poss=Yes`` and plain)
+
+    A 3rd-person pronoun is a referring expression with no name of its own — in a correction
+    ("Actually *his* name is Max, not Rex") it MUST be coref-resolved to its antecedent entity,
+    never matched literally as if "his" were an entity surface.
+    """
+    try:
+        morph = tok.morph
+        return morph.get("Person") == ["3"] and "Prs" in morph.get("PronType")
+    except Exception:  # noqa: BLE001 — morphology probe must never crash extraction
+        return False
+
+
+def is_third_person_pronoun(text: str) -> bool:
+    """True iff ``text`` is exactly a single 3rd-person personal/possessive pronoun.
+
+    Grammatical (spaCy morphology), not a word-list. Used by the correction path to detect a
+    pronoun subject ("his"/"its"/"their"/"her"…) that the extractor could not name and that
+    must be coref-resolved to an antecedent entity. Fail-safe: any parse miss / multi-token
+    input / failure → False (the caller then keeps its normal resolution ladder).
+    """
+    if not text or not text.strip():
+        return False
+    doc = _parse(text.strip())
+    if doc is None:
+        return False
+    toks = [t for t in doc if not t.is_space]
+    if len(toks) != 1:
+        return False
+    return _is_third_person_pronoun(toks[0])
+
+
 def analyze_copula(text: str):
     r"""Deterministic first-cut for a copular self-predication. Returns ``CopulaAnalysis`` or ``None``.
 
@@ -6660,12 +6697,32 @@ def analyze_directive(text: str):
         # not a problem", "I am not worried") → head POS is AUX/VERB → NOT contrastive. The
         # distinction is the head's grammatical class, not a word-list.
         for tok in doc:
-            if tok.dep_ == "neg" and (
-                tok.head.dep_ in ("appos", "conj")
-                or tok.head.pos_ in ("NOUN", "PROPN", "NUM")
-            ):
+            if tok.dep_ != "neg":
+                continue
+            h = tok.head
+            # (a) NOMINAL contrast: ``neg`` over an apposition/conjunct, or a noun/propn/num it
+            #     directly heads ("…Luna, not Bella", "…14, not 12").
+            if h.dep_ in ("appos", "conj") or h.pos_ in ("NOUN", "PROPN", "NUM"):
                 has_contrastive_negation = True
                 break
+            # (b) COMPLEMENT contrast: ``neg`` over a predicate complement (acomp/attr) that stands
+            #     OPPOSITE an ASSERTED sibling complement of the same predicate ("is red, not BLUE").
+            #     The asserted sibling is exactly what separates a CONTRAST (two complements, one
+            #     negated) from plain predicate negation ("I am not worried" — a single, negated
+            #     complement → head POS is ADJ/AUX with no asserted sibling → NOT contrastive). The
+            #     distinction is the grammatical shape (a competing non-negated complement), not a
+            #     word-list.
+            if h.dep_ in ("acomp", "attr"):
+                pred = h.head
+                sibling_asserted = any(
+                    c is not h
+                    and c.dep_ in ("acomp", "attr", "conj")
+                    and not any(g.dep_ == "neg" for g in c.children)
+                    for c in pred.children
+                )
+                if sibling_asserted:
+                    has_contrastive_negation = True
+                    break
 
         # TEMPORAL-CESSATION shape: a ROOT predicate (copular AUX / verb) that is NEGATED and
         # scoped by an adverbial ("no longer", "anymore", "no more"). Grammar only — we report the
