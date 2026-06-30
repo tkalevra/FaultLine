@@ -1768,7 +1768,30 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
                         linguistic_cue_overlay.record_cue_candidate(_pc, "problem_noun")
                     except Exception:  # noqa: BLE001 — fail-safe: growth signal never breaks ingest
                         pass
-                if _promote_arg and getattr(ev, "problem_head", False):
+                # FIRE the competing has_state candidate ONLY when the LVC device-issue gate holds in
+                # FULL (tight — an LVC is broad; most LVCs are NOT device-issues, so every clause below
+                # must hold or we FALL THROUGH to the normal reading, never forcing a has_state):
+                #   (1) DOBJ ∈ problem-noun cue class  — ``problem_head`` (the eventive head is a
+                #       SEMANTICALLY-EMPTY problem noun: issue/bug/glitch/…; grown per-tenant + the
+                #       cold-tenant floor). Excludes "had a MEETING/LUNCH/CONVERSATION with X".
+                #   (2) PP-COMPLEMENT pobj is a TYPED THING — ``problem_affected_thing`` (GLiNER2/NER
+                #       typed it NON-social: Object/Concept/…, never Person/Org). Excludes "had a problem
+                #       with my COWORKER Sam" (interpersonal) and a forced bind on an ABSTRACT/untyped
+                #       pobj ("a problem with the traffic/the math" → untyped → no fire).
+                #   (3) the ``with`` adposition (a closed grammatical primitive; ``_with_pp_subject_matter``
+                #       already rejects a date/temporal pobj) — the affected-entity preposition, not a
+                #       temporal/other PP.
+                #   (4) light-verb head ∈ lvc_support cue + first-person/possessive grounding — already
+                #       established upstream by this LVC ``analyze_event`` path that produced ``ev``.
+                # LVC classification basis: light-verb head + problem-noun dobj + typeable-thing
+                # PP-complement (dependency-tree LVC identification + noun-complement relation; cf. AAAI
+                # "English LVC Identification Using Lexical Knowledge"). Fail-safe: any gate miss → the
+                # flat participated_in reading stands (today's behavior); arbitration keeps BOTH on a tie.
+                _problem_fire = (
+                    getattr(ev, "problem_head", False)
+                    and getattr(ev, "problem_affected_thing", False)
+                )
+                if _promote_arg and _problem_fire:
                     _state_obj = event  # the bland head TYPE ("issue"/"problem") = the reusable state
                     _state = {"subject": _flat_object, "rel_type": "has_state", "object": _state_obj,
                               "subject_type": "Object", "object_type": "Concept",
@@ -1837,11 +1860,21 @@ def _reified_event_manifest(reified_edges: list[dict]) -> dict:
     titles: set[str] = set()
     event_types: set[str] = set()
     event_dates: set[str] = set()
+    # state_heads — the SEMANTICALLY-EMPTY problem-head OBJECTS the device-issue has_state lane bound
+    # ("(gps system, has_state, ISSUE)"): the bland head is now a STATE of the affected thing, so its
+    # DIVORCED mis-captures from the competing flat lanes — (user, owns, issue), (system, has_pet,
+    # issue), (issue, subclass_of/instance_of, …) — are junk to purge (the affected thing keeps the
+    # real binding). Collected here; the suppressor drops the divorced edges (never the has_state edge,
+    # which lives in the reified set, not in edges_dict at suppression time).
+    state_heads: set[str] = set()
     try:
         for _e in (reified_edges or []):
             _rel = (_e.get("rel_type") or "").strip().lower()
             _subj = (_e.get("subject") or "").strip().lower()
             _obj = (_e.get("object") or "").strip().lower()
+            if _rel == "has_state":
+                if _obj:
+                    state_heads.add(_obj)
             if _rel == "instance_of":
                 # (<occurrence-handle>) instance_of (<bare-type>): the handle is the canonical node,
                 # the object is the bare L4 PLACE the flat lanes must not re-pile onto.
@@ -1866,9 +1899,10 @@ def _reified_event_manifest(reified_edges: list[dict]) -> dict:
                 if _ed:
                     event_dates.add(_ed)
     except Exception:  # noqa: BLE001 — fail-safe: no manifest → no suppression (legacy behavior)
-        return {"handles": set(), "titles": set(), "event_types": set(), "event_dates": set()}
+        return {"handles": set(), "titles": set(), "event_types": set(), "event_dates": set(),
+                "state_heads": set()}
     return {"handles": handles, "titles": titles, "event_types": event_types,
-            "event_dates": event_dates}
+            "event_dates": event_dates, "state_heads": state_heads}
 
 
 def _spine_bound_surfaces(edges, is_edgeinput: bool = False) -> set[str]:
@@ -2001,7 +2035,8 @@ def _suppress_flat_event_duplicates(edges, manifest: dict, is_edgeinput: bool = 
     event_types = manifest.get("event_types") or set()
     handles = manifest.get("handles") or set()
     event_dates = manifest.get("event_dates") or set()
-    if not titles and not event_types and not event_dates:
+    state_heads = manifest.get("state_heads") or set()
+    if not titles and not event_types and not event_dates and not state_heads:
         return edges
     # STEP-4 gate signal: the spine minted ≥1 reified occurrence handle for this turn (an
     # instance_of/also_known_as/participated_in reified edge populates ``handles``). When True, the
@@ -2151,6 +2186,29 @@ def _suppress_flat_event_duplicates(edges, manifest: dict, is_edgeinput: bool = 
                 log.info("ingest.flat_event_dup_suppressed",
                          reason="date_keyed_event_noise", subject=_s[:32], rel=_r,
                          object=_o[:32], event_date=_ed)
+                continue
+        # (5) DEVICE-ISSUE STATE-HEAD PURGE — the has_state lane bound the bland problem head as a
+        # STATE of the affected thing ("(gps system, has_state, ISSUE)"), so the competing flat lanes'
+        # DIVORCED captures of that same head are junk: (user/X, owns, issue) + (X, has_pet, issue)
+        # [the head wrongly possessed], and (issue, instance_of/subclass_of, …) [the bland head wrongly
+        # filed into L4 — a HARD-LINE violation; a state is not an L4 place]. Drop them by the
+        # head-surface key (structural, no noun list). The real (affected, has_state, head) edge lives
+        # in the reified set, not here, so it is never at risk. Fail-safe: no state_heads → no-op.
+        if state_heads:
+            # The bland problem head as ANY edge's OBJECT is a DIVORCED mis-capture: the has_state lane
+            # rebound it as a state of the affected thing, so (user, have/owns, issue) and
+            # (system, has_pet, issue) are junk regardless of the (possibly not-yet-canonicalized) rel
+            # surface ("have"→"owns" happens downstream). The REAL (affected, has_state, head) edge is
+            # in the reified set, NOT in this edge set, so it is never at risk here. Per-turn + only when
+            # has_state fired for this exact head → no legit object-"issue" edge is collateral.
+            if _o in state_heads:
+                log.info("ingest.flat_event_dup_suppressed",
+                         reason="state_head_divorced_possession", subject=_s[:32], rel=_r, object=_o[:32])
+                continue
+            # The bland head must NEVER be filed into L4 (a state is not a place — THE HARD LINE).
+            if _s in state_heads and _r in ("instance_of", "subclass_of", "also_known_as"):
+                log.info("ingest.flat_event_dup_suppressed",
+                         reason="state_head_l4_leak", subject=_s[:32], rel=_r, object=_o[:32])
                 continue
         kept.append(e)
     return kept
@@ -16728,7 +16786,7 @@ async def harvest_spans(req: RewriteRequest) -> dict:
         # flat fallback (no reified hinges) yields an empty manifest → no-op (today's behavior).
         _evt_manifest = _reified_event_manifest(_event_edges)
         if (_evt_manifest.get("titles") or _evt_manifest.get("event_types")
-                or _evt_manifest.get("event_dates")):
+                or _evt_manifest.get("event_dates") or _evt_manifest.get("state_heads")):
             _before_evt = len(edges)
             edges = _suppress_flat_event_duplicates(edges, _evt_manifest, is_edgeinput=False)
             # Keep `seen` consistent so a purged flat edge can't block its reified replacement.
@@ -19393,7 +19451,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         # instance_of/also_known_as edges → a legacy flat fallback yields an empty manifest → no-op.
         _evt_manifest_ing = _reified_event_manifest(_reified_event_edges)
         if (_evt_manifest_ing.get("titles") or _evt_manifest_ing.get("event_types")
-                or _evt_manifest_ing.get("event_dates")):
+                or _evt_manifest_ing.get("event_dates") or _evt_manifest_ing.get("state_heads")):
             _before_keys = set(edges_dict.keys())
             _kept_edges = _suppress_flat_event_duplicates(
                 list(edges_dict.values()), _evt_manifest_ing, is_edgeinput=True)

@@ -162,19 +162,27 @@ _BOOTSTRAP_POSSESSION_VERBS: frozenset[str] = frozenset({
     "have", "own", "possess", "keep", "hold",
 })
 
-# ── PROBLEM-NOUN (bland eventive head) class — CARVED (grown per-tenant, NOT seeded) ──
-# CARVE-OUT (lean-seed): problem_noun is a DOMAIN-FLAVORED class (issue/glitch/bug/error vary by
-# domain), NOT a grammar/unit primitive — so it is NO LONGER SEEDED. It is GROWN PER-TENANT from the
-# OBSERVED construction (a 1st-person LVC "I had a <bland-head> with <non-person thing>" whose head is
-# not yet known) via the ``linguistic_cue_candidate`` queue → re_embedder freq-gate (≥3) →
-# ``<tenant>.linguistic_cues`` (category='problem_noun'). The DB-DOWN code-fallback is now EMPTY (no
-# in-code word zoo): a cold tenant resolves to the empty set and the construction DEGRADES safely (the
-# affected entity stays walkable via its other chains; the bland head's participated_in lands in the
-# Class-C short-term lane — captured-not-dropped), while the head is queued for growth. The discriminator
-# is therefore GROWN per-tenant, never enumerated in code. (The grammar/unit cue classes — naming /
-# lvc_support / inchoative / aspectual / acquisition / possession / svo_particle / kinship / unit_scalar
-# — REMAIN seeded; only the three domain-flavored classes were carved.)
-_BOOTSTRAP_PROBLEM_NOUNS: frozenset[str] = frozenset()
+# ── PROBLEM-NOUN (bland eventive head) class — DB-DOWN / COLD-TENANT FLOOR + grown per-tenant ──
+# problem_noun is the eventive-head class of an LVC device-issue: a light verb ("have"/"take"/"get")
+# governs a SEMANTICALLY-EMPTY problem-noun dobj whose meaning lives in its ``with``-PP complement
+# ("I had an ISSUE with my car's GPS system"). The class GROWS per-tenant from the observed
+# construction (re_embedder freq-gate ≥3 → ``<tenant>.linguistic_cues`` category='problem_noun'), so a
+# domain's own problem vocabulary accretes without code edits.
+#
+# It ALSO carries a DB-DOWN / COLD-TENANT BOOTSTRAP FLOOR — a small CLOSED class of generic
+# abnormal-state nouns — EXACTLY like every other cue class here (svo_particle, discourse_marker, …).
+# WHY a floor (this reverses the earlier empty-set carve, which was the bug): the LVC→has_state bind is
+# gated on problem-noun MEMBERSHIP of the dobj (so "had a MEETING/LUNCH/CONVERSATION with X" — eventive
+# but NOT a problem — never binds). With an EMPTY floor a fresh/oracle tenant (the harness wipes per Q)
+# resolves the class empty → the gate can NEVER fire → "I had an issue with my GPS" FRAGMENTS (the
+# device-issue is lost to a bare owns/participated_in). These are GENERIC GRAMMAR-LEVEL problem nouns
+# (a closed abnormal-state class), NOT a domain word zoo (no gps/car/device surfaces) — the same
+# justification the discourse-marker / particle floors carry. Per-tenant growth still extends it; this
+# is only the never-empty fail-safe the resolver docstring already promises.
+_BOOTSTRAP_PROBLEM_NOUNS: frozenset[str] = frozenset({
+    "issue", "problem", "trouble", "bug", "glitch", "error", "fault",
+    "defect", "malfunction", "failure", "difficulty", "complication",
+})
 
 # ── BOOTSTRAP load-bearing SVO particle set — DB-DOWN SAFETY NET ONLY ────────────────
 # The closed grammatical class of particles/prepositions that are LOAD-BEARING on a verb (they change

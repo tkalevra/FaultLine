@@ -236,6 +236,17 @@ _REL_EXTENSION_NAME = "rel"
 # this is the single in-code reference to it in the linguistic layer.
 _STATE_REL = "has_state"
 
+# SOCIAL co-participant TYPE labels — the entity categories a comitative "with" introduces (a person
+# you meet / an organization you call). These are UNIVERSAL ONTOLOGY/NER PRIMITIVES (the GLiNER2
+# zero-shot type names ∪ the spaCy NER labels), NOT a domain word-list — the same primitives the code
+# already tests when it checks ``_ent.label_ == "PERSON"``. Used by the device-issue degrade gate to
+# tell a comitative co-participant ("had lunch WITH <person/org>") from an affected THING ("had an
+# issue WITH <object>"): a problem is ABOUT an inanimate thing, an activity is WITH a social party.
+# Lowercased compare. Anything typed and NOT in this set is treated as a (non-social) THING.
+_SOCIAL_AFFECTED_LABELS: frozenset[str] = frozenset({
+    "person", "org", "organization", "norp", "group", "company", "gpe", "fac",
+})
+
 
 def _ensure_rel_extension() -> bool:
     """Register the ``Doc._.rel`` extension once (default ``None``). Returns True iff the
@@ -2538,6 +2549,21 @@ class EventAnalysis:
     #                    gate (the with-PP affected entity is NOT a PERSON) excludes neutral occurrences
     #                    ("had a meeting WITH Sarah" → Sarah is a person → no candidate). None otherwise.
     problem_candidate: str | None = None
+    # ``problem_affected_thing`` : True when the with-PP affected entity (``concerns``) is TYPED as a
+    #                    NON-SOCIAL THING (an Object/Concept/Product/Location/… — anything that is NOT a
+    #                    Person/Organization/social co-participant) by the path's own entity typer
+    #                    (GLiNER2 ents on the spine doc, or the spaCy NER singleton on the rewrite path).
+    #                    This is the COLD-TENANT DEGRADE signal: problem_noun is grown per-tenant and is
+    #                    EMPTY on a fresh tenant (so ``problem_head`` never fires there), but a "had a
+    #                    <bland-head> WITH <typed THING>" construction is structurally a device-issue —
+    #                    the comitative "with" of an activity ("lunch/meeting/call WITH <person/org>")
+    #                    introduces a SOCIAL co-participant, never an inanimate thing. So when the
+    #                    affected entity is a typed THING the caller may fire the ``has_state`` competitor
+    #                    WITHOUT waiting for the grown class (the binding "<thing> has_state <problem>"
+    #                    lands NOW). Grammar+type driven, ZERO noun/word-list. UNKNOWN (no type signal)
+    #                    leaves this False — degrade-fire only on a POSITIVE thing-typing, so a NER-missed
+    #                    person/org co-participant can never be mis-bound; the head still queues for growth.
+    problem_affected_thing: bool = False
 
 
 # Quoted-title net: a TITLE is most reliably marked by quotes ("Data Analysis using Python",
@@ -2818,6 +2844,114 @@ def _with_pp_subject_matter(event_noun) -> str | None:
     except Exception as e:  # noqa: BLE001 — fail-safe: a subject-matter miss is a bare occurrence
         log.warning("linguistics.with_pp_subject_matter_failed", error=str(e)[:160])
         return None
+
+
+def _with_pp_pobj_token(event_noun):
+    r"""Return the TOKEN of the first ``with``-PP ``pobj`` (NOUN/PROPN, non-date) off ``event_noun``,
+    or ``None``. The token twin of ``_with_pp_subject_matter`` (which returns the surface phrase) —
+    the caller needs the live token to read its subtree morphology (1st-person possessive) and its
+    head lemma (a social-role/kinship cue). Same closed ``with``-adposition primitive, same date-skip,
+    fail-safe to ``None``."""
+    try:
+        try:
+            _date_spans = _collect_date_spans(event_noun.doc.text)
+        except Exception:  # noqa: BLE001
+            _date_spans = []
+
+        def _overlaps_date(tok) -> bool:
+            try:
+                t_lo, t_hi = tok.idx, tok.idx + len(tok.text)
+                for (_s, _span) in (_date_spans or []):
+                    if _s < t_hi and (_s + len(_span)) > t_lo:
+                        return True
+            except Exception:  # noqa: BLE001
+                return False
+            return False
+
+        for c in event_noun.children:
+            if c.dep_ != "prep" or (c.text or "").strip().lower() != "with":
+                continue
+            for gc in c.children:
+                if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and not _overlaps_date(gc):
+                    return gc
+        return None
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+
+
+def _affected_is_social(pobj_tok, concerns: str) -> bool:
+    r"""True when the ``with``-PP affected entity is a SOCIAL co-participant (a person / organization),
+    so an LVC "had a <problem> with <X>" is INTERPERSONAL ("a problem with my coworker Sam") rather
+    than a device-issue ("an issue with my car's GPS system"). Two deterministic signals, NO word zoo:
+      (1) spaCy NER on the affected span labels it PERSON/ORG/NORP/GPE (a proper-name party — "Sam",
+          "Apple") — the existing NER singleton, never GLiNER2;
+      (2) the affected HEAD LEMMA is a person role in the grown cue classes — kinship_noun
+          ("brother"/"mother") ∪ social_role ("coworker"/"manager"/"boss") — covering common-noun
+          parties NER does not tag.
+    Fail-safe: any miss → False (not provably social) so the caller's POSSESSION gate still guards."""
+    try:
+        # (2) lexical person-role cue (cheap, no NER) — head lemma in kinship ∪ social_role.
+        try:
+            _head = (pobj_tok.lemma_ or "").strip().lower() if pobj_tok is not None else ""
+            if _head and (_head in _kinship_nouns() or _head in (_social_role_map() or {})):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        # (1) proper-name PERSON/ORG via the NER singleton. Run NER over the FULL sentence and test
+        # whether any social entity overlaps the pobj's SUBTREE char span — so an APPOSITIVE name not
+        # carried in the bare ``concerns`` phrase is still caught ("my coworker Sam" → the pobj subtree
+        # spans "my coworker Sam", NER tags "Sam" PERSON → social). Fall back to NER on the bare span
+        # when the token/doc is unavailable.
+        _ner = _get_nlp_ner()
+        if _ner is not None:
+            _lo = _hi = None
+            _full = None
+            try:
+                if pobj_tok is not None:
+                    _sub = list(pobj_tok.subtree)
+                    if _sub:
+                        _lo = min(t.idx for t in _sub)
+                        _hi = max(t.idx + len(t.text) for t in _sub)
+                        _full = pobj_tok.doc.text
+            except Exception:  # noqa: BLE001
+                _lo = _hi = _full = None
+            if _full is not None and _lo is not None:
+                for _ent in (_ner(_full).ents or []):
+                    if (_ent.label_ or "").strip().lower() not in _SOCIAL_AFFECTED_LABELS:
+                        continue
+                    # overlap test: the social entity sits within / touches the pobj subtree span.
+                    if _ent.start_char < _hi and _ent.end_char > _lo:
+                        return True
+            else:
+                _span = (concerns or "").strip()
+                if _span:
+                    for _ent in (_ner(_span).ents or []):
+                        if (_ent.label_ or "").strip().lower() in _SOCIAL_AFFECTED_LABELS:
+                            return True
+    except Exception:  # noqa: BLE001 — fail-safe: NER/cue unavailable → not provably social
+        return False
+    return False
+
+
+def _is_first_person_possessed(pobj_tok) -> bool:
+    r"""True when the affected NP is POSSESSED BY THE SPEAKER — any token in the pobj subtree is a
+    1st-person POSSESSIVE determiner (Person=1 ∧ Poss=Yes: "my"/"our", possibly NESTED as in "my
+    car's GPS system" where "my" possesses "car" which possesses "system"). This is the CONCRETENESS
+    + ownership signal that separates a device-issue ("an issue with MY car's GPS") from an abstract
+    topic ("a problem with the traffic / the math" — no 1st-person possessive). Subtree walk so a
+    nested possessive is caught; morphology only, NO word-list. Fail-safe: any error → False."""
+    try:
+        if pobj_tok is None:
+            return False
+        for t in pobj_tok.subtree:
+            try:
+                if t.morph.get("Person") == ["1"] and "Yes" in (t.morph.get("Poss") or []):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _collect_eventive_heads(tok, text: str) -> list:
@@ -3165,65 +3299,49 @@ def _build_event_analysis(event_noun, tok, text: str):
                 if _stripped:
                     event = _stripped
         # STATE-LANE SIGNAL (Stage 3): the eventive head is a SEMANTICALLY-EMPTY PROBLEM noun (lemma in
-        # the DB-grown ``problem_noun`` cue class) AND a with-PP affected entity is present (``concerns``).
-        # This is the "I had an issue WITH my car's GPS system" shape: the meaning lives in the affected
-        # entity, not the empty head. Flag it so the caller emits a competing ``(<concerns>, has_state,
-        # <problem-state>)`` candidate (the structural twin of ``feels``). THE DISCRIMINATOR is the cue
-        # class ∧ the with-PP — both must hold, so "had a meeting WITH Sarah" (meeting ∉ problem_noun)
-        # and "had an issue" with NO affected entity both leave problem_head False (untouched). The cue
-        # class is DB-grown (NO noun literal in this logic); fail-safe: any resolve miss → code-fallback
-        # set, never an empty gate. Read against the bare HEAD LEMMA, not the modified phrase.
+        # the problem_noun cue class — grown per-tenant + the cold-tenant floor) AND a with-PP affected
+        # entity is present (``concerns``). This is the "I had an issue WITH my car's GPS system" shape:
+        # the meaning lives in the affected entity, not the empty head. The deriver runs on a GRAMMAR-ONLY
+        # doc (no GLiNER2 types, and spaCy NER does NOT tag "gps system"), so the affected-thing test is
+        # GRAMMATICAL, never type-table-dependent:
+        #   • problem_head            — DOBJ lemma ∈ problem_noun (so "had a MEETING/LUNCH/CONVERSATION
+        #                               with X" — eventive but not a problem — never fires).
+        #   • _affected_is_social     — the with-PP pobj is a PERSON/ORG (spaCy NER) or a person-role cue
+        #                               (kinship_noun ∪ social_role): "a problem with my COWORKER Sam"
+        #                               is interpersonal → NOT a device-issue → excluded.
+        #   • _is_first_person_possessed — the pobj NP is possessed by the speaker ("MY car's GPS", "MY
+        #                               router"): the concreteness/ownership signal that excludes an
+        #                               ABSTRACT topic ("a problem with the traffic / the math").
+        # ``problem_affected_thing`` = NON-social ∧ 1st-person-possessed → the caller fires the competing
+        # ``(<affected>, has_state, <problem>)`` candidate (the structural twin of ``feels``). NO word
+        # zoo; fail-safe: any miss → flags stay False → the flat reading stands. ``problem_candidate``
+        # (the growth signal) is queued whenever the affected entity is NON-social (even if not possessed).
         problem_head = False
         problem_candidate = None
+        problem_affected_thing = False
         if concerns:
             try:
                 _head_lemma = (event_noun.lemma_ or "").strip().lower()
                 if _head_lemma and _head_lemma in _problem_nouns():
                     problem_head = True
-                elif _head_lemma and event_noun.pos_ == "NOUN":
-                    # CARVE-OUT GROWTH SIGNAL: the head is NOT (yet) a grown problem_noun but it heads a
-                    # "had a <bland-head> with <X>" construction. Queue it as a problem_noun candidate —
-                    # GATED on the affected with-PP entity NOT being a PERSON, so a neutral occurrence
-                    # ("had a meeting WITH Sarah", "had lunch WITH Tom") never grows a problem head. The
-                    # person test is spaCy's own PERSON NER (deterministic, NO word-list). CONSERVATIVE:
-                    # we queue ONLY when NER actually classified the affected entity AND it is NOT a
-                    # person — an UNKNOWN (no NER signal) never queues, so growth can never mis-grow a
-                    # neutral occurrence head when NER is unavailable.
-                    _affected = concerns.strip().lower()
-                    _person_known = False
-                    _person_affected = False
-                    # (a) typed doc (spine path: GLiNER2 wrote ents onto the doc) — read PERSON directly.
-                    try:
-                        _ents = list(event_noun.doc.ents or [])
-                    except Exception:  # noqa: BLE001
-                        _ents = []
-                    if _ents:
-                        _person_known = True
-                        for _ent in _ents:
-                            if _ent.label_ == "PERSON" and (_ent.text or "").strip().lower() in _affected:
-                                _person_affected = True
-                                break
-                    else:
-                        # (b) NER-disabled grammar doc (ingest/rewrite path): run the NER singleton on
-                        #     the affected span to classify it (deterministic spaCy NER, no word-list).
-                        try:
-                            _ner = _get_nlp_ner()
-                            if _ner is not None:
-                                _person_known = True
-                                for _ent in (_ner(concerns).ents or []):
-                                    if _ent.label_ == "PERSON":
-                                        _person_affected = True
-                                        break
-                        except Exception:  # noqa: BLE001 — NER unavailable → unknown (do not queue)
-                            _person_known = False
-                    if _person_known and not _person_affected:
+                if _head_lemma and event_noun.pos_ == "NOUN":
+                    _pobj = _with_pp_pobj_token(event_noun)
+                    _social = _affected_is_social(_pobj, concerns)
+                    if not _social:
+                        # Queue the head for freq-gated problem_noun growth (the carve-out growth signal):
+                        # a "had a <bland-head> with <non-social X>" the cue class hasn't learned yet.
                         problem_candidate = _head_lemma
+                        if _is_first_person_possessed(_pobj):
+                            # NON-social ∧ speaker-possessed concrete thing → device-issue. Fire-eligible.
+                            problem_affected_thing = True
             except Exception:  # noqa: BLE001 — fail-safe: lemma/overlay miss → not a problem head
                 problem_head = False
                 problem_candidate = None
+                problem_affected_thing = False
         return EventAnalysis(event=event, title=title, concerns=concerns,
                              negated=negated, problem_head=problem_head,
-                             problem_candidate=problem_candidate)
+                             problem_candidate=problem_candidate,
+                             problem_affected_thing=problem_affected_thing)
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.build_event_analysis_failed", error=str(e)[:160])
         return None
