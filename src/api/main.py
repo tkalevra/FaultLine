@@ -14457,6 +14457,17 @@ LLM_SPAN_DETECT = os.getenv("LLM_SPAN_DETECT", "true").lower() not in ("0", "fal
 # keeps its own per-clause peel as the (lower-in-the-stack) backstop. See _peel_dates_at_entry.
 HARVEST_ENTRY_PEEL = os.getenv("HARVEST_ENTRY_PEEL", "true").lower() not in ("0", "false", "no")
 
+# RECALL READ-ONLY FIREWALL (sentence-pipeline harvest) — DEFAULT ON. The buried-fact harvest fires
+# on EVERY recall turn; in the SENTENCE_PIPELINE path the LLM atomizer (reframe_to_atomic) runs FIRST
+# and REWRITES a question into a declarative atom ("do you know what kind of car I own?" → "I own a
+# car"), LAUNDERING the interrogative grammar the downstream is_interrogative_clause gate relies on →
+# the question's OWN content is minted as a fact (owns/has_role). When ON, interrogative clauses are
+# dropped from the RAW source text BEFORE the atomizer ever sees them: a pure question contributes no
+# declarative text (→ empty harvest, no atomizer cost), while a genuine declarative aside survives and
+# is atomized/derived exactly as today. Grammar-only (is_interrogative_clause); fail-safe both ways.
+HARVEST_RECALL_INTERRO_PREFILTER = os.getenv(
+    "HARVEST_RECALL_INTERRO_PREFILTER", "true").lower() not in ("0", "false", "no")
+
 # SENTENCE PIPELINE ("feed it the clean sentence") — DEFAULT OFF, fail-safe to today's harvest path.
 # ROOT CAUSE it fixes: the legacy harvest feeds spaCy the LLM's leftovers — _llm_detect_factbearing_
 # spans → join → _peel_dates_at_entry (date stripped) → THEN the spaCy lanes, so spaCy never sees a
@@ -14960,6 +14971,50 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     text = (_text_no_marker or req.text or "").strip()
     if not text:
         return {"edges": [], "spans": 0}
+
+    # 1b. RECALL READ-ONLY FIREWALL — DROP interrogative clauses from the RAW source text BEFORE the
+    #     LLM atomizer runs. The atomizer (step 2) REWRITES a question into a declarative atom ("do you
+    #     know what kind of car I own?" → "I own a car"), which LAUNDERS the interrogative grammar the
+    #     post-atomizer is_interrogative_clause gate (step ~"DROP interrogative clauses") relies on →
+    #     the question's OWN content would be minted as a fact. Filtering the RAW clauses first means a
+    #     pure question yields NO declarative text (→ empty harvest, no atomizer cost), while a genuine
+    #     declarative aside ("…by the way, I fixed the fence yesterday") survives untouched. Grammar-
+    #     only (is_interrogative_clause); fail-safe: layer unavailable (None) → keep clause; parse-as-
+    #     question (True) → drop; declarative (False) → keep. The post-atomizer gate stays as a backstop.
+    if HARVEST_RECALL_INTERRO_PREFILTER:
+        try:
+            _raw_clauses = segment_clauses(text) or [text]
+            _decl_clauses: list[str] = []
+            _pre_dropped = 0
+            for _rc in _raw_clauses:
+                if not (_rc or "").strip():
+                    continue
+                try:
+                    _rv = _is_interro(_rc)
+                except Exception:  # noqa: BLE001 — per-clause fail-safe → keep (do not drop a fact)
+                    _rv = None
+                if _rv is True:
+                    _pre_dropped += 1
+                    continue
+                _decl_clauses.append(_rc.strip())
+            if _pre_dropped:
+                # The gate ACTIVELY dropped >=1 question clause. Rebuild the harvest input from the
+                # surviving DECLARATIVE clauses only — NEVER fall back to the raw turn (that would
+                # re-admit the question's content). If nothing declarative remains → pure question →
+                # zero harvest (recall is read-only for the question's own content).
+                if not _decl_clauses:
+                    log.info("sentence_pipeline.interrogative_prefilter_all_dropped",
+                             user_id=user_id[:8], dropped=_pre_dropped,
+                             note="pure question on the recall path — zero facts harvested")
+                    return {"edges": [], "spans": 0}
+                text = " ".join(_decl_clauses).strip()
+                log.info("sentence_pipeline.interrogative_prefiltered",
+                         user_id=user_id[:8], dropped=_pre_dropped, kept=len(_decl_clauses),
+                         note="dropped the question's own clause(s) BEFORE the LLM atomizer; "
+                              "only declarative asides survive to be harvested")
+        except Exception as _ipfe:  # noqa: BLE001 — prefilter failure → today's behavior (atomize raw)
+            log.warning("sentence_pipeline.interrogative_prefilter_failed",
+                        user_id=user_id[:8], error=str(_ipfe)[:160])
 
     # 2. ATOMIZE FIRST, THEN SEGMENT ("build down to meet strength"). The spine spans (deriver +
     #    chains + date layer) garble a RAW multi-clause rant — the spaCy sentencizer keeps a
@@ -34571,6 +34626,7 @@ def correct_fact(req: FactCorrectionRequest):
     _ensure_tenant_ready_sync(user_id, "/retract/correct")
 
     db = None
+    _rt_schema_tok = None  # rel_type/taxonomy overlay ContextVar token (reset in finally)
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
 
@@ -34580,6 +34636,13 @@ def correct_fact(req: FactCorrectionRequest):
             schema_name = context["schema_name"]
             with db.cursor() as cur:
                 cur.execute(f"SET search_path TO {schema_name}")
+            # Bind the per-tenant overlay ContextVar so _rel_meta() resolves the tenant's GROWN
+            # rel_types (seed ∪ tenant), not just the module seed. Without this the metadata-axis
+            # override below can't see a grown rel (e.g. favorite_color) and falls back to the
+            # LLM's free-text dimension guess — mis-routing a relational correction to the scalar
+            # path. Ingest/query bind this identically; the correction path must too. Reset in
+            # finally. (taxonomy_overlay shares this same ContextVar binding.)
+            _rt_schema_tok = rel_type_overlay.set_current_schema(schema_name)
             log.info("correct_fact.schema_context_set", user_id=user_id[:8], schema=schema_name)
         except ValueError as e:
             log.warning("correct_fact.schema_context_failed", user_id=user_id, error=str(e))
@@ -34776,12 +34839,107 @@ def correct_fact(req: FactCorrectionRequest):
                 _role_anchor = None
             # Accept ONLY a concrete redirect to a DIFFERENT entity (a cached role→name alias):
             # anchor == user means no role-alias matched → keep the first-person fast-path.
+            # GUARD (correction VALUE is never the SUBJECT): resolve_anchor scans the WHOLE text,
+            # so for "no, my favorite color is red, not blue" it grabs the object entity "red" (a
+            # bare alias hit) and would redirect the subject onto the correction's own NEW value.
+            # A correction's subject can never be its own old/new value — reject an anchor that
+            # resolves to either, keeping the first-person subject (the user). Deterministic
+            # (UUID identity compare, lookup-only), subject-agnostic, no rel/word literal.
             if _role_anchor and _role_anchor != req.user_id:
-                subject_uuid = _role_anchor
-                log.info("correct_fact.role_alias_redirected_off_user",
-                         subject_name=subject_name, subject_uuid=str(subject_uuid)[:8],
-                         note="possessive role resolved via the DB alias cache to a named "
-                              "entity; scalar binds there, NOT the user (Defect 3)")
+                _value_uuids = set()
+                for _v in (old_value, new_value):
+                    if _v:
+                        with db.cursor() as _vc:
+                            _vc.execute(
+                                "SELECT entity_id FROM entity_aliases WHERE alias = %s "
+                                "ORDER BY is_preferred DESC LIMIT 1",
+                                (str(_v).lower().strip(),))
+                            _vr = _vc.fetchone()
+                        if _vr and _vr[0]:
+                            _value_uuids.add(str(_vr[0]))
+                if str(_role_anchor) in _value_uuids:
+                    log.info("correct_fact.role_alias_redirect_rejected_value_entity",
+                             subject_name=subject_name, anchor=str(_role_anchor)[:8],
+                             note="anchor equals the correction's own old/new value → not the "
+                                  "subject; keeping first-person subject (the user)")
+                else:
+                    subject_uuid = _role_anchor
+                    log.info("correct_fact.role_alias_redirected_off_user",
+                             subject_name=subject_name, subject_uuid=str(subject_uuid)[:8],
+                             note="possessive role resolved via the DB alias cache to a named "
+                                  "entity; scalar binds there, NOT the user (Defect 3)")
+
+        # ── DETERMINISTIC PRONOUN COREF (correction target resolution) ────────────────
+        # The extractor emits the LITERAL subject surface, so a correction that refers to its
+        # target by a 3rd-person pronoun ("Actually HIS name is Max, not Rex") yields
+        # subject_name="his" — a referring expression with no entity surface of its own. The
+        # generic resolver (resolve_anchor) then grabs whatever word in the text happens to be a
+        # registered alias (e.g. the noun "name"), superseding the WRONG entity. A pronoun MUST be
+        # coref-resolved to its ANTECEDENT, which the correction names explicitly via the OLD VALUE
+        # ("…, not REX" → Rex). Resolve old_value through the alias registry (lookup-only, never
+        # mints), else the single non-user entity that actually HOLDS this old fact. Deterministic,
+        # subject-agnostic: the pronoun is detected GRAMMATICALLY (spaCy Person=3 ∧ PronType=Prs —
+        # NOT a token list) and the antecedent is a structural DB lookup (NO fuzzy/cosine). FAIL
+        # LOUD: a 3rd-person-pronoun subject we cannot ground is never silently matched against the
+        # text — we ask for clarification rather than corrupt the wrong memory (user-is-truth).
+        # CORRECTIONS only — retractions keep their byte-identical resolution/staging path.
+        if not subject_uuid and subject_name and not is_retraction:
+            try:
+                from src.extraction.linguistics import is_third_person_pronoun as _is_3p
+                _subject_is_pronoun = _is_3p(subject_name)
+            except Exception:  # noqa: BLE001 — detector failure must never break the path
+                _subject_is_pronoun = False
+            if _subject_is_pronoun:
+                _coref_uuid = None
+                _coref_signal = None
+                # (a) old_value names the antecedent (the most reliable signal — the user just
+                #     said "…, not <old_value>"; that surface IS the thing being corrected).
+                if old_value:
+                    with db.cursor() as _cf_cur:
+                        _cf_cur.execute(
+                            "SELECT entity_id FROM entity_aliases WHERE alias = %s "
+                            "ORDER BY is_preferred DESC LIMIT 1",
+                            (str(old_value).lower().strip(),))
+                        _r = _cf_cur.fetchone()
+                    if _r and _r[0]:
+                        _coref_uuid = _r[0]
+                        _coref_signal = "old_value_alias"
+                # (b) fallback: the SINGLE non-user entity holding (old_rel_type) — a name
+                #     correction stores pref_name on the entity, so when old_value didn't itself
+                #     register an alias, the unique holder of the corrected rel/attribute is the
+                #     antecedent. Refuse to guess when there are 0 or >1 candidates.
+                if not _coref_uuid and old_rel_type:
+                    _olc = old_rel_type.lower()
+                    _cands: set = set()
+                    with db.cursor() as _cf_cur:
+                        _cf_cur.execute(
+                            "SELECT DISTINCT entity_id FROM entity_attributes "
+                            "WHERE attribute = %s AND entity_id <> %s",
+                            (_olc, req.user_id))
+                        _cands.update(r[0] for r in _cf_cur.fetchall() if r[0])
+                        _cf_cur.execute(
+                            "SELECT DISTINCT subject_id FROM facts "
+                            "WHERE rel_type = %s AND subject_id <> %s "
+                            "AND superseded_at IS NULL AND archived_at IS NULL",
+                            (_olc, req.user_id))
+                        _cands.update(r[0] for r in _cf_cur.fetchall() if r[0])
+                    if len(_cands) == 1:
+                        _coref_uuid = next(iter(_cands))
+                        _coref_signal = "unique_rel_holder"
+                if _coref_uuid:
+                    subject_uuid = _coref_uuid
+                    log.info("correct_fact.pronoun_coref_resolved",
+                             pronoun=subject_name, subject_uuid=str(subject_uuid)[:8],
+                             signal=_coref_signal, old_value=old_value, old_rel_type=old_rel_type)
+                else:
+                    # Fail loud: never let a bare pronoun fall through to a text-scan match.
+                    log.warning("correct_fact.pronoun_coref_unresolved",
+                                pronoun=subject_name, old_value=old_value,
+                                old_rel_type=old_rel_type)
+                    return FactCorrectionResponse(
+                        status="clarification_needed",
+                        message=("I couldn't tell which one you're correcting. Could you name "
+                                 "the specific person or thing (instead of 'it'/'his'/'their')?"))
 
         if subject_uuid:
             pass  # already redirected via the alias cache above
@@ -34987,6 +35145,11 @@ def correct_fact(req: FactCorrectionRequest):
             affected_ids = []
             found_via = None  # Set by RELATIONAL/HIERARCHICAL branch; None for all other dimensions
             old_fact_object_id = None  # Set by RELATIONAL/HIERARCHICAL branch; used by post-commit staged_facts cleanup
+            # Scalar/alias supersession count. The facts-table dimensions report via affected_ids;
+            # SCALAR corrections live in entity_attributes / entity_aliases (no facts row), so they
+            # track their own count here and surface it in facts_superseded so a successful scalar
+            # correction is never reported as "0 superseded".
+            _scalar_superseded = 0
 
             # ── Break C-a (rel-type pin — user-is-truth) ──────────────────────────────
             # PIN the LLM's extracted old_rel_type to a rel the SUBJECT ACTUALLY HOLDS before any
@@ -35038,6 +35201,33 @@ def correct_fact(req: FactCorrectionRequest):
                                  llm_dimension=dimension,
                                  metadata_axis=_meta_dim)
                         dimension = _meta_dim
+
+            # ── SCALAR axis via STORED ATTRIBUTE (ad-hoc / non-ontology scalar rel) ──────
+            # The metadata-axis override above can only classify a rel that EXISTS in rel_types.
+            # An ad-hoc scalar attribute captured at ingest ("my car is a Honda Civic" → the
+            # entity_attributes row (user, car, …)) has no rel_types row, so the LLM's free-text
+            # dimension guess (RELATIONAL) survives and the correction 404s against the facts table
+            # ("Old relational fact not found: car"). If the subject actually HOLDS this rel as a
+            # stored scalar attribute, the supersession axis IS scalar — route it there. Pure DB
+            # existence check (deterministic, subject-agnostic, no rel/word literal). Only promotes
+            # RELATIONAL/HIERARCHICAL → SCALAR; never downgrades an explicit/metadata SCALAR.
+            if (subject_uuid and old_rel_type
+                    and dimension in ("RELATIONAL", "HIERARCHICAL")):
+                try:
+                    with db.cursor() as _sc_cur:
+                        _sc_cur.execute(
+                            "SELECT 1 FROM entity_attributes "
+                            "WHERE entity_id = %s AND attribute = %s LIMIT 1",
+                            (subject_uuid, old_rel_type.lower()))
+                        _has_scalar_attr = _sc_cur.fetchone() is not None
+                except Exception as _sc_err:  # noqa: BLE001 — fail-safe: keep LLM dimension
+                    log.warning("correct_fact.scalar_axis_probe_failed", error=str(_sc_err)[:120])
+                    _has_scalar_attr = False
+                if _has_scalar_attr:
+                    log.info("correct_fact.axis_scalar_via_stored_attribute",
+                             rel_type=old_rel_type, subject=str(subject_uuid)[:8],
+                             llm_dimension=dimension)
+                    dimension = "SCALAR"
 
             # ── REWIRE (TEMPORAL axis — harness spaCy + the temporal machinery) ──
             # A correction whose supersession axis is the VALID-TIME event_date (e.g.
@@ -35189,16 +35379,23 @@ def correct_fact(req: FactCorrectionRequest):
                         message=("Stopped using that nickname." if is_retraction
                                  else "Updated who that nickname refers to."))
 
-                # Special case: pref_name (delete from entity_aliases)
+                # Special case: pref_name (demote in entity_aliases — non-destructive)
                 elif old_rel_type in ["pref_name", "also_known_as"]:
-                    # Delete old preferred name from entity_aliases
+                    # Archive Model (non-destructive): DEMOTE the old preferred name rather than
+                    # hard-deleting it — the name is still a known alias of the entity (recall by
+                    # the old name still resolves), it is simply no longer the PREFERRED label. The
+                    # new name becomes preferred below. This supersedes the old naming fact without
+                    # losing it (mirrors entity_name_conflicts "all names preserved").
                     cur.execute("""
-                        DELETE FROM entity_aliases
+                        UPDATE entity_aliases
+                        SET is_preferred = false
                         WHERE entity_id = %s AND is_preferred = true
                     """, (subject_uuid,))
-                    log.info("correct_fact.scalar_old_pref_name_deleted",
+                    _scalar_superseded += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    log.info("correct_fact.scalar_old_pref_name_demoted",
                             entity=subject_uuid,
                             old_name=old_value,
+                            demoted=cur.rowcount,
                             is_retraction=is_retraction)
 
                     # RETRACTION: Stop here (name is deleted)
@@ -35215,6 +35412,7 @@ def correct_fact(req: FactCorrectionRequest):
                                 ON CONFLICT (entity_id, alias) DO UPDATE
                                 SET is_preferred = true
                             """, (subject_uuid, new_value.lower()))
+                            _scalar_superseded = max(_scalar_superseded, 1)
                             log.info("correct_fact.scalar_new_pref_name_registered",
                                     entity=subject_uuid,
                                     new_name=new_value)
@@ -35234,9 +35432,11 @@ def correct_fact(req: FactCorrectionRequest):
                             DELETE FROM entity_attributes
                             WHERE entity_id = %s AND attribute = %s
                         """, (subject_uuid, _pinned_attr))
+                        _scalar_superseded += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                         log.info("correct_fact.scalar_retraction_deleted",
                                 entity=subject_uuid,
                                 attribute=_pinned_attr,
+                                deleted=cur.rowcount,
                                 requested_attribute=old_rel_type)
                     else:
                         # CORRECTION: Standard scalar update: entity_attributes table.
@@ -35271,6 +35471,11 @@ def correct_fact(req: FactCorrectionRequest):
                         if cur.rowcount < 1:
                             log.error("correct_fact.scalar_upsert_no_row",
                                       entity=subject_uuid, attribute=_pinned_attr, new_value=new_value)
+                        else:
+                            # The upsert overwrote the entity's single-valued attribute by identity
+                            # — the prior value was superseded in place. Count it so a successful
+                            # scalar correction reports facts_superseded >= 1 (user-is-truth landed).
+                            _scalar_superseded = max(_scalar_superseded, 1)
 
                         log.info("correct_fact.scalar_updated",
                                 entity=subject_uuid,
@@ -36439,12 +36644,17 @@ def correct_fact(req: FactCorrectionRequest):
                             error=str(_sf_cleanup_err))
                 # Do NOT raise — staged_facts cleanup failure must never fail the retraction.
 
+        # facts-table dimensions report via affected_ids; SCALAR (entity_attributes/aliases)
+        # reports via _scalar_superseded. Surface whichever is non-zero so a successful scalar
+        # correction is never mis-reported as "0 superseded".
+        _superseded_count = len(affected_ids) if affected_ids else _scalar_superseded
+
         log.info("correct_fact.success",
                 user_id=req.user_id,
                 subject=subject_uuid,
                 old=f"{old_rel_type}={old_value}",
                 new=f"{new_rel_type}={new_value}",
-                facts_superseded=len(affected_ids))
+                facts_superseded=_superseded_count)
 
         response = FactCorrectionResponse(
             status="corrected",
@@ -36454,8 +36664,9 @@ def correct_fact(req: FactCorrectionRequest):
             old_value=old_value,
             new_rel_type=new_rel_type,
             new_value=new_value,
+            dimension=dimension,
             confidence=confidence,
-            facts_superseded=len(affected_ids),
+            facts_superseded=_superseded_count,
             hierarchies_modified=[],
             message=f"✓ {extraction.get('subject_name')}: {old_rel_type}={old_value} → {new_rel_type}={new_value}"
         )
@@ -36481,6 +36692,11 @@ def correct_fact(req: FactCorrectionRequest):
                 pass
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        if _rt_schema_tok is not None:
+            try:
+                rel_type_overlay.reset_current_schema(_rt_schema_tok)
+            except Exception:
+                pass
         if db:
             try:
                 db.close()
