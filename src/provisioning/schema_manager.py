@@ -1109,7 +1109,20 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
             """, (user_id,))
             db.commit()
 
-            return True
+        # Flush the Redis idempotency cache on tenant wipe. The cache is keyed by an
+        # opaque request hash with no per-tenant prefix, so a wiped tenant's stale
+        # "already stored" entries would otherwise survive (TTL 3600s) and phantom-block a
+        # legitimate re-ingest. Best-effort + fail-safe — a Redis error never fails the wipe.
+        try:
+            from src.api.idempotency import flush_idempotency_keys
+            flushed = flush_idempotency_keys()
+            log.info("schema_deletion.idempotency_flushed",
+                     schema=schema_name, keys=flushed)
+        except Exception as _flush_err:
+            log.warning("schema_deletion.idempotency_flush_failed",
+                        schema=schema_name, error=str(_flush_err))
+
+        return True
 
     except Exception as e:
         log.error(f"schema_deletion_failed", schema=schema_name, user_id=user_id, error=str(e))
