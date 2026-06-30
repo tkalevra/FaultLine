@@ -6881,8 +6881,10 @@ def _purge_conflicting_staged_hierarchy_facts(
                 )
             # Fallback by derived point ID (new (source_table, fact_id) scheme). Legacy
             # bare-int points are cleaned by re_embedder reconcile / collection re-sync.
-            _http_client_sync.delete(
-                f"{_qdrant_url}/collections/{collection}/points",
+            # Qdrant points-delete is a POST with a points-selector body; httpx .delete()
+            # takes no body kwarg (json/content), so the call must POST to /points/delete.
+            _http_client_sync.post(
+                f"{_qdrant_url}/collections/{collection}/points/delete",
                 json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
                 timeout=5.0,
             )
@@ -18146,8 +18148,9 @@ def _delete_from_qdrant(
         # (source_table, fact_id) UUIDv5). Idempotent belt-and-suspenders alongside the
         # filtered delete above. Legacy bare-int points are cleaned by re_embedder reconcile.
         try:
-            resp = _http_client_sync.delete(
-                f"{qdrant_url}/collections/{collection}/points",
+            # POST /points/delete with a points-selector body; httpx .delete() takes no body.
+            resp = _http_client_sync.post(
+                f"{qdrant_url}/collections/{collection}/points/delete",
                 json={"points": [derive_qdrant_point_id(_st, _fid) for _fid in fact_ids]},
                 timeout=5.0,
             )
@@ -18592,6 +18595,82 @@ async def wait_for_schema_ready(
         backoff_ms = min(backoff_ms * 2, max_backoff_ms)
 
 
+def _idempotency_cached_facts_present(schema_name: Optional[str], cached_response: dict) -> bool:
+    """Validate an idempotency cache HIT against actual tenant DB state.
+
+    The idempotency cache is a SUCCESS-dedup keyed by an opaque hash of the request text;
+    it is NOT a tenant-state snapshot. A tenant can be wiped/re-provisioned underneath a
+    still-live Redis key (TTL 3600s) — e.g. the oracle tenant is wiped frequently but Redis
+    is not flushed with it — leaving a phantom "already stored" that returns committed=0 /
+    stale and PERMANENTLY blocks a legitimate re-ingest (the reported dog-after-retraction
+    footgun). Trust a relational cache hit ONLY when the facts it claims to have persisted
+    still physically exist in the tenant's `facts`/`staged_facts` rows. Any missing row →
+    tenant diverged (wipe / cross-version payload) → caller must re-ingest.
+
+    Row existence is checked WITHOUT an archived_at/superseded_at filter on purpose: a wipe
+    deletes the row entirely (→ re-ingest), whereas a correction soft-deletes it but keeps
+    the row (→ trust the cache, never resurrect a corrected fact).
+
+    Only relational facts (object is a UUID surrogate) are validated — scalar attributes are
+    not carried in the response `facts` list and scalar-only ingests already re-process today
+    (the read gate ignores scalar_committed). Fail-safe: no schema / no checkable relational
+    facts / DB error → return False (re-ingest); the store is idempotent (ON CONFLICT) so a
+    re-run never loses or duplicates the write. Subject-agnostic — no per-domain logic.
+    """
+    if not schema_name:
+        return False
+    facts = cached_response.get("facts") or []
+    if not facts:
+        return False
+    rel_keys = []  # (subject_id, object_id, rel_type) — relational rows to corroborate
+    for f in facts:
+        if not isinstance(f, dict):
+            return False
+        subj = f.get("subject")
+        obj = f.get("object")
+        rt = (f.get("rel_type") or "").lower().strip()
+        if not subj or obj is None or not rt:
+            return False
+        # Subject is always a resolved UUID surrogate; a non-UUID subject means a
+        # cross-version payload we cannot corroborate → re-ingest.
+        if not _UUID_PATTERN.match(str(subj)):
+            return False
+        if _UUID_PATTERN.match(str(obj)):
+            rel_keys.append((str(subj), str(obj), rt))
+        # else: scalar-valued object — not represented in facts/staged_facts; skip.
+    if not rel_keys:
+        # committed/staged>0 implies relational rows existed; if none are checkable the
+        # payload is cross-version/opaque — don't trust it.
+        return False
+    conn = None
+    try:
+        conn = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            for (subj, obj, rt) in rel_keys:
+                cur.execute(
+                    "SELECT 1 FROM facts "
+                    "WHERE subject_id = %s AND object_id = %s AND rel_type = %s "
+                    "UNION ALL "
+                    "SELECT 1 FROM staged_facts "
+                    "WHERE subject_id = %s AND object_id = %s AND rel_type = %s "
+                    "LIMIT 1",
+                    (subj, obj, rt, subj, obj, rt),
+                )
+                if cur.fetchone() is None:
+                    log.info("ingest.idempotency_cache_row_absent",
+                             schema=schema_name, rel_type=rt)
+                    return False
+        return True
+    except Exception as e:
+        log.warning("ingest.idempotency_state_check_failed",
+                    schema=schema_name, error=str(e))
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 @app.post("/ingest")
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -18690,17 +18769,29 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         if cached_response:
             cached_committed = cached_response.get("committed", 0)
             cached_staged = cached_response.get("staged", 0)
-            if cached_committed > 0 or cached_staged > 0:
+            if not (cached_committed > 0 or cached_staged > 0):
+                # The store side only caches when something persisted, so a
+                # committed=0 AND staged=0 hit is by definition stale/cross-version —
+                # never trust it to mean "already stored".
+                log.info("ingest.idempotency_cache_skipped_empty",
+                        key=idempotency_key[:12],
+                        user_id=req.user_id,
+                        reason="previous attempt stored 0 relational facts, re-processing")
+            elif not _idempotency_cached_facts_present(schema_name, cached_response):
+                # The cache claims relational facts persisted, but the tenant no longer
+                # holds those rows — the tenant was wiped/re-provisioned underneath a
+                # still-live Redis key (or the payload is cross-version). Bust and
+                # re-ingest rather than phantom-block a legitimate write.
+                log.info("ingest.idempotency_cache_busted_stale",
+                        key=idempotency_key[:12],
+                        user_id=req.user_id,
+                        reason="cached facts absent from tenant DB (wipe/cross-version), re-processing")
+            else:
                 log.info("ingest.idempotency_cache_hit",
                         key=idempotency_key[:12],
                         user_id=req.user_id,
                         cached_committed=cached_committed)
                 return cached_response
-            else:
-                log.info("ingest.idempotency_cache_skipped_empty",
-                        key=idempotency_key[:12],
-                        user_id=req.user_id,
-                        reason="previous attempt stored 0 facts, re-processing")
     # === END IDEMPOTENCY CHECK ===
 
     global _INGEST_EXTRACTION_CALL_COUNT
@@ -35886,9 +35977,10 @@ def correct_fact(req: FactCorrectionRequest):
                                                         },
                                                         timeout=5.0,
                                                     )
-                                                _http_client_sync.delete(
+                                                # POST /points/delete — httpx .delete() takes no body kwarg.
+                                                _http_client_sync.post(
                                                     f"{_orphan_qdrant_url}/collections/"
-                                                    f"{_orphan_collection}/points",
+                                                    f"{_orphan_collection}/points/delete",
                                                     json={"points": [
                                                         derive_qdrant_point_id("staged_facts", _oid)
                                                         for _oid in _orphan_ids
@@ -36520,8 +36612,14 @@ def correct_fact(req: FactCorrectionRequest):
                 # Belt-and-suspenders: filtered delete handles new points, point-ID delete
                 # handles old ones. Both are safe to run together.
                 try:
-                    _http_client_sync.delete(
-                        f"{_qdrant_url}/collections/{_collection}/points",
+                    # Qdrant points-delete is a POST with a points-selector body. httpx's
+                    # .delete() convenience method takes NO body kwarg (json/content), so the
+                    # old call raised "Client.delete() got an unexpected keyword argument
+                    # 'json'" and the fallback was dead. POST /points/delete with a bare
+                    # point-id selector is the documented legacy fallback (collision-safe
+                    # filtered delete above is primary).
+                    _http_client_sync.post(
+                        f"{_qdrant_url}/collections/{_collection}/points/delete",
                         json={"points": [derive_qdrant_point_id(_src_table, _fid) for _fid in affected_ids]},
                         timeout=5.0,
                     )
@@ -36670,8 +36768,9 @@ def correct_fact(req: FactCorrectionRequest):
                                     )
                                 # Pass 2: fallback derived point-ID delete (new (source_table,
                                 # fact_id) scheme). Legacy bare-int points → re_embedder reconcile.
-                                _http_client_sync.delete(
-                                    f"{_sf_qdrant_url}/collections/{_sf_collection}/points",
+                                # POST /points/delete — httpx .delete() takes no body kwarg.
+                                _http_client_sync.post(
+                                    f"{_sf_qdrant_url}/collections/{_sf_collection}/points/delete",
                                     json={"points": [
                                         derive_qdrant_point_id("staged_facts", _sf_id)
                                         for _sf_id in _deleted_sf_ids

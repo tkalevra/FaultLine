@@ -6849,8 +6849,10 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
                         # the deterministic (source_table, fact_id) point even if its
                         # source_table payload were somehow absent. Legacy bare-int points
                         # are handled by reconcile / collection re-sync.
-                        _http_client.delete(
-                            f"{qdrant_url}/collections/{collection}/points",
+                        # POST /points/delete with a points-selector body; httpx .delete()
+                        # takes no body kwarg (json/content) and would raise.
+                        _http_client.post(
+                            f"{qdrant_url}/collections/{collection}/points/delete",
                             json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
                             timeout=5.0,
                         )
@@ -8082,14 +8084,18 @@ def store_retraction_pattern(pattern_text: str, pattern_type: str, negation_type
             )
 
         db_conn.commit()
-        log.info("re_embedder.pattern_stored",
-                pattern=pattern_text, negation_type=negation_type,
-                confidence=confidence)
+        # stdlib logger (logging.getLogger) — use f-string form, NOT structlog kwargs.
+        # Passing pattern=/negation_type= as kwargs reaches Logger._log() which rejects
+        # them ("unexpected keyword argument 'pattern'"), raising AFTER the commit and
+        # making the caller report pattern_learning_failed though the row was stored.
+        log.info(
+            f"re_embedder.pattern_stored pattern={pattern_text} "
+            f"negation_type={negation_type} confidence={confidence}")
         return True
 
     except Exception as e:
-        log.error("re_embedder.pattern_storage_failed",
-                 pattern=pattern_text, error=str(e))
+        log.error(
+            f"re_embedder.pattern_storage_failed pattern={pattern_text} error={str(e)}")
         try:
             db_conn.rollback()
         except Exception:

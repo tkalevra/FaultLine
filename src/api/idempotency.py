@@ -19,6 +19,34 @@ log = structlog.get_logger()
 _REDIS_URL = os.getenv("REDIS_URL", "redis://faultline-redis:6379/0")
 
 
+def flush_idempotency_keys(redis_url: Optional[str] = None) -> int:
+    """Delete all idempotency cache + lock keys from Redis (best-effort).
+
+    Called on a tenant wipe. The cache is keyed by an opaque sha256 of the request (no
+    per-tenant prefix to scan selectively), so a wipe clears the whole idempotency
+    namespace. Safe: the cache is a short-lived success-dedup, so clearing it only costs a
+    one-time re-run of any in-flight duplicate request, never data. Fail-safe — any Redis
+    error returns the count so far and never raises (a wipe must not fail on cache hygiene).
+
+    Returns the number of keys deleted.
+    """
+    url = redis_url or _REDIS_URL
+    deleted = 0
+    try:
+        client = redis.from_url(url, decode_responses=True)
+        for pattern in ("idempotent:*", "lock:*"):
+            for key in client.scan_iter(match=pattern, count=500):
+                try:
+                    client.delete(key)
+                    deleted += 1
+                except Exception:
+                    pass
+        log.info("idempotency.flush_complete", deleted=deleted)
+    except Exception as e:
+        log.warning("idempotency.flush_failed", error=str(e), deleted=deleted)
+    return deleted
+
+
 class IdempotencyManager:
     """Cache responses by idempotency_key to detect and handle duplicate requests."""
 
