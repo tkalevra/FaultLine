@@ -231,6 +231,15 @@ async def rest_recall_memory(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST recall_memory user_id={user_id[:8]}...")
+    # Provisioning gate — the REST path (OpenWebUI's live door) must wait out provisioning
+    # too, else a fresh tenant's first recall races the schema. Backend _ensure_tenant_ready
+    # is the real guard; this returns the clean retry signal without a doomed backend call.
+    if not await _mcp._ensure_provisioned(user_id):
+        return JSONResponse(
+            {"status": "provisioning",
+             "message": "Memory is being set up for you — please retry in a moment.",
+             "facts": []}
+        )
     result = await _mcp.recall_memory_tool(query=body.query, user_id=user_id)
     return JSONResponse(result)
 
@@ -251,6 +260,14 @@ async def rest_remember_facts(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST remember_facts user_id={user_id[:8]}...")
+    # Provisioning gate — wait out provisioning on the REST path so a fresh tenant's first
+    # remember does not race the schema. Backend _ensure_tenant_ready is the authoritative guard.
+    if not await _mcp._ensure_provisioned(user_id):
+        return JSONResponse(
+            {"status": "provisioning",
+             "message": "Memory is being set up for you — please retry in a moment.",
+             "committed": 0}
+        )
     result = await _mcp.remember_facts_tool(text=body.text, user_id=user_id)
     return JSONResponse(result)
 

@@ -6619,7 +6619,15 @@ def evaluate_extraction_patterns(db_conn) -> dict:
 
     try:
         with db_conn.cursor() as cur:
-            # Query patterns with feedback data
+            # NO-OP CHURN TRIM (deterministic, fail-safe): every decision below — archive,
+            # confidence-update, promote — REQUIRES accumulated feedback (confirmed_count /
+            # rejected_count > 0). A freshly-seeded pattern with zero feedback can NEVER trigger
+            # any decision, yet the old unfiltered sweep re-evaluated all ~64 seeded patterns
+            # PER TENANT EVERY cycle (incl. a per-pattern `SELECT engine_generated`), logging
+            # evaluated=64/archived=0/promoted=0 churn against a DB busy provisioning. So fetch
+            # ONLY patterns that carry feedback ("any candidates?" precheck) — a pattern becomes
+            # a candidate the moment a match is confirmed/rejected, so no real promotion is ever
+            # skipped (correction_count is included as a belt-and-suspenders superset).
             cur.execute("""
                 SELECT
                     ep.id,
@@ -6632,6 +6640,9 @@ def evaluate_extraction_patterns(db_conn) -> dict:
                     ep.frequency
                 FROM extraction_patterns ep
                 WHERE ep.is_active = true
+                  AND (COALESCE(ep.confirmed_count, 0) > 0
+                       OR COALESCE(ep.rejected_count, 0) > 0
+                       OR COALESCE(ep.correction_count, 0) > 0)
                 ORDER BY ep.frequency DESC, ep.global_confidence DESC
             """)
             patterns = cur.fetchall()
@@ -6642,7 +6653,9 @@ def evaluate_extraction_patterns(db_conn) -> dict:
         return stats
 
     if not patterns:
-        log.info("re_embedder.extraction_pattern_eval no_patterns_to_evaluate")
+        # No pattern carries feedback yet → nothing any decision could act on. Skip the whole
+        # sweep (no per-pattern queries, no eval_complete churn) until feedback accrues.
+        log.debug("re_embedder.extraction_pattern_eval no_candidates_to_evaluate")
         return stats
 
     log.info(f"re_embedder.extraction_pattern_eval_start count={len(patterns)}")
