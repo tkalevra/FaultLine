@@ -26,7 +26,7 @@
 --   3. NEVER set status='ready'
 --   4. Fail loud per CLAUDE.md constraint #3
 
--- USER SCHEMA TEMPLATE: Replace {schema_name} with actual schema name (e.g., faultline_alexander)
+-- USER SCHEMA TEMPLATE: Replace {schema_name} with actual schema name (e.g., faultline_christopher)
 -- This template is applied when provisioning a new user schema
 
 -- Create schema
@@ -636,6 +636,102 @@ DROP TRIGGER IF EXISTS lowercase_rel_types_before_update ON rel_types;
 CREATE TRIGGER lowercase_rel_types_before_update
     BEFORE UPDATE ON rel_types
     FOR EACH ROW EXECUTE FUNCTION lowercase_rel_types();
+
+-- ----------------------------------------------------------------------------
+-- DEFINING-GROUP ELIGIBILITY INVARIANT (migration 119)
+-- ----------------------------------------------------------------------------
+-- A rel may be a DEFINING rel of a taxonomy (rel_types_defining_group) only if it can
+-- describe a HOMOGENEOUS membership group. This single trigger is the producer-agnostic
+-- enforcement point: it catches every write (seeding, growth/re_embedder, ingest in-flow,
+-- /learn, and any future producer) instead of guarding each call site. Subject-agnostic —
+-- it reasons purely over types, never rel/place literals.
+--   INVARIANT 1: a TYPE-CLASSIFICATION rel (is_hierarchy_rel AND wikidata_pid ∈ P31/P279 —
+--     instance_of/subclass_of/is_a, "what IS this entity") is never a defining rel: it would
+--     intercept nearly every typed-entity query. MEMBERSHIP/COMPOSITION hierarchy rels
+--     (member_of/part_of/located_in — "belongs to a GROUP/whole/place", no classification PID)
+--     ARE allowed to define a grouping (subject to INVARIANT 2): they only match edges into a
+--     specific named group, not every typed entity. This mirrors the P31/P279 split used by
+--     _get_classification_rels and is what lets an engine-grown collective ("my band") become a
+--     walkable grouping node defined by its observed member_of edges. (migration 122)
+--   INVARIANT 2 (cross-type guard): every CONCRETE head/tail type (excluding the ANY/SCALAR
+--     sentinels) must be a member of this taxonomy. A cross-type asymmetric rel
+--     (e.g. person->location for `lives_in`) cannot define a single-type group — it was the
+--     root of the false hierarchy_membership_violation that demoted residence facts to Class C.
+-- Fail-safe: a rel absent from rel_types (novel, not yet minted) or a taxonomy with no/`ANY`
+-- members is KEPT (we never silently lose a defining rel we cannot judge). Each removal RAISEs
+-- a loud WARNING. This is the producer-side twin of the read-time guard in wgm/gate.py.
+CREATE OR REPLACE FUNCTION enforce_defining_group_eligibility()
+RETURNS TRIGGER AS $$
+DECLARE
+    _rel     TEXT;
+    _kept    TEXT[] := '{}';
+    _is_hier BOOLEAN;
+    _pid     TEXT;
+    _heads   TEXT[];
+    _tails   TEXT[];
+    _members TEXT[];
+BEGIN
+    IF NEW.rel_types_defining_group IS NULL
+       OR array_length(NEW.rel_types_defining_group, 1) IS NULL THEN
+        RETURN NEW;
+    END IF;
+    -- No concrete membership to judge against → keep as-is (fail-safe).
+    IF NEW.member_entity_types IS NULL
+       OR array_length(NEW.member_entity_types, 1) IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT array_agg(LOWER(m)) INTO _members FROM unnest(NEW.member_entity_types) m;
+
+    FOREACH _rel IN ARRAY NEW.rel_types_defining_group LOOP
+        SELECT is_hierarchy_rel, wikidata_pid, head_types, tail_types
+          INTO _is_hier, _pid, _heads, _tails
+          FROM rel_types WHERE rel_type = LOWER(_rel);
+
+        IF NOT FOUND THEN
+            _kept := array_append(_kept, _rel);          -- novel/unknown rel → keep
+            CONTINUE;
+        END IF;
+
+        -- INVARIANT 1: drop only TYPE-CLASSIFICATION hierarchy rels (P31/P279 — instance_of/
+        -- subclass_of/is_a). Membership/composition hierarchy rels (member_of/part_of/located_in)
+        -- are kept here and arbitrated by the cross-type guard below.
+        IF COALESCE(_is_hier, FALSE) AND COALESCE(_pid, '') IN ('P31', 'P279') THEN
+            RAISE WARNING 'faultline: dropped classification rel % from defining group of taxonomy %',
+                          _rel, NEW.taxonomy_name;
+            CONTINUE;
+        END IF;
+
+        -- 'ANY' in the member set = wildcard membership → no cross-type constraint.
+        IF NOT ('any' = ANY(_members)) THEN
+            IF EXISTS (SELECT 1 FROM unnest(COALESCE(_heads, '{}')) h
+                       WHERE LOWER(h) NOT IN ('any','scalar') AND LOWER(h) <> ALL(_members))
+               OR EXISTS (SELECT 1 FROM unnest(COALESCE(_tails, '{}')) t
+                          WHERE LOWER(t) NOT IN ('any','scalar') AND LOWER(t) <> ALL(_members))
+            THEN
+                RAISE WARNING 'faultline: dropped cross-type rel % from defining group of taxonomy % (head/tail not all members)',
+                              _rel, NEW.taxonomy_name;
+                CONTINUE;
+            END IF;
+        END IF;
+
+        _kept := array_append(_kept, _rel);
+    END LOOP;
+
+    NEW.rel_types_defining_group := _kept;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS enforce_defining_group_eligibility_ins ON entity_taxonomies;
+CREATE TRIGGER enforce_defining_group_eligibility_ins
+    BEFORE INSERT ON entity_taxonomies
+    FOR EACH ROW EXECUTE FUNCTION enforce_defining_group_eligibility();
+
+DROP TRIGGER IF EXISTS enforce_defining_group_eligibility_upd ON entity_taxonomies;
+CREATE TRIGGER enforce_defining_group_eligibility_upd
+    BEFORE UPDATE ON entity_taxonomies
+    FOR EACH ROW EXECUTE FUNCTION enforce_defining_group_eligibility();
 
 -- system_alerts: persistent per-user warnings with countdown suppression
 -- alert_type is unique per schema; alerts_shown tracks how many times the warning

@@ -79,9 +79,16 @@ class Atom:
     INVARIANT (enforced by the guardrail): ``source_span`` is a byte-substring of the original
     message, and ``text`` introduces no content token / numeric literal absent from the user's
     actual words. A guardrail-rejected atom keeps ``text == source_span`` (the user's exact words).
+
+    ``rejected`` is a health flag (NOT load-bearing for downstream): True iff the LLM's clean
+    rewrite was DISCARDED in favor of a verbatim fallback (subject-drop / content / numeric).
+    It exists only so ``reframe_to_atomic`` can count genuine rejections instead of the old
+    ``text == source_span`` heuristic, which false-counted OK atoms whose model ``source`` happened
+    to equal its ``statement`` (the common single-fact case).
     """
     text: str
     source_span: str
+    rejected: bool = False
 
 
 @dataclass
@@ -118,7 +125,7 @@ _FUNCTION_WORDS: frozenset[str] = frozenset({
 })
 
 # Token regex that keeps dotted/dated/IP/email literals INTACT as one token:
-#   192.0.2.21, foo@bar.com, 3/22, 2023-03-22  →  single tokens.
+#   10.0.0.21, foo@bar.com, 3/22, 2023-03-22  →  single tokens.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[.\-:/@][A-Za-z0-9]+)*")
 
 
@@ -144,7 +151,7 @@ def _literals(s: str) -> set[str]:
 # falls to Class C (lost). Tier 3 rejects an atom that drops the source clause's subject so
 # the verbatim source span (which the spine parses correctly) is substituted instead.
 #
-# Subject-agnostic: "My son Sampson broke his leg" → atom "broke his leg" loses the subject
+# Subject-agnostic: "My son Theodore broke his leg" → atom "broke his leg" loses the subject
 # "son" and is rejected the same way. Grammar only (spaCy nsubj/nsubjpass + first-person
 # morphology), NO hardcoded pronoun/noun list. Fail-safe: spaCy missing / parse error →
 # treat as PASS (never crash, never a new false reject — strictly no worse than today).
@@ -176,7 +183,7 @@ def _subject_preserved(atom_text: str, source_span: str) -> bool:
       1. If the SOURCE has a grammatical subject (nsubj/nsubjpass) and the ATOM has NONE → FAIL.
          This is the bug case: "I have been attending the workshop ..." → "attending the
          workshop ..." (subject "I" dropped → bare participial fragment, no nsubj), and
-         subject-agnostically "My son Sampson broke his leg" → "broke his leg" (subject "son"
+         subject-agnostically "My son Theodore broke his leg" → "broke his leg" (subject "son"
          dropped). A subject-stripped atom cannot ground downstream, so reject it.
       2. SINGLE-clause first-person guard: if the SOURCE has EXACTLY ONE subject and it is a
          1st-person pronoun ("I"/"we"), the atom must STILL carry a first-person subject. This
@@ -255,8 +262,8 @@ def _containing_sentence(full_message: str, source_span: str) -> str:
 
 # Guardrail outcomes. ``OK`` = pass through the LLM rewrite. The rejection reasons are
 # DISTINGUISHED because their verbatim fallback TARGET differs (RC §4.3 + the subject-drop fix):
-#   - SUBJECT_DROP  → the LLM's ``source`` itself dropped the subject, so it is NOT a safe verbatim
-#                     anchor; fall back to the TRUE ORIGINAL sentence (subject intact).
+#   - SUBJECT_DROP  → the LLM's REWRITE (``atom_text``) dropped the clause subject, so it cannot
+#                     ground downstream; fall back to the TRUE ORIGINAL sentence (subject intact).
 #   - CONTENT/NUMERIC → the ``source`` span is still the user's exact words for this fact; the LLM
 #                     only mangled its rewrite, so the verbatim ``source`` span remains the anchor.
 _GR_OK = "ok"
@@ -297,24 +304,25 @@ def _guardrail_check(atom_text: str, source_span: str, full_message: str) -> str
     Any violation → a rejection token → caller substitutes the appropriate verbatim text.
     """
     # Tier 3 (FIRST — most destructive, safest fallback): the source clause's grammatical subject
-    # must survive. Checked against the TRUE ORIGINAL sentence (the one in ``full_message``
-    # containing the LLM's ``source``), NOT just the LLM's ``source`` span — because the model can
-    # drop the subject from BOTH the statement AND its ``source`` field (the source then has no
-    # subject for Tier 3 to compare to, so the drop would sail through). The true sentence always
-    # carries the user's subject, so the drop is caught regardless of how the model mangled it.
+    # must survive in the ATOM TEXT — the thing that actually flows downstream to the spine. Checked
+    # against the TRUE ORIGINAL sentence (the one in ``full_message`` containing the LLM's
+    # ``source``), NOT just the LLM's ``source`` span — because the model can drop the subject from
+    # BOTH the statement AND its ``source`` field, and the true sentence always carries the user's
+    # subject so the drop is caught regardless of how the model mangled it.
     #
-    # We test BOTH the LLM's clean ``atom_text`` AND its ``source`` span against that true sentence,
-    # because they feed different fallbacks downstream: ``atom_text`` is used on an OK pass, while
-    # the ``source`` span is what the CONTENT/NUMERIC branch substitutes verbatim. If the ``source``
-    # itself dropped the subject (the live bug: statement keeps "I" but source is the bare
-    # participial fragment "attending the workshop …"), then a content/numeric rejection would
-    # anchor downstream on that subject-less fragment — strictly WORSE than the subject-drop
-    # fallback (``_containing_sentence`` → the true subject-intact sentence). So a subject drop in
-    # EITHER place routes to ``_GR_SUBJECT_DROP``, and it runs before Tiers 1+2 so the safer
-    # true-sentence fallback wins the race against the content/numeric source-span fallback.
-    # Fail-safe PASS when spaCy is unavailable, leaving Tiers 1+2 to decide as before.
+    # IMPORTANT (enumeration fix): we test ONLY ``atom_text`` here, NOT the ``source`` span. A
+    # correctly-split ENUMERATION item carries the shared subject in the ATOM TEXT but cites a bare
+    # subjectless NP as its ``source`` — e.g. "We have a cat …, a dog named Rex, … a snake named
+    # Sophia" splits to atom_text="We have a dog named Rex." (subject "We" intact) with
+    # source="a dog named Rex" (no nsubj). The atom is GOOD; the source is just the verbatim
+    # provenance fragment. The OLD code also tested the ``source`` span and rejected these correct
+    # atoms, replacing them with the entire run-on sentence — the live "Rex/Sophia merge" bug.
+    # The ``source``-subjectlessness only matters when the source is USED as the downstream text
+    # (the CONTENT/NUMERIC verbatim fallback), so that case is handled in ``_apply_guardrail`` by
+    # anchoring a subjectless source to its true containing sentence — without falsely rejecting the
+    # OK atom here. Fail-safe PASS when spaCy is unavailable, leaving Tiers 1+2 to decide as before.
     subject_ref = _containing_sentence(full_message, source_span)
-    if not _subject_preserved(atom_text, subject_ref) or not _subject_preserved(source_span, subject_ref):
+    if not _subject_preserved(atom_text, subject_ref):
         return _GR_SUBJECT_DROP
 
     atom_ct = _content_tokens(atom_text)
@@ -348,7 +356,7 @@ def _guardrail_ok(atom_text: str, source_span: str, full_message: str) -> bool:
 # top-level JSON ARRAY would not survive that regex fallback. So we ask the model for an OBJECT
 # wrapping the list — ``{"atoms": [...]}`` — which parses on the happy path AND the regex
 # fallback. (Deviation from RC §3's top-level-array shape; required for the shared parser.)
-_SYSTEM_PROMPT = 'You are helping build a MEMORY GRAPH. The same real thing must come out in the SAME clean canonical form EVERY time, so it can be matched and de-duplicated downstream. Your job is to reformat one chat message into clean, single-fact statements.\n\nWHO each fact is ABOUT (critical — the graph is subject-agnostic):\nKeep each statement\'s TRUE SUBJECT exactly as the user wrote it. If the user wrote "I" / "my car" / "my son Sampson" / "the server", that EXACT subject stays. NEVER reattribute a fact to someone else, NEVER rewrite the subject to "the user", and NEVER force first person. A fact about the user\'s son stays about the son; a fact about a server stays about the server. Keep the user\'s OWN action verb ("drove", "received", "met", "attended") — do not swap it for a different verb.\n\nHARD RULES — obey every one:\n1. NEVER add a fact, name, number, date, place, or value that is not in the message. Copy every number/date/name/address EXACTLY, character for character.\n2. NEVER drop a real fact, and NEVER invent one. Every concrete statement in the message — including a fact tucked into a "by the way" aside — becomes its own line.\n3. ONE fact per line. Split compound sentences; keep each statement short. Never split one fact across two lines and never merge two facts into one line.\n4. STRIP the chatter and any request or question to the assistant, but KEEP every concrete stated fact in the SAME message. Remove ONLY the conversational parts — greetings, "by the way", "I just", "also", "anyway", and the request/question clause itself ("can you help me", "do you have any tips", "do you have any recommendations", "do you have any ideas"). A message can ASK a question AND state a fact in passing — keep the fact, drop the question. The request/question wording must never appear in a statement, but any concrete fact tucked beside or behind it (a "by the way" aside, an "I recall that…" background note, a stated event/date/name) STILL becomes its own statement. Return {"atoms": []} ONLY when the message states no concrete fact at all.\n5. DROP pure opinion/plan/feeling that names no concrete thing ("excited to capture great shots", "it was an amazing event"). Keep every clause that states something concrete about a subject.\n6. Resolve a pronoun ONLY to a noun literally present earlier in the SAME message; otherwise leave the pronoun as-is. When the pronoun could refer to EITHER a person\'s proper NAME or a common-noun role word for that SAME person (the message already gave both, e.g. "my mother\'s name is Robin" then "she ...", or "my sister is Taylor" then "she ..."), resolve the pronoun to the proper NAME, never the role word. This affects ONLY the pronoun\'s own clause; the earlier naming statement still becomes its own separate line unchanged.\n\nNAMING THINGS — ONE STABLE CANONICAL FORM (this is what lets the graph de-duplicate):\nA. Refer to a named thing by its EXACT proper/quoted TITLE — same words, same order, with its quotes — EVERY time, no matter how the surrounding sentence was phrased.\nB. For a named EVENT, the event phrase MUST be written in this EXACT shape, every single time:\n       the \'<Exact Title>\' event\n   - ALWAYS keep the quoted title AND the literal word "event" right after it. Never omit "event".\n   - NEVER put any other word between the title and "event", and NEVER fold extra words into the phrase: drop describers like "auto racking"/"annual", and drop any venue/place adjunct ("at the local racing track", "in nearby city") from the event phrase.\n   - If a date is given for the event, append it as  on <date>  AFTER the word "event" (a venue/place is dropped, only the date may follow). \n   This identical shape must come out for EVERY mention of the same event, whatever verb the user used and wherever the title sat in the original sentence.\n   Examples (identical event phrase every time; the user\'s own verb is kept):\n     "I participated in the \'Turbocharged Tuesdays\' auto racking event ... on June 14th"  ->  "I participated in the \'Turbocharged Tuesdays\' event on June 14th."\n     "I drove my car at the \'Turbocharged Tuesdays\' event ... on June 14th"  ->  "I drove my car at the \'Turbocharged Tuesdays\' event on June 14th."\n     "I met a mechanic ... at the \'Turbocharged Tuesdays\' event"  ->  "I met a mechanic at the \'Turbocharged Tuesdays\' event."\n     "just got back from the \'Rack Fest\' in nearby city on June 18th"  ->  "I got back from the \'Rack Fest\' event on June 18th."  (venue "in nearby city" dropped, "event" added)\n     "I attended the \'Rack Fest\' event last weekend, on June 18th"  ->  "I attended the \'Rack Fest\' event on June 18th."\nC. When the message gives a specific name next to a general word for the SAME thing ("the laptop, Dell XPS 13"), use the SPECIFIC name ("Dell XPS 13").\nD. EACH date belongs to EXACTLY ONE statement — the fact it actually describes. Never copy one date onto two statements, never strip a date off the thing it modifies.\n\nNO-FACT TURNS: if the message states no concrete fact (a pure question, greeting, or filler), return {"atoms": []}. Do not invent a statement just to have output.\n\nOUTPUT: strict JSON, nothing else — an OBJECT with one key "atoms":\n{"atoms": [ {"statement": "<clean single-fact sentence>", "source": "<the exact substring of the original message this came from>"} , ... ] }\nIf there is no statable fact, return {"atoms": []}.\n\nEXAMPLES:\nMessage: "My favorite color is red."\nOutput: {"atoms": [{"statement": "My favorite color is red.", "source": "My favorite color is red"}]}\nMessage: "By the way, my son Sampson broke his leg last Tuesday."\nOutput: {"atoms": [{"statement": "My son Sampson broke his leg last Tuesday.", "source": "my son Sampson broke his leg last Tuesday"}]}\nMessage: "The server in the rack went down on March 3rd."\nOutput: {"atoms": [{"statement": "The server in the rack went down on March 3rd.", "source": "The server in the rack went down on March 3rd"}]}\nMessage: "What\'s the best way to clean and maintain my hiking boots?"\nOutput: {"atoms": []}\n'
+_SYSTEM_PROMPT = 'You are helping build a MEMORY GRAPH. The same real thing must come out in the SAME clean canonical form EVERY time, so it can be matched and de-duplicated downstream. Your job is to reformat one chat message into clean, single-fact statements.\n\nWHO each fact is ABOUT (critical — the graph is subject-agnostic):\nKeep each statement\'s TRUE SUBJECT exactly as the user wrote it. If the user wrote "I" / "my car" / "my son Theodore" / "the server", that EXACT subject stays. NEVER reattribute a fact to someone else, NEVER rewrite the subject to "the user", and NEVER force first person. A fact about the user\'s son stays about the son; a fact about a server stays about the server. Keep the user\'s OWN action verb ("drove", "received", "met", "attended") — do not swap it for a different verb.\n\nHARD RULES — obey every one:\n1. NEVER add a fact, name, number, date, place, or value that is not in the message. Copy every number/date/name/address EXACTLY, character for character.\n2. NEVER drop a real fact, and NEVER invent one. Every concrete statement in the message — including a fact tucked into a "by the way" aside — becomes its own line.\n3. ONE fact per line. Split compound sentences; keep each statement short. Never split one fact across two lines and never merge two facts into one line.\n4. STRIP the chatter and any request or question to the assistant, but KEEP every concrete stated fact in the SAME message. Remove ONLY the conversational parts — greetings, "by the way", "I just", "also", "anyway", and the request/question clause itself ("can you help me", "do you have any tips", "do you have any recommendations", "do you have any ideas"). A message can ASK a question AND state a fact in passing — keep the fact, drop the question. The request/question wording must never appear in a statement, but any concrete fact tucked beside or behind it (a "by the way" aside, an "I recall that…" background note, a stated event/date/name) STILL becomes its own statement. Return {"atoms": []} ONLY when the message states no concrete fact at all.\n5. DROP pure opinion/plan/feeling that names no concrete thing ("excited to capture great shots", "it was an amazing event"). Keep every clause that states something concrete about a subject.\n6. Resolve a pronoun ONLY to a noun literally present earlier in the SAME message; otherwise leave the pronoun as-is. When the pronoun could refer to EITHER a person\'s proper NAME or a common-noun role word for that SAME person (the message already gave both, e.g. "my mother\'s name is Diane" then "she ...", or "my sister is Sarah" then "she ..."), resolve the pronoun to the proper NAME, never the role word. This affects ONLY the pronoun\'s own clause; the earlier naming statement still becomes its own separate line unchanged.\n7. A RELATIVE CLAUSE IS A SEPARATE FACT. "X who is 10", "the server that runs Linux", "Paris, which is in France" each state a SECOND fact about that thing — split it onto its OWN line with the thing ITSELF as the subject ("Mia is 10.", "The server runs Linux.", "Paris is in France."). NEVER let a relative pronoun (who, that, which) be the subject of a line, and never leave "who is 10" attached to a list.\n8. A LIST OF DISTINCT THINGS SPLITS PER THING. When one clause introduces several distinct things — a comma/"and" list, or a count followed by the items ("three kids: Mia, Theo, and Leo", "two cars: a Tesla and a truck", "three servers: a web server named Apollo, a database named Vault, and a cache named Echo") — keep the bare NAMES listed together on the ONE membership line (carrying the shared subject and verb, e.g. "We have three kids: Mia, Theo, and Leo."), and put each thing\'s OWN attribute (its age, type, owner, location) on its own separate line. When a list item is itself "a <type> named <Name>", give it its own membership line in that exact form ("We run a database named Vault."). Never collapse two different things onto one line, and never invent a singular noun for an item the message only named inside the list.\n\nNAMING THINGS — ONE STABLE CANONICAL FORM (this is what lets the graph de-duplicate):\nA. Refer to a named thing by its EXACT proper/quoted TITLE — same words, same order, with its quotes — EVERY time, no matter how the surrounding sentence was phrased.\nB. For a named EVENT, the event phrase MUST be written in this EXACT shape, every single time:\n       the \'<Exact Title>\' event\n   - ALWAYS keep the quoted title AND the literal word "event" right after it. Never omit "event".\n   - NEVER put any other word between the title and "event", and NEVER fold extra words into the phrase: drop describers like "auto racking"/"annual", and drop any venue/place adjunct ("at the local racing track", "in nearby city") from the event phrase.\n   - If a date is given for the event, append it as  on <date>  AFTER the word "event" (a venue/place is dropped, only the date may follow). \n   This identical shape must come out for EVERY mention of the same event, whatever verb the user used and wherever the title sat in the original sentence.\n   Examples (identical event phrase every time; the user\'s own verb is kept):\n     "I participated in the \'Turbocharged Tuesdays\' auto racking event ... on June 14th"  ->  "I participated in the \'Turbocharged Tuesdays\' event on June 14th."\n     "I drove my car at the \'Turbocharged Tuesdays\' event ... on June 14th"  ->  "I drove my car at the \'Turbocharged Tuesdays\' event on June 14th."\n     "I met a mechanic ... at the \'Turbocharged Tuesdays\' event"  ->  "I met a mechanic at the \'Turbocharged Tuesdays\' event."\n     "just got back from the \'Rack Fest\' in nearby city on June 18th"  ->  "I got back from the \'Rack Fest\' event on June 18th."  (venue "in nearby city" dropped, "event" added)\n     "I attended the \'Rack Fest\' event last weekend, on June 18th"  ->  "I attended the \'Rack Fest\' event on June 18th."\nC. When the message gives a specific name next to a general word for the SAME thing ("the laptop, Dell XPS 13"), use the SPECIFIC name ("Dell XPS 13").\nD. EACH date belongs to EXACTLY ONE statement — the fact it actually describes. Never copy one date onto two statements, never strip a date off the thing it modifies.\n\nNO-FACT TURNS: if the message states no concrete fact (a pure question, greeting, or filler), return {"atoms": []}. Do not invent a statement just to have output.\n\nOUTPUT: strict JSON, nothing else — an OBJECT with one key "atoms":\n{"atoms": [ {"statement": "<clean single-fact sentence>", "source": "<the exact substring of the original message this came from>"} , ... ] }\nIf there is no statable fact, return {"atoms": []}.\n\nEXAMPLES:\nMessage: "My favorite color is red."\nOutput: {"atoms": [{"statement": "My favorite color is red.", "source": "My favorite color is red"}]}\nMessage: "By the way, my son Theodore broke his leg last Tuesday."\nOutput: {"atoms": [{"statement": "My son Theodore broke his leg last Tuesday.", "source": "my son Theodore broke his leg last Tuesday"}]}\nMessage: "The server in the rack went down on March 3rd."\nOutput: {"atoms": [{"statement": "The server in the rack went down on March 3rd.", "source": "The server in the rack went down on March 3rd"}]}\nMessage: "We have three kids: Mia who is 10, Theo who is 12, and Leo who is 19."\nOutput: {"atoms": [{"statement": "We have three kids: Mia, Theo, and Leo.", "source": "We have three kids: Mia who is 10, Theo who is 12, and Leo who is 19"}, {"statement": "Mia is 10.", "source": "Mia who is 10"}, {"statement": "Theo is 12.", "source": "Theo who is 12"}, {"statement": "Leo is 19.", "source": "Leo who is 19"}]}\nMessage: "We run two servers: a web server named Apollo and a cache named Echo."\nOutput: {"atoms": [{"statement": "We run a web server named Apollo.", "source": "a web server named Apollo"}, {"statement": "We run a cache named Echo.", "source": "a cache named Echo"}]}\nMessage: "What\'s the best way to clean and maintain my hiking boots?"\nOutput: {"atoms": []}\n'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -417,9 +425,11 @@ async def reframe_to_atomic(
         return ReframeResult(atoms=[], used_llm=True)
 
     atoms = _apply_guardrail(raw_atoms, raw)
-    rejected = sum(1 for a in atoms if a.text == a.source_span and a.text != "")
-    # "rejected" here counts atoms whose LLM rewrite was discarded in favor of the verbatim span;
-    # it is a fail-loud health signal (model drift / invention), not a hard failure.
+    rejected = sum(1 for a in atoms if a.rejected)
+    # "rejected" counts atoms whose LLM rewrite was DISCARDED in favor of the verbatim span (the
+    # ``Atom.rejected`` flag set by the guardrail). It is a fail-loud health signal (model drift /
+    # invention), not a hard failure. NOTE: the old ``text == source_span`` heuristic false-counted
+    # OK atoms whose model ``source`` happened to equal its ``statement`` (the single-fact case).
     log.info("reframe.done",
              user_id=(user_id or "?")[:8],
              raw_len=len(raw),
@@ -471,15 +481,24 @@ def _apply_guardrail(raw_atoms: list, full_message: str) -> list[Atom]:
         if outcome == _GR_OK:
             out.append(Atom(text=statement, source_span=source))
         elif outcome == _GR_SUBJECT_DROP:
-            # The LLM dropped the subject — its ``source`` is the subject-less fragment and cannot
-            # ground downstream. Anchor to the TRUE original sentence (subject intact) instead.
+            # The LLM dropped the subject FROM ITS REWRITE — the atom text cannot ground downstream.
+            # Anchor to the TRUE original sentence (subject intact) instead.
             true_sentence = _containing_sentence(full_message, source)
             log.warning("reframe.subject_drop_fallback",
                         dropped_source_preview=source[:80],
                         true_sentence_preview=true_sentence[:120])
-            out.append(Atom(text=true_sentence, source_span=true_sentence))
+            out.append(Atom(text=true_sentence, source_span=true_sentence, rejected=True))
         else:
-            # CONTENT / NUMERIC rejection: the source span is still the user's exact words for
-            # this fact; fall back to it verbatim (strictly no worse than today).
-            out.append(Atom(text=source, source_span=source))
+            # CONTENT / NUMERIC rejection: fall back to the user's verbatim words for this fact.
+            # The ``source`` span is normally the right anchor, BUT if it is itself a subjectless
+            # fragment (a correctly-split enumeration item whose shared subject sits at the head of
+            # the list, e.g. "a dog named Rex"), the spine cannot ground it — so in that one case
+            # anchor to the TRUE containing sentence (subject intact). This preserves the old
+            # "subjectless source → true sentence" safety for genuine content/numeric rejections,
+            # WITHOUT it pre-empting and falsely rejecting OK enumeration atoms (that pre-emption was
+            # the live merge bug). Grammatical + subject-agnostic; fail-safe (spaCy off → source).
+            fallback = source
+            if not _subject_preserved(source, _containing_sentence(full_message, source)):
+                fallback = _containing_sentence(full_message, source)
+            out.append(Atom(text=fallback, source_span=fallback, rejected=True))
     return out

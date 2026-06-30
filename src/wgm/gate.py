@@ -1242,6 +1242,28 @@ class WGMValidationGate:
         subject_type_upper = subject_type.upper().strip() if subject_type else None
         object_type_upper = object_type.upper().strip() if object_type else None
 
+        # CROSS-TYPE ASYMMETRIC GUARD (metadata-driven, subject-agnostic — NO rel_type name check).
+        # The homogeneous "both ends must be members of the same taxonomy" model below is only
+        # correct for SAME-TYPE relations: peer groups / containment hierarchies whose head and
+        # tail are the same kind (e.g. located_in Location→Location, sibling_of Person→Person).
+        # An ASYMMETRIC CROSS-TYPE rel connects two DIFFERENT kinds BY DESIGN
+        # (e.g. lives_in Person→Location, born_in Person→Location): requiring both ends to be
+        # members of one homogeneous taxonomy is a category error that falsely demotes the
+        # canonical residence/location fact to Class C. Such rels are typed by head_types/
+        # tail_types via _check_type_constraints instead, which is the correct asymmetric gate.
+        # Detect "cross-type" purely from the live ontology: concrete head set disjoint from
+        # concrete tail set (generic ANY/SCALAR sentinels excluded). Fail-safe: any miss falls
+        # through to the membership check below (no new drops).
+        try:
+            _ont = self.get_current_ontology().get(rt_lower, {}) or {}
+            _generic = {"any", "scalar"}
+            _h = {t.lower() for t in (_ont.get("head_types") or []) if t and t.lower() not in _generic}
+            _t = {t.lower() for t in (_ont.get("tail_types") or []) if t and t.lower() not in _generic}
+            if _h and _t and _h.isdisjoint(_t):
+                return (True, "cross_type_asymmetric_defer_to_type_constraints", [])
+        except Exception:
+            pass  # fail-safe: fall through to the homogeneous membership check
+
         try:
             with self.db_conn.cursor() as cur:
                 # Query hierarchies that define this rel_type

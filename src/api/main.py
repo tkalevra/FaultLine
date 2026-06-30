@@ -422,7 +422,7 @@ def _detect_naming_states(text: str) -> list[dict]:
     r"""Deterministic NAMING-construction detector (RC2 naming seam).
 
     Captures "<noun> named/called <ProperName>" ("I have a dog named Rex", "a server called
-    Atlas", "my dog is named Rex") as a VALID naming edge so the proper name is not lost and
+    Apollo", "my dog is named Rex") as a VALID naming edge so the proper name is not lost and
     the verb-lift "nam" junk (``(noun, nam, ProperName)``) is eliminated. Mirrors the proven-live
     ``_detect_preference_states`` / ``_detect_feeling_states`` harvest seams.
 
@@ -1754,7 +1754,20 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
                 # CRATER participated_in (the GPS-as-Event tail-type veto) and picks has_state. The
                 # affected entity keeps its part_of/owns grounding from the other chains (untouched here).
                 # THE DISCRIMINATOR: problem_head (cue class ∧ with-PP) — a non-problem "have + with-PP"
-                # ("had a meeting with Taylor") never sets problem_head, so this lane never fires there.
+                # ("had a meeting with Sarah") never sets problem_head, so this lane never fires there.
+                # CARVE-OUT GROWTH: problem_noun is grown per-tenant. When the head is NOT (yet) a grown
+                # problem head but the analysis flagged it as a candidate (a "had a <bland-head> with
+                # <NON-person thing>" construction — person-gated in _build_event_analysis), queue the
+                # head for freq-gated growth so a future cycle promotes it into the problem_noun class
+                # (then problem_head fires and the has_state competitor lands). Best-effort; the affected
+                # entity is already captured here (participated_in/Class-C) + walkable via its other
+                # chains, so this is purely additive growth, never a drop.
+                _pc = getattr(ev, "problem_candidate", None)
+                if _pc and not getattr(ev, "problem_head", False):
+                    try:
+                        linguistic_cue_overlay.record_cue_candidate(_pc, "problem_noun")
+                    except Exception:  # noqa: BLE001 — fail-safe: growth signal never breaks ingest
+                        pass
                 if _promote_arg and getattr(ev, "problem_head", False):
                     _state_obj = event  # the bland head TYPE ("issue"/"problem") = the reusable state
                     _state = {"subject": _flat_object, "rel_type": "has_state", "object": _state_obj,
@@ -3201,7 +3214,7 @@ def get_user_schema_context(user_id: str, db) -> dict:
     Returns:
         {
             "user_id": user_id,
-            "schema_name": "faultline_alexander",  # from users.slug
+            "schema_name": "faultline_christopher",  # from users.slug
             "status": "ready"
         }
 
@@ -3657,6 +3670,182 @@ def _retraction_semantic_fallback(
     except Exception as e:
         log.warning("retraction_semantic_fallback.unexpected_error", error=str(e))
         return None
+
+
+def _grouping_candidate_rels(db) -> list[str]:
+    """The rel_types that can DEFINE a grown grouping, read from per-tenant metadata.
+
+    A grouping/containment edge ("X member_of/part_of/located_in <group>") names a
+    collective the members belong to — exactly the edge that should mint a walkable
+    grouping. We select these GENERICALLY from rel metadata, never by literal name:
+
+      hierarchy rels (is_hierarchy_rel = true)   ← "belongs to a group/whole/place"
+        MINUS the TYPE-CLASSIFICATION rels (wikidata_pid ∈ P31/P279 — instance_of,
+        subclass_of, is_a), which answer "what IS this" and would intercept every
+        typed entity (the exact danger the defining-group eligibility trigger guards).
+
+    This mirrors `_get_classification_rels`' P31/P279 distinction (membership/composition
+    are hierarchy rels but NOT classification). Subject-agnostic, zero domain literals.
+    Returns [] on any error (fail-safe: no mint, never crash ingest).
+    """
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT rel_type FROM rel_types "
+                "WHERE is_hierarchy_rel = true "
+                "  AND (wikidata_pid IS NULL OR wikidata_pid <> ALL(%s))",
+                (list(_CLASSIFICATION_PIDS),),
+            )
+            return [r[0].lower() for r in cur.fetchall() if r[0]]
+    except Exception as _e:
+        log.warning("grouping_mint.candidate_rels_failed", error=str(_e)[:120])
+        return []
+
+
+def _mint_groupings_from_membership(db, user_id: str, min_members: int = None) -> int:
+    """ENGINE GROWTH: auto-mint a grouping taxonomy from OBSERVED membership at ingest.
+
+    The system grows an entity's FACTS for any novel subject, but the GROUPING node the
+    scoped query walk needs (entity_taxonomies) was 100% hand-seeded — so a novel
+    collective ("my band", "my book club") captured `member_of <group>` edges perfectly
+    yet had no taxonomy to scope, leaking to fetch-all. This producer closes that gap:
+    it forms/extends the grouping node from the membership edges ingest already commits.
+
+    DETERMINISTIC + FREQ-GATED + SUBJECT-AGNOSTIC + ZERO domain literals:
+      • Defining rel  : any `_grouping_candidate_rels` (membership/containment, metadata).
+      • Grouping head : the SHARED group OBJECT of those edges (co-membership) — its own
+                        preferred alias becomes the `taxonomy_name`. NOT a name map.
+      • Members       : the distinct SUBJECTS pointing at that group via the rel; their
+                        resolved GLiNER2 entity types become `member_entity_types`.
+      • Freq gate     : a grouping is minted only once ≥ `min_members` DISTINCT members
+                        share the same group object (a single membership is just a fact).
+      • Convergence   : ON CONFLICT extends member_types/defining rels by IDENTITY (array
+                        union) — no cosine/embedding/fuzzy.
+      • Per-tenant    : writes UNQUALIFIED under the request's tenant search_path; refuses
+                        to run if the search_path fell through to `public` (fail-loud).
+      • Source        : 'engine_grown_ingest' (NEVER 'seeded'); seeded rows are protected
+                        from grown mutation by the ON CONFLICT … WHERE source <> 'seeded'.
+
+    The defining-group eligibility TRIGGER still polices the write (it strips a true
+    type-classification rel / a cross-type rel) — we feed it eligible membership rels and
+    let it arbitrate. A mint failure is swallowed (the underlying facts are already
+    committed); the grouping simply isn't grown this pass. Returns the number of
+    groupings minted/extended.
+    """
+    floor = min_members if min_members is not None else max(
+        2, int(os.getenv("GROUPING_MINT_MIN_MEMBERS", "2"))
+    )
+    minted = 0
+    try:
+        # Fail-loud per-tenant guard: never grow into the public template.
+        with db.cursor() as cur:
+            cur.execute("SHOW search_path")
+            _sp = (cur.fetchone() or [""])[0] or ""
+        _first = _sp.split(",")[0].strip().strip('"')
+        if not _first.startswith("faultline_"):
+            log_crit(log, "grouping_mint.refused_non_tenant_search_path",
+                     search_path=_sp[:120], user_id=str(user_id)[:8])
+            return 0
+
+        cand = _grouping_candidate_rels(db)
+        if not cand:
+            return 0
+
+        # Co-membership: distinct members sharing one group OBJECT via a candidate rel.
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT object_id, rel_type,
+                       COUNT(DISTINCT subject_id) AS n,
+                       ARRAY_AGG(DISTINCT subject_id) AS members
+                  FROM (
+                        SELECT subject_id, object_id, rel_type FROM facts
+                         WHERE rel_type = ANY(%s) AND superseded_at IS NULL
+                           AND archived_at IS NULL AND deleted_at IS NULL
+                        UNION
+                        SELECT subject_id, object_id, rel_type FROM staged_facts
+                         WHERE rel_type = ANY(%s) AND promoted_at IS NULL
+                  ) m
+                 WHERE object_id <> %s
+                 GROUP BY object_id, rel_type
+                HAVING COUNT(DISTINCT subject_id) >= %s
+                """,
+                (cand, cand, user_id, floor),
+            )
+            rows = cur.fetchall()
+
+        for object_id, rel_type, n, members in rows:
+            # Grouping name = the group object's preferred alias (its surface), never a map.
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+                    "ORDER BY is_preferred DESC, alias ASC LIMIT 1",
+                    (object_id,),
+                )
+                _r = cur.fetchone()
+            group_name = (_r[0] if _r else None)
+            if not group_name:
+                continue
+            group_name = group_name.strip().lower()
+            if len(group_name) < 2:
+                continue
+
+            # member_entity_types = resolved GLiNER2 types of the members (drop unknown).
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT entity_type FROM entities "
+                    "WHERE id = ANY(%s) AND entity_type IS NOT NULL "
+                    "  AND entity_type <> 'unknown'",
+                    (list(members),),
+                )
+                mtypes = sorted({t[0] for t in cur.fetchall() if t[0]})
+
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO entity_taxonomies
+                            (taxonomy_name, description, member_entity_types,
+                             rel_types_defining_group, has_transitivity,
+                             transitive_rel_types, is_hierarchical, parent_rel_type, source)
+                        VALUES (%s, %s, %s::text[], %s::text[], false,
+                                '{}'::text[], false, NULL, 'engine_grown_ingest')
+                        ON CONFLICT (taxonomy_name) DO UPDATE SET
+                            member_entity_types = (
+                                SELECT ARRAY_AGG(DISTINCT e)
+                                  FROM unnest(COALESCE(entity_taxonomies.member_entity_types, '{}')
+                                              || EXCLUDED.member_entity_types) e),
+                            rel_types_defining_group = (
+                                SELECT ARRAY_AGG(DISTINCT x)
+                                  FROM unnest(COALESCE(entity_taxonomies.rel_types_defining_group, '{}')
+                                              || EXCLUDED.rel_types_defining_group) x)
+                        WHERE entity_taxonomies.source <> 'seeded'
+                        """,
+                        (group_name,
+                         f"auto-grown grouping from observed {rel_type} membership",
+                         mtypes, [rel_type]),
+                    )
+                db.commit()
+                minted += 1
+                log.info("ingest.grouping_minted",
+                         taxonomy=group_name, defining_rel=rel_type,
+                         member_types=mtypes, members=int(n),
+                         source="engine_grown_ingest")
+            except Exception as _ie:
+                log.warning("ingest.grouping_mint_insert_failed",
+                            taxonomy=group_name, error=str(_ie)[:140])
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        return minted
+    except Exception as _e:
+        log.warning("ingest.grouping_mint_failed", error=str(_e)[:160])
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
 
 
 def _safe_taxonomy_rel_types(rel_types: list[str]) -> list[str]:
@@ -4577,13 +4766,13 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
     GLiNER2 returns: {
         "relation_extraction": {
             "spouse": [("jordan", "user")],
-            "instance_of": [("sam", "person")],
+            "instance_of": [("theo", "person")],
         }
     }
 
     Convert to: [
         {"subject": "jordan", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
-        {"subject": "sam", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
+        {"subject": "theo", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
     ]
 
     Severance #4 (Phase 1): carry subject_type/object_type on each edge, sourced from the
@@ -5878,7 +6067,7 @@ def _attach_to_seeded_backbone(
         # (e.g. animal -> {subclass_of, instance_of}). Do NOT fall back to subclass_of
         # for MEMBERSHIP/relational taxonomies (family -> {has_pet, age, ...}, pets ->
         # {has_pet}) — that would mis-attach a (often mis-typed) entity as a subclass of a
-        # membership group (e.g. a server typed Person -> "atlas subclass_of family").
+        # membership group (e.g. a server typed Person -> "apollo subclass_of family").
         # A taxonomy that declares no classification rel is not a classification target.
         if hier_rel is None:
             continue
@@ -6115,6 +6304,90 @@ def _queue_concept_for_grounding(
         except Exception:
             pass
         return False
+
+
+def _flush_cue_candidates(user_id: str) -> int:
+    """Drain the request-scoped CARVED-CLASS growth candidates (social_role / problem_noun) recorded by
+    the deriver/consumer and write them to the per-tenant ``ontology_evaluations`` growth queue (the
+    SAME queue the rel_type / concept paths reuse), marked extraction_method='linguistic_cue_candidate'
+    so the rel-type evaluator's firewall skips them. The re_embedder freq-gates (≥3) and grows them into
+    ``<tenant>.linguistic_cues`` (``grow_linguistic_cue_candidates``).
+
+    PER-TENANT: opens a short-lived connection and binds ``SET search_path TO <tenant>`` (NO public) —
+    the INSERT is schema-qualified so growth NEVER lands in public.ontology_evaluations. Idempotent
+    (ON CONFLICT bumps occurrence_count). Best-effort + fail-safe: any error is swallowed and NEVER
+    breaks ingest (the construction already degraded to a generic walkable rel; growth is best-effort).
+    Skips the connection entirely when nothing was recorded. Returns the number of rows written/bumped.
+    """
+    try:
+        cands = linguistic_cue_overlay.drain_cue_candidates()
+    except Exception:  # noqa: BLE001 — fail-safe
+        return 0
+    if not cands:
+        return 0
+    try:
+        from src.provisioning.schema_manager import derive_user_slug_from_uuid
+        schema = f"faultline_{derive_user_slug_from_uuid(user_id)}"
+    except Exception:  # noqa: BLE001 — fail-safe
+        return 0
+    dsn = os.environ.get("POSTGRES_DSN", "")
+    if not dsn or not schema:
+        return 0
+    written = 0
+    _conn = None
+    try:
+        _conn = psycopg2.connect(dsn, connect_timeout=5)
+        with _conn as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {schema}")
+                for (cue, category) in cands:
+                    _cue = (cue or "").strip().lower()
+                    _cat = (category or "").strip().lower()
+                    if not _cue or not _cat:
+                        continue
+                    try:
+                        cur.execute("SAVEPOINT sp_cue_cand")
+                        # candidate_rel_type=category, sample_subject_id='__cue__', sample_object=cue →
+                        # the UNIQUE (candidate_rel_type, sample_subject_id, sample_object) gives one
+                        # freq-counted row per (category, cue). candidate_object_type also carries the
+                        # category so the re_embedder grow sweep reads it back.
+                        cur.execute(
+                            f"INSERT INTO {schema}.ontology_evaluations"
+                            " (candidate_rel_type, candidate_subject_type, candidate_object_type,"
+                            "  sample_subject_id, sample_object, extraction_method,"
+                            "  decision_reason, occurrence_count, last_seen_at)"
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s, 1, now())"
+                            " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                            " DO UPDATE SET"
+                            "   occurrence_count = ontology_evaluations.occurrence_count + 1,"
+                            "   last_seen_at = now(),"
+                            "   extraction_method = EXCLUDED.extraction_method",
+                            (_cat, "unknown", _cat, "__cue__", _cue,
+                             "linguistic_cue_candidate",
+                             "carved cue-class candidate — freq-gated per-tenant growth"),
+                        )
+                        cur.execute("RELEASE SAVEPOINT sp_cue_cand")
+                        written += 1
+                    except Exception:  # noqa: BLE001 — one bad candidate never aborts the batch
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT sp_cue_cand")
+                        except Exception:  # noqa: BLE001
+                            pass
+            conn.commit()
+    except Exception as _ce:  # noqa: BLE001 — fail-safe: growth queue write never breaks ingest
+        log.debug("flush_cue_candidates_failed", error=str(_ce)[:140])
+        return written
+    finally:
+        # psycopg2's context manager commits/rolls back but does NOT close — close explicitly so the
+        # per-turn growth write never leaks a connection.
+        try:
+            if _conn is not None:
+                _conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if written:
+        log.info("flush_cue_candidates.queued", schema=schema, count=written)
+    return written
 
 
 def enforce_directionality(
@@ -7948,7 +8221,7 @@ _SCALAR_REL_TYPES_CACHE: set[str] = set()
 # System / ontology entity names that must never be written as personal facts into
 # a user schema.  These appear as subjects/objects of LLM-generated hierarchy edges
 # (e.g. /expand FaultLine) and, if allowed through, surface as garbled query results
-# ("alex is a subclass of sam").  frozenset gives O(1) membership tests.
+# ("alex is a subclass of theo").  frozenset gives O(1) membership tests.
 # Primary guard — entity_type ('Concept'/'Object') is the metadata-driven secondary guard
 # applied in learn_topic() alongside this name list.
 _SYSTEM_ENTITY_NAMES: frozenset[str] = frozenset({
@@ -8062,6 +8335,29 @@ def _is_scalar_rel_type(rel_type: str) -> bool:
         'occupation', 'nationality', 'has_gender'
     }
     return rt in fallback_scalars
+
+
+def _edge_is_scalar(edge) -> bool:
+    """Is THIS edge's object a SCALAR value (kept as a string, never resolved to a UUID)?
+
+    Two deterministic signals, OR'd:
+      1. the rel_type is SCALAR-tailed in the ontology (``_is_scalar_rel_type``), OR
+      2. the edge CARRIES an ``object_datatype`` — the per-edge scalar signal set by the
+         deterministic detectors (the atomic-value detector for ip/mac/email/…, and the spine
+         deriver's possessive-attribute capture for a VERBATIM literal value like an address).
+
+    Signal 2 is load-bearing for a NOVEL per-tenant attribute scalar (e.g. "address"): the
+    ontology-only ``_is_scalar_rel_type`` resolves rel_types from the PUBLIC seed and cannot see a
+    tenant-grown scalar rel, so without the per-edge datatype the value would be wrongly resolved to
+    a phantom UUID entity. An edge with NO object_datatype is unchanged (today's behavior); the
+    atomic-detector edges already carry one AND ride seeded SCALAR rels, so this is a no-op for them.
+    Fail-safe: any error → fall back to the rel-type-only check."""
+    try:
+        if getattr(edge, "object_datatype", None):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return _is_scalar_rel_type(getattr(edge, "rel_type", "") or "")
 
 
 def _get_rel_type_metadata(rel_type: str) -> dict:
@@ -10402,7 +10698,7 @@ someone user-adjacent.
 Examples of subject extraction:
 - "I am not a doctor" → subject_name: "user" (speaker/user)
 - "I'm not 18, I'm 23" → subject_name: "user" (speaker/user)
-- "University of Guelph is not a person, it is an organization" → subject_name: "University of Guelph"
+- "Riverton University is not a person, it is an organization" → subject_name: "Riverton University"
 - "Wren is an LLM model, not a person" → subject_name: "Wren"
 - "Computing and Communication Services is an organization" → subject_name: "Computing and Communication Services"
 - "Ottawa is the capital of Canada, not a person" → subject_name: "Ottawa"
@@ -10453,13 +10749,13 @@ RULES:
 2. RELATIONAL dimension (spouse, parent_of, has_pet, works_for):
    - old_value and new_value are ENTITY NAMES (resolve to UUID)
    - Update facts.object_id
-   - Example: spouse of old_entity → Taylor
+   - Example: spouse of old_entity → Sarah
 
 3. HIERARCHICAL dimension (instance_of, member_of, part_of):
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
    - Update facts.object_id with hierarchy semantics
    - Example: instance_of dog → cat
-   - Example: "University of Guelph is not a person" → subject_name="University of Guelph", old_value="person", new_value="organization"
+   - Example: "Riverton University is not a person" → subject_name="Riverton University", old_value="person", new_value="organization"
 
 4. SUBJECT dimension (wrong entity):
    - subject_uuid MUST CHANGE
@@ -10598,7 +10894,7 @@ Examples of subject extraction:
 - "I don't have any pets" → subject: "user"
 - "I'm not 42" → subject: "user"
 - "Spot is not a bunny" → subject: "Spot"
-- "University of Guelph is not a person" → subject: "University of Guelph"
+- "Riverton University is not a person" → subject: "Riverton University"
 - "forget that Wren is a person" → subject: "Wren"
 - "Computing and Communication Services is not an organization" → subject: "Computing and Communication Services"
 - "Remove the name Rex" → subject: "user" (self-alias removal)
@@ -10652,7 +10948,7 @@ RULES:
    - rel_type = the hierarchy rel (instance_of, member_of, part_of)
    - object = the type/class being removed
    - Example: "Spot is not a bunny" → subject="Spot", rel_type="instance_of", object="bunny"
-   - Example: "University of Guelph is not a person" → subject="University of Guelph", rel_type="instance_of", object="person"
+   - Example: "Riverton University is not a person" → subject="Riverton University", rel_type="instance_of", object="person"
 
 4. ENTITY (alias removal):
    - dimension = ENTITY
@@ -11672,6 +11968,89 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
             log.info("classify_intent.cue_no_agreement", user_id=user_id[:8],
                      cue=_cue_route, llm=_bypass_route, llm_conf=round(_bypass_conf, 3))
         # No cue (or ambiguous without LLM agreement) → fall through to GLiNER2 (pure).
+
+    # === PRE-GLINER2 AFFECTIVE-STATEMENT ROUTE (Task 4) ===
+    # GLiNER2's verbose intent labels mis-score a bare first-person affective construction ("I feel
+    # overwhelmed") as QUERY → it never reaches ingest and the feeling is silently lost. Mirror the
+    # spaCy correction/negation pre-gate: a CONFIDENT, DECLARATIVE, NON-NEGATED first-person affective
+    # self-predication routes to STATEMENT deterministically, BEFORE GLiNER2 (kept pure — no label
+    # edits, Pitfall 11). Signals (grammar/POS only, NO emotion word list): an interrogative clause is
+    # NEVER routed here (a real question stays for GLiNER2); else a feel-verb construction
+    # (_detect_feeling_states) OR a first-person affective copula (analyze_copula relation=='feels' +
+    # ADJ complement, not negated) OR a coordinated affective complement list. Fail-safe: layer off /
+    # no construction / any error → fall through to GLiNER2 (never a drop).
+    if AFFECT_STATEMENT_PREROUTE:
+        try:
+            from src.extraction.linguistics import (
+                is_interrogative_clause as _is_interro_q,
+                analyze_copula as _ac_q,
+                analyze_copula_affect_complements as _acac_q,
+                linguistics_available as _ling_ok_q,
+            )
+            if _ling_ok_q() and _is_interro_q(text) is not True:
+                _affective = False
+                try:
+                    if _detect_feeling_states(text):
+                        _affective = True
+                except Exception:  # noqa: BLE001
+                    pass
+                if not _affective:
+                    try:
+                        if _acac_q(text):
+                            _affective = True
+                    except Exception:  # noqa: BLE001
+                        pass
+                if not _affective:
+                    try:
+                        _ca_q = _ac_q(text)
+                        if (_ca_q is not None and _ca_q.subject_is_self and not _ca_q.negated
+                                and (_ca_q.relation or "") == "feels"
+                                and (_ca_q.complement_pos or "").upper() == "ADJ"):
+                            _affective = True
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _affective:
+                    log.info("classify_intent.affective_statement_preroute",
+                             user_id=user_id[:8],
+                             note="first-person affective construction → STATEMENT (GLiNER2 skipped, "
+                                  "kept pure); a feeling must reach ingest, never mis-route to QUERY")
+                    print("[/classify-intent] AFFECTIVE PRE-ROUTE: → STATEMENT "
+                          "(first-person feeling; GLiNER2 skipped)", flush=True)
+                    return {"intent": "STATEMENT", "confidence": 0.95}
+        except Exception as _aff_err:  # noqa: BLE001 — fail-safe: never block GLiNER2 on an affect miss
+            log.debug("classify_intent.affective_preroute_failed",
+                      user_id=user_id[:8], error=str(_aff_err)[:120])
+
+    # === PRE-GLINER2 DECLARATIVE-STATEMENT ROUTE (intent-misroute fix) ===
+    # A first-person declarative that ASSERTS facts ("I wanted to tell you about my family. My
+    # wife's name is Jordan. We have three kids: Mia, Theo, and Leo.") is mis-scored QUERY
+    # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Theo/Leo drop.
+    # Mirror the affect/correction pre-gates: when the turn carries >= 2 GRAMMATICAL assertions
+    # (count_declarative_assertions — explicit-subject copula/transitive predicates; imperatives
+    # like "tell me about my family" and questions are excluded by construction), route STATEMENT
+    # deterministically BEFORE GLiNER2 (kept pure, Pitfall 11). The >= 2 threshold keeps the
+    # STATEMENT surface narrow (a lone one-liner stays for GLiNER2 / the copula+affect seams) so a
+    # genuine recall ("tell me about my family", "I want to know about my family") is never hijacked.
+    # Fail-safe: layer unavailable / parse miss / any error → fall through to GLiNER2 (never a drop).
+    if DECLARATIVE_STATEMENT_PREROUTE:
+        try:
+            from src.extraction.linguistics import (
+                count_declarative_assertions as _cda,
+                linguistics_available as _ling_ok_d,
+            )
+            if _ling_ok_d():
+                _n_assert = _cda(text)
+                if isinstance(_n_assert, int) and _n_assert >= 2:
+                    log.info("classify_intent.declarative_statement_preroute",
+                             user_id=user_id[:8], assertions=_n_assert,
+                             note="multi-assertion first-person declarative → STATEMENT "
+                                  "(GLiNER2 skipped, kept pure); a stated fact must reach ingest")
+                    print(f"[/classify-intent] DECLARATIVE PRE-ROUTE: → STATEMENT "
+                          f"({_n_assert} assertions; GLiNER2 skipped)", flush=True)
+                    return {"intent": "STATEMENT", "confidence": 0.95}
+        except Exception as _decl_err:  # noqa: BLE001 — fail-safe: never block GLiNER2
+            log.debug("classify_intent.declarative_preroute_failed",
+                      user_id=user_id[:8], error=str(_decl_err)[:120])
 
     try:
         # ENHANCEMENT: Build semantic-rich intent descriptions from DB patterns
@@ -13446,7 +13825,7 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
     * X MUST be a literal, named entity (a real name). If X is only a pronoun ("I call HER my Y"),
       DO NOT emit synonym_of — fall back to normal handling (omit).
     * Example: "call Robert my ace" → (robert, synonym_of, "ace", is_preferred_label=false)
-    * Example: "my box is the your-server-host server" → (your-server-host server, synonym_of, "box", is_preferred_label=false)
+    * Example: "my box is the truenas server" → (truenas server, synonym_of, "box", is_preferred_label=false)
     * Distinguish from pref_name/also_known_as: synonym_of is how the SPEAKER talks ABOUT X
       (a nickname/slang/referential word), NOT an alternate proper name X is publicly known by.
 
@@ -14011,6 +14390,22 @@ SPINE_NAMING_CHAIN = os.getenv("SPINE_NAMING_CHAIN", "false").lower() in ("1", "
 # today's spine behavior exactly (the legacy seams stay reachable only on the non-spine path).
 SPINE_AFFECT_PREFERENCE = os.getenv("SPINE_AFFECT_PREFERENCE", "true").lower() not in ("0", "false", "no")
 
+# AFFECTIVE-STATEMENT PRE-ROUTE (Task 4): a CONFIDENT first-person affective construction
+# ("I feel overwhelmed", "I am anxious", "I was busy and exhausted") is routed to STATEMENT
+# DETERMINISTICALLY BEFORE GLiNER2 intent classification — mirroring the spaCy correction/negation
+# dual-gate that pre-empts GLiNER2. GLiNER2's verbose intent labels otherwise mis-score the bare
+# "I feel X" as QUERY, so the feeling never reaches ingest and is silently lost. The pre-route keeps
+# GLiNER2 PURE (no label edits — Pitfall 11) and is fail-safe (no construction / not confident /
+# any error → fall through to GLiNER2, never a drop). Default ON.
+AFFECT_STATEMENT_PREROUTE = os.getenv("AFFECT_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
+# DECLARATIVE-STATEMENT PRE-ROUTE (intent-misroute fix): a multi-sentence first-person
+# declarative carrying >= 2 grammatical assertions ("I wanted to tell you about my family.
+# My wife's name is Jordan. We have three kids …") is mis-scored QUERY by GLiNER2 (the "tell"
+# verb) and dropped at the QUERY gate. A fact-bearing declarative must reach ingest. Grammar-
+# only (count_declarative_assertions: explicit-subject copula/transitive assertions, imperatives
+# and questions excluded), BEFORE GLiNER2 (kept pure, no label edits). Fail-safe → GLiNER2.
+DECLARATIVE_STATEMENT_PREROUTE = os.getenv("DECLARATIVE_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
+
 
 def _resolve_head_noun_type(head_name: str | None) -> str | None:
     r"""Resolve a head-noun type-NAME (e.g. "dog") → its canonical entity type, metadata-driven.
@@ -14096,7 +14491,7 @@ def _possession_rel_for_head_type(head_type: str | None,
     r"""Resolve the POSSESSION rel_type that fits a head-noun's type, metadata-driven.
 
     "I have a dog named Rex" → the head noun "dog" is an ANIMAL → the pet relation (has_pet);
-    "my server named Atlas" → "server" is an OBJECT → the generic ownership relation (owns). We do
+    "my server named Apollo" → "server" is an OBJECT → the generic ownership relation (owns). We do
     NOT hardcode ``if type=='Animal'``: we scan the rel_types overlay for an ownership-CLASS rel
     (head admits Person/ANY) whose ``tail_types`` ADMIT the head-noun's type, and pick the most
     specific (a concrete tail_types match beats an ANY match).
@@ -14324,8 +14719,21 @@ def _build_typed_doc(sentence: str, gmodel, labels):
             _lab = (_label or "").strip().upper()
             if not _lab:
                 continue
+            # COORDINATED-SURFACE SPLIT (subject-agnostic, deterministic): GLiNER2 sometimes returns a
+            # comma/"and"-joined LIST of names as ONE surface ("Mia, Theo") — seeding that whole
+            # span as a single entity GLUES the names into one merged entity ("mia theo") and the
+            # tail member is lost. Split such a surface on its coordinating commas / " and " into the
+            # individual names and seed EACH as its own typed span. A surface with no internal
+            # coordinator is unchanged. Pure punctuation/coordinator split — NO fuzzy/similarity.
+            _surfaces: list[str] = []
             for _nm in (_names or []):
-                _n = (_nm or "").strip()
+                _n0 = (_nm or "").strip()
+                if not _n0:
+                    continue
+                _parts = re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", _n0)
+                _parts = [p.strip() for p in _parts if p and p.strip()]
+                _surfaces.extend(_parts if len(_parts) > 1 else [_n0])
+            for _n in _surfaces:
                 if not _n:
                     continue
                 _start = _low.find(_n.lower())
@@ -14432,6 +14840,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
         from src.extraction.linguistics import (
             linguistics_available, segment_clauses, derive_sentence_facts,
             is_interrogative_clause as _is_interro,
+            suppress_name_type_binder_vs_attr_scalar as _suppress_binder_vs_attr_scalar,
         )
     except Exception as _ie:  # noqa: BLE001 — layer import failure → fall through to legacy
         log.debug("sentence_pipeline.import_failed", error=str(_ie)[:120])
@@ -14485,6 +14894,105 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             sentences = [text]
     if not sentences:
         sentences = [text]
+
+    # DETERMINISTIC ENUMERATION PRE-SPLIT (the atomizer reliability net). The LLM atomizer's split of
+    # a colon-introduced named list is NON-DETERMINISTIC: it intermittently FOLDS "a designer named
+    # Priya" back into the membership line (the downstream collective walk routes only BARE PROPN
+    # conjuncts, so Priya's member_of silently drops), drops a per-member attribute ("backend dev"),
+    # or — on a REFRAME timeout — leaves the whole dense sentence un-split (cross-member smear). For
+    # EACH atom that is itself a recognizable colon enumeration, replace it with split_enumeration's
+    # canonical set (bare-name membership + one clean per-member copula atom). This makes the spine's
+    # input IDENTICAL run-to-run regardless of LLM split variance. A non-enumeration atom (or one the
+    # splitter declines / the fabrication guard rejects) is passed through UNCHANGED. Deterministic,
+    # subject-agnostic, fabrication-safe; fail-safe (any error → today's sentences).
+    try:
+        from src.extraction.linguistics import split_enumeration as _split_enum
+
+        def _norm_key(_a: str) -> str:
+            return " ".join((_a or "").strip().lower().split())
+
+        # (a) Per-ATOM normalization: an LLM atom that is ITSELF a colon enumeration (the FOLDED /
+        #     un-split / timeout-smeared form, e.g. "…and a designer named Priya.") is replaced by the
+        #     deterministic bare-name membership + per-member copula atoms.
+        _normalized: list[str] = []
+        _enum_hits = 0
+        for _s in sentences:
+            _split = None
+            try:
+                _split = _split_enum(_s)
+            except Exception:  # noqa: BLE001 — per-sentence fail-safe → keep the original atom
+                _split = None
+            if _split:
+                _enum_hits += 1
+                _normalized.extend(_split)
+            else:
+                _normalized.append(_s)
+        # (b) SOURCE-SENTENCE COVERAGE guarantee (the deterministic "no silent drop" net). The LLM
+        #     atomizer can drop ANY stated detail, not just an enumeration item: a clean bare-name
+        #     membership while DROPPING one per-member attribute ("Tom is a backend dev."), or an entire
+        #     standalone clause ("Apollo is a Dell R740.") that no enumeration carries. So we walk the
+        #     RAW SOURCE sentences and VALIDATE coverage deterministically:
+        #       • a source sentence that is itself a colon ENUMERATION → ensure its canonical split
+        #         atoms (bare membership + per-member copula) are all present (add the missing ones);
+        #       • ANY OTHER source sentence whose CONTENT TOKENS are not fully represented across the
+        #         current atom set → the atomizer dropped (part of) it, so RE-ADD the verbatim source
+        #         sentence (worst-case un-split residue — never a silent drop; the spine derives it).
+        #     For clean atomizer output every source token is already covered → nothing is added. Only a
+        #     genuine DROP triggers a repair. Subject-agnostic, deterministic, fabrication-impossible
+        #     (we only ever re-add text the user actually wrote). Edges dedup downstream.
+        from src.extraction.reframe import _content_tokens as _ctoks
+        _present = {_norm_key(_a) for _a in _normalized}
+        _covered_tokens: set = set()
+        for _a in _normalized:
+            try:
+                _covered_tokens |= _ctoks(_a)
+            except Exception:  # noqa: BLE001
+                pass
+        _src_added = 0
+        try:
+            _src_sents = segment_clauses(text) or []
+        except Exception:  # noqa: BLE001 — segmentation miss → no coverage pass (per-atom (a) still ran)
+            _src_sents = []
+        for _ss in _src_sents:
+            _src_split = None
+            try:
+                _src_split = _split_enum(_ss)
+            except Exception:  # noqa: BLE001 — per-sentence fail-safe
+                _src_split = None
+            if _src_split:
+                for _a in _src_split:
+                    _k = _norm_key(_a)
+                    if _k and _k not in _present:
+                        _present.add(_k)
+                        _normalized.append(_a)
+                        try:
+                            _covered_tokens |= _ctoks(_a)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _src_added += 1
+                continue
+            # non-enumeration source sentence: re-add it iff any of its content tokens is uncovered.
+            try:
+                _ss_tokens = _ctoks(_ss)
+            except Exception:  # noqa: BLE001
+                _ss_tokens = set()
+            if _ss_tokens and not (_ss_tokens <= _covered_tokens):
+                _k = _norm_key(_ss)
+                if _k and _k not in _present:
+                    _present.add(_k)
+                    _normalized.append(_ss.strip())
+                    _covered_tokens |= _ss_tokens
+                    _src_added += 1
+        if _enum_hits or _src_added:
+            log.info("sentence_pipeline.enum_presplit",
+                     user_id=user_id[:8], enum_atoms_replaced=_enum_hits,
+                     source_atoms_added=_src_added,
+                     atoms_in=len(sentences), atoms_out=len(_normalized),
+                     note="deterministic colon-enumeration split (per-atom + source-coverage union) "
+                          "→ stable per-member atom set regardless of LLM atomizer split variance")
+            sentences = _normalized
+    except Exception as _ene:  # noqa: BLE001 — import/loop failure → today's sentences unchanged
+        log.debug("sentence_pipeline.enum_presplit_failed", error=str(_ene)[:120])
 
     # DROP interrogative clauses — recall stays READ-ONLY for the question's own content. None
     # (layer unavailable) → keep (harvest-all fallback); True → drop; False → keep (declarative).
@@ -14609,6 +15117,12 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 # and carried it on _f.thin_type — convergence done at the source, no surface match.
                 if _f.thin_type:
                     _edge["object_type"] = _f.thin_type
+                # SCALAR-ATTRIBUTE (Defect 1): the deriver tagged a possessive-attribute literal
+                # ("my address is 123 …") as a SCALAR value. Thread the datatype onto the edge so
+                # /ingest routes the VERBATIM value into entity_attributes (the SCALAR path) instead
+                # of resolving it to a UUID entity. The value is captured exactly as the user wrote it.
+                if getattr(_f, "scalar_datatype", None):
+                    _edge["object_datatype"] = _f.scalar_datatype
                 if _f.event_date:
                     _edge["event_date"] = _f.event_date
                     _edge["event_date_granularity"] = _f.event_date_granularity or "day"
@@ -14730,7 +15244,28 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 _inch_set = _inch_verbs()
             except Exception:  # noqa: BLE001
                 _inch_set = frozenset()
-            _dash_facts = derive_sentence_facts(text, reference, dash_specifier_only=True)
+            # NAMED-INSTANCE-LIST GUARD: when the raw turn's dash/colon list ENUMERATES named instances
+            # ("we run three servers: a web server named Apollo, a database named Vault, …"), the atomizer
+            # SPLITS it into clean per-item "We run a web server named Apollo." atoms that the per-atom
+            # named-instance chain ALREADY captures in full (instance_of + the activity/possession link).
+            # Re-running the dash-specifier on the raw turn then mints noisy fragment edges ((user, run,
+            # "web")) for the SAME list. So SKIP the recovery when the turn carries a NAMING verb — that
+            # list is owned by the named-instance path, never the dash-event recovery (which targets the
+            # SEVERED inchoative crop-list case, where no naming verb appears). Subject-agnostic,
+            # grammatical (the naming-verb cue class), fail-safe → run the recovery (today's behavior).
+            _skip_dash_recovery = False
+            try:
+                from src.extraction.linguistics import _naming_verbs as _nv, _parse as _lp
+                _nvset = _nv()
+                _rawdoc = _lp(text)
+                if _rawdoc is not None and _nvset:
+                    _skip_dash_recovery = any(
+                        (_t.lemma_ or _t.text or "").strip().lower() in _nvset
+                        and _t.pos_ in ("VERB", "AUX") for _t in _rawdoc)
+            except Exception:  # noqa: BLE001 — fail-safe: do not skip on any error
+                _skip_dash_recovery = False
+            _dash_facts = [] if _skip_dash_recovery else derive_sentence_facts(
+                text, reference, dash_specifier_only=True)
             for _f in (_dash_facts or []):
                 _key = (_f.subject, _f.rel_type, (_f.object or "").strip().lower())
                 if not all(_key):
@@ -14880,6 +15415,76 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 edges.append(_edge)
         except Exception as _dse:  # noqa: BLE001 — fail-safe: dash-spec recovery never breaks harvest
             log.debug("sentence_pipeline.dash_specifier_failed", error=str(_dse)[:120])
+
+        # ── COMMA-ROLE COLLECTIVE RECOVERY (gap-2, cross-atom membership) ─────────────────────────────
+        # "My band has a guitarist named Jax, a drummer named Reef, and a singer named Coda." has NO
+        # colon "members:" head, so split_enumeration leaves it whole — but the LLM atomizer SEVERS the
+        # roster into per-member atoms ("My band has a guitarist named Jax.") BEFORE the deriver, so the
+        # deriver never sees the >=2-member roster that mints membership. Each member gets instance_of
+        # <role> but no member_of, so the group floats (owns) and the grouping auto-mint (keyed on
+        # member_of) never fires. So run ONE extra deriver pass on the RAW un-atomized turn with
+        # ``named_role_only`` → ONLY the comma-role reconcile fires (no cross-clause smear; same pattern
+        # as the dash recovery, but a SEPARATE pass because the dash recovery is SKIPPED whenever a
+        # naming verb is present — exactly this construction). Dedup via ``seen``. Subject-agnostic,
+        # deterministic, fail-safe (any error → no member_of, the atomized edges stand).
+        try:
+            _role_facts = derive_sentence_facts(text, reference, named_role_only=True)
+            for _f in (_role_facts or []):
+                _key = (_f.subject, _f.rel_type, (_f.object or "").strip().lower())
+                if not all(_key) or _key in seen:
+                    continue
+                seen.add(_key)
+                edges.append({
+                    "subject": _f.subject,
+                    "rel_type": _f.rel_type,
+                    "object": _f.object,
+                    "fact_provenance": "user_stated",
+                    "confidence": 0.8,
+                })
+        except Exception as _nrre:  # noqa: BLE001 — fail-safe: membership recovery never breaks harvest
+            log.debug("sentence_pipeline.named_role_recovery_failed", error=str(_nrre)[:120])
+
+        # ── PERSON-SUBJECT SCALAR RECONCILIATION (cross-atom, metadata-driven) ───────────────────────
+        # The atomizer SPLITS a per-member attribute onto its own micro-atom ("Mia is 10."), where
+        # GLiNER2 mis-types the bare name (Mia→Animal, Theo→Organization). That noisy type rides the
+        # SCALAR edge's ``subject_type`` and the WGM gate then QUARANTINES the Person-scoped scalar (age
+        # head_types={Person}) to Class C — even though the SAME turn established the member as a PERSON
+        # via a kin/person relation ("…child_of user", head/tail Person). Reconcile across the batch:
+        # any name that ANOTHER edge types Person (a rel whose head/tail_types include Person on that
+        # name's side, or an explicit subject_type=Person) IS a Person → stamp Person onto its SCALAR
+        # edges that lack a confirmed Person type, so the gate admits them into entity_attributes
+        # (durable) instead of burying them in the short-term C lane. Metadata-driven (head_types/
+        # tail_types via the overlay, schema still bound here), subject-agnostic, deterministic.
+        try:
+            _person_names: set = set()
+            for _e in edges:
+                _r = (_e.get("rel_type") or "").strip().lower()
+                if not _r:
+                    continue
+                _m = _rel_meta(_r) or {}
+                _ht = {str(t).strip().lower() for t in (_m.get("head_types") or [])}
+                _tt = {str(t).strip().lower() for t in (_m.get("tail_types") or [])}
+                _sn = (_e.get("subject") or "").strip().lower()
+                _on = (_e.get("object") or "").strip().lower()
+                if "person" in _ht and _sn and _sn != "user":
+                    _person_names.add(_sn)
+                if "person" in _tt and _on and _on != "user":
+                    _person_names.add(_on)
+                if (_e.get("subject_type") or "").strip().lower() == "person" and _sn:
+                    _person_names.add(_sn)
+            if _person_names:
+                for _e in edges:
+                    _sn = (_e.get("subject") or "").strip().lower()
+                    if _sn not in _person_names:
+                        continue
+                    try:
+                        _is_sc = _is_scalar_rel_type((_e.get("rel_type") or "").strip().lower())
+                    except Exception:  # noqa: BLE001
+                        _is_sc = False
+                    if _is_sc and (_e.get("subject_type") or "").strip().lower() != "person":
+                        _e["subject_type"] = "Person"
+        except Exception as _pse:  # noqa: BLE001 — fail-safe: reconciliation never breaks harvest
+            log.debug("sentence_pipeline.person_scalar_reconcile_failed", error=str(_pse)[:120])
     finally:
         rel_type_overlay.reset_current_schema(_tok)
 
@@ -14911,44 +15516,92 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             _affect_text = " ".join(s for s in _declarative if s and s.strip()).strip()
             if _affect_text:
                 _feeling_edges_sp: list[dict] = []
+
+                def _add_feeling(_comp: str):
+                    """Append a (user, feels, <complement>) edge if non-junk and not already present."""
+                    _c = (_comp or "").strip().lower()
+                    if not _c or len(_c) < 3 or _c in _FEELING_COMPLEMENT_STOP:
+                        return
+                    if any((_fe.get("object") or "").strip().lower() == _c
+                           and (_fe.get("rel_type") or "") == "feels"
+                           for _fe in _feeling_edges_sp):
+                        return
+                    _feeling_edges_sp.append(
+                        {"subject": "user", "rel_type": "feels", "object": _c})
+
                 try:
-                    # feelings route to the SEEDED `feels` rel → Class C transient (correct).
                     # (1) FEEL-VERB construction ("I feel/I'm feeling/I felt worried") — the proven
-                    #     legacy seam. NO fact_provenance → the /ingest router defaults llm_inferred →
-                    #     `feels` (fact_class='C') → Class C, the transient affect tier.
-                    _feeling_edges_sp = _detect_feeling_states(_affect_text)
+                    #     legacy seam.
+                    for _fe in _detect_feeling_states(_affect_text):
+                        _add_feeling((_fe.get("object") or ""))
                 except Exception:  # noqa: BLE001 — fail-safe: a feeling miss never breaks the harvest
-                    _feeling_edges_sp = []
-                # (2) BARE-COPULA self-predication ("I'm excited", "I am anxious") — the feel-verb
-                #     regex does NOT match the bare copula, so this complements it DETERMINISTICALLY
-                #     via analyze_copula (NO LLM, NO emotion word list — the grammar + ADJ-complement
-                #     POS decides). Fire ONLY on a genuine 1st-person PERSONAL-pronoun subject
-                #     (subject_is_self, Person=1 — grammatical) with an AFFECTIVE ADJ complement
-                #     (relation=='feels' first-cut + complement_pos=='ADJ'), NOT negated (negation
-                #     deferred, parity with _detect_feeling_states). A NOUN complement ("I am a
-                #     teacher" → occupation) and a PROPN ("I am Alex" → also_known_as) are NOT this
-                #     lane and are left to their own seams. Same seeded `feels` rel, NO provenance →
-                #     Class C. Deduped against the feel-verb edges below on `seen`. Subject-agnostic.
+                    pass
+                # (2) BARE-COPULA self-predication, ENUMERATED over the FULL coordinated complement
+                #     list ("I was busy, overwhelmed, underappreciated, and exhausted" → FOUR feels
+                #     edges, not just "busy"). DETERMINISTIC (analyze_copula_affect_complements: grammar
+                #     + ADJ/VBN-complement POS + the conj coordination — NO LLM, NO emotion word list),
+                #     gated to a genuine 1st-person PERSONAL-pronoun subject, not negated. A NOUN
+                #     complement ("I am a teacher" → occupation) / PROPN ("I am Alex" → also_known_as)
+                #     are NOT this lane. Deduped via _add_feeling. Subject-agnostic.
                 try:
-                    from src.extraction.linguistics import analyze_copula as _analyze_copula
-                    _ca = _analyze_copula(_affect_text)
-                    if (_ca is not None and _ca.subject_is_self and not _ca.negated
-                            and (_ca.relation or "") == "feels"
-                            and (_ca.complement_pos or "").upper() == "ADJ"):
-                        _comp = (_ca.complement or "").strip().lower()
-                        if _comp and len(_comp) >= 3 and _comp not in _FEELING_COMPLEMENT_STOP:
-                            if not any((_fe.get("object") or "").strip().lower() == _comp
-                                       and (_fe.get("rel_type") or "") == "feels"
-                                       for _fe in _feeling_edges_sp):
-                                _feeling_edges_sp.append(
-                                    {"subject": "user", "rel_type": "feels", "object": _comp})
+                    from src.extraction.linguistics import (
+                        analyze_copula_affect_complements as _affect_comps)
+                    for _comp in (_affect_comps(_affect_text) or []):
+                        _add_feeling(_comp)
                 except Exception:  # noqa: BLE001 — fail-safe: copula miss never breaks the harvest
                     pass
+                # TEMPORAL STAMP + PROVENANCE: a USER-STATED feeling is DURABLE — fact_provenance=
+                # "user_stated" so /ingest's provenance router + assign_class land it at Class B (the
+                # feels rel's defined class is C, so user_stated → B, NOT A; NEVER force C — see
+                # CLAUDE.md FEELINGS TIERING). Each edge is stamped with the clause's resolved
+                # event_date ("last week" → the date, anchored to the session reference) so longitudinal
+                # affect persists and state-changes COEXIST (recency picks current, history kept). A
+                # miss → NULL event_date (never wall-clock). Deterministic (spaCy DATE NER + dateparser
+                # via extract_event_date), fail-safe.
+                if _feeling_edges_sp:
+                    _aff_date = _aff_gran = None
+                    try:
+                        from src.extraction.linguistics import extract_event_date as _eed
+                        _aff_date, _aff_gran = _eed(_affect_text, reference)
+                    except Exception:  # noqa: BLE001 — fail-safe: date miss → NULL event_date
+                        _aff_date = _aff_gran = None
+                    for _fe in _feeling_edges_sp:
+                        _fe["fact_provenance"] = "user_stated"
+                        if _aff_date:
+                            _fe["event_date"] = _aff_date
+                            _fe["event_date_granularity"] = _aff_gran or "day"
                 _preference_edges_sp: list[dict] = []
                 try:
                     _preference_edges_sp = _detect_preference_states(_affect_text)
                 except Exception:  # noqa: BLE001 — fail-safe: a preference miss never breaks harvest
                     _preference_edges_sp = []
+                # ATTRIBUTE-SCALAR DEFERRAL (Defect 1): the deriver's attr-scalar chain OWNS a
+                # possessive-attribute LITERAL ("my address is 123 …") and already emitted the clean
+                # VERBATIM scalar edge (carrying object_datatype). The legacy preference seam, blind to
+                # the value shape, re-reads the SAME construction and mints a MANGLED head-only edge
+                # (e.g. (user, address, "street")). Drop any preference edge whose (subject, rel_type)
+                # collides with a scalar edge already captured — the attr-scalar chain is authoritative
+                # for the literal-value construction; the preference seam keeps the single-word cases.
+                if _preference_edges_sp:
+                    _scalar_keys = {
+                        ((e.get("subject") or "").strip().lower(),
+                         (e.get("rel_type") or "").strip().lower())
+                        for e in edges if e.get("object_datatype")
+                    }
+                    if _scalar_keys:
+                        _kept_pref_sp = [
+                            _pe for _pe in _preference_edges_sp
+                            if ((_pe.get("subject") or "").strip().lower(),
+                                (_pe.get("rel_type") or "").strip().lower()) not in _scalar_keys
+                        ]
+                        if len(_kept_pref_sp) != len(_preference_edges_sp):
+                            log.info("sentence_pipeline.preference_deferred_to_attr_scalar",
+                                     user_id=user_id[:8],
+                                     dropped=len(_preference_edges_sp) - len(_kept_pref_sp),
+                                     note="possessive-attribute literal owned by the deriver's "
+                                          "attr-scalar chain (verbatim scalar); preference head-only "
+                                          "mangle dropped")
+                            _preference_edges_sp = _kept_pref_sp
 
                 # SUPPRESS the deriver's possessive/copula-state junk for each preference the seam
                 # OWNS. The preference edge is (user, <rel>, <value>) over the possessed phrase X; the
@@ -15022,6 +15675,32 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
         except Exception as _ape:  # noqa: BLE001 — fail-safe: seam miss never breaks the spine harvest
             log.debug("sentence_pipeline.affect_preference_failed",
                       user_id=user_id[:8], error=str(_ape)[:120])
+
+    # ── NAME↔TYPE BINDER vs ATTR-SCALAR PRECEDENCE (possessive-attribute copula) ───────────────────
+    # The unified name↔type binding detector fires on "my address is 123 Main Street, Riverton,
+    # Ontario" when LIVE GLiNER2 types the value-span head ("Street") as a NAMED INSTANCE of the
+    # attribute noun ("address") read as a TYPE — minting junk twins ((street, also_known_as|
+    # instance_of|has_role, address), (user, owns, street), (street, age, 123)) that COMPETE with the
+    # attr-scalar chain's authoritative VERBATIM scalar edge (user, address, "123 main street, …",
+    # carrying object_datatype). The attr-scalar chain OWNS this construction. Mirror the preference-
+    # seam attr-scalar deferral above: union-level, DETERMINISTIC whole-word token membership against
+    # the claimed scalar VALUE — drop the binder twins, KEEP the geo-containment `located_in` chain
+    # (it shares value words like "riverton"/"ontario" but is desired; located_in is not a twin rel).
+    # FAIL-SAFE: no attr-scalar claim in the batch → no change (the leak only arises with live GLiNER2).
+    try:
+        _before_bn = len(edges)
+        edges = _suppress_binder_vs_attr_scalar(edges)
+        if len(edges) != _before_bn:
+            seen = {(_e.get("subject"), _e.get("rel_type"),
+                     (_e.get("object") or "").strip().lower()) for _e in edges}
+            log.info("sentence_pipeline.name_type_binder_deferred_to_attr_scalar",
+                     user_id=user_id[:8], dropped=_before_bn - len(edges),
+                     note="possessive-attribute copula owned by the attr-scalar chain (verbatim "
+                          "scalar); name↔type binder twin edges sharing the value's words dropped; "
+                          "located_in geo-chain preserved")
+    except Exception as _bne:  # noqa: BLE001 — fail-safe: suppression miss never breaks the harvest
+        log.debug("sentence_pipeline.name_type_binder_suppress_failed",
+                  user_id=user_id[:8], error=str(_bne)[:120])
 
     # Fix B, Part 1 (flag-gated): merge the NAMED-INSTANCE / NAMING-VERB seam edges + suppress the
     # bare-type ownership island ("my dog" → (user, owns, dog)) the deriver's possessive chain emits
@@ -15133,10 +15812,27 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             # taxonomy_overlay.resolve_current() resolves THIS tenant (seed ∪ tenant, no public).
             _ba_tok = rel_type_overlay.set_current_schema(schema_name)
             try:
+                # FAIL LOUD on an unresolved tenant schema: a backbone-resolve connection bound to
+                # ``public`` would hit the seed template (no entity_aliases) and abort. Refuse it.
+                if not schema_name or not schema_name.startswith("faultline_"):
+                    log_crit(log, "sentence_pipeline.backbone_schema_unresolved",
+                             schema=str(schema_name), user_id=(user_id or "")[:8],
+                             note="refusing backbone attach without a resolved tenant schema "
+                                  "(would run against public — no entity_aliases)")
+                    raise RuntimeError(f"unresolved tenant schema for backbone attach: {schema_name!r}")
                 _ba_conn = psycopg2.connect(_ba_dsn)
                 with _ba_conn.cursor() as _bc:
                     # Per-tenant search_path WITHOUT public (refuse public fallthrough).
                     _bc.execute(f"SET search_path TO {schema_name}")
+                # DURABILITY (Defect 5): COMMIT the SET so it is the SESSION default. The connection
+                # opens with autocommit OFF, so a plain SET lives in an UNCOMMITTED transaction — and
+                # EntityRegistry.resolve()'s aborted-transaction probe (registry.py) issues a ROLLBACK
+                # on the FIRST resolve miss, which UNDOES that uncommitted SET. The search_path then
+                # reverts to the default (no tenant schema) and every subsequent resolve fails with
+                # ``relation "entity_aliases" does not exist`` → ``current transaction is aborted``,
+                # cascading. Committing the SET makes it the durable session search_path so a later
+                # in-resolve rollback can never strip the tenant schema off this connection.
+                _ba_conn.commit()
                 _ba_registry = EntityRegistry(_ba_conn, auto_commit=False, schema_name=schema_name)
                 _attached = 0
                 # ── RELATION-STEERED TYPING (the TIGHTEN) ────────────────────────────────────
@@ -15413,6 +16109,9 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     log.info("sentence_pipeline.done", user_id=user_id[:8],
              sentences=len(_declarative), dropped_interro=_dropped, edges=len(edges),
              residue_to_c=len(_residue_sentences))
+    # CARVE-OUT GROWTH: flush any carved-class growth candidates (social_role degrades recorded by the
+    # named-instance chain during this turn's derivation) to the per-tenant growth queue. Best-effort.
+    _flush_cue_candidates(user_id)
     return {"edges": edges, "spans": len(_declarative)}
 
 
@@ -15617,7 +16316,7 @@ async def harvest_spans(req: RewriteRequest) -> dict:
             _preference_edges = _detect_preference_states(_declarative_text)
         except Exception:
             _preference_edges = []
-        # NAMING capture (RC2 seam): "I have a dog named Rex" / "a server called Atlas" — the
+        # NAMING capture (RC2 seam): "I have a dog named Rex" / "a server called Apollo" — the
         # verb-lift over-strips "named"→"nam" and drops the name; this deterministic seam OWNS the
         # naming construction → a valid (head-noun, also_known_as, ProperName) edge. The verb-lift
         # SKIPS the naming connector (is_naming_predicate) so the "nam" junk is never minted.
@@ -15954,6 +16653,10 @@ async def harvest_spans(req: RewriteRequest) -> dict:
         log.info("harvest_spans.done", user_id=user_id[:8], spans=len(spans),
                  edges=len(edges), feelings=len(_feeling_edges), naming=len(_naming_edges),
                  events=len(_event_edges))
+        # CARVE-OUT GROWTH: flush carved-class candidates recorded on the legacy harvest path
+        # (problem_noun via the reified event seam). Best-effort. (The spine path flushes inside
+        # _harvest_via_sentence_pipeline and returned earlier; /ingest flushes the reified path there.)
+        _flush_cue_candidates(user_id)
         return {"edges": edges, "spans": len(spans)}
     except Exception as e:
         log.warning("harvest_spans.failed", user_id=user_id[:8], error=str(e)[:120])
@@ -18573,6 +19276,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 )
     except Exception as _eex:
         log.warning("ingest.event_synthesis_failed", error=str(_eex)[:120])
+    # CARVE-OUT GROWTH: flush carved-class candidates (problem_noun) recorded by the reified-event seam
+    # above to the per-tenant growth queue. Best-effort; opens its own per-tenant connection. Never
+    # blocks/breaks the commit (the affected entity is already captured + walkable via its other chains).
+    try:
+        _flush_cue_candidates(user_id)
+    except Exception:  # noqa: BLE001 — fail-safe
+        pass
 
     # Occurrence-residue tail (growth-wired): the deterministic LVC fast-path found nothing but a
     # DATE parses with no host edge ("I underwent surgery on March 3" — "underwent" is outside the
@@ -18622,7 +19332,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
     # Guard: if another named entity is mentioned with a preference signal
-    # (e.g., "Sampson prefers alice"), skip auto-synthesis for the user.
+    # (e.g., "Theodore prefers alice"), skip auto-synthesis for the user.
     # The LLM already extracted the correct entity assignment.
     _third_party_pref = re.compile(
         r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
@@ -19196,9 +19906,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.placement_seam_failed",
                                     rel_type=(edge.rel_type or "")[:60], error=str(_seam_e)[:120])
 
-                    # Scalar fact validation: metadata-driven check via tail_types
+                    # Scalar fact validation: metadata-driven check via tail_types, OR the per-edge
+                    # ``object_datatype`` scalar signal (Defect 1 — a novel tenant attribute scalar like
+                    # "address" is not SCALAR-tailed in the public-seeded ontology, so the edge datatype
+                    # is the load-bearing scalar signal that keeps the VERBATIM value out of UUID resolution).
                     rel_meta = _rel_meta(edge.rel_type.lower()) or None
-                    is_scalar_rel = rel_meta and "SCALAR" in rel_meta.get("tail_types", [])
+                    is_scalar_rel = _edge_is_scalar(edge)
 
                     if is_scalar_rel:
                         _raw_obj = edge.object.strip()
@@ -19496,8 +20209,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         note="leaving edge as extracted (fail-safe)")
 
                     # For scalar rel_types, object is a string value (not an entity reference)
-                    # Skip resolution and keep the raw string value
-                    if _is_scalar_rel_type(edge.rel_type):
+                    # Skip resolution and keep the raw string value. Edge-aware (Defect 1): an edge
+                    # carrying ``object_datatype`` is a SCALAR by construction even when its (novel)
+                    # rel_type is not SCALAR-tailed in the seeded ontology — keep the VERBATIM value,
+                    # never resolve it to a phantom UUID entity.
+                    if _edge_is_scalar(edge):
                         canonical_object = edge.object.lower().strip()
                         log.info("ingest.object_kept_as_scalar",
                                rel_type=edge.rel_type, object=canonical_object)
@@ -20025,7 +20741,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # dBug-036A: Normalizing scalar values to UUID breaks conflict detection for user corrections.
                     if (canonical_object in _user_aliases and canonical_object != user_entity_id and
                         edge.rel_type.lower() not in ("also_known_as", "pref_name") and
-                        not _is_scalar_rel_type(edge.rel_type)):
+                        not _edge_is_scalar(edge)):
                         log.info("ingest.object_normalized_to_user_id",
                                  original=canonical_object, user_id=user_entity_id)
                         canonical_object = user_entity_id
@@ -20060,7 +20776,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # ROLE-ALIAS NON-PREFERENCE (Fix B, Part 2 — flag-gated): a ROLE noun
                         # (mother/sister/colleague) registered as an also_known_as alias of a NAMED
                         # person is a SLOT, not the display name — it must NEVER win the preferred
-                        # display over the proper NAME (so recall renders "Robin", not "mother").
+                        # display over the proper NAME (so recall renders "Diane", not "mother").
                         # When the alias object is in the kinship/relational cue class, register it
                         # NON-preferred. THE HARD LINE: the role is a slot on the named instance; the
                         # NAME is the display. Metadata-driven (cue overlay), subject-agnostic, NO
@@ -20216,6 +20932,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # handled by the _quarantine_edge branch below; never dropped.
                     classification_3d = classify_fact_3d(
                         edge.rel_type.lower(), _raw_object.lower().strip(), registry, req.user_id)
+                    # SCALAR-ATTRIBUTE routing (Defect 1): an edge carrying ``object_datatype`` is a
+                    # SCALAR by construction (the deterministic detectors set it). classify_fact_3d
+                    # routes by the rel's ONTOLOGY, which for a NOVEL tenant attribute scalar resolves
+                    # from the public seed and cannot see it → storage None/relational. Force the
+                    # SCALAR storage path so the VERBATIM value lands in entity_attributes, never as a
+                    # relational fact / phantom UUID. Identity aliases keep their own routing.
+                    if (getattr(edge, "object_datatype", None)
+                            and edge.rel_type.lower() not in ("also_known_as", "pref_name")
+                            and isinstance(classification_3d, dict)
+                            and classification_3d.get("storage") != "scalar"):
+                        classification_3d["storage"] = "scalar"
+                        classification_3d["direction"] = None
+                        classification_3d["reason"] = (
+                            (classification_3d.get("reason") or "")
+                            + " | forced scalar: edge carries object_datatype (Defect 1)")
 
                     # PHASE 2: Determine provenance + confidence
                     # Three provenances: user_stated, llm_inferred, llm_learned
@@ -20934,7 +21665,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                             if match:
                                 relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                                entity_name = match.group(2).lower()  # alice, Noodle, Spot, etc.
+                                entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
 
                                 # Resolve the mentioned entity to its canonical ID
                                 resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -22819,6 +23550,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 except Exception as _iof_err:
                     log.warning("ingest.instance_of_linking_failed", error=str(_iof_err))
 
+                # ── ENGINE GROWTH: auto-mint grouping taxonomies from observed membership ──
+                # The members of a novel collective ("my band has … Jax, Reef, Coda") are
+                # captured as `member_of <group>` edges, but the GROUPING node the scoped walk
+                # needs was hand-seeded only — so the novel grouping leaked to fetch-all. Grow
+                # it here, deterministically + freq-gated + per-tenant, from the just-committed
+                # edges. Runs after the atomic commit on the tenant-bound connection; fully
+                # fail-safe (a mint failure never loses the underlying facts — already committed).
+                try:
+                    _minted = _mint_groupings_from_membership(db, req.user_id)
+                    if _minted:
+                        log.info("ingest.groupings_grown", count=_minted,
+                                 user_id=req.user_id[:8])
+                except Exception as _gm_err:
+                    log.warning("ingest.grouping_mint_outer_failed", error=str(_gm_err)[:160])
+
     except psycopg2.Error as err:
         db.rollback()
         log.error("ingest.database_constraint_violation",
@@ -22932,8 +23678,8 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
       when allowed_rels is set, filtered to the in-scope attributes only.
 
     anchor_uuid: When provided, skip facts where the connected entity points back at
-    the anchor (e.g., sam→child_of→user). These anchor-inverse facts are already
-    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→sam).
+    the anchor (e.g., theo→child_of→user). These anchor-inverse facts are already
+    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→theo).
     Surfacing them again creates dual-direction render in the memory block.
     """
     results: list[dict] = []
@@ -22963,9 +23709,9 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
                 )
                 for r in cur.fetchall():
                     # Skip facts where the connected entity points back at the anchor.
-                    # These are anchor-inverse facts (e.g., sam→child_of→user) already handled
+                    # These are anchor-inverse facts (e.g., theo→child_of→user) already handled
                     # by fetch_facts_from_anchor()'s inverse query which inverted them to
-                    # (user→parent_of→sam). Surfacing them again creates dual-direction render.
+                    # (user→parent_of→theo). Surfacing them again creates dual-direction render.
                     if anchor_uuid and role_col == "subject_id" and r[1] == anchor_uuid:
                         continue
                     key = (r[0], r[1], r[2])
@@ -23535,7 +24281,7 @@ def resolve_entity_synonym(term: str, anchor: str, db) -> str | None:
 
     try:
         # ---- 1/2. EXACT-TERM LOOKUP (approved-only, live-only). Qualifier-first is
-        # structural: a qualified phrase ("your-server-host box") is its OWN normalized key and
+        # structural: a qualified phrase ("truenas box") is its OWN normalized key and
         # never collides into the bare term. No substring/fuzzy (the ex-wife trap). ----
         with db.cursor() as cur:
             cur.execute(
@@ -24556,6 +25302,33 @@ def _canonical_scalar_name(db, word: str) -> str:
     return w
 
 
+def _has_first_or_second_person_reference(query_text: str) -> bool:
+    """True when the query contains a FIRST- or SECOND-person reference — a genuine recall request
+    ABOUT the user/listener ("tell me about ME", "what do YOU know", "MY family", "tell me everything").
+    Grammatical/morphological ONLY (spaCy ``Person`` ∈ {1, 2} — covers I/me/my/mine/myself and
+    you/your/yourself), NO phrase or pronoun word list. A pure greeting / external question
+    ("how's it going" → "it" is Person=3; "what's the weather tomorrow" → none) has NO such reference.
+    Used as the BROAD-RECALL gate's exemption: a query with such a reference is a real recall and is
+    NEVER blanked. FAIL-SAFE: parse unavailable / any error → True (prefer returning facts — never
+    silently blank a possible real recall)."""
+    if not query_text or not query_text.strip():
+        return False
+    try:
+        from src.extraction.linguistics import _parse as _ling_parse, linguistics_available
+        if not linguistics_available():
+            return True  # layer off → cannot judge → prefer returning facts
+        doc = _ling_parse(query_text)
+        if doc is None:
+            return True
+        for tok in doc:
+            _p = tok.morph.get("Person")
+            if "1" in _p or "2" in _p:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — fail-safe: never blank a possible real recall
+        return True
+
+
 def resolve_anchor(
     query_text: str,
     conversation_history: list[ConversationMessage],
@@ -24709,7 +25482,7 @@ def resolve_anchor(
                                 _mark("alias", term=phrase)
                                 return row[0]
                     # SYNONYM SEAM (IMPL-3 secondary): after the per-phrase alias MISS,
-                    # same helper / same gate so multi-word synonyms ("your-server-host box")
+                    # same helper / same gate so multi-word synonyms ("truenas box")
                     # resolve identically. None continues the n-gram loop unchanged.
                     _syn_anchor = resolve_entity_synonym(phrase, user_id, db)
                     if _syn_anchor is not None:
@@ -27952,7 +28725,7 @@ def determine_path(
                     # anchor to a same-named entity (e.g. a stray `owns family` → injects `owns` →
                     # leaks every `owns web server`/`owns firewall` into the family answer) is exactly
                     # the cross-domain bleed. So we exclude taxonomy-keyword matches from the
-                    # connectivity pull; a real named-entity match (anxious, taylor) still connects.
+                    # connectivity pull; a real named-entity match (anxious, sarah) still connects.
                     # Checked against entity_taxonomies.taxonomy_name (per-tenant overlay seed∪tenant).
                     _p0_tax_names: set[str] = set()
                     try:
@@ -28311,11 +29084,15 @@ def determine_path(
                         _nrow = _ntcur.fetchone()
                         if not _nrow:
                             continue
-                        # (a) the taxonomy's OWN transitive (nesting/composition) rels.
-                        for _r in (_nrow[0] or []):
-                            if _r:
-                                _nesting.add(str(_r).lower())
-                        # (b) each named sub-group's defining rels (parent ⊃ child anchor).
+                        # NESTING = the connecting rels of the NAMED sub-groups only
+                        # (member_taxonomies' defining rels — family ⊃ pets via has_pet). We do
+                        # NOT fold in the taxonomy's OWN broad transitive_rel_types here: that set
+                        # is over-wide (family.transitive ∋ lives_in/works_for) and re-admitting it
+                        # would leak the address/work edges into a "family" answer (and, via the
+                        # Qdrant scope-projection, leak off-concept C facts too). The axis-projection
+                        # gate already keys on member_taxonomies' defining rels — keep nesting_rels in
+                        # lock-step so the DIRECT re-admission and the projection agree. Subject-
+                        # agnostic, metadata-driven (the sub-group rows only).
                         for _sub in (_nrow[1] or []):
                             if not _sub:
                                 continue
@@ -29172,12 +29949,12 @@ def fetch_facts_from_anchor(
                         inverse_rel_type = rel_type_meta.get("inverse_rel_type")
 
                         # For asymmetric relationships, fully invert: swap subject/object
-                        # AND use the inverse rel_type. This transforms (quinn, child_of, user)
-                        # → (user, parent_of, quinn), matching the anchor's perspective.
+                        # AND use the inverse rel_type. This transforms (leo, child_of, user)
+                        # → (user, parent_of, leo), matching the anchor's perspective.
                         # The dedup step will merge this with any lower-confidence direct
                         # counterpart and keep the higher-confidence version.
                         # Half-inversion (flip rel_type only, no subject/object swap) produces
-                        # semantically wrong facts like "quinn is the parent of user".
+                        # semantically wrong facts like "leo is the parent of user".
                         rel_type_final = rel_type_orig
                         if not is_symmetric and inverse_rel_type:
                             facts.append({
@@ -29422,6 +30199,86 @@ def fetch_facts_from_anchor(
                             if not category_rels:
                                 log.warning("taxonomy_rels.empty", taxonomy=taxonomy)
                                 continue
+
+                            # ── NAMED-GROUP SCOPING (anti cross-group leak) ──────────────
+                            # A GROWN grouping is named after a CONCRETE group ENTITY (the
+                            # "band"/"team" node). Two such groupings share the same defining
+                            # rel (member_of), so the broad domain-scoped lane below (fetch
+                            # ALL member_of facts) would leak team members into a band answer.
+                            # When the taxonomy_name resolves to a real entity, scope STRICTLY
+                            # to THAT group node's members and skip the broad lanes. Seeded
+                            # ABSTRACT taxonomies (family/work/pets) do NOT resolve to an
+                            # entity → this is a no-op for them (byte-for-byte unchanged).
+                            # Subject-agnostic, metadata-driven (defining rels only).
+                            _grp_id = None
+                            try:
+                                cur.execute(
+                                    "SELECT entity_id FROM entity_aliases "
+                                    "WHERE alias = %s ORDER BY is_preferred DESC LIMIT 1",
+                                    (taxonomy.lower(),),
+                                )
+                                _grow = cur.fetchone()
+                                _grp_id = _grow[0] if _grow else None
+                            except Exception:
+                                _grp_id = None
+                            if _grp_id is not None:
+                                _ng_ph = ",".join(["%s"] * len(category_rels))
+                                cur.execute(
+                                    f"""
+                                    SELECT subject_id, object_id, rel_type, confidence, fact_class
+                                      FROM facts
+                                     WHERE (subject_id = %s OR object_id = %s)
+                                       AND rel_type IN ({_ng_ph})
+                                       AND superseded_at IS NULL
+                                       AND archived_at IS NULL AND deleted_at IS NULL
+                                    UNION ALL
+                                    SELECT subject_id, object_id, rel_type, confidence, fact_class
+                                      FROM staged_facts
+                                     WHERE (subject_id = %s OR object_id = %s)
+                                       AND rel_type IN ({_ng_ph})
+                                       AND promoted_at IS NULL
+                                    """,
+                                    (_grp_id, _grp_id) + tuple(category_rels)
+                                    + (_grp_id, _grp_id) + tuple(category_rels),
+                                )
+                                _ng_members: set = set()
+                                for _row in cur.fetchall():
+                                    facts.append({
+                                        "subject": _row[0],
+                                        "object": _row[1],
+                                        "rel_type": _row[2],
+                                        "confidence": float(_row[3]) if _row[3] else 0.8,
+                                        "fact_class": _row[4] or "B",
+                                        "source": "db",
+                                        "category": _get_rel_type_category(_row[2]),
+                                    })
+                                    _ng_members.add(_row[0])
+                                    _ng_members.add(_row[1])
+                                _ng_members.discard(_grp_id)
+                                # Members' scalar attributes (ages, etc.) — the descend.
+                                if _ng_members:
+                                    cur.execute(
+                                        "SELECT entity_id, attribute, value_text "
+                                        "FROM entity_attributes WHERE entity_id = ANY(%s)",
+                                        (list(_ng_members),),
+                                    )
+                                    for _row in cur.fetchall():
+                                        if _row[2]:
+                                            facts.append({
+                                                "subject": _row[0],
+                                                "rel_type": _row[1],
+                                                "object": _row[2],
+                                                "confidence": 1.0,
+                                                "fact_class": "A",
+                                                "source": "attributes",
+                                                "category": _get_rel_type_category(_row[1]),
+                                                "valid_from": None,
+                                                "valid_until": None,
+                                            })
+                                log.info("fetch_facts_from_anchor.named_group_scoped",
+                                         taxonomy=taxonomy, group=str(_grp_id)[:8],
+                                         members=len(_ng_members))
+                                continue  # named-group fully scoped; skip broad lanes
 
                             # Query facts with these rel_types
                             placeholders = ",".join(["%s"] * len(category_rels))
@@ -30769,10 +31626,10 @@ def _compose_object_clause(
                 # POSSESSIVE-VERB normalization: the named-instance shape ("a <Type>
                 # named <Name>") is a POSSESSIVE construction. A rel whose template verb
                 # is a copula (parent_of → "You ARE the parent of Y") would render the
-                # WRONG perspective here — "you are a son named Quinn" makes the USER the
+                # WRONG perspective here — "you are a son named Leo" makes the USER the
                 # son. When the named instance is on the OBJECT side and the parsed verb
                 # is a copula, substitute the closed-class possessive primitive (have/has)
-                # so it reads "you have a son named Quinn". Grammar primitive, NOT a domain
+                # so it reads "you have a son named Leo". Grammar primitive, NOT a domain
                 # token (same justification as Shape 4's predicate inventory). Non-copula
                 # rel verbs (has_pet→have, owns→own) are kept verbatim.
                 if verb in ("is", "are", "was", "were", "be", "am"):
@@ -30800,14 +31657,14 @@ def _compose_inverse_anchor_clause(
     The structure-driven NAMED-INSTANCE composer was built for POSSESSION — the named
     instance on the OBJECT side ((user, has_pet, rex) → "you have a dog named
     Rex"). When the SAME shape appears MIRRORED — the named instance on the SUBJECT
-    side and the query anchor ("you") on the OBJECT side ((quinn, child_of, you)) — the
+    side and the query anchor ("you") on the OBJECT side ((leo, child_of, you)) — the
     object-side composer's gate (object≠"you") rightly declines, and the bare template
-    path renders it from the WRONG perspective ("you are a son named Quinn": it makes the
+    path renders it from the WRONG perspective ("you are a son named Leo": it makes the
     USER the son). This composer re-frames such a fact FROM THE ANCHOR'S perspective by
     FLIPPING along the rel's ``inverse_rel_type`` (overlay metadata):
 
-      (quinn, child_of, you)  --inverse-->  (you, parent_of, quinn)
-        → "you have a son named Quinn"   (Type=son from quinn's instance_of, Name=Quinn)
+      (leo, child_of, you)  --inverse-->  (you, parent_of, leo)
+        → "you have a son named Leo"   (Type=son from leo's instance_of, Name=Leo)
 
     Detection is purely STRUCTURAL (caller guarantees: named instance on subject side,
     anchor on object side) + the rel having an ``inverse_rel_type`` in metadata. ZERO
@@ -30820,7 +31677,7 @@ def _compose_inverse_anchor_clause(
       • ASYMMETRIC inverse (parent_of ≠ child_of): the anchor POSSESSES a typed-and-named
         instance → "<anchor> have/has a <Type> named <Name>" (Shape-1 possessive reading,
         mirrored). Falls through (None) when no instance_of TYPE is known, so we never
-        fabricate "you have a named Quinn".
+        fabricate "you have a named Leo".
       • SYMMETRIC rel (spouse: inverse == self): no possession reading — render the
         relationship naturally, anchor-first → "<Name> is your <role>" using the rel's
         own label as the role noun. (e.g. spouse → "Jordan is your spouse"; if a cleaner
@@ -31066,6 +31923,28 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         # never compose for instance_of/subclass_of themselves). Fail-safe: no type → unchanged.
         named_instance_type_id: dict = occurrence_type_id
 
+        # GROUP-SCAFFOLD OBJECT SUPPRESSION (prose cleanup — "You own Team/Family",
+        # "You have a pet that is Pets"). Ingest sometimes mints a COLLECTIVE-NOUN entity for a
+        # grouping word ("pets"/"team"/"family") and hangs a non-membership edge off it
+        # (user owns team / user has_pet pets). That object is GROUP SCAFFOLDING, not content —
+        # the real members are reached via the grouping's own membership rels. Suppress a fact
+        # whose OBJECT is such a group-name entity UNLESS the rel is a classification/membership
+        # hierarchy rel (is_hierarchy_rel — e.g. `member_of`, where a group object is correct:
+        # "Sarah is a member of Team" stays). Metadata-driven (taxonomy names + is_hierarchy_rel),
+        # subject-agnostic, lean (it removes scaffold, never a real member). Fail-safe → no suppression.
+        _group_scaffold_ids: set = set()
+        try:
+            if db:
+                with db.cursor() as _gsc:
+                    _gsc.execute(
+                        "SELECT DISTINCT a.entity_id FROM entity_aliases a "
+                        "JOIN entity_taxonomies t ON lower(a.alias) = lower(t.taxonomy_name)"
+                    )
+                    _group_scaffold_ids = {r[0] for r in _gsc.fetchall() if r[0]}
+        except Exception as _gse:
+            log.debug("convert_to_prose.group_scaffold_index_failed", error=str(_gse)[:120])
+            _group_scaffold_ids = set()
+
         # Convert each fact to prose
         for fact in facts:
             try:
@@ -31077,6 +31956,15 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 subject_id = fact.get("_subject_id") or fact.get("subject_id") or fact.get("subject")
                 object_id = fact.get("_object_id") or fact.get("object_id") or fact.get("object")
                 fact_class = fact.get("fact_class")
+
+                # GROUP-SCAFFOLD SUPPRESSION: drop a non-membership edge whose object is a
+                # collective grouping-name entity (scaffolding, not content). A hierarchy/
+                # membership rel keeps it ("member_of Team" is correct). See index build above.
+                if (object_id in _group_scaffold_ids
+                        and not _REL_TYPE_META.get(rel_type, {}).get("is_hierarchy_rel")):
+                    log.debug("convert_to_prose.group_scaffold_suppressed",
+                              rel_type=rel_type, object=str(object_id)[:8])
+                    continue
 
                 # Get natural_language template — fall back to label then rel_type
                 # Never drop a fact just because the phrasing hasn't been learned yet.
@@ -31259,13 +32147,13 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 if not is_unbound:
                     # SUBJECT-SIDE NAMED-INSTANCE flip (perspective fix): when the named
                     # instance is on the SUBJECT side and the query anchor ("you") is the
-                    # OBJECT — (quinn, child_of, you) — the object-side composer declines
+                    # OBJECT — (leo, child_of, you) — the object-side composer declines
                     # (object=="you") and the bare template renders the WRONG perspective
-                    # ("you are a son named Quinn"). Re-frame anchor-first by FLIPPING along
-                    # the rel's inverse_rel_type (overlay metadata): (quinn, child_of, you)
-                    # → you-parent_of-quinn → "you have a son named Quinn". The Type ("son")
-                    # is quinn's instance_of (resolved here, mirroring the object-side block),
-                    # the Name is quinn's alias — ZERO kin literals. Detection is STRUCTURAL:
+                    # ("you are a son named Leo"). Re-frame anchor-first by FLIPPING along
+                    # the rel's inverse_rel_type (overlay metadata): (leo, child_of, you)
+                    # → you-parent_of-leo → "you have a son named Leo". The Type ("son")
+                    # is leo's instance_of (resolved here, mirroring the object-side block),
+                    # the Name is leo's alias — ZERO kin literals. Detection is STRUCTURAL:
                     # object is the anchor (UUID), subject is a UUID named instance, rel has a
                     # metadata inverse. Symmetric rels (spouse) render naturally. Runs BEFORE
                     # the object-side composer; takes priority for this mirrored shape.
@@ -31461,7 +32349,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         and len(subject_name.split()) == 1):
                     _name_slots.append(subject_name)
                 # Object alias → titlecase ONLY a clean SINGLE-TOKEN entity NAME on a
-                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Atlas/Biscuit). A
+                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Goose). A
                 # hierarchy object is a TYPE word ("dog"/"animal"), a participated_in object
                 # is an occurrence TITLE/handle, and a STATE object is a state word ("down")
                 # — none are proper names, all read naturally lowercase and must NOT be titled
@@ -31741,6 +32629,37 @@ async def query(request: QueryRequest) -> QueryResponse:
         # Fix A: thread the (pure, query_text-derived) temporal intent so the anchor fetch
         # can OR-in the dated-event lane (event_date IS NOT NULL) under temporal intent.
         _anchor_temporal_intent = _detect_temporal_query_intent(query_text)
+        # ── BROAD-RECALL RELEVANCE GATE (chitchat must NOT dump the whole memory) ──────────────────
+        # A query with NO concrete anchor/concept (anchor fell back to "default"; scope_active False)
+        # would hit the UNSCOPED fetch-all lane and dump EVERY authoritative fact — so "how's it going"
+        # / "what's the weather tomorrow" answered "You feel Overwhelmed/Busy". The gate: when the
+        # anchor was NOT explicitly resolved (method=="default"), no concept scope is active, the query
+        # carries NO first/second-person reference (a real recall ABOUT the user), and there is NO
+        # temporal recall intent — there is nothing the user asked memory for → return EMPTY instead of
+        # fetch-all. LEGITIMATE broad recall is preserved: "tell me about me" / "what do you know about
+        # me" carry a 1st/2nd-person reference (exempt); "tell me about my family" resolves a taxonomy
+        # (scope_active True, exempt); a concrete-entity query ("tell me about Aurora") resolves a
+        # non-default method (exempt). FAIL-SAFE: the reference detector returns True (don't blank) when
+        # the layer is unavailable, so an uncertain case prefers returning facts. Deterministic, no
+        # phrase list (anchor method + scope flag + Person-morphology + parsed temporal intent).
+        if (_anchor_meta.get("method") == "default"
+                and not getattr(path, "scope_active", False)
+                and not _anchor_temporal_intent
+                and not _has_first_or_second_person_reference(query_text)):
+            log.info("query.phase5.broad_recall_gated",
+                     query=query_text[:60], anchor_method=_anchor_meta.get("method"),
+                     note="anchorless, no concept scope, no 1st/2nd-person reference, no temporal "
+                          "intent → chitchat/greeting; returning empty instead of fetch-all")
+            return QueryResponse(
+                anchor=anchor or "",
+                facts=[],
+                preferred_names={},
+                canonical_identity=anchor or "",
+                confidence_applied=True,
+                staged_facts_count=0,
+                error=None,
+                alerts=_get_active_alerts(locals().get("schema_name")) or [],
+            )
         # MULTI-ENTITY TEMPORAL COMPARISON (Defect-1): a comparison/ordinal ask
         # ("which seeds started first, tomatoes or marigolds?", "how many days between
         # A and B?") resolves ONE anchor, so the second operand's dated edge (a DIFFERENT
@@ -32205,8 +33124,8 @@ async def query(request: QueryRequest) -> QueryResponse:
         # Qdrant payloads store subject/object as DISPLAY NAMES (re_embedder writes
         # subject_display/object_display), not UUIDs. A DB copy of the same fact keys
         # on its UUID; the Qdrant copy keyed on a display name — so dedup never
-        # collapsed them and the SAME fact rendered twice (e.g. "you works for guelph"
-        # AND "alex works for guelph"). Resolve each Qdrant point's backing row
+        # collapsed them and the SAME fact rendered twice (e.g. "you works for riverton"
+        # AND "alex works for riverton"). Resolve each Qdrant point's backing row
         # (fact_id + source_table) to its real subject_id/object_id UUIDs and stamp
         # them onto the fact, so the UUID-keyed dedup below collapses DB+Qdrant copies
         # and the central resolver renders the survivor ONE way. Runs AFTER the
@@ -32304,6 +33223,40 @@ async def query(request: QueryRequest) -> QueryResponse:
             except Exception as _cce:
                 # Fail-safe: never break recall — fall back to the unfiltered lane.
                 log.warning("query.vector_class_c_only_failed non-blocking", error=str(_cce))
+
+        # ─── SCOPE PROJECTION on the Qdrant Class-C lane (cross-grouping leak fix) ───
+        # The deterministic PostgreSQL walk is PROJECTED by the resolved concept scope
+        # (allowed_rels). The Qdrant short-term lane was NOT — so a scoped concept query
+        # ("tell me about my family", "where do I live") still pulled in OFF-SCOPE Class-C
+        # memory: the unscoped store_context affect blobs (rel_type == "context") and any
+        # C fact whose rel_type is outside the concept. That is exactly the "affect rant /
+        # greeting leaks into the family/location answer" bug. PostgreSQL A/B is authoritative
+        # and already scoped; the C lane must obey the SAME projection when a concept is active.
+        #
+        # Apply the SAME rule the walk uses: keep a Qdrant fact iff its rel_type satisfies
+        # the active scope (allowed_rels ∪ — on the membership axis — the nesting rels that
+        # descend a nested sub-group). A `context` blob has NO structured rel → it can never
+        # satisfy a concept scope → dropped under active scope (it is short-term memory with
+        # no place in a scoped grouping). When NO concept scope is active (greeting / pure
+        # "tell me everything" / fetch-all) the lane is UNTOUCHED — short-term C still
+        # surfaces there. Deterministic (rel-set membership, no fuzz); metadata-driven
+        # (allowed_rels/nesting come from the taxonomy overlay); subject-agnostic; fail-safe.
+        if qdrant_facts and getattr(path, "scope_active", False) and not getattr(path, "fetch_all_details", False):
+            try:
+                _scope_keep = set(path.allowed_rels)
+                if (AXIS_SCOPED_QUERY and getattr(path, "axis", None) == "membership"):
+                    _scope_keep |= {r.lower() for r in (getattr(path, "nesting_rels", None) or [])}
+                _before_sp = len(qdrant_facts)
+                qdrant_facts = [
+                    f for f in qdrant_facts
+                    if (f.get("rel_type") or "").lower() in _scope_keep
+                ]
+                if len(qdrant_facts) < _before_sp:
+                    log.info("query.qdrant_scope_projection",
+                             before=_before_sp, after=len(qdrant_facts),
+                             scope_rels=sorted(_scope_keep)[:8])
+            except Exception as _spe:
+                log.warning("query.qdrant_scope_projection_failed non-blocking", error=str(_spe)[:120])
 
         # ─── D4 (query half): genuine scoped HIT increments hit_count on Class C ───
         # A Class C Qdrant fact is a HIT (not a mere bulk return) when:
@@ -33702,7 +34655,7 @@ def correct_fact(req: FactCorrectionRequest):
         # The correction LLM flattens a 1st-person POSSESSIVE role phrase ("Actually my mother
         # is 63") to subject_name="user" (the "my" → first-person rule above). But when Fix B
         # has registered the ROLE noun ("mother") as a non-preferred alias of a NAMED person
-        # (Robin), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
+        # (Diane), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
         # (user, age, N). We do NOT special-case the word: we ground the correction text with
         # the SAME shared anchor resolver ingest/query use (resolve_anchor), whose Rule 2 reads
         # the DB ALIAS CACHE for "my <role>" and returns the named entity's UUID iff the role is
@@ -34865,8 +35818,8 @@ def correct_fact(req: FactCorrectionRequest):
                         new_rel_type=new_rel_type)
 
                 # Verify old fact exists. The resolved correction subject may be either side
-                # of the stored edge: "Taylor is my cousin, not my sister" resolves the subject
-                # to TAYLOR, but the grounded edge is (user, sibling_of, taylor) — Taylor is the
+                # of the stored edge: "Sarah is my cousin, not my sister" resolves the subject
+                # to SARAH, but the grounded edge is (user, sibling_of, sarah) — Sarah is the
                 # OBJECT. A subject-only lookup (the historical path) misses it and the user's
                 # correction is silently lost. We therefore look up BOTH orientations (the
                 # resolved entity as subject, then as object) and carry the matched edge's REAL
@@ -36643,7 +37596,7 @@ async def learn_topic(req: LearnTopicRequest):
     # The LLM frequently generates abstract upper-ontology edges such as:
     #   "faultline subclass_of object", "organization subclass_of person"
     # These are meaningless as personal facts and surface as garbled query results
-    # (e.g. "alex is a subclass of sam") when abstract UUIDs collide with known entities.
+    # (e.g. "alex is a subclass of theo") when abstract UUIDs collide with known entities.
     #
     # Two complementary checks — belt-and-suspenders:
     #   1. Name check (primary): subject or object in _SYSTEM_ENTITY_NAMES

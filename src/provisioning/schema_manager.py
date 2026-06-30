@@ -247,14 +247,14 @@ def derive_schema_name(user_slug: str) -> str:
         user_slug: Human-readable slug from users.slug (e.g., "alexander")
 
     Returns:
-        Schema name (e.g., "faultline_alexander")
+        Schema name (e.g., "faultline_christopher")
 
     Examples:
         >>> derive_schema_name("alexander")
-        'faultline_alexander'
+        'faultline_christopher'
 
         >>> derive_schema_name("jordan")
-        'faultline_jordan'
+        'faultline_marla'
     """
     # Sanitize slug: lowercase, alphanumeric + underscore only
     safe_slug = "".join(c if c.isalnum() or c == "_" else "_" for c in user_slug.lower())
@@ -458,7 +458,13 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
             # 'aspectual_control_verb' (migration 113, _aspectual_activity_xcomp — start/begin/keep/
             # continue/resume/finish/stop phase verbs licensing the split-SVO xcomp descent). The
             # relations stay in code; only the verb-LEMMA / particle-SURFACE VOCABULARY is DB data that grows
-            # (freq-gated, tenant-only). Blanket SELECT copies ALL seeded categories.
+            # (freq-gated, tenant-only). Copies the seeded GRAMMAR/UNIT/KINSHIP categories.
+            #
+            # CARVE-OUT (lean-seed): the DOMAIN-FLAVORED classes social_role / problem_noun / thin_type
+            # are NO LONGER seeded — they are GROWN PER-TENANT from observed constructions (re_embedder
+            # grow_linguistic_cue_candidates). The WHERE excludes them as defense-in-depth so a NEW tenant
+            # never inherits them even if a stray seed row reappears in public (migration 119 also clears
+            # public). KINSHIP (kinship_noun/kinship_gender) + grammar/unit classes REMAIN seeded.
             cur.execute("""
                 INSERT INTO linguistic_cues
                     (cue, category, frequency, confirmed_count, rejected_count,
@@ -468,6 +474,7 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
                        correction_count, global_confidence, description, example_text,
                        source, is_active, archived_at, last_matched_at
                 FROM public.linguistic_cues
+                WHERE category NOT IN ('social_role', 'problem_noun', 'thin_type')
                 ON CONFLICT (cue, category) DO NOTHING
             """)
 
@@ -816,7 +823,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
         ...     user_slug="alexander"
         ... )
-        >>> assert schema_name == "faultline_alexander"
+        >>> assert schema_name == "faultline_christopher"
         >>> assert status == "ready"
     """
     schema_name = derive_schema_name(user_slug)
@@ -1069,7 +1076,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
     Args:
         user_id: UUID of user (for logging)
-        schema_name: Schema to delete (e.g., "faultline_alexander")
+        schema_name: Schema to delete (e.g., "faultline_christopher")
         db: Optional psycopg2 connection. Creates new if not provided.
 
     Returns:
@@ -1078,7 +1085,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
     Examples:
         >>> success = delete_user_schema(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     schema_name="faultline_alexander"
+        ...     schema_name="faultline_christopher"
         ... )
         >>> assert success
     """

@@ -113,7 +113,7 @@ _VECTOR_CLASS_C_ONLY = _flag("VECTOR_CLASS_C_ONLY", "true")
 _HIERARCHY_RELS = ("instance_of", "is_a", "subclass_of", "part_of", "member_of")
 
 # THE HARD LINE — the SKOS naming/label rels whose OBJECT is a NAME (a memory: Rex,
-# Atlas, "Alex"), NOT a type. An alias registered as the object of one of these edges is a
+# Apollo, "Alex"), NOT a type. An alias registered as the object of one of these edges is a
 # proper name and is NEVER a valid L4 classification subject — the subclass_of ladder hangs
 # off the TYPE node (dog, computer), never off the name. Same fixed SKOS-identity invariant the
 # rest of the codebase pins (main._ALIAS_BACKED_NAME_RELS = pref_name/also_known_as, the
@@ -1029,7 +1029,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         db_conn: PostgreSQL connection (per-user schema context via search_path)
         qdrant_url: Qdrant service URL for staged collection cleanup
         user_id: User UUID for collection naming (optional, derived from schema context)
-        schema_name: User schema name (e.g., "faultline_alexander"). If provided, sets search_path.
+        schema_name: User schema name (e.g., "faultline_christopher"). If provided, sets search_path.
         promotion_threshold: Confirmed count threshold for promotion (default 3, configurable)
 
     Returns:
@@ -2377,7 +2377,7 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
     feeling concepts → the domain is-a chain. Returns an ORDERED list of snake_case
     category tokens, MOST-SPECIFIC FIRST, up to a general root (the concept itself is NOT
     included; the first element is its immediate parent). Returns None on failure or for a
-    PROPER-NAME instance (prefer null over a speculative chain — `atlas` the program must
+    PROPER-NAME instance (prefer null over a speculative chain — `apollo` the program must
     not be force-typed as `spacecraft`).
 
     Bounded via the centralized stack (CLASSIFY_CHAIN op — bigger token budget than a single
@@ -2431,7 +2431,7 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             f"  anxious  -> [\"fear\", \"emotion\"]   (STOP at emotion — do NOT climb into "
             f"\"affective_state\"/\"psychological_phenomenon\"/\"mental_concept\"/\"cognitive_entity\""
             f"/\"abstract_entity\"; those are upper-ontology junk, NOT a real category)\n"
-            f"  atlas   -> []\n"
+            f"  apollo   -> []\n"
             f"  alexander -> []\n\n"
             f"Concept: \"{c}\"\n\n"
             f"Respond with ONLY valid JSON (no markdown, no extra text):\n"
@@ -2452,7 +2452,7 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             return None
 
         # PROPER-NAME GUARD: an explicit empty chain means "specific named instance" — prefer
-        # null over a speculative ladder (atlas → spacecraft was wrong; qwen knows the program).
+        # null over a speculative ladder (apollo → spacecraft was wrong; qwen knows the program).
         raw = result.get("chain")
         if not isinstance(raw, (list, tuple)):
             return None
@@ -2645,6 +2645,15 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
     stats = {"classified": 0, "grounded": 0, "deferred": 0, "errors": 0}
     if not _ENGINE_WHATIS_CLASSIFY:
         return stats
+    # DEFENSIVE ENTRY-ROLLBACK: this runs on the poll loop's SHARED connection AFTER several other
+    # per-tenant subsystems. If a prior subsystem left the txn ABORTED without rolling back (the
+    # known throwaway-tenant cascade), our very first SELECT fails "current transaction is aborted"
+    # and the whole concept-classify sweep silently no-ops every cycle — the climb then starves. Clear
+    # any inherited aborted state up front so this consumer always starts clean. Best-effort, fail-safe.
+    if schema_name:
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+    # The seeded backbone roots (animal/person/organization/…) — the TYPE→ROOT fallback ceiling below.
+    _roots = _seeded_backbone_roots(os.environ.get("POSTGRES_DSN", ""), schema_name)
     try:
         with db_conn.cursor() as cur:
             # first_text_snippet (additive): the full sentence that surfaced the concept,
@@ -2662,6 +2671,8 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
             )
             rows = cur.fetchall()
     except Exception as e:
+        if schema_name:
+            _rollback_and_reapply_search_path(db_conn, schema_name)
         log.error(f"re_embedder.whatis_fetch_failed: {e}")
         return stats
 
@@ -2734,6 +2745,23 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
 
             entity_type = proposal["entity_type"]
             parent = proposal.get("parent")
+
+            # TYPE→ROOT GROUNDING (closes the GAP-1 climb-coverage hole): the LLM reliably gives a
+            # TYPE but often returns parent=None for agent/role concepts ("a guitarist"/"a violinist"/
+            # "a potter" → type=Person, parent=null). With no parent the concept never gets a first
+            # subclass_of rung, so it is NEVER a climb leaf and NEVER reaches a seeded root — the role
+            # types stall un-laddered. When the LLM proposes no intermediate parent, ground the concept
+            # DIRECTLY to its TYPE's SEEDED BACKBONE ROOT by identity (Person→person, Organization→
+            # organization, …): a one-rung subclass_of that TERMINATES at a seeded root. This is the
+            # eager-attach ceiling — deterministic (type→root name identity, NO cosine/LLM), and the
+            # seeded root is the convergence ceiling so we never overshoot. The async climb's Option-A
+            # splice later inserts intermediate rungs (guitarist→musician→…→person) IF the LLM proposes
+            # them; until then the concept is grounded to a real root, meeting the bar. Subject-agnostic:
+            # the type→root set is the seeded hierarchical taxonomies, NO entity/role/domain literal.
+            if not parent:
+                _type_root = (entity_type or "").strip().lower()
+                if _type_root and _type_root in _roots and _type_root != concept:
+                    parent = _type_root
 
             # 1. TYPE the concept entity (unknown-only — never override an existing type).
             #    Resolve the concept's entity via its alias; if it isn't a registered entity
@@ -2878,15 +2906,25 @@ def _seeded_backbone_roots(dsn: str, schema_name: str | None) -> set:
 
     Reads the per-tenant seeded HIERARCHICAL taxonomies via the taxonomy overlay
     (seed ∪ tenant, tenant-only — never public for a bound tenant) and returns the set
-    of their canonical anchor names, lowercased (animal, location, person, …). These are
+    of their canonical anchor names, lowercased (animal, location, …). These are
     the roots _attach_to_seeded_backbone connects leaves to; a climb that reaches one is
     DONE. Metadata-driven (NO hardcoded type/entity list); subject-agnostic — a new domain
     needs only a seeded hierarchical taxonomy row.
 
-    Fail-safe: any error / unreadable tenant → empty set (climb then relies on the ±6 hop
-    backstop to stop, never crashes).
+    UNIVERSAL TYPE BACKBONE: the seeded DOMAIN taxonomies (family/animal/location/…) cover
+    only some entity classes — a tenant has no 'person'/'organization'/'object'/'concept'
+    hierarchical taxonomy, so an agent/role concept (a violinist → … → person) would have NO
+    seeded root to terminate at and would stall un-rooted. So we ALSO admit the CANONICAL
+    entity-type names (person/animal/organization/location/object/concept) as universal
+    backbone roots — the fixed ontology backbone (the SAME closed canonical set GLiNER2 types
+    into and the whatis classifier emits), i.e. the seeded canonical backbone / attach ceiling
+    referenced throughout. This is NOT a domain/role word list: it is the closed entity-type
+    set, the universal top of the is-a backbone every type ultimately roots at.
+
+    Fail-safe: any error / unreadable tenant → the canonical type roots alone (the climb still
+    has a universal ceiling to terminate at; never crashes).
     """
-    roots: set = set()
+    roots: set = {t.lower() for t in _CANONICAL_ENTITY_TYPES}
     if not dsn:
         return roots
     try:
@@ -3470,6 +3508,12 @@ def climb_classification_chains(
         return stats
     if not user_id or not schema_name:
         return stats  # need a bound tenant + user to resolve UUIDs / overlay
+
+    # DEFENSIVE ENTRY-ROLLBACK (same rationale as classify_unknown_concepts): the climb runs LAST on
+    # the shared poll-loop connection, so an aborted txn inherited from an earlier subsystem makes the
+    # subclass_of check below fail "current transaction is aborted" and the climb returns early EVERY
+    # cycle — the un-laddered concepts never deepen. Clear inherited aborted state up front. Fail-safe.
+    _rollback_and_reapply_search_path(db_conn, schema_name)
 
     dsn = os.environ.get("POSTGRES_DSN", "")
     roots = _seeded_backbone_roots(dsn, schema_name)
@@ -4358,6 +4402,21 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                 "   SELECT candidate_rel_type, SUM(occurrence_count) AS total_occ"
                 "   FROM ontology_evaluations"
                 "   WHERE re_embedder_decision IS NULL"
+                # CONSUMER FIREWALL — the rel-type evaluator owns rel-type CANDIDATES only.
+                # ingest_miss_pushback rows are CONCEPT-classification candidates owned by
+                # classify_unknown_concepts; they merely REUSE candidate_rel_type to record the
+                # surfacing rel (e.g. `mira instance_of violinist` → candidate_rel_type=instance_of).
+                # Without this exclusion a curated surfacing rel (instance_of/member_of) drags the
+                # concept rows into the rel aggregate and the curated-rel suppression UPDATE below
+                # flips them to 'already_known' — starving the whatis classifier so the role TYPE
+                # (violinist) never gets a subclass_of ladder. (Structural extraction_method marker,
+                # not a domain literal — same marker the concept consumer keys on.)
+                "     AND extraction_method IS DISTINCT FROM 'ingest_miss_pushback'"
+                # CARVE-OUT firewall: linguistic_cue_candidate rows are CARVED cue-class growth
+                # candidates owned by grow_linguistic_cue_candidates — they REUSE candidate_rel_type to
+                # carry the cue CATEGORY (e.g. 'social_role'), NOT a real rel_type. Excluding them here
+                # prevents the rel-type evaluator from minting a bogus rel_type named after the category.
+                "     AND extraction_method IS DISTINCT FROM 'linguistic_cue_candidate'"
                 "   GROUP BY candidate_rel_type"
                 " ) agg"
                 " JOIN LATERAL ("
@@ -4366,6 +4425,8 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                 "   FROM ontology_evaluations oe"
                 "   WHERE oe.candidate_rel_type = agg.candidate_rel_type"
                 "     AND oe.re_embedder_decision IS NULL"
+                "     AND oe.extraction_method IS DISTINCT FROM 'ingest_miss_pushback'"
+                "     AND oe.extraction_method IS DISTINCT FROM 'linguistic_cue_candidate'"
                 "   ORDER BY oe.occurrence_count DESC, oe.last_seen_at DESC"
                 "   LIMIT 1"
                 " ) rep ON true"
@@ -4531,7 +4592,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  decision_timestamp = now(),"
                         "  decision_reason = %s,"
                         "  created_rel_type = %s"
-                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL",
+                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL"
+                        # never clobber concept-classification rows (see consumer firewall above)
+                        "   AND extraction_method IS DISTINCT FROM 'ingest_miss_pushback'",
                         (f"existing curated rel — regeneration suppressed ({reason})",
                          candidate_rel, candidate_rel),
                     )
@@ -4706,7 +4769,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  llm_fact_class = %s,"
                         "  llm_confidence = %s,"
                         "  llm_metadata_json = %s"
-                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL",
+                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL"
+                        # never clobber concept-classification rows (see consumer firewall above)
+                        "   AND extraction_method IS DISTINCT FROM 'ingest_miss_pushback'",
                         (decision, 0.8, reason, candidate_rel,
                          llm_metadata.get("llm_natural_language", ""),
                          llm_metadata.get("llm_is_symmetric", False),
@@ -4727,7 +4792,9 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                         "  best_fit_rel_type = %s,"
                         "  best_fit_score = %s,"
                         "  created_rel_type = %s"
-                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL",
+                        " WHERE candidate_rel_type = %s AND re_embedder_decision IS NULL"
+                        # never clobber concept-classification rows (see consumer firewall above)
+                        "   AND extraction_method IS DISTINCT FROM 'ingest_miss_pushback'",
                         (decision, best_score, reason, best_fit, best_score,
                          best_fit, candidate_rel),
                     )
@@ -4976,6 +5043,110 @@ def decay_ontology_candidates(db_conn, user_id: str = None) -> dict:
         except Exception:
             pass
         log.error(f"re_embedder.ontology_candidate_decay_error user_id={user_id}: {e}")
+
+    return stats
+
+
+# Freq gate for CARVED cue-class growth — mirrors the rel_type / correction-signal threshold (≥3).
+LINGUISTIC_CUE_GROWTH_THRESHOLD = 3
+
+
+def grow_linguistic_cue_candidates(db_conn, schema_name: str = None) -> dict:
+    """Grow CARVED cue classes (social_role / problem_noun) PER-TENANT from observed, freq-gated
+    candidates.
+
+    THE CARVE-OUT (lean-seed): social_role and problem_noun are DOMAIN-FLAVORED classes that are no
+    longer seeded — they are GROWN from the OBSERVED construction. The ingest/harvest seam records a
+    candidate into ``ontology_evaluations`` (extraction_method='linguistic_cue_candidate',
+    candidate_object_type=<category>, sample_object=<cue lemma>) and bumps occurrence_count on each
+    re-sighting (ON CONFLICT). This sweep reads candidates that crossed the freq gate (≥3) and writes
+    them into ``<tenant>.linguistic_cues`` so the overlay resolves them on the next turn — then the
+    consumer routes the construction correctly instead of degrading.
+
+    DETERMINISTIC + per-tenant + fail-safe: search_path is set by the caller's per-tenant connection;
+    the INSERT is into the bound tenant schema (NO public — growth never pollutes the seed template).
+    Convergence-by-identity (the UNIQUE (cue, category) ON CONFLICT), NO cosine/fuzzy. The grown
+    rel_type for social_role is the GENERIC person tie ``knows`` (the specific friend_of tie is not
+    auto-distinguished — user-correctable). problem_noun is a SET (membership in ``cue``); its
+    description is a human note. Decided candidates are marked re_embedder_decision='cue_grown' so they
+    never re-grow; un-reinforced candidates age out via the shared decay sweep.
+
+    Returns {"grown": int, "errors": int}. thin_type growth is intentionally NOT here (deferred —
+    its only candidate signal is circular with GLiNER2's live typing; see the overlay carve comment)."""
+    stats = {"grown": 0, "errors": 0}
+    # Per-category grown-row shape (NO domain literals — the cue lemmas come from observation):
+    #   social_role → keyed map: description carries the rel_type (generic person tie ``knows``).
+    #   problem_noun → set: description carries a note (membership is the cue column).
+    _CARVED = {
+        "social_role": "knows",
+        "problem_noun": "grown problem/fault eventive head (freq-gated, observed)",
+    }
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, candidate_object_type, sample_object, occurrence_count"
+                "  FROM ontology_evaluations"
+                " WHERE extraction_method = 'linguistic_cue_candidate'"
+                "   AND re_embedder_decision IS NULL"
+                "   AND occurrence_count >= %s",
+                (LINGUISTIC_CUE_GROWTH_THRESHOLD,),
+            )
+            rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001 — fail-safe: no candidates table / read error
+        log.debug(f"re_embedder.cue_growth_fetch_failed schema={schema_name}: {str(e)[:140]}")
+        return stats
+
+    for (rid, category, cue, occ) in (rows or []):
+        _cat = (category or "").strip().lower()
+        _cue = (cue or "").strip().lower()
+        if not _cat or not _cue or _cat not in _CARVED:
+            # Not a carved class we grow (or malformed) → resolve so it stops re-reading.
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET re_embedder_decision = 'cue_skipped',"
+                        "  decision_timestamp = now() WHERE id = %s", (rid,))
+                db_conn.commit()
+            except Exception:  # noqa: BLE001
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+            continue
+        _desc = _CARVED[_cat]
+        try:
+            with db_conn.cursor() as cur:
+                # Grow the cue into the BOUND tenant schema (search_path = tenant, NO public). Convergence
+                # by identity: ON CONFLICT (cue, category) DO NOTHING — a re-grow is a no-op.
+                cur.execute(
+                    "INSERT INTO linguistic_cues"
+                    "  (cue, category, description, source, global_confidence, frequency,"
+                    "   confirmed_count, is_active)"
+                    " VALUES (%s, %s, %s, 'grown', 0.75, %s, %s, true)"
+                    " ON CONFLICT (cue, category) DO NOTHING",
+                    (_cue, _cat, _desc, occ, occ),
+                )
+                cur.execute(
+                    "UPDATE ontology_evaluations SET re_embedder_decision = 'cue_grown',"
+                    "  decision_timestamp = now(),"
+                    "  decision_reason = %s WHERE id = %s",
+                    (f"carved cue grown into linguistic_cues (category={_cat}, occ={occ})", rid),
+                )
+            db_conn.commit()
+            stats["grown"] += 1
+            log.info(f"re_embedder.cue_grown schema={schema_name} category={_cat} "
+                     f"cue={_cue} occ={occ}")
+        except Exception as e:  # noqa: BLE001 — per-candidate isolation
+            stats["errors"] += 1
+            try:
+                db_conn.rollback()
+                if schema_name:
+                    with db_conn.cursor() as _r:
+                        _r.execute(f"SET search_path TO {schema_name}")
+            except Exception:  # noqa: BLE001
+                pass
+            log.warning(f"re_embedder.cue_growth_error schema={schema_name} "
+                        f"category={_cat} cue={_cue}: {str(e)[:140]}")
 
     return stats
 
@@ -7259,6 +7430,24 @@ def main():
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.ontology_candidate_decay_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+
+                            # ── CARVED cue-class growth (social_role / problem_noun, per-user schema) ──
+                            # Grow the DOMAIN-FLAVORED cue classes that were carved out of the seed from
+                            # freq-gated observed candidates (≥3) into <tenant>.linguistic_cues. Marks the
+                            # schema changed so its linguistic_cue overlay is invalidated and the next turn
+                            # routes the grown construction correctly. Self-isolating (failure never
+                            # crashes the tenant sweep). Per-tenant only (search_path already = _schema).
+                            try:
+                                _cue_grow = grow_linguistic_cue_candidates(_ont_db, schema_name=_schema)
+                                if _cue_grow.get("grown", 0) > 0:
+                                    log.info(
+                                        f"re_embedder.cue_class_growth schema={_schema} "
+                                        f"grown={_cue_grow['grown']} errors={_cue_grow['errors']}"
+                                    )
+                                    _changed_schemas.add(_schema)
+                            except Exception as e:
+                                _rollback_and_reapply_search_path(_ont_db, _schema)
+                                log.error(f"re_embedder.cue_class_growth_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
                             # ── Correction-signal growth + firing promotion (per-user schema) ──
                             # MUST run here on the per-tenant _ont_db (search_path = _schema),
