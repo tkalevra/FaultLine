@@ -162,26 +162,19 @@ _BOOTSTRAP_POSSESSION_VERBS: frozenset[str] = frozenset({
     "have", "own", "possess", "keep", "hold",
 })
 
-# ── BOOTSTRAP PROBLEM-NOUN (bland eventive head) set — DB-DOWN SAFETY NET ONLY ───────
-# The bounded LEXICAL class of SEMANTICALLY-EMPTY PROBLEM / FAULT eventive heads — the bland nouns
-# that head an LVC "I had an <issue/problem/trouble> with X" construction where the MEANING lives in
-# the with-PP affected entity ("X"), not the empty head. Recognizing the head as a problem_noun (AND
-# a with-PP affected entity being present) lets the deriver emit a competing `(<affected>, has_state,
-# <problem-state>)` candidate — the affected entity's PROBLEM as a typed reusable state node (the
-# structural twin of `feels`). ⚠️ FLAGGED BOUNDED CLASS (the GPS / Stage-3 brief): the problem reading
-# cannot be made purely structural — "had an issue with X" and "had a meeting with X" share the SAME
-# dep shape (light-verb → dobj NOUN → with-PP); only the HEAD NOUN's lexical semantics distinguishes a
-# problem/fault state from a neutral occurrence. So a small bounded NOUN class is unavoidable here,
-# EXACTLY as for the naming / LVC / inchoative / aspectual / acquisition classes. It is firewalled
-# downstream by the parse the SAME way: the state reading fires ONLY when the head is in THIS class AND
-# a with-PP supplies the affected entity — a non-problem "have + with-PP" ("had a meeting with Taylor",
-# "had lunch with Tom", "had a call with the team") is UNTOUCHED (head ∉ problem_noun). DB-HELD + per-
-# tenant + GROWABLE on the SAME rail (category='problem_noun'); this in-code set is the DB-DOWN code-
-# fallback seed only, NOT the authority. Mirrors migration 116's public seed.
-_BOOTSTRAP_PROBLEM_NOUNS: frozenset[str] = frozenset({
-    "issue", "problem", "trouble", "fault", "difficulty",
-    "glitch", "bug", "error", "concern",
-})
+# ── PROBLEM-NOUN (bland eventive head) class — CARVED (grown per-tenant, NOT seeded) ──
+# CARVE-OUT (lean-seed): problem_noun is a DOMAIN-FLAVORED class (issue/glitch/bug/error vary by
+# domain), NOT a grammar/unit primitive — so it is NO LONGER SEEDED. It is GROWN PER-TENANT from the
+# OBSERVED construction (a 1st-person LVC "I had a <bland-head> with <non-person thing>" whose head is
+# not yet known) via the ``linguistic_cue_candidate`` queue → re_embedder freq-gate (≥3) →
+# ``<tenant>.linguistic_cues`` (category='problem_noun'). The DB-DOWN code-fallback is now EMPTY (no
+# in-code word zoo): a cold tenant resolves to the empty set and the construction DEGRADES safely (the
+# affected entity stays walkable via its other chains; the bland head's participated_in lands in the
+# Class-C short-term lane — captured-not-dropped), while the head is queued for growth. The discriminator
+# is therefore GROWN per-tenant, never enumerated in code. (The grammar/unit cue classes — naming /
+# lvc_support / inchoative / aspectual / acquisition / possession / svo_particle / kinship / unit_scalar
+# — REMAIN seeded; only the three domain-flavored classes were carved.)
+_BOOTSTRAP_PROBLEM_NOUNS: frozenset[str] = frozenset()
 
 # ── BOOTSTRAP load-bearing SVO particle set — DB-DOWN SAFETY NET ONLY ────────────────
 # The closed grammatical class of particles/prepositions that are LOAD-BEARING on a verb (they change
@@ -240,7 +233,7 @@ _BOOTSTRAP_RELATIONAL_NOUNS: frozenset[str] = frozenset({
 # code-fallback seed only — the EXACT contents of the retired in-code `_KINSHIP_RELATIONAL_NOUNS`.
 _BOOTSTRAP_KINSHIP_NOUNS: frozenset[str] = frozenset({
     "mother", "father", "mom", "dad", "parent", "sister", "brother", "sibling",
-    "son", "daughter", "child", "wife", "husband", "spouse", "partner",
+    "son", "daughter", "child", "kid", "wife", "husband", "spouse", "partner",
     "uncle", "aunt", "cousin", "grandmother", "grandfather", "grandma", "grandpa",
 })
 
@@ -256,7 +249,7 @@ _BOOTSTRAP_KINSHIP_REL_MAP: dict[str, str] = {
     "mother": "parent_of", "father": "parent_of", "mom": "parent_of",
     "dad": "parent_of", "parent": "parent_of",
     "sister": "sibling_of", "brother": "sibling_of", "sibling": "sibling_of",
-    "son": "child_of", "daughter": "child_of", "child": "child_of",
+    "son": "child_of", "daughter": "child_of", "child": "child_of", "kid": "child_of",
     "wife": "spouse", "husband": "spouse", "spouse": "spouse", "partner": "spouse",
     "uncle": "related_to", "aunt": "related_to", "cousin": "related_to",
     "grandmother": "related_to", "grandfather": "related_to",
@@ -284,23 +277,18 @@ _BOOTSTRAP_KINSHIP_GENDER_MAP: dict[str, str] = {
     "grandma": "female", "grandpa": "male",
 }
 
-# ── BOOTSTRAP SOCIAL-ROLE-NOUN → REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ──────────────
-# A MAP (social-relational PERSON-role noun lemma → the social rel_type it carries toward the
-# possessor/speaker) for the named-instance binding chain. "a friend Sam" / "my friend is Sam" →
-# friend → (sam, friend_of, user); "my colleague Sam" → knows. This is the PERSON-relational
-# counterpart of kinship: a role that links two PEOPLE socially (NOT kinship, NOT a possession). It is
-# a DISTINCT category ('social_role') so a person introduced by a social role binds to a social rel
-# (friend_of / knows) rather than the generic ``has_role`` slot or — worse — ``owns`` (a person is
-# never owned). A role OUTSIDE this map falls to ``has_role`` (a generic role slot the walk resolves),
-# never a fabricated social tie. Stored on the SAME (cue, category) rail: `cue` = the role noun,
-# `description` = the rel_type. DB-DOWN code-fallback seed only — mirrors migration 117's public seed.
-_BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {
-    "friend": "friend_of",
-    "colleague": "knows", "coworker": "knows", "co-worker": "knows",
-    "neighbour": "knows", "neighbor": "knows",
-    "acquaintance": "knows", "classmate": "knows", "roommate": "knows",
-    "boss": "knows", "manager": "knows",
-}
+# ── SOCIAL-ROLE-NOUN → REL_TYPE MAP — CARVED (grown per-tenant, NOT seeded) ──────────
+# CARVE-OUT (lean-seed): social_role is a DOMAIN-FLAVORED class (boss/colleague/roommate/classmate
+# vary by domain), NOT a grammar primitive — so it is NO LONGER SEEDED. It is GROWN PER-TENANT from the
+# OBSERVED construction: a possessed/apposed COMMON-noun role head governing a PERSON-typed named
+# instance ("my colleague Sam", "a roommate named Dana") that is NEITHER kinship NOR an already-grown
+# social role → the role noun is queued (``linguistic_cue_candidate`` → re_embedder freq-gate ≥3 →
+# ``<tenant>.linguistic_cues`` category='social_role', grown rel_type = the generic person tie ``knows``).
+# The DB-DOWN code-fallback is now EMPTY (no boss/colleague word zoo). On a COLD tenant the named-
+# instance chain DEGRADES the person to the generic walkable ``related_to(name, user)`` (a PERSON is
+# never ``owns``) and queues the role — NEVER dropped, NEVER an error. The specific tie (friend_of)
+# is not auto-distinguished on growth (generic ``knows`` is the safe grown default; user-correctable).
+_BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {}
 
 # ── BOOTSTRAP MEASUREMENT-UNIT → SCALAR REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ───────
 # A MAP (measurement-unit head lemma → the SCALAR rel_type it measures) for the copula measurement
@@ -317,22 +305,17 @@ _BOOTSTRAP_UNIT_SCALAR_MAP: dict[str, str] = {
     "pound": "weight", "lb": "weight", "kilogram": "weight", "kg": "weight", "kilo": "weight",
 }
 
-# ── BOOTSTRAP THIN-TYPE MAP — DB-DOWN SAFETY NET ONLY ────────────────────────────────
-# A MAP (surface head lemma → coarse one-step "thin" slot-type tag), NOT a set: a few high-signal
-# device/system compound heads collapse to their immediate kind ("gps system"/"system" → "device").
-# This is ONLY a slot tag the deriver stamps — GLiNER2 supplies real typing and WINS over it
-# (`_thin_type_label_for_object`, monotonic-forward authority). Modeled on the SAME (cue, category)
-# rail by storing the SURFACE in `cue` and the TARGET TYPE in `description`, so the keyed value rides
-# the existing table without a new schema; `resolve_thin_type()` returns the {surface: type} dict.
-# This in-code map is the DB-DOWN code-fallback seed only — the EXACT contents of the retired in-code
-# `_thin_type_for_token` dict.
-_BOOTSTRAP_THIN_TYPE_MAP: dict[str, str] = {
-    "system": "device",
-    "device": "device",
-    "gadget": "device",
-    "appliance": "device",
-    "machine": "device",
-}
+# ── THIN-TYPE MAP — CARVED (NOT seeded; degrade is LOSSLESS, active growth DEFERRED) ──
+# CARVE-OUT (lean-seed): thin_type is a DOMAIN-FLAVORED device/system synonym MAP (device/gadget/
+# appliance/machine → device), NOT a grammar/unit primitive — so it is NO LONGER SEEDED and the
+# DB-DOWN code-fallback is now EMPTY. thin_type is ONLY a coarse slot-type FALLBACK that GLiNER2's
+# live typing already WINS over, so an empty map is LOSSLESS: a cold tenant simply uses GLiNER2's
+# type (or the generic Object), nothing is dropped. ACTIVE GROWTH IS DEFERRED (honest residual): the
+# only candidate signal — "GLiNER2 typed this head as X" — is circular (GLiNER2 already supplies that
+# type live), so a freq-gated grow would just re-cache what GLiNER2 says with no new capability. The
+# carve removes the seeded device vocabulary (the brief's core ask); growth is left as a no-op until a
+# non-circular signal exists.
+_BOOTSTRAP_THIN_TYPE_MAP: dict[str, str] = {}
 
 # Cue CATEGORIES this module resolves. The table is general by category so every verb/particle cue
 # class rides the SAME rail (one table, one overlay) without a new module.
@@ -773,6 +756,56 @@ def resolve_social_role_map(dsn: str) -> dict[str, str]:
     driven; a role OUTSIDE the map falls to a generic role slot (never a fabricated social tie). Same
     contract as resolve_kinship_gender_map. Fail-safe: bootstrap floor (`_BOOTSTRAP_SOCIAL_ROLE_MAP`)."""
     return _resolve_keyed_map(dsn, SOCIAL_ROLE_CATEGORY, _BOOTSTRAP_SOCIAL_ROLE_MAP)
+
+
+# ── CARVED-CLASS GROWTH ACCUMULATOR (request-scoped cue-candidate side-channel) ──────
+# When a consumer of a CARVED cue class (social_role / problem_noun) sees the class's construction but
+# the cue is NOT yet grown for this tenant, it DEGRADES to a generic walkable rel AND records the cue
+# as a growth CANDIDATE here. The deriver/consumer cannot write to the DB itself (it is pure / has no
+# connection), so candidates accumulate on a REQUEST-SCOPED ContextVar; the ingest/harvest seam drains
+# them once (``drain_cue_candidates``) and writes them to ``<tenant>.ontology_evaluations`` (the SAME
+# growth queue the rel_type / concept paths reuse, marked extraction_method='linguistic_cue_candidate'
+# so the rel-type evaluator's firewall skips them). The re_embedder freq-gates (≥3) and grows them into
+# ``<tenant>.linguistic_cues``. ContextVar (not a global list) so candidates never leak across requests
+# or tenants. Bounded (a cap) so a non-draining caller can never grow it unboundedly.
+import contextvars  # noqa: E402 — local to this growth seam
+
+_cue_candidates: "contextvars.ContextVar[list]" = contextvars.ContextVar(
+    "_linguistic_cue_candidates", default=None)
+_CUE_CANDIDATE_CAP = 64
+
+
+def record_cue_candidate(cue: str, category: str) -> None:
+    """Record a CARVED-CLASS growth candidate (cue lemma, category) for the current request. Fail-safe:
+    never raises (a growth-signal miss must never break extraction). De-dups within the request and is
+    bounded by ``_CUE_CANDIDATE_CAP`` so a non-draining caller cannot accumulate unboundedly."""
+    try:
+        cue = (cue or "").strip().lower()
+        category = (category or "").strip().lower()
+        if not cue or not category:
+            return
+        lst = _cue_candidates.get()
+        if lst is None:
+            lst = []
+            _cue_candidates.set(lst)
+        if len(lst) >= _CUE_CANDIDATE_CAP:
+            return
+        pair = (cue, category)
+        if pair not in lst:
+            lst.append(pair)
+    except Exception:  # noqa: BLE001 — fail-safe
+        return
+
+
+def drain_cue_candidates() -> list:
+    """Return and CLEAR the request's accumulated cue candidates (list of (cue, category) tuples).
+    Fail-safe → empty list. The caller writes them to the per-tenant growth queue."""
+    try:
+        lst = _cue_candidates.get()
+        _cue_candidates.set(None)
+        return list(lst) if lst else []
+    except Exception:  # noqa: BLE001 — fail-safe
+        return []
 
 
 def invalidate(schema_name=None) -> None:

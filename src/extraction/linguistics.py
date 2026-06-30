@@ -104,12 +104,39 @@ TEMPORAL_DATE_LAYER: bool = os.environ.get(
 #     possession shape lives at the caller, mirroring _detect_named_instance_states).
 #   • Part 2 (this module): the copula-appositive / genitive ROLE↔NAME collapse chains
 #     (``_chain_copula_name``; the role-alias leg of ``_chain_genitive_name``) — so "My sister is
-#     Taylor" / "My mother's name is Robin" bind the kin rel to the NAMED person and register the ROLE
+#     Sarah" / "My mother's name is Diane" bind the kin rel to the NAMED person and register the ROLE
 #     (sister/mother) as an alias/role-slot of that person, never a parallel role entity.
 # DEFAULT OFF so the commit is dormant and the temporal first-10 path is byte-for-byte unchanged
 # until validated ON. Fail-safe: flag OFF or any failure → today's behavior exactly.
 SPINE_NAMING_CHAIN: bool = os.environ.get(
     "SPINE_NAMING_CHAIN", "false"
+).strip().lower() in ("1", "true", "yes")
+
+# COLLECTIVE MEMBER-LIST reconciliation (default ON). A "<subj> <verb> [<count>] <HEAD>: M1, M2, …"
+# enumeration ("we have three kids: Mia, Theo, Leo", "my team has three engineers: Sarah, Tom,
+# Priya", "we run three servers: Apollo, Vault, Echo") was mangled by the generic chains: the collective
+# HEAD became a type the members were ``instance_of`` / the user ``owns``, only the FIRST member got
+# typed, and members lost their proper membership/kinship edge. This post-chain pass reconciles the
+# construction deterministically: route by the HEAD noun's resolved cue/type (kinship head → the kin
+# rel + direction + intrinsic gender; non-kin group head → instance_of the SINGULAR type + the
+# membership/activity relation to the governor), distributing to EVERY member and dropping the junk.
+# OFF → byte-identical to today's chain output. Subject-agnostic, cue/morphology/parse-driven.
+COLLECTIVE_MEMBER_LIST: bool = os.environ.get(
+    "COLLECTIVE_MEMBER_LIST", "true"
+).strip().lower() in ("1", "true", "yes")
+
+# DETERMINISTIC ENUMERATION PRE-SPLIT (the atomizer reliability net). The LLM atomizer's split of a
+# colon-introduced named list ("My team has three engineers: Sarah who is 35, Tom who is a backend
+# dev, and a designer named Priya") VARIES run-to-run — sometimes it folds "a designer named Priya"
+# back into the membership line (so the downstream collective walk, which only routes BARE PROPN
+# conjuncts, silently drops Priya's member_of), sometimes it drops a per-member attribute, and on a
+# REFRAME timeout the whole dense sentence flows un-split (cross-member smear). ``split_enumeration``
+# normalizes the structurally-obvious colon list DETERMINISTICALLY so the spine sees the SAME clean
+# atom set every time, regardless of LLM variance. Subject-agnostic, structural (colon + comma/"and"
+# split + the relative-pronoun grammatical class + the structural "<np> <acl-verb> <PROPN>" naming
+# shape); fabrication-safe (every emitted atom's content tokens ⊆ source). OFF → today's behavior.
+ENUM_PRESPLIT: bool = os.environ.get(
+    "ENUM_PRESPLIT", "true"
 ).strip().lower() in ("1", "true", "yes")
 
 # Universal POS tags that mark a token as a FUNCTION word (grammar, not a relation). This is the
@@ -424,6 +451,74 @@ def analyze_copula(text: str):
     return None
 
 
+def analyze_copula_affect_complements(text: str) -> list[str]:
+    r"""Enumerate ALL coordinated affective complements of a 1st-person copula.
+
+    "I was busy, overwhelmed, underappreciated, and exhausted." predicates FOUR affective states of
+    the speaker, but ``analyze_copula`` returns only the FIRST complement ("busy"), so the tail
+    states drop. This walks the COORDINATION off the head complement and returns every coordinated
+    complement surface, lowercased, in source order — one ``feels`` edge each at the caller.
+
+    THE RULE (subject-agnostic, dependency-driven — NO emotion word list):
+      • The clause is a copula ``be`` with a 1st-person personal-pronoun subject (``subject_is_self``)
+        and the HEAD complement is an ``acomp`` ADJECTIVE (the affective first-cut → ``feels``).
+      • Collect the head complement + its coordinated ``conj`` descendants whose POS is ADJ or whose
+        tag is a PAST PARTICIPLE (VBN) — a predicate participle ("overwhelmed"/"exhausted") is an
+        affective complement coordinated with the ADJ head, NOT an action. A present participle (VBG,
+        ongoing action) and any other POS are excluded.
+      • A conjunct carrying its OWN ``neg`` ("…but not exhausted") is skipped (negation deferred).
+    Returns ``[]`` when there is no first-person affective copula (the caller then has nothing to add).
+    Fail-safe → ``[]``."""
+    doc = _parse(text)
+    if doc is None:
+        return []
+    try:
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            if not _is_first_person_personal_pronoun(tok):
+                continue
+            head = tok.head
+            comp = None
+            if head.lemma_ == "be" and head.pos_ == "AUX":
+                for child in head.children:
+                    if child.dep_ == "acomp" and child.pos_ == "ADJ":
+                        comp = child
+                        break
+            if comp is None:
+                continue
+            if any(c.dep_ == "neg" for c in head.children):
+                continue  # whole-clause negation → deferred
+            # Walk the conj coordination off the ADJ head, collecting ADJ + VBN predicate complements.
+            out: list[str] = []
+            seen: set = set()
+            frontier = [comp]
+            visited = {comp.i}
+            members = [comp]
+            while frontier:
+                nxt = []
+                for t in frontier:
+                    for c in t.children:
+                        if c.dep_ == "conj" and c.i not in visited and (
+                                c.pos_ == "ADJ" or c.tag_ == "VBN"):
+                            visited.add(c.i)
+                            members.append(c)
+                            nxt.append(c)
+                frontier = nxt
+            for m in sorted(members, key=lambda t: t.i):
+                if any(ch.dep_ == "neg" for ch in m.children):
+                    continue  # this conjunct is negated → skip
+                surf = (m.text or m.lemma_ or "").strip().lower()
+                if surf and surf not in seen:
+                    seen.add(surf)
+                    out.append(surf)
+            return out
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        log.warning("linguistics.analyze_copula_affect_complements_failed", error=str(e)[:160])
+        return []
+    return []
+
+
 @dataclass(frozen=True)
 class PossessivePredication:
     """A deterministic reading of a 1st-person possessive predication ("my favorite color is blue").
@@ -526,7 +621,7 @@ def analyze_possessive_predication(text: str):
 
 
 # ── NAMING ANALYSIS — the "<noun> named/called <ProperName>" construction ──────────
-# THE WHY (RC2): "I have a dog named Rex" / "a server called Atlas" / "my dog is named
+# THE WHY (RC2): "I have a dog named Rex" / "a server called Apollo" / "my dog is named
 # Rex" must mint a VALID naming edge binding the PROPER NAME to the HEAD NOUN being named
 # (dog/server), NOT to the user. On the live harvest path the verb-lift over-strips "named" →
 # "nam" and mints junk ``(noun, nam, ProperName)``; this seam OWNS the naming construction so the
@@ -575,7 +670,7 @@ class NamingAnalysis:
     - ``named``       : the HEAD NOUN being named, lowercased ("dog", "server", "cat") — its
                         head plus left ``compound``/``amod`` modifiers ("file server"). NEVER the
                         speaker; the name binds to the THING named.
-    - ``proper_name`` : the proper name assigned, surface form ("Rex", "Atlas").
+    - ``proper_name`` : the proper name assigned, surface form ("Rex", "Apollo").
     - ``negated``     : True when a ``neg`` dependency hangs off the naming verb ("not named X").
     """
     named: str
@@ -601,7 +696,16 @@ def _np_conjuncts(head_tok) -> list:
     peppers, and cucumbers" the parse is tomatoes →conj peppers →conj cucumbers (or all three hang
     off the head). We walk the ``conj`` subtree from the head and collect every coordinated NOUN/PROPN
     token. Returns the token list in source order (head first). A non-coordinated head returns just
-    ``[head_tok]``. Structural only — NO list/word enumeration."""
+    ``[head_tok]``. Structural only — NO list/word enumeration.
+
+    PROPER-NOUN LIST QUIRK (appos chaining): spaCy is INCONSISTENT about how it chains a
+    comma-separated list of BARE PROPER NAMES. "Mia, Theo, and Leo" parses as a clean conj
+    chain (Mia →conj Theo →conj Leo), but "Apollo, Vault, and Echo" parses the middle
+    member as ``appos`` (Apollo →appos Vault →conj Echo) — so a pure-conj walk DROPS the tail
+    ("Vault"/"Echo"). We therefore ALSO follow an ``appos`` edge, but ONLY when BOTH endpoints are
+    PROPN (the proper-noun-list signature): an apposition RENAME ("my friend Sam", "the president, a
+    leader") has a common-NOUN endpoint and is left untouched, so no rename is mis-distributed.
+    Subject-agnostic, structural (PROPN↔PROPN appos), NO list/word enumeration."""
     out = [head_tok]
     seen = {head_tok.i}
     frontier = [head_tok]
@@ -609,12 +713,56 @@ def _np_conjuncts(head_tok) -> list:
         nxt = []
         for t in frontier:
             for c in t.children:
-                if c.dep_ == "conj" and c.pos_ in ("NOUN", "PROPN") and c.i not in seen:
+                if c.i in seen or c.pos_ not in ("NOUN", "PROPN"):
+                    continue
+                # conj is always a coordinated sibling. appos is a coordinated list member ONLY for the
+                # PROPN↔PROPN proper-noun-list quirk above (never a common-noun apposition rename).
+                _is_member = c.dep_ == "conj" or (
+                    c.dep_ == "appos" and c.pos_ == "PROPN" and t.pos_ == "PROPN")
+                if _is_member:
                     seen.add(c.i)
                     out.append(c)
                     nxt.append(c)
         frontier = nxt
     return sorted(out, key=lambda t: t.i)
+
+
+def _is_relative_pronoun(tok) -> bool:
+    """True for a RELATIVE pronoun heading a relative clause ("the brother WHO lives…", "the car
+    THAT runs…", "WHOSE"). Grammatical/morphological: the wh-pronoun tags WP / WP$ / WDT whose
+    syntactic head is a ``relcl``/``acl`` clause. A DEMONSTRATIVE "that"/"this" is tagged DT (not
+    WDT) so it is excluded; an INTERROGATIVE wh-word ("who runs?") heads no relcl so it is excluded
+    here (and the question is already dropped upstream). Subject-agnostic, NO word list. Fail-safe →
+    False."""
+    try:
+        if tok is None or tok.tag_ not in ("WP", "WP$", "WDT"):
+            return False
+        return tok.head is not None and tok.head.dep_ in ("relcl", "acl")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _relative_pronoun_antecedent(tok) -> str | None:
+    """Resolve a relative pronoun to the surface of the NOUN it stands for — its antecedent. spaCy
+    parses "<antecedent> who/that <relcl-verb> …" as wh →head→ relcl-verb →head→ antecedent-noun, so
+    the antecedent is the relcl verb's head. Returns the lowercased antecedent surface ("user" for a
+    first-person antecedent), or ``None`` when no antecedent resolves (the caller then DROPS the edge
+    rather than bind the pronoun as an entity — THE HARD LINE: a function-word is never a memory).
+    Structural, subject-agnostic, fail-safe → None."""
+    try:
+        if not _is_relative_pronoun(tok):
+            return None
+        ante = tok.head.head  # relcl-verb → its head noun = the antecedent
+        if ante is None or ante is tok:
+            return None
+        if _is_first_person_personal_pronoun(ante):
+            return "user"
+        if ante.pos_ not in ("NOUN", "PROPN", "PRON"):
+            return None
+        surf = (ante.text or ante.lemma_ or "").strip().lower()
+        return surf or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def list_conjuncts(text: str, head_phrase: str) -> list:
@@ -668,13 +816,136 @@ def list_conjuncts(text: str, head_phrase: str) -> list:
         return []
 
 
+# Closed grammatical class of English RELATIVE pronouns (a LANGUAGE PRIMITIVE, not a domain word
+# list — the same closed class the function-word guardrail already recognizes). Used ONLY to locate
+# the relative-clause boundary inside a single enumeration ITEM ("Sarah who is 35" → name="Sarah",
+# predicate="is 35"); spaCy tags the in-clause relative pronoun inconsistently (nsubj vs relcl-head),
+# so a robust split keys on the relative-pronoun token itself, corroborated by the surrounding parse.
+_REL_PRONOUNS: frozenset[str] = frozenset({"who", "whom", "which", "that", "whose"})
+
+
+def _enum_content_tokens(s: str) -> set[str]:
+    """Lowercased alphanumeric tokens of ``s`` for the enumeration fabrication guard (no deps)."""
+    return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+
+def split_enumeration(sentence: str):
+    r"""Deterministically split a COLON-INTRODUCED named-entity enumeration into a clean atom set.
+
+    THE RELIABILITY NET for the LLM atomizer (see the ``ENUM_PRESPLIT`` flag note). Given a sentence
+    of the shape ``<prefix>: <item>, <item>, and <item>`` whose items NAME entities, returns:
+
+        [ "<prefix>: <Name1>, <Name2>, and <Name3>."           # membership (BARE proper names only)
+        , "<Name> is <attribute>." , ... ]                      # one per item that carries an attribute
+
+    so the downstream collective walk routes EVERY member (it only distributes membership/kinship over
+    BARE PROPN conjuncts) and each per-member attribute lands on its own clean copula clause. Returns
+    ``None`` (fail-safe → caller keeps the LLM atom / raw sentence) when the sentence is not such an
+    enumeration, when any item yields no proper NAME, or when the fabrication guard trips.
+
+    Item shapes recognized (subject-agnostic, structural — NO domain/role/type word list):
+      • RELATIVE clause  "Sarah who is 35"          → name="Sarah",  atom="Sarah is 35."
+                         "Tom who is a backend dev" → name="Tom",    atom="Tom is a backend dev."
+      • NAMING apposite  "a designer named Priya"   → name="Priya",  atom="Priya is a designer."
+        (structural: a ``acl`` VERB with a PROPN ``oprd``/``attr``/``dobj`` child — the reduced
+         "named/called <Name>" relative — NOT a verb word list)
+      • BARE proper name "Leo"                    → name="Leo",  (no attribute atom)
+
+    FABRICATION-SAFE ("USER IS TRUTH"): every emitted atom's content tokens must be a subset of the
+    SOURCE sentence's content tokens (the copula "is" is the only inserted function word) — any
+    introduced token aborts the whole split (return ``None``). The split only RE-SEGMENTS text that is
+    actually present; it never invents a name, number, or type. Deterministic; spaCy-only; no LLM.
+    """
+    if not ENUM_PRESPLIT:
+        return None
+    s = (sentence or "").strip().rstrip(".").strip()
+    if ":" not in s:
+        return None
+    prefix, rest = s.split(":", 1)
+    prefix = prefix.strip()
+    rest = rest.strip()
+    if not prefix or not rest:
+        return None
+    # Split the post-colon region into items on commas, strip a leading coordinator ("and"/"or"),
+    # then split a remaining no-comma two-item "X and Y". Structural punctuation only.
+    items = [re.sub(r"^(?:and|or)\s+", "", x.strip(), flags=re.I).strip()
+             for x in re.split(r",\s*", rest) if x.strip()]
+    items = [it for it in items if it]
+    if len(items) == 1:
+        parts = re.split(r"\s+(?:and|or)\s+", items[0], flags=re.I)
+        if len(parts) > 1:
+            items = [p.strip() for p in parts if p.strip()]
+    if len(items) < 2:
+        return None
+    try:
+        names: list[str] = []
+        per_item: list[str] = []
+        for it in items:
+            d = _parse(it)
+            if d is None:
+                return None
+            name = None
+            atom = None
+            # (1) NAMING apposite: a reduced "named/called <PROPN>" relative — structural ``acl`` VERB
+            #     with a PROPN oprd/attr/dobj child. The modified noun phrase (everything before the
+            #     acl verb) is the TYPE; the PROPN is the NAME.
+            nv = next((t for t in d
+                       if t.dep_ == "acl" and t.pos_ == "VERB"
+                       and any(c.dep_ in ("oprd", "attr", "dobj") and c.pos_ == "PROPN"
+                               for c in t.children)), None)
+            if nv is not None:
+                pr = next(c for c in nv.children
+                          if c.dep_ in ("oprd", "attr", "dobj") and c.pos_ == "PROPN")
+                name = pr.text
+                typ = " ".join(w.text for w in d if w.i < nv.i).strip()
+                if typ:
+                    atom = f"{name} is {typ}."
+            # (2) RELATIVE clause: a relative pronoun splits NAME (before) from PREDICATE (after).
+            if name is None:
+                rp = next((t for t in d if t.text.lower() in _REL_PRONOUNS), None)
+                if rp is not None and rp.i > 0:
+                    _nm = " ".join(w.text for w in d if w.i < rp.i).strip()
+                    _pred = " ".join(w.text for w in d if w.i > rp.i).strip()
+                    if _nm and _pred:
+                        name = _nm
+                        atom = f"{_nm} {_pred}."
+            # (3) BARE proper name (no attribute).
+            if name is None:
+                props = [t for t in d if t.pos_ == "PROPN"]
+                if props:
+                    name = " ".join(t.text for t in props)
+            if not name:
+                return None  # an item with no proper NAME → not a named-entity enumeration → bail
+            names.append(name.strip())
+            if atom:
+                per_item.append(atom)
+        if len(names) < 2:
+            return None
+        if len(names) == 2:
+            member_list = f"{names[0]} and {names[1]}"
+        else:
+            member_list = ", ".join(names[:-1]) + ", and " + names[-1]
+        atoms = [f"{prefix}: {member_list}."] + per_item
+        # FABRICATION GUARD: every emitted atom's content tokens ⊆ source (copula "is" excepted).
+        src = _enum_content_tokens(sentence) | {"is"}
+        for a in atoms:
+            if not _enum_content_tokens(a) <= src:
+                log.warning("linguistics.split_enumeration_fabrication_guard",
+                            atom_preview=a[:80])
+                return None
+        return atoms
+    except Exception as e:  # noqa: BLE001 — fail-safe: any failure → no pre-split (caller keeps LLM)
+        log.warning("linguistics.split_enumeration_failed", error=str(e)[:160])
+        return None
+
+
 def analyze_naming_all(text: str) -> list:
     r"""Deterministic reading of EVERY naming/dubbing construction in ``text``. Returns a list of
     ``NamingAnalysis`` (possibly empty) — the multi-construction sibling of ``analyze_naming``.
 
-    A comma-and enumeration ("I have a dog named Rex, a snake named Noodle, and a cat named
-    Biscuit") contains ONE naming verb ("named"/"called") per conjunct, each modifying its OWN head
-    noun. The single-result ``analyze_naming`` returned only the FIRST, dropping Noodle/Biscuit. This
+    A comma-and enumeration ("I have a dog named Rex, a snake named Sophia, and a cat named
+    Goose") contains ONE naming verb ("named"/"called") per conjunct, each modifying its OWN head
+    noun. The single-result ``analyze_naming`` returned only the FIRST, dropping Sophia/Goose. This
     walks the SAME per-verb grammar (identical recovery rules), collecting one (head-noun, proper-
     name) pair for every naming verb that yields a valid pair. Subject-agnostic — the KIND is whatever
     common noun the verb modifies; this function makes NO entity-typing or rel-type decision.
@@ -763,7 +1034,7 @@ def analyze_naming(text: str):
 
         "I have a dog named Rex"  → "named" is an ``acl``/``vfin`` modifying the NOUN "dog";
                                         "Rex" is its ``oprd``/``attr``/``dobj`` child (PROPN).
-        "a server called Atlas"      → same reduced-relative shape on "server".
+        "a server called Apollo"      → same reduced-relative shape on "server".
         "my dog is named Rex"     → "named" is the ROOT (passive: ``nsubjpass`` "dog",
                                         ``auxpass`` "is"); "Rex" is the ``oprd``/``attr``.
 
@@ -956,7 +1227,7 @@ def analyze_named_instance(text: str):
 
 # ── UNIFIED NAME↔TYPE BINDING — the ONE connector-agnostic named-instance detector ────────────────
 # THE WHY (the THIRD named-instance wall): "a dog named Rex", "a son Alex 19", "my friend Sam",
-# "a server Atlas", "my friend is Sam" are ONE thing — a PROPER NAME is introduced and classified
+# "a server Apollo", "my friend is Sam" are ONE thing — a PROPER NAME is introduced and classified
 # as a common-noun TYPE. ONLY the CONNECTOR varies (the naming verb "named", bare apposition, the
 # copula "is"). Extraction had grown CHAIN-PER-CONSTRUCTION: ``analyze_naming`` keyed on the verb
 # "named"; the appositive/copula forms fell through to garbage (an enumeration "a son Alex, a daughter
@@ -1124,7 +1395,7 @@ def _bound_name_for_type(type_tok, _naming):
     #     friend"/"my sister" — a user-anchored role, the same gate _chain_copula_name uses) AND (b)
     #     the complement is NOT determiner-introduced (a det → "is a poodle" is a TYPE, owned
     #     elsewhere). A bare PROPN complement is always accepted. This never over-captures "the printer
-    #     is Atlas"-style non-possessed subjects (no 1st-person poss → NOUN complement rejected).
+    #     is Apollo"-style non-possessed subjects (no 1st-person poss → NOUN complement rejected).
     if type_tok.dep_ in ("nsubj", "nsubjpass"):
         head = type_tok.head
         if head is not None and head.lemma_ == "be" and head.pos_ == "AUX":
@@ -1570,7 +1841,7 @@ def _aspectual_activity_xcomp(verb_tok):
         activity-on-a-thing, so it is rejected here (and the matrix would in any case carry an
         infinitival ``to`` → ``_verb_has_clausal_complement``); AND
       • the matrix lemma is NOT a CATENATIVE / MENTAL-STATE verb (``predicate_span._CATENATIVE`` /
-        ``_MENTAL_STATE``) — intent/opinion/cognition verbs ("I considered hiring Taylor", "I like
+        ``_MENTAL_STATE``) — intent/opinion/cognition verbs ("I considered hiring Sarah", "I like
         working with Rachel") take an ``-ing`` complement too but predicate an UNREALIZED desire /
         habitual preference, NOT a stated occurrence; reusing those existing closed sets is the
         belt-and-suspenders INTENT firewall ("user is truth": an intention is not a thing the user did).
@@ -1833,16 +2104,14 @@ def _lvc_support_verbs() -> frozenset[str]:
         return _LVC_SUPPORT_VERB_LEMMAS
 
 
-# DB-HELD + per-tenant + GROWABLE (linguistic_cue_overlay, category='problem_noun'). The frozenset below
-# is the in-code DB-DOWN CODE-FALLBACK seed only: `_problem_nouns()` resolves the live set from
-# `<tenant>.linguistic_cues` (seed-copied ∪ grown) via the SAME per-tenant overlay the LVC/naming/
-# temporal layers use, and falls back to THIS frozenset only when the overlay is unavailable/unbound.
-# Membership checks call `_problem_nouns()`, NOT this frozenset directly. This is a bounded LEXICAL
-# class of SEMANTICALLY-EMPTY problem/fault HEADS — corroborated downstream by the parse (a with-PP
-# affected entity must be present), NOT a domain word-list; a non-problem head never reaches the lane.
-_PROBLEM_NOUN_LEMMAS: frozenset[str] = frozenset(
-    {"issue", "problem", "trouble", "fault", "difficulty", "glitch", "bug", "error", "concern"}
-)
+# CARVED CLASS (lean-seed): problem_noun is DOMAIN-FLAVORED (issue/glitch/bug vary by domain), so it is
+# NO LONGER SEEDED and the in-code fallback is EMPTY — the discriminator is GROWN PER-TENANT, never
+# enumerated in code. `_problem_nouns()` resolves the live set from `<tenant>.linguistic_cues`
+# (category='problem_noun', GROWN — empty on a cold tenant) via the per-tenant overlay; an empty set
+# means the "had a <bland-head> with X" construction DEGRADES safely (the affected entity stays walkable
+# via its other chains; the bland head's participated_in lands Class-C — captured-not-dropped) while the
+# head is queued for growth. Kept (empty) only so the fail-safe path has a stable name.
+_PROBLEM_NOUN_LEMMAS: frozenset[str] = frozenset()
 
 
 def _problem_nouns() -> frozenset[str]:
@@ -1863,6 +2132,19 @@ def _problem_nouns() -> frozenset[str]:
     except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
         log.warning("linguistics.problem_nouns_resolve_failed", error=str(e)[:160])
         return _PROBLEM_NOUN_LEMMAS
+
+
+def _record_cue_candidate(cue: str, category: str) -> None:
+    """Record a CARVED-CLASS growth candidate (cue lemma → category) for the current request via the
+    overlay's request-scoped accumulator. The ingest/harvest seam drains it once and writes it to the
+    per-tenant growth queue; the re_embedder freq-gates (≥3) and grows it into ``linguistic_cues``.
+    Fail-safe: any import/record failure is swallowed — a missed growth signal NEVER breaks the
+    deriver (the construction already degraded to a generic walkable rel; growth is best-effort)."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        linguistic_cue_overlay.record_cue_candidate(cue, category)
+    except Exception:  # noqa: BLE001 — fail-safe
+        return
 
 
 # DB-HELD + per-tenant + GROWABLE (linguistic_cue_overlay, category='inchoative_verb'). The frozenset
@@ -2209,8 +2491,16 @@ class EventAnalysis:
     #                    candidate (the structural twin of ``feels``) alongside the participated_in
     #                    candidate, and Stage-2 arbitration picks the strong state reading over the
     #                    cratered participation. The discriminator is the cue class ∧ the with-PP — a
-    #                    non-problem head ("had a meeting WITH Taylor") leaves this False (untouched).
+    #                    non-problem head ("had a meeting WITH Sarah") leaves this False (untouched).
     problem_head: bool = False
+    # ``problem_candidate`` : the bland eventive head LEMMA when this is the problem_noun GROWTH signal —
+    #                    a "had a <bland-head> with <NON-person thing>" construction whose head is NOT
+    #                    (yet) in the grown ``problem_noun`` class. CARVE-OUT: problem_noun is grown
+    #                    per-tenant, so on a cold tenant ``problem_head`` is False but this carries the
+    #                    candidate head so the ingest seam queues it for freq-gated growth. The PERSON
+    #                    gate (the with-PP affected entity is NOT a PERSON) excludes neutral occurrences
+    #                    ("had a meeting WITH Sarah" → Sarah is a person → no candidate). None otherwise.
+    problem_candidate: str | None = None
 
 
 # Quoted-title net: a TITLE is most reliably marked by quotes ("Data Analysis using Python",
@@ -2251,7 +2541,7 @@ def _event_title(event_noun, text: str) -> str | None:
           between them is copied VERBATIM. Highest-precision signal, so it is preferred.
       (b) PROPER-NOUN appositive / PP object — a PROPN appos/PP-object hanging off the eventive
           noun ("the workshop on Effective Time Management" → "Effective Time Management";
-          "the Atlas conference" handled by the modifier path). The title is the contiguous
+          "the Apollo conference" handled by the modifier path). The title is the contiguous
           proper-noun span (PROPN run) under that dependent.
 
     TITLE↔HEAD BINDING (fix 5 — the title is its OWN eventive head's name, not the main verb's
@@ -2404,7 +2694,7 @@ def _event_title(event_noun, text: str) -> str | None:
         except Exception:  # noqa: BLE001 — naming-participle probe must not crash; fall through
             pass
 
-        # (b2) COMPOUND PROPER-NOUN PREMODIFIER — "the Atlas webinar". The title is the head noun's
+        # (b2) COMPOUND PROPER-NOUN PREMODIFIER — "the Apollo webinar". The title is the head noun's
         # left ``compound``/PROPN run. GATED on a Title-Case / proper-name span: a descriptive
         # non-Title-Case multi-word premod ("the data analysis using python webinar") is ambiguous →
         # left to the gap-fill (we do NOT force it). The event TYPE string (_np_phrase) excludes this
@@ -2779,7 +3069,7 @@ def _build_event_analysis(event_noun, tok, text: str):
         negated = any(c.dep_ == "neg" for c in tok.children)
         # TITLE (the dog/Rex split): a quoted name, PROPN appositive/PP-object, an
         # acl/relcl naming-participle ("workshop called X"), or a Title-Case compound premod
-        # ("the Atlas webinar") on the eventive noun is the NAME of THIS occurrence — it rides
+        # ("the Apollo webinar") on the eventive noun is the NAME of THIS occurrence — it rides
         # ``also_known_as``, never the occurrence object (which stays the bare type). ``None`` for
         # a bare common occurrence. _event_title binds a quoted/appos/PP title to the HEAD it hangs
         # under, scoped to THIS head's own subtree — so per-head analysis gives each occurrence its
@@ -2826,10 +3116,10 @@ def _build_event_analysis(event_noun, tok, text: str):
         if _has_naming_child and _support_lemma in ("have", "get"):
             return None
 
-        # EVENT-TYPE EXCLUDES the lifted Title-Case compound premodifier (the "Atlas" in "the
-        # Atlas webinar"): when the title was lifted from a leading Title-Case PROPN compound
+        # EVENT-TYPE EXCLUDES the lifted Title-Case compound premodifier (the "Apollo" in "the
+        # Apollo webinar"): when the title was lifted from a leading Title-Case PROPN compound
         # that is embedded in the bare-type phrase, strip it so the occurrence object stays the
-        # bare place ("webinar"), not "atlas webinar". Structural surface strip only — if the
+        # bare place ("webinar"), not "apollo webinar". Structural surface strip only — if the
         # title did not come from a premod (quoted/appos/acl), event is already the bare type.
         if title:
             _tl = title.strip().lower()
@@ -2842,20 +3132,61 @@ def _build_event_analysis(event_noun, tok, text: str):
         # This is the "I had an issue WITH my car's GPS system" shape: the meaning lives in the affected
         # entity, not the empty head. Flag it so the caller emits a competing ``(<concerns>, has_state,
         # <problem-state>)`` candidate (the structural twin of ``feels``). THE DISCRIMINATOR is the cue
-        # class ∧ the with-PP — both must hold, so "had a meeting WITH Taylor" (meeting ∉ problem_noun)
+        # class ∧ the with-PP — both must hold, so "had a meeting WITH Sarah" (meeting ∉ problem_noun)
         # and "had an issue" with NO affected entity both leave problem_head False (untouched). The cue
         # class is DB-grown (NO noun literal in this logic); fail-safe: any resolve miss → code-fallback
         # set, never an empty gate. Read against the bare HEAD LEMMA, not the modified phrase.
         problem_head = False
+        problem_candidate = None
         if concerns:
             try:
                 _head_lemma = (event_noun.lemma_ or "").strip().lower()
                 if _head_lemma and _head_lemma in _problem_nouns():
                     problem_head = True
+                elif _head_lemma and event_noun.pos_ == "NOUN":
+                    # CARVE-OUT GROWTH SIGNAL: the head is NOT (yet) a grown problem_noun but it heads a
+                    # "had a <bland-head> with <X>" construction. Queue it as a problem_noun candidate —
+                    # GATED on the affected with-PP entity NOT being a PERSON, so a neutral occurrence
+                    # ("had a meeting WITH Sarah", "had lunch WITH Tom") never grows a problem head. The
+                    # person test is spaCy's own PERSON NER (deterministic, NO word-list). CONSERVATIVE:
+                    # we queue ONLY when NER actually classified the affected entity AND it is NOT a
+                    # person — an UNKNOWN (no NER signal) never queues, so growth can never mis-grow a
+                    # neutral occurrence head when NER is unavailable.
+                    _affected = concerns.strip().lower()
+                    _person_known = False
+                    _person_affected = False
+                    # (a) typed doc (spine path: GLiNER2 wrote ents onto the doc) — read PERSON directly.
+                    try:
+                        _ents = list(event_noun.doc.ents or [])
+                    except Exception:  # noqa: BLE001
+                        _ents = []
+                    if _ents:
+                        _person_known = True
+                        for _ent in _ents:
+                            if _ent.label_ == "PERSON" and (_ent.text or "").strip().lower() in _affected:
+                                _person_affected = True
+                                break
+                    else:
+                        # (b) NER-disabled grammar doc (ingest/rewrite path): run the NER singleton on
+                        #     the affected span to classify it (deterministic spaCy NER, no word-list).
+                        try:
+                            _ner = _get_nlp_ner()
+                            if _ner is not None:
+                                _person_known = True
+                                for _ent in (_ner(concerns).ents or []):
+                                    if _ent.label_ == "PERSON":
+                                        _person_affected = True
+                                        break
+                        except Exception:  # noqa: BLE001 — NER unavailable → unknown (do not queue)
+                            _person_known = False
+                    if _person_known and not _person_affected:
+                        problem_candidate = _head_lemma
             except Exception:  # noqa: BLE001 — fail-safe: lemma/overlay miss → not a problem head
                 problem_head = False
+                problem_candidate = None
         return EventAnalysis(event=event, title=title, concerns=concerns,
-                             negated=negated, problem_head=problem_head)
+                             negated=negated, problem_head=problem_head,
+                             problem_candidate=problem_candidate)
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.build_event_analysis_failed", error=str(e)[:160])
         return None
@@ -3463,7 +3794,7 @@ def _possession_rel_for_type(type_lemma: str | None, instance_type_tag: str | No
     the SAME rel_types overlay), kept here so the deriver stays self-contained (it cannot import main).
 
     "a dog named Rex" → the TYPE "dog" is an ANIMAL → the pet relation (``has_pet``); "a server
-    Atlas" → "server" is an OBJECT → generic ownership (``owns``). We do NOT hardcode ``if
+    Apollo" → "server" is an OBJECT → generic ownership (``owns``). We do NOT hardcode ``if
     type=='Animal'``: we scan the rel_types overlay for an ownership-CLASS rel (head admits Person/ANY)
     whose ``tail_types`` ADMIT this type, and pick the MOST SPECIFIC (a concrete tail match beats an
     ANY catch-all; among concretes the narrowest tail_types wins, so ``has_pet={Animal}`` beats
@@ -3633,6 +3964,75 @@ class SentenceFact:
     provenance: str
     tentative: bool = False
     negated: bool = False
+    # SCALAR-ATTRIBUTE discipline: when set (e.g. "string"), this fact's OBJECT is a literal SCALAR
+    # VALUE (an address / serial / employee-id span captured VERBATIM), NOT an entity to resolve. The
+    # harvest threads this onto the edge's ``object_datatype`` so /ingest routes the value to
+    # entity_attributes (the SCALAR storage path), never resolving it to a UUID. Default None (every
+    # relational/hierarchical fact). Mirrors how event_date/negated ride their own fields.
+    scalar_datatype: str | None = None
+
+
+# ── NAME↔TYPE BINDER vs ATTR-SCALAR PRECEDENCE ────────────────────────────────────────────────────
+# The unified name↔type binding detector (analyze_name_type_bindings / analyze_named_instance and the
+# deriver's binding chains) fires on the possessive-attribute copula ("my address is 123 Main Street,
+# Riverton, Ontario") when LIVE GLiNER2 types the value-span head ("Street") as a NAMED INSTANCE of
+# the attribute noun ("address") read as a TYPE. It then mints a cluster of junk TWINS — e.g.
+#   (street, also_known_as|instance_of|has_role, address) + (user, owns, street) + (street, age, 123)
+# alongside the attr-scalar chain's authoritative VERBATIM scalar edge (user, address, "123 main
+# street, …" carrying object_datatype). The attr-scalar chain OWNS this construction; the binder twins
+# compete with it. There is no in-binder precedence for this construction, so we suppress the twins at
+# the union level: deterministic whole-word token membership against the claimed scalar VALUE.
+#
+# located_in is DELIBERATELY EXCLUDED from the twin-rel set: the geo-containment chain emits
+# (123 main street, located_in, riverton) / (riverton, located_in, ontario) whose subjects/objects
+# ARE whole-word fragments of the same value — but those edges are DESIRED and must survive. Only the
+# binder's own twin rels are eligible to drop.
+_NAME_TYPE_BINDER_TWIN_RELS = frozenset({
+    "instance_of", "also_known_as", "has_role", "owns", "age", "has_state",
+})
+
+_BINDER_VALUE_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _value_word_tokens(value) -> set:
+    """Whole-word, lowercased token set of a scalar value string (split on any non-alphanumeric run).
+    "123 Main Street, Riverton, Ontario" → {"123","main","street","riverton","ontario"}."""
+    return {t for t in _BINDER_VALUE_TOKEN_RE.split((value or "").lower()) if t}
+
+
+def suppress_name_type_binder_vs_attr_scalar(edges):
+    """Union-level, deterministic, subject-agnostic suppression of name↔type-binder TWIN edges that
+    collide with an attr-scalar claim over the SAME possessive-attribute copula.
+
+    For every attr-scalar edge in ``edges`` (an edge carrying ``object_datatype`` — the verbatim
+    scalar the deriver's attr-scalar chain captured), collect the whole-word token set of its claimed
+    VALUE. Then DROP any other edge whose rel_type is a known binder twin
+    (``_NAME_TYPE_BINDER_TWIN_RELS``) and whose SUBJECT or OBJECT shares a whole-word token with that
+    claimed value. ``located_in`` (the geo-containment chain) is not in the twin set, so the geo edges
+    — which legitimately share value words like "riverton"/"ontario" — are always preserved.
+
+    FAIL-SAFE: no attr-scalar claim in the batch → returns the edge list unchanged. The attr-scalar
+    edge itself (it carries ``object_datatype``) is never dropped. Pure function, no I/O, no fuzzy
+    scoring — exact normalized-token membership only."""
+    try:
+        claimed_tokens: set = set()
+        for e in edges:
+            if e.get("object_datatype"):
+                claimed_tokens |= _value_word_tokens(e.get("object"))
+        if not claimed_tokens:
+            return list(edges)  # no scalar claim → no change
+        kept = []
+        for e in edges:
+            rel = (e.get("rel_type") or "").strip().lower()
+            # Never drop the scalar claim itself; only the binder's twin rels are eligible.
+            if rel in _NAME_TYPE_BINDER_TWIN_RELS and not e.get("object_datatype"):
+                if ((_value_word_tokens(e.get("subject")) & claimed_tokens)
+                        or (_value_word_tokens(e.get("object")) & claimed_tokens)):
+                    continue
+            kept.append(e)
+        return kept
+    except Exception:  # noqa: BLE001 — fail-safe: a suppression miss never drops real edges
+        return list(edges)
 
 
 def _strip_leading_discourse_marker(sentence: str) -> str:
@@ -3703,7 +4103,8 @@ def _thin_type_for_token(tok) -> str | None:
         return None
 
 
-def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_only=False):
+def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_only=False,
+                          named_role_only=False):
     r"""Derive the FULL structured fact set for ONE clean sentence (ClausIE-lite, deterministic).
 
     Returns ``list[SentenceFact]``. This is the clean-sentence deriver the harvest's
@@ -3869,10 +4270,24 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 pass
 
     def _emit(subject, rel, obj, verb_tok=None, obj_tok=None, subj_tok=None, tentative=False,
-              negated=False):
+              negated=False, scalar_datatype=None):
         subj = (subject or "").strip().lower()
         rel = (rel or "").strip().lower()
         obj = (obj or "").strip().lower()
+        # RELATIVE-PRONOUN GUARD (THE HARD LINE — a function word is never a memory). When a chain's
+        # subject/object token is a relative pronoun ("the brother WHO lives…", "the car THAT runs…")
+        # the deriver would otherwise bind "who"/"that" as a standalone entity. Resolve it to its
+        # antecedent NOUN; if the antecedent cannot be resolved, DROP the edge rather than bind the
+        # pronoun. Single chokepoint (every chain emits here), grammar/morphology-driven, fail-safe.
+        for _tk, _is_subj in ((subj_tok, True), (obj_tok, False)):
+            if _tk is not None and _is_relative_pronoun(_tk):
+                _ante = _relative_pronoun_antecedent(_tk)
+                if not _ante:
+                    return  # unresolved relative pronoun → never bind as an entity
+                if _is_subj:
+                    subj = _ante
+                else:
+                    obj = _ante
         # PREDICATE CONVERGENCE (gap-1 phase 2, §2.1): a GLiNER2-minted rel on ``doc._.rel``
         # for THIS (subject token, object token) pair is AUTHORITATIVE and WINS over the
         # deriver's SVO verb-lemma predicate; an absent minted rel → the SVO predicate
@@ -3906,6 +4321,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 rel = _minted
         if not (subj and rel and obj) or subj == obj:
             return
+        # NAMING-NOUN-IS-NEVER-A-TYPE GUARD (genitive-name fix — THE HARD LINE). "My wife's name
+        # is Jordan" must bind Jordan as the SPOUSE'S name (spouse + also_known_as), never classify
+        # Jordan as a thing of type "name". The atomizer sometimes reshapes the genitive so a generic
+        # copula/SVO seam fires (Jordan, instance_of, name) instead of the genitive chain — and "name"
+        # is the NAMING-CONSTRUCTION anchor (the same lemma the genitive/possessive-naming seams are
+        # built on), NOT an L4 type. So DROP any classification edge whose object IS that naming
+        # noun: classifying anything INTO "name" is a category error across the memory/place line.
+        # Structural (the naming-construction head), subject-agnostic, no domain literal.
+        if rel in ("instance_of", "subclass_of") and obj == "name":
+            return
         # CLAIM the spans this candidate touches REGARDLESS of dedup outcome — a span that two chains
         # both match (§10.7 overlap) is still covered by whichever fact lands; the loser converges
         # away (dedup below) but the tokens are accounted for, never re-flagged as residue.
@@ -3932,6 +4357,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             event_date=_iso, event_date_granularity=_gran,
             thin_type=thin, provenance="user_stated",
             tentative=bool(tentative), negated=bool(negated),
+            scalar_datatype=(scalar_datatype or None),
         ))
 
     # ── INTRA-TURN PRONOUN COREF (shared by every chain) ─────────────────────────────────────────
@@ -3983,7 +4409,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                 if _c.dep_ in ("dobj", "obj") and _c.pos_ == "NOUN" and (
                                         any(_g.dep_ in ("appos", "conj") for _g in _c.children)):
                                     _ni_suppress.add(_c.i)
-                    # the nickname relative clause "who goes by Sam" (the ``go`` verb + its subtree)
+                    # the nickname relative clause "who goes by Theo" (the ``go`` verb + its subtree)
                     if (_t.lemma_ or "").strip().lower() == "go" and _t.pos_ == "VERB" and \
                             _t.dep_ in ("relcl", "acl"):
                         if any(_c.dep_ == "prep" and (_c.text or "").strip().lower() == "by"
@@ -3992,6 +4418,57 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                 _ni_suppress.add(_d.i)
         except Exception:  # noqa: BLE001 — fail-safe: suppression is best-effort, never blocks capture
             _ni_suppress = set()
+
+    # ── KINSHIP-COLLECTIVE PRE-PASS (the family-list case) ───────────────────────────────────────
+    # "We have three kids: Mia, Theo, and Leo." — a COLLECTIVE kinship head ("kids"/"children"/
+    # "sons") governing a named member list. The bare SVO would mint a degenerate (user, have, kids)
+    # owning the collective TYPE, and the dash chain would distribute the verb (user, have, mia).
+    # Neither uses the KINSHIP relation the head metadata carries. Here we detect such a head ONCE so:
+    #   • the SVO chain SUPPRESSES the (user, have, <collective>) edge (the collective is a class, not a
+    #     thing the user owns), and
+    #   • the dash-specifier chain re-routes each named member to the head's kinship rel + direction
+    #     ((mia, child_of, user)) + the head's intrinsic gender, if any.
+    # Detection is grammatical + metadata-driven (the DB-grown kinship cue maps via the head's LEMMA —
+    # NO kinship word list in code) and fail-safe (any miss → today's behavior). ``_kin_collective``
+    # maps the collective head token index → (kin_rel, gender_or_None); the members are resolved by the
+    # dash chain. Gated to a 1st-person/coref possessor + a possession verb governing the head as dobj.
+    _kin_collective: dict = {}
+    try:
+        _kin_map = _kinship_rel_map()
+        _kin_gender = _kinship_gender_map()
+        for _v in doc:
+            if _v.pos_ not in ("VERB", "AUX"):
+                continue
+            _vl = (_v.lemma_ or _v.text or "").strip().lower()
+            if _vl not in _possession_verbs() and _vl != "have":
+                continue
+            _sj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if _sj is None:
+                continue
+            for _h in _v.children:
+                if _h.dep_ not in ("dobj", "obj") or _h.pos_ != "NOUN":
+                    continue
+                _hl = (_h.lemma_ or _h.text or "").strip().lower()
+                _krel = _kin_map.get(_hl)
+                if not _krel:
+                    continue
+                # the head must INTRODUCE a named member list (a PROPN appos/conj member, or a
+                # dash/colon-separated PROPN following it) — else it is a bare "I have a son" the
+                # named-instance chain already owns. Structural, subject-agnostic.
+                _has_named_members = any(
+                    g.pos_ == "PROPN" and g.dep_ in ("appos", "conj") for g in _h.children)
+                if not _has_named_members:
+                    for _t in doc[_h.i + 1:]:
+                        if _t.is_space:
+                            continue
+                        if _t.pos_ == "PUNCT" and (_t.text or "").strip() in ("-", "–", "—", ":"):
+                            continue
+                        _has_named_members = _t.pos_ == "PROPN"
+                        break
+                if _has_named_members:
+                    _kin_collective[_h.i] = (_krel, _kin_gender.get(_hl))
+    except Exception:  # noqa: BLE001 — fail-safe: collective routing is best-effort
+        _kin_collective = {}
 
     # ── CAPTURE CHAINS (gap-2 §10.1) ─────────────────────────────────────────────────────────────
     # The deriver is NOT a fixed sequence of capture rules. Each capture chain is a self-contained
@@ -4005,6 +4482,280 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # teach the deriver a new shape you ADD a chain / GROW the cue ontology, never reorder a list.
     #
     # A chain receives the typed ``doc`` and shares ``_emit`` / ``_claim`` / ``_coref`` by closure.
+
+    def _attr_scalar_binding(nsubj_tok):
+        # POSSESSIVE-ATTRIBUTE SCALAR construction detector (Defect 1, subject-agnostic, grammar +
+        # value-shape — NO attribute word-list). Recognizes "<possessor> <attribute-noun> is <literal
+        # value span>" where the value is a SCALAR LITERAL (an address / serial / employee-id, etc.):
+        #     "my address is 123 Main Street, Riverton, Ontario"  → (user,    address, "<verbatim>")
+        #     "the laptop's serial is XR7-9920"                    → (laptop,  serial,  "XR7-9920")
+        # The ENTIRE post-copula span is the SCALAR VALUE, kept VERBATIM and routed to entity_attributes
+        # (the deriver tags it via scalar_datatype="string"); it is NEVER decomposed into a relationship
+        # to a sub-entity. Returns a dict {possessor, attribute, value, comp} or None.
+        #
+        # The construction is detected ONLY structurally:
+        #   • nsubj_tok is a NOUN that is the subject of a copula ``be`` AUX, and
+        #   • it is POSSESSED — either a 1st-person possessive determiner ("my"/"our", Person=1∧Poss=Yes)
+        #     → possessor "user"; OR a genitive possessor noun ("the laptop's …") → that noun, and
+        #   • the attribute head-noun is NOT a kinship role (kinship_noun cue class) — "my daughter is 28"
+        #     is an AGE, owned by the copula-measure chain, never an attribute scalar, and
+        #   • the complement is a NOUN/PROPN/NUM value (not wh/interrogative), not negated, and
+        #   • the value span is a SCALAR LITERAL: it contains a DIGIT, OR it is a multi-token nominal
+        #     span (>=2 content tokens with a nominal head — a literal like "main street", not a bare
+        #     single-word ADJ preference "blue" which the preference seam still owns).
+        # Deterministic, fail-safe → None. Shared by the attr-scalar chain AND the possessive /
+        # copula-measure suppression guards (so OUTCOME is order-independent — the chain owns the
+        # construction and the twins step aside, the established own-the-construction / suppress-twin
+        # pattern).
+        try:
+            if nsubj_tok is None or nsubj_tok.pos_ != "NOUN":
+                return None
+            if nsubj_tok.dep_ not in ("nsubj", "nsubjpass"):
+                return None
+            head = nsubj_tok.head
+            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+                return None
+            # POSSESSOR: 1st-person poss determiner → user; genitive NOUN/PROPN poss → that possessor.
+            possessor = None
+            for c in nsubj_tok.children:
+                if c.dep_ != "poss":
+                    continue
+                try:
+                    if c.morph.get("Person") == ["1"] and "Yes" in c.morph.get("Poss"):
+                        possessor = "user"
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                if c.pos_ in ("NOUN", "PROPN"):
+                    possessor = (c.text or c.lemma_ or "").strip().lower()
+                    break
+            if not possessor:
+                return None
+            # KINSHIP head → an age/person reading, NOT an attribute scalar (let copula-measure own it).
+            _hl = (nsubj_tok.lemma_ or nsubj_tok.text or "").strip().lower()
+            if _hl in _kinship_nouns():
+                return None
+            # COMPLEMENT: a NOUN/PROPN/NUM value of the copula; skip wh/interrogative.
+            comp = None
+            for c in head.children:
+                if c.dep_ in ("attr", "oprd", "dobj", "obj") and c.pos_ in ("NOUN", "PROPN", "NUM"):
+                    try:
+                        if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    comp = c
+                    break
+            if comp is None:
+                return None
+            # NEGATION ("my address is not X") → absence; defer (parity with the other chains).
+            if any(c.dep_ == "neg" for c in head.children) or any(
+                    c.dep_ == "neg" for c in comp.children):
+                return None
+            # VERBATIM value span = the complement's full subtree (covers "123 Main Street, Riverton,
+            # Ontario" / "XR7-9920"), sliced from the sentence text so commas/appositions survive.
+            try:
+                _sub = list(comp.subtree)
+                _start = min(t.idx for t in _sub)
+                _end = max(t.idx + len(t.text) for t in _sub)
+                value = (sentence[_start:_end] or "").strip()
+            except Exception:  # noqa: BLE001
+                value = (comp.text or "").strip()
+            if not value:
+                return None
+            # SCALAR-LITERAL gate: a digit anywhere, OR a multi-token nominal span (>=2 content tokens
+            # with a nominal head). A bare single-word ADJ/NOUN value ("blue") is NOT scalar-literal —
+            # it stays with the preference seam (unchanged). Value-shape, deterministic, no word list.
+            _has_digit = any(ch.isdigit() for ch in value)
+            try:
+                _content = [t for t in comp.subtree if not t.is_punct and not t.is_space]
+            except Exception:  # noqa: BLE001
+                _content = []
+            _head_nominal = comp.pos_ in ("NOUN", "PROPN", "NUM")
+            if not (_has_digit or (len(_content) >= 2 and _head_nominal)):
+                return None
+            attribute = _np_phrase(nsubj_tok)
+            if not attribute:
+                return None
+            return {"possessor": possessor, "attribute": attribute, "value": value, "comp": comp}
+        except Exception as e:  # noqa: BLE001 — fail-safe: never break the deriver
+            log.warning("linguistics.attr_scalar_binding_failed", error=str(e)[:160])
+            return None
+
+    def _chain_attr_scalar(doc):
+        # ATTRIBUTE-SCALAR (Defect 1) — owns the possessive-attribute copula "my <attr> is <literal>"
+        # / "<X>'s <attr> is <literal>" and emits the SCALAR value VERBATIM, keyed by the attribute
+        # head-noun, on the possessor. tagged scalar_datatype="string" so the harvest routes it to
+        # entity_attributes (the SCALAR path), never resolving the value to a UUID. The possessive /
+        # copula-measure deriver twins step aside via the shared _attr_scalar_binding guard; the
+        # preference seam defers (the harvest drops a preference edge that collides with a scalar edge).
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            b = _attr_scalar_binding(tok)
+            if not b:
+                continue
+            rel = (b["attribute"] or "").strip().lower().replace(" ", "_")
+            value = b["value"]
+            if not rel or not value:
+                continue
+            _emit(b["possessor"], rel, value, subj_tok=tok, obj_tok=None, scalar_datatype="string")
+            # CLAIM the whole construction so the residue guard never re-flags it. The SUBJECT side
+            # (the attribute noun + its possessor / appositive fragments — "laptop", a tokenized-apart
+            # "id") is a CLASSIFICATION/possessor, not a standalone entity; the VALUE span is a SCALAR
+            # leaf, not a set of entities. Geo Locations inside the value span are ADDITIONALLY
+            # hierarchized by the geo-containment chain (the dual-reading division).
+            try:
+                for _d in tok.subtree:
+                    _claim(_d)
+                for _d in b["comp"].subtree:
+                    _claim(_d)
+            except Exception:  # noqa: BLE001
+                _claim(tok)
+
+    def _loc_obj_phrase(tok):
+        # A LOCATION/container object phrase: head + left compound/amod modifiers AND right nummod
+        # ("rack 4", "gps system") — but NOT appos/conj (those are separate containment members the
+        # geo-list chain decomposes). Lowercased, structural, subject-agnostic.
+        try:
+            left = [c for c in tok.children if c.dep_ in ("compound", "amod") and c.i < tok.i]
+            right = [c for c in tok.children if c.dep_ == "nummod" and c.i > tok.i]
+            parts = ([m.text for m in sorted(left, key=lambda m: m.i)] + [tok.text]
+                     + [m.text for m in sorted(right, key=lambda m: m.i)])
+            return " ".join(p.strip() for p in parts if p and p.strip()).lower()
+        except Exception:  # noqa: BLE001
+            return (tok.text or "").strip().lower()
+
+    def _chain_classification_containment(doc):
+        # CLASSIFICATION + CONTAINMENT (Defect 2) — "X is a <type> [in|within|inside <Location>]":
+        #   "Riverton is a city in Ontario" → instance_of(riverton, city) + located_in(riverton, ontario)
+        #   "Paris is a city in France"      → instance_of(paris, city)     + located_in(paris, france)
+        #   "the server is in rack 4"        →                                located_in(server, "rack 4")
+        # Lays down the L4 founding anchors for the geographic (and any containment) domain at ingest;
+        # the async ±6 backbone climb grows Ontario→Canada→… once these anchors exist. Subject-agnostic,
+        # structural (copula + determiner-introduced TYPE complement; containment preposition + nominal
+        # pobj) — NO city/province/country word zoo. instance_of files the named instance AT its type
+        # (THE HARD LINE); located_in is the containment hierarchy edge (child located_in parent).
+        _CONTAINMENT_PREPS = ("in", "within", "inside")  # closed containment-preposition primitive
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            head = tok.head
+            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+                continue
+            if _is_first_person_personal_pronoun(tok):
+                continue  # "I am ..." is the self/feeling/identity lane, never a geo classification
+            if any(c.dep_ == "neg" for c in head.children):
+                continue  # negated copula — absence deferred (parity)
+            # An attribute-SCALAR construction ("my address is 123 …") is owned by _chain_attr_scalar.
+            if _attr_scalar_binding(tok) is not None:
+                continue
+            subject = _np_phrase(tok)
+            if not subject:
+                continue
+            # (A) TYPE complement → instance_of. A determiner-introduced common NOUN ("a city"/"the
+            #     city") is a TYPE the subject is an instance of; a PROPN complement is a name (owned
+            #     by the naming chains), a bare NOUN with no determiner is a state/role (other chains).
+            type_comp = None
+            for c in head.children:
+                if c.dep_ in ("attr", "oprd") and c.pos_ == "NOUN" and \
+                        any(g.dep_ == "det" for g in c.children):
+                    try:
+                        if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    type_comp = c
+                    break
+            if type_comp is not None:
+                _type = _np_phrase(type_comp)
+                if _type and _type != subject:
+                    _emit(subject, "instance_of", _type, subj_tok=tok, obj_tok=type_comp)
+            # (B) CONTAINMENT preposition (in/within/inside) reachable from the copula head (it may
+            #     hang off the copula, the type complement, or an intervening "located" participle) +
+            #     a nominal pobj → located_in(subject, pobj). A temporal pobj ("in an hour") is dropped.
+            for prep in doc:
+                if prep.dep_ != "prep":
+                    continue
+                if (prep.text or "").strip().lower() not in _CONTAINMENT_PREPS:
+                    continue
+                _cur = prep.head
+                _hops = 0
+                _reach = False
+                while _cur is not None and _hops < 5:
+                    if _cur.i == head.i:
+                        _reach = True
+                        break
+                    if _cur.head is _cur:
+                        break
+                    _cur = _cur.head
+                    _hops += 1
+                if not _reach:
+                    continue
+                for pobj in prep.children:
+                    if pobj.dep_ != "pobj" or pobj.pos_ not in ("NOUN", "PROPN"):
+                        continue
+                    try:
+                        if (pobj.ent_type_ or "").upper() in ("DATE", "TIME"):
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _loc = _loc_obj_phrase(pobj)
+                    if _loc and _loc != subject:
+                        _emit(subject, "located_in", _loc, subj_tok=tok, obj_tok=pobj)
+
+    def _chain_geo_containment_list(doc):
+        # GEOGRAPHIC COMMA-LIST CONTAINMENT (Defect 2) — "…, Riverton, Ontario" / "Riverton, Ontario"
+        # → located_in(riverton, ontario): in a comma-separated run of LOCATION entities the TRAILING
+        # element CONTAINS the leading one, so each adjacent pair (child, parent) is a containment edge
+        # ("Riverton, Ontario, Canada" → located_in(riverton, ontario), located_in(ontario, canada)).
+        # Subject-agnostic, NO place word zoo: members are identified by GLiNER2 Location typing
+        # (token-aligned ent labels on the typed Doc); a pair is admitted only when the tokens BETWEEN
+        # the two ents are purely a comma / "and" / whitespace (an enumerated containment list). When no
+        # GLiNER2 types are present (raw-str parse), fall back to a PROPN appos/conj chain rooted at the
+        # pobj of a locative preposition ("I live in Riverton, Ontario") — a grammatically-locative
+        # context only, so a non-geo PROPN list is never swept in.
+        def _emit_pair(child_txt, parent_txt, child_tok=None, parent_tok=None):
+            c = (child_txt or "").strip().lower()
+            p = (parent_txt or "").strip().lower()
+            if c and p and c != p:
+                _emit(c, "located_in", p, subj_tok=child_tok, obj_tok=parent_tok)
+
+        # PRIMARY: GLiNER2 Location ents.
+        _loc_ents = []
+        try:
+            for _e in (getattr(doc, "ents", []) or []):
+                if (_e.label_ or "").strip().upper() in ("LOCATION", "GPE", "LOC"):
+                    _loc_ents.append(_e)
+        except Exception:  # noqa: BLE001
+            _loc_ents = []
+        if _loc_ents:
+            _loc_ents = sorted(_loc_ents, key=lambda e: e.start)
+            for _a, _b in zip(_loc_ents, _loc_ents[1:]):
+                try:
+                    _between = [t for t in doc[_a.end:_b.start] if not t.is_space]
+                    if all(t.is_punct or t.pos_ == "CCONJ"
+                           or (t.lemma_ or "").strip().lower() == "and" for t in _between):
+                        _emit_pair(_a.text, _b.text)
+                        for _t in list(_a) + list(_b):  # claim the spans (no residue false-alarm)
+                            _claim(_t)
+                except Exception:  # noqa: BLE001
+                    continue
+            return
+        # FALLBACK (no GLiNER2 types): a PROPN appos/conj chain rooted at a locative-prep pobj.
+        _LOC_PREPS = ("in", "within", "inside", "from", "at")
+        for prep in doc:
+            if prep.dep_ != "prep" or (prep.text or "").strip().lower() not in _LOC_PREPS:
+                continue
+            pobj = next((c for c in prep.children
+                         if c.dep_ == "pobj" and c.pos_ == "PROPN"), None)
+            if pobj is None:
+                continue
+            _chain = [pobj] + [c for c in pobj.children
+                               if c.dep_ in ("appos", "conj") and c.pos_ == "PROPN"]
+            _chain = sorted(_chain, key=lambda t: t.i)
+            for _a, _b in zip(_chain, _chain[1:]):
+                _emit_pair(_a.text, _b.text, child_tok=_a, parent_tok=_b)
 
     def _chain_svo(doc):
         # SVO backbone (+ governing-verb date + conjunct distribution). Each non-copula content verb
@@ -4061,6 +4812,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             for _ct in _np_conjuncts(obj_tok):  # conjunct/dash-list distribution
                 if _ct.i in _ni_suppress:
                     continue  # a named-instance collective/type the binding chain owns
+                if _ct.i in _kin_collective:
+                    continue  # kinship COLLECTIVE ("kids") — members route via the kinship rel (dash chain)
                 obj_phrase = _np_phrase(_ct)
                 if not obj_phrase or len(obj_phrase) < 2:
                     continue
@@ -4097,7 +4850,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if tok.pos_ != "VERB":
                 continue
             if tok.i in _ni_suppress:
-                continue  # the named-instance nickname relcl ("who goes by Sam") — not a state
+                continue  # the named-instance nickname relcl ("who goes by Theo") — not a state
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -4191,13 +4944,19 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # possessed head whose token the named-instance chain suppressed (else "(user, owns, dog)").
             if head.i in _ni_suppress:
                 continue
+            # ATTRIBUTE-SCALAR GUARD (Defect 1): "my address is 123 …" / "the laptop's serial is X"
+            # is owned by _chain_attr_scalar (the value is a VERBATIM SCALAR, not an ownership of the
+            # bare attribute noun). Skip so we never mint (user, owns, address) / (serial, related_to,
+            # laptop) for the construction the attr-scalar chain captures. Shared detector, structural.
+            if _attr_scalar_binding(head) is not None:
+                continue
             # INTERPLAY GUARD (Fix 2): the "X's name is Y" naming construction is owned by the
             # GENITIVE-NAME chain (it binds Y as the person + attaches the kin relation there). The
             # possessive chain must stay OUT of it in BOTH directions:
             #   (a) the possessor leg ("my mother's …"): the head role-noun ("mother") is itself a
             #       ``poss`` of a "name" nsubj-of-copula → emitting (mother, parent_of, user) here would
             #       leave "mother" as a standalone entity (Fix 2 collapses it into the named person).
-            #   (b) the naming leg ("…'s name is Robin"): the possessed head IS the naming noun "name"
+            #   (b) the naming leg ("…'s name is Diane"): the possessed head IS the naming noun "name"
             #       (nsubj of a copula) → emitting (name, related_to, mother) here is the spurious
             #       "name"-as-entity leak. Skip it; the genitive-name chain mints the real edges.
             # Detected grammatically (lemma "name" + nsubj-of-be), NO word list.
@@ -4207,10 +4966,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         and _n.head is not None
                         and _n.head.lemma_ == "be" and _n.head.pos_ == "AUX")
             if head.dep_ == "poss" and _is_name_copula_nsubj(head.head):
-                continue   # (a) possessor leg of "my mother's name is Robin"
+                continue   # (a) possessor leg of "my mother's name is Diane"
             if _is_name_copula_nsubj(head):
                 continue   # (b) naming leg — head IS "name"; never (name, related_to, role)
-            # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Taylor" is owned by the
+            # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Sarah" is owned by the
             # COPULA-NAME chain (it binds the kin rel to the named person + registers the role as an
             # alias). The possessive chain must stay OUT of it, else it would mint (sister, sibling_of,
             # user) — the very parallel role entity Part 2 collapses. Detected grammatically: the
@@ -4222,7 +4981,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if any(_c.dep_ in ("attr", "oprd", "dobj", "obj") and _c.pos_ == "PROPN"
                        and not any(_g.dep_ == "det" for _g in _c.children)
                        for _c in head.head.children):
-                    continue   # the copula-name chain owns "my sister is Taylor"
+                    continue   # the copula-name chain owns "my sister is Sarah"
             head_phrase = _np_phrase(head)
             if not head_phrase or len(head_phrase) < 2:
                 continue
@@ -4365,18 +5124,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                   tentative=False, negated=_neg)
 
     def _chain_copula_name(doc):
-        # COPULA-APPOSITIVE ROLE↔NAME (Fix B, Part 2). "My sister is Taylor" / "My colleague is Bob" /
-        # "My server is Atlas" — a copular clause whose nsubj is a 1st-person-POSSESSED ROLE noun and
+        # COPULA-APPOSITIVE ROLE↔NAME (Fix B, Part 2). "My sister is Sarah" / "My colleague is Bob" /
+        # "My server is Apollo" — a copular clause whose nsubj is a 1st-person-POSSESSED ROLE noun and
         # whose attr complement is a PROPER NAME. spaCy parses it as:
         #     My      poss   -> sister     (Person=1, Poss=Yes)
         #     sister  nsubj  -> is         (the ROLE noun)
         #     is      ROOT (AUX, lemma be)
-        #     Taylor   attr   -> is         (the PROPER NAME)
-        # THE HARD LINE: the NAMED person (Taylor) is the entity; the ROLE (sister) is a slot/alias on
+        #     Sarah   attr   -> is         (the PROPER NAME)
+        # THE HARD LINE: the NAMED person (Sarah) is the entity; the ROLE (sister) is a slot/alias on
         # it — NEVER a parallel "sister" entity. We bind the kin/role relation to the NAMED person and
         # register the role surface as an ``also_known_as`` alias of that person, so a later atom
-        # ("My sister is 28") resolves sister→taylor and the scalar lands on the named person.
-        #   • KINSHIP role  → (name, <kin>, user)        e.g. (taylor, sibling_of, user)
+        # ("My sister is 28") resolves sister→sarah and the scalar lands on the named person.
+        #   • KINSHIP role  → (name, <kin>, user)        e.g. (sarah, sibling_of, user)
         #   • NON-kin role  → (name, has_role, role)     e.g. (bob, has_role, colleague) — a generic
         #                      role-slot the walk resolves; still binds the name as the entity.
         # PLUS the role-alias leg: (name, also_known_as, role) so the role resolves to the person.
@@ -4398,7 +5157,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the role noun must carry a 1st-person possessive determiner ("my"/"our") — that is what
             # makes "sister" a USER-anchored role rather than a free-standing subject. Grammatical
             # (Person=1 ∧ Poss=Yes), NOT a token list. Without it we never fire (no over-capture of
-            # "the printer is Atlas"-style clauses where the subject is not user-possessed).
+            # "the printer is Apollo"-style clauses where the subject is not user-possessed).
             poss_self = False
             for c in tok.children:
                 try:
@@ -4432,7 +5191,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             role_lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not proper_name or not role_lemma or proper_name == role_lemma:
                 continue
-            # NEGATION ("my sister is not Taylor") → absence; skip (parity with the other chains).
+            # NEGATION ("my sister is not Sarah") → absence; skip (parity with the other chains).
             if any(c.dep_ == "neg" for c in head.children):
                 continue
             # BIND the kin/role relation to the NAMED person. Kinship role → its specific kin rel
@@ -4444,7 +5203,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             else:
                 _emit(proper_name, "has_role", role_lemma, obj_tok=None, subj_tok=proper)
             # ROLE-ALIAS leg: register the ROLE surface as an alias of the NAMED person so a later
-            # atom ("My sister is 28") resolves sister→taylor and the scalar lands on the named person.
+            # atom ("My sister is 28") resolves sister→sarah and the scalar lands on the named person.
             # THE HARD LINE: the role is a slot/alias ON the named instance, not a second entity.
             _emit(proper_name, "also_known_as", role_lemma, obj_tok=None, subj_tok=proper)
             # COLLAPSE the role noun: claim it so the residue guard never flags it as a dropped entity.
@@ -4452,7 +5211,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
     def _chain_genitive_name(doc):
         # GENITIVE NAME-BINDING (Fix 2). "[poss] <relational-noun>'s name is <PROPN>"
-        #   "my mother's name is Robin"     → (robin, parent_of, user)   [Robin is the named entity]
+        #   "my mother's name is Diane"     → (diane, parent_of, user)   [Diane is the named entity]
         #   "John's mother's name is Susan" → (susan, parent_of, john)   [Susan is the named entity]
         # spaCy parses this as: a copula ``be`` whose nsubj is the NOUN "name" (lemma 'name'); that
         # "name" carries a ``poss`` role-noun child (mother/son/wife); the role-noun carries its OWN
@@ -4479,7 +5238,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             role_lemma = (role.lemma_ or role.text or "").strip().lower()
             # the PROPER NAME assigned — the copula's attr/attr-like complement (PROPN or a NOUN the
-            # parser mis-tagged, e.g. "Robin" → NOUN). Exclude a wh/interrogative complement.
+            # parser mis-tagged, e.g. "Diane" → NOUN). Exclude a wh/interrogative complement.
             proper = None
             for c in head.children:
                 if c.dep_ in ("attr", "oprd", "dobj", "obj") and c.pos_ in ("PROPN", "NOUN"):
@@ -4517,17 +5276,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _kin = _inherent_relation_for_noun(role_lemma)
             else:
                 _kin = "related_to"
-            # (person, kin, possessor) — e.g. (robin, parent_of, user). subj_tok=proper so the named
+            # (person, kin, possessor) — e.g. (diane, parent_of, user). subj_tok=proper so the named
             # person is the entity; verb_tok=None (no date on a name/role edge). The proper name BECOMES
             # the entity's surface here (the deriver works lowercased, so the alias is the subject
-            # surface itself) — the EntityRegistry registers "robin" as the entity's also_known_as alias
-            # when it grounds this edge at ingest. A separate (robin, also_known_as, robin) self-edge
+            # surface itself) — the EntityRegistry registers "diane" as the entity's also_known_as alias
+            # when it grounds this edge at ingest. A separate (diane, also_known_as, diane) self-edge
             # would be degenerate (subj==obj, rejected by _emit) and is unnecessary: the NAME is filed
             # via the subject surface, never classified into L4 (THE HARD LINE preserved).
             _emit(proper_name, _kin, possessor, obj_tok=None, subj_tok=proper)
             # ROLE-ALIAS leg (Fix B, Part 2 — flag-gated): register the ROLE surface (mother/son/wife)
             # as an ``also_known_as`` alias of the NAMED person so a later SPLIT atom ("My mother is
-            # 62" — the reframe Root-1 split) resolves mother→robin and the scalar lands on the named
+            # 62" — the reframe Root-1 split) resolves mother→diane and the scalar lands on the named
             # person, not a parallel "mother" role entity. THE HARD LINE: the role is a slot/alias ON
             # the named instance. Only meaningful for a kinship/relational role (a generic possessor
             # like "John" is not a role-slot); we gate it on the role being in the relational/kinship
@@ -4549,7 +5308,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if low not in ("she", "he", "they", "her", "him", "them"):
                 return None
             # nearest preceding named person in the doc: a PROPN, OR a NOUN bound as a name by a
-            # "X's name is <Name>" copula (the attr complement — spaCy sometimes tags "Robin" NOUN).
+            # "X's name is <Name>" copula (the attr complement — spaCy sometimes tags "Diane" NOUN).
             best = None
             for _t in doc:
                 if _t.i >= tok.i:
@@ -4559,7 +5318,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if _t.pos_ == "PROPN":
                     best = (_t.text or "").strip().lower()
                     continue
-                # a NOUN that is the attr of a naming copula ("name is Robin") is the bound person name
+                # a NOUN that is the attr of a naming copula ("name is Diane") is the bound person name
                 if _t.pos_ == "NOUN" and _t.dep_ in ("attr", "oprd"):
                     _h = _t.head
                     if (_h is not None and _h.lemma_ == "be" and _h.pos_ == "AUX"
@@ -4578,14 +5337,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         return None
 
     def _chain_copula_measure(doc):
-        # COPULA MEASUREMENT / SCALAR (Fix 3). "she is 62 years old", "Taylor is 28", "he is 6 feet
+        # COPULA MEASUREMENT / SCALAR (Fix 3). "she is 62 years old", "Sarah is 28", "he is 6 feet
         # tall" → a SCALAR edge (subject, <scalar_rel>, value). The rel_type is metadata-driven via the
         # unit→rel_type map (unit_scalar cue class: year→age, foot→height, …); a BARE NUM with no unit
-        # ("Taylor is 28") resolves to ``age`` (the default bare-number person scalar). The value is the
+        # ("Sarah is 28") resolves to ``age`` (the default bare-number person scalar). The value is the
         # NUM surface as a STRING → routes to entity_attributes downstream (these rels carry
         # tail_types={SCALAR}). Subject-agnostic: any "X is N <unit>"; NO age token list, NO number
         # zoo — the NUM is detected grammatically (pos NUM / nummod) and the unit via the cue map.
-        # Subject via the existing intra-turn coref ("she"→nearest named person; "Taylor"→the PROPN).
+        # Subject via the existing intra-turn coref ("she"→nearest named person; "Sarah"→the PROPN).
         _units = _unit_scalar_map()
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
@@ -4597,6 +5356,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # here (kept parity with the copula-state chain). "I am 40" still routes via the identity/
             # self path; this chain handles a NON-self measured subject.
             if _is_first_person_personal_pronoun(tok):
+                continue
+            # ATTRIBUTE-SCALAR GUARD (Defect 1): a possessed-attribute literal ("my employee id is
+            # 4471", "the laptop's serial is XR7-9920") is NOT a measured person — step aside so the
+            # bare NUM is captured VERBATIM by _chain_attr_scalar, never mis-read as ``age``. Kinship
+            # subjects ("my daughter is 28") are EXCLUDED from the binding, so their age still lands.
+            if _attr_scalar_binding(tok) is not None:
                 continue
             subject = (tok.text or tok.lemma_ or "").strip().lower()
             _cr = _person_coref(tok)
@@ -4649,7 +5414,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 num_tok = _num
                 break
             # (b) BARE NUM person-scalar: a NUM directly as the copula complement (attr/acomp/attr-num)
-            #     with no unit → age. "Taylor is 28".
+            #     with no unit → age. "Sarah is 28".
             if rel is None:
                 for c in head.children:
                     if c.pos_ == "NUM" and c.dep_ in ("attr", "acomp", "dobj", "obj"):
@@ -4668,14 +5433,22 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # GLiNER2 type is not admitted by the scalar rel's head_types: emit NOTHING here and do NOT
             # claim the subject, leaving ``_chain_copula_state`` to capture the entity relationally
             # (it survives the gate, head_types={ANY}). The Person cases the family fix added (she/he/
-            # Taylor — untyped pronoun or Person PROPN) are ADMITTED → unchanged. Metadata-driven
+            # Sarah — untyped pronoun or Person PROPN) are ADMITTED → unchanged. Metadata-driven
             # (overlay head_types), grammatical (GLiNER2 ent_type), subject-agnostic, NO word list.
             try:
                 _subj_et = (tok.ent_type_ or "").strip()
             except Exception:  # noqa: BLE001 — fail-safe
                 _subj_et = ""
-            if not _scalar_rel_admits_subject(rel, _subj_et):
-                continue  # leave the entity to its relational has_state capture (additive, not dead-C)
+            # PROPER-NOUN OVERRIDE (live-only bug, was silently dropping per-member ages): a PROPER
+            # NOUN subject ("Mia is 10", "Theo is 12") is a NAMED entity whose bare-cardinal
+            # copula complement is ITS OWN measurement. GLiNER2's type on a one-name micro-sentence is
+            # NOISE — it mis-types "Mia"→Animal and "Theo"→Organization, so the additive guard
+            # below would VETO their age (head_types={Person}) while admitting "Leo"→Person. The
+            # guard's real job is the COMMON-noun over-reach ("the tomatoes are 2-3 inches tall" → leave
+            # to has_state). A PROPN named subject is never that case, so trust the grammar, not the
+            # noisy NER. Grammatical (PROPN), subject-agnostic, NO word list.
+            if tok.pos_ != "PROPN" and not _scalar_rel_admits_subject(rel, _subj_et):
+                continue  # common-noun, type-incompatible → let has_state capture it relationally
             # SCALAR emit: object is the STRING value; verb_tok=head so a date could bind (rare);
             # obj_tok=num_tok claims the number span. The rel carries tail_types={SCALAR} downstream so
             # the value lands in entity_attributes, never resolved to a UUID.
@@ -4849,6 +5622,27 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _generic_surface = ""
             if generic_obj is not None:
                 _generic_surface = (generic_obj.lemma_ or generic_obj.text or "").strip().lower()
+            # KINSHIP COLLECTIVE re-route: when the generic head is a kinship collective the pre-pass
+            # flagged ("kids"/"children"/"sons" → child_of), each named member is bound to the head's
+            # KINSHIP rel toward the possessor — (mia, child_of, user) — NOT (user, have, mia)
+            # and NOT (user, owns, kids). Direction: the kin map gives the rel the HEAD plays toward the
+            # possessor, so the member is the SUBJECT and the possessor the OBJECT. The head's intrinsic
+            # gender (if any — neutral kin roles carry none) rides as a scalar on each member. Metadata-
+            # driven (kinship cue maps), grammar-gated; the inchoative/event path below is skipped here.
+            _kin_route = _kin_collective.get(generic_obj.i) if generic_obj is not None else None
+            if _kin_route:
+                _kin_rel, _kin_gender_val = _kin_route
+                _claim(generic_obj)  # the collective head is consumed by the kinship route (not residue)
+                for member in _np_conjuncts(spec_head):
+                    _mp = _spec_phrase(member)
+                    if not _mp or len(_mp) < 2 or _mp in ("it", "they", "them"):
+                        continue
+                    _emit(_mp, _kin_rel, subject,
+                          verb_tok=svo_head, obj_tok=subj_tok, subj_tok=member)
+                    if _kin_gender_val:
+                        _emit(_mp, "has_gender", _kin_gender_val,
+                              verb_tok=None, obj_tok=None, subj_tok=member)
+                continue
             # DISTRIBUTE the event over each named specifier (its coordinated conjuncts).
             for member in _np_conjuncts(spec_head):
                 obj_phrase = _spec_phrase(member)
@@ -4889,7 +5683,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         #                                              the rel_types overlay (_possession_rel_for_type).
         #   3c. NON-kin, NOT self-possessed person/role → (name, has_role, type) — a generic role slot.
         #   4. age scalar (name, age, "19")         — the bare cardinal in the binding's span.
-        #   5. nickname (name, also_known_as, Sam)  — a "goes by Sam" run.
+        #   5. nickname (name, also_known_as, Theo)  — a "goes by Theo" run.
         #   6. SUPPRESS the bare TYPE noun (son/daughter/dog/children) from becoming a standalone entity
         #      (claim it) once the named instance binds — the role is a CLASSIFICATION, not a thing.
         # Gated behind SPINE_NAMING_CHAIN (parity with the sibling naming chains); subject-agnostic,
@@ -4948,15 +5742,55 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             elif _social_rel:
                 # a PERSON social role → the social tie to the speaker (friend_of / knows). Never owns.
                 _emit(name_key, _social_rel, "user", subj_tok=None, obj_tok=None)
+            elif _name_ner == "PERSON":
+                # CARVE-OUT FAIL-SAFE DEGRADE: a PERSON-typed named instance introduced by a common-noun
+                # role that is NEITHER kinship NOR an already-grown social role ("my colleague Sam", "a
+                # roommate named Dana"). The social_role class is GROWN per-tenant and is empty/missing
+                # here, so we DEGRADE to the generic walkable ``related_to(name, user)`` (a PERSON is
+                # NEVER ``owns``) — captured, NOT dropped, NOT an error — and QUEUE the role noun for
+                # freq-gated growth. After it grows, the elif above routes it to the social tie. Person-
+                # safe by construction (gated on the instance's GLiNER2 PERSON type, no word list).
+                _emit(name_key, "related_to", "user", subj_tok=None, obj_tok=None)
+                _record_cue_candidate(type_head, "social_role")
             elif b.possessor_is_self:
                 _poss = _possession_rel_for_type(type_head, instance_type_tag=_name_ner)
                 _emit("user", _poss, name_key, subj_tok=None, obj_tok=None)
-            # ELSE (non-kin, non-social, NOT self-possessed — "a server named Atlas" stated
-            # without a possessor): the ``instance_of`` classification already files the instance; we
-            # mint NO possession/role edge (there is no stated relation to bind). A determiner-
-            # introduced person-role apposition ("Rachel, a doctor") never reaches THIS chain (it is a
-            # TYPE apposition, rejected by the binding detector) — it is owned by ``_chain_appositive``
-            # which mints its ``has_role``. So no generic role slot is fabricated here.
+            else:
+                # NO stated possessor, but the named instance may be the OBJECT of a SELF-subject
+                # ACTIVITY verb — "We run a web server named Apollo" → (user, run, apollo). The
+                # atomizer SPLITS an infra membership list ("we run three servers: a web server named
+                # Apollo, …") into one such atom per item, so without this the members are typed
+                # (instance_of) but NEVER linked to the user. Locate the TYPE-noun token, climb to its
+                # governing content VERB; if that verb has a 1st-person subject and is not be/naming/
+                # possession-generic, mint (user, <verb-lemma>, name). The possession-generic case
+                # ("we have …") is already the self-possessed branch above. Subject-agnostic,
+                # grammatical (the user's OWN verb), NO verb word list. Fail-safe → no edge.
+                try:
+                    _tn_tok = next(
+                        (t for t in doc if t.pos_ in ("NOUN", "PROPN")
+                         and (t.text or "").strip().lower() == type_head), None)
+                    _gv = None
+                    _cur = _tn_tok
+                    _hops = 0
+                    while _cur is not None and _hops < 6:
+                        if _cur.pos_ == "VERB":
+                            _gv = _cur
+                            break
+                        if _cur.head is None or _cur.head.i == _cur.i:
+                            break
+                        _cur = _cur.head
+                        _hops += 1
+                    if _gv is not None:
+                        _gl = (_gv.lemma_ or _gv.text or "").strip().lower()
+                        _gsubj = next((c for c in _gv.children
+                                       if c.dep_ in ("nsubj", "nsubjpass")), None)
+                        if (_gl and _gl != "be" and _gl not in _naming_verbs()
+                                and _gl not in _possession_verbs()
+                                and _gsubj is not None
+                                and _is_first_person_personal_pronoun(_gsubj)):
+                            _emit("user", _gl, name_key, subj_tok=None, obj_tok=None)
+                except Exception:  # noqa: BLE001 — fail-safe: activity membership is best-effort
+                    pass
             # 4. age scalar (the bare cardinal in the binding's span) → the age rel (tail_types=SCALAR).
             if b.age:
                 _emit(name_key, "age", b.age, subj_tok=None, obj_tok=None)
@@ -5049,6 +5883,276 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             _emit(named, "has_role", role, obj_tok=tok, subj_tok=head)
 
+    def _reconcile_collective_member_list(doc):
+        # See COLLECTIVE_MEMBER_LIST. Reconcile a "<subj> <verb> [<count>] <HEAD>: M1, M2, …" named
+        # enumeration AFTER the generic chains have run. The generic chains (SVO / classification /
+        # named-instance) mangle this construction: they make the collective HEAD a type each member is
+        # ``instance_of`` and the user ``owns``, only type the FIRST member, and never route the members
+        # to their proper membership/kinship edge. Here we detect the construction structurally, route
+        # by the HEAD noun's resolved cue/type, distribute to EVERY member, and drop the junk. The HEAD
+        # is the dobj/obj of a non-copula verb; the members are the appos PROPN + its coordinated PROPN
+        # conjuncts. Kinship HEAD (cue map) → (member, kin_rel, possessor) + intrinsic gender, NO type;
+        # non-kin group HEAD → (member, instance_of, SINGULAR head) + the membership/activity relation
+        # (a non-self group governor → member_of the governor; a self governor → its own verb to each
+        # member, e.g. "we run servers" → (user, run, <server>)). Subject-agnostic, cue/morphology/
+        # parse-driven, NO collective-noun word list. Fail-safe: any error → today's chain output.
+        if not COLLECTIVE_MEMBER_LIST:
+            return
+        try:
+            _kin_map = _kinship_rel_map()
+            _gen_map = _kinship_gender_map()
+        except Exception:  # noqa: BLE001 — fail-safe
+            _kin_map, _gen_map = {}, {}
+        try:
+            _poss_verbs = _possession_verbs()
+        except Exception:  # noqa: BLE001 — fail-safe
+            _poss_verbs = frozenset()
+        for _v in doc:
+            if _v.pos_ not in ("VERB", "AUX"):
+                continue
+            _vl = (_v.lemma_ or _v.text or "").strip().lower()
+            if not _vl or _vl == "be":
+                continue
+            _subj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if _subj is None:
+                continue
+            for _head in _v.children:
+                if _head.dep_ not in ("dobj", "obj") or _head.pos_ != "NOUN":
+                    continue
+                # the HEAD must INTRODUCE a NAMED LIST: an appos PROPN member, and the HEAD is a genuine
+                # collective (plural morphology, a numeric modifier, OR more than one named member).
+                _m0 = next((g for g in _head.children
+                            if g.dep_ == "appos" and g.pos_ == "PROPN"), None)
+                if _m0 is None:
+                    continue
+                _members_toks = [t for t in _np_conjuncts(_m0) if t.pos_ == "PROPN"]
+                _members: list = []
+                for _mt in _members_toks:
+                    _ms = (_mt.text or "").strip().lower()
+                    if _ms and _ms not in _members:
+                        _members.append(_ms)
+                try:
+                    _is_plural = "Plur" in _head.morph.get("Number")
+                except Exception:  # noqa: BLE001
+                    _is_plural = False
+                _has_count = any(c.pos_ == "NUM" and c.dep_ == "nummod" for c in _head.children)
+                if not _members or not (_is_plural or _has_count or len(_members) > 1):
+                    continue
+                _head_lemma = (_head.lemma_ or _head.text or "").strip().lower()
+                _head_surface = (_head.text or "").strip().lower()
+                try:
+                    _head_sing, _ = _morph_variants(_head_surface)
+                except Exception:  # noqa: BLE001
+                    _head_sing = _head_lemma
+                _head_sing = _head_sing or _head_lemma
+                _head_variants = {x for x in (_head_lemma, _head_surface, _head_sing) if x}
+                _kin_rel = _kin_map.get(_head_lemma) or _kin_map.get(_head_sing)
+                _gender = _gen_map.get(_head_lemma) or _gen_map.get(_head_sing)
+                _subj_is_self = _is_first_person_personal_pronoun(_subj)
+                _subj_surface = "user" if _subj_is_self else \
+                    (_subj.text or _subj.lemma_ or "").strip().lower()
+                _member_set = set(_members)
+                # The FULL enumerated region: every NOUN/PROPN in the appos/conj subtree under the head
+                # / first member, INCLUDING common-noun specifiers ("a designer named Priya" contributes
+                # "designer"). The dash-specifier RECOVERY pass distributes the raw colon list over ALL
+                # of these, minting (governor, owns/have, <specifier>) junk we must drop alongside the
+                # member possession junk. Structural walk, NO word list.
+                _region_surfaces = set(_member_set) | _head_variants
+                try:
+                    _frontier = [_m0, _head]
+                    _seen_i = {_m0.i, _head.i}
+                    while _frontier:
+                        _nx = []
+                        for _t in _frontier:
+                            for _c in _t.children:
+                                if _c.i in _seen_i or _c.pos_ not in ("NOUN", "PROPN"):
+                                    continue
+                                if _c.dep_ in ("appos", "conj", "compound", "nmod"):
+                                    _seen_i.add(_c.i)
+                                    _cs = (_c.text or "").strip().lower()
+                                    if _cs:
+                                        _region_surfaces.add(_cs)
+                                    _nx.append(_c)
+                        _frontier = _nx
+                except Exception:  # noqa: BLE001 — fail-safe: fall back to members+head only
+                    _region_surfaces = set(_member_set) | _head_variants
+                _governors = {_subj_surface, "user"}
+
+                # ── DROP the junk the generic chains / dash-recovery emitted for THIS construction ──
+                def _is_junk(_f, _hv=_head_variants, _ms_set=_member_set, _vlemma=_vl,
+                             _region=_region_surfaces, _govs=_governors):
+                    _s = (_f.subject or "").strip().lower()
+                    _r = (_f.rel_type or "").strip().lower()
+                    _o = (_f.object or "").strip().lower()
+                    # a member is ``instance_of`` the COLLECTIVE head (plural class) — never its real type
+                    if _r == "instance_of" and _o in _hv and _s in _ms_set:
+                        return True
+                    # subject owns/has a MEMBER (possession junk: "user owns mia"/"team have sarah")
+                    if _r in ("owns", "own", "have", "has") and _o in _ms_set:
+                        return True
+                    # the GOVERNOR (the construction's subject, or the user) "owns/has" anything in the
+                    # enumerated region — the group does not OWN its listed members/specifiers; they are
+                    # member_of it ("team owns designer"/"team have sarah" → dropped; "user owns team",
+                    # subject=user object NOT in region, is KEPT).
+                    if _r in ("owns", "own", "have", "has") and _s in _govs and _o in _region:
+                        return True
+                    # subject → (possession/verb) → the collective HEAD itself ("user have kids")
+                    if _r in ("owns", "own", "have", "has", _vlemma) and _o in _hv:
+                        return True
+                    # the GOVERNING GROUP itself is not "owned": once a non-self collective ("my team")
+                    # governs a routed member list, the possessive's (user, owns, team) edge is
+                    # redundant noise — the members are ``member_of`` the group, not the group a
+                    # possession. Drop a (governor, owns/has, <the governing group>) edge. Subject-
+                    # agnostic; only fires for a NON-self governing collective inside this chain.
+                    if (_r in ("owns", "own", "have", "has")
+                            and not _subj_is_self and _subj_surface
+                            and _subj_surface not in ("user", "")
+                            and _o == _subj_surface):
+                        return True
+                    # MEMBER ↔ MEMBER spurious edge: the members of an enumeration are distinct PEERS,
+                    # so any edge BETWEEN two of them is a mis-link — e.g. the geo-containment chain
+                    # reads "three cities: Paris, Tokyo, Cairo" as Paris located_in Tokyo. Drop it.
+                    if _s in _ms_set and _o in _ms_set:
+                        return True
+                    return False
+                _kept = [_f for _f in out if not _is_junk(_f)]
+                if len(_kept) != len(out):
+                    for _f in out:
+                        if _is_junk(_f):
+                            seen.discard((_f.subject, _f.rel_type, (_f.object or "").strip().lower()))
+                    out[:] = _kept
+
+                # members that ALREADY carry a self→member edge (the named-instance chain links the
+                # FIRST member's possession, e.g. (user, has_pet, rex)) — do NOT re-emit a conflicting
+                # bland possession for them; only the tail members need the distributed edge.
+                _self_keys = {"user"} if _subj_is_self else {_subj_surface}
+                _already_linked = {
+                    (_f.object or "").strip().lower() for _f in out
+                    if (_f.subject or "").strip().lower() in _self_keys
+                    and (_f.object or "").strip().lower() in _member_set
+                }
+                # ── ADD the correct member edges (dedup via _emit/seen) ──
+                for _m in _members:
+                    if _kin_rel:
+                        # KINSHIP collective: member kin-relates to the possessor; NO collective type.
+                        _emit(_m, _kin_rel, ("user" if _subj_is_self else _subj_surface))
+                        if _gender:
+                            _emit(_m, "has_gender", _gender)
+                    else:
+                        # GROUP collective: type each member by the SINGULAR head + a membership edge.
+                        if _head_sing and _head_sing != _m:
+                            _emit(_m, "instance_of", _head_sing)
+                        if _m in _already_linked:
+                            # the named-instance chain already linked this member to the governor
+                            # (e.g. (user, has_pet, rex)) — don't re-emit a conflicting bland edge.
+                            continue
+                        if not _subj_is_self and _subj_surface and _subj_surface != _m:
+                            # a non-self group governs the members → (member, member_of, group)
+                            _emit(_m, "member_of", _subj_surface)
+                        elif _subj_is_self:
+                            # self governs the members. A POSSESSION verb ("we have two dogs: Rex,
+                            # Bella") routes to the TYPE-appropriate possession rel (has_pet for an
+                            # animal head, owns for an object) — metadata-driven, NOT the bland "have".
+                            # An ACTIVITY verb ("we run servers", "I grow plants") keeps the user's OWN
+                            # verb. Subject-agnostic, NO verb/type word list.
+                            if _vl == "have" or _vl in _poss_verbs:
+                                try:
+                                    _het = (_head.ent_type_ or "").strip() or None
+                                except Exception:  # noqa: BLE001
+                                    _het = None
+                                _prel = _possession_rel_for_type(_head_sing, instance_type_tag=_het)
+                                _emit("user", _prel, _m)
+                            else:
+                                _emit("user", _vl, _m)
+                try:
+                    _claim(_head, _m0, *_members_toks)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _reconcile_named_role_collective(doc):
+        # COMMA-ROLE COLLECTIVE (GAP-2): "<group-subj> <have> a <role> named <Name>, a <role> named
+        # <Name>, and a <role> named <Name>". Unlike the colon form ("… has these members: a violinist
+        # named Mira, …") this has NO "members:" head and NO shared appos head, so split_enumeration
+        # returns None and the whole sentence reaches the deriver. The named members get
+        # instance_of <role> (analyze_naming) but NO membership edge — so the group floats via owns and
+        # the grouping auto-mint (keyed on member_of) never fires → the group is not walkable.
+        #
+        # Here we emit (member, member_of, <group>) for each NAMED member when a NON-SELF COMMON-NOUN
+        # subject governs a LIST (>=2) of "<role> named <PROPN>" bindings — exact PARITY with
+        # _reconcile_collective_member_list's GROUP branch (which owns the colon/"members:" form). The
+        # group is the governing subject's surface (the head noun "band"). Members are located
+        # STRUCTURALLY: a naming-verb (DB-grown naming_verb cue ∪ code-fallback) attached as ``acl`` to a
+        # role NOUN that sits in the verb's OBJECT region (never the subject), binding a PROPN name.
+        #
+        # GATES (deterministic, NO role/group/domain word list):
+        #   • subject is a COMMON NOUN (a collective that can HAVE members — "my band"/"the team"); a
+        #     1st-person / PROPN / pronoun subject is excluded (a person does not have "members").
+        #   • >=2 named members → a genuine membership LIST (a single "a dog named Rex" is not a roster;
+        #     this also bounds the possession/pet false-positive the colon form shares for a non-self
+        #     possessor — an honest, parity-level residual, NOT a new error class).
+        # _emit dedups via ``seen`` so a colon form that ALSO matches here lands the identical edges.
+        # Fail-safe: any error → today's chain output (no member_of), never lose other capture.
+        if not COLLECTIVE_MEMBER_LIST:
+            return
+        try:
+            _naming = _naming_verbs()
+        except Exception:  # noqa: BLE001 — fail-safe
+            _naming = _NAMING_VERB_LEMMAS
+
+        def _role_in_object_region(role_tok, verb_tok, subj_tok):
+            # True iff role_tok reaches verb_tok by climbing heads WITHOUT crossing the subject token
+            # (i.e. it lives in the verb's object/predicate region, not the subject NP). Cycle/hop-bounded.
+            _cur = role_tok
+            _hops = 0
+            while _cur is not None and _hops < 12:
+                if _cur.i == subj_tok.i:
+                    return False
+                if _cur.i == verb_tok.i:
+                    return True
+                if _cur.head is None or _cur.head.i == _cur.i:
+                    return False
+                _cur = _cur.head
+                _hops += 1
+            return False
+
+        for _v in doc:
+            if _v.pos_ not in ("VERB", "AUX"):
+                continue
+            _vl = (_v.lemma_ or _v.text or "").strip().lower()
+            if not _vl or _vl == "be" or _vl in _naming:
+                continue
+            _subj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if _subj is None:
+                continue
+            # a collective that HAS members is a COMMON NOUN; self / proper-name / pronoun subjects are not.
+            if _is_first_person_personal_pronoun(_subj) or _subj.pos_ != "NOUN":
+                continue
+            _group = (_subj.text or _subj.lemma_ or "").strip().lower()
+            if not _group:
+                continue
+            _members: list = []
+            for _nv in doc:
+                if _nv.dep_ != "acl":
+                    continue
+                if (_nv.lemma_ or _nv.text or "").strip().lower() not in _naming:
+                    continue
+                _role = _nv.head
+                if _role is None or _role.pos_ != "NOUN":
+                    continue
+                if not _role_in_object_region(_role, _v, _subj):
+                    continue
+                _name = next((c for c in _nv.children
+                              if c.dep_ in ("oprd", "dobj", "obj", "attr") and c.pos_ == "PROPN"), None)
+                if _name is None:
+                    continue
+                _ms = (_name.text or "").strip().lower()
+                if _ms and _ms != _group and _ms not in _members:
+                    _members.append(_ms)
+            if len(_members) < 2:
+                continue  # not a roster (single named instance is not a membership list)
+            for _m in _members:
+                _emit(_m, "member_of", _group)
+
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
     # "all the shapes the deriver knows", not "the order to try them in". Add a shape → add a chain.
@@ -5061,10 +6165,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # chains — that is exactly why atomization exists), recovering the distributed event edges. Dedup
     # at the harvest seam drops any overlap with the atomized edges. Subject-agnostic, deterministic.
     _chains = (
+        () if named_role_only else
         (_chain_dash_specifier,) if dash_specifier_only else
         (_chain_svo, _chain_intransitive, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_dash_specifier,
+         _chain_attr_scalar, _chain_classification_containment,
+         _chain_geo_containment_list,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
 
@@ -5075,6 +6182,40 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             except Exception as _ce:  # noqa: BLE001 — one chain failing never sinks the others
                 log.warning("linguistics.derive_chain_failed",
                             chain=getattr(_chain, "__name__", "?"), error=str(_ce)[:160])
+
+        # COLLECTIVE MEMBER-LIST reconciliation (post-chain): a "<subj> <verb> <HEAD>: M1, M2, …" named
+        # enumeration is fixed up here (drop collective-as-type/owns junk; distribute the right kin/
+        # membership edge to EVERY member). Runs in BOTH modes: the dash_specifier_only RECOVERY pass
+        # fires on the RAW un-atomized turn, so a named-member collective ("my team has three engineers:
+        # Sarah, Tom, and a designer named Priya") would otherwise leak the un-reconciled
+        # (team, owns, <member>) / collective-as-type junk from the dash chain. The reconciliation only
+        # acts on a HEAD with appos PROPER-NOUN members, so the crop-seed recovery case (common-noun
+        # specifiers — tomatoes/peppers) it is meant for is never touched. Fail-safe → chain output.
+        if not named_role_only:
+            try:
+                _reconcile_collective_member_list(doc)
+            except Exception as _rce:  # noqa: BLE001 — reconciliation never sinks capture
+                log.warning("linguistics.collective_reconcile_failed", error=str(_rce)[:160])
+
+        # COMMA-ROLE COLLECTIVE (gap-2): "<group> has a <role> named <Name>, …, and a <role> named
+        # <Name>" — no colon "members:" head, so split_enumeration leaves it whole and the members get
+        # instance_of but no membership edge. Distribute (member, member_of, <group>) for a non-self
+        # common-noun group governing a >=2 named-role roster. _emit dedups. The live harvest LLM-
+        # ATOMIZES a turn BEFORE the deriver, severing the roster into per-member atoms (each <2
+        # members → no roster), so the harvest runs ONE extra pass on the RAW un-atomized turn with
+        # ``named_role_only`` → ONLY this reconcile fires (no cross-clause smear; identical pattern to
+        # ``dash_specifier_only``). Skipped under the dash-recovery pass. Fail-safe → no member_of.
+        if not dash_specifier_only:
+            try:
+                _reconcile_named_role_collective(doc)
+            except Exception as _nrce:  # noqa: BLE001 — reconciliation never sinks capture
+                log.warning("linguistics.named_role_reconcile_failed", error=str(_nrce)[:160])
+
+        # named_role_only RECOVERY pass: like dash_specifier_only, this fires ONE reconcile on the raw
+        # turn to recover membership only — the rest of the turn's content is captured by the atomized
+        # passes, so the residue guard below would false-alarm. Return the member_of edges now.
+        if named_role_only:
+            return out
 
         # ── RESIDUE GUARD (gap-2 §10.3) — fail loud on a silently-dropped content span ───────────
         # Every content-bearing NOUN/PROPN that no chain claimed is failure-residue. It is NOT dropped
@@ -5366,6 +6507,92 @@ def is_interrogative_clause(text: str):
     except Exception as e:  # noqa: BLE001 — fail-safe: bias to skip on the recall path
         log.warning("linguistics.is_interrogative_failed", error=str(e)[:160])
         return True
+
+
+def count_declarative_assertions(text: str):
+    r"""Count the DECLARATIVE FACTUAL ASSERTIONS in ``text``. Returns an int, or ``None``
+    when the grammar layer is unavailable (caller keeps its existing behaviour).
+
+    WHY THIS EXISTS (intent-misroute fix): a multi-sentence first-person STATEMENT that opens
+    with a courtesy/announcement clause ("I wanted to tell you about my family. My wife's name
+    is Jordan. We have three kids …") is mis-scored as QUERY by GLiNER2 — the "tell" verb drags
+    it to the recall route and the whole turn is dropped at the QUERY gate. The grammar is
+    unambiguous: the turn CONTAINS asserted facts. This counts them so the caller can route a
+    fact-bearing declarative to STATEMENT/ingest BEFORE GLiNER2 (kept pure — no label edits).
+
+    An ASSERTION sentence (subject-agnostic, NO keyword/word-list — pure dependency structure):
+      • is NOT interrogative (``is_interrogative_clause`` is False), and
+      • has an EXPLICIT nominal subject (nsubj/nsubjpass) — this excludes IMPERATIVES like
+        "Tell me about my family" / "Show me my pets" (no overt subject), which is exactly the
+        recall surface we must NOT capture, and
+      • PREDICATES content one of two grammatical ways:
+          (a) COPULA assignment — a ``be`` root (or a ``cop`` dependency) with a nominal/numeric/
+              adjectival complement (attr/acomp/oprd): "my wife's name IS Jordan", "she IS 28".
+          (b) STATIVE/POSSESSIVE transitive — a content-verb root with a direct object (dobj/obj/
+              dative/attr): "we HAVE three kids", "I OWN a dog".
+      A retrieval-desire clause ("I want to know about my family", "I'd like to hear about X")
+      does NOT qualify: its predicate is the desire verb with an xcomp/prep, never a copula-attr
+      or a concrete dobj — so it scores 0 and stays for GLiNER2 (a real recall is preserved).
+
+    Caller contract: route to STATEMENT when the return is >= 2 (a clear, multi-fact declarative
+    that GLiNER2 would otherwise misroute) — single-assertion turns are left to GLiNER2 / the
+    affect+copula seams so this never widens the STATEMENT surface for ordinary one-liners.
+    Fail-safe: layer unavailable → None; any parse error → 0 (fall through to GLiNER2).
+    """
+    if not text or not text.strip():
+        return 0
+    nlp = _get_nlp()
+    if nlp is None:
+        return None
+    try:
+        doc = nlp(text)
+    except Exception as e:  # noqa: BLE001 — never crash the intent path
+        log.warning("linguistics.count_declarative_assertions_parse_failed", error=str(e)[:160])
+        return 0
+    try:
+        _COP_COMPL = {"attr", "acomp", "oprd"}
+        _OBJ_DEPS = {"dobj", "obj", "dative", "attr"}
+        n = 0
+        for sent in doc.sents:
+            stext = sent.text.strip()
+            if not stext:
+                continue
+            # A question clause is never an assertion (a real recall stays for GLiNER2).
+            if is_interrogative_clause(stext) is True:
+                continue
+            # Find a finite ROOT (or any clause head) with an EXPLICIT nominal subject.
+            asserted = False
+            for tok in sent:
+                if tok.dep_ not in ("nsubj", "nsubjpass"):
+                    continue
+                head = tok.head
+                if head is None:
+                    continue
+                children = list(head.children)
+                # (a) COPULA assignment: head is `be` with a nominal/adj complement, OR the head
+                #     itself is the predicate nominal carrying a `cop` child (spaCy attaches the
+                #     copula as a dependent of the complement in some parses).
+                is_be_root = (head.lemma_ == "be") and head.pos_ in ("AUX", "VERB")
+                has_cop_child = any(c.dep_ == "cop" for c in children)
+                if is_be_root or has_cop_child:
+                    if is_be_root:
+                        if any(c.dep_ in _COP_COMPL for c in children):
+                            asserted = True
+                    else:  # head IS the complement (noun/adj) with a cop child
+                        if head.pos_ in ("NOUN", "PROPN", "NUM", "ADJ"):
+                            asserted = True
+                # (b) STATIVE/POSSESSIVE transitive: a content-verb head with a direct object.
+                if not asserted and head.pos_ == "VERB":
+                    if any(c.dep_ in _OBJ_DEPS for c in children):
+                        asserted = True
+                if asserted:
+                    break
+            if asserted:
+                n += 1
+        return n
+    except Exception as e:  # noqa: BLE001 — fail-safe: fall through to GLiNER2
+        log.warning("linguistics.count_declarative_assertions_failed", error=str(e)[:160])
+        return 0
 
 
 # ── DIRECTIVE / CORRECTION GRAMMAR FIRST-CUT (negation is NOT GLiNER2's job) ────────
