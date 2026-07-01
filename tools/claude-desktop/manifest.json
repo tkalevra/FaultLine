@@ -32,7 +32,7 @@
     },
     {
       "name": "remember_facts",
-      "description": "Store facts from the conversation OR correct/update a prior fact. Correction signals: 'actually X is Y', 'X is now Y not Z', 'I meant X', any update to a previously stated value."
+      "description": "Store something the user said, OR correct/update a prior fact. Pass the user's message in NATURAL LANGUAGE, verbatim — do NOT extract, summarize, or restructure it into facts, triples, or line items yourself; FaultLine's engine does all extraction. Correction signals to forward as-is: 'actually X is Y', 'X is now Y not Z', 'I no longer …', 'I moved to …'."
     },
     {
       "name": "learn_facts",
