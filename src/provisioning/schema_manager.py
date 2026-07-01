@@ -456,7 +456,9 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
             # 108, _svo_predicate_token / _svo_object_head — to/for/with/…), 'inchoative_verb'
             # (migration 112, analyze_inchoative — start/begin/… ingressive START verbs), and
             # 'aspectual_control_verb' (migration 113, _aspectual_activity_xcomp — start/begin/keep/
-            # continue/resume/finish/stop phase verbs licensing the split-SVO xcomp descent). The
+            # continue/resume/finish/stop phase verbs licensing the split-SVO xcomp descent), and
+            # 'employment_verb' (migration 125, derive_sentence_facts._chain_employment — work/serve/
+            # act/employ/hire/… gating the "<subj> <verb> as <role> [at|for <org>]" construction). The
             # relations stay in code; only the verb-LEMMA / particle-SURFACE VOCABULARY is DB data that grows
             # (freq-gated, tenant-only). Copies the seeded GRAMMAR/UNIT/KINSHIP categories.
             #

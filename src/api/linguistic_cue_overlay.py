@@ -162,6 +162,30 @@ _BOOTSTRAP_POSSESSION_VERBS: frozenset[str] = frozenset({
     "have", "own", "possess", "keep", "hold",
 })
 
+# ── BOOTSTRAP EMPLOYMENT / ROLE-PREDICATION verb set — DB-DOWN SAFETY NET ONLY ───────
+# The bounded LEXICAL class of EMPLOYMENT / ROLE-PREDICATION verbs: a verb whose lexical semantics is
+# the subject HOLDING / DISCHARGING a role or affiliation ("I WORK as a nurse at the clinic", "she
+# SERVES as treasurer", "he ACTS as mediator", "I am EMPLOYED as an engineer at Globex", "she was HIRED
+# as a manager", "he was APPOINTED as chair"). Used by the employment deriver chain
+# (``linguistics.derive_sentence_facts`` → ``_chain_employment``) to recognize the
+# "<subject> <employment verb> as <role> [at|for <org>]" construction → occupation(<subject>, <role>)
+# + works_for(<subject>, <org>). This is what lets the chain be BROAD (any employment verb we've grown)
+# without over-capturing: "I DRESSED as a pirate" / "he is KNOWN as Ace" — ``dress``/``know`` are NOT
+# in this class, so those are NEVER read as an occupation. The verb cue class IS the safety gate.
+#
+# ⚠️ FLAGGED BOUNDED LEXICAL CLASS, honestly documented — like naming/acquisition/possession, the
+# employment "as <role>" reading cannot be made purely structural: "work as a nurse" (role) and "act as
+# a catalyst" vs "dress as a pirate" (costume) share the SAME prep-``as`` dep shape; only the verb's
+# lexical semantics distinguishes an employment/role-holding reading. It is firewalled downstream by
+# the parse the SAME way (a grammatical subject — 1st-person-personal-pronoun OR a named 3rd-person
+# subject — governing the verb, and the ``as``/``at``/``for`` PP frame), and it is DB-HELD + per-tenant
+# + GROWABLE (category='employment_verb') so a tenant grows its own employment verbs freq-gated without
+# code edits. This in-code set is the DB-DOWN code-fallback seed only, NOT the authority. Mirrors
+# migration 125's public seed.
+_BOOTSTRAP_EMPLOYMENT_VERBS: frozenset[str] = frozenset({
+    "work", "serve", "act", "function", "employ", "hire", "appoint", "contract",
+})
+
 # ── PROBLEM-NOUN (bland eventive head) class — DB-DOWN / COLD-TENANT FLOOR + grown per-tenant ──
 # problem_noun is the eventive-head class of an LVC device-issue: a light verb ("have"/"take"/"get")
 # governs a SEMANTICALLY-EMPTY problem-noun dobj whose meaning lives in its ``with``-PP complement
@@ -333,6 +357,7 @@ INCHOATIVE_VERB_CATEGORY = "inchoative_verb"
 ASPECTUAL_CONTROL_VERB_CATEGORY = "aspectual_control_verb"
 ACQUISITION_VERB_CATEGORY = "acquisition_verb"
 POSSESSION_VERB_CATEGORY = "possession_verb"
+EMPLOYMENT_VERB_CATEGORY = "employment_verb"
 PROBLEM_NOUN_CATEGORY = "problem_noun"
 SVO_PARTICLE_CATEGORY = "svo_particle"
 RELATIONAL_NOUN_CATEGORY = "relational_noun"
@@ -364,6 +389,7 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     ASPECTUAL_CONTROL_VERB_CATEGORY: _BOOTSTRAP_ASPECTUAL_CONTROL_VERBS,
     ACQUISITION_VERB_CATEGORY: _BOOTSTRAP_ACQUISITION_VERBS,
     POSSESSION_VERB_CATEGORY: _BOOTSTRAP_POSSESSION_VERBS,
+    EMPLOYMENT_VERB_CATEGORY: _BOOTSTRAP_EMPLOYMENT_VERBS,
     PROBLEM_NOUN_CATEGORY: _BOOTSTRAP_PROBLEM_NOUNS,
     SVO_PARTICLE_CATEGORY: _BOOTSTRAP_SVO_PARTICLES,
     RELATIONAL_NOUN_CATEGORY: _BOOTSTRAP_RELATIONAL_NOUNS,
@@ -534,6 +560,19 @@ def resolve_possession_verbs(dsn: str) -> frozenset[str]:
     lexical class (see ``_BOOTSTRAP_POSSESSION_VERBS``). Fail-safe: never empty (the possession_verb
     bootstrap floor)."""
     return resolve_cues(dsn, rel_type_overlay.get_current_schema(), POSSESSION_VERB_CATEGORY)
+
+
+def resolve_employment_verbs(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE EMPLOYMENT / role-predication verb lemma set for the ContextVar-
+    bound current request schema (tenant-only), via the SAME binding as the naming/lvc/acquisition/
+    possession/temporal resolvers. Used by ``linguistics.derive_sentence_facts``'s ``_chain_employment``
+    to recognize the "<subject> <employment verb> as <role> [at|for <org>]" construction —
+    occupation(<subject>, <role>) + works_for(<subject>, <org>) — so "I work as a nurse at the clinic",
+    "she serves as treasurer", "employed as an engineer at Globex" all land. The cue class IS the safety
+    gate that lets the chain be broad without over-capturing ("dressed as a pirate" / "known as X" — the
+    verb is NOT in this class → NOT an occupation). ⚠️ FLAGGED bounded lexical class (see
+    ``_BOOTSTRAP_EMPLOYMENT_VERBS``). Fail-safe: never empty (the employment_verb bootstrap floor)."""
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), EMPLOYMENT_VERB_CATEGORY)
 
 
 def resolve_problem_nouns(dsn: str) -> frozenset[str]:
