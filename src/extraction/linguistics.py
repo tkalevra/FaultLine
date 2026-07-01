@@ -711,6 +711,37 @@ def _naming_verbs() -> frozenset[str]:
         return _NAMING_VERB_LEMMAS
 
 
+# ── EMPLOYMENT / ROLE-PREDICATION verb class — DB-DOWN CODE-FALLBACK SEED ────────────
+# The bounded lexical class of EMPLOYMENT / role-predication verbs read by ``derive_sentence_facts``'s
+# ``_chain_employment`` (the "<subject> <verb> as <role> [at|for <org>]" construction). Authority lives
+# in ``<tenant>.linguistic_cues`` (category='employment_verb', seed-copied ∪ grown) resolved via the
+# per-tenant overlay; this frozenset is the DB-DOWN / unbound-overlay fail-safe ONLY. The cue class is
+# the SAFETY GATE — a verb NOT in it ("dress"/"know") never yields an occupation. Membership checks
+# call ``_employment_verbs()``, NOT this frozenset directly. Mirrors ``_naming_verbs`` exactly.
+_EMPLOYMENT_VERB_LEMMAS: frozenset[str] = frozenset(
+    {"work", "serve", "act", "function", "employ", "hire", "appoint", "contract"}
+)
+
+
+def _employment_verbs() -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE employment-verb lemma set via the overlay (ContextVar-bound to the
+    request's tenant schema — the SAME binding the naming/svo/kinship overlays use). Returns a frozenset
+    of lowercased verb lemmas. Fail-safe: any import/read failure / unbound schema / empty resolution →
+    the in-code ``_EMPLOYMENT_VERB_LEMMAS`` code-fallback seed so a DB-down / pre-migration / unwarmed-
+    overlay turn still recognizes the employment construction instead of silently dropping it. Never
+    empty. Mirrors ``_naming_verbs()`` exactly."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        cues = linguistic_cue_overlay.resolve_employment_verbs(dsn)
+        if cues:
+            return cues
+        return _EMPLOYMENT_VERB_LEMMAS  # empty resolution → code-fallback (never lose detection)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.employment_verbs_resolve_failed", error=str(e)[:160])
+        return _EMPLOYMENT_VERB_LEMMAS
+
+
 @dataclass(frozen=True)
 class NamingAnalysis:
     """A deterministic reading of a naming/dubbing construction ("a dog named Rex").
@@ -4608,6 +4639,85 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         except Exception:  # noqa: BLE001 — fail-safe: suppression is best-effort, never blocks capture
             _ni_suppress = set()
 
+    # ── EMPLOYMENT CONSTRUCTION PRE-PASS (role-predication + affiliation) ─────────────────────────
+    # "<subject> <employment verb> as <role> [at|for <org>]" — "I work as a Systems Analyst III at the
+    # University of Springfield's Computing Services", "Sarah works as a nurse at the clinic", "I serve
+    # as a board member of the co-op", "employed as an engineer at Globex". WITHOUT this chain the
+    # employment clause falls to the LLM relation-fill / rewrite, which drops the role and mislabels
+    # "work at <university>" as ``educated_at`` (a university object biases the weak model to education)
+    # and leaks genitive ``related_to`` junk. THE FIX (deterministic, grammar + a DB-grown verb cue
+    # class — NO per-subject/employer/role literals):
+    #   • the VERB LEMMA must be in the ``employment_verb`` cue class (``_employment_verbs()``, overlay
+    #     seed∪tenant + bootstrap floor). This class IS the safety gate: "I DRESSED as a pirate" /
+    #     "known as X" — ``dress``/``know`` are not employment verbs → NEVER read as an occupation.
+    #   • the SUBJECT is resolved GRAMMATICALLY — a 1st-person personal pronoun ("I"/"we") → ``user``,
+    #     or a NAMED 3rd-person subject ("Sarah works …") → that name. Not first-person-only.
+    #   • "as <NP>"        → occupation(subject, <full role NP incl. trailing "III">) — TYPE-agnostic.
+    #   • "at|for <ORG>"   → works_for(subject, <org NP>) — the EMPLOYMENT VERB (not the object's type)
+    #     determines the relation, so a university/school object is NEVER flipped to ``educated_at``.
+    #     The affiliation PP may hang directly off the verb ("work at HelpDeskPro") OR nest under the
+    #     role NP ("work as a <role> at <org>" — spaCy attaches "at" to the role head), so we look on
+    #     BOTH the verb and the role head. A temporal/duration "for" pobj (a resolved date span or a
+    #     DATE/TIME entity — "work for 3 years") is EXCLUDED, never bound as an employer.
+    # This pre-pass computes the bindings ONCE (so the SVO/intransitive/possessive chains SUPPRESS the
+    # verb + the role/org subtrees they would otherwise mis-capture) and ``_chain_employment`` emits
+    # off it. Subject-agnostic, deterministic, fail-safe (any miss → today's path). ``study``/``graduate``
+    # are NOT employment verbs → "I studied at the University" still routes to ``educated_at`` untouched.
+    _emp_binds: list = []
+    _emp_suppress: set = set()
+    try:
+        _empverbs = _employment_verbs()
+        for _v in doc:
+            if _v.pos_ != "VERB" or _v.i in _ni_suppress:
+                continue
+            _vlem = (_v.lemma_ or _v.text or "").strip().lower()
+            if _vlem not in _empverbs:
+                continue
+            _subj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if _subj is None:
+                continue
+            # NEGATED employment clause ("I don't work for them") → skip (absence deferred, SVO parity).
+            if any(c.dep_ == "neg" for c in _v.children):
+                continue
+            # ROLE: "as <NP>" — the prep "as" the verb governs, its NOUN/PROPN pobj is the role head.
+            _role = None
+            _as = next((c for c in _v.children if c.dep_ == "prep"
+                        and (c.text or "").strip().lower() == "as"), None)
+            if _as is not None:
+                _role = next((g for g in _as.children
+                              if g.dep_ == "pobj" and g.pos_ in ("NOUN", "PROPN")), None)
+            # ORG: "at|for <PROPN/NOUN>" governed by the verb OR nested under the role head. A pobj that
+            # is a resolved date span / DATE-TIME entity (duration "for 3 years") is not an employer.
+            _org = None
+            for _h in ([_v, _role] if _role is not None else [_v]):
+                for _c in _h.children:
+                    if _c.dep_ != "prep" or (_c.text or "").strip().lower() not in ("at", "for"):
+                        continue
+                    _po = next((g for g in _c.children
+                                if g.dep_ == "pobj" and g.pos_ in ("NOUN", "PROPN")
+                                and g.i not in _date_token_idx
+                                and (g.ent_type_ or "").upper() not in ("DATE", "TIME")), None)
+                    if _po is not None:
+                        _org = _po
+                        break
+                if _org is not None:
+                    break
+            if _role is None and _org is None:
+                continue  # not an employment frame this verb owns → leave to SVO/other chains
+            _emp_binds.append((_v, _subj, _role, _org))
+            # SUPPRESS the spans this construction OWNS so the SVO/intransitive/possessive chains never
+            # re-capture them: the verb (kills "(user, has_state, work)" + a duplicate SVO "work_at"),
+            # the role subtree (which — since "at <org>" nests under it — also covers the org PP and its
+            # genitive junk "(computing services, related_to, springfield)"), and the org subtree.
+            _emp_suppress.add(_v.i)
+            for _o in (_role, _org):
+                if _o is not None:
+                    for _d in _o.subtree:
+                        _emp_suppress.add(_d.i)
+    except Exception:  # noqa: BLE001 — fail-safe: employment detection never blocks capture
+        _emp_binds = []
+        _emp_suppress = set()
+
     # ── KINSHIP-COLLECTIVE PRE-PASS (the family-list case) ───────────────────────────────────────
     # "We have three kids: Mia, Theo, and Leo." — a COLLECTIVE kinship head ("kids"/"children"/
     # "sons") governing a named member list. The bare SVO would mint a degenerate (user, have, kids)
@@ -5013,6 +5123,57 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             for _a, _b in zip(_chain, _chain[1:]):
                 _emit_pair(_a.text, _b.text, child_tok=_a, parent_tok=_b)
 
+    def _chain_employment(doc):
+        # EMPLOYMENT construction (role-predication + affiliation). Consumes the bindings the
+        # ``_emp_binds`` pre-pass computed (verb in the ``employment_verb`` cue class + a grammatical
+        # subject + an "as <role>" and/or "at|for <org>" frame) and emits:
+        #   • occupation(<subject>, <full role NP>)  — the whole title incl. a trailing "III"/"Sr."
+        #   • works_for(<subject>, <org NP>)          — the EMPLOYMENT VERB decides the relation, so a
+        #     university/school object is never flipped to ``educated_at``.
+        # Subject-agnostic (1st-person → ``user``; a named 3rd-person subject → that name). The role/org
+        # objects are TYPE-agnostic. We DO NOT pass ``subj_tok`` to ``_emit`` (mirroring the kinship
+        # chain): the employment construction is an AUTHORITATIVE deterministic reading, so a prep-blind
+        # GLiNER2-minted rel for the pair (which would otherwise wrongly re-assert ``educated_at``)
+        # cannot override it — ``_minted_rel_for_pair`` needs BOTH tokens, so omitting the subject token
+        # disables the override while ``obj_tok`` still supplies GLiNER2 object typing. Fail-safe.
+        def _role_phrase(head):
+            # The FULL role title span (subject-agnostic, no literals): the head noun + its ENTIRE
+            # left-modifier run via spaCy ``left_edge`` — so a multi-level compound ("Systems Analyst
+            # III", where "Systems" is a compound of "Analyst" which is a compound of the head "III")
+            # is captured WHOLE, not just the head's direct child ("analyst iii"). Mirrors the shipped
+            # full-value span logic. A leading determiner ("a"/"the") is stripped. The trailing "at
+            # <org>" PP nests to the RIGHT of the head, so left_edge..head never includes it. Fail-safe
+            # → ``_np_phrase``.
+            try:
+                _lo = head.left_edge.i
+                _toks = [doc[_k] for _k in range(_lo, head.i + 1)]
+                while _toks and (_toks[0].pos_ == "DET" or _toks[0].dep_ == "det"
+                                 or _toks[0].is_punct or _toks[0].is_space):
+                    _toks.pop(0)
+                _ph = " ".join(t.text.strip() for t in _toks if t.text and t.text.strip()).lower()
+                return _ph or _np_phrase(head)
+            except Exception:  # noqa: BLE001 — never break capture on a span build
+                return _np_phrase(head)
+
+        for (_v, _subj, _role, _org) in _emp_binds:
+            if _is_first_person_personal_pronoun(_subj):
+                subject = "user"
+            else:
+                subject = _np_phrase(_subj) or (_subj.text or _subj.lemma_ or "").strip().lower()
+                _cr = _coref(_subj)
+                if _cr:
+                    subject = _cr
+            if not subject:
+                continue
+            if _role is not None:
+                role_phrase = _role_phrase(_role)  # full title → "systems analyst iii"
+                if role_phrase and len(role_phrase) >= 2:
+                    _emit(subject, "occupation", role_phrase, obj_tok=_role)
+            if _org is not None:
+                org_phrase = _object_value_phrase(_org)
+                if org_phrase and len(org_phrase) >= 2:
+                    _emit(subject, "works_for", org_phrase, verb_tok=_v, obj_tok=_org)
+
     def _chain_svo(doc):
         # SVO backbone (+ governing-verb date + conjunct distribution). Each non-copula content verb
         # with a subject and an object → (subject, verb-lemma[+particle], object). First-person subject
@@ -5023,6 +5184,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if tok.i in _ni_suppress:
                 continue  # the named-instance chain owns this clause's verb ("we have a son …")
+            if tok.i in _emp_suppress:
+                continue  # the employment chain owns this verb ("work as … at …") — no SVO dup
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -5110,6 +5273,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if tok.i in _ni_suppress:
                 continue  # the named-instance nickname relcl ("who goes by Theo") — not a state
+            if tok.i in _emp_suppress:
+                continue  # the employment chain owns this verb — never "(user, has_state, work)"
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -5202,6 +5367,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # appositive name) owned by the named-instance chain, NOT an ``owns`` of a bare type. Skip a
             # possessed head whose token the named-instance chain suppressed (else "(user, owns, dog)").
             if head.i in _ni_suppress:
+                continue
+            # EMPLOYMENT GUARD: the org affiliation PP ("… at the University of Springfield's Computing
+            # Services") is owned by the employment chain — skip a possessed/possessor token inside that
+            # span so we never leak the genitive "(computing services, related_to, springfield)" junk.
+            if head.i in _emp_suppress or tok.i in _emp_suppress:
                 continue
             # ATTRIBUTE-SCALAR GUARD (Defect 1): "my address is 123 …" / "the laptop's serial is X"
             # is owned by _chain_attr_scalar (the value is a VERBATIM SCALAR, not an ownership of the
@@ -6426,7 +6596,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     _chains = (
         () if named_role_only else
         (_chain_dash_specifier,) if dash_specifier_only else
-        (_chain_svo, _chain_intransitive, _chain_copula_state,
+        (_chain_employment,
+         _chain_svo, _chain_intransitive, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_dash_specifier,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
