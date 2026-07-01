@@ -5802,6 +5802,21 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
 
         log.info(f"re_embedder.name_conflict_resolution_start pending={len(conflicts)}")
 
+        # The tenant user entity (id == user_id) is CANONICAL and must win any conflict
+        # over its OWN name — never let the LLM adjudicate the user's identity onto a
+        # surrogate (registry.py: "user"/first-person always resolves to user_id). Derive
+        # user_id from the bound per-tenant schema (faultline_<uuid-with-underscores>).
+        # Fail-safe: None → today's LLM-only behavior.
+        _tenant_user_id = None
+        try:
+            with db_conn.cursor() as _uc:
+                _uc.execute("SELECT current_schema()")
+                _sch = (_uc.fetchone() or [None])[0] or ""
+            if _sch.startswith("faultline_"):
+                _tenant_user_id = _sch[len("faultline_"):].replace("_", "-")
+        except Exception:
+            _tenant_user_id = None
+
         # ────────────────────────────────────────────────────────────────
         # Step 2: Process each conflict
         # ────────────────────────────────────────────────────────────────
@@ -5933,11 +5948,33 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                     stats["errors"] += 1
                     continue
 
+                # CANONICAL USER OVERRIDE (deterministic): if either entity IS the tenant
+                # user (id == user_id), the user ALWAYS wins its own name — override the LLM.
+                # The user's identity is authoritative and must never be merged onto a
+                # surrogate. The recall path looks up the user's name by user_id, so losing
+                # it here is exactly what made "what is my name?" return nothing.
+                if _tenant_user_id and entity_id_1 == _tenant_user_id and winner_id != entity_id_1:
+                    winner_id, loser_id = entity_id_1, entity_id_2
+                    winner_name, loser_name = entity_name_1, entity_name_2
+                    log.info(f"re_embedder.name_conflict_user_canonical conflict_id={conflict_id} winner_is_user=true")
+                elif _tenant_user_id and entity_id_2 == _tenant_user_id and winner_id != entity_id_2:
+                    winner_id, loser_id = entity_id_2, entity_id_1
+                    winner_name, loser_name = entity_name_2, entity_name_1
+                    log.info(f"re_embedder.name_conflict_user_canonical conflict_id={conflict_id} winner_is_user=true")
+
                 # ────────────────────────────────────────────────────────────────
                 # Update aliases based on LLM decision
                 # ────────────────────────────────────────────────────────────────
                 try:
                     with db_conn.cursor() as cur:
+                        # Clear any OTHER preferred alias on the winner FIRST — the
+                        # one-preferred-per-entity constraint (idx_entity_aliases_one_preferred)
+                        # rejects a second preferred row, which was aborting the whole merge.
+                        cur.execute(
+                            "UPDATE entity_aliases SET is_preferred = false "
+                            "WHERE entity_id = %s AND alias <> %s AND is_preferred = true",
+                            (winner_id, disputed_name)
+                        )
                         # Winner: set preferred
                         cur.execute(
                             "UPDATE entity_aliases SET is_preferred = true "
