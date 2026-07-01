@@ -36,13 +36,17 @@ TOOLS = [
                        "fact about themselves, another person, or their world — a name, relationship, "
                        "preference, job, possession, or location — even mentioned in passing, and also "
                        "when they correct a prior fact. Default to calling it; skip only pure questions "
-                       "or chitchat. Do not ask permission first.",
+                       "or chitchat. Do not ask permission first. "
+                       "IMPORTANT — pass the user's message in NATURAL LANGUAGE, verbatim: do NOT extract, "
+                       "summarize, or restructure it into facts, triples, or line items yourself. FaultLine's "
+                       "engine does all extraction, validation, and structuring; it needs the raw sentence(s). "
+                       "(learn_facts is the only tool where you generate structured statements.)",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "The user's own sentence(s) containing the fact(s), copied verbatim. Required — never leave empty."
+                    "description": "The user's message in natural language, copied VERBATIM and in full — the raw sentence(s) exactly as they said them. Do NOT pre-extract, summarize, rephrase, or restructure it into facts, triples, or line items: FaultLine's engine does ALL extraction, typing, and structuring — it needs the raw words. Keep every word, especially 'not'/'no'/'now'/'actually'/'instead' and any names, values, and dates. Required — never leave empty."
                 },
                 "user_id": {
                     "type": "string",

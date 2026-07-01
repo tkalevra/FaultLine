@@ -737,6 +737,37 @@ def _np_phrase(tok) -> str:
     return " ".join(p.strip() for p in parts if p and p.strip()).lower()
 
 
+def _object_value_phrase(tok) -> str:
+    """Object/value NP phrase for a VALUE-bearing object slot (SVO/locative object).
+
+    Head + its left ``compound``/``amod`` modifiers (exactly like ``_np_phrase``), PLUS the head's
+    left ``nummod``/``quantmod`` — but ONLY when the head is a MULTI-TOKEN PROPER NAME. This is the
+    grammatical distinction between a NUMBER-THAT-IS-PART-OF-A-NAME and a NUMBER-THAT-IS-A-COUNT:
+
+      • "I live at 156 Cedar St. S"  → head "S" is PROPN with PROPN compounds ("Cedar", "St.") →
+        a NAMED value → keep the leading number → "156 cedar st. s" (the house number is the value).
+      • "I have 3 cats" / "I work for 3 companies" → head is a bare common NOUN → a COUNT → the
+        quantifier is NOT folded in → "cats" / "companies" (unchanged — no relational regression).
+
+    "Named" is decided STRUCTURALLY (subject-agnostic, no word list): the head is itself ``PROPN``,
+    or it carries a left ``PROPN`` ``compound`` child (the multi-token-proper-name signature). This
+    keeps the truncation fix scoped to values whose leading modifier genuinely belongs to the value
+    (addresses, product/model names, serials-as-names) and NEVER absorbs a count into a relational
+    object. Lowercased (matching ``_np_phrase`` / ``_emit``). Fail-safe → ``_np_phrase(tok)``.
+    """
+    try:
+        head_is_named = tok.pos_ == "PROPN" or any(
+            c.dep_ == "compound" and c.pos_ == "PROPN" and c.i < tok.i for c in tok.children
+        )
+        deps = ("compound", "amod", "nummod", "quantmod") if head_is_named else ("compound", "amod")
+        mods = [c for c in tok.children if c.dep_ in deps and c.i < tok.i]
+        parts = [m.text for m in sorted(mods, key=lambda m: m.i)] + [tok.text]
+        phrase = " ".join(p.strip() for p in parts if p and p.strip()).lower()
+        return phrase or _np_phrase(tok)
+    except Exception:  # noqa: BLE001 — fail-safe: never break capture on a span build
+        return _np_phrase(tok)
+
+
 def _np_conjuncts(head_tok) -> list:
     """Return ``head_tok`` plus its COORDINATED noun siblings ("tomatoes, peppers, and cucumbers").
 
@@ -2057,7 +2088,10 @@ def analyze_svo_relations(text: str) -> list:
                 continue
             # Object phrase = head + its left compound/amod modifiers (NP), with char offsets so the
             # caller can overlap-match a GLiNER2 entity onto this span.
-            object_text = _np_phrase(obj_tok)
+            # Grammar's fallback object surface: keep a NAMED multi-token value's leading number
+            # ("156 Cedar St. S") — the caller PREFERS a GLiNER2 entity overlapping the span, so this
+            # only affects the scalar-value fallback; a bare count ("3 cats") is never absorbed.
+            object_text = _object_value_phrase(obj_tok)
             if not object_text or len(object_text) < 2:
                 continue
             try:
@@ -4708,9 +4742,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     c.dep_ == "neg" for c in comp.children):
                 return None
             # VERBATIM value span = the complement's full subtree (covers "123 Main Street, Riverton,
-            # Ontario" / "XR7-9920"), sliced from the sentence text so commas/appositions survive.
+            # Ontario" / "XR7-9920" / "a Tesla Model 3"), sliced from the sentence text so commas/
+            # appositions/numbers survive. A LEADING DETERMINER ("a"/"an"/"the") is a function word,
+            # NOT part of the value (THE HARD LINE — a function word is never a memory), so it is
+            # dropped from the left edge → "Tesla Model 3", not "a Tesla Model 3".
             try:
-                _sub = list(comp.subtree)
+                _sub = sorted(comp.subtree, key=lambda t: t.i)
+                while _sub and _sub[0].pos_ == "DET":
+                    _sub = _sub[1:]
+                if not _sub:
+                    return None
                 _start = min(t.idx for t in _sub)
                 _end = max(t.idx + len(t.text) for t in _sub)
                 value = (sentence[_start:_end] or "").strip()
@@ -4765,6 +4806,66 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     _claim(_d)
                 for _d in b["comp"].subtree:
                     _claim(_d)
+            except Exception:  # noqa: BLE001
+                _claim(tok)
+
+    def _chain_quoted_value(doc):
+        # QUOTED-VALUE SCALAR — "my <attr> is '<verbatim quoted text>'" / "<X>'s <attr> is \"…\"".
+        # A quotation-mark-delimited span after a possessive-attribute copula is a VERBATIM scalar
+        # VALUE (a quote, a motto, a passphrase, a title) — the ENTIRE quoted text is the memory,
+        # kept intact and routed to entity_attributes (scalar_datatype="string"), NEVER decomposed
+        # into the clause spaCy parses INSIDE it. Detected purely structurally (subject-agnostic, NO
+        # word list): a copula ``be`` AUX whose nsubj is POSSESSED (1st-person poss determiner → user,
+        # or a genitive NOUN/PROPN possessor) + a balanced pair of QUOTE punct tokens after the copula.
+        # Quotation marks are a closed grammatical/punctuation primitive. Fail-safe; _emit dedups.
+        _QUOTES = {'"', "'", "‘", "’", "“", "”", "`"}
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            head = tok.head
+            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+                continue
+            # POSSESSOR — 1st-person poss determiner → user; genitive NOUN/PROPN poss → that possessor.
+            possessor = None
+            for c in tok.children:
+                if c.dep_ != "poss":
+                    continue
+                try:
+                    if c.morph.get("Person") == ["1"] and "Yes" in c.morph.get("Poss"):
+                        possessor = "user"
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                if c.pos_ in ("NOUN", "PROPN"):
+                    possessor = (c.text or c.lemma_ or "").strip().lower()
+                    break
+            if not possessor:
+                continue
+            if any(c.dep_ == "neg" for c in head.children):
+                continue  # negated copula — absence deferred (parity with the other scalar chains)
+            # Balanced QUOTE pair AFTER the copula head → the inner span is the verbatim value.
+            q = [t for t in doc if t.i > head.i and (t.text or "").strip() in _QUOTES]
+            if len(q) < 2:
+                continue
+            first, last = q[0], q[-1]
+            if last.idx <= first.idx + len(first.text):
+                continue
+            value = (sentence[first.idx + len(first.text):last.idx] or "").strip()
+            if not value or len(value) < 2:
+                continue
+            attribute = _np_phrase(tok)
+            if not attribute:
+                continue
+            rel = attribute.replace(" ", "_")
+            _emit(possessor, rel, value, subj_tok=tok, obj_tok=None, scalar_datatype="string")
+            # CLAIM the subject subtree AND every token between the quotes so the residue guard never
+            # re-flags the inner-clause tokens ("constant", "change") as uncovered content.
+            try:
+                for _d in tok.subtree:
+                    _claim(_d)
+                for _t in doc:
+                    if first.i <= _t.i <= last.i:
+                        _claim(_t)
             except Exception:  # noqa: BLE001
                 _claim(tok)
 
@@ -4969,7 +5070,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     continue  # a named-instance collective/type the binding chain owns
                 if _ct.i in _kin_collective:
                     continue  # kinship COLLECTIVE ("kids") — members route via the kinship rel (dash chain)
-                obj_phrase = _np_phrase(_ct)
+                # VALUE-SPAN build: a NAMED multi-token object ("156 Cedar St. S") keeps its leading
+                # number (the value is the whole name); a bare count ("3 cats") does NOT — so a scalar
+                # value is captured in FULL without absorbing a quantifier into a relational object.
+                obj_phrase = _object_value_phrase(_ct)
                 if not obj_phrase or len(obj_phrase) < 2:
                     continue
                 if obj_phrase in ("it", "they", "them"):
@@ -6325,7 +6429,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         (_chain_svo, _chain_intransitive, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_dash_specifier,
-         _chain_attr_scalar, _chain_classification_containment,
+         _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
          _chain_geo_containment_list,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
