@@ -155,6 +155,22 @@ Expand once and every future conversation in that domain benefits automatically.
 
 ---
 
+## Multi-tenant isolation
+
+Every user gets a **physically separate PostgreSQL schema** (`faultline_<user_id>`) and their own Qdrant collection. Each request binds to the caller's schema via `SET search_path` **without `public`**, so one tenant's queries cannot even *name* another tenant's tables. There is no shared `user_id` column to filter on and forget — the boundary **is** the schema, enforced by the database.
+
+**Verified on a live instance.** Three fresh tenants, each told one distinct thing, then inspected:
+
+| Tenant | Told | Stored in *its* schema | Any other tenant's data? |
+|---|---|---|---|
+| A | a cat named Whiskers | `cat → feline → mammal → animal` | **none** |
+| B | a red Tesla Model 3 | `tesla → vehicle → transportation_device` | **none** |
+| C | lives in Berlin, Germany | `berlin → city`, `germany → country` | **none** |
+
+Each schema contained **only** its own entities and hierarchy — zero cross-tenant tokens. A recall issued as one tenant can only ever read from that tenant's schema, so it is structurally impossible for one user's memory to surface in another's. (The per-tenant `±6` hierarchy also grew independently in each — isolation holds through the growth engine, not just at rest.)
+
+---
+
 ## Requirements
 
 - Docker and Docker Compose
@@ -168,7 +184,19 @@ Expand once and every future conversation in that domain benefits automatically.
 ```bash
 git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
+```
 
+**Guided setup (recommended).** An interactive wizard picks your LLM backend, **tests the connection and lists your available models to choose from**, generates a secret `MCP_API_KEY`, sorts out your tenant id, and writes a ready-to-use `.env` — then prints exactly what to paste into your client:
+
+```bash
+./setup.sh            # Linux / macOS
+setup.bat             # Windows
+#  or, on any platform:  python3 quickstart.py
+```
+
+**Or configure manually:**
+
+```bash
 cp .env.example .env
 # Set LLM_BACKEND_TYPE + LLM_BASE_URL to point at the LLM you already run
 # (Ollama, LM Studio, OpenWebUI, OpenAI, Anthropic, ...)
@@ -179,30 +207,43 @@ curl http://localhost:8000/health
 # {"status": "ok", ...}
 ```
 
+Re-run the connectivity check anytime with `python3 quickstart.py --validate`.
+
 FaultLine hooks into an LLM you already run — it doesn't host one. (If you *don't* have a model handy, `docker compose --profile ollama up -d` starts a bundled Ollama alongside the stack.)
 
 The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no GPU or CUDA required). Takes 3–5 minutes.
 
 ### Connecting a client
 
-The backend is the same for every client — only a few env values change. Point `LLM_BACKEND_TYPE` / `LLM_BASE_URL` at whatever you run, and connect over HTTP (the OpenWebUI filter on `:8000`) or MCP (`:8002`). Any number of clients can share the one store at once.
+Two independent choices — the wizard handles both, or set them by hand.
 
-| Client | `LLM_BACKEND_TYPE` | `LLM_BASE_URL` (example) | How it connects |
-|---|---|---|---|
-| OpenWebUI | `openwebui` | `http://open-webui:8080` | Filter function → `:8000` |
-| LM Studio | `lm_studio` | `http://host.docker.internal:1234` | Filter function → `:8000` |
-| Ollama (direct) | `ollama` | `http://host.docker.internal:11434` | Filter function → `:8000` |
-| OpenAI / Anthropic | `openai` / `anthropic` | provider API base URL | Filter function → `:8000` |
-| Claude Desktop | *(n/a — Claude is the client)* | — | MCP → `:8002` |
+**1. Which LLM FaultLine talks to** (`LLM_BACKEND_TYPE` + `LLM_BASE_URL` — host+port only, no path):
+
+| Backend | `LLM_BACKEND_TYPE` | `LLM_BASE_URL` (example) |
+|---|---|---|
+| LM Studio | `lm_studio` | `http://host.docker.internal:1234` |
+| Ollama | `ollama` | `http://host.docker.internal:11434` |
+| OpenWebUI | `openwebui` | `http://open-webui:8080` |
+| OpenAI / Anthropic / Groq | `openai` / `anthropic` / `groq` | provider API base URL |
+
+**2. How your chat client calls FaultLine's memory tools** — all through the **MCP server on `:8002`** (Bearer `MCP_API_KEY`). Any number of clients can share one store at once:
+
+- **OpenWebUI** → Settings → Tools → Add Tool Server *(below)*
+- **Claude Desktop** → the `.mcpb` extension *(below)*
+- **Cursor / other MCP clients** → `http://<host>:8002/mcp` with header `Authorization: Bearer <MCP_API_KEY>`
 
 ### Connect to OpenWebUI
 
-1. Go to **Workspace → Functions → +** in OpenWebUI
-2. Paste the contents of `openwebui/faultline_function.py`
-3. Open **Valves** and set `FAULTLINE_URL` to `http://faultline:8000` (or `http://localhost:8000` if not using Docker networking)
-4. Enable the filter
+OpenWebUI calls FaultLine's tools through its **OpenAPI tool server** connection:
 
-Start a conversation — FaultLine begins learning immediately.
+1. **Settings → Tools → Add Tool Server** (or **Admin Settings → External Tools → +**).
+2. **URL:** `http://faultline-mcp:8002` (same Docker network) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
+3. **Auth:** `Bearer` → your `MCP_API_KEY`.
+4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them (it forwards the `X-OpenWebUI-User-Id` header FaultLine keys on — without it, per-user memory won't work).
+
+OpenWebUI reads `/openapi.json` and surfaces `recall_memory`, `remember_facts`, `retract_fact` as tools in every conversation.
+
+> **Legacy alternative:** the inlet/outlet Filter (`openwebui/faultline_function.py`, Workspace → Functions) still exists for automatic injection, but the MCP tool server above is the supported path.
 
 ---
 
@@ -306,9 +347,10 @@ See [`.env.example`](.env.example) for the full list with descriptions.
 
 | File | What it is |
 |---|---|
-| `openwebui/faultline_function.py` | The OpenWebUI filter — drop this in and you're running |
+| `quickstart.py` · `setup.sh` · `setup.bat` | Guided setup wizard — writes `.env`, tests connectivity, lists your models |
+| `src/mcp/server.py` | The MCP tool server — the live integration path |
 | `src/api/main.py` | The backend API |
-| `src/mcp/server.py` | The MCP tool server |
+| `openwebui/faultline_function.py` | Legacy OpenWebUI Filter (the MCP tool server above is preferred) |
 | `migrations/` | Database schema — runs automatically on first start |
 
 ---
