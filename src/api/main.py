@@ -104,6 +104,26 @@ def _query_has_name_intent(query_text: str) -> bool:
     return False
 
 
+def _query_is_first_person_name(query_text: str) -> bool:
+    """True when the recall asks about the SPEAKER'S OWN name (first-person), so the
+    user's registry name should surface even if the noun-anchor resolved to "name"
+    rather than the user (e.g. "what is my name?"). Excludes a foreign possessor
+    ("my mother's name" → the mother, not the user). Presentation gate only;
+    subject-agnostic (grammar/possessive, no entity names)."""
+    if not query_text:
+        return False
+    q = query_text.lower()
+    # A genitive possessor other than a bare "my name" (e.g. "my mother's name",
+    # "Bob's name") is NOT the speaker's own name — let it anchor to that entity.
+    if re.search(r"\b\w+'s\s+name\b", q) and not re.search(r"\bmy\s+name\b", q):
+        return False
+    return bool(
+        re.search(r"\bmy\s+(full |real |legal |actual |preferred |first |last )?name\b", q)
+        or re.search(r"\bwhat\s+am\s+i\s+called\b", q)
+        or re.search(r"\bwho\s+am\s+i\b", q)
+    )
+
+
 def _synthesize_user_name_facts(db_conn, user_id: str, preferred_user_name: str = None) -> list[dict]:
     """PIECE 2 — NAME-INTENT SURFACING (read-time presentation, fail-safe).
 
@@ -34296,7 +34316,9 @@ async def query(request: QueryRequest) -> QueryResponse:
             if len(gated_facts) < _before_ni:
                 log.info("query.name_intent_gate.aka_held",
                          before=_before_ni, after=len(gated_facts))
-        elif QUERY_NAME_INTENT_SURFACING and anchor and anchor == user_id:
+        elif QUERY_NAME_INTENT_SURFACING and (
+            (anchor and anchor == user_id) or _query_is_first_person_name(query_text)
+        ):
             # PIECE 2 — the "asked" branch the gate above has lacked: on a NAME question
             # about the schema owner, the registry holds the names but `facts` has no
             # name FACT, so the walk returns nothing. Synthesize the owner's surfaceable
