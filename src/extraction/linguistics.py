@@ -4655,7 +4655,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     #   • "as <NP>"        → occupation(subject, <full role NP incl. trailing "III">) — TYPE-agnostic.
     #   • "at|for <ORG>"   → works_for(subject, <org NP>) — the EMPLOYMENT VERB (not the object's type)
     #     determines the relation, so a university/school object is NEVER flipped to ``educated_at``.
-    #     The affiliation PP may hang directly off the verb ("work at HelpDeskPro") OR nest under the
+    #     The affiliation PP may hang directly off the verb ("work at Acme Corp") OR nest under the
     #     role NP ("work as a <role> at <org>" — spaCy attaches "at" to the role head), so we look on
     #     BOTH the verb and the role head. A temporal/duration "for" pobj (a resolved date span or a
     #     DATE/TIME entity — "work for 3 years") is EXCLUDED, never bound as an employer.
