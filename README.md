@@ -8,7 +8,7 @@
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
-  <img src="https://img.shields.io/badge/OpenWebUI-0.9.5%2B-green" alt="OpenWebUI"/>
+  <img src="https://img.shields.io/badge/OpenWebUI-0.6%2B%20(0.10.x%20tested)-green" alt="OpenWebUI"/>
   <img src="https://img.shields.io/badge/MCP-2025--03--26-purple" alt="MCP"/>
 </p>
 
@@ -28,11 +28,9 @@ Everything runs on your machine. Your conversations, your memories, your data �
 
 FaultLine exposes an MCP server. That means the same memory store is available to OpenWebUI, Claude Desktop, or any other MCP-capable endpoint. Change your server IP in one conversation, every model sees the update.
 
-### 3. Deterministic recall — not RAG guesswork
+### 3. Write-validated facts — not RAG guesswork
 
-RAG ranks document chunks by similarity and asks the LLM to interpret them. The answer depends on wording, context, and luck. FaultLine is different all the way down: facts are validated before storage (hallucinations rejected at the gate), stored in a **PostgreSQL knowledge graph**, and recalled by a **deterministic walk** of that graph — not a vector similarity search. Ask the same question twice and you get the same rows. Your AI knows "AlphaNode's IP is 192.0.2.20" because it resolved the `AlphaNode` entity and read its IP attribute — not because "a document mentioned something about a server."
-
-The vector index is still there, but it's a **short-term scratchpad** for facts the engine hasn't classified yet — a backstop behind the authoritative graph, never the source of truth. (For the full mechanical contrast, see [docs/ARCHITECTURE.md → "Why this isn't RAG"](docs/ARCHITECTURE.md#why-this-isnt-rag-mechanically), and a candid note on how this was previously mis-described in [HONESTY.md](HONESTY.md).)
+RAG retrieves documents and asks the LLM to interpret them. The answer depends on wording, context, and luck. FaultLine validates facts before storing them and rejects hallucinations at the gate. Your AI knows "AlphaNode's IP is 10.44.5.20" — not "a document mentioned something about a server."
 
 ### 4. Correctable, relational data
 
@@ -75,16 +73,11 @@ AI:   "Your firewall OPNsense is a networking device — I have that from earlie
 
 ## How it works (briefly)
 
-- Your AI calls FaultLine's **MCP tools** — `remember_facts` to store, `recall_memory` to retrieve, `retract_fact` to correct
-- Every statement is scanned for facts worth keeping (strong, deterministic-first extraction)
-- Facts pass a **validation gate** before storage — hallucinated details are rejected, not stored
-- Authoritative facts live in a **PostgreSQL knowledge graph**; recall is a **deterministic walk** of that graph, not a similarity search
+- Every message is scanned for facts worth keeping
+- Facts go through a validation gate before storage — hallucinated details are rejected
+- Relevant facts are injected into the conversation before the AI responds
 - Memories strengthen with confirmation; corrections archive the old value cleanly
 - `/expand <topic>` teaches FaultLine how a domain is structured so facts about it land correctly
-
-> **Strong ingest, lean query.** All the work happens at ingest — extraction, validation, classification, building the hierarchy. The query side just walks what ingest laid down and returns the rows it finds. If a fact isn't there, it says so rather than guessing.
-
-More depth: [Architecture](docs/ARCHITECTURE.md) · [Core concepts](docs/CONCEPTS.md) · [Plain-English flow](docs/FLOW-BRIEF.md) · [MCP setup](docs/MCP-SETUP.md) · [Deployment](docs/DEPLOYMENT.md)
 
 ---
 
@@ -228,22 +221,36 @@ Two independent choices — the wizard handles both, or set them by hand.
 
 **2. How your chat client calls FaultLine's memory tools** — all through the **MCP server on `:8002`** (Bearer `MCP_API_KEY`). Any number of clients can share one store at once:
 
-- **OpenWebUI** → Settings → Tools → Add Tool Server *(below)*
+- **OpenWebUI** → Settings → Tools → `+` (OpenAPI), or Admin Settings → External Tools (native MCP, 0.6.31+) *(below)*
 - **Claude Desktop** → the `.mcpb` extension *(below)*
 - **Cursor / other MCP clients** → `http://<host>:8002/mcp` with header `Authorization: Bearer <MCP_API_KEY>`
 
 ### Connect to OpenWebUI
 
-OpenWebUI calls FaultLine's tools through its **OpenAPI tool server** connection:
+*Verified against OpenWebUI v0.10.x (latest); the paths below apply from v0.6.31+. OpenWebUI's menu labels shift between releases — look for **Tools** (OpenAPI) or **External Tools** (native MCP) if yours differ.*
 
-1. **Settings → Tools → Add Tool Server** (or **Admin Settings → External Tools → +**).
+FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWebUI can reach it two ways. **Use Option A** — it's the only path that reliably forwards the per-user identity header FaultLine scopes on.
+
+**Option A — OpenAPI tool server (recommended):**
+
+1. **Settings → Tools → `+`** (Manage Tool Servers). For an instance-wide server, use **Admin Settings → Tools** instead.
 2. **URL:** `http://faultline-mcp:8002` (same Docker network) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
 3. **Auth:** `Bearer` → your `MCP_API_KEY`.
-4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them (it forwards the `X-OpenWebUI-User-Id` header FaultLine keys on — without it, per-user memory won't work).
+4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them. It forwards the `X-OpenWebUI-User-Id` header FaultLine keys on (also `-User-Name`/`-Email`/`-Role`) — without it, per-user memory won't work.
 
 OpenWebUI reads `/openapi.json` and surfaces `recall_memory`, `remember_facts`, `retract_fact` as tools in every conversation.
 
-> **Legacy alternative:** the inlet/outlet Filter (`openwebui/faultline_function.py`, Workspace → Functions) still exists for automatic injection, but the MCP tool server above is the supported path.
+**Option B — native MCP (OpenWebUI 0.6.31+):**
+
+1. **Admin Settings → External Tools → `+` (Add Server)** — native MCP is **admin-only**.
+2. **Type:** `MCP (Streamable HTTP)` (the only transport OpenWebUI's native MCP supports).
+3. **URL:** `http://<host>:8002/mcp` · **Auth:** `Bearer` → your `MCP_API_KEY`.
+
+> ⚠️ **Native MCP is the newer, less-tested path with FaultLine** (its `/mcp` is a stateless JSON-RPC endpoint) — if the server or tools don't appear, use **Option A**. And per-user scoping is weaker here: as of v0.10.x, `ENABLE_FORWARD_USER_INFO_HEADERS` does **not** forward `X-OpenWebUI-User-*` headers over native MCP, and custom-header template tokens (`{{USER_ID}}`) may not resolve there yet ([open-webui#21134](https://github.com/open-webui/open-webui/issues/21134)). For reliable per-user memory use **Option A**; if you run native MCP, pin a single tenant with `FAULTLINE_USER_ID`.
+
+**Tool firing (weak models).** As of v0.10.0, OpenWebUI defaults every model to **Native** function calling (the old "Default" mode is renamed **"Legacy"** and is unsupported). Native works for most 2024+ models; if a smaller model (Qwen, Llama, Mistral, Phi) won't reliably call the tools, switch **Chat Controls → Advanced Params → Function Calling → Legacy** (or set it per-model / globally under **Model Parameters**).
+
+> **Legacy alternative:** the inlet/outlet Filter (`openwebui/faultline_function.py`, Workspace → Functions) still exists for automatic injection, but the tool-server paths above are the supported ones.
 
 ---
 
