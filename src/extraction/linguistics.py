@@ -4490,7 +4490,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 pass
 
     def _emit(subject, rel, obj, verb_tok=None, obj_tok=None, subj_tok=None, tentative=False,
-              negated=False, scalar_datatype=None):
+              negated=False, scalar_datatype=None, distribute=True):
         subj = (subject or "").strip().lower()
         rel = (rel or "").strip().lower()
         obj = (obj or "").strip().lower()
@@ -4579,6 +4579,50 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             tentative=bool(tentative), negated=bool(negated),
             scalar_datatype=(scalar_datatype or None),
         ))
+
+        # ── GENERAL COORDINATED-CONJUNCT DISTRIBUTION (rel-agnostic) ────────────────────────────
+        # When a predicate's SUBJECT or OBJECT is a COORDINATED list ("... Leo, Theo, and Mia",
+        # "affects Apache, Nginx, and OpenSSL", "I use Python, Rust, and Go"), a capture chain binds only
+        # the FIRST conjunct and the coordinated rest are silently dropped. This step distributes the
+        # SAME resolved (subject, rel, object) over EVERY coordinated sibling of the bound head — one
+        # edge per member — REGARDLESS of the rel_type. It is the general engine; the rel itself is
+        # whatever the chain already resolved (kinship child_of from the kinship_noun cue class, an SVO
+        # verb, a social tie, …). We only distribute a side whose emitted surface is EXACTLY the head
+        # token's surface (a single-token, correctly-aligned argument — never a merged multi-token span
+        # or a mislabeled token), and only over ``_np_conjuncts`` members (the shared conj/PROPN-appos
+        # collector — NOT arbitrary siblings). Each coordinated member is its own MEMORY entity (bound
+        # by its own token, so object-type/thin convergence re-resolves per member); a NAME is never a
+        # type (THE HARD LINE is unchanged — we replicate the same edge, we do not classify the name).
+        # Recursion-guarded (``distribute=False`` on the replicated calls); dedup via ``seen`` makes it
+        # idempotent when a chain already distributed (e.g. SVO's own dobj loop). Subject-agnostic,
+        # structural, fail-safe. OFF-path parity: a non-coordinated head has a single-member conjunct
+        # list → no replication → byte-identical to before.
+        if distribute:
+            try:
+                if subj_tok is not None and subj_tok.pos_ in ("PROPN", "NOUN") \
+                        and subj == (subj_tok.text or "").strip().lower():
+                    _sibs = _np_conjuncts(subj_tok)
+                    if len(_sibs) > 1:
+                        for _sib in _sibs:
+                            if _sib.i == subj_tok.i:
+                                continue
+                            _emit((_sib.text or "").strip().lower(), rel, obj,
+                                  verb_tok=verb_tok, obj_tok=obj_tok, subj_tok=_sib,
+                                  tentative=tentative, negated=negated,
+                                  scalar_datatype=scalar_datatype, distribute=False)
+                if obj_tok is not None and obj_tok.pos_ in ("PROPN", "NOUN") \
+                        and obj == (obj_tok.text or "").strip().lower():
+                    _sibs = _np_conjuncts(obj_tok)
+                    if len(_sibs) > 1:
+                        for _sib in _sibs:
+                            if _sib.i == obj_tok.i:
+                                continue
+                            _emit(subj, rel, (_sib.text or "").strip().lower(),
+                                  verb_tok=verb_tok, obj_tok=_sib, subj_tok=subj_tok,
+                                  tentative=tentative, negated=negated,
+                                  scalar_datatype=scalar_datatype, distribute=False)
+            except Exception as _de:  # noqa: BLE001 — distribution never sinks the primary capture
+                log.debug("linguistics.conj_distribution_failed", error=str(_de)[:160])
 
     # ── INTRA-TURN PRONOUN COREF (shared by every chain) ─────────────────────────────────────────
     # Resolve a 3rd-person pronoun (it/they/them) with no in-sentence antecedent to the most-recent
@@ -6127,103 +6171,140 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         _kin_set = _kinship_nouns()
         _gender_map = _kinship_gender_map()
         _social_map = _social_role_map()
+        # Every PROPER NAME that is INDEPENDENTLY bound to its OWN type (the mixed "a son Alex, a
+        # daughter Robin" enumeration gives each name its own binding) — used below to keep the
+        # shared-role conj-distribution ROLE-BLEED-SAFE (a coordinated sibling that is another
+        # binding's name keeps its own role; it is NEVER swept into this binding's role).
+        _all_bound = {(x.name or "").strip().lower()
+                      for x in (_bindings or []) if x and not x.negated}
         for b in (_bindings or []):
             if b is None or b.negated:
                 continue
             name_key = (b.name or "").strip().lower()
             type_noun = (b.type_noun or "").strip().lower()
-            type_head = (type_noun.split()[-1] if type_noun else "")
+            type_head_raw = (type_noun.split()[-1] if type_noun else "")
             if not name_key or not type_noun or name_key == type_noun:
                 continue
-            # Object-type tag for the instance: the GLiNER2 type seeded onto the proper-name token
-            # (native), else None — passed to the possession resolver (NO GLiNER2 injection).
-            _name_ner = None
+            # SINGULARIZE the type head for the SINGULAR-KEYED cue maps (kinship/gender/social) and for
+            # the instance_of place: a PLURAL collective role ("My kids are …", "children named …") must
+            # still resolve its metadata and file each name at the SINGULAR type ("kid"/"child"), never
+            # the collective. Use the spaCy LEMMA of the type token (handles irregulars: children→child),
+            # falling back to the surface. Morphological, NO plural/irregular word list.
+            _ttok = next((t for t in doc if t.pos_ == "NOUN"
+                          and (t.text or "").strip().lower() == type_head_raw), None)
+            type_head = ((_ttok.lemma_ if _ttok is not None else "") or type_head_raw).strip().lower()
+            _type_obj = type_head if (type_noun == type_head_raw and type_head) else type_noun
+
+            # SHARED-ROLE COORDINATED NAMES (general conj-distribution, role-bleed-safe). "children named
+            # Leo, Theo, and Mia" / "My kids are Leo, Theo, and Mia" bind ONE role over a
+            # COORDINATED name list, but the detector returns a single binding (the first name). Walk the
+            # coordination (``_np_conjuncts`` — the shared conj/PROPN-appos collector) and distribute the
+            # SAME role to every coordinated sibling that is NOT independently bound to its own type — so
+            # the mixed "a son Alex, a daughter Robin" case (each name has its own binding) never bleeds a
+            # role across siblings. Each name is its OWN MEMORY entity; a NAME is never classified as a
+            # type (THE HARD LINE — we replicate the role, we do not make Leo a type). Fail-safe.
+            _emit_names = [name_key]
             try:
-                for _ent in getattr(doc, "ents", []) or []:
-                    if (_ent.text or "").strip().lower() == name_key and _ent.label_:
-                        _name_ner = _ent.label_.upper()
-                        break
-            except Exception:  # noqa: BLE001
-                _name_ner = None
-            # 1. the name IS-AN-INSTANCE of its type. (name as subject surface; THE HARD LINE.)
-            _emit(name_key, "instance_of", type_noun, subj_tok=None, obj_tok=None)
-            # 2. the proper name in the naming layer (also_known_as). A self-edge (subj==obj) is
-            #    rejected by _emit, so we register the SURFACE-cased name as the alias via the subject
-            #    surface itself (the registry files it at ingest) — emit only when it adds an alias arc.
+                _ptok = next((t for t in doc if t.pos_ == "PROPN"
+                              and (t.text or "").strip().lower() == name_key), None)
+                if _ptok is not None:
+                    for _sib in _np_conjuncts(_ptok):
+                        _ss = (_sib.text or "").strip().lower()
+                        if _sib.i == _ptok.i or not _ss or _ss == type_noun:
+                            continue
+                        if _ss in _all_bound or _ss in _emit_names:
+                            continue  # a sibling with its OWN binding keeps its own role (no bleed)
+                        _emit_names.append(_ss)
+            except Exception:  # noqa: BLE001 — fail-safe: distribution never sinks the primary bind
+                _emit_names = [name_key]
+
+            def _name_ner_for(nk):
+                # Object-type tag for the instance: the GLiNER2 type seeded onto the proper-name token
+                # (native), else None — passed to the possession resolver (NO GLiNER2 injection).
+                try:
+                    for _ent in getattr(doc, "ents", []) or []:
+                        if (_ent.text or "").strip().lower() == nk and _ent.label_:
+                            return _ent.label_.upper()
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+
+            def _emit_category(nk, nk_ner):
+                # 3. the relation from the TYPE'S CATEGORY (the only place domains differ) — metadata.
+                #    Resolution order (each layer is DB-grown metadata, NO domain literal in code):
+                #      (a) KINSHIP type → the specific kin rel + the intrinsic gender (son→child_of+male).
+                #      (b) SOCIAL person-role type → the social rel (friend→friend_of) — never ``owns``.
+                #      (c) self-possessed NON-person type → the possession rel that fits the type
+                #          (animal→has_pet, object→owns) via the rel_types overlay.
+                #      (d) else → a self-subject activity verb (user, <verb>, name), if any.
+                _social_rel = _social_map.get(type_head)
+                if type_head in _kin_set:
+                    _kin = _inherent_relation_for_noun(type_head)
+                    _emit(nk, _kin, "user", subj_tok=None, obj_tok=None)
+                    _gender = _gender_map.get(type_head)
+                    if _gender:
+                        # has_gender carries tail_types={SCALAR} → routes to entity_attributes (STRING).
+                        _emit(nk, "has_gender", _gender, subj_tok=None, obj_tok=None)
+                elif _social_rel:
+                    # a PERSON social role → the social tie to the speaker (friend_of / knows).
+                    _emit(nk, _social_rel, "user", subj_tok=None, obj_tok=None)
+                elif nk_ner == "PERSON":
+                    # CARVE-OUT FAIL-SAFE DEGRADE: a PERSON-typed named instance introduced by a common-
+                    # noun role that is NEITHER kinship NOR an already-grown social role ("my colleague
+                    # Sam"). The social_role class is GROWN per-tenant and is empty/missing here, so we
+                    # DEGRADE to the generic walkable ``related_to(name, user)`` (a PERSON is NEVER
+                    # ``owns``) — captured, NOT dropped — and QUEUE the role noun for freq-gated growth.
+                    _emit(nk, "related_to", "user", subj_tok=None, obj_tok=None)
+                    _record_cue_candidate(type_head, "social_role")
+                elif b.possessor_is_self:
+                    _poss = _possession_rel_for_type(type_head, instance_type_tag=nk_ner)
+                    _emit("user", _poss, nk, subj_tok=None, obj_tok=None)
+                else:
+                    # NO stated possessor, but the named instance may be the OBJECT of a SELF-subject
+                    # ACTIVITY verb — "We run a web server named Apollo" → (user, run, apollo). Locate the
+                    # TYPE-noun token, climb to its governing content VERB; if that verb has a 1st-person
+                    # subject and is not be/naming/possession-generic, mint (user, <verb-lemma>, name).
+                    # Subject-agnostic, grammatical (the user's OWN verb), NO verb word list.
+                    try:
+                        _tn_tok = next(
+                            (t for t in doc if t.pos_ in ("NOUN", "PROPN")
+                             and (t.text or "").strip().lower() == type_head), None)
+                        _gv = None
+                        _cur = _tn_tok
+                        _hops = 0
+                        while _cur is not None and _hops < 6:
+                            if _cur.pos_ == "VERB":
+                                _gv = _cur
+                                break
+                            if _cur.head is None or _cur.head.i == _cur.i:
+                                break
+                            _cur = _cur.head
+                            _hops += 1
+                        if _gv is not None:
+                            _gl = (_gv.lemma_ or _gv.text or "").strip().lower()
+                            _gsubj = next((c for c in _gv.children
+                                           if c.dep_ in ("nsubj", "nsubjpass")), None)
+                            if (_gl and _gl != "be" and _gl not in _naming_verbs()
+                                    and _gl not in _possession_verbs()
+                                    and _gsubj is not None
+                                    and _is_first_person_personal_pronoun(_gsubj)):
+                                _emit("user", _gl, nk, subj_tok=None, obj_tok=None)
+                    except Exception:  # noqa: BLE001 — fail-safe: activity membership is best-effort
+                        pass
+
+            # 1 + 3 for EVERY coordinated name: the name IS-AN-INSTANCE of its (singular) type place
+            # (THE HARD LINE files the name AT the type place, never the name into L4) + the category rel.
+            for nk in _emit_names:
+                _emit(nk, "instance_of", _type_obj, subj_tok=None, obj_tok=None)
+                _emit_category(nk, _name_ner_for(nk))
+            # 2. the proper name in the naming layer (also_known_as) — PRIMARY name only. A self-edge
+            #    (subj==obj) is rejected by _emit; the SURFACE-cased name is filed as the alias at ingest.
             if b.name and b.name.strip().lower() != name_key:
                 _emit(name_key, "also_known_as", b.name.strip(), subj_tok=None, obj_tok=None)
-            # 3. the relation from the TYPE'S CATEGORY (the only place domains differ) — metadata.
-            #    Resolution order (each layer is DB-grown metadata, NO domain literal in code):
-            #      (a) KINSHIP type → the specific kin rel + the intrinsic gender (son→child_of+male).
-            #      (b) SOCIAL person-role type → the social rel (friend→friend_of) — a PERSON is never
-            #          ``owns``; the social tie binds to the speaker (the self-ref).
-            #      (c) self-possessed NON-person type → the possession rel that fits the type
-            #          (animal→has_pet, object→owns) via the rel_types overlay.
-            #      (d) else → a generic ``has_role`` slot anchored at the named instance.
-            _social_rel = _social_map.get(type_head)
-            if type_head in _kin_set:
-                _kin = _inherent_relation_for_noun(type_head)
-                _emit(name_key, _kin, "user", subj_tok=None, obj_tok=None)
-                _gender = _gender_map.get(type_head)
-                if _gender:
-                    # has_gender carries tail_types={SCALAR} → routes to entity_attributes (STRING).
-                    _emit(name_key, "has_gender", _gender, subj_tok=None, obj_tok=None)
-            elif _social_rel:
-                # a PERSON social role → the social tie to the speaker (friend_of / knows). Never owns.
-                _emit(name_key, _social_rel, "user", subj_tok=None, obj_tok=None)
-            elif _name_ner == "PERSON":
-                # CARVE-OUT FAIL-SAFE DEGRADE: a PERSON-typed named instance introduced by a common-noun
-                # role that is NEITHER kinship NOR an already-grown social role ("my colleague Sam", "a
-                # roommate named Dana"). The social_role class is GROWN per-tenant and is empty/missing
-                # here, so we DEGRADE to the generic walkable ``related_to(name, user)`` (a PERSON is
-                # NEVER ``owns``) — captured, NOT dropped, NOT an error — and QUEUE the role noun for
-                # freq-gated growth. After it grows, the elif above routes it to the social tie. Person-
-                # safe by construction (gated on the instance's GLiNER2 PERSON type, no word list).
-                _emit(name_key, "related_to", "user", subj_tok=None, obj_tok=None)
-                _record_cue_candidate(type_head, "social_role")
-            elif b.possessor_is_self:
-                _poss = _possession_rel_for_type(type_head, instance_type_tag=_name_ner)
-                _emit("user", _poss, name_key, subj_tok=None, obj_tok=None)
-            else:
-                # NO stated possessor, but the named instance may be the OBJECT of a SELF-subject
-                # ACTIVITY verb — "We run a web server named Apollo" → (user, run, apollo). The
-                # atomizer SPLITS an infra membership list ("we run three servers: a web server named
-                # Apollo, …") into one such atom per item, so without this the members are typed
-                # (instance_of) but NEVER linked to the user. Locate the TYPE-noun token, climb to its
-                # governing content VERB; if that verb has a 1st-person subject and is not be/naming/
-                # possession-generic, mint (user, <verb-lemma>, name). The possession-generic case
-                # ("we have …") is already the self-possessed branch above. Subject-agnostic,
-                # grammatical (the user's OWN verb), NO verb word list. Fail-safe → no edge.
-                try:
-                    _tn_tok = next(
-                        (t for t in doc if t.pos_ in ("NOUN", "PROPN")
-                         and (t.text or "").strip().lower() == type_head), None)
-                    _gv = None
-                    _cur = _tn_tok
-                    _hops = 0
-                    while _cur is not None and _hops < 6:
-                        if _cur.pos_ == "VERB":
-                            _gv = _cur
-                            break
-                        if _cur.head is None or _cur.head.i == _cur.i:
-                            break
-                        _cur = _cur.head
-                        _hops += 1
-                    if _gv is not None:
-                        _gl = (_gv.lemma_ or _gv.text or "").strip().lower()
-                        _gsubj = next((c for c in _gv.children
-                                       if c.dep_ in ("nsubj", "nsubjpass")), None)
-                        if (_gl and _gl != "be" and _gl not in _naming_verbs()
-                                and _gl not in _possession_verbs()
-                                and _gsubj is not None
-                                and _is_first_person_personal_pronoun(_gsubj)):
-                            _emit("user", _gl, name_key, subj_tok=None, obj_tok=None)
-                except Exception:  # noqa: BLE001 — fail-safe: activity membership is best-effort
-                    pass
-            # 4. age scalar (the bare cardinal in the binding's span) → the age rel (tail_types=SCALAR).
+            # 4. age scalar (the bare cardinal in the binding's span) — PRIMARY name only.
             if b.age:
                 _emit(name_key, "age", b.age, subj_tok=None, obj_tok=None)
-            # 5. nickname → a second also_known_as of the instance ("Jamie … goes by Jay").
+            # 5. nickname → a second also_known_as of the instance ("Jamie … goes by Jay") — PRIMARY only.
             if b.nickname and b.nickname.strip().lower() != name_key:
                 _emit(name_key, "also_known_as", b.nickname.strip(), subj_tok=None, obj_tok=None)
             # 6. SUPPRESS the bare TYPE noun + CLAIM the PROPER NAME so neither leaks/false-flags. The
@@ -6235,9 +6316,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             try:
                 for _t in doc:
                     _tl = (_t.text or "").strip().lower()
-                    if _t.pos_ == "NOUN" and _tl == type_head:
+                    # claim the type head by SURFACE or LEMMA (a plural collective "children" has
+                    # surface != singular lemma "child") so the role never leaks as a bare entity.
+                    if _t.pos_ == "NOUN" and _tl in (type_head, type_head_raw):
                         _claim(_t)
-                    if _t.pos_ in ("PROPN", "NOUN") and _tl == name_key:
+                    # claim EVERY bound name (primary + coordinated riders) so no name is residue.
+                    if _t.pos_ in ("PROPN", "NOUN") and _tl in _emit_names:
                         _claim(_t)
                     # the nickname proper noun (also consumed by the alias edge)
                     if b.nickname and _t.pos_ in ("PROPN", "NOUN") and \

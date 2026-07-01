@@ -17,7 +17,7 @@ from typing import Optional
 import httpx
 import psycopg2
 import redis
-from src.api.llm_client import get_llm_headers, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
+from src.api.llm_client import get_llm_headers, get_embedding_headers, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from src.api.llm_calls import (
     call_llm_with_retry_sync,
     close_llm_http_client,
@@ -555,14 +555,14 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
             response = _http_client_sync.post(
                 embed_url,
                 json={"model": _EMBEDDING_MODEL, "input": text},
-                headers=get_llm_headers(),
+                headers=get_embedding_headers(),
                 timeout=timeout,
             )
         else:
             response = _http_client.post(
                 embed_url,
                 json={"model": _EMBEDDING_MODEL, "input": text},
-                headers=get_llm_headers(),
+                headers=get_embedding_headers(),
                 timeout=timeout,
             )
         response.raise_for_status()

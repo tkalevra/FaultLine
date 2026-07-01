@@ -17055,6 +17055,87 @@ async def ground_self_predication_endpoint(req: RewriteRequest) -> dict:
         return {"edges": []}
 
 
+def _expand_coordinated_edges(triples: list, source_text: str) -> list:
+    """General coordination preservation on the LLM extraction lane (subject-agnostic).
+
+    The LLM frequently returns only the FIRST member of a coordinated subject or object
+    ("X affects A, B, and C" → only (X, affects, A)); the tail is silently dropped. This
+    deterministically recovers the dropped members: for each extracted edge, if its subject
+    or object surface appears in the source as the HEAD of a coordination (conj / PROPN-appos
+    siblings in the spaCy parse), mint a parallel edge per sibling carrying the SAME rel_type.
+    Rel-agnostic, domain-agnostic, additive, idempotent — the SAME conjunct primitive the spine
+    deriver uses (`_np_conjuncts`), so both extraction lanes give the identical "no coordinated
+    member is ever dropped" guarantee (CVE affects-lists, ingredient lists, precedent citations,
+    interface lists — all the same structure). Members are NOUN/PROPN only, so scalar/temporal
+    objects never expand.
+
+    Deterministic (spaCy dependency structure only — no LLM, no fuzzy/cosine). Fail-safe: no
+    model / parse miss / any error → triples returned unchanged.
+    """
+    if not source_text or not triples:
+        return triples
+    try:
+        from src.extraction.linguistics import _get_nlp, _np_conjuncts
+        nlp = _get_nlp()
+        if nlp is None:
+            return triples
+        doc = nlp(source_text)
+    except Exception:  # noqa: BLE001 — layer unavailable → no-op
+        return triples
+
+    # index EVERY token by surface for head lookup — spaCy routinely MIS-TAGS a lowercase OOV
+    # coordination head ("glucose"→VERB, "libssl"→ADJ), so a NOUN/PROPN-only index would miss it.
+    # The member-collection guard stays NOUN/PROPN-only inside `_np_conjuncts`, so scalars/verbs
+    # can never become expanded members — only the head we anchor on may be mis-tagged.
+    by_surface: dict = {}
+    for _t in doc:
+        by_surface.setdefault(_t.text.lower(), []).append(_t)
+
+    def _members_for(value: str) -> list:
+        """Coordinated member surfaces for an edge endpoint, or [] if it isn't a coordination head."""
+        if not value:
+            return []
+        # match the endpoint's syntactic head = its LAST content token (English NP head):
+        # 'Apache' → Apache; 'Apache HTTP Server' → Server.
+        _words = [w for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", value.lower()) if w]
+        for _w in reversed(_words):
+            for _tok in by_surface.get(_w, []):
+                _members = _np_conjuncts(_tok)
+                if len(_members) > 1:
+                    return [m.text for m in _members]
+        return []
+
+    existing = set()
+    for _e in triples:
+        if isinstance(_e, dict):
+            existing.add((str(_e.get("subject", "")).lower(),
+                          str(_e.get("rel_type", "")).lower(),
+                          str(_e.get("object", "")).lower()))
+
+    added: list = []
+    for e in triples:
+        if not isinstance(e, dict):
+            continue
+        rel, subj, obj = e.get("rel_type"), e.get("subject"), e.get("object")
+        # OBJECT-side: (S, rel, A) → also (S, rel, B), (S, rel, C)
+        for m in _members_for(str(obj) if obj is not None else ""):
+            key = (str(subj).lower(), str(rel).lower(), m.lower())
+            if key in existing:
+                continue
+            _ne = dict(e); _ne["object"] = m; _ne["extraction_source"] = "coord_expanded"
+            added.append(_ne); existing.add(key)
+        # SUBJECT-side: (A, rel, O) → also (B, rel, O), (C, rel, O)
+        for m in _members_for(str(subj) if subj is not None else ""):
+            key = (m.lower(), str(rel).lower(), str(obj).lower())
+            if key in existing:
+                continue
+            _ne = dict(e); _ne["subject"] = m; _ne["extraction_source"] = "coord_expanded"
+            added.append(_ne); existing.add(key)
+    if added:
+        log.info("extract_rewrite.coord_expanded", added=len(added), base=len(triples))
+    return triples + added
+
+
 @app.post("/extract/rewrite", response_model=dict)
 async def extract_rewrite(req: RewriteRequest) -> dict:
     """
@@ -18133,6 +18214,15 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             for _e in triples:
                 if isinstance(_e, dict):
                     _e["extraction_source"] = "llm_atomized"
+
+        # COORDINATION PRESERVATION (subject-agnostic): the LLM often keeps only the FIRST member
+        # of a coordinated subject/object ("X affects A, B, and C" → only (X,affects,A)). Recover
+        # the dropped siblings deterministically from the source parse so the LLM lane matches the
+        # spine lane's "no coordinated member dropped" guarantee. Fail-safe → triples unchanged.
+        try:
+            triples = _expand_coordinated_edges(triples, req.text or "")
+        except Exception as _cxe:  # noqa: BLE001
+            log.debug("extract_rewrite.coord_expand_failed", error=str(_cxe)[:120])
 
         # Cache successful response for idempotency
         response = {
