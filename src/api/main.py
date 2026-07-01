@@ -3180,8 +3180,54 @@ def _get_canonical_rel_type(rel_type_alias: str) -> str:
         except Exception:
             pass  # Fall through to cache
 
-    # Fall back to startup cache
-    return _REL_TYPE_ALIASES.get(alias_lower, rel_type_alias)
+    # Fall back to startup cache (full alias)
+    _cached = _REL_TYPE_ALIASES.get(alias_lower)
+    if _cached:
+        return _cached
+
+    # PARTICLE-STRIP FALLBACK (subject-agnostic, no per-subject literals):
+    # an unresolved verb+load-bearing-particle rel ("work_at", "works_at") should
+    # canonicalize via its VERB-ROOT when that root is itself an alias — so "work_at"
+    # resolves like the seeded "work"→works_for, instead of dangling in pending_placement
+    # and mis-converging by surface shape ("*_at"→educated_at). Guardrails: fires ONLY when
+    # (a) the full rel is unknown (we're past both lookups), (b) the trailing token is a
+    # load-bearing svo_particle (DB cue class, not a hardcoded list), and (c) the stripped
+    # verb-root has an explicit alias. So "care_for"→"care" (not aliased)→left alone.
+    # Guard: NEVER strip a rel that is itself a known canonical rel_type — a canonical rel
+    # like parent_of / child_of / member_of / part_of ends in a preposition by NAMING
+    # CONVENTION (the inverse/genitive form the ontology owns), not a verb+particle. The
+    # strip is ONLY for unknown/novel verb+particle rels ("work_at").
+    if "_" in alias_lower and alias_lower not in _REL_TYPE_META:
+        _root, _, _particle = alias_lower.rpartition("_")
+        _particles = frozenset()
+        if dsn:
+            try:
+                _particles = linguistic_cue_overlay.resolve_svo_particles(dsn)
+            except Exception:
+                _particles = frozenset()
+        if _root and _particle in _particles:
+            _root_canon = None
+            if dsn:
+                try:
+                    with psycopg2.connect(dsn) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s",
+                                (_root,),
+                            )
+                            _r = cur.fetchone()
+                            if _r:
+                                _root_canon = _r[0].lower()
+                except Exception:
+                    _root_canon = None
+            if _root_canon is None:
+                _root_canon = _REL_TYPE_ALIASES.get(_root)
+            if _root_canon:
+                log.info("rel_type.particle_strip_canonicalized",
+                         raw=alias_lower, root=_root, canonical=_root_canon)
+                return _root_canon
+
+    return rel_type_alias
 
 
 def _get_canonical_rel_type_with_directionality(rel_type_alias: str) -> tuple[str, bool]:
@@ -19485,6 +19531,18 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             log.warning("ingest.edges_third_person_pronoun_skipped",
                         pronoun=subj, text_snippet=req.text[:80])
             continue
+        # dprompt-125 parity: canonicalize the rel_type on the SPINE/externally-provided edge
+        # lane too (the /extract/rewrite lane above already does). A verb+particle rel like
+        # "work_at" resolves via its verb-root alias (particle-strip in _get_canonical_rel_type)
+        # to the canonical "works_for" at ingest, instead of dangling in pending_placement and
+        # mis-converging by surface shape. Subject-agnostic; reuses the seeded aliases only.
+        _rt = (edge.rel_type or "").lower().strip()
+        if _rt:
+            _canon = _get_canonical_rel_type(_rt)
+            if _canon and _canon != _rt:
+                edge.rel_type = _canon
+                log.info("ingest.rel_type_aliased", original=_rt, canonical=_canon,
+                         reason="req.edges canonicalize")
         key = (edge.subject, edge.object, edge.rel_type)
         edges_dict[key] = edge
 
