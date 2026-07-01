@@ -151,6 +151,37 @@ _nlp = None                      # the loaded spaCy Language, or None
 _load_attempted = False          # so a failed load is not retried on every call (fail-safe, cheap)
 _load_lock = threading.Lock()    # guard concurrent first-load (FastAPI is multi-threaded)
 
+# IDENTIFIER-shaped token: a letter+digit alphanumeric mix joined by an internal ``-_.:/@`` separator
+# (CVE-2024-9999, v1.2.3, x86-64, bug-4471, log4j@2.17, COVID-19). Requires BOTH a letter AND a digit
+# so normal hyphenated words ("well-known") and pure-numeric/IP spans (no letter) are NEVER caught.
+# Shape-only, subject-agnostic — NO domain/token list.
+_IDENTIFIER_TOKEN_RE = re.compile(
+    r"^(?=[A-Za-z0-9._:/@-]*[A-Za-z])(?=[A-Za-z0-9._:/@-]*[0-9])"
+    r"[A-Za-z0-9]+(?:[-_.:/@][A-Za-z0-9]+)+$"
+)
+
+
+def _install_identifier_tokenizer(nlp) -> None:
+    """Keep IDENTIFIER-shaped tokens WHOLE through tokenization (subject-agnostic, shape-based).
+
+    spaCy's statistical parser DERAILS on out-of-vocabulary identifier tokens its tokenizer SPLITS on
+    internal separators — "CVE-2024-9999" → ["CVE-2024","-","9999"], so the bare number becomes the
+    subject and the real verb demotes to a noun (the parse ROOT collapses). We extend the tokenizer's
+    ``token_match`` (the SAME hook spaCy uses to keep URLs whole) so any ``_IDENTIFIER_TOKEN_RE`` span
+    stays a SINGLE token → parses as one PROPN → the identifier survives WHOLE as the entity and the
+    clause structure holds. Idempotent, fail-safe: any error leaves the tokenizer untouched."""
+    try:
+        _base = nlp.tokenizer.token_match
+
+        def _match(text, _base=_base):
+            if _IDENTIFIER_TOKEN_RE.match(text):
+                return True
+            return _base(text) if _base else None
+
+        nlp.tokenizer.token_match = _match
+    except Exception as e:  # noqa: BLE001 — never break the parse over a tokenizer tweak
+        log.warning("linguistics.identifier_tokenizer_install_failed", error=str(e)[:120])
+
 
 def _get_nlp():
     """Return the loaded spaCy pipeline, or ``None`` if unavailable (flag off / no spaCy / no model).
@@ -184,6 +215,7 @@ def _get_nlp():
             # NER is GLiNER2's job and the slowest component — disable it (faster parse, smaller
             # footprint). We only need tagger + parser for POS + dependency labels.
             _nlp = spacy.load(_SPACY_MODEL, disable=["ner"])
+            _install_identifier_tokenizer(_nlp)  # keep CVE ids / version strings / x86-64 whole
             log.info("linguistics.model_loaded", model=_SPACY_MODEL)
         except Exception as e:  # noqa: BLE001 — model not baked into the image → no-op layer
             log.warning("linguistics.model_load_failed", model=_SPACY_MODEL, error=str(e)[:160])
