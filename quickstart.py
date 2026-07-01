@@ -210,7 +210,8 @@ def _prompt_connection(backend):
     if backend == "openwebui":
         print(dim("\n  OpenWebUI needs its base URL + an API key:"))
         print(dim("  1. Enable keys once (admin): Admin Panel → Settings → General → 'Enable API Keys'"))
-        print(dim("     (until enabled, the section below is hidden)."))
+        print(dim("     (until enabled, the section below is hidden; on v0.6.40+ non-admins may also"))
+        print(dim("     need the API Keys feature permission for their group)."))
         print(dim("  2. Your key: Profile (bottom-left) → Settings → Account → API Keys →"))
         print(dim("     'Generate New API Key'. Copy it now — it's shown only once."))
         print(dim("  Base URL = host:port only (container port is usually 8080; host-published often 3000)."))
@@ -325,7 +326,8 @@ def configure_identity():
             print(dim("  (pinning would put every user in the SAME memory). Set up two things:"))
             print(dim("   1. On OpenWebUI, set  " + bold("ENABLE_FORWARD_USER_INFO_HEADERS=true")))
             print(dim("      in its environment — that's what makes it send the X-OpenWebUI-User-Id"))
-            print(dim("      header. Without it, per-user memory won't work."))
+            print(dim("      header. Without it, per-user memory won't work. (This forwards over the"))
+            print(dim("      OpenAPI tool-server connection, not native MCP — see open-webui#21134.)"))
             print(dim("   2. Find a user's id (for testing): Admin Panel → Users."))
             return ""
 
@@ -474,14 +476,20 @@ def print_integration_guide(mcp_key, user_id):
         print(dim(f'    "command": "npx", "args": ["mcp-remote", "http://{host}:8002/mcp", "--header", "Authorization: Bearer {key}"]'))
 
     def owui_block():
-        print(bold("\n  OpenWebUI"))
-        print(dim("  Settings → Tools → Add Tool Server   (or Admin Settings → External Tools → +)"))
+        print(bold("\n  OpenWebUI") + dim("   (v0.10.x paths; from v0.6.31+)"))
+        print(dim("  Recommended — OpenAPI tool server:  Settings → Tools → +   (instance-wide: Admin Settings → Tools)"))
         print(dim("   • URL:  ") + cyan(f"http://faultline-mcp:8002") +
               dim("   (if OWUI is in the same compose network; else ") + cyan(f"http://{host}:8002") + dim(")"))
         print(dim("   • Auth: Bearer  →  ") + cyan(key))
         print(dim("   • The modal may pre-fill https:// — change it to http:// for a local server, then hit refresh."))
         print(dim("  OWUI reads /openapi.json and exposes recall_memory / remember_facts / retract_fact."))
-        print(dim("  Also set  ") + bold("ENABLE_FORWARD_USER_INFO_HEADERS=true") + dim("  on OWUI so per-user memory works."))
+        print(dim("  Also set  ") + bold("ENABLE_FORWARD_USER_INFO_HEADERS=true") + dim("  on OWUI so per-user memory works"))
+        print(dim("  (forwards the X-OpenWebUI-User-Id header FaultLine scopes on)."))
+        print(dim("  Native MCP (Admin Settings → External Tools → + → MCP (Streamable HTTP), ") + cyan(f"http://{host}:8002/mcp") + dim(")"))
+        print(dim("  also works, but does NOT forward the user-id header yet (open-webui#21134) —"))
+        print(dim("  use the OpenAPI path above for per-user memory, or pin FAULTLINE_USER_ID for single-user."))
+        print(dim("  Weak model not firing tools? Chat Controls → Advanced Params → Function Calling → Legacy"))
+        print(dim("  (v0.10.0 defaults to Native; 'Default' was renamed 'Legacy')."))
 
     def mcp_block():
         print(bold("\n  Cursor / other MCP client"))
