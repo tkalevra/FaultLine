@@ -109,6 +109,24 @@ def get_llm_headers() -> dict:
     return {}
 
 
+def get_embedding_headers() -> dict:
+    """
+    Return HTTP headers for the EMBEDDING endpoint.
+
+    The embedding endpoint may live on a DIFFERENT host than the chat LLM
+    (EMBEDDING_API_URL) and may need its own auth. Precedence:
+    - EMBEDDING_API_KEY (dedicated embedding key) wins when set,
+    - else fall back to LLM_API_KEY (same provider / same key case),
+    - else no auth (keyless local embedders — Ollama / LM Studio).
+    Embedding endpoints are OpenAI-compatible (Bearer); Anthropic has none.
+    """
+    api_key = (os.environ.get("EMBEDDING_API_KEY", "").strip()
+               or os.environ.get("LLM_API_KEY", "").strip())
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
+
+
 def build_llm_payload(
     messages: list[dict],
     model: str,

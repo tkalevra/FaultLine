@@ -13,11 +13,14 @@ What it does:
   2. Asks for your LLM backend + connection details, then CONNECTS and lists the
      models it actually finds so you can pick one (no blind typing). If a
      connection fails you can go back and fix the URL/key.
-  3. Offers to generate a secret MCP_API_KEY.
-  4. Resolves your tenant id (FAULTLINE_USER_ID): generate, reuse, enter
+  3. Embeddings: keep the built-in local CPU embedder (default, zero-config) or
+     point at an EXTERNAL embedding model — which may live on a different host
+     than your chat LLM (connect → list → pick, same as the LLM step).
+  4. Offers to generate a secret MCP_API_KEY.
+  5. Resolves your tenant id (FAULTLINE_USER_ID): generate, reuse, enter
      manually, or leave blank for OpenWebUI multi-user.
-  5. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
-  6. Prints the exact next steps.
+  6. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
+  7. Prints the exact next steps.
 
 FaultLine hooks into an LLM you already run; it does not host one.
 """
@@ -278,6 +281,99 @@ def configure_backend():
         sys.exit(1)
 
 
+# ── embeddings (built-in local CPU by default; optional external endpoint) ────
+_EMBED_BACKENDS = [
+    ("lm_studio", "LM Studio        (load an embedding model, e.g. nomic-embed-text)"),
+    ("ollama",    "Ollama           (`ollama pull nomic-embed-text`)"),
+    ("openwebui", "OpenWebUI        (proxies an embedding model)"),
+    ("openai",    "OpenAI-compatible (any /v1/embeddings endpoint)"),
+]
+_DEFAULT_EMBED_MODEL = {
+    "lm_studio": "text-embedding-nomic-embed-text-v1.5",
+    "ollama":    "nomic-embed-text",
+    "openwebui": "nomic-embed-text",
+    "openai":    "text-embedding-3-small",
+}
+
+
+def _embedding_endpoint_url(backend, base_url):
+    """Full /embeddings URL for the chosen embedding endpoint."""
+    base = base_url.rstrip("/")
+    return f"{base}/api/embeddings" if backend == "openwebui" else f"{base}/v1/embeddings"
+
+
+def _external_embed_overrides(backend, url, key, llm_key, model):
+    """Env overrides that ACTUALLY route embeddings to an external endpoint."""
+    ov = {
+        "EMBEDDING_MODEL": model,
+        "EMBEDDING_API_URL": _embedding_endpoint_url(backend, _host_for_container(url)),
+        # the built-in local CPU embedder runs FIRST and would otherwise win —
+        # blank it so the external endpoint is the one actually used.
+        "FASTEMBED_MODEL": "",
+    }
+    if key and key != llm_key:  # separate endpoint with its own auth
+        ov["EMBEDDING_API_KEY"] = key
+    return ov
+
+
+def configure_embeddings(llm_cfg):
+    """
+    Resolve embedding config. FaultLine ships a built-in LOCAL CPU embedder
+    (fastembed / nomic, baked into the image) that runs first and needs ZERO
+    config — it works offline. This step only configures an EXTERNAL embedding
+    model instead, which may live on a DIFFERENT host than the chat LLM.
+    Returns a dict of env overrides (empty = keep the built-in local embedder).
+    """
+    print(bold("Embeddings") + dim("  (vectorize facts for the Class-C short-term recall lane)"))
+    print(dim("  FaultLine has a built-in LOCAL CPU embedder (nomic) — works out of the box,"))
+    print(dim("  offline, no setup. Only add an external one if you want your own embed model."))
+    if not ask_yes("Use an external embedding model instead of the built-in local one?", default_yes=False):
+        print(green("  ✓ using the built-in local CPU embedder (nomic) — nothing to configure"))
+        return {}
+
+    llm_url = llm_cfg.get("LLM_BASE_URL", "")
+    llm_key = llm_cfg.get("LLM_API_KEY", "")
+    llm_backend = llm_cfg.get("LLM_BACKEND_TYPE", "")
+    print(dim("  Note: the embedding model can live on a different host than your chat LLM."))
+
+    while True:
+        same = False
+        if llm_url and llm_backend in ("lm_studio", "ollama", "openwebui", "openai"):
+            same = ask_yes(f"Is the embedding model on the SAME endpoint as your LLM "
+                           f"({_probe_url(llm_url)})?", default_yes=True)
+        if same:
+            e_backend, e_url, e_key = llm_backend, llm_url, llm_key
+        else:
+            e_backend = choose("Embedding endpoint type:", _EMBED_BACKENDS)
+            e_url, e_key = _prompt_connection(e_backend)
+
+        print(f"\n{bold('Connecting')} → {_probe_url(e_url)} ...")
+        ok, models, detail = probe_models(e_backend, e_url, e_key)
+        if ok:
+            print(green(f"  ✓ connected ({detail})"))
+            model = pick_model(models, _DEFAULT_EMBED_MODEL.get(e_backend, ""))
+            ov = _external_embed_overrides(e_backend, e_url, e_key, llm_key, model)
+            print(green(f"  ✓ embedding model: {model}"))
+            print(dim(f"    endpoint: {ov['EMBEDDING_API_URL']}  (built-in local embedder disabled)"))
+            print(dim("    if this model's vector size differs from nomic (768), start with a fresh"))
+            print(dim("    Qdrant volume — mixing vector dimensions in one collection will error."))
+            return ov
+
+        print(red(f"  ✗ could not connect — {detail}"))
+        action = choose("What now?", [
+            ("retry", "Re-enter the embedding endpoint details and try again"),
+            ("local", "Forget it — use the built-in local CPU embedder"),
+            ("skip",  "Continue anyway — I'll type the model id and fix connectivity later"),
+        ])
+        if action == "retry":
+            continue
+        if action == "local":
+            print(green("  ✓ using the built-in local CPU embedder (nomic)"))
+            return {}
+        model = ask("Embedding model id", _DEFAULT_EMBED_MODEL.get(e_backend, ""))
+        return _external_embed_overrides(e_backend, e_url, e_key, llm_key, model)
+
+
 # ── tenant identity (FAULTLINE_USER_ID) ───────────────────────────────────────
 def configure_identity():
     """
@@ -341,7 +437,7 @@ def _host_for_container(url):
     return url
 
 
-def write_env(cfg, mcp_key, faultline_user_id=""):
+def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
     if not os.path.exists(ENV_EXAMPLE):
         print(red(f"  ✗ {ENV_EXAMPLE} not found — run this from the FaultLine repo root."))
         sys.exit(1)
@@ -359,6 +455,9 @@ def write_env(cfg, mcp_key, faultline_user_id=""):
         "WGM_LLM_MODEL": cfg["WGM_LLM_MODEL"],
         "FAULTLINE_USER_ID": faultline_user_id,
     }
+    # embedding overrides are already container-final (host rewrite applied) — merge verbatim
+    for k, v in (embed_overrides or {}).items():
+        to_set[k] = v
     if mcp_key:
         to_set["MCP_API_KEY"] = mcp_key
 
@@ -568,6 +667,9 @@ def main():
     cfg = configure_backend()
 
     hr()
+    embed_overrides = configure_embeddings(cfg)
+
+    hr()
     print(bold("MCP API key") + dim("  (secures the MCP server on :8002 — recommended)"))
     if ask_yes("Generate a strong MCP_API_KEY for you now?", default_yes=True):
         mcp_key = secrets.token_urlsafe(32)
@@ -579,7 +681,7 @@ def main():
     faultline_user_id = configure_identity()
 
     hr()
-    write_env(cfg, mcp_key, faultline_user_id)
+    write_env(cfg, mcp_key, faultline_user_id, embed_overrides)
     print_next_steps(mcp_key)
 
     print()

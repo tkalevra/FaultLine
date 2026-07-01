@@ -309,18 +309,27 @@ _BOOTSTRAP_KINSHIP_GENDER_MAP: dict[str, str] = {
     "grandma": "female", "grandpa": "male",
 }
 
-# ── SOCIAL-ROLE-NOUN → REL_TYPE MAP — CARVED (grown per-tenant, NOT seeded) ──────────
-# CARVE-OUT (lean-seed): social_role is a DOMAIN-FLAVORED class (boss/colleague/roommate/classmate
-# vary by domain), NOT a grammar primitive — so it is NO LONGER SEEDED. It is GROWN PER-TENANT from the
-# OBSERVED construction: a possessed/apposed COMMON-noun role head governing a PERSON-typed named
-# instance ("my colleague Sam", "a roommate named Dana") that is NEITHER kinship NOR an already-grown
-# social role → the role noun is queued (``linguistic_cue_candidate`` → re_embedder freq-gate ≥3 →
-# ``<tenant>.linguistic_cues`` category='social_role', grown rel_type = the generic person tie ``knows``).
-# The DB-DOWN code-fallback is now EMPTY (no boss/colleague word zoo). On a COLD tenant the named-
-# instance chain DEGRADES the person to the generic walkable ``related_to(name, user)`` (a PERSON is
-# never ``owns``) and queues the role — NEVER dropped, NEVER an error. The specific tie (friend_of)
-# is not auto-distinguished on growth (generic ``knows`` is the safe grown default; user-correctable).
-_BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {}
+# ── SOCIAL-ROLE-NOUN → REL_TYPE MAP — universal tie SEEDED, domain roles GROWN ──────
+# CARVE-OUT (lean-seed): the DOMAIN-FLAVORED social roles (boss/colleague/roommate/classmate/coworker/
+# neighbour/acquaintance/manager) vary by domain and are NOT grammar primitives — so they are NOT
+# seeded. They are GROWN PER-TENANT from the OBSERVED construction: a possessed/apposed COMMON-noun role
+# head governing a PERSON-typed named instance ("my colleague Sam", "a roommate named Dana") that is
+# NEITHER kinship NOR an already-grown social role → the role noun is queued (``linguistic_cue_candidate``
+# → re_embedder freq-gate ≥3 → ``<tenant>.linguistic_cues`` category='social_role', grown rel_type = the
+# generic person tie ``knows``). On a COLD tenant such an unknown role DEGRADES to the generic walkable
+# ``related_to(name, user)`` (a PERSON is never ``owns``) and queues the role — NEVER dropped/errored.
+#
+# BUT ``friend`` is the ONE UNIVERSAL, subject-agnostic social primitive (parity with the seeded kinship
+# class — mother/son/… are seeded because they are universal, not domain-flavored). Migration 123's
+# carve-out over-removed ``friend`` along with the domain roles, which regressed the social-role COPULA
+# ("my friend is Sam" fell through to has_role + ``owns(user, sam)`` — a PERSON owned, the very invariant
+# the carve-out promised to hold). We restore ONLY the universal tie here: ``friend → friend_of``. This
+# floor is what the DSN-unset / carved-tenant path resolves (``_resolve_keyed_map`` returns the bootstrap
+# when the tenant's social_role rows are empty), so "my friend is Sam" → friend_of(sam, user), collapsing
+# the role noun so ``friend`` is never a standalone owned entity. Domain roles stay GROWN (empty here).
+_BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {
+    "friend": "friend_of",
+}
 
 # ── BOOTSTRAP MEASUREMENT-UNIT → SCALAR REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ───────
 # A MAP (measurement-unit head lemma → the SCALAR rel_type it measures) for the copula measurement
