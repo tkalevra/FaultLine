@@ -42,11 +42,32 @@ fi
 echo "Migration validation complete"
 
 # Run migrations
+# NOTE: execution semantics are unchanged (every file runs fully, errors do not
+# stop startup — legacy migrations rely on continue-past-error idempotency), but
+# ERROR lines are now surfaced and summarized instead of silently swallowed.
+# A silently-failed ADD CONSTRAINT here is how dBug-074 happened.
 echo "Running migrations..."
+MIGRATION_ERRORS=""
 for migration in /app/migrations/*.sql; do
   echo "Applying $migration..."
-  psql "${POSTGRES_DSN}" -f "$migration" || true  # Ignore errors for idempotency
+  MIG_OUT=$(psql "${POSTGRES_DSN}" -f "$migration" 2>&1) || true
+  echo "$MIG_OUT"
+  ERR_COUNT=$(echo "$MIG_OUT" | grep -c 'ERROR:' || true)
+  if [ "$ERR_COUNT" -gt 0 ]; then
+    echo ">>> $migration produced $ERR_COUNT ERROR line(s) (execution continued)"
+    MIGRATION_ERRORS="${MIGRATION_ERRORS}  - ${migration} (${ERR_COUNT} error(s))\n"
+  fi
 done
+
+if [ -n "$MIGRATION_ERRORS" ]; then
+  echo "=================================================================="
+  echo "WARNING: migrations produced ERROR lines (startup continues):"
+  printf "%b" "$MIGRATION_ERRORS"
+  echo "Some errors are expected re-run noise (e.g. duplicate_object on"
+  echo "unguarded ADD CONSTRAINT), but a NEW migration appearing here means"
+  echo "its schema change may NOT have applied. Inspect before trusting."
+  echo "=================================================================="
+fi
 
 echo "Migrations complete"
 

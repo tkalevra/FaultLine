@@ -19,8 +19,10 @@ What it does:
   4. Offers to generate a secret MCP_API_KEY.
   5. Resolves your tenant id (FAULTLINE_USER_ID): generate, reuse, enter
      manually, or leave blank for OpenWebUI multi-user.
-  6. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
-  7. Prints the exact next steps.
+  6. Names the deployment's resources (Postgres DB, per-tenant schema prefix,
+     Qdrant collection) — one "faultline for all" fast-path, or set each (validated).
+  7. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
+  8. Prints the exact next steps.
 
 FaultLine hooks into an LLM you already run; it does not host one.
 """
@@ -30,6 +32,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -282,12 +285,6 @@ def configure_backend():
 
 
 # ── embeddings (built-in local CPU by default; optional external endpoint) ────
-_EMBED_BACKENDS = [
-    ("lm_studio", "LM Studio        (load an embedding model, e.g. nomic-embed-text)"),
-    ("ollama",    "Ollama           (`ollama pull nomic-embed-text`)"),
-    ("openwebui", "OpenWebUI        (proxies an embedding model)"),
-    ("openai",    "OpenAI-compatible (any /v1/embeddings endpoint)"),
-]
 _DEFAULT_EMBED_MODEL = {
     "lm_studio": "text-embedding-nomic-embed-text-v1.5",
     "ollama":    "nomic-embed-text",
@@ -323,29 +320,33 @@ def configure_embeddings(llm_cfg):
     config — it works offline. This step only configures an EXTERNAL embedding
     model instead, which may live on a DIFFERENT host than the chat LLM.
     Returns a dict of env overrides (empty = keep the built-in local embedder).
+
+    UX: the address is PRE-FILLED from the LLM you just connected (editable — the
+    embed model might be on another box), then we do an ACTUAL model pull against
+    it (probe → pick from the served list, no blind typing).
     """
     print(bold("Embeddings") + dim("  (vectorize facts for the Class-C short-term recall lane)"))
     print(dim("  FaultLine has a built-in LOCAL CPU embedder (nomic) — works out of the box,"))
-    print(dim("  offline, no setup. Only add an external one if you want your own embed model."))
-    if not ask_yes("Use an external embedding model instead of the built-in local one?", default_yes=False):
+    print(dim("  offline, no setup."))
+    if not ask_yes("Choose your own embedding model, or use the standard built-in one?", default_yes=False):
         print(green("  ✓ using the built-in local CPU embedder (nomic) — nothing to configure"))
         return {}
 
     llm_url = llm_cfg.get("LLM_BASE_URL", "")
     llm_key = llm_cfg.get("LLM_API_KEY", "")
-    llm_backend = llm_cfg.get("LLM_BACKEND_TYPE", "")
-    print(dim("  Note: the embedding model can live on a different host than your chat LLM."))
+    # probe protocol follows the LLM backend (anthropic can't embed → OpenAI-style probe)
+    e_backend = llm_cfg.get("LLM_BACKEND_TYPE", "") or "openai"
+    if e_backend == "anthropic":
+        e_backend = "openai"
+    print(dim("  The embedding model can live on a different host than your chat LLM."))
+    print(dim("  The address is pre-filled from your LLM — press enter to accept, or type another."))
 
     while True:
-        same = False
-        if llm_url and llm_backend in ("lm_studio", "ollama", "openwebui", "openai"):
-            same = ask_yes(f"Is the embedding model on the SAME endpoint as your LLM "
-                           f"({_probe_url(llm_url)})?", default_yes=True)
-        if same:
-            e_backend, e_url, e_key = llm_backend, llm_url, llm_key
-        else:
-            e_backend = choose("Embedding endpoint type:", _EMBED_BACKENDS)
-            e_url, e_key = _prompt_connection(e_backend)
+        e_url = ask("Embedding server URL", llm_url)
+        # only ask for a separate key when the box differs from the LLM (else reuse the LLM key)
+        e_key = llm_key
+        if _probe_url(e_url) != _probe_url(llm_url):
+            e_key = ask("Embedding API key (blank = reuse the LLM key)", "") or llm_key
 
         print(f"\n{bold('Connecting')} → {_probe_url(e_url)} ...")
         ok, models, detail = probe_models(e_backend, e_url, e_key)
@@ -361,7 +362,7 @@ def configure_embeddings(llm_cfg):
 
         print(red(f"  ✗ could not connect — {detail}"))
         action = choose("What now?", [
-            ("retry", "Re-enter the embedding endpoint details and try again"),
+            ("retry", "Re-enter the embedding server address and try again"),
             ("local", "Forget it — use the built-in local CPU embedder"),
             ("skip",  "Continue anyway — I'll type the model id and fix connectivity later"),
         ])
@@ -426,6 +427,83 @@ def configure_identity():
             print(dim("      OpenAPI tool-server connection, not native MCP — see open-webui#21134.)"))
             print(dim("   2. Find a user's id (for testing): Admin Panel → Users."))
             return ""
+
+
+# ── resource naming (DB / schema prefix / vector collection) ──────────────────
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")        # schema prefix / db name
+_COLL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")        # Qdrant collection (allows '-')
+
+
+def _default_dsn():
+    """The POSTGRES_DSN default from .env.example (keeps the compose 'postgres' host)."""
+    fallback = "postgresql://faultline:faultline@postgres:5432/faultline"
+    if os.path.exists(ENV_EXAMPLE):
+        for line in open(ENV_EXAMPLE, encoding="utf-8"):
+            s = line.strip()
+            if s.startswith("POSTGRES_DSN="):
+                return s.split("=", 1)[1].strip()
+    return fallback
+
+
+def _rewrite_dsn_db(dsn, db):
+    """Replace only the database segment of a DSN, preserving host/port and any ?query."""
+    head, sep, tail = dsn.rpartition("/")
+    if not sep:
+        return dsn
+    query = ""
+    if "?" in tail:
+        _, _, q = tail.partition("?")
+        query = "?" + q
+    return f"{head}/{db}{query}"
+
+
+def _ask_name(prompt, default, pattern, kind):
+    """Prompt for an identifier, re-prompting until it validates against `pattern`."""
+    allowed = ("letters, digits, underscore or dash" if pattern is _COLL_RE
+               else "letters, digits or underscore")
+    while True:
+        v = ask(prompt, default)
+        if pattern.match(v):
+            return v
+        print(red(f"  ✗ invalid {kind} '{v}' — use {allowed}, starting with a letter or underscore."))
+
+
+def _port_open(host, port, timeout=1.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def configure_naming():
+    """
+    Name the deployment's resources — Postgres DB (the db segment of POSTGRES_DSN),
+    per-tenant SCHEMA_NAME_PREFIX, and QDRANT_COLLECTION. Each defaults to 'faultline'.
+    Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
+    DB that isn't up yet (the stack may not be built).
+    """
+    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix, Qdrant collection)"))
+    print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
+    base_dsn = _default_dsn()
+
+    if ask_yes("Use 'faultline' for all resource names (recommended)?", default_yes=True):
+        prefix = db = coll = "faultline"
+    else:
+        prefix = _ask_name("Per-tenant schema prefix", "faultline", _IDENT_RE, "schema prefix")
+        db = _ask_name("Postgres database name", "faultline", _IDENT_RE, "database name")
+        coll = _ask_name("Qdrant collection name", "faultline", _COLL_RE, "collection name")
+
+    ov = {
+        "SCHEMA_NAME_PREFIX": prefix,
+        "QDRANT_COLLECTION": coll,
+        "POSTGRES_DSN": _rewrite_dsn_db(base_dsn, db),
+    }
+    print(green(f"  ✓ schema prefix: {prefix}   db: {db}   collection: {coll}"))
+    print(dim(f"    Postgres DSN: {ov['POSTGRES_DSN']}  (compose host preserved)"))
+    if _port_open("localhost", 5432):
+        print(dim("    (a Postgres is reachable on localhost:5432 — the db is created on first boot)"))
+    return ov
 
 
 # ── .env writing ──────────────────────────────────────────────────────────────
@@ -681,7 +759,10 @@ def main():
     faultline_user_id = configure_identity()
 
     hr()
-    write_env(cfg, mcp_key, faultline_user_id, embed_overrides)
+    naming_overrides = configure_naming()
+
+    hr()
+    write_env(cfg, mcp_key, faultline_user_id, {**(embed_overrides or {}), **naming_overrides})
     print_next_steps(mcp_key)
 
     print()

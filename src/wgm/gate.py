@@ -175,6 +175,23 @@ _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
 )
 
+# Schema-name shape guard: schema names (faultline_{slug}) are interpolated into
+# "SET search_path TO {schema}" via f-string; restrict to safe identifier chars.
+# Defense-in-depth for the interpolation pattern (used repo-wide) — not a refactor of it.
+_SCHEMA_NAME_RE = re.compile(r'^[a-z0-9_]+$')
+
+
+class SearchPathError(RuntimeError):
+    """Tenant search_path could not be (re)applied or verified on this connection.
+
+    A non-LOCAL SET search_path issued inside a transaction REVERTS on rollback,
+    so a failed re-apply leaves the connection pointing at the public (seed
+    template) schema. Continuing would risk silent cross-tenant/seed pollution —
+    this error must propagate (fail the request) and must NEVER be swallowed.
+    """
+    pass
+
+
 class WGMValidationGate:
     @staticmethod
     def validate_edge_inputs(edges: list) -> str | None:
@@ -200,6 +217,14 @@ class WGMValidationGate:
     def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None, schema_name: str = None):
         self.db_conn = db_conn
         self.registry = registry
+        # Guard the schema name shape — it is interpolated into SET search_path
+        # via f-string (defense-in-depth; see _SCHEMA_NAME_RE).
+        if schema_name and not _SCHEMA_NAME_RE.match(schema_name):
+            raise ValueError(
+                f"Invalid tenant schema_name {schema_name!r}: must match "
+                f"^[a-z0-9_]+$ (expected faultline_{{slug}}); refusing to "
+                f"interpolate into SET search_path"
+            )
         self._schema_name = schema_name
         # Initialize unified LLM output validator (dBug-046 Phase 2a)
         # If not provided, create instance with auto-detected LLM endpoint via centralized logic
@@ -216,13 +241,48 @@ class WGMValidationGate:
         # See get_current_ontology() for fallback chain
 
     def _reapply_search_path(self):
-        """Re-apply per-user search_path after rollback to prevent public schema fallthrough."""
-        if self._schema_name:
-            try:
-                with self.db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {self._schema_name}")
-            except Exception:
-                pass
+        """Re-apply per-user search_path after rollback to prevent public schema fallthrough.
+
+        A non-LOCAL SET search_path issued inside a transaction REVERTS if that
+        transaction rolls back, so this re-apply is the ONLY thing keeping
+        subsequent unqualified SQL out of the public (seed template) schema.
+        Failure here can never be silent: log CRIT and raise SearchPathError —
+        a failed request (500) is strictly better than continuing on a
+        connection whose tenant binding is unknown.
+        """
+        if not self._schema_name:
+            return
+        try:
+            with self.db_conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self._schema_name}")
+                # Verify the SET actually took effect on this connection —
+                # closes the case where SET "succeeds" but connection state
+                # is not what we think.
+                cur.execute("SHOW search_path")
+                row = cur.fetchone()
+                current_path = row[0] if row else ""
+        except Exception as e:
+            msg = (
+                f"wgm.search_path_reapply_failed: could not re-apply search_path "
+                f"to tenant schema '{self._schema_name}': {e}. Connection tenant "
+                f"binding is unknown — refusing to continue (public-schema "
+                f"fallthrough / cross-tenant pollution risk)."
+            )
+            log_crit(log, msg, schema=self._schema_name, error=str(e),
+                     component="search_path")
+            raise SearchPathError(msg) from e
+        if self._schema_name not in (current_path or ""):
+            msg = (
+                f"wgm.search_path_reapply_failed: SET search_path executed but "
+                f"verification failed — SHOW search_path returned "
+                f"{current_path!r}, expected it to contain "
+                f"'{self._schema_name}'. Connection tenant binding is wrong — "
+                f"refusing to continue (public-schema fallthrough / "
+                f"cross-tenant pollution risk)."
+            )
+            log_crit(log, msg, schema=self._schema_name,
+                     search_path=current_path, component="search_path")
+            raise SearchPathError(msg)
 
     def _check_type_constraints(
         self,
@@ -526,6 +586,8 @@ class WGMValidationGate:
                             f"object_type '{object_type}' not allowed for '{rel_type}' (allowed: {tail_types})")
 
             return (True, "ok_authoritative")
+        except SearchPathError:
+            raise  # tenant binding unknown — must never be swallowed
         except Exception as e:  # noqa: BLE001 — fail-safe to the existing cache-based check
             log.warning("wgm.authoritative_recheck_failed",
                         extra={"rel_type": rel_type, "error": str(e)})
@@ -533,6 +595,8 @@ class WGMValidationGate:
                 return self._check_type_constraints(
                     rel_type, subject_id, object_id,
                     subject_type=subject_type, object_type=object_type)
+            except SearchPathError:
+                raise  # tenant binding unknown — must never be swallowed
             except Exception:
                 return (True, "type_unknown")
 
@@ -628,6 +692,8 @@ class WGMValidationGate:
             try:
                 self.db_conn.rollback()
                 self._reapply_search_path()
+            except SearchPathError:
+                raise  # tenant binding unknown — must never be swallowed
             except Exception:
                 pass
             log.warning("wgm.entity_type_infer_failed", entity_id=entity_id, error=str(e))
@@ -748,6 +814,8 @@ class WGMValidationGate:
             try:
                 self.db_conn.rollback()
                 self._reapply_search_path()
+            except SearchPathError:
+                raise  # tenant binding unknown — must never be swallowed
             except Exception:
                 pass
             log.error(
@@ -829,6 +897,8 @@ class WGMValidationGate:
                     error=str(e),
                 )
                 self.db_conn.rollback()
+                # SearchPathError intentionally propagates from here — tenant
+                # binding unknown means we must fail the request, not continue.
                 self._reapply_search_path()
 
             return {
@@ -985,6 +1055,8 @@ class WGMValidationGate:
             try:
                 self.db_conn.rollback()
                 self._reapply_search_path()
+            except SearchPathError:
+                raise  # tenant binding unknown — must never be swallowed
             except Exception:
                 pass
             return 0
@@ -1388,6 +1460,8 @@ class WGMValidationGate:
                         try:
                             self.db_conn.rollback()
                             self._reapply_search_path()
+                        except SearchPathError:
+                            raise  # tenant binding unknown — must never be swallowed
                         except Exception:
                             pass
                         log.warning("wgm.pending_types_insert_failed", rel_type=rt, error=str(e))
@@ -2188,5 +2262,7 @@ Respond with ONLY the JSON, no explanation."""
                 error=str(e),
             )
             self.db_conn.rollback()
+            # SearchPathError intentionally propagates from here — tenant
+            # binding unknown means we must fail the request, not continue.
             self._reapply_search_path()
             return False
