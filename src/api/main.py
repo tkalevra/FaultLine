@@ -483,7 +483,7 @@ def _detect_naming_states(text: str) -> list[dict]:
 def _detect_named_instance_states(text: str) -> list[dict]:
     r"""Deterministic NAMED-INSTANCE copula+appositive detector (the "Rex/poodle" seam).
 
-    Captures "My dog Rex is a poodle." / "My cat Whiskers is a tabby." / "My car Betsy is a
+    Captures "My dog Rex is a poodle." / "My cat Mittens is a tabby." / "My car Betsy is a
     Subaru." — the appositive-name + copula type-predication construction the live LLM relation
     extractor (/extract/rewrite) drops (returns []) and the GLiNER2 lane only half-captures
     ("my dog" → owns dog), losing the named instance, its type, and the type→kind rung.
@@ -21325,7 +21325,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # Type inference for hierarchy facts (dprompt-127 strengthening + dprompt-127-Layer2-bidirectional)
                     # When is_hierarchy_rel=true (instance_of, subclass_of), infer subject's type from object
-                    # Pattern: (whiskers, instance_of, cat) → look up cat's type, or infer from entity_taxonomies
+                    # Pattern: (mittens, instance_of, cat) → look up cat's type, or infer from entity_taxonomies
                     # Metadata-driven: Uses entity_taxonomies to map entity names to types (e.g., "cat" → Animal)
                     # GROWTH LAYER: When object has misclassified type (Location for an animal name), correct it bidirectionally
                     if rel_meta.get("is_hierarchy_rel"):
@@ -21570,7 +21570,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # ROLE-ALIAS NON-PREFERENCE (Fix B, Part 2 — flag-gated): a ROLE noun
                         # (mother/sister/colleague) registered as an also_known_as alias of a NAMED
                         # person is a SLOT, not the display name — it must NEVER win the preferred
-                        # display over the proper NAME (so recall renders "Diane", not "mother").
+                        # display over the proper NAME (so recall renders "Carol", not "mother").
                         # When the alias object is in the kinship/relational cue class, register it
                         # NON-preferred. THE HARD LINE: the role is a slot on the named instance; the
                         # NAME is the display. Metadata-driven (cue overlay), subject-agnostic, NO
@@ -35489,7 +35489,7 @@ def correct_fact(req: FactCorrectionRequest):
         # The correction LLM flattens a 1st-person POSSESSIVE role phrase ("Actually my mother
         # is 63") to subject_name="user" (the "my" → first-person rule above). But when Fix B
         # has registered the ROLE noun ("mother") as a non-preferred alias of a NAMED person
-        # (Diane), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
+        # (Carol), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
         # (user, age, N). We do NOT special-case the word: we ground the correction text with
         # the SAME shared anchor resolver ingest/query use (resolve_anchor), whose Rule 2 reads
         # the DB ALIAS CACHE for "my <role>" and returns the named entity's UUID iff the role is
