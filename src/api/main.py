@@ -30837,7 +30837,25 @@ def fetch_facts_from_anchor(
 
                 # ─── Fetch SCALAR ATTRIBUTES: (anchor, attribute, value) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
-                if path.fetch_all_details or path.scalar_rels:
+                #
+                # ANCHORED-ENTITY SCALAR LANE (subject-agnostic): when the anchor is a
+                # CONCRETE non-user entity (resolve_anchor pinned "humans" / "my NAS" to a
+                # real UUID), the entity IS the scope — its scalar attributes are always
+                # in-scope for it. Without this the scalar fetch was gated on
+                # `fetch_all_details or scalar_rels`, so a scoped question that named a
+                # scalar attribute ("how many chromosomes do humans have", "how much
+                # storage does my NAS have") DROPPED the scalar: determine_path routes the
+                # attribute NAME (chromosomes/storage) — minted as a rel_type with
+                # tail_types={ANY} — into relationship_rels, flipping scope_active on with
+                # scalar_rels empty, so this block never ran. The value lives in
+                # entity_attributes on the anchored entity all along. Fetching the anchored
+                # entity's OWN scalars is the lean walk (real rows, no re-structuring); it
+                # mirrors the else-branch below that already fetches ALL attributes for a
+                # named anchor. User-anchored recall is byte-for-byte unchanged (this only
+                # widens the gate for a non-user anchor). Metadata-free, no attribute
+                # literals — the mechanism is "return the anchored entity's scalars".
+                _nonuser_concrete_anchor = bool(anchor_uuid) and anchor_uuid != user_id
+                if path.fetch_all_details or path.scalar_rels or _nonuser_concrete_anchor:
                     if not path.fetch_all_details and path.scalar_rels and anchor_uuid == user_id:
                         # D1: WHERE attribute IN (...) — strict scalar scoping for user anchor.
                         # When anchor is a named entity (not user), fetch all its attributes
