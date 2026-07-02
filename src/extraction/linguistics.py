@@ -668,6 +668,16 @@ def analyze_possessive_predication(text: str):
             if comp is None:
                 continue
 
+            # PASSIVE-PARTICIPLE PREDICATE GUARD (subject-agnostic, morphological). "My wife was born
+            # on …", "my server was provisioned in …", "my company was founded in …" — here the copula/
+            # auxpass branch makes the PARTICIPLE VERB the complement, so this seam would mis-capture the
+            # passive EVENT as a preference VALUE ((user, wife, born) / (user, server, provisioned)). A
+            # preference/attribute value is a predicative ADJ/NOUN ("my favorite color is BLUE"), NEVER a
+            # verbal predicate. So REJECT a VERB complement (a passive participle is a predicate, not a
+            # value) — the dated passive-event chain owns that construction. No lemma/word list.
+            if comp.pos_ == "VERB":
+                continue
+
             # A QUESTION ("what is my favorite colour?") is not a statement of value — its
             # interrogative complement ("what"/"which"/"who") must NOT be captured as a fact.
             # Grammatical + subject-agnostic: wh-words carry PronType=Int / WP|WP$|WDT|WRB tags.
@@ -4758,6 +4768,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         except Exception as e:  # noqa: BLE001 — date binding is best-effort; facts still emit undated
             log.warning("linguistics.derive_date_bind_failed", error=str(e)[:160])
 
+    # ── DATE-VALUED ATTRIBUTE STATE (populated by the pre-pass below; consumed at ``_emit`` + the
+    #    ``_chain_date_attribute`` chain). ``_date_attr_suppress`` holds the token indices of the
+    #    ATTRIBUTE noun + the DATE complement of a "<owner>'s <noun> is <date>" / "<owner> has a <noun>
+    #    of <date>" construction, so the other chains never mis-read the month-name PROPN / day-NUM /
+    #    attribute noun as an entity/age (the date-value chain OWNS them). Empty unless the construction
+    #    is present → zero behaviour change for every other sentence. ``_date_attr_binds`` carries the
+    #    raw (owner_tok, attr_noun_tok, iso, gran) so the chain can resolve the owner via coref (defined
+    #    later) and emit the normalized dated scalar. Kept minimal + fail-safe.
+    _date_attr_suppress: set = set()
+    _date_attr_suppress_surf: set = set()
+    _date_attr_binds: list = []
+
     def _date_for_verb(verb_tok):
         """The (iso, gran) bound to this verb, or the sentence's sole date as a single-verb fallback.
 
@@ -4809,6 +4831,24 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         subj = (subject or "").strip().lower()
         rel = (rel or "").strip().lower()
         obj = (obj or "").strip().lower()
+        # DATE-VALUED-ATTRIBUTE SUPPRESSION (single chokepoint). When a "<owner>'s <noun> is <date>" /
+        # "<owner> has a <noun> of <date>" construction is present, its ATTRIBUTE noun (birthday /
+        # "provision date") and its DATE complement (the month-name PROPN + day-NUM + year) are OWNED by
+        # the date-value chain — no OTHER chain may bind those tokens as a standalone entity/age/name
+        # (else "March"→instance_of/age, "date"→owns/related_to junk). The date-value chain itself emits
+        # the owner (not in this set) + the normalized value, so it is never self-suppressed. Empty for
+        # every sentence without the construction → zero behaviour change. Grammar-driven, fail-safe.
+        for _tk in (subj_tok, obj_tok):
+            if _tk is not None and _tk.i in _date_attr_suppress:
+                return
+        # SURFACE fallback: many chains (named-instance, measure, possessive) resolve a SURFACE and do
+        # not pass the exact token, so the index guard alone misses "March"→instance_of/age /
+        # "date"→owns junk. Drop a NON-scalar emit whose subject/object surface is a suppressed token
+        # surface (the month/day/attribute words the date-value chain owns). Scoped to NON-scalar edges
+        # so the date-value chain's OWN normalized scalar (which carries ``scalar_datatype``) survives.
+        if _date_attr_suppress_surf and scalar_datatype is None:
+            if subj in _date_attr_suppress_surf or obj in _date_attr_suppress_surf:
+                return
         # RELATIVE-PRONOUN GUARD (THE HARD LINE — a function word is never a memory). When a chain's
         # subject/object token is a relative pronoun ("the brother WHO lives…", "the car THAT runs…")
         # the deriver would otherwise bind "who"/"that" as a standalone entity. Resolve it to its
@@ -5225,6 +5265,172 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     except Exception:  # noqa: BLE001 — fail-safe: employment detection never blocks capture
         _emp_binds = []
         _emp_suppress = set()
+
+    # ── DATED PASSIVE-EVENT PRE-PASS (bind the DATE + predicate to the NAMED entity; participle is
+    #    NEVER an object) ─────────────────────────────────────────────────────────────────────────
+    # "My wife Jordan was born on July 8, 1985." / "My company Acme was founded in 1998." / "My server
+    # Apollo was provisioned on March 1, 2023." / "The product was released in 2019." Today a DATED
+    # passive-participle clause mints junk: the objectless-state chain reads the participle as a STATE
+    # OBJECT and strands the date on the role/possessed noun — (wife, has_state, bear)@1985-07-08,
+    # (server, has_state, provision)@2023-03-01 — and sibling chains can read it as a relationship
+    # object (spouse(user, born) / owns(x, founded)). So "When was Jordan born?" / "When was Apollo
+    # provisioned?" finds nothing (the date is on the wrong node, tagged with a junk state).
+    #
+    # THE FIX — ONE fully ENTITY-AGNOSTIC + PREDICATE-AGNOSTIC grammatical rule (NO lemma / role /
+    # kinship / domain literals): for ANY "<entity> was <PASSIVE-PARTICIPLE> [prep <date>]" the
+    # PARTICIPLE is the PREDICATE (never an object) and the ``event_date`` + predicate bind to the
+    # entity the clause is ABOUT — resolved by the SAME appositive/naming + possessive + discourse-
+    # coref the deriver already uses (a person, a dog, a server, a product all take this path). The
+    # participle is detected MORPHOLOGICALLY — spaCy ``tag_ == "VBN"`` (VerbForm=Part) governed by an
+    # ``auxpass`` 'be' aux (the "was/were/is/are/been <Xed>" passive) — NOT any surface/lemma. We only
+    # bind (and only suppress the state twin) when the DATE layer actually resolves a date for this
+    # verb, so a DATELESS passive state ("the server was decommissioned") is left to today's chains
+    # untouched (no regression). Fail-safe: any miss → today's path.
+    _passive_binds: list = []
+    _passive_suppress: set = set()
+    try:
+        for _v in doc:
+            # PASSIVE PARTICIPLE, purely morphological: a past-participle verb (VBN / VerbForm=Part)
+            # with a 'be' ``auxpass`` child — the general "was/were <Xed>" passive. No lemma list.
+            if _v.tag_ != "VBN" and "Part" not in str(_v.morph):
+                continue
+            if not any(c.dep_ == "auxpass" and (c.lemma_ or "").strip().lower() == "be"
+                       for c in _v.children):
+                continue
+            _psubj = next((c for c in _v.children if c.dep_ in ("nsubjpass", "nsubj")), None)
+            if _psubj is None:
+                continue
+            # AGENT / OBJECT guard — our lane is the OBJECTLESS dated passive (born / hired /
+            # provisioned / released). A by-agent passive ("founded BY Ada"), a direct object, or a
+            # prepositional/oblique complement ("diagnosed WITH diabetes", "cited BY the court") is a
+            # real subject↔object relation the agent/SVO chain captures WITH its own date — leave it to
+            # that chain so we never mint a redundant date-only twin. This is the SAME objectless test
+            # the intransitive chain uses (``_svo_object_head`` sees NOUN/PROPN objects incl. the by-
+            # agent; a date-only pobj is excluded via ``_date_token_idx`` so it stays "objectless").
+            if any(c.dep_ in ("agent", "dobj", "obj", "iobj", "dative", "obl") for c in _v.children):
+                continue
+            if _svo_object_head(_v, exclude_idx=_date_token_idx, include_agent=True) is not None:
+                continue
+            # DATE bound to THIS participle's governing verb (the shared temporal machinery). A dateless
+            # passive clause is NOT ours — leave it to the existing chains (no fabricated date, no
+            # regression). NEGATED passive ("was not born here") also stays with the existing chains.
+            _piso, _pgran = _date_for_verb(_v)
+            if not _piso or any(c.dep_ == "neg" for c in _v.children):
+                continue
+            _passive_binds.append((_v, _psubj, _piso, _pgran))
+            _passive_suppress.add(_v.i)  # the intransitive chain must never mint (x, has_state, <part>)
+    except Exception:  # noqa: BLE001 — fail-safe: passive-event detection never blocks capture
+        _passive_binds, _passive_suppress = [], set()
+
+    # ── DATE-VALUED ATTRIBUTE PRE-PASS (construction-agnostic date-value binding) ────────────────
+    # The date-valued sibling of the numeric copula-measure layer. A DATE is a VALUE: when a clause
+    # PREDICATES a date OF an entity via a possessive/copula ("<owner>'s <noun> is <date>", "my <noun>
+    # is <date>") or a have-construction ("<owner> has a <noun> of <date>"), bind it as a dated SCALAR
+    # named by the possessed/predicate NOUN, on the entity — so "Rex was born in 2020" and
+    # "Rex's birthday is March 3, 2020" both land a date value on Rex. This pre-pass does the
+    # GRAMMAR + DATE-LAYER detection only (owner resolution + emit happen in ``_chain_date_attribute``,
+    # which can use the coref helpers defined later). It records (owner_tok, attr_noun_tok, iso, gran)
+    # and populates ``_date_attr_suppress`` (the attribute noun + date complement tokens) so no OTHER
+    # chain mis-reads the month-name/day-num/attribute-noun as an entity/age. ZERO word/attribute
+    # literals: DATE-ness is decided ONLY by the date layer; the attribute NAME is the possessed noun;
+    # the OWNER is genitive/possessive/subject grammar. A bare "X's birthday" with NO date → nothing
+    # (no fabrication); a PLACE ("born in Toronto") is a participle/location construction, never here.
+    def _da_date_of(_text):
+        try:
+            for _st, _sp in (_collect_date_spans(_text) or []):
+                _di, _dg, _, _ = _resolve_first_valid_date(_sp, reference)
+                if _di:
+                    return _di, (_dg or "day")
+        except Exception:  # noqa: BLE001
+            pass
+        return None, None
+
+    def _da_subtree_text(_t):
+        _ts = sorted(_t.subtree, key=lambda x: x.idx)
+        if not _ts:
+            return ""
+        return doc.text[_ts[0].idx:(_ts[-1].idx + len(_ts[-1].text))]
+
+    def _da_suppress_subtree(_t):
+        try:
+            for _st in _t.subtree:
+                _date_attr_suppress.add(_st.i)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        for _tok in doc:
+            # Pattern B: HAVE + <noun> of <date>.
+            if _tok.pos_ == "VERB" and (_tok.lemma_ or "").strip().lower() == "have":
+                _hs = next((c for c in _tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+                _hd = next((c for c in _tok.children
+                            if c.dep_ in ("dobj", "obj") and c.pos_ == "NOUN"), None)
+                if _hs is None or _hd is None:
+                    continue
+                _hof = next((c for c in _hd.children if c.dep_ == "prep"
+                             and (c.text or "").strip().lower() == "of"), None)
+                if _hof is None:
+                    continue
+                _hp = next((g for g in _hof.children if g.dep_ == "pobj"), None)
+                if _hp is None:
+                    continue
+                _di, _dg = _da_date_of(_da_subtree_text(_hp))
+                if not _di:
+                    continue
+                _date_attr_binds.append((_hs, _hd, _di, _dg))
+                # suppress the attribute noun + the "of <date>" complement (never a standalone entity)
+                _date_attr_suppress.add(_hd.i)
+                for _m in _hd.children:
+                    if _m.dep_ in ("compound", "amod") and _m.i < _hd.i:
+                        _date_attr_suppress.add(_m.i)
+                _da_suppress_subtree(_hp)
+                continue
+            # Pattern A: COPULA be with a DATE complement + a possessed attribute NOUN.
+            if not ((_tok.lemma_ or "").strip().lower() == "be" and _tok.pos_ == "AUX"):
+                continue
+            _cmp = next((c for c in _tok.children
+                         if c.dep_ in ("attr", "acomp", "oprd", "npadvmod")), None)
+            if _cmp is None:
+                continue
+            _di, _dg = _da_date_of(_da_subtree_text(_cmp))
+            if not _di:
+                continue
+            _acands = []
+            for c in _tok.children:
+                if c.dep_ in ("nsubj", "nsubjpass") and c.pos_ in ("NOUN", "PROPN"):
+                    _acands.append(c)
+                    for g in c.children:
+                        if g.dep_ == "appos" and g.pos_ in ("NOUN", "PROPN"):
+                            _acands.append(g)
+            _an = _ao = None
+            for c in _acands:  # PREFER a genitive PROPN owner ("Apollo's date") over a determiner
+                _pp = next((x for x in c.children if x.dep_ == "poss" and x.pos_ == "PROPN"), None)
+                if _pp is not None:
+                    _an, _ao = c, _pp
+                    break
+            if _an is None:
+                for c in _acands:
+                    _pp = next((x for x in c.children if x.dep_ == "poss"), None)
+                    if _pp is not None:
+                        _an, _ao = c, _pp
+                        break
+            if _an is None or _ao is None:
+                continue
+            _date_attr_binds.append((_ao, _an, _di, _dg))
+            # suppress the attribute noun (+ its compound/amod) and the whole DATE complement subtree
+            _date_attr_suppress.add(_an.i)
+            for _m in _an.children:
+                if _m.dep_ in ("compound", "amod") and _m.i < _an.i:
+                    _date_attr_suppress.add(_m.i)
+            _da_suppress_subtree(_cmp)
+        # SURFACE index for the ``_emit`` fallback (chains that resolve a surface, not the token).
+        for _si in _date_attr_suppress:
+            try:
+                _date_attr_suppress_surf.add((doc[_si].text or "").strip().lower())
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001 — fail-safe: date-attribute detection never blocks capture
+        _date_attr_binds, _date_attr_suppress, _date_attr_suppress_surf = [], set(), set()
 
     # ── KINSHIP-COLLECTIVE PRE-PASS (the family-list case) ───────────────────────────────────────
     # "We have three kids: Mia, Theo, and Leo." — a COLLECTIVE kinship head ("kids"/"children"/
@@ -5947,6 +6153,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the employment chain owns this verb — never "(user, has_state, work)"
             if tok.i in _quantity_verb_suppress:
                 continue  # the quantity-of chain owns this verb ("NAS has 40 TB of storage") — scalar
+            if tok.i in _passive_suppress:
+                continue  # the dated passive-event chain owns "was <Xed>" — never (x, has_state, <part>)
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -6029,6 +6237,82 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             _emit(subject, _STATE_REL, state, verb_tok=tok, obj_tok=tok, subj_tok=subj_tok,
                   tentative=_state_tentative, negated=_neg)
+
+    def _chain_passive_event(doc):
+        # DATED PASSIVE EVENT → the NAMED ENTITY (pre-pass ``_passive_binds``). For ANY
+        # "<entity> was <PASSIVE-PARTICIPLE> [prep <date>]" emit ONE dated fact whose PREDICATE is the
+        # participle (never an object) and whose value carries the ``event_date`` — filed on the entity
+        # the clause is ABOUT. Fully entity-agnostic (a person / dog / server / product) and predicate-
+        # agnostic (born / founded / hired / provisioned / released — the participle SURFACE is the rel,
+        # no lemma list): the entity is resolved by the SAME appositive/naming + possessive + discourse-
+        # coref the deriver already uses, and the date binds via the shared governing-verb date map. The
+        # value is emitted as a SCALAR (``scalar_datatype`` set) so the date is a scalar LEAF, not a
+        # relationship graph object — THE HARD LINE (the participle is the place/relation, the date the
+        # value). A miss → NULL (the pre-pass only enrolled dated passives). No role/person/kinship gate.
+        for _v, _psubj, _iso, _gran in _passive_binds:
+            _entity = None
+            _etok = None
+            # PREFER THE PROPER NAME (subject-agnostic, ONE grammatical rule for ALL possessed-noun+name
+            # shapes). "my <possessed-noun> <Name> was <participle>" reaches the deriver in two spaCy
+            # parse shapes: (i) the name is an ``appos`` of the common-noun subject ("my wife MARLA",
+            # "my server APOLLO"); (ii) the common noun AND the name are BOTH attached as ``nsubjpass``
+            # siblings of the participle ("my cat cat/WHISKERS", "my dog dog/FRAGGLE"). In BOTH the
+            # date-bearing entity is the trailing PROPER NAME — never the possessed common noun (which
+            # keeps its own owns/has_pet/kinship edge). Resolve the NAME first, regardless of whether
+            # the possessed noun is kinship/animal/thing (no role/type literal): a PROPN among the
+            # participle's subject candidates, else a PROPN ``appos`` of one. Only when there is NO name
+            # do we fall to first-person → user, 3rd-person coref, or the possessed noun itself.
+            _subj_cands = [c for c in _v.children if c.dep_ in ("nsubjpass", "nsubj")]
+            _name_tok = next((c for c in _subj_cands if c.pos_ == "PROPN"), None)
+            if _name_tok is None:
+                for _c in _subj_cands:
+                    _ap = next((g for g in _c.children
+                                if g.dep_ == "appos" and g.pos_ == "PROPN"), None)
+                    if _ap is not None:
+                        _name_tok = _ap
+                        break
+            if _name_tok is not None:
+                # (a) the trailing PROPER NAME is the named instance the event files at (THE HARD LINE).
+                _entity = (_name_tok.text or "").strip().lower()
+                _etok = _name_tok
+            elif _is_first_person_personal_pronoun(_psubj):
+                # (b) first person ("I was hired in 2020") → the user.
+                _entity = "user"
+            elif _psubj.pos_ == "PRON":
+                # (c) 3rd-person pronoun ("she/he/it/they was …") → discourse/near-antecedent coref.
+                _cr = _coref(_psubj) or _person_coref(_psubj)
+                if _cr:
+                    _entity = _cr
+                else:
+                    _entity = (_psubj.text or "").strip().lower()
+                    _etok = _psubj
+            else:
+                # (d) an un-named possessed/definite common-noun subject ("my server was provisioned",
+                #     "the product was released") — the thing itself is the entity. No person gate.
+                _entity = (_psubj.lemma_ or _psubj.text or "").strip().lower()
+                _etok = _psubj
+            if not _entity:
+                continue
+            # PREDICATE = the participle SURFACE (lowercased) — the same word the user would ask with
+            # ("when was X born / founded / hired"). NOT the lemma (which would split "born"↔"bear").
+            _pred = (_v.text or _v.lemma_ or "").strip().lower()
+            if not _pred:
+                continue
+            # VALUE by GRANULARITY — never surface a fabricated day for a year/month-granular date. A
+            # full DAY stores the ISO date (datatype "date" → value_date); coarser granularities store
+            # the granularity-trimmed string the user gave ("1958", "1985-07") as an untyped-string
+            # scalar (the strict date validator wants full YYYY-MM-DD). ``scalar_datatype`` FORCES the
+            # scalar route so the date is a leaf value, not a resolved entity/graph object.
+            _iso10 = _iso[:10]
+            if _gran == "year":
+                _val, _dt = _iso10[:4], "string"
+            elif _gran == "month":
+                _val, _dt = _iso10[:7], "string"
+            else:
+                _val, _dt = _iso10, "date"
+            _emit(_entity, _pred, _val, verb_tok=_v, obj_tok=None,
+                  subj_tok=(_etok if _etok is not None else _psubj),
+                  scalar_datatype=_dt, distribute=False)
 
     def _chain_possessive(doc):
         # POSSESSIVE (relational-vs-sortal split). ``my X`` (1st-person poss pronoun) → (user, owns, X).
@@ -6561,6 +6845,60 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the value lands in entity_attributes, never resolved to a UUID.
             _emit(subject, rel, value, verb_tok=head, obj_tok=num_tok, subj_tok=tok)
             _claim(tok)
+
+    def _chain_date_attribute(doc):
+        # DATE-VALUED SCALAR ATTRIBUTE — the emit half of the pre-pass ``_date_attr_binds``. A DATE is a
+        # VALUE: for each detected "<owner>'s <noun> is <date>" / "my <noun> is <date>" / "<owner> has a
+        # <noun> of <date>" construction, emit ONE dated SCALAR (owner, <possessed-noun>, date-value) —
+        # so "Rex was born in 2020" and "Rex's birthday is March 3, 2020" both land a date value
+        # on Rex, retrievably. The attribute/date tokens are already SUPPRESSED from every other
+        # chain (``_date_attr_suppress`` at ``_emit``), so no month-name/day-num/attribute-noun junk. The
+        # OWNER is resolved here (coref helpers are in scope now): first-person→user, PROPN→name,
+        # 3rd-person→coref, else the possessed/subject noun. Subject-agnostic, ZERO word/attribute
+        # literals, no fabricated dates (the pre-pass only enrolled date-layer-resolved complements).
+        def _fmt(iso, gran):
+            _i10 = iso[:10]
+            if gran == "year":
+                return _i10[:4], "string"
+            if gran == "month":
+                return _i10[:7], "string"
+            return _i10, "date"
+
+        def _owner_resolve(_tk):
+            # the genitive/possessive/subject owner → (entity surface, token|None). ``my/our`` (Poss,
+            # Person=1) and a 1st-person subject → user; a PROPN → the name; a 3rd-person pronoun →
+            # coref; else the noun's own lemma/surface (a possessed common noun IS the entity).
+            if _tk is None:
+                return None, None
+            try:
+                _p1 = (_tk.morph.get("Person") == ["1"] and "Yes" in _tk.morph.get("Poss"))
+            except Exception:  # noqa: BLE001
+                _p1 = False
+            if _is_first_person_personal_pronoun(_tk) or _p1:
+                return "user", None
+            if _tk.pos_ == "PROPN":
+                return (_tk.text or "").strip().lower(), _tk
+            if _tk.pos_ == "PRON":
+                _cr = _coref(_tk) or _person_coref(_tk)
+                if _cr:
+                    return _cr, None
+            return (_tk.lemma_ or _tk.text or "").strip().lower(), _tk
+
+        def _attr_phrase(noun):
+            _mods = [c for c in noun.children if c.dep_ in ("compound", "amod") and c.i < noun.i]
+            _parts = [m.text for m in sorted(_mods, key=lambda m: m.i)] + [noun.text]
+            return " ".join(p.strip() for p in _parts if p and p.strip()).lower()
+
+        for _owner_tok, _attr_tok, _iso, _gran in _date_attr_binds:
+            _owner, _otok = _owner_resolve(_owner_tok)
+            _attr = _attr_phrase(_attr_tok)
+            if not _owner or not _attr:
+                continue
+            _val, _dt = _fmt(_iso, _gran)
+            # subj_tok=_otok only when it is NOT the suppressed attribute region (the owner never is);
+            # obj_tok=None (the value is a scalar leaf, not an entity). distribute=False.
+            _emit(_owner, _attr, _val, verb_tok=None, obj_tok=None,
+                  subj_tok=_otok, scalar_datatype=_dt, distribute=False)
 
     def _chain_dash_specifier(doc):
         # DASH/COLON-INTRODUCED SPECIFYING LIST (gap-class: loose apposition that ENUMERATES a prior
@@ -7589,9 +7927,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         () if named_role_only else
         (_chain_dash_specifier,) if dash_specifier_only else
         (_chain_employment,
-         _chain_svo, _chain_intransitive, _chain_copula_state,
+         _chain_svo, _chain_intransitive, _chain_passive_event, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
-         _chain_copula_measure, _chain_dash_specifier,
+         _chain_copula_measure, _chain_date_attribute, _chain_dash_specifier,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
          _chain_has_measure, _chain_measure_pp, _chain_attributive_measure,
          _chain_quantity_of,

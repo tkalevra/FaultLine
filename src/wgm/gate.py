@@ -1508,6 +1508,28 @@ class WGMValidationGate:
         # trusted and skip type constraints, hierarchy, and category validation.
         raw_confidence = edge_args.get("confidence", 0.8) or 0.0
         is_user_correction = self._is_user_correction(edge_args)
+        # USER-IS-TRUTH TYPE-VETO EXEMPTION (keyed on PROVENANCE only, subject-agnostic).
+        # A type constraint (head_types/tail_types) is a validator/growth-guide for INFERRED
+        # edges — it is NOT a veto on what the USER STATED. The user can validly say "a product
+        # was born in 2019" / "my company was founded in 1998" / "the legend was born" — those
+        # are TRUE and MUST land durable; the engine GROWS to fit them, it never quarantines
+        # them because the subject/object doesn't match a Person-constrained rel. So when the
+        # edge is user-authored (fact_provenance == 'user_stated') OR a correction, the
+        # head/tail type-mismatch veto below MUST NOT crater/downgrade it — the mismatch is a
+        # GROWTH signal, not a rejection. The veto STILL applies to llm_inferred / llm_learned
+        # (its legitimate job: crater a bad inference like a car's GPS mis-filed into the event
+        # graph). fact_provenance flows in via edge_args (source="mcp" → "user_stated") or the
+        # explicit `provenance` param. NO rel/type/name literals — provenance only.
+        _edge_provenance = (
+            edge_args.get("fact_provenance")
+            or (provenance if isinstance(provenance, str) else None)
+            or ""
+        ).strip().lower()
+        _is_user_authored = (_edge_provenance == "user_stated") or is_user_correction
+        # Set True when a user-authored edge's type genuinely mismatched (logged as a growth
+        # candidate below); used to skip the constraint-driven type INFERENCE so we never stamp
+        # a mismatching constraint type (e.g. Person) onto the user's actual entity (a product).
+        _user_authored_type_mismatch = False
         # Fix B — TYPE-CONSISTENCY PRE-GATE on the confidence bypass.
         # A high-confidence LLM-extracted edge (e.g. a false `(user, parent_of, Rex)`
         # minted by /extract/rewrite) must NOT skip type constraints when its rel_type
@@ -1582,13 +1604,23 @@ class WGMValidationGate:
                         # quarantine keeps the false `(user, parent_of, Rex)` out of the
                         # authoritative Class-A facts while remaining non-destructive
                         # (Class C, user-correctable). Metadata-driven, no rel-name literal.
-                        _bypass_type_conflict = True
-                        log.info("wgm.confidence_bypass_type_pregate",
-                                 rel_type=rt, confidence=raw_confidence,
+                        # USER-IS-TRUTH EXEMPTION: a user-authored edge is NOT quarantined —
+                        # it lands durable and the mismatch is logged as an ontology-growth
+                        # candidate (widen the rel's head/tail_types to admit the user's world).
+                        if not _is_user_authored:
+                            _bypass_type_conflict = True
+                            log.info("wgm.confidence_bypass_type_pregate",
+                                     rel_type=rt, confidence=raw_confidence,
+                                     reason=_ty_reason,
+                                     note="type-inconsistent high-confidence edge quarantined to "
+                                          "Class C (bypass denied)")
+                            return {"status": "valid", "hierarchy_type_mismatch": True}
+                        _user_authored_type_mismatch = True
+                        log.info("wgm.type_veto_exempted_user_stated",
+                                 rel_type=rt, provenance=_edge_provenance or "user_correction",
                                  reason=_ty_reason,
-                                 note="type-inconsistent high-confidence edge quarantined to "
-                                      "Class C (bypass denied)")
-                        return {"status": "valid", "hierarchy_type_mismatch": True}
+                                 note="user-authored fact lands durable despite type mismatch; "
+                                      "ontology-growth candidate (widen head/tail_types)")
 
                     # PASSED-TYPE VETO (WGM_TYPE_MISMATCH_VETO, default ON): the ground-truth
                     # check above is edge-ORDER dependent — a freshly-minted object is still
@@ -1613,15 +1645,28 @@ class WGMValidationGate:
                             and self._passed_type_is_genuine_mismatch(subject_type, _ht, subject_id)
                         )
                         if _tail_bad or _head_bad:
-                            _bypass_type_conflict = True
-                            log.info("wgm.confidence_bypass_passed_type_veto",
-                                     rel_type=rt, confidence=raw_confidence,
+                            # USER-IS-TRUTH EXEMPTION: the veto craters a bad INFERENCE, never a
+                            # user-authored fact. A user-stated "a product was born" / "the company
+                            # was founded" genuinely violates a Person-constrained head — but it is
+                            # TRUE, so it lands durable and the mismatch becomes a growth candidate.
+                            if not _is_user_authored:
+                                _bypass_type_conflict = True
+                                log.info("wgm.confidence_bypass_passed_type_veto",
+                                         rel_type=rt, confidence=raw_confidence,
+                                         subject_type=subject_type, object_type=object_type,
+                                         head_types=_ht, tail_types=_tt,
+                                         role=("tail" if _tail_bad else "head"),
+                                         note="GLiNER2-passed type genuinely violates constraint; "
+                                              "durable-A cast craters to Class C (bypass denied)")
+                                return {"status": "valid", "hierarchy_type_mismatch": True}
+                            _user_authored_type_mismatch = True
+                            log.info("wgm.type_veto_exempted_user_stated",
+                                     rel_type=rt, provenance=_edge_provenance or "user_correction",
                                      subject_type=subject_type, object_type=object_type,
                                      head_types=_ht, tail_types=_tt,
                                      role=("tail" if _tail_bad else "head"),
-                                     note="GLiNER2-passed type genuinely violates constraint; "
-                                          "durable-A cast craters to Class C (bypass denied)")
-                            return {"status": "valid", "hierarchy_type_mismatch": True}
+                                     note="user-authored fact lands durable despite type mismatch; "
+                                          "ontology-growth candidate (widen head/tail_types)")
             except Exception as _pge:
                 log.warning("wgm.confidence_bypass_pregate_failed",
                             rel_type=rt, error=str(_pge)[:120])
@@ -1636,14 +1681,20 @@ class WGMValidationGate:
             head_any = not head_types or "any" in [t.lower() for t in head_types]
             tail_any = not tail_types or "any" in [t.lower() for t in tail_types]
             is_scalar = tail_types and "scalar" in [t.lower() for t in tail_types]
-            if not head_any and head_types:
-                st = self._resolve_entity_type(subject_id)
-                if st and st.lower() == 'unknown':
-                    self._infer_entity_type(subject_id, head_types[0])
-            if not tail_any and not is_scalar and tail_types:
-                ot = self._resolve_entity_type(object_id)
-                if ot and ot.lower() == 'unknown':
-                    self._infer_entity_type(object_id, tail_types[0])
+            # GROW, DON'T MISTYPE: when a user-authored fact genuinely mismatched the rel's
+            # constraints (exempted above), do NOT stamp the constraint type onto the entity —
+            # that would poison L4 (e.g. mark the user's product as 'Person' just because
+            # born_on.head=Person). The mismatch is a rel-widening candidate, not an entity
+            # re-type. Only fill types for user-authored edges whose types actually satisfy.
+            if not _user_authored_type_mismatch:
+                if not head_any and head_types:
+                    st = self._resolve_entity_type(subject_id)
+                    if st and st.lower() == 'unknown':
+                        self._infer_entity_type(subject_id, head_types[0])
+                if not tail_any and not is_scalar and tail_types:
+                    ot = self._resolve_entity_type(object_id)
+                    if ot and ot.lower() == 'unknown':
+                        self._infer_entity_type(object_id, tail_types[0])
             log.info("wgm.confidence_bypass_early",
                      rel_type=rt, confidence=raw_confidence,
                      is_user_correction=is_user_correction,
@@ -1662,7 +1713,16 @@ class WGMValidationGate:
         # Hierarchy-aware mismatch: entity type was resolved via hierarchy facts but
         # conflicts with rel_type's head/tail type constraints. Return valid but flag
         # for downgrade to Class C in the ingest loop — never silently pass.
-        if not type_ok and type_reason == "hierarchy_type_mismatch":
+        # USER-IS-TRUTH EXEMPTION: a user-authored fact (user_stated / correction) at
+        # sub-0.95 confidence is NOT downgraded either — same principle as the bypass pregate.
+        if not type_ok and type_reason == "hierarchy_type_mismatch" and _is_user_authored:
+            log.info("wgm.type_veto_exempted_user_stated",
+                     rel_type=rt, provenance=_edge_provenance or "user_correction",
+                     reason="hierarchy_type_mismatch",
+                     note="user-authored fact lands durable despite hierarchy type mismatch; "
+                          "ontology-growth candidate (widen head/tail_types)")
+            return {"status": "valid"}
+        elif not type_ok and type_reason == "hierarchy_type_mismatch":
             log.info("wgm.hierarchy_type_mismatch_staged",
                      rel_type=rt, subject_id=str(subject_id)[:16],
                      object_id=str(object_id)[:16],
