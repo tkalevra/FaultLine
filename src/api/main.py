@@ -5844,6 +5844,7 @@ def _retype_mistyped_edge(
     object_is_known_class: bool,
     rel_meta_resolver,
     rel_is_scalar: bool = False,
+    user_authored: bool = False,
 ) -> dict | None:
     """RE-ROUTE a type-inconsistent classificatory edge — keep the info, fix the slot.
 
@@ -5887,6 +5888,27 @@ def _retype_mistyped_edge(
     """
     rt = (getattr(edge, "rel_type", "") or "").lower().strip()
     if not rt:
+        return None
+    # USER-IS-TRUTH EXEMPTION (keyed on PROVENANCE only, subject-agnostic). A type constraint
+    # (head_types) is a validator/growth-guide for INFERRED edges — it is NOT a veto on what the
+    # USER STATED. The user can validly say "a product was born", "my company was founded", or any
+    # relational fact whose subject/object type falls outside a Person-leaning ``head_types``. Those
+    # are TRUE, so the engine records them AS STATED and GROWS to fit — it must NOT re-slot or
+    # quarantine them to Class C because the type mismatches. This GENERALIZES the ``object_datatype``
+    # scalar exemption below to every user-authored fact (user_stated / correction), not just typed
+    # scalars. The re-slot/quarantine still applies to LLM-INFERRED edges (its legitimate job: a
+    # breed mis-filed into occupation, a car's GPS mis-slotted). NO rel/type/name literal.
+    if user_authored:
+        return None
+    # TYPED-SCALAR EXEMPTION (subject-agnostic). An edge carrying a validated ``object_datatype``
+    # (date / ip / number / …) is a SCALAR VALUE, never a mis-slotted concept-OBJECT. This re-slot/
+    # pushback exists to catch an UNTYPED concept mis-filed into a scalar (a breed into occupation /
+    # nationality), NOT a legitimately-typed value. A birth/founding/provisioning DATE on a non-Person
+    # entity ("my dog Rex was born in 2020", "my server Apollo was provisioned in 2023") is a valid
+    # scalar regardless of the rel's Person-leaning ``head_types`` — the value carries no concept to
+    # re-type, so head-type inconsistency must NOT quarantine it to Class C (the dateless-stub bug).
+    # Mirrors the ``object_datatype`` exemption in ``_drop_temporal_object_edges``. Fail-safe.
+    if getattr(edge, "object_datatype", None):
         return None
     rel_meta = rel_meta_resolver(rt) or {}
     head_types = rel_meta.get("head_types") or []
@@ -14061,6 +14083,15 @@ def _drop_temporal_object_edges(edges: list[dict], db_conn=None) -> list[dict]:
     kept: list[dict] = []
     for _e in edges:
         _o = (_e.get("object") or "")
+        # SCALAR-VALUE EXEMPTION: an edge carrying ``object_datatype`` is an INTENTIONAL scalar leaf
+        # (a captured VALUE routed to entity_attributes), NOT a date leaked as a relationship graph
+        # object. A DATED-attribute scalar (a birth/founding/provisioning date bound to its entity via
+        # the dated passive-event chain, or the atomic ``born_on`` detector) legitimately HAS a date as
+        # its value — that is the ONE place a date IS the value, and it must survive. Only strip a
+        # temporal object on a RELATIONSHIP edge (no object_datatype), where the date genuinely leaked.
+        if _e.get("object_datatype"):
+            kept.append(_e)
+            continue
         if _object_is_temporal(_o, db_conn):
             log.info("extraction.temporal_object_rejected",
                      rel_type=(_e.get("rel_type") or "")[:40], object=str(_o)[:40])
@@ -20894,12 +20925,23 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 gliner_type=_retype_class_obj_gliner,
                                 batch_class_objects=_batch_class_objects,
                             )
+                            # USER-IS-TRUTH: a user-authored fact is exempt from the re-slot/
+                            # quarantine (it lands AS STATED; the mismatch is a growth signal, not a
+                            # veto). Provenance routing runs later (≈21729), so derive the effective
+                            # provenance here the SAME way: source="mcp" → user_stated (all MCP
+                            # ingest), an already-user_stated edge, or an explicit correction.
+                            _edge_user_authored = (
+                                req.source == "mcp"
+                                or getattr(edge, "fact_provenance", None) == "user_stated"
+                                or getattr(edge, "is_correction", False)
+                            )
                             _retype_directive = _retype_mistyped_edge(
                                 edge,
                                 _retype_subject_type,
                                 _obj_is_class,
                                 _rel_meta,
                                 rel_is_scalar=_is_scalar_rel_type(edge.rel_type),
+                                user_authored=_edge_user_authored,
                             )
                             if _retype_directive:
                                 if _retype_directive["action"] == "retype":
@@ -22651,6 +22693,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             object_type=final_object_type,
                             confidence=confidence,  # reassessed confidence (1.0 for user-stated), not raw edge.confidence
                             is_correction=edge.is_correction,  # dprompt-136: Gate needs to know if this is a correction
+                            fact_provenance=edge.fact_provenance,  # user-is-truth: user_stated edges are EXEMPT from the type-mismatch veto (grow, don't quarantine)
                             temporal_status=_req_temporal_status,  # verb tense (now|past|future), not gated
                             event_date=_gate_ed,                   # event_date ISO, gated by temporal_class
                             event_date_granularity=_gate_gran,     # granularity, matched to event_date
@@ -22784,6 +22827,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         fact_subject, canonical_object, canonical_rel_type,
                                         subject_type=edge.subject_type,
                                         object_type=edge.object_type,
+                                        is_correction=edge.is_correction,
+                                        fact_provenance=edge.fact_provenance,  # user-is-truth: exempt user_stated from type-veto
                                         temporal_status=_req_temporal_status,
                                         event_date=_gate_ed,
                                         event_date_granularity=_gate_gran,
