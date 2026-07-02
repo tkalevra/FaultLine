@@ -156,7 +156,7 @@ Every user gets a **physically separate PostgreSQL schema** (`faultline_<user_id
 
 | Tenant | Told | Stored in *its* schema | Any other tenant's data? |
 |---|---|---|---|
-| A | a cat named Whiskers | `cat → feline → mammal → animal` | **none** |
+| A | a cat named Mittens | `cat → feline → mammal → animal` | **none** |
 | B | a red Tesla Model 3 | `tesla → vehicle → transportation_device` | **none** |
 | C | lives in Berlin, Germany | `berlin → city`, `germany → country` | **none** |
 
