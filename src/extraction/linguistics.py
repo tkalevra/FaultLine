@@ -1752,7 +1752,7 @@ def _svo_keep_particles() -> frozenset[str]:
         return _SVO_KEEP_PARTICLES
 
 
-def _svo_predicate_token(verb_tok, exclude_idx=None) -> str | None:
+def _svo_predicate_token(verb_tok, exclude_idx=None, include_agent=False) -> str | None:
     """Build the predicate token from a verb token: the verb LEMMA + one load-bearing particle/prep.
 
     "got" → "get"; "went to" (go + prt/prep "to") → "go_to"; "moved into" → "move_into". The object
@@ -1816,6 +1816,17 @@ def _svo_predicate_token(verb_tok, exclude_idx=None) -> str | None:
             if c.dep_ == "prep" and not has_direct_object:
                 parts.append((c.lemma_ or c.text or "").strip().lower())
                 break
+        # PASSIVE AGENT BY-PHRASE (``include_agent``, subordinate-predicate path only): "was cited BY
+        # X" folds "_by" so the demoted-subject agent becomes the relation's object ("cited_by"). The
+        # agent by-phrase carries dep_=="agent" (NOT prep), so it is invisible to the particle loop; we
+        # fold it ONLY when no particle already folded AND the verb governs no direct object (the agent
+        # IS the object). Grammatical (dep_), subject-agnostic, gated OFF by default → every existing
+        # caller byte-identical. A date-span "by" is never an agent (excluded).
+        if include_agent and len(parts) == 1 and not has_direct_object:
+            for c in verb_tok.children:
+                if c.dep_ == "agent" and not _in_date(c):
+                    parts.append("by")
+                    break
         token = "_".join(p for p in parts if p)
         # Reject a pure function-word predicate (e.g. the verb tagged as an aux only).
         if not token or token in _particles:
@@ -1965,7 +1976,7 @@ def _content_verb_beats_mint(verb_tok, rel: str, minted: str) -> bool:
         return False
 
 
-def _svo_object_head(verb_tok, exclude_idx=None):
+def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
     """Return the OBJECT head noun token a verb governs, or ``None``.
 
     Direct object ("got a phone" → dobj "phone"), or the prepositional object of a load-bearing
@@ -1997,7 +2008,91 @@ def _svo_object_head(verb_tok, exclude_idx=None):
         for c in verb_tok.children:
             if c.dep_ in ("attr", "oprd") and c.pos_ in ("NOUN", "PROPN") and _ok(c):
                 return c
+        # PASSIVE AGENT (``include_agent``): the pobj of a passive "by"-phrase (dep_=="agent") IS the
+        # relation's object ("was cited BY three later cases" → "cases"). Gated OFF by default so every
+        # existing caller is byte-identical. Grammatical (dep_), subject-agnostic.
+        if include_agent:
+            for c in verb_tok.children:
+                if c.dep_ == "agent" and _ok(c):
+                    for gc in c.children:
+                        if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and _ok(gc):
+                            return gc
     except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
+def _carried_subject_token(verb_tok):
+    r"""The COREFERENCE-CARRIED subject token for a SUBORDINATE / COORDINATED predicate that lacks its
+    OWN grammatical subject — the deterministic key to DENSE multi-predicate decomposition.
+
+    A dense sentence packs several predicates about ONE subject into subordinate/coordinated clauses
+    that spaCy leaves subject-LESS (their subject is shared by coordination or supplied by the noun
+    they modify):
+
+        "CVE… is a vulnerability …, attributed to X, targeting Y, patched on <date>."
+            attributed(acl of "vulnerability") · targeting(conj) · patched(conj) — none has an nsubj.
+        "The patient … presented with pain, was diagnosed …, and was prescribed <drug> on <date>."
+            presented(acl of "patient") · prescribed(conj of the ROOT) — subjectless.
+        "Smith v. Jones, decided …, overruled Baker, established …, and was cited by …."
+            overruled(advcl) · established(conj) · cited(conj) — subjectless.
+
+    The SVO / intransitive chains require a direct ``nsubj``/``nsubjpass`` child, so today they SKIP
+    every one of these and the sentence UNDER-DECOMPOSES. This resolver supplies the carried subject
+    so those SAME chains (and their verb-lift / date / object machinery) fire per subordinate predicate
+    — no parallel extractor.
+
+    Returns the subject TOKEN, or ``None``. Resolution (grammar/dep_ only, subject-agnostic, NO
+    literal):
+      • ONLY for a verb that has NO ``nsubj``/``nsubjpass`` of its own AND whose dep_ is a
+        subordinate/coordinated predicate arc (``conj``/``acl``/``advcl``/``acl:relcl``/``relcl``);
+      • REJECT an infinitival / irrealis form (``xcomp``, or a ``to`` ``aux``/``mark`` child, or
+        ``VerbForm=Inf``) — a purpose/control clause ("went to the store TO buy milk") is not an
+        asserted predicate about the subject;
+      • climb the head chain: the FIRST ancestor verb carrying an explicit ``nsubj``/``nsubjpass``
+        supplies it (coordination — the shared subject); a modified NOUN reached via ``acl``/``advcl``
+        IS the subject, unless that noun is a copula complement (``attr``/``oprd`` of ``be``), in which
+        case the copula's own subject is used (so "… is a vulnerability, attributed to X" carries the
+        CVE, not "vulnerability").
+    Fail-safe: any miss / parse error → ``None`` (the caller keeps today's skip)."""
+    try:
+        if verb_tok is None or verb_tok.pos_ != "VERB":
+            return None
+        if any(c.dep_ in ("nsubj", "nsubjpass") for c in verb_tok.children):
+            return None  # has its own subject — the normal chain handles it
+        if verb_tok.dep_ not in ("conj", "acl", "advcl", "acl:relcl", "relcl"):
+            return None
+        # Irrealis / infinitival guard — a purpose/control clause is not an asserted predicate.
+        try:
+            if "Inf" in verb_tok.morph.get("VerbForm"):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        if any(c.dep_ in ("aux", "mark") and (c.lemma_ or c.text or "").strip().lower() == "to"
+               for c in verb_tok.children):
+            return None
+        cur = verb_tok
+        hops = 0
+        while cur is not None and hops < 8:
+            parent = cur.head
+            if parent is None or parent.i == cur.i:
+                break
+            # (A) a coordinated / clausal-head verb carrying an explicit subject → the shared subject.
+            for c in parent.children:
+                if c.dep_ in ("nsubj", "nsubjpass"):
+                    return c
+            # (B) a NOUN reached via acl/advcl/relcl IS the subject — unless it is a copula complement,
+            #     in which case the copula's subject is the real subject.
+            if cur.dep_ in ("acl", "advcl", "acl:relcl", "relcl") and parent.pos_ in ("NOUN", "PROPN"):
+                if parent.dep_ in ("attr", "oprd") and parent.head is not None \
+                        and (parent.head.lemma_ or "").strip().lower() == "be":
+                    for c in parent.head.children:
+                        if c.dep_ in ("nsubj", "nsubjpass"):
+                            return c
+                return parent
+            cur = parent
+            hops += 1
+    except Exception:  # noqa: BLE001 — fail-safe: undecidable → no carried subject
         return None
     return None
 
@@ -5375,6 +5470,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # naming construction → analyze_naming owns it (caller runs that seam)
             subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
             if subj_tok is None:
+                # DENSE DECOMPOSITION: a subordinate/coordinated predicate ("…, attributed to X",
+                # "and was prescribed Y", "overruled Baker") has no subject of its own — carry it by
+                # coreference from the clause it shares/modifies so this verb still yields its fact.
+                subj_tok = _carried_subject_token(tok)
+            if subj_tok is None:
                 continue
             if _is_first_person_personal_pronoun(subj_tok):
                 subject = "user"
@@ -5404,10 +5504,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # PART 1: exclude PEELED date tokens so the atomizer's "see_on march 1st" wobble never
             # folds "on" into the predicate nor lifts the date phrase as the object — both
             # atomizations land (user, see, house)@event_date. ``_date_token_idx`` is in closure.
-            predicate = _svo_predicate_token(svo_head, exclude_idx=_date_token_idx)
+            predicate = _svo_predicate_token(svo_head, exclude_idx=_date_token_idx, include_agent=True)
             if not predicate:
                 continue
-            obj_tok = _svo_object_head(svo_head, exclude_idx=_date_token_idx)
+            obj_tok = _svo_object_head(svo_head, exclude_idx=_date_token_idx, include_agent=True)
             if obj_tok is None:
                 continue
             for _ct in _np_conjuncts(obj_tok):  # conjunct/dash-list distribution
@@ -5464,6 +5564,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
             if subj_tok is None:
+                # DENSE DECOMPOSITION: an objectless subordinate/coordinated predicate ("…, decided in
+                # 2019", "and was cited by …") shares/modifies a subject — carry it by coreference so
+                # the state/event (with its date) still lands. Fail-safe → skip (today's behavior).
+                subj_tok = _carried_subject_token(tok)
+            if subj_tok is None:
                 continue
             # ASSERTION POLARITY (Q1 negated-state capture): a ``neg`` dependency on THIS state
             # verb is NOT a drop — it is a NEGATED genuine STATE ("it is not functioning", "the
@@ -5479,8 +5584,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # only sees NOUN/PROPN objects (the SVO chain's mergeable-entity objects); a verb with a
             # PRONOUN/clausal object ("she helped ME", "I told THEM") is still TRANSITIVE — not an
             # intransitive state — so we ALSO reject any direct/indirect object child of ANY pos.
-            if _svo_object_head(tok) is not None:
-                continue  # SVO chain owns a NOUN/PROPN-object verb
+            if _svo_object_head(tok, exclude_idx=_date_token_idx, include_agent=True) is not None:
+                continue  # SVO owns a NOUN/PROPN-object verb (a date-only pobj is NOT an object —
+                #           "patched on <date>" is an objectless dated STATE this chain must capture)
             if any(c.dep_ in ("dobj", "obj", "iobj", "dative", "obl") for c in tok.children):
                 continue  # transitive (incl. pronoun/oblique object) → not an objectless state
             # ── STRUCTURAL STATE PRE-FILTER (over-capture firewall) ──────────────────────────────
@@ -6804,6 +6910,181 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             for _m in _members:
                 _emit(_m, "member_of", _group)
 
+    def _measure_pp_subject_tok(prep):
+        # The SUBJECT entity a measure/adjunct PP predicates about: climb the PP's head chain to the
+        # governing clause and return its subject token (carrying it by coreference for a subordinate
+        # governing verb). A copula-attr NOUN host resolves to the copula's subject. Fail-safe → None.
+        try:
+            cur = prep.head
+            hops = 0
+            while cur is not None and hops < 8:
+                if cur.pos_ in ("VERB", "AUX"):
+                    _s = next((c for c in cur.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+                    if _s is not None:
+                        return _s
+                    if cur.pos_ == "VERB":
+                        _cs = _carried_subject_token(cur)
+                        if _cs is not None:
+                            return _cs
+                if cur.pos_ in ("NOUN", "PROPN"):
+                    if cur.dep_ in ("attr", "oprd") and cur.head is not None \
+                            and (cur.head.lemma_ or "").strip().lower() == "be":
+                        _s = next((c for c in cur.head.children
+                                   if c.dep_ in ("nsubj", "nsubjpass")), None)
+                        if _s is not None:
+                            return _s
+                    elif cur.dep_ in ("nsubj", "nsubjpass", "appos"):
+                        return cur.head if cur.dep_ == "appos" else cur
+                nxt = cur.head
+                if nxt is None or nxt.i == cur.i:
+                    break
+                cur = nxt
+                hops += 1
+        except Exception:  # noqa: BLE001 — fail-safe
+            return None
+        return None
+
+    def _chain_measure_pp(doc):
+        # SCALAR MEASURE PP (dense decomposition) — "<clause> with a CVSS score of 9.8", "at a
+        # temperature of 39C", "for a term of 20 years". A prepositional phrase whose pobj NOUN carries
+        # an "of"-PP (or nummod) with a DIGIT-bearing value is a SCALAR MEASUREMENT of the governing
+        # clause's SUBJECT: the attribute name is the pobj head-noun phrase ("cvss score"/"temperature"/
+        # "term"), the value is the numeric object ("9.8"/"39C"/"20 years"), routed to the SCALAR path
+        # (scalar_datatype="string") — NEVER a relationship object. Subject-agnostic, grammar +
+        # value-shape (a digit gates it), NO attribute/unit word list. The subject is carried by
+        # coreference to the governing clause (a subordinate governing verb → the shared subject).
+        for prep in doc:
+            if prep.dep_ != "prep" or prep.pos_ != "ADP":
+                continue
+            pobj = next((c for c in prep.children
+                         if c.dep_ == "pobj" and c.pos_ in ("NOUN", "PROPN")), None)
+            if pobj is None:
+                continue
+            # a temporal pobj ("in June") is not a measurement — leave it to the temporal lane.
+            try:
+                if (pobj.ent_type_ or "").upper() in ("DATE", "TIME"):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            # VALUE: an "of"/quantity PP under the pobj whose object is (or carries a nummod) a DIGIT.
+            val_root = None
+            for c in pobj.children:
+                if c.dep_ == "prep":
+                    for gc in c.children:
+                        if gc.dep_ != "pobj":
+                            continue
+                        if any(ch.isdigit() for ch in (gc.text or "")):
+                            val_root = gc
+                            break
+                        if any(k.dep_ == "nummod" and any(ch.isdigit() for ch in (k.text or ""))
+                               for k in gc.children):
+                            val_root = gc
+                            break
+                if val_root is not None:
+                    break
+            if val_root is None:
+                continue
+            subj_tok = _measure_pp_subject_tok(prep)
+            if subj_tok is None:
+                continue
+            if _is_first_person_personal_pronoun(subj_tok):
+                subject = "user"
+            else:
+                subject = (subj_tok.text or subj_tok.lemma_ or "").strip().lower()
+                _cr = _coref(subj_tok)
+                if _cr:
+                    subject = _cr
+            if not subject:
+                continue
+            attribute = _np_phrase(pobj)
+            if not attribute:
+                continue
+            # VALUE span = the value root's subtree, sliced verbatim ("9.8", "20 years").
+            try:
+                _sub = sorted(val_root.subtree, key=lambda t: t.i)
+                _sub = [t for t in _sub if not t.is_punct or t.i == val_root.i]
+                value = (sentence[min(t.idx for t in _sub):
+                                  max(t.idx + len(t.text) for t in _sub)] or "").strip()
+            except Exception:  # noqa: BLE001
+                value = (val_root.text or "").strip()
+            if not value:
+                continue
+            rel = attribute.replace(" ", "_")
+            _emit(subject, rel, value, subj_tok=subj_tok, obj_tok=None, scalar_datatype="string")
+            try:
+                for _d in pobj.subtree:
+                    _claim(_d)
+            except Exception:  # noqa: BLE001
+                _claim(pobj)
+
+    def _chain_attributive_measure(doc):
+        # ATTRIBUTIVE MEASURE (dense decomposition) — "a 62-year-old smoker", "a 6-foot-tall man": an
+        # amod ADJ whose npadvmod is a UNIT noun (unit_scalar cue map) carrying a NUM nummod → a SCALAR
+        # (unit→rel_type, value=NUM) on the entity the ADJ modifies. The described noun is an appositive
+        # of the real subject ("a 62-year-old smoker" appos of "patient") → attach to that subject.
+        # Metadata-driven (unit_scalar map: year→age, foot→height), grammatical, subject-agnostic, NO
+        # age/unit word list. Reuses the SCALAR emit path (routes to entity_attributes).
+        # ATTRIBUTIVE position only (amod/attr/nummod modifier of a noun); the PREDICATIVE "62 years
+        # old" (acomp) is owned by _chain_copula_measure. The identifier tokenizer merges the phrase to
+        # one token typed ADJ ("62-year-old") or NUM ("6-foot-tall"), so admit both POS.
+        _units = _unit_scalar_map()
+        for adj in doc:
+            if adj.pos_ not in ("ADJ", "NUM") or adj.dep_ not in ("amod", "attr", "nummod"):
+                continue
+            mapped = None
+            value = None
+            num = None
+            # (a) SPLIT form: "6 feet tall" → an npadvmod UNIT noun with a NUM nummod ("year"/"foot").
+            unit = next((c for c in adj.children
+                         if c.dep_ == "npadvmod" and c.pos_ == "NOUN"), None)
+            if unit is not None:
+                _ul = (unit.lemma_ or unit.text or "").strip().lower()
+                _ut = (unit.text or "").strip().lower()
+                mapped = _units.get(_ul) or _units.get(_ut)
+                if mapped:
+                    num = next((c for c in unit.children
+                                if c.pos_ == "NUM" and c.dep_ == "nummod"), None)
+                    if num is not None:
+                        value = (num.text or "").strip()
+            # (b) MERGED form: the identifier tokenizer keeps "62-year-old" / "6-foot-tall" WHOLE
+            #     (one ADJ token). Parse the surface "<NUM><sep><unit>…" — the UNIT-map gate keeps it
+            #     to genuine measurements (an id/version ADJ never matches). Subject-agnostic, no word
+            #     list beyond the metadata unit map.
+            if mapped is None:
+                _m = re.match(r"^(\d+(?:\.\d+)?)[-\s]?([a-zA-Z]+)", (adj.text or "").strip())
+                if _m:
+                    _uw = _m.group(2).strip().lower()
+                    _mapped2 = _units.get(_uw)
+                    if _mapped2:
+                        mapped = _mapped2
+                        value = _m.group(1).strip()
+            if not mapped or not value:
+                continue
+            described = adj.head
+            if described is None or described.pos_ not in ("NOUN", "PROPN"):
+                continue
+            # the subject entity: an appositive describes its head; else the described noun (1st-person
+            # → user). A copula complement resolves to the copula's subject.
+            if described.dep_ == "appos" and described.head is not None:
+                subj_tok = described.head
+            elif described.dep_ in ("attr", "oprd") and described.head is not None \
+                    and (described.head.lemma_ or "").strip().lower() == "be":
+                subj_tok = next((c for c in described.head.children
+                                 if c.dep_ in ("nsubj", "nsubjpass")), described)
+            else:
+                subj_tok = described
+            if _is_first_person_personal_pronoun(subj_tok):
+                subject = "user"
+            else:
+                subject = (subj_tok.text or subj_tok.lemma_ or "").strip().lower()
+                _cr = _coref(subj_tok)
+                if _cr:
+                    subject = _cr
+            if not subject:
+                continue
+            _emit(subject, mapped, value, subj_tok=subj_tok, obj_tok=num, scalar_datatype="string")
+            _claim(adj, unit, num, described)
+
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
     # "all the shapes the deriver knows", not "the order to try them in". Add a shape → add a chain.
@@ -6823,6 +7104,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_dash_specifier,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
+         _chain_measure_pp, _chain_attributive_measure,
          _chain_geo_containment_list,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
