@@ -104,7 +104,7 @@ TEMPORAL_DATE_LAYER: bool = os.environ.get(
 #     possession shape lives at the caller, mirroring _detect_named_instance_states).
 #   • Part 2 (this module): the copula-appositive / genitive ROLE↔NAME collapse chains
 #     (``_chain_copula_name``; the role-alias leg of ``_chain_genitive_name``) — so "My sister is
-#     Sarah" / "My mother's name is Diane" bind the kin rel to the NAMED person and register the ROLE
+#     Sarah" / "My mother's name is Carol" bind the kin rel to the NAMED person and register the ROLE
 #     (sister/mother) as an alias/role-slot of that person, never a parallel role entity.
 # DEFAULT OFF so the commit is dormant and the temporal first-10 path is byte-for-byte unchanged
 # until validated ON. Fail-safe: flag OFF or any failure → today's behavior exactly.
@@ -1275,19 +1275,19 @@ def analyze_naming(text: str):
 # lemma "be", the appositive ``appos`` dependency, the ``poss`` possessive dependency, the
 # determiner ``det`` (to confirm the complement is a common-noun TYPE), and the wh-interrogative
 # morphology gate. Casing-robust: the appositive name may tag PROPN ("Rex"/"Betsy") or NOUN
-# ("Whiskers" lemmatized to "whisker") — both are accepted as the instance NAME because the
+# ("Mittens" lemmatized to "whisker") — both are accepted as the instance NAME because the
 # ``appos`` dependency, not the POS, identifies it as the renaming of the head.
 
 
 @dataclass(frozen=True)
 class NamedInstanceAnalysis:
     """A deterministic reading of the named-instance copula+appositive construction
-    ("My dog Rex is a poodle." / "My cat Whiskers is a tabby." / "My car Betsy is a Subaru.").
+    ("My dog Rex is a poodle." / "My cat Mittens is a tabby." / "My car Betsy is a Subaru.").
 
     - ``kind``         : the possessed HEAD NOUN being typed/named, lowercased ("dog", "cat",
                          "car") — its head plus left ``compound``/``amod`` modifiers. The broad KIND.
     - ``name``         : the appositive PROPER NAME of the specific instance, surface form
-                         ("Rex", "Whiskers", "Betsy"). Goes in the NAMING layer — never L4.
+                         ("Rex", "Mittens", "Betsy"). Goes in the NAMING layer — never L4.
     - ``instance_type``: the copula complement common-noun TYPE, lowercased ("poodle", "tabby",
                          "subaru") — the more-specific type the named instance IS an instance_of.
     - ``possessor_is_self`` : True when the head noun carries a genuine 1st-person possessive
@@ -1355,7 +1355,7 @@ def analyze_named_instance(text: str):
 
             # (a) the appositive NAME of the specific instance — the rename of the subject head.
             # ``appos`` identifies a renaming nominal regardless of its POS tag (PROPN "Rex"
-            # /"Betsy", or NOUN "Whiskers"); a determiner-introduced appositive ("a poodle") is a
+            # /"Betsy", or NOUN "Mittens"); a determiner-introduced appositive ("a poodle") is a
             # TYPE apposition, not a name, so require NO ``det`` child on the appositive.
             appos = None
             for c in tok.children:
@@ -6254,9 +6254,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _etok = None
             # PREFER THE PROPER NAME (subject-agnostic, ONE grammatical rule for ALL possessed-noun+name
             # shapes). "my <possessed-noun> <Name> was <participle>" reaches the deriver in two spaCy
-            # parse shapes: (i) the name is an ``appos`` of the common-noun subject ("my wife MARLA",
+            # parse shapes: (i) the name is an ``appos`` of the common-noun subject ("my wife JORDAN",
             # "my server APOLLO"); (ii) the common noun AND the name are BOTH attached as ``nsubjpass``
-            # siblings of the participle ("my cat cat/WHISKERS", "my dog dog/FRAGGLE"). In BOTH the
+            # siblings of the participle ("my cat cat/MITTENS", "my dog dog/REX"). In BOTH the
             # date-bearing entity is the trailing PROPER NAME — never the possessed common noun (which
             # keeps its own owns/has_pet/kinship edge). Resolve the NAME first, regardless of whether
             # the possessed noun is kinship/animal/thing (no role/type literal): a PROPN among the
@@ -6347,7 +6347,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #   (a) the possessor leg ("my mother's …"): the head role-noun ("mother") is itself a
             #       ``poss`` of a "name" nsubj-of-copula → emitting (mother, parent_of, user) here would
             #       leave "mother" as a standalone entity (Fix 2 collapses it into the named person).
-            #   (b) the naming leg ("…'s name is Diane"): the possessed head IS the naming noun "name"
+            #   (b) the naming leg ("…'s name is Carol"): the possessed head IS the naming noun "name"
             #       (nsubj of a copula) → emitting (name, related_to, mother) here is the spurious
             #       "name"-as-entity leak. Skip it; the genitive-name chain mints the real edges.
             # Detected grammatically (lemma "name" + nsubj-of-be), NO word list.
@@ -6357,7 +6357,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         and _n.head is not None
                         and _n.head.lemma_ == "be" and _n.head.pos_ == "AUX")
             if head.dep_ == "poss" and _is_name_copula_nsubj(head.head):
-                continue   # (a) possessor leg of "my mother's name is Diane"
+                continue   # (a) possessor leg of "my mother's name is Carol"
             if _is_name_copula_nsubj(head):
                 continue   # (b) naming leg — head IS "name"; never (name, related_to, role)
             # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Sarah" is owned by the
@@ -6602,7 +6602,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
     def _chain_genitive_name(doc):
         # GENITIVE NAME-BINDING (Fix 2). "[poss] <relational-noun>'s name is <PROPN>"
-        #   "my mother's name is Diane"     → (diane, parent_of, user)   [Diane is the named entity]
+        #   "my mother's name is Carol"     → (carol, parent_of, user)   [Carol is the named entity]
         #   "John's mother's name is Susan" → (susan, parent_of, john)   [Susan is the named entity]
         # spaCy parses this as: a copula ``be`` whose nsubj is the NOUN "name" (lemma 'name'); that
         # "name" carries a ``poss`` role-noun child (mother/son/wife); the role-noun carries its OWN
@@ -6629,7 +6629,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             role_lemma = (role.lemma_ or role.text or "").strip().lower()
             # the PROPER NAME assigned — the copula's attr/attr-like complement (PROPN or a NOUN the
-            # parser mis-tagged, e.g. "Diane" → NOUN). Exclude a wh/interrogative complement.
+            # parser mis-tagged, e.g. "Carol" → NOUN). Exclude a wh/interrogative complement.
             proper = None
             for c in head.children:
                 if c.dep_ in ("attr", "oprd", "dobj", "obj") and c.pos_ in ("PROPN", "NOUN"):
@@ -6667,17 +6667,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _kin = _inherent_relation_for_noun(role_lemma)
             else:
                 _kin = "related_to"
-            # (person, kin, possessor) — e.g. (diane, parent_of, user). subj_tok=proper so the named
+            # (person, kin, possessor) — e.g. (carol, parent_of, user). subj_tok=proper so the named
             # person is the entity; verb_tok=None (no date on a name/role edge). The proper name BECOMES
             # the entity's surface here (the deriver works lowercased, so the alias is the subject
-            # surface itself) — the EntityRegistry registers "diane" as the entity's also_known_as alias
-            # when it grounds this edge at ingest. A separate (diane, also_known_as, diane) self-edge
+            # surface itself) — the EntityRegistry registers "carol" as the entity's also_known_as alias
+            # when it grounds this edge at ingest. A separate (carol, also_known_as, carol) self-edge
             # would be degenerate (subj==obj, rejected by _emit) and is unnecessary: the NAME is filed
             # via the subject surface, never classified into L4 (THE HARD LINE preserved).
             _emit(proper_name, _kin, possessor, obj_tok=None, subj_tok=proper)
             # ROLE-ALIAS leg (Fix B, Part 2 — flag-gated): register the ROLE surface (mother/son/wife)
             # as an ``also_known_as`` alias of the NAMED person so a later SPLIT atom ("My mother is
-            # 62" — the reframe Root-1 split) resolves mother→diane and the scalar lands on the named
+            # 62" — the reframe Root-1 split) resolves mother→carol and the scalar lands on the named
             # person, not a parallel "mother" role entity. THE HARD LINE: the role is a slot/alias ON
             # the named instance. Only meaningful for a kinship/relational role (a generic possessor
             # like "John" is not a role-slot); we gate it on the role being in the relational/kinship
@@ -6699,7 +6699,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if low not in ("she", "he", "they", "her", "him", "them"):
                 return None
             # nearest preceding named person in the doc: a PROPN, OR a NOUN bound as a name by a
-            # "X's name is <Name>" copula (the attr complement — spaCy sometimes tags "Diane" NOUN).
+            # "X's name is <Name>" copula (the attr complement — spaCy sometimes tags "Carol" NOUN).
             best = None
             for _t in doc:
                 if _t.i >= tok.i:
@@ -6709,7 +6709,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if _t.pos_ == "PROPN":
                     best = (_t.text or "").strip().lower()
                     continue
-                # a NOUN that is the attr of a naming copula ("name is Diane") is the bound person name
+                # a NOUN that is the attr of a naming copula ("name is Carol") is the bound person name
                 if _t.pos_ == "NOUN" and _t.dep_ in ("attr", "oprd"):
                     _h = _t.head
                     if (_h is not None and _h.lemma_ == "be" and _h.pos_ == "AUX"
