@@ -164,6 +164,9 @@ _IDENTIFIER_TOKEN_RE = re.compile(
 def _install_identifier_tokenizer(nlp) -> None:
     """Keep IDENTIFIER-shaped tokens WHOLE through tokenization (subject-agnostic, shape-based).
 
+    GROUNDING: spaCy Tokenizer `token_match` — "matches strings that should never be split, overriding
+    infix rules" (spaCy Tokenizer API). See DEV/DESIGN-ingest-hardening-grounding.md.
+
     spaCy's statistical parser DERAILS on out-of-vocabulary identifier tokens its tokenizer SPLITS on
     internal separators — "CVE-2024-9999" → ["CVE-2024","-","9999"], so the bare number becomes the
     subject and the real verb demotes to a noun (the parse ROOT collapses). We extend the tokenizer's
@@ -789,7 +792,11 @@ _SHELL_NOUN_LEMMAS: frozenset[str] = frozenset({
 
 def _shell_nouns() -> frozenset[str]:
     """Resolve the per-tenant ACTIVE shell-noun lemma set via the overlay (ContextVar-bound to the
-    request's tenant schema — the SAME binding the naming/kinship overlays use). Returns a frozenset of
+    request's tenant schema — the SAME binding the naming/kinship overlays use).
+
+    GROUNDING: "shell nouns" are an established open class of abstract nouns whose primary discourse use
+    is anaphoric reference (Schmid 2000; ACL D13-1030). See DEV/DESIGN-ingest-hardening-grounding.md.
+    Returns a frozenset of
     lowercased noun lemmas. Fail-safe: any import/read failure / unbound schema / empty resolution → the
     in-code ``_SHELL_NOUN_LEMMAS`` code-fallback seed so a DB-down / pre-migration / unwarmed-overlay
     turn still recognizes the shell-noun co-referent instead of islanding it. Never empty. Mirrors
@@ -2057,6 +2064,9 @@ def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
 def _carried_subject_token(verb_tok):
     r"""The COREFERENCE-CARRIED subject token for a SUBORDINATE / COORDINATED predicate that lacks its
     OWN grammatical subject — the deterministic key to DENSE multi-predicate decomposition.
+
+    GROUNDING: walks spaCy dependency labels (acl/advcl/conj/relcl per the ClearNLP/UD scheme in spaCy
+    glossary.py). See DEV/DESIGN-ingest-hardening-grounding.md.
 
     A dense sentence packs several predicates about ONE subject into subordinate/coordinated clauses
     that spaCy leaves subject-LESS (their subject is shared by coordination or supplied by the noun
@@ -7502,6 +7512,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
 def discourse_topic_from_doc(doc, facts=None):
     """Establish the DISCOURSE TOPIC of a turn from its FIRST sentence (deterministic, subject-agnostic).
+
+    GROUNDING: a reduced Centering Theory model (Grosz/Joshi/Weinstein 1995) — most-salient entity by
+    grammatical role (subject) as antecedent; locality guard per Hobbs (1978). Shell-noun anaphora per
+    Schmid (2000). See DEV/DESIGN-ingest-hardening-grounding.md.
 
     The topic is the salient primary entity introduced early — operationalized as the FIRST sentence's
     ROOT-clause grammatical SUBJECT (a NAMED/definite NP, or ``user`` for a 1st-person subject). This

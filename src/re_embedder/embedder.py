@@ -4270,6 +4270,10 @@ def _hierarchy_degree(db_conn, node_id, rels) -> int:
 def collapse_hierarchy_2cycles(db_conn, schema_name: str = "") -> dict:
     """Lever 2 — COLLAPSE hierarchy 2-CYCLES so the climb stops islanding on ``cycle_rejected``.
 
+    GROUNDING: antisymmetry of a partial order (RDFS subClassOf pre-order / SKOS broader semantics) —
+    a mutual subclass relation entails identity, not a similarity guess. See
+    DEV/DESIGN-ingest-hardening-grounding.md.
+
     ``subclass_of`` (and the hierarchy rels) is a partial ORDER: A⊆B ∧ B⊆A ⟹ A=B. So a LIVE
     reciprocal hierarchy-edge pair between two DISTINCT entities (``vulnerability`` ⇄
     ``security_vulnerability``) is a proof-BY-IDENTITY that they are the SAME backbone node — NOT a
