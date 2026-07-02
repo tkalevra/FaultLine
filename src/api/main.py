@@ -15242,6 +15242,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     try:
         from src.extraction.linguistics import (
             linguistics_available, segment_clauses, derive_sentence_facts,
+            discourse_topic_from_doc,
             is_interrogative_clause as _is_interro,
             suppress_name_type_binder_vs_attr_scalar as _suppress_binder_vs_attr_scalar,
         )
@@ -15465,6 +15466,11 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     edges: list[dict] = []
     seen: set = set()
     _prior_nps: list[str] = []   # intra-turn coref antecedents accumulated across sentences (Rule 1)
+    # CROSS-SENTENCE DISCOURSE TOPIC (subject-agnostic): established from the FIRST sentence that yields
+    # a clear single subject, then threaded into the LATER sentences so a subject pronoun / definite
+    # type-NP with no closer antecedent resolves back to it (consolidate onto ONE entity). None until
+    # set / when ambiguous (coordinated competing subjects) → no cross-sentence rebinding.
+    _discourse_topic = None
     # gap-2 §10.3: a declarative content-bearing sentence that yields ZERO edges even AFTER the
     # chains + the gated LLM relation-fill is the failure-residue → the MINIMIZED last resort
     # (Class C via the EXISTING store_context). We collect those sentences here and route them once,
@@ -15494,10 +15500,20 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             try:
                 _facts = derive_sentence_facts(
                     _typed_doc if _typed_doc is not None else _sent,
-                    reference, prior_nps=list(_prior_nps))
+                    reference, prior_nps=list(_prior_nps),
+                    discourse_topic=_discourse_topic)
             except Exception as _de:  # noqa: BLE001 — per-sentence fail-safe
                 log.debug("sentence_pipeline.derive_failed", error=str(_de)[:120])
                 _facts = []
+            # Establish the DISCOURSE TOPIC from the FIRST sentence that yields a clear single subject
+            # (typed Doc → the topic's coarse GLiNER2 type). Later sentences carry it in (above).
+            if _discourse_topic is None:
+                try:
+                    _discourse_topic = discourse_topic_from_doc(
+                        _typed_doc if _typed_doc is not None else _sent, _facts)
+                except Exception as _dte:  # noqa: BLE001 — topic derivation never blocks capture
+                    log.debug("sentence_pipeline.topic_failed", error=str(_dte)[:120])
+                    _discourse_topic = None
             # SUBJECT TYPE lookup (native): map a subject surface → its GLiNER2 type off the typed
             # Doc's ents (token-aligned, no surface match). Empty → no subject_type (block-c fallback
             # handles it downstream). Built per-sentence from the Doc we just typed.
