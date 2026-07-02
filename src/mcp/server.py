@@ -189,6 +189,22 @@ def bind_tenant(principal: str | None, claimed_user_id: str) -> str:
 # remember path drops residue that cannot build a valid triple.
 SHORT_TERM_MEMORY = os.environ.get("SHORT_TERM_MEMORY", "true").strip().lower() not in ("false", "0", "no")
 
+# Backend INGEST_ENABLED freeze switch ("knowledge-store mode"). Deliberately NO env
+# read here — the BACKEND is authoritative (avoids split-brain config between
+# containers). The gated backend endpoints return 200-shaped {"status": "ingest_disabled"}
+# responses; tools detect that status and surface this message instead of pretending
+# success (success-shaped zeros). GET /internal/ingest-route also reports
+# `ingest_enabled` for the fire-and-forget /learn path that cannot inspect its response.
+_INGEST_DISABLED_STATUS = "ingest_disabled"
+_INGEST_DISABLED_MESSAGE = (
+    "Memory ingest is currently disabled (knowledge-store mode). No facts were stored."
+)
+
+
+def _is_ingest_disabled(payload: Any) -> bool:
+    """True when a backend response dict carries the freeze-switch status."""
+    return isinstance(payload, dict) and payload.get("status") == _INGEST_DISABLED_STATUS
+
 # When true (default), recall_memory_tool consults the SAME DB-weighted intent brain that
 # remember_facts_tool uses and ROUTES by the resulting intent (brain-not-transport): a
 # CORRECTION/RETRACTION the model mis-picked as recall defers to retract_fact_tool, a STATEMENT
@@ -437,10 +453,19 @@ async def _harvest_turn_facts(text: str, user_id: str) -> int:
             json={"text": text, "user_id": user_id},
         )
         resp.raise_for_status()
-        edges = resp.json().get("edges", []) or []
+        harvest_data = resp.json()
+        # Backend freeze switch: nothing to harvest OR ingest — genuinely read-only.
+        if _is_ingest_disabled(harvest_data):
+            _log("harvest_turn_facts: backend ingest disabled (knowledge-store mode) — skipped")
+            return 0
+        edges = harvest_data.get("edges", []) or []
         if not edges:
             return 0
-        await ingest_tool(text, user_id, edges, source="mcp")
+        ingest_result = await ingest_tool(text, user_id, edges, source="mcp")
+        # Backend freeze switch: /ingest stored nothing — do NOT report the edges as captured.
+        if _is_ingest_disabled(ingest_result):
+            _log("harvest_turn_facts: backend ingest disabled (knowledge-store mode) — nothing stored")
+            return 0
         _log(f"harvest_turn_facts: ingested {len(edges)} buried-fact edge(s)")
         return len(edges)
     except Exception as exc:
@@ -461,10 +486,19 @@ async def _ground_self_predication_facts(text: str, user_id: str) -> int:
             json={"text": text, "user_id": user_id},
         )
         resp.raise_for_status()
-        edges = resp.json().get("edges", []) or []
+        ground_data = resp.json()
+        # Backend freeze switch: grounding gated backend-side — nothing to ingest.
+        if _is_ingest_disabled(ground_data):
+            _log("ground_self_predication: backend ingest disabled (knowledge-store mode) — skipped")
+            return 0
+        edges = ground_data.get("edges", []) or []
         if not edges:
             return 0
-        await ingest_tool(text, user_id, edges, source="mcp")
+        ingest_result = await ingest_tool(text, user_id, edges, source="mcp")
+        # Backend freeze switch: /ingest stored nothing — do NOT report the edges as captured.
+        if _is_ingest_disabled(ingest_result):
+            _log("ground_self_predication: backend ingest disabled (knowledge-store mode) — nothing stored")
+            return 0
         _log(f"ground_self_predication: ingested {len(edges)} self-fact edge(s)")
         return len(edges)
     except Exception as exc:
@@ -528,7 +562,25 @@ async def _learn_via_llm(
     When source_url is provided, fetches the page content and passes it as
     source_text to the backend so the LLM grounds ontology in real content.
     On any fetch failure, falls back to topic-only (LLM training knowledge).
+
+    Backend freeze switch: because this path is fire-and-forget (the ack returns
+    before /learn responds), the disabled status on the /learn response can never
+    reach the caller. So consult the BACKEND-AUTHORITATIVE freeze state via
+    GET /internal/ingest-route (no env read here — brain, not transport) BEFORE
+    scheduling: frozen → return the disabled message instead of a fake "building
+    concept map" ack. Fail-safe: brain unreachable → proceed as today.
     """
+    try:
+        _route_resp = await _http_client.get(
+            f"{FAULTLINE_API_URL}/internal/ingest-route", timeout=5.0
+        )
+        _route_resp.raise_for_status()
+        if _route_resp.json().get("ingest_enabled") is False:
+            _log("learn_via_llm: backend ingest disabled (knowledge-store mode) — /learn not dispatched")
+            return {"status": _INGEST_DISABLED_STATUS, "memory": _INGEST_DISABLED_MESSAGE}
+    except Exception as exc:
+        _log(f"learn_via_llm ingest-state probe failed (proceeding): {exc!r}")
+
     async def _background_learn() -> None:
         import re as _re2
         source_text: str | None = None
@@ -691,10 +743,16 @@ async def _statement_extractor_route(user_id: str) -> str:
         return "rewrite"
 
 
-async def _ingest_statement_via_spine(text: str, user_id: str) -> dict[str, Any] | None:
+async def _ingest_statement_via_spine(
+    text: str, user_id: str, source_ref: str | None = None
+) -> dict[str, Any] | None:
     """STATEMENT ingest via the DETERMINISTIC SPINE (D1). Calls /harvest-spans (the spine: LLM
     atomize-only → spaCy deriver → GLiNER2 typing → ±6 backbone attach, NO LLM triple extraction)
     and ingests the returned edges ONCE via /ingest.
+
+    source_ref (document lane only): citable provenance (URL/filename/title) threaded into the
+    /ingest body so document-derived facts carry their citation (migration 128). None (the
+    conversational default) omits the key entirely — byte-identical request to today's.
 
     Returns the /ingest response on success (>=1 edge), or None to signal the caller to FALL BACK
     to the legacy /extract/rewrite path (fail-safe: spine produced no edge / any error → None, so a
@@ -711,7 +769,13 @@ async def _ingest_statement_via_spine(text: str, user_id: str) -> dict[str, Any]
             timeout=60.0,
         )
         resp.raise_for_status()
-        edges = resp.json().get("edges", []) or []
+        harvest_data = resp.json()
+        # Backend freeze switch: do NOT fall through to /extract/rewrite (it is frozen
+        # too) — short-circuit with the disabled status so the caller surfaces the message.
+        if _is_ingest_disabled(harvest_data):
+            _log("statement_via_spine: backend ingest disabled (knowledge-store mode)")
+            return {"status": _INGEST_DISABLED_STATUS, "message": _INGEST_DISABLED_MESSAGE}
+        edges = harvest_data.get("edges", []) or []
     except Exception as exc:
         _log(f"statement_spine_harvest_failed: {exc!r} — falling back to /extract/rewrite")
         return None
@@ -720,10 +784,15 @@ async def _ingest_statement_via_spine(text: str, user_id: str) -> dict[str, Any]
         # /harvest-spans). Signal fall-through so the legacy extractor gets a shot — fail-safe, not
         # a silent drop. No double-ingest: the spine ingested NOTHING here (it only returns edges).
         return None
+    _ingest_body: dict[str, Any] = {
+        "text": text, "user_id": user_id, "edges": edges, "source": "mcp",
+    }
+    if source_ref:
+        _ingest_body["source_ref"] = source_ref
     try:
         ingest_resp = await _http_client.post(
             f"{FAULTLINE_API_URL}/ingest",
-            json={"text": text, "user_id": user_id, "edges": edges, "source": "mcp"},
+            json=_ingest_body,
             timeout=30.0,
         )
         ingest_resp.raise_for_status()
@@ -733,8 +802,13 @@ async def _ingest_statement_via_spine(text: str, user_id: str) -> dict[str, Any]
         # Fail loud with a non-drop signal — the orchestrator/operator sees the error.
         _log(f"statement_spine_ingest_failed: {exc!r}")
         return {"status": "error", "reason": "spine ingest failed", "committed": 0}
+    _spine_data = ingest_resp.json()
+    # Backend freeze switch: /ingest stored nothing — surface it, never success-shaped zeros.
+    if _is_ingest_disabled(_spine_data):
+        _log("statement_via_spine: backend ingest disabled (knowledge-store mode)")
+        return {"status": _INGEST_DISABLED_STATUS, "message": _INGEST_DISABLED_MESSAGE}
     _log(f"statement_via_spine: ingested {len(edges)} edge(s)")
-    return ingest_resp.json()
+    return _spine_data
 
 
 async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
@@ -926,6 +1000,126 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     return {"memory": f"{preamble}\n\n" + "\n\n".join(sections)}
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Naive sentence split on `[.!?]` boundaries.
+
+    Local, dependency-free counterpart to the backend's chunking sentence split —
+    server.py deliberately does not import from src.api.main. Good enough for
+    residual-sentence bookkeeping; not used for extraction itself.
+    """
+    return [s.strip() for s in _re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def _extraction_residual_sentences(text: str, edges: list[dict]) -> list[str]:
+    """Return input sentences that contributed NO extracted edge.
+
+    A sentence is 'covered' when any edge's subject or object string (lowercased,
+    substring match) appears in the lowercased sentence. Everything else is
+    residual — content the extractor read but did not structure.
+    """
+    terms: set[str] = set()
+    for e in edges:
+        for key in ("subject", "object"):
+            val = e.get(key)
+            if isinstance(val, str) and val.strip():
+                terms.add(val.strip().lower())
+    residual: list[str] = []
+    for sentence in _split_sentences(text):
+        lowered = sentence.lower()
+        if not any(term in lowered for term in terms):
+            residual.append(sentence)
+    return residual
+
+
+# ── Document chunking (deterministic — no LLM) ──────────────────────────────
+
+# Hard cap on chunks processed per document — bounds total backend work.
+_DOC_MAX_CHUNKS = 200
+# Soft size/shape targets per chunk (the conversational pipeline chunks at
+# 3 sentences; documents get paragraph-shaped chunks of roughly 2-6 sentences).
+_DOC_CHUNK_MAX_CHARS = 1200
+_DOC_CHUNK_MAX_SENTS = 6
+_DOC_CHUNK_MIN_SENTS = 2
+
+
+def _chunk_document(text: str) -> list[str]:
+    """Split a document into paragraph-shaped chunks. Deterministic — no LLM.
+
+    1. Split on blank lines (paragraph boundaries).
+    2. Any paragraph over _DOC_CHUNK_MAX_CHARS is re-split on sentence
+       boundaries (via _split_sentences) into <=_DOC_CHUNK_MAX_CHARS pieces.
+    3. Tiny fragments (fewer than _DOC_CHUNK_MIN_SENTS sentences) are merged
+       forward with the following piece so each chunk lands at roughly
+       2-6 sentences, never exceeding the char bound during a merge.
+    """
+    paragraphs = [p.strip() for p in _re.split(r"\n\s*\n", text) if p.strip()]
+
+    # Step 2: break oversized paragraphs on sentence boundaries.
+    pieces: list[str] = []
+    for para in paragraphs:
+        if len(para) <= _DOC_CHUNK_MAX_CHARS:
+            pieces.append(para)
+            continue
+        buf: list[str] = []
+        buf_len = 0
+        for sent in _split_sentences(para):
+            if buf and buf_len + len(sent) + 1 > _DOC_CHUNK_MAX_CHARS:
+                pieces.append(" ".join(buf))
+                buf, buf_len = [], 0
+            buf.append(sent)
+            buf_len += len(sent) + 1
+        if buf:
+            pieces.append(" ".join(buf))
+
+    # Step 3: merge tiny fragments forward. Merging only continues while the
+    # accumulating chunk is still tiny (< min sentences); a normal paragraph
+    # therefore stays its own chunk.
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_sents = 0
+    cur_len = 0
+    for piece in pieces:
+        n_sents = max(1, len(_split_sentences(piece)))
+        if cur and (
+            cur_sents >= _DOC_CHUNK_MIN_SENTS
+            or cur_sents + n_sents > _DOC_CHUNK_MAX_SENTS
+            or cur_len + len(piece) + 2 > _DOC_CHUNK_MAX_CHARS
+        ):
+            chunks.append("\n\n".join(cur))
+            cur, cur_sents, cur_len = [], 0, 0
+        cur.append(piece)
+        cur_sents += n_sents
+        cur_len += len(piece) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+async def _episodic_capture(text: str, user_id: str, intent: str | None) -> None:
+    """Durable episodic capture (safety net) — POST /episodic/append, NEVER fatal.
+
+    Persists the raw utterance VERBATIM before any routing/extraction so short
+    fragments, misrouted-as-QUERY text, harvested non-STATEMENT turns, and
+    no-extraction ramblings are ALL retained even when they produce zero
+    structured facts. The backend endpoint itself is soft-fail (never 500s on an
+    unprovisioned schema); any transport failure here is logged and swallowed.
+    """
+    try:
+        await _http_client.post(
+            f"{FAULTLINE_API_URL}/episodic/append",
+            json={
+                "user_id": user_id,
+                "raw_text": text,
+                "source": "mcp",
+                "intent": intent,
+                "extracted_fact_count": None,
+            },
+            timeout=5.0,
+        )
+    except Exception as exc:
+        _log(f"episodic_append_failed (non-fatal): {exc!r}")
+
+
 async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     """Call /extract/rewrite then /ingest — full pipeline in one call.
 
@@ -951,6 +1145,17 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         intent, confidence, gate = await _classify_and_gate(text, user_id)
     except Exception:
         intent, confidence, gate = "STATEMENT", 0.0, 0.70
+
+    # ── Durable episodic capture (safety net) ────────────────────────────────
+    # Persist the raw utterance VERBATIM before any routing/extraction, so short
+    # fragments, misrouted-as-QUERY text, harvested non-STATEMENT turns, and
+    # no-extraction ramblings are ALL retained even when they produce zero
+    # structured facts. Placed AFTER the injection check (rejected content is
+    # never stored) and intent classification (so intent is known), but BEFORE
+    # the intent-independent harvest, the routing branches, and the word-count
+    # gate below — this is the only point that captures every downstream path.
+    # A failure here MUST NEVER break remember_facts: log and continue.
+    await _episodic_capture(text, user_id, intent)
 
     # ── Trust the backend route (transport parity — do NOT re-derive) ────────
     # The route/gate/escalation decision is BRAIN, not transport. /classify-intent already
@@ -999,6 +1204,9 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     # Shared with recall_memory_tool's STATEMENT-diversion guard via _passes_ingest_gate
     # so both sites agree on what "ingestable" means (word_count >= 3 OR self-identity).
     if not _passes_ingest_gate(text):
+        # No held-blob fallback here (ingest-spine "no-islands" spec, guarded by
+        # test_store_context_residue_fallback_removed). The episodic capture above
+        # already retains the fragment verbatim for re-mining by the backfill.
         return {"status": "no_ingest", "message": "Text too short for fact extraction"}
 
     # ── D1: STATEMENT extractor route (brain-not-transport) ──────────────────
@@ -1026,8 +1234,19 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         timeout=60.0,
     )
     rewrite_resp.raise_for_status()
-    _raw_edges = rewrite_resp.json().get("edges", [])
+    _rewrite_data = rewrite_resp.json()
+    # Backend freeze switch: extraction is gated backend-side too (its entity-strengthen
+    # phase writes knowledge rows). Short-circuit HERE — the harvest/grounding fallbacks
+    # and /ingest below are all frozen as well; surface the message, not zero-shaped churn.
+    if _is_ingest_disabled(_rewrite_data):
+        _log("remember_facts: backend ingest disabled (knowledge-store mode)")
+        return {"status": _INGEST_DISABLED_STATUS, "message": _INGEST_DISABLED_MESSAGE}
+    _raw_edges = _rewrite_data.get("edges", [])
     edges = [e for e in _raw_edges if not e.get("low_confidence", False)]
+    # Low-confidence edges stay excluded from /ingest (deliberate — protects the
+    # WGM gate) but are demoted to the Class C context lane in the remainder
+    # capture after a successful ingest below, not silently dropped.
+    low_conf_edges = [e for e in _raw_edges if e.get("low_confidence", False)]
     if not edges:
         # /extract/rewrite returns no structured edges for CONSTRUCTION-only facts — most
         # notably affective statements ("I feel anxious"): the complement is not a GLiNER2
@@ -1064,7 +1283,293 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         timeout=30.0,
     )
     ingest_resp.raise_for_status()
-    return ingest_resp.json()
+    ingest_result = ingest_resp.json()
+
+    # Backend freeze switch: surface a clear message instead of pretending success.
+    if _is_ingest_disabled(ingest_result):
+        _log("remember_facts: backend ingest disabled (knowledge-store mode)")
+        return {"status": _INGEST_DISABLED_STATUS, "message": _INGEST_DISABLED_MESSAGE}
+
+    # ── Extraction remainder capture ─────────────────────────────────────────
+    # Extraction succeeded for SOME of the input; sentences that produced no
+    # structured edge — plus low-confidence edges filtered from /ingest — go to
+    # the Class C fuzzy lane instead of the void. Fire-and-forget supplement:
+    # any failure here must never affect the already-committed ingest response.
+    # (The spine route above self-handles its residue backend-side; this covers
+    # the legacy /extract/rewrite path only.)
+    remainder_stored = False
+    if SHORT_TERM_MEMORY:
+        try:
+            residual_sentences = _extraction_residual_sentences(text, edges)
+            residual_text = " ".join(residual_sentences)
+            if len(residual_text.split()) < 4:
+                # Trivially small residual is noise — episodic log has it verbatim.
+                residual_text = ""
+
+            demoted_lines: list[str] = []
+            for e in low_conf_edges:
+                subj = str(e.get("subject", "")).strip()
+                rel = str(e.get("rel_type", "")).strip().replace("_", " ")
+                obj = str(e.get("object", "")).strip()
+                if subj and rel and obj:
+                    demoted_lines.append(f"{subj} {rel} {obj}.")
+            if demoted_lines:
+                _log(f"low_confidence_demoted_to_context: count={len(demoted_lines)}")
+
+            supplement_parts = ([residual_text] if residual_text else []) + demoted_lines
+            if supplement_parts:
+                supplement = " ".join(supplement_parts)
+                await store_context_tool(text=supplement, user_id=user_id)
+                remainder_stored = True
+                _log(
+                    f"remainder_stored: residual_sentences={len(residual_sentences) if residual_text else 0} "
+                    f"demoted_edges={len(demoted_lines)} chars={len(supplement)}"
+                )
+        except Exception as exc:
+            _log(f"remainder_capture_failed (non-fatal): {exc!r}")
+    ingest_result["remainder_stored"] = remainder_stored
+    return ingest_result
+
+
+async def ingest_document_tool(
+    text: str, user_id: str, source_ref: str = "", title: str = ""
+) -> dict[str, Any]:
+    """Document/bulk ingest lane — a wrapper over the existing endpoints.
+
+    Documents (PDF text, web articles, long pasted notes) are STATEMENTS by
+    definition, so intent classification and the word-count ingest gate are
+    skipped entirely. The document is chunked deterministically by paragraph
+    (no LLM, unlike the 3-sentence density chunking tuned for conversation),
+    and each chunk runs the SAME brain-decided STATEMENT extraction fork
+    remember_facts uses — the deterministic spine (/harvest-spans → /ingest)
+    when the backend routes "spine", falling back to the legacy
+    /extract/rewrite → /ingest → remainder-capture path — with durable
+    per-chunk episodic retention BEFORE extraction. Per-chunk failures never
+    abort the document.
+
+    Provisioning is gated by the TRANSPORT (same as every other tool):
+    _call_tool for JSON-RPC, the REST endpoint for OpenWebUI's OpenAPI path.
+    The injection check runs here, ONCE per document, before any backend call.
+
+    source_ref/title: citable provenance (migration 128) — threaded into the
+    episodic log AND every per-chunk /ingest so document-derived facts carry
+    their citation through staging, promotion, and the Qdrant payload.
+    """
+    ref = (source_ref or title or "").strip()
+
+    def _summary(status: str, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "status": status,
+            "chunks": 0,
+            "chunks_failed": 0,
+            "facts_committed": 0,
+            "facts_staged": 0,
+            "context_stored": 0,
+            "truncated": False,
+            "source_ref": ref,
+        }
+        base.update(overrides)
+        return base
+
+    # ── Pre-flight injection check — reject before any backend call ─────────
+    injection_signal = _check_injection_signals(text)
+    if injection_signal:
+        _log(f"SECURITY: injection signal rejected (ingest_document) — {injection_signal[:80]}")
+        return _summary("rejected", reason="Input contains disallowed content")
+
+    # ── Deterministic paragraph chunking ─────────────────────────────────────
+    chunks = _chunk_document(text)
+    if not chunks:
+        return _summary("no_content", message="Document contained no text to ingest")
+
+    truncated = False
+    if len(chunks) > _DOC_MAX_CHUNKS:
+        _log(
+            f"ingest_document: truncating {len(chunks)} chunks to {_DOC_MAX_CHUNKS} "
+            f"(ref={ref!r}) — remainder NOT processed"
+        )
+        chunks = chunks[:_DOC_MAX_CHUNKS]
+        truncated = True
+
+    # ── D1: extractor route (brain-not-transport) — resolved ONCE per document ──
+    # Same fork as the remember_facts STATEMENT branch: the backend brain decides
+    # WHICH extractor a statement goes through (SENTENCE_PIPELINE flag, backend-side).
+    # Documents are statements, so they take the same route: "spine" → per-chunk
+    # /harvest-spans + /ingest (deterministic, self-handles residue), with the
+    # legacy /extract/rewrite path as the per-chunk fail-safe fallback; "rewrite"
+    # (default / brain unreachable) → straight to /extract/rewrite per chunk.
+    extractor_route = await _statement_extractor_route(user_id)
+
+    _log(
+        f"ingest_document: {len(chunks)} chunks (ref={ref!r}, chars={len(text)}, "
+        f"route={extractor_route})"
+    )
+
+    sem = asyncio.Semaphore(3)
+
+    async def _process_chunk(idx: int, chunk: str) -> dict[str, int]:
+        out = {"committed": 0, "staged": 0, "context": 0, "failed": 0, "disabled": 0}
+        async with sem:
+            # (a) Durable episodic retention BEFORE extraction — every chunk is
+            # kept verbatim even if extraction fails. Non-fatal on failure.
+            try:
+                await _http_client.post(
+                    f"{FAULTLINE_API_URL}/episodic/append",
+                    json={
+                        "user_id": user_id,
+                        "raw_text": chunk,
+                        "source": "document",
+                        "source_ref": ref or None,
+                        "intent": None,
+                        "extracted_fact_count": None,
+                    },
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                _log(f"ingest_document chunk {idx}: episodic_append_failed (non-fatal): {exc!r}")
+
+            # (b) Deterministic spine first when the brain routed "spine" — mirrors
+            # the remember_facts STATEMENT fork. A successful spine ingest is the
+            # SOLE ingest for this chunk (the spine self-handles residue backend-
+            # side, so the remainder capture below is rewrite-path-only). None →
+            # no edges / harvest error → fall through to /extract/rewrite
+            # (fail-safe, never a silent drop). An explicit error dict (spine
+            # edges ingested-failed) counts the chunk failed WITHOUT re-extracting
+            # (re-extraction risks a partial double-write; the episodic log has
+            # the chunk verbatim for later re-mining).
+            if extractor_route == "spine":
+                spine_result = await _ingest_statement_via_spine(
+                    chunk, user_id, source_ref=ref or None
+                )
+                if spine_result is not None:
+                    if _is_ingest_disabled(spine_result):
+                        # Backend freeze switch: nothing was stored for this chunk.
+                        out["disabled"] = 1
+                    elif spine_result.get("status") == "error":
+                        out["failed"] = 1
+                        _log(f"ingest_document chunk {idx}: spine ingest failed (non-fatal)")
+                    else:
+                        out["committed"] = int(spine_result.get("committed", 0) or 0)
+                        out["staged"] = int(spine_result.get("staged", 0) or 0)
+                    return out
+
+            edges: list[dict] = []
+            low_conf_edges: list[dict] = []
+            try:
+                # (c) LLM relation extraction — same endpoint/timeout as remember_facts.
+                rewrite_resp = await _http_client.post(
+                    f"{FAULTLINE_API_URL}/extract/rewrite",
+                    json={"text": chunk, "user_id": user_id},
+                    timeout=60.0,
+                )
+                rewrite_resp.raise_for_status()
+                _chunk_rewrite = rewrite_resp.json()
+                # Backend freeze switch: extraction gated backend-side — nothing
+                # can be stored for this chunk; flag disabled, skip the rest.
+                if _is_ingest_disabled(_chunk_rewrite):
+                    out["disabled"] = 1
+                    return out
+                all_edges = _chunk_rewrite.get("edges", [])
+                # (d) Low-confidence edges stay out of /ingest (protects the WGM
+                # gate) but are demoted to the Class C context lane below.
+                edges = [e for e in all_edges if not e.get("low_confidence", False)]
+                low_conf_edges = [e for e in all_edges if e.get("low_confidence", False)]
+
+                # (e) Ingest through the WGM gate. source="mcp" so provenance
+                # routes to user_stated — the user explicitly submitted this
+                # document, same as a remember_facts submission. source_ref
+                # threads the citation into facts/staged_facts (migration 128).
+                if edges:
+                    ingest_resp = await _http_client.post(
+                        f"{FAULTLINE_API_URL}/ingest",
+                        json={
+                            "text": chunk,
+                            "user_id": user_id,
+                            "edges": edges,
+                            "source": "mcp",
+                            "source_ref": ref or None,
+                        },
+                        timeout=30.0,
+                    )
+                    ingest_resp.raise_for_status()
+                    ingest_result = ingest_resp.json()
+                    # Backend freeze switch: nothing was stored for this chunk.
+                    if _is_ingest_disabled(ingest_result):
+                        out["disabled"] = 1
+                        return out
+                    out["committed"] = int(ingest_result.get("committed", 0) or 0)
+                    out["staged"] = int(ingest_result.get("staged", 0) or 0)
+            except Exception as exc:
+                # Per-chunk failure must never abort the document — the chunk is
+                # already retained in the episodic log for later re-mining.
+                out["failed"] = 1
+                _log(f"ingest_document chunk {idx}: extract/ingest failed (non-fatal): {exc!r}")
+                return out
+
+            # (f) Extraction remainder + demoted low-confidence edges → Class C
+            # fuzzy lane (same pattern as remember_facts' rewrite path). With zero
+            # edges the residual is the whole chunk, so nothing extractable is
+            # dropped. Non-fatal: the structured ingest above already succeeded.
+            if SHORT_TERM_MEMORY:
+                try:
+                    residual_sentences = _extraction_residual_sentences(chunk, edges)
+                    residual_text = " ".join(residual_sentences)
+                    if len(residual_text.split()) < 4:
+                        # Trivially small residual is noise — episodic log has it verbatim.
+                        residual_text = ""
+
+                    demoted_lines: list[str] = []
+                    for e in low_conf_edges:
+                        subj = str(e.get("subject", "")).strip()
+                        rel = str(e.get("rel_type", "")).strip().replace("_", " ")
+                        obj = str(e.get("object", "")).strip()
+                        if subj and rel and obj:
+                            demoted_lines.append(f"{subj} {rel} {obj}.")
+
+                    supplement_parts = ([residual_text] if residual_text else []) + demoted_lines
+                    if supplement_parts:
+                        context_result = await store_context_tool(text=" ".join(supplement_parts), user_id=user_id)
+                        if _is_ingest_disabled(context_result):
+                            # Backend freeze switch (chunk had no gate-worthy edges,
+                            # so /ingest never ran) — flag disabled, count nothing.
+                            out["disabled"] = 1
+                        else:
+                            out["context"] = 1
+                except Exception as exc:
+                    _log(f"ingest_document chunk {idx}: remainder_capture_failed (non-fatal): {exc!r}")
+        return out
+
+    results = await asyncio.gather(*(_process_chunk(i, c) for i, c in enumerate(chunks)))
+
+    # Backend freeze switch: if any chunk hit the disabled backend, the whole
+    # document was not stored — say so clearly instead of reporting zero counts.
+    if any(r.get("disabled") for r in results):
+        _log("ingest_document: backend ingest disabled (knowledge-store mode)")
+        return _summary(_INGEST_DISABLED_STATUS, message=_INGEST_DISABLED_MESSAGE)
+
+    chunks_failed = sum(r["failed"] for r in results)
+    if chunks_failed == 0:
+        status = "ok"
+    elif chunks_failed >= len(chunks):
+        status = "failed"
+    else:
+        status = "partial"
+
+    summary = _summary(
+        status,
+        chunks=len(chunks),
+        chunks_failed=chunks_failed,
+        facts_committed=sum(r["committed"] for r in results),
+        facts_staged=sum(r["staged"] for r in results),
+        context_stored=sum(r["context"] for r in results),
+        truncated=truncated,
+    )
+    _log(
+        f"ingest_document done: status={status} chunks={summary['chunks']} "
+        f"failed={chunks_failed} committed={summary['facts_committed']} "
+        f"staged={summary['facts_staged']} context={summary['context_stored']}"
+    )
+    return summary
 
 
 def _parse_ontological_statements(text: str) -> list[dict]:
@@ -1134,6 +1639,10 @@ async def learn_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     )
     ingest_resp.raise_for_status()
     data = ingest_resp.json()
+    # Backend freeze switch: surface a clear message instead of "Learned 0 facts".
+    if _is_ingest_disabled(data):
+        _log("learn_facts: backend ingest disabled (knowledge-store mode)")
+        return {"status": _INGEST_DISABLED_STATUS, "message": _INGEST_DISABLED_MESSAGE}
     committed = data.get("committed", 0)
     staged = data.get("staged", 0)
     return {
@@ -1204,7 +1713,17 @@ async def retract_fact_tool(
             json={"text": text, "user_id": user_id, "intent": intent},
         )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    # Backend freeze switch: retractions/corrections are also paused in
+    # knowledge-store mode — surface it clearly instead of pretending success.
+    if _is_ingest_disabled(data):
+        _log("retract_fact: backend ingest disabled (knowledge-store mode)")
+        return {
+            "status": _INGEST_DISABLED_STATUS,
+            "message": "Memory ingest is currently disabled (knowledge-store mode). "
+                       "Retractions and corrections are paused; no changes were made.",
+        }
+    return data
 
 
 async def forget_fact_tool(
@@ -1231,7 +1750,16 @@ async def forget_fact_tool(
         body["old_value"] = old_value
     resp = await _post(f"{FAULTLINE_API_URL}/forget", json=body)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    # Backend freeze switch: forget (tombstone) is paused in knowledge-store mode.
+    if _is_ingest_disabled(data):
+        _log("forget_fact: backend ingest disabled (knowledge-store mode)")
+        return {
+            "status": _INGEST_DISABLED_STATUS,
+            "message": "Memory ingest is currently disabled (knowledge-store mode). "
+                       "Forget is paused; no changes were made.",
+        }
+    return data
 
 
 # ── Tool dispatch ────────────────────────────────────────────────────────────
@@ -1239,6 +1767,7 @@ async def forget_fact_tool(
 TOOL_DISPATCH: dict[str, callable] = {
     "recall_memory": recall_memory_tool,
     "remember_facts": remember_facts_tool,
+    "ingest_document": ingest_document_tool,
     "learn_facts": learn_facts_tool,
     "retract_fact": retract_fact_tool,
     "forget_fact": forget_fact_tool,
@@ -1273,7 +1802,7 @@ def _validate_tool_input(tool_name: str, arguments: dict) -> dict | None:
         if err:
             return {"error": f"Invalid query: {err}"}
 
-    elif tool_name in ("remember_facts", "learn_facts", "retract_fact"):
+    elif tool_name in ("remember_facts", "learn_facts", "retract_fact", "ingest_document"):
         err = validate_text(arguments.get("text", ""))
         if err:
             return {"error": f"Invalid text: {err}"}

@@ -57,6 +57,46 @@ TOOLS = [
         }
     },
     {
+        "name": "ingest_document",
+        "description": "Store a document, article, PDF text, or long-form content in memory. "
+                       "Use when the user shares or pastes a document, article, notes, or any "
+                       "multi-paragraph body of text and wants it remembered — the whole text is "
+                       "chunked, retained verbatim, and mined for facts automatically. Pass the "
+                       "FULL text verbatim; do NOT summarize or pre-extract facts yourself. "
+                       "Provide source_ref (URL/filename) or title when known so extracted facts "
+                       "carry a citation. Not for conversational messages — use remember_facts "
+                       "for those.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The FULL text of the document, article, PDF extraction, or "
+                                   "long-form note to store, copied VERBATIM — do NOT summarize, "
+                                   "shorten, or pre-extract facts from it. FaultLine chunks and "
+                                   "extracts everything itself; it needs the raw text. Required — "
+                                   "never leave empty."
+                },
+                "source_ref": {
+                    "type": "string",
+                    "description": "Optional: where this document came from — a URL, filename, or "
+                                   "citation string. Stored with every fact extracted from the "
+                                   "document so recall can cite its source."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional: the document's title. Used as the source reference "
+                                   "when source_ref is not provided."
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User UUID — omit if FAULTLINE_USER_ID env var is set"
+                }
+            },
+            "required": ["text"]
+        }
+    },
+    {
         "name": "learn_facts",
         "description": (
             "Ingest structured ontological statements into the knowledge graph as source=llm_learn. "
