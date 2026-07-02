@@ -956,6 +956,9 @@ CREATE INDEX IF NOT EXISTS idx_temporal_patterns_category ON {schema_name}.tempo
 --                          analyze_svo_relations): have/go/attend/take/do/make/get/participate. (mig 108)
 --   * 'svo_particle'     — load-bearing particles/preps on a verb (_svo_predicate_token /
 --                          _svo_object_head): to/for/with/in/on/at/from/into/about/of. (mig 108)
+--   * 'shell_noun'       — generic abstract/shell anaphoric heads (derive_sentence_facts._topic_
+--                          definite_subject): "the flaw"/"the ruling"/"the condition" re-refer to the
+--                          turn's discourse topic and bind back to it (cross-sentence coref). (mig 126)
 -- The dependency relations (acl/compound/appos/dobj/pobj/prt/…) + POS function-word set stay in code;
 -- ONLY the verb-LEMMA / particle-SURFACE vocabulary is DB data that grows (freq-gated, tenant-only).
 -- Mirrors temporal_patterns lifecycle/confidence. Seeded (ALL categories, blanket SELECT) from

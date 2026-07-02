@@ -774,6 +774,38 @@ def _employment_verbs() -> frozenset[str]:
         return _EMPLOYMENT_VERB_LEMMAS
 
 
+# ── SHELL-NOUN class — DB-HELD + per-tenant + GROWABLE (migration 126 / linguistic_cue_overlay,
+# category='shell_noun'). The GENERIC ABSTRACT/SHELL anaphoric heads ("the flaw"/"the ruling"/"the
+# condition") a later sentence uses to re-refer to the turn's topic. Authority lives in
+# ``<tenant>.linguistic_cues`` (seed-copied ∪ grown) resolved via the per-tenant overlay; this
+# frozenset is the DB-DOWN / unbound-overlay fail-safe ONLY. Membership checks call ``_shell_nouns()``,
+# NOT this frozenset directly. Mirrors ``_employment_verbs`` exactly.
+_SHELL_NOUN_LEMMAS: frozenset[str] = frozenset({
+    "flaw", "issue", "problem", "matter", "condition", "situation", "case",
+    "finding", "defect", "fault", "entity", "item", "thing", "ruling",
+    "decision", "incident",
+})
+
+
+def _shell_nouns() -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE shell-noun lemma set via the overlay (ContextVar-bound to the
+    request's tenant schema — the SAME binding the naming/kinship overlays use). Returns a frozenset of
+    lowercased noun lemmas. Fail-safe: any import/read failure / unbound schema / empty resolution → the
+    in-code ``_SHELL_NOUN_LEMMAS`` code-fallback seed so a DB-down / pre-migration / unwarmed-overlay
+    turn still recognizes the shell-noun co-referent instead of islanding it. Never empty. Mirrors
+    ``_employment_verbs()`` exactly."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        cues = linguistic_cue_overlay.resolve_shell_nouns(dsn)
+        if cues:
+            return cues
+        return _SHELL_NOUN_LEMMAS  # empty resolution → code-fallback (never lose detection)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.shell_nouns_resolve_failed", error=str(e)[:160])
+        return _SHELL_NOUN_LEMMAS
+
+
 @dataclass(frozen=True)
 class NamingAnalysis:
     """A deterministic reading of a naming/dubbing construction ("a dog named Rex").
@@ -5010,9 +5042,25 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not head:
                 return None
             # TYPE-COMPATIBILITY: (a) head IS the topic's type noun ("the vulnerability"), OR
-            #                     (b) head shares the topic's coarse GLiNER2 type ("the flaw"/Concept).
+            #                     (b) head shares the topic's coarse GLiNER2 type ("the flaw"/Concept), OR
+            #                     (c) head is a GENERIC SHELL NOUN co-referent ("the flaw"/"the ruling").
             if head in (_topic.type_nouns or frozenset()):
                 return _topic.surface
+            # (c) SHELL/ABSTRACT co-referent (gap-1 shell-noun anaphora). A DEFINITE generic shell noun
+            #     ("the flaw"/"the ruling"/"the condition") re-refers to the salient topic — these are
+            #     the domain-agnostic anaphoric shells English uses to pick a prior entity back up, and
+            #     GLiNER2 does NOT coarse-match them to the topic's exact type noun (flaw ≉ vulnerability,
+            #     ruling ≉ case), so (a)/(b) miss them and the sentence's facts island. Shell nouns are
+            #     TYPE-AGNOSTIC by nature (a shell can re-refer to a Person topic — "the condition
+            #     worsened" → the patient), so this is NOT gated on type match; it rides the SAME
+            #     definiteness + single-topic + no-closer-antecedent guards already applied above (an
+            #     INDEFINITE "a flaw" was rejected earlier → a newly-introduced shell never binds). The
+            #     shell-noun class is DB-grown per-tenant via the overlay (NOT an in-code list).
+            try:
+                if head in _shell_nouns():
+                    return _topic.surface
+            except Exception:  # noqa: BLE001 — fail-safe → fall through to coarse-type / no bind
+                pass
             try:
                 _ht = (tok.ent_type_ or "").strip().upper()
             except Exception:  # noqa: BLE001

@@ -208,6 +208,31 @@ _BOOTSTRAP_PROBLEM_NOUNS: frozenset[str] = frozenset({
     "defect", "malfunction", "failure", "difficulty", "complication",
 })
 
+# ── BOOTSTRAP SHELL-NOUN set — DB-DOWN / COLD-TENANT FLOOR + grown per-tenant ─────────
+# shell_noun is the class of GENERIC ABSTRACT/SHELL nouns — semantically-light anaphoric heads that a
+# later sentence uses to REFER BACK to a previously-introduced entity ("The FLAW has been exploited",
+# "The RULING overruled Baker", "The CONDITION worsened"). These are NOT domain terms: they are the
+# domain-agnostic shell-noun inventory of English discourse (Schmid's "shell nouns" / Halliday's
+# general nouns) that recurs across EVERY subject (a CVE, a court case, a diagnosis, a device fault all
+# get called "the issue"/"the matter"/"the thing"). The cross-sentence discourse-topic coref
+# (derive_sentence_facts._topic_definite_subject) consults this set: a DEFINITE subject NP whose head
+# is in this class, with no closer antecedent, binds to the turn's topic — so a later description that
+# uses a generic shell co-referent (which GLiNER2 does NOT coarse-match to the topic's exact type
+# noun — "flaw" ≉ "vulnerability") still CONSOLIDATES onto the topic instead of islanding.
+#
+# It is DB-HELD + per-tenant + GROWABLE on the SAME rail as the other cue classes; this in-code set is
+# the DB-DOWN code-fallback / cold-tenant floor ONLY (never the authority). The bind is heavily gated
+# by the parse (ONE unambiguous topic, DEFINITE determiner — an INDEFINITE "a flaw" introduces a NEW
+# entity and is never bound, no closer in-sentence antecedent), so an over-broad floor cannot
+# over-bind. These are generic grammar-level abstract nouns, NOT a domain word zoo.
+_BOOTSTRAP_SHELL_NOUNS: frozenset[str] = frozenset({
+    # generic abstract/shell heads (subject-agnostic — recur across every domain)
+    "flaw", "issue", "problem", "matter", "condition", "situation", "case",
+    "finding", "defect", "fault", "entity", "item", "thing",
+    # domain-neutral "outcome/act" shells that commonly re-refer (a ruling, a decision, an incident)
+    "ruling", "decision", "incident",
+})
+
 # ── BOOTSTRAP load-bearing SVO particle set — DB-DOWN SAFETY NET ONLY ────────────────
 # The closed grammatical class of particles/prepositions that are LOAD-BEARING on a verb (they change
 # the relation: "go" vs "go to", "work" vs "work for", "move" vs "move into"). Kept on the predicate
@@ -372,6 +397,10 @@ SVO_PARTICLE_CATEGORY = "svo_particle"
 RELATIONAL_NOUN_CATEGORY = "relational_noun"
 DISCOURSE_MARKER_CATEGORY = "discourse_marker"
 KINSHIP_NOUN_CATEGORY = "kinship_noun"
+# shell_noun is a flat SET class (generic abstract/shell anaphoric heads) on the SAME rail, resolved by
+# resolve_shell_nouns() into a frozenset. Used by the cross-sentence discourse-topic coref to bind a
+# definite generic co-referent ("the flaw"/"the ruling"/"the condition") back to the turn's topic.
+SHELL_NOUN_CATEGORY = "shell_noun"
 # Thin-type is a KEYED-VALUE class (surface→type) on the SAME rail (cue=surface, description=type),
 # resolved by resolve_thin_type() into a dict — not by the set-returning resolve_cues path.
 THIN_TYPE_CATEGORY = "thin_type"
@@ -404,6 +433,7 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     RELATIONAL_NOUN_CATEGORY: _BOOTSTRAP_RELATIONAL_NOUNS,
     DISCOURSE_MARKER_CATEGORY: _BOOTSTRAP_DISCOURSE_MARKERS,
     KINSHIP_NOUN_CATEGORY: _BOOTSTRAP_KINSHIP_NOUNS,
+    SHELL_NOUN_CATEGORY: _BOOTSTRAP_SHELL_NOUNS,
     # THIN_TYPE_CATEGORY is intentionally NOT here: it is a keyed-value (surface→type) class resolved
     # by resolve_thin_type() into a dict, not a flat cue set. Its DB-DOWN fallback is
     # _BOOTSTRAP_THIN_TYPE_MAP, applied in resolve_thin_type().
@@ -617,6 +647,17 @@ def resolve_kinship_nouns(dsn: str) -> frozenset[str]:
     person↔person kinship link (``related_to``); NOT in it is component/part mereology (``part_of``).
     Fail-safe: never empty (the kinship_noun bootstrap floor)."""
     return resolve_cues(dsn, rel_type_overlay.get_current_schema(), KINSHIP_NOUN_CATEGORY)
+
+
+def resolve_shell_nouns(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE SHELL-NOUN (generic abstract anaphoric head) set for the
+    ContextVar-bound current request schema (tenant-only), via the SAME binding as the naming/kinship/
+    temporal resolvers. Used by the cross-sentence discourse-topic coref
+    (derive_sentence_facts._topic_definite_subject): a DEFINITE subject NP whose head is in this set,
+    with no closer antecedent, co-refers with the turn's topic and binds to it — consolidating a later
+    generic-shell description ("the flaw"/"the ruling"/"the condition") that GLiNER2 cannot coarse-match
+    to the topic's exact type noun. Fail-safe: never empty (the shell_noun bootstrap floor)."""
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), SHELL_NOUN_CATEGORY)
 
 
 def _fetch_thin_type_map(dsn: str, schema_qualifier: str) -> dict[str, str]:
