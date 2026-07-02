@@ -4362,6 +4362,33 @@ def _scalar_rel_admits_subject(rel_type: str, subj_ent_type: str) -> bool:
 
 
 @dataclass(frozen=True)
+class DiscourseTopic:
+    """The salient PRIMARY entity of an ingest turn — established from its FIRST sentence and used to
+    resolve cross-sentence anaphora in the LATER sentences of the SAME turn (deterministic, subject-
+    agnostic). It is NOT a memory (never emitted as a fact); it is the discourse-structure anchor a
+    later sentence's subject pronoun / definite type-NP co-refers to so all the sentences consolidate
+    onto ONE entity instead of islanding on the wrong local subject.
+
+    - ``surface``     : the topic entity surface, lowercased (a NOUN/PROPN NP, or ``"user"`` for a
+                        1st-person sentence-1 subject). This is what a resolved anaphor rebinds to.
+    - ``gliner_type`` : the topic's COARSE GLiNER2 type (upper: ``PERSON``/``ORGANIZATION``/… ) or
+                        ``None``. The type-compatibility GATE: an anaphor binds only when it agrees
+                        with this type (``it``/``this`` ⇎ a PERSON topic; ``he``/``she`` ⇒ a PERSON
+                        topic; a definite type-NP head must share this coarse type or be the topic's
+                        type noun). This is what stops "the lesion" binding to a PERSON patient.
+    - ``type_nouns`` : the topic's TYPE-noun surfaces (from its ``instance_of``/``subclass_of`` /
+                        copula complement — "vulnerability", "request-forgery vulnerability"), plus
+                        each phrase's head word. A definite NP whose head is in this set is the topic's
+                        own type restated ("the vulnerability") → a strong co-reference signal.
+
+    Built by ``discourse_topic_from_doc``. Absent / ambiguous (coordinated competing subjects) → the
+    caller passes ``None`` and NO cross-sentence rebinding happens (today's per-sentence behavior)."""
+    surface: str
+    gliner_type: str | None = None
+    type_nouns: frozenset = frozenset()
+
+
+@dataclass(frozen=True)
 class SentenceFact:
     """One structured fact derived from a single clean sentence by ``derive_sentence_facts``.
 
@@ -4546,7 +4573,7 @@ def _thin_type_for_token(tok) -> str | None:
 
 
 def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_only=False,
-                          named_role_only=False):
+                          named_role_only=False, discourse_topic=None):
     r"""Derive the FULL structured fact set for ONE clean sentence (ClausIE-lite, deterministic).
 
     Returns ``list[SentenceFact]``. This is the clean-sentence deriver the harvest's
@@ -4730,6 +4757,22 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     subj = _ante
                 else:
                     obj = _ante
+        # CROSS-SENTENCE DISCOURSE-TOPIC REBIND (single chokepoint) — rebind the resolved SUBJECT to the
+        # turn's topic when it is a topic-compatible anaphor: (A) a subject pronoun ("it has a CVSS score
+        # of 9.8" → the CVE), else (B) a definite type-NP co-referent ("the flaw has been exploited" →
+        # the CVE). Type/agreement-gated + no-closer-antecedent inside the helpers (see their defs); a
+        # non-anaphoric subject returns None → unchanged. This OVERRIDES a weaker in-chain ``_coref``
+        # prior-NP guess for a topic-compatible pronoun (the whole point — a subject pronoun co-refers
+        # with the salient topic, not a random recent object), but NOT when incompatible ("it" ⇎ a
+        # PERSON topic keeps the chain's local resolution → "I have a dog. It is brown" stays the dog).
+        if _topic is not None and subj_tok is not None:
+            _tb = _topic_pronoun_bind(subj_tok)
+            if _tb:
+                subj = _tb
+            else:
+                _td = _topic_definite_subject(subj_tok, subj)
+                if _td:
+                    subj = _td
         # PREDICATE CONVERGENCE (gap-1 phase 2, §2.1): a GLiNER2-minted rel on ``doc._.rel``
         # for THIS (subject token, object token) pair is AUTHORITATIVE and WINS over the
         # deriver's SVO verb-lemma predicate; an absent minted rel → the SVO predicate
@@ -4874,6 +4917,112 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         except Exception:  # noqa: BLE001
             return None
         return None
+
+    # ── CROSS-SENTENCE DISCOURSE-TOPIC COREF (subject-agnostic, deterministic) ────────────────────
+    # The turn's salient primary entity (established from sentence 1 by ``discourse_topic_from_doc`` and
+    # passed in) is the antecedent a LATER sentence's subject anaphor resolves to — so a description
+    # spread across several sentences CONSOLIDATES onto ONE entity (the CVE / the patient / the ruling)
+    # instead of islanding on a random local subject. TWO anaphor shapes rebind the SUBJECT to the topic:
+    #   (A) a 3rd-person / demonstrative SUBJECT PRONOUN ("it"/"they"/"this"/"he"/"she") with no closer
+    #       antecedent, AND type/agreement-compatible with the topic; and
+    #   (B) a DEFINITE type-NP subject ("the flaw"/"the vulnerability"/"the ruling") whose head is the
+    #       topic's TYPE noun OR shares the topic's coarse GLiNER2 type (a generic co-referent).
+    # ANTI-OVER-EAGER GUARDS (a wrong bind is worse than none): only ONE unambiguous topic (else the
+    # caller passed None); NO bind when a closer in-sentence antecedent exists; TYPE-COMPATIBILITY gates
+    # every bind ("the lesion"/Object ⇎ patient/Person; "the attacker"/Person ⇎ cve/Concept; "it" ⇎ a
+    # Person topic so "I have a dog. It is brown" stays on the dog). Applied at the single ``_emit``
+    # chokepoint on the resolved SUBJECT token — every chain routes through it. Fail-safe → no rebind.
+    _topic = discourse_topic if (
+        discourse_topic is not None and getattr(discourse_topic, "surface", None)) else None
+
+    def _preceding_content_noun(tok):
+        # A NOUN/PROPN (non-date) that LINEARLY PRECEDES ``tok`` in THIS sentence — a closer in-sentence
+        # antecedent that must win over the cross-sentence topic. Grammar-only, subject-agnostic.
+        try:
+            for _t in doc:
+                if _t.i >= tok.i:
+                    break
+                if _t.dep_ == "case" or _t.pos_ not in ("NOUN", "PROPN"):
+                    continue
+                if (_t.ent_type_ or "").upper() in ("DATE", "TIME"):
+                    continue
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _topic_pronoun_bind(tok):
+        # (A) A SUBJECT pronoun → the topic, when agreement-compatible + no closer antecedent.
+        if _topic is None or tok is None:
+            return None
+        try:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                return None
+            low = (tok.text or "").strip().lower()
+            _is_dem = False
+            try:
+                _is_dem = tok.pos_ == "PRON" and "Dem" in tok.morph.get("PronType")
+            except Exception:  # noqa: BLE001
+                _is_dem = False
+            if not (_is_third_person_pronoun(tok) or _is_dem):
+                return None
+            ttype = (_topic.gliner_type or "").upper()
+            # AGREEMENT: inanimate "it"/"this"/"that" ⇎ a PERSON topic; animate "he"/"she" ⇒ a PERSON
+            # (or as-yet-untyped) topic. "they"/"them" (plural) agree with any type. This is what keeps
+            # "it" off a person topic (the dog case) and "he" off a non-person topic.
+            if low in ("it", "this", "that"):
+                if ttype == "PERSON":
+                    return None
+            elif low in ("he", "she", "him", "her"):
+                if ttype and ttype != "PERSON":
+                    return None
+            if _preceding_content_noun(tok):
+                return None
+            return _topic.surface
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _topic_definite_subject(tok, subj):
+        # (B) A DEFINITE type-NP subject co-referent with the topic → the topic. Type-compatibility gated.
+        if _topic is None or tok is None:
+            return None
+        try:
+            if tok.pos_ != "NOUN" or tok.dep_ not in ("nsubj", "nsubjpass"):
+                return None  # a PROPN is its own named entity; a pronoun is handled by (A)
+            if subj == _topic.surface:
+                return None
+            _det = next((c for c in tok.children if c.dep_ == "det"), None)
+            if _det is None:
+                return None  # bare (no determiner) → not a definite anaphor
+            _dl = (_det.lemma_ or _det.text or "").strip().lower()
+            if _dl in ("a", "an"):
+                return None  # INDEFINITE → introduces a NEW entity, never a co-referent
+            if _dl not in ("the", "this", "that", "these", "those"):
+                try:
+                    _pt = _det.morph.get("PronType")
+                    if "Dem" not in _pt and "Art" not in _pt:
+                        return None
+                except Exception:  # noqa: BLE001
+                    return None
+            if _preceding_content_noun(tok):
+                return None
+            head = (tok.lemma_ or tok.text or "").strip().lower()
+            if not head:
+                return None
+            # TYPE-COMPATIBILITY: (a) head IS the topic's type noun ("the vulnerability"), OR
+            #                     (b) head shares the topic's coarse GLiNER2 type ("the flaw"/Concept).
+            if head in (_topic.type_nouns or frozenset()):
+                return _topic.surface
+            try:
+                _ht = (tok.ent_type_ or "").strip().upper()
+            except Exception:  # noqa: BLE001
+                _ht = ""
+            _tt = (_topic.gliner_type or "").upper()
+            if _ht and _tt and _ht == _tt:
+                return _topic.surface
+            return None
+        except Exception:  # noqa: BLE001
+            return None
 
     # ── NAMED-INSTANCE SUPPRESSION SET (the unified binding chain OWNS these spans) ───────────────
     # When the unified name↔type binding chain owns a clause ("a son Alex 19", "a dog named Rex"),
@@ -5045,6 +5194,60 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     _kin_collective[_h.i] = (_krel, _kin_gender.get(_hl))
     except Exception:  # noqa: BLE001 — fail-safe: collective routing is best-effort
         _kin_collective = {}
+
+    # ── HAS-A-MEASURE PRE-PASS (SCALAR "has/have a <measure> of <value>") ─────────────────────────
+    # "It has a CVSS base score of 9.8", "the patient has a temperature of 39", "the case has a term of
+    # 20 years" — a possession verb ("have") whose dobj is a MEASURE noun carrying an "of"-PP with a
+    # DIGIT-bearing value is a SCALAR MEASUREMENT of the subject (attribute = the dobj head-noun phrase,
+    # value = the of-object), NOT a relationship object. This is the companion to ``_chain_measure_pp``
+    # (which owns the PP form "with a score of 9.8"). The DIGIT gate + the "of"-PP shape keep it narrow:
+    # "I have a dog" / "I have three children" (no of-PP) never match. Computed ONCE here so the SVO
+    # chain SUPPRESSES the (subject, have, <measure>) junk twin; ``_chain_has_measure`` emits the scalar
+    # off these binds. Subject-agnostic, grammar + value-shape (NO attribute/unit word list), fail-safe.
+    _has_measure_binds: list = []
+    _has_measure_suppress: set = set()
+    try:
+        for _v in doc:
+            if (_v.lemma_ or "").strip().lower() != "have" or _v.pos_ not in ("VERB", "AUX"):
+                continue
+            if _v.i in _ni_suppress:
+                continue  # a named-instance "have" collective the binding chain owns
+            _dobj = next((c for c in _v.children
+                          if c.dep_ in ("dobj", "obj") and c.pos_ in ("NOUN", "PROPN")), None)
+            if _dobj is None:
+                continue
+            try:
+                if (_dobj.ent_type_ or "").upper() in ("DATE", "TIME"):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            # VALUE: an "of"-PP under the measure dobj whose pobj IS (or carries a nummod) a DIGIT.
+            _val_root = None
+            for _c in _dobj.children:
+                if _c.dep_ == "prep" and (_c.text or "").strip().lower() == "of":
+                    for _gc in _c.children:
+                        if _gc.dep_ != "pobj":
+                            continue
+                        if any(ch.isdigit() for ch in (_gc.text or "")):
+                            _val_root = _gc
+                            break
+                        if any(k.dep_ == "nummod" and any(ch.isdigit() for ch in (k.text or ""))
+                               for k in _gc.children):
+                            _val_root = _gc
+                            break
+                if _val_root is not None:
+                    break
+            if _val_root is None:
+                continue
+            _sj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if _sj is None:
+                _sj = _carried_subject_token(_v)
+            if _sj is None:
+                continue
+            _has_measure_binds.append({"verb": _v, "subj": _sj, "dobj": _dobj, "val": _val_root})
+            _has_measure_suppress.add(_v.i)
+    except Exception:  # noqa: BLE001 — fail-safe: has-measure detection is best-effort
+        _has_measure_binds, _has_measure_suppress = [], set()
 
     # ── CAPTURE CHAINS (gap-2 §10.1) ─────────────────────────────────────────────────────────────
     # The deriver is NOT a fixed sequence of capture rules. Each capture chain is a self-contained
@@ -5463,6 +5666,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the named-instance chain owns this clause's verb ("we have a son …")
             if tok.i in _emp_suppress:
                 continue  # the employment chain owns this verb ("work as … at …") — no SVO dup
+            if tok.i in _has_measure_suppress:
+                continue  # the has-measure chain owns this verb ("has a score of 9.8") — scalar, no SVO
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -6944,6 +7149,46 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             return None
         return None
 
+    def _chain_has_measure(doc):
+        # HAS-A-MEASURE SCALAR — emits off the ``_has_measure_binds`` pre-pass ("has/have a <measure> of
+        # <value>"). attribute = the measure dobj head-noun phrase ("cvss base score"/"temperature"),
+        # value = the of-object value span (digit-gated), routed to the SCALAR path (scalar_datatype=
+        # "string") — NEVER a relationship object. Subject via the shared coref (a pronoun subject "it"
+        # → the discourse topic through _emit's rebind). Subject-agnostic, grammar + value-shape.
+        for _b in _has_measure_binds:
+            subj_tok = _b["subj"]
+            dobj = _b["dobj"]
+            val_root = _b["val"]
+            if _is_first_person_personal_pronoun(subj_tok):
+                subject = "user"
+            else:
+                subject = (subj_tok.text or subj_tok.lemma_ or "").strip().lower()
+                _cr = _coref(subj_tok)
+                if _cr:
+                    subject = _cr
+            if not subject:
+                continue
+            attribute = _np_phrase(dobj)
+            if not attribute:
+                continue
+            try:
+                _sub = sorted(val_root.subtree, key=lambda t: t.i)
+                _sub = [t for t in _sub if not t.is_punct or t.i == val_root.i]
+                value = (sentence[min(t.idx for t in _sub):
+                                  max(t.idx + len(t.text) for t in _sub)] or "").strip()
+            except Exception:  # noqa: BLE001
+                value = (val_root.text or "").strip()
+            if not value:
+                continue
+            rel = attribute.replace(" ", "_")
+            _emit(subject, rel, value, subj_tok=subj_tok, obj_tok=None, scalar_datatype="string")
+            try:
+                for _d in dobj.subtree:
+                    _claim(_d)
+                _claim(_b["verb"])
+            except Exception:  # noqa: BLE001
+                _claim(dobj)
+
     def _chain_measure_pp(doc):
         # SCALAR MEASURE PP (dense decomposition) — "<clause> with a CVSS score of 9.8", "at a
         # temperature of 39C", "for a term of 20 years". A prepositional phrase whose pobj NOUN carries
@@ -7104,7 +7349,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_dash_specifier,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
-         _chain_measure_pp, _chain_attributive_measure,
+         _chain_has_measure, _chain_measure_pp, _chain_attributive_measure,
          _chain_geo_containment_list,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
@@ -7205,6 +7450,110 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         log.warning("linguistics.derive_sentence_facts_failed", error=str(e)[:160])
         return out
     return out
+
+
+def discourse_topic_from_doc(doc, facts=None):
+    """Establish the DISCOURSE TOPIC of a turn from its FIRST sentence (deterministic, subject-agnostic).
+
+    The topic is the salient primary entity introduced early — operationalized as the FIRST sentence's
+    ROOT-clause grammatical SUBJECT (a NAMED/definite NP, or ``user`` for a 1st-person subject). This
+    anchor is threaded into ``derive_sentence_facts`` for the LATER sentences of the same turn so a
+    subject pronoun ("it"/"they"/"he") or a definite type-NP ("the flaw"/"the vulnerability") that has
+    no closer antecedent resolves BACK to it — consolidating the whole description onto one entity.
+
+    ``doc`` is the sentence-1 spaCy ``Doc`` (a TYPED Doc carries GLiNER2 ``ent_type_`` → the topic's
+    coarse type; a str is parsed with no types). ``facts`` are sentence-1's derived ``SentenceFact``s
+    (source of the topic's ``instance_of``/``subclass_of`` TYPE nouns).
+
+    ANTI-OVER-EAGER: returns ``None`` (→ NO cross-sentence rebinding) when there is no single clear
+    subject, when the subject is COORDINATED (multiple competing topics → ambiguous), or the subject is
+    itself a pronoun/undecidable. Subject-agnostic (grammar + GLiNER2 type only); fail-safe → ``None``."""
+    try:
+        if doc is None:
+            return None
+        if isinstance(doc, str):
+            if not doc.strip():
+                return None
+            doc = _parse(doc)
+            if doc is None:
+                return None
+        # ROOT-clause subject (a copula "X is a Y" attaches the subject under the "be" AUX / the attr).
+        subj = None
+        root = next((t for t in doc if t.dep_ == "ROOT"), None)
+        if root is not None:
+            subj = next((c for c in root.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+        if subj is None:
+            subj = next((t for t in doc if t.dep_ in ("nsubj", "nsubjpass")), None)
+        if subj is None:
+            return None
+        # AMBIGUITY GUARD: a coordinated subject ("the server and the database …") is MULTIPLE competing
+        # topics — never pick one. Also bail if a DISTINCT second top-level clause subject exists.
+        if any(c.dep_ == "conj" for c in subj.children):
+            return None
+        _subj_surface_of = lambda t: (_np_phrase(t) or (t.text or "").strip().lower())  # noqa: E731
+        _distinct_subjects = {
+            _subj_surface_of(t) for t in doc
+            if t.dep_ in ("nsubj", "nsubjpass") and t.pos_ in ("NOUN", "PROPN")
+        }
+        # SURFACE + COARSE TYPE. A bare PRONOUN subject in sentence 1 is not a stable anchor → None.
+        # Otherwise accept the subject surface as the topic — including an OOV IDENTIFIER the tokenizer
+        # kept whole but mis-tagged (a CVE id / version / hostname surfaces as PUNCT/X/NUM, not PROPN);
+        # excluding those would drop exactly the technical primary entity the topic is meant to be.
+        _is_dem_pron = False
+        try:
+            _is_dem_pron = subj.pos_ == "PRON" and "Dem" in subj.morph.get("PronType")
+        except Exception:  # noqa: BLE001
+            _is_dem_pron = False
+        if _is_first_person_personal_pronoun(subj):
+            surface, gtype = "user", "PERSON"
+        elif subj.pos_ == "PRON" or _is_third_person_pronoun(subj) or _is_dem_pron:
+            return None
+        else:
+            surface = _subj_surface_of(subj)
+            if not surface or not any(ch.isalnum() for ch in surface):
+                return None  # punctuation-only / empty subject → not a real anchor
+            try:
+                gtype = (subj.ent_type_ or "").strip().upper() or None
+            except Exception:  # noqa: BLE001
+                gtype = None
+        if not surface:
+            return None
+        if surface != "user" and len(_distinct_subjects) > 1 and surface in _distinct_subjects:
+            # more than one distinct NAMED clause subject in sentence 1 → topic is ambiguous.
+            return None
+        # TYPE NOUNS — from sentence-1's classification facts + the copula complement off the parse.
+        type_nouns: set = set()
+        for f in (facts or []):
+            try:
+                if (f.subject or "").strip().lower() == surface and \
+                        (f.rel_type or "").strip().lower() in ("instance_of", "subclass_of"):
+                    o = (f.object or "").strip().lower()
+                    if o:
+                        type_nouns.add(o)
+                        type_nouns.add(o.split()[-1])
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            for t in doc:
+                if not ((t.lemma_ or "").strip().lower() == "be" and t.pos_ == "AUX"):
+                    continue
+                _s = next((c for c in t.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+                if _s is None or _subj_surface_of(_s) != surface:
+                    continue
+                _comp = next((c for c in t.children
+                              if c.dep_ in ("attr", "oprd") and c.pos_ in ("NOUN", "PROPN")), None)
+                if _comp is not None:
+                    _cp = _np_phrase(_comp)
+                    if _cp:
+                        type_nouns.add(_cp)
+                        type_nouns.add(_cp.split()[-1])
+        except Exception:  # noqa: BLE001
+            pass
+        return DiscourseTopic(surface=surface, gliner_type=gtype,
+                              type_nouns=frozenset(type_nouns))
+    except Exception as e:  # noqa: BLE001 — fail-safe: undecidable → no topic (no rebinding)
+        log.warning("linguistics.discourse_topic_failed", error=str(e)[:160])
+        return None
 
 
 def is_naming_predicate(predicate: str):
