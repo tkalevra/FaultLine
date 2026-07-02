@@ -200,7 +200,7 @@ def extract_compound_facts(text: str) -> list[dict]:
                     # token IS the name and the subject is the first-person speaker.
                     #   1 group  → first-person self-identity: group 0 = name, subject = "user".
                     #   2 groups → subject AND object both captured:
-                    #              e.g. "Jordan goes by emma"        → (jordan, emma)
+                    #              e.g. "Ada goes by emma"        → (ada, emma)
                     #              e.g. "a dog named Rex"       → (dog,   rex)   [RC2]
                     #     group 0 is the HEAD NOUN being named (subject-agnostic: any common
                     #     noun — dog/cat/server/boat — captured by the naming construction in

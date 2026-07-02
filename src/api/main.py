@@ -4889,13 +4889,13 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
 
     GLiNER2 returns: {
         "relation_extraction": {
-            "spouse": [("jordan", "user")],
+            "spouse": [("ada", "user")],
             "instance_of": [("theo", "person")],
         }
     }
 
     Convert to: [
-        {"subject": "jordan", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
+        {"subject": "ada", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
         {"subject": "theo", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
     ]
 
@@ -6708,13 +6708,13 @@ def enforce_directionality(
 
     Examples:
     - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
-    - User says "Jordan is spouse of me" → swap to (user, spouse, jordan) (canonical anchor-first)
+    - User says "Ada is spouse of me" → swap to (user, spouse, ada) (canonical anchor-first)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
     """
     if is_symmetric:
         # Canonical direction: anchor (user UUID) is always subject for user-anchored symmetric rels.
-        # Prevents both (user, spouse, jordan) and (jordan, spouse, user) from accumulating as
+        # Prevents both (user, spouse, ada) and (ada, spouse, user) from accumulating as
         # separate DB rows — the unique constraint treats them as different facts.
         # Compare against resolved user_entity_id UUID, not the literal string "user"
         # (entity resolution has already replaced "user" with the UUID by call time).
@@ -8049,9 +8049,9 @@ def _collect_member_taxonomy_entities(
       - "my animals" → transitive subclass_of → the pet.
 
     SUBJECT-AGNOSTIC: the anchor is whatever `resolve_anchor` produced (user OR any
-    entity UUID — my / Jordan's / the datacenter's). NEVER `if subject == user`. The
-    nesting recursion stays anchored to the SAME subject, so "Jordan's family" folds
-    Jordan's pets, not the user's.
+    entity UUID — my / Ada's / the datacenter's). NEVER `if subject == user`. The
+    nesting recursion stays anchored to the SAME subject, so "Ada's family" folds
+    Ada's pets, not the user's.
 
     Metadata-driven: reads rel_types_defining_group, member_taxonomies,
     has_transitivity, transitive_rel_types from the bound tenant schema (NO
@@ -12479,7 +12479,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
 
     # === PRE-GLINER2 DECLARATIVE-STATEMENT ROUTE (intent-misroute fix) ===
     # A first-person declarative that ASSERTS facts ("I wanted to tell you about my family. My
-    # wife's name is Jordan. We have three kids: Mia, Theo, and Leo.") is mis-scored QUERY
+    # wife's name is Ada. We have three kids: Mia, Theo, and Leo.") is mis-scored QUERY
     # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Theo/Leo drop.
     # Mirror the affect/correction pre-gates: when the turn carries >= 2 GRAMMATICAL assertions
     # (count_declarative_assertions — explicit-subject copula/transitive predicates; imperatives
@@ -14064,7 +14064,7 @@ def _object_is_temporal(obj: str, db_conn=None) -> bool:
     # 3. YEAR-LESS month-day ("march 1st", "february 20th") — the gap (1) and (2) both miss. Reuse the
     #    EXACT deterministic event-date machinery the ingest temporal lane uses (spaCy DATE NER +
     #    dateparser), so a bare month-day leaked as a graph object is stripped + re-routed to the
-    #    event_date scalar. A non-date object ("house", "jordan") resolves to None → kept (no over-drop).
+    #    event_date scalar. A non-date object ("house", "ada") resolves to None → kept (no over-drop).
     try:
         from src.extraction.linguistics import extract_event_date as _eed
         _iso, _gran = _eed(o, _dt2.now(_tz2.utc))
@@ -14876,7 +14876,7 @@ SPINE_AFFECT_PREFERENCE = os.getenv("SPINE_AFFECT_PREFERENCE", "true").lower() n
 AFFECT_STATEMENT_PREROUTE = os.getenv("AFFECT_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
 # DECLARATIVE-STATEMENT PRE-ROUTE (intent-misroute fix): a multi-sentence first-person
 # declarative carrying >= 2 grammatical assertions ("I wanted to tell you about my family.
-# My wife's name is Jordan. We have three kids …") is mis-scored QUERY by GLiNER2 (the "tell"
+# My wife's name is Ada. We have three kids …") is mis-scored QUERY by GLiNER2 (the "tell"
 # verb) and dropped at the QUERY gate. A fact-bearing declarative must reach ingest. Grammar-
 # only (count_declarative_assertions: explicit-subject copula/transitive assertions, imperatives
 # and questions excluded), BEFORE GLiNER2 (kept pure, no label edits). Fail-safe → GLiNER2.
@@ -22600,11 +22600,11 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # RE-SYNC fact_subject after a directionality SWAP (self-loop bugfix).
                     # ``fact_subject`` was captured from ``canonical_subject`` UP at line ~18305, BEFORE
                     # this phase. enforce_directionality SWAPS subject↔object for a symmetric rel whose
-                    # OBJECT is the user (canonical anchor-first: "(jordan, spouse, user)" → "(user,
-                    # spouse, jordan)"), but the relational row build below uses ``fact_subject`` +
-                    # ``canonical_object`` — so a stale ``fact_subject`` (jordan) paired with the swapped
-                    # ``canonical_object`` (jordan) produced the degenerate self-loop ``(jordan, spouse,
-                    # jordan)``. Re-bind ``fact_subject`` to the post-swap subject so the row reflects the
+                    # OBJECT is the user (canonical anchor-first: "(ada, spouse, user)" → "(user,
+                    # spouse, ada)"), but the relational row build below uses ``fact_subject`` +
+                    # ``canonical_object`` — so a stale ``fact_subject`` (ada) paired with the swapped
+                    # ``canonical_object`` (ada) produced the degenerate self-loop ``(ada, spouse,
+                    # ada)``. Re-bind ``fact_subject`` to the post-swap subject so the row reflects the
                     # canonical direction. Guarded to the non-identity path: pref_name/also_known_as keep
                     # their own ``fact_subject`` resolution (the correction/alias block below), and a
                     # scalar already `continue`d. Subject-agnostic, metadata-driven (acts only on the
@@ -32437,10 +32437,10 @@ def _compose_object_clause(
                 and not is_hier and named_type_name
                 and named_type_name.lower() != object_name.lower()):
             # SYMMETRIC guard: a symmetric rel (spouse/sibling_of/…) has no possessive
-            # reading — "you have a wife named Jordan" / the verb-less "you and a wife
-            # named Jordan" both read wrong. Render the relationship NATURALLY anchor-
+            # reading — "you have a wife named Ada" / the verb-less "you and a wife
+            # named Ada" both read wrong. Render the relationship NATURALLY anchor-
             # first using the object's OWN type word as the role noun: "<Name> is your
-            # <Type>" ("Jordan is your wife"). ZERO kin literals — the role is the
+            # <Type>" ("Ada is your wife"). ZERO kin literals — the role is the
             # object's instance_of TYPE (data). Only when the subject is the anchor
             # ("you"); otherwise fall through to the possessive shape below.
             if bool(rel_meta.get("is_symmetric")) and subject_is_you:
@@ -32505,7 +32505,7 @@ def _compose_inverse_anchor_clause(
         fabricate "you have a named Leo".
       • SYMMETRIC rel (spouse: inverse == self): no possession reading — render the
         relationship naturally, anchor-first → "<Name> is your <role>" using the rel's
-        own label as the role noun. (e.g. spouse → "Jordan is your spouse"; if a cleaner
+        own label as the role noun. (e.g. spouse → "Ada is your spouse"; if a cleaner
         2p relation template exists the caller keeps that instead — see wiring.)
 
     Returns the full prose string, or None to leave the existing render untouched.
@@ -32522,7 +32522,7 @@ def _compose_inverse_anchor_clause(
             # NOUN from metadata (spouse → "spouse"); de-snake a bare rel_type fallback.
             role = (rel_meta.get("label") or rel_type.replace("_", " ")).strip().lower()
             poss = "your" if anchor_is_you else ("%s's" % anchor_name)
-            # "<Name> is your <role>"  (e.g. "Jordan is your spouse")
+            # "<Name> is your <role>"  (e.g. "Ada is your spouse")
             return "%s is %s %s" % (instance_name, poss, role)
 
         # ASYMMETRIC inverse — the anchor POSSESSES a typed, named instance.
@@ -32633,7 +32633,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         user_id: Canonical user UUID (identity-set seed alongside anchor).
 
     Returns:
-        List of prose strings (e.g., "You are married to Jordan")
+        List of prose strings (e.g., "You are married to Ada")
         Facts with missing natural_language template are skipped with warning logged
     """
     prose_list = []
@@ -34876,7 +34876,7 @@ async def query(request: QueryRequest) -> QueryResponse:
                                rel_type=rel_type, object_uuid=object_id[:8])
                     continue
             else:
-                # Issue 4 Fix: Scalar fact: object is STRING value (age="12", name="Jordan")
+                # Issue 4 Fix: Scalar fact: object is STRING value (age="12", name="Ada")
                 object_display = object_id  # Use as-is (already a string value)
 
             # Create resolved fact with display names (remove internal _id fields)
@@ -35062,7 +35062,7 @@ async def query(request: QueryRequest) -> QueryResponse:
 # family.member_taxonomies), records it in severed_taxonomies (the durable lock the
 # growth engine must respect), and marks source='user_corrected'. Class A,
 # NOT-superseded: the engine can never re-link what the user severed. Subject-agnostic
-# (works for ANY two groups: "Jordan's pets aren't her family" is the same op).
+# (works for ANY two groups: "Ada's pets aren't her family" is the same op).
 #
 # Metadata-driven detection (no hardcoded group/rel names):
 #   • GROUPS  — both surface tokens resolve to entity_taxonomies.taxonomy_name (tenant).

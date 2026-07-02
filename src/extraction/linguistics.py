@@ -1740,7 +1740,7 @@ def analyze_name_type_bindings(text):
 class SVORelation:
     """A deterministic Subject–Verb–Object reading for the merge brain.
 
-    - ``subject_text``    : the surface subject token/phrase, lowercased ("i", "we", "jordan").
+    - ``subject_text``    : the surface subject token/phrase, lowercased ("i", "we", "ada").
     - ``subject_is_self`` : True ONLY for a genuine 1st-person personal pronoun ("I"/"we" — the
                             self-ref binding to the user). A nominal/proper subject → False (the
                             caller resolves it as an entity, or hosts a GLiNER2 entity in its place).
@@ -4924,9 +4924,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         if not (subj and rel and obj) or subj == obj:
             return
         # NAMING-NOUN-IS-NEVER-A-TYPE GUARD (genitive-name fix — THE HARD LINE). "My wife's name
-        # is Jordan" must bind Jordan as the SPOUSE'S name (spouse + also_known_as), never classify
-        # Jordan as a thing of type "name". The atomizer sometimes reshapes the genitive so a generic
-        # copula/SVO seam fires (Jordan, instance_of, name) instead of the genitive chain — and "name"
+        # is Ada" must bind Ada as the SPOUSE'S name (spouse + also_known_as), never classify
+        # Ada as a thing of type "name". The atomizer sometimes reshapes the genitive so a generic
+        # copula/SVO seam fires (Ada, instance_of, name) instead of the genitive chain — and "name"
         # is the NAMING-CONSTRUCTION anchor (the same lemma the genitive/possessive-naming seams are
         # built on), NOT an L4 type. So DROP any classification edge whose object IS that naming
         # noun: classifying anything INTO "name" is a category error across the memory/place line.
@@ -5268,12 +5268,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
     # ── DATED PASSIVE-EVENT PRE-PASS (bind the DATE + predicate to the NAMED entity; participle is
     #    NEVER an object) ─────────────────────────────────────────────────────────────────────────
-    # "My wife Jordan was born on July 8, 1985." / "My company Acme was founded in 1998." / "My server
+    # "My wife Ada was born on July 8, 1985." / "My company Acme was founded in 1998." / "My server
     # Apollo was provisioned on March 1, 2023." / "The product was released in 2019." Today a DATED
     # passive-participle clause mints junk: the objectless-state chain reads the participle as a STATE
     # OBJECT and strands the date on the role/possessed noun — (wife, has_state, bear)@1985-07-08,
     # (server, has_state, provision)@2023-03-01 — and sibling chains can read it as a relationship
-    # object (spouse(user, born) / owns(x, founded)). So "When was Jordan born?" / "When was Apollo
+    # object (spouse(user, born) / owns(x, founded)). So "When was Ada born?" / "When was Apollo
     # provisioned?" finds nothing (the date is on the wrong node, tagged with a junk state).
     #
     # THE FIX — ONE fully ENTITY-AGNOSTIC + PREDICATE-AGNOSTIC grammatical rule (NO lemma / role /
@@ -6254,7 +6254,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _etok = None
             # PREFER THE PROPER NAME (subject-agnostic, ONE grammatical rule for ALL possessed-noun+name
             # shapes). "my <possessed-noun> <Name> was <participle>" reaches the deriver in two spaCy
-            # parse shapes: (i) the name is an ``appos`` of the common-noun subject ("my wife JORDAN",
+            # parse shapes: (i) the name is an ``appos`` of the common-noun subject ("my wife ADA",
             # "my server APOLLO"); (ii) the common noun AND the name are BOTH attached as ``nsubjpass``
             # siblings of the participle ("my cat cat/MITTENS", "my dog dog/REX"). In BOTH the
             # date-bearing entity is the trailing PROPER NAME — never the possessed common noun (which
@@ -8385,7 +8385,7 @@ def count_declarative_assertions(text: str):
 
     WHY THIS EXISTS (intent-misroute fix): a multi-sentence first-person STATEMENT that opens
     with a courtesy/announcement clause ("I wanted to tell you about my family. My wife's name
-    is Jordan. We have three kids …") is mis-scored as QUERY by GLiNER2 — the "tell" verb drags
+    is Ada. We have three kids …") is mis-scored as QUERY by GLiNER2 — the "tell" verb drags
     it to the recall route and the whole turn is dropped at the QUERY gate. The grammar is
     unambiguous: the turn CONTAINS asserted facts. This counts them so the caller can route a
     fact-bearing declarative to STATEMENT/ingest BEFORE GLiNER2 (kept pure — no label edits).
@@ -8397,7 +8397,7 @@ def count_declarative_assertions(text: str):
         recall surface we must NOT capture, and
       • PREDICATES content one of two grammatical ways:
           (a) COPULA assignment — a ``be`` root (or a ``cop`` dependency) with a nominal/numeric/
-              adjectival complement (attr/acomp/oprd): "my wife's name IS Jordan", "she IS 28".
+              adjectival complement (attr/acomp/oprd): "my wife's name IS Ada", "she IS 28".
           (b) STATIVE/POSSESSIVE transitive — a content-verb root with a direct object (dobj/obj/
               dative/attr): "we HAVE three kids", "I OWN a dog".
       A retrieval-desire clause ("I want to know about my family", "I'd like to hear about X")
