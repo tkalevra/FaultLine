@@ -1870,6 +1870,101 @@ def _load_bearing_prep_of(verb_tok, exclude_idx=None) -> str | None:
     return None
 
 
+def _norm_rel_identity(surface: str) -> str:
+    """Normalize a rel/predicate surface to its RUNG-1 canonical identity key using the SAME
+    morphology the codebase's canonical resolver uses (``ontology.canonical.normalize_rel`` — PURE,
+    no DB/LLM/cosine): lemmatize the head verb + keep load-bearing preps ("lives_in"→"live_in",
+    "works_for"→"work_for", "manages"→"manage"). Deferred import (avoid a cycle); fail-safe:
+    any import/normalize failure → the lowered surface unchanged."""
+    try:
+        from src.ontology.canonical import normalize_rel as _normalize_rel  # deferred: avoid cycle
+        return _normalize_rel(surface or "") or (surface or "").strip().lower()
+    except Exception:  # noqa: BLE001 — fail-safe
+        return (surface or "").strip().lower()
+
+
+def _predicate_is_novel_to_ontology(predicate: str) -> bool:
+    """Is ``predicate`` (an SVO verb-lemma predicate like ``affect`` / ``live_in`` / ``marry``) NOVEL to
+    the per-tenant ontology — i.e. it resolves to NO seeded/known rel_type (RUNG 2 exact ∪ RUNG 3 alias ∪
+    RUNG 3 seeded-morphology fold)? This is the SAME known-vs-novel test the verb-lift/growth path uses
+    (``ontology.canonical.resolve_canonical`` + ``resolve_seeded_by_morphology``), so a verdict here is
+    consistent with where the novel verb subsequently flows.
+
+    Why this is the right discriminator: GLiNER2's relation scorer mints from the SEEDED menu. When the
+    user's verb IS in the ontology (directly or by morphology — ``live_in``≡``lives_in``, ``meet``≡seeded
+    ``met``), a different seeded mint is a legitimate ontology-level choice → let the mint WIN. When the
+    verb is genuinely ABSENT from the ontology (``affect``), GLiNER2 was FORCED to substitute a wrong
+    seeded rel (``manages``) → the deterministic content verb must win and flow to growth.
+
+    Deterministic, NO cosine. Reads the ContextVar-bound tenant schema (the SAME binding the overlays
+    use). FAIL-SAFE — returns ``False`` (→ "mint WINS", today's behavior) whenever novelty CANNOT be
+    POSITIVELY confirmed: the ontology isn't loaded (DB down / empty rel_types), the predicate resolves
+    to a known rel, or any error. So a novel verb only wins when the ontology is present AND lacks it."""
+    try:
+        from src.ontology import canonical as _canon  # deferred: avoid import cycle
+        try:
+            from src.api.rel_type_overlay import get_current_schema as _get_schema
+            _schema = _get_schema()
+        except Exception:  # noqa: BLE001
+            _schema = None
+        _dsn = os.environ.get("POSTGRES_DSN", "")
+        # Ontology must be LOADED before a "novel" verdict is trustworthy — an empty set means the
+        # DB/seed is unavailable, NOT that every verb is novel. Fail-safe → mint wins.
+        if not _canon._load_reltypes(_dsn or None, _schema):
+            return False
+        if _canon.resolve_canonical(predicate, _dsn or None, _schema).get("canonical") is not None:
+            return False  # RUNG 2/3 known rel — the mint is an ontology-level choice, let it win
+        if _canon.resolve_seeded_by_morphology(predicate, _dsn or None, _schema) is not None:
+            return False  # folds onto a seeded canonical (live_in→lives_in, meet→met) — known
+        return True  # ontology present, predicate absent from it → genuinely novel
+    except Exception:  # noqa: BLE001 — fail-safe → not-novel → mint wins (unchanged behavior)
+        return False
+
+
+def _content_verb_beats_mint(verb_tok, rel: str, minted: str) -> bool:
+    """CONVERGENCE CARVE-OUT (sibling of the preposition guard): should the deriver's SVO CONTENT-VERB
+    predicate WIN over a GLiNER2-minted rel for this pair (i.e. is the mint a FUZZY guess clobbering
+    the user's own DETERMINISTIC verb)?
+
+    Returns True — DROP the mint, keep the SVO predicate — ONLY when ALL hold (grammar/ontology-driven,
+    subject-agnostic, NO rel/verb/domain literal):
+      (a) there is a real verb token and it is a genuine CONTENT verb (``pos_ == "VERB"``, lemma ≠ "be"
+          — an AUX/copula/verb-less chain has no user-verb to protect);
+      (b) the verb is NOT a light/support verb (``_lvc_support_verbs`` — "have"/"take"/"get"/…): a light
+          verb carries NO relational content and EXISTS to be replaced by a better seeded rel, so its
+          mint ("I have a dog" → ``has_pet``) MUST still win — a KEY no-regression discriminator;
+      (c) the emitted ``rel`` genuinely DERIVES from this verb — its normalized HEAD equals the verb
+          lemma's ("affect"/"live_in"/"work_at" head == the verb). This limits the carve-out to a raw
+          SVO verb-lemma gap-fill and leaves any CANONICAL rel a chain deliberately chose (state
+          ``has_state``, possessive ``owns``, …) to converge normally;
+      (d) the SVO predicate is NOVEL to the ontology (``_predicate_is_novel_to_ontology``). A predicate
+          that resolves to a known/seeded rel — an inflection/canonical variant ("live_in"≡``lives_in``,
+          "work_for"≡``works_for``) OR a different seeded rel the verb is a known member of ("meet"≡seeded
+          ``met``) — lets the mint WIN (return False). Only a genuinely-novel verb ("affect") whose forced
+          fuzzy mint ("manages") is a fabrication loses to the deterministic content verb.
+
+    Fail-safe: any miss / undecidable → False (today's "minted WINS" behavior is unchanged)."""
+    try:
+        if verb_tok is None:
+            return False
+        if verb_tok.pos_ != "VERB":
+            return False
+        _lemma = (verb_tok.lemma_ or verb_tok.text or "").strip().lower()
+        if not _lemma or _lemma == "be":
+            return False
+        if _lemma in _lvc_support_verbs():  # light/support verb → let the seeded mint replace it
+            return False
+        _rel_norm = _norm_rel_identity(rel)
+        _verb_head = _norm_rel_identity(_lemma).split("_", 1)[0]
+        if _rel_norm.split("_", 1)[0] != _verb_head:
+            return False  # emitted rel is NOT this verb's own SVO predicate — do not interfere
+        # Known/seeded predicate → the mint is an ontology-level choice, let it win; genuinely novel
+        # verb → its forced fuzzy mint is a fabrication, the deterministic content verb wins + grows.
+        return _predicate_is_novel_to_ontology(rel)
+    except Exception:  # noqa: BLE001 — fail-safe → mint wins (unchanged behavior)
+        return False
+
+
 def _svo_object_head(verb_tok, exclude_idx=None):
     """Return the OBJECT head noun token a verb governs, or ``None``.
 
@@ -4569,6 +4664,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 f"_{_prep}" not in _minted and not _minted.endswith(_prep)
             ):
                 pass  # prep-bearing SVO predicate wins; prep-blind minted rel dropped for this pair
+            # CONTENT-VERB GUARD (sibling carve-out): GLiNER2's relation scorer picks the best-fitting
+            # rel from the seeded menu even when the sentence's verb expresses a relation NOT in that
+            # menu — so "CVE affects Exchange" mints a fuzzy ``manages`` that would CLOBBER the user's
+            # own content verb ``affect``. A genuine, non-light CONTENT verb whose lemma is a DIFFERENT
+            # relation from the mint (by inflectional identity — ``affect`` ≠ ``manage``, but ``live`` ==
+            # ``lives_in``) keeps ITS OWN predicate; the fuzzy mint is dropped and the novel verb flows on
+            # to verb-lift/growth. Light-verb mints ("have" → ``has_pet``) and same-verb canonicalizations
+            # ("live" → ``lives_in``, "work" → ``works_for``) are NOT affected (they return False → mint
+            # WINS). Structural/identity-driven, subject-agnostic; fail-safe → today's "minted WINS".
+            elif _content_verb_beats_mint(verb_tok, rel, _minted):
+                pass  # deterministic content verb wins; fuzzy prep-blind mint dropped for this pair
             else:
                 rel = _minted
         if not (subj and rel and obj) or subj == obj:
