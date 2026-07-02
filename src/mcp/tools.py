@@ -148,7 +148,7 @@ TOOLS = [
         "name": "forget_fact",
         "description": "Use ONLY when the user EXPLICITLY and deliberately asks to forget or delete "
                        "ONE specific fact about a NAMED target — e.g. 'forget my email address', "
-                       "'delete that I have a dog named Rex', 'forget that Jordan is my spouse'. "
+                       "'delete that I have a dog named Rex', 'forget that Ada is my spouse'. "
                        "Tombstones exactly the one named fact (recoverable, not a hard wipe). You MUST "
                        "name the target via 'subject' (use 'me' for the user) and, to pin it, "
                        "'rel_type' and/or 'old_value'. NEVER call for a broad/bulk request ('forget "

@@ -185,8 +185,8 @@ class FactStoreManager:
                           the grace window. Restores the fact to the live view.
         subject and old_value are pre-resolved UUIDs (already lowercase).
 
-        Searches both subject-side and object-side: if "forget jordan" is issued,
-        jordan's UUID may be the object (user → spouse → jordan). Searches subject
+        Searches both subject-side and object-side: if "forget ada" is issued,
+        ada's UUID may be the object (user → spouse → ada). Searches subject
         first, falls back to object-side if no match.
 
         BOUNDED TARGET ONLY: a forget/un-forget operates on the SPECIFIC resolved
