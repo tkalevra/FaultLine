@@ -219,6 +219,70 @@ def _subject_preserved(atom_text: str, source_span: str) -> bool:
     return True
 
 
+# ── Tier 2.5: VERB INTEGRITY (grammatical, spaCy-only, lemma-level — no word lists) ──────
+# The LLM reframe/atomizer is DETECT/SEGMENT/PASS-ALONG-ONLY: it may split and de-noise the
+# user's prose but must NEVER swap the CONTENT VERB of a fact. Live bug: "CVE-2026-5555 affects
+# Microsoft Exchange" atomized to a statement with the verb "manages" (absent from the source)
+# and the deterministic deriver faithfully produced the fabricated relation
+# ``manages(cve-2026-5555, microsoft exchange)``. Tier 1 (content tokens) is MESSAGE-scoped — a
+# deliberate leniency so a resolved pronoun ("it" → an earlier "fence") passes — so a verb
+# BORROWED from a sibling clause/sentence in the same turn slips through and fabricates the
+# fact's core relation. Verb integrity pins the atom's content-verb lemmas to the fact's OWN
+# source (span-scoped, or the true containing sentence when the source is a bare enumeration NP),
+# lemma-level so a legitimate inflection ("affect" → "affects") still passes.
+#
+# CONTENT verbs only (spaCy ``pos_ == "VERB"``): AUX/copula ("is/are/was/be") is EXEMPT so a
+# bare-predicate copula insertion and the affect/preference copula seams are never touched.
+# Subject-agnostic, NO allowlist, NO cosine. Fail-safe: spaCy unavailable / parse miss / atom
+# has no content verb / no reference verb → PASS (defer to Tiers 1–2; strictly no worse than
+# today). A violation → ``_GR_CONTENT`` so the existing verbatim-source fallback (which carries
+# the user's TRUE verb) is substituted.
+
+def _content_verb_lemmas(doc) -> set[str]:
+    """Lowercased lemmas of the CONTENT verbs (``pos_ == 'VERB'``) in ``doc`` — AUX/copula excluded."""
+    try:
+        return {t.lemma_.lower() for t in doc if t.pos_ == "VERB"}
+    except Exception:  # noqa: BLE001 — POS probe must never crash extraction
+        return set()
+
+
+def _verb_integrity_ok(atom_text: str, source_span: str, full_message: str) -> bool:
+    """Tier 2.5 gate. True ⇒ the atom introduces no CONTENT verb absent from the fact's source.
+
+    Grammatical, spaCy-only, lemma-level (no word lists). The reference verb set is the content-
+    verb lemmas of the TRUE CONTAINING SENTENCE (``_containing_sentence`` — the user's real
+    subject-intact sentence, resolved off the ``source`` span). That is the right granularity:
+    the fact's own sentence, not the whole turn — so a verb BORROWED from a different sentence is
+    rejected, while a per-member split of a coordinated sentence ("I have a dog named Rex and a
+    cat named Milo." → "I have a dog named Rex.") whose ``source`` is a bare subjectless NP ("a
+    dog named Rex", missing the head verb "have") still PASSES (the shared verb lives in the
+    containing sentence). Using the bare-NP span alone would wrongly drop "have" and over-reject
+    that legitimate atom.
+
+    Returns True (PASS — fail-safe) when spaCy is unavailable, either parse fails, the atom has
+    NO content verb (nominal / copula atom — nothing to verify), or the reference sentence has no
+    content verb to compare against. The gate can only ever ADD a rejection it is certain about,
+    never invent one or crash. Residual (honest): a verb borrowed from a SIBLING CLAUSE of the
+    SAME sentence is not caught here (same reference set) — a rare construction backstopped by
+    Tier 1 when the borrowed verb is otherwise absent from the message.
+    """
+    try:
+        from src.extraction.linguistics import _get_nlp
+        nlp = _get_nlp()
+        if nlp is None:                        # spaCy layer off / not baked → fail-safe PASS
+            return True
+        atom_verbs = _content_verb_lemmas(nlp(atom_text))
+        if not atom_verbs:                     # nominal / copula atom — no content verb to verify
+            return True
+        ref_verbs = _content_verb_lemmas(nlp(_containing_sentence(full_message, source_span)))
+    except Exception:  # noqa: BLE001 — any spaCy failure → fail-safe PASS (never lose a good atom)
+        return True
+
+    if not ref_verbs:                          # no verb in the reference sentence → defer to Tiers 1–2
+        return True
+    return atom_verbs <= ref_verbs
+
+
 def _containing_sentence(full_message: str, source_span: str) -> str:
     """The TRUE original sentence within ``full_message`` that CONTAINS ``source_span``.
 
@@ -324,6 +388,15 @@ def _guardrail_check(atom_text: str, source_span: str, full_message: str) -> str
     subject_ref = _containing_sentence(full_message, source_span)
     if not _subject_preserved(atom_text, subject_ref):
         return _GR_SUBJECT_DROP
+
+    # Tier 2.5 (verb integrity, grammatical — CHECKED BEFORE the message-scoped Tier 1): reject an
+    # atom whose CONTENT verb was SWAPPED for one absent from the fact's own source ("affects" →
+    # "manages"). Message-scoped Tier 1 waves this through when the invented verb appears in a
+    # sibling clause/sentence of the same turn. CONTENT-class rejection → the verbatim-source
+    # fallback (which carries the user's TRUE verb) is substituted. Fail-safe PASS when spaCy is
+    # unavailable, so Tiers 1+2 then decide exactly as before.
+    if not _verb_integrity_ok(atom_text, source_span, full_message):
+        return _GR_CONTENT
 
     atom_ct = _content_tokens(atom_text)
     source_ct = _content_tokens(source_span)

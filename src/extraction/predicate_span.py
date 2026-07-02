@@ -63,7 +63,7 @@ _EMPTY_CONNECTORS: frozenset[str] = frozenset({
 })
 
 # Naming / dubbing verbs: the predicative naming construction ("a dog NAMED Rex", "a server
-# CALLED Atlas") is NOT an activity predicate — it assigns a PROPER NAME to the head noun and is
+# CALLED Apollo") is NOT an activity predicate — it assigns a PROPER NAME to the head noun and is
 # OWNED by the deterministic naming seam (``main._detect_naming_states`` → ``also_known_as``). The
 # verb-lift must SKIP it so it never mints the over-stripped junk rel ``nam`` (the rung-1 stemmer
 # turns "named" → "nam" — see canonical._suffix_lemma). We match the SURFACE inflected forms of the
@@ -116,7 +116,9 @@ def _find_span_position(span_lower: str, needle: str) -> Optional[tuple[int, int
     return None
 
 
-def lift_predicate(span: str, subject: str, object_: str) -> Optional[str]:
+def lift_predicate(
+    span: str, subject: str, object_: str, content_verb_only: bool = False
+) -> Optional[str]:
     """Lift the user's connecting verb between (subject, object) in ``span`` → normalized rel token.
 
     Deterministic + pure. Steps:
@@ -130,6 +132,13 @@ def lift_predicate(span: str, subject: str, object_: str) -> Optional[str]:
       4. Reject empty / pure-connector results (returns None — caller keeps today's behavior).
 
     Returns the snake_cased normalized rel_type token, or None on any miss (fail-safe).
+
+    ``content_verb_only`` (default False → existing behavior): when True, REFUSE to lift a
+    copula / auxiliary / light verb head ("is"/"are"/"be"/"have"/"has"/"get"/"make"/…). Used by
+    the DESTRUCTIVE relabel post-pass (main._relabel_coerced_rels), where a light/copula
+    construction is OWNED by the seeded copula/possessive/scalar seams and must NOT be lifted
+    into an activity rel. The additive verb-lift (lift_edges_from_entities) keeps its light-verb
+    fold ("had an issue with" → has_issue) by leaving this False.
 
     NOTE: this lifts ONLY the connecting predicate between the pair. Trailing scalars
     ("three weeks ago") fall OUTSIDE the pair and are never folded in (scalar-tail caveat).
@@ -191,6 +200,16 @@ def lift_predicate(span: str, subject: str, object_: str) -> Optional[str]:
         return None
 
     head_lemma = _lemmatize(head)
+
+    # CONTENT-VERB-ONLY gate (destructive relabel pass): a copula / auxiliary / light verb head
+    # is NOT a domain activity predicate — "is/are/be" is a copula (seeded copula seam owns it),
+    # "have/has/get/make/take/give" is a light verb whose meaning is the object noun (seeded
+    # possessive/scalar seams own it). Refuse to lift these so the relabel pass never OVER-WRITES
+    # a correct seeded rel with a junk activity token ("have a dog" must NOT become has_dog).
+    if content_verb_only and (
+        head in _AUXILIARIES or head_lemma == "be" or head_lemma in _LIGHT_VERBS
+    ):
+        return None
 
     # Naming/dubbing verb ("named"/"called") → the naming seam owns this construction (it mints
     # the valid ``(head-noun, also_known_as, ProperName)`` edge). Skip so the verb-lift never
