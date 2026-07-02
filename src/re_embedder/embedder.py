@@ -3515,6 +3515,22 @@ def climb_classification_chains(
     # cycle — the un-laddered concepts never deepen. Clear inherited aborted state up front. Fail-safe.
     _rollback_and_reapply_search_path(db_conn, schema_name)
 
+    # LEVER 2 (GRACE TO INTENT): break any hierarchy 2-CYCLES (A⊆B ∧ B⊆A — duplicate roots like
+    # `vulnerability` ⇄ `security_vulnerability`) BEFORE we walk/climb, so the cycle-guard no longer
+    # rejects good rungs (`cycle_rejected`) and islands the chain. Deterministic identity merge
+    # (survivor = higher-evidence node); fail-safe (never raises). Runs FIRST each pass so the climb
+    # below advances onto the single collapsed survivor node this same cycle.
+    try:
+        _cyc = collapse_hierarchy_2cycles(db_conn, schema_name=schema_name)
+        if _cyc.get("cycles_collapsed", 0) > 0:
+            log.info(f"re_embedder.climb_precollapse schema={schema_name} "
+                     f"cycles_collapsed={_cyc['cycles_collapsed']} "
+                     f"edges_repointed={_cyc['edges_repointed']}")
+    except Exception as e:
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        log.warning(f"re_embedder.climb_precollapse_failed schema={schema_name} "
+                    f"error={type(e).__name__}: {str(e)[:120]}")
+
     dsn = os.environ.get("POSTGRES_DSN", "")
     roots = _seeded_backbone_roots(dsn, schema_name)
 
@@ -3683,9 +3699,21 @@ def climb_classification_chains(
                 # (until new info changes the fingerprint).
                 _climb_state_record(db_conn, leaf_id, "placed", "rooted", _fp)
                 continue
-            # BACKSTOP termination: ±6 hop cap reached without a seeded root → quarantine
-            # this chain's tip (queue for whatis reclassify) and STOP generating on it.
+            # BACKSTOP termination: ±6 hop cap reached without a seeded root. LEVER 1 (GRACE TO
+            # INTENT, over ISLANDS): if the tip the walk reached is itself a COHERENT GROWN ROOT (a
+            # genuine, already-grounded category node — passes the same rung-4 category gate the
+            # seeded roots satisfy, is NOT a named instance, NOT a no-info upper placeholder), TERM-
+            # INATE GRACEFULLY there: the chain is placed + walkable, it just tops out at a GROWN
+            # root (minecraft→…→program, program is a real category) instead of a SEEDED one — a
+            # coherent standalone grouping is first-class. Only a NON-coherent tip (junk / no-info
+            # tower) still QUARANTINES for later what-is reclassify. Structural/identity, no cosine.
             if hit_cap:
+                if _is_coherent_grown_root(db_conn, tip_id, tip_name, roots):
+                    stats["terminated"] += 1
+                    _climb_state_record(db_conn, leaf_id, "placed", "grown_root", _fp)
+                    log.info("re_embedder.climb_terminated_at_grown_root",
+                             extra={"leaf": leaf_name, "grown_root": tip_name, "at": "hop_cap"})
+                    continue
                 _quarantine_climb_tip(db_conn, tip_id, tip_name)
                 stats["quarantined"] += 1
                 _climb_state_record(db_conn, leaf_id, "unplaceable", "cap_hit", _fp)
@@ -3746,11 +3774,24 @@ def climb_classification_chains(
                     stats["deferred"] += 1
                     _climb_state_record(db_conn, leaf_id, "unplaceable", "cycle_rejected", _fp)
             else:
-                # Unresolved parent → MINT-AND-QUARANTINE (never auto-place). The async
-                # whatis classifier types/places it next cycle; once it becomes a real
-                # backbone node, this chain advances onto it on a later pass (identity).
-                # CACHE 'unplaceable'/no_info_root — the proposed parent is not (yet) a backbone
-                # node; re-open when growth makes it one (fingerprint change) or after backoff.
+                # Proposed parent is NOT (yet) a backbone node. LEVER 1 (GRACE TO INTENT, over
+                # ISLANDS): the LLM (full-chain AND single-rung) could not connect this tip to the
+                # seeded backbone — so if the TIP ITSELF is a COHERENT GROWN ROOT (genuine, grounded
+                # category, not a named instance / no-info placeholder), TERMINATE GRACEFULLY at it:
+                # a coherent standalone grouping is first-class, placed + walkable, topping out at a
+                # grown root. Cache 'placed' so we stop re-LLMing forever; a later growth that mints
+                # the real parent changes the fingerprint and re-opens the climb (identity).
+                if _is_coherent_grown_root(db_conn, tip_id, tip_name, roots):
+                    stats["terminated"] += 1
+                    _climb_state_record(db_conn, leaf_id, "placed", "grown_root", _fp)
+                    log.info("re_embedder.climb_terminated_at_grown_root",
+                             extra={"leaf": leaf_name, "grown_root": tip_name,
+                                    "at": "single_rung_fallback"})
+                    continue
+                # Non-coherent tip → MINT-AND-QUARANTINE the proposed parent (never auto-place). The
+                # async whatis classifier types/places it next cycle; once it becomes a real backbone
+                # node, this chain advances onto it on a later pass (identity). CACHE 'unplaceable'/
+                # no_info_root — re-open when growth makes it a node (fingerprint) or after backoff.
                 _quarantine_climb_tip(db_conn, None, parent)
                 stats["quarantined"] += 1
                 _climb_state_record(db_conn, leaf_id, "unplaceable", "no_info_root", _fp)
@@ -4189,6 +4230,190 @@ def converge_hierarchy_by_identity(db_conn, schema_name: str = "") -> dict:
     return stats
 
 
+def _pick_survivor_by_evidence(a_id, a_deg: int, b_id, b_deg: int) -> tuple:
+    """PURE deterministic survivor pick for a hierarchy-node merge (no DB, no cosine).
+
+    Higher hierarchy DEGREE (more live edges touching it = the more-established node) survives; on a
+    tie the lexicographically-lower UUID string wins (stable, subject-agnostic). Returns
+    (survivor_id, loser_id) as strings. Unit-testable."""
+    a, b = str(a_id), str(b_id)
+    if int(a_deg) != int(b_deg):
+        return (a, b) if int(a_deg) > int(b_deg) else (b, a)
+    return (a, b) if a <= b else (b, a)
+
+
+def _hierarchy_degree(db_conn, node_id, rels) -> int:
+    """Count of LIVE hierarchy edges touching ``node_id`` (as subject OR object), both tables.
+    Read-only, fail-safe (0 on error)."""
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT"
+                "  (SELECT count(*) FROM facts"
+                "     WHERE (subject_id = %s OR object_id = %s) AND rel_type = ANY(%s)"
+                "       AND superseded_at IS NULL AND archived_at IS NULL)"
+                " +(SELECT count(*) FROM staged_facts"
+                "     WHERE (subject_id = %s OR object_id = %s) AND rel_type = ANY(%s)"
+                "       AND promoted_at IS NULL AND deleted_at IS NULL)",
+                (str(node_id), str(node_id), rels, str(node_id), str(node_id), rels),
+            )
+            row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def collapse_hierarchy_2cycles(db_conn, schema_name: str = "") -> dict:
+    """Lever 2 — COLLAPSE hierarchy 2-CYCLES so the climb stops islanding on ``cycle_rejected``.
+
+    ``subclass_of`` (and the hierarchy rels) is a partial ORDER: A⊆B ∧ B⊆A ⟹ A=B. So a LIVE
+    reciprocal hierarchy-edge pair between two DISTINCT entities (``vulnerability`` ⇄
+    ``security_vulnerability``) is a proof-BY-IDENTITY that they are the SAME backbone node — NOT a
+    similarity guess. Un-collapsed, that loop makes ``_is_ancestor_or_descendant`` reject every new
+    rung (``cycle_rejected``) and QUARANTINE otherwise-good chains. This is the convergence case
+    ``converge_hierarchy_by_identity`` MISSES because the two nodes carry DIFFERENT canonical names
+    (synonym / compound variants), so name-identity never groups them; the reciprocal-edge identity
+    does.
+
+    MERGE (deterministic): survivor = the higher-EVIDENCE node (``_pick_survivor_by_evidence`` —
+    more live hierarchy edges; tie → lowest UUID). REPOINT every live hierarchy edge of the loser
+    onto the survivor (object_id AND subject_id), skipping rows that would COLLIDE with an existing
+    survivor edge (``NOT EXISTS`` guard — no unique violation), then TOMBSTONE every remaining live
+    loser edge + the reciprocal pair + any self-loop (facts: superseded+archived; staged: deleted_at
+    — non-destructive, recoverable). Hierarchy EDGES only — never entity rows / aliases / scalars
+    (mirrors ``converge_hierarchy_by_identity``). Idempotent; once merged the loop is gone and the
+    climb advances onto the single survivor node.
+
+    Fail-safe: per-pair try/except + rollback so one bad pair never aborts the rest; never crashes
+    the sweep. Deterministic — identity / evidence-order only, NO cosine / difflib / similarity.
+    Guarded by ``_RUNG6_CONVERGENCE`` (same convergence family). Returns stats dict."""
+    stats = {"cycles_collapsed": 0, "edges_repointed": 0}
+    if not _RUNG6_CONVERGENCE:
+        return stats
+    rels = list(_HIERARCHY_RELS)
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH live AS (
+                    SELECT subject_id AS s, object_id AS o FROM facts
+                      WHERE rel_type = ANY(%s) AND superseded_at IS NULL AND archived_at IS NULL
+                    UNION
+                    SELECT subject_id AS s, object_id AS o FROM staged_facts
+                      WHERE rel_type = ANY(%s) AND promoted_at IS NULL AND deleted_at IS NULL
+                )
+                SELECT DISTINCT l1.s, l1.o FROM live l1
+                  JOIN live l2 ON l2.s = l1.o AND l2.o = l1.s
+                 WHERE l1.s <> l1.o
+                """,
+                (rels, rels),
+            )
+            raw_pairs = cur.fetchall()
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return stats
+    if not raw_pairs:
+        return stats
+
+    seen: set = set()
+    for s, o in raw_pairs:
+        key = tuple(sorted((str(s), str(o))))
+        if key in seen:
+            continue
+        seen.add(key)
+        a_id, b_id = key
+        try:
+            survivor, loser = _pick_survivor_by_evidence(
+                a_id, _hierarchy_degree(db_conn, a_id, rels),
+                b_id, _hierarchy_degree(db_conn, b_id, rels),
+            )
+            repointed = 0
+            with db_conn.cursor() as cur:
+                # Repoint object_id (X -> loser  ⇒  X -> survivor), skipping self-loops and rows
+                # that would collide with an existing live (X -> survivor) edge of the same rel.
+                cur.execute(
+                    "UPDATE facts f SET object_id = %s, qdrant_synced = false"
+                    "  WHERE f.object_id = %s AND f.rel_type = ANY(%s)"
+                    "    AND f.superseded_at IS NULL AND f.archived_at IS NULL"
+                    "    AND f.subject_id <> %s"
+                    "    AND NOT EXISTS (SELECT 1 FROM facts g WHERE g.subject_id = f.subject_id"
+                    "        AND g.object_id = %s AND g.rel_type = f.rel_type"
+                    "        AND g.superseded_at IS NULL AND g.archived_at IS NULL)",
+                    (survivor, loser, rels, survivor, survivor),
+                )
+                repointed += cur.rowcount
+                cur.execute(
+                    "UPDATE staged_facts f SET object_id = %s, qdrant_synced = false"
+                    "  WHERE f.object_id = %s AND f.rel_type = ANY(%s)"
+                    "    AND f.promoted_at IS NULL AND f.deleted_at IS NULL"
+                    "    AND f.subject_id <> %s"
+                    "    AND NOT EXISTS (SELECT 1 FROM staged_facts g WHERE g.subject_id = f.subject_id"
+                    "        AND g.object_id = %s AND g.rel_type = f.rel_type"
+                    "        AND g.promoted_at IS NULL AND g.deleted_at IS NULL)",
+                    (survivor, loser, rels, survivor, survivor),
+                )
+                repointed += cur.rowcount
+                # Repoint subject_id (loser -> Y  ⇒  survivor -> Y), same collision/self-loop guard.
+                cur.execute(
+                    "UPDATE facts f SET subject_id = %s, qdrant_synced = false"
+                    "  WHERE f.subject_id = %s AND f.rel_type = ANY(%s)"
+                    "    AND f.superseded_at IS NULL AND f.archived_at IS NULL"
+                    "    AND f.object_id <> %s"
+                    "    AND NOT EXISTS (SELECT 1 FROM facts g WHERE g.object_id = f.object_id"
+                    "        AND g.subject_id = %s AND g.rel_type = f.rel_type"
+                    "        AND g.superseded_at IS NULL AND g.archived_at IS NULL)",
+                    (survivor, loser, rels, survivor, survivor),
+                )
+                repointed += cur.rowcount
+                cur.execute(
+                    "UPDATE staged_facts f SET subject_id = %s, qdrant_synced = false"
+                    "  WHERE f.subject_id = %s AND f.rel_type = ANY(%s)"
+                    "    AND f.promoted_at IS NULL AND f.deleted_at IS NULL"
+                    "    AND f.object_id <> %s"
+                    "    AND NOT EXISTS (SELECT 1 FROM staged_facts g WHERE g.object_id = f.object_id"
+                    "        AND g.subject_id = %s AND g.rel_type = f.rel_type"
+                    "        AND g.promoted_at IS NULL AND g.deleted_at IS NULL)",
+                    (survivor, loser, rels, survivor, survivor),
+                )
+                repointed += cur.rowcount
+                # TOMBSTONE every remaining live edge that still touches the loser (the collided
+                # duplicates + the reciprocal cycle pair) and any self-loop the repoint produced.
+                cur.execute(
+                    "UPDATE facts SET superseded_at = now(), archived_at = now(), qdrant_synced = false"
+                    "  WHERE rel_type = ANY(%s) AND superseded_at IS NULL AND archived_at IS NULL"
+                    "    AND (subject_id = %s OR object_id = %s OR subject_id = object_id)",
+                    (rels, loser, loser),
+                )
+                cur.execute(
+                    "UPDATE staged_facts SET deleted_at = now(), qdrant_synced = false"
+                    "  WHERE rel_type = ANY(%s) AND promoted_at IS NULL AND deleted_at IS NULL"
+                    "    AND (subject_id = %s OR object_id = %s OR subject_id = object_id)",
+                    (rels, loser, loser),
+                )
+            db_conn.commit()
+            stats["cycles_collapsed"] += 1
+            stats["edges_repointed"] += repointed
+            log.info("re_embedder.hierarchy_2cycle_collapsed "
+                     f"schema={schema_name} survivor={str(survivor)[:8]} "
+                     f"loser={str(loser)[:8]} edges_repointed={repointed}")
+        except Exception as e:
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+            log.warning(f"re_embedder.hierarchy_2cycle_collapse_failed schema={schema_name} "
+                        f"error={type(e).__name__}: {str(e)[:120]}")
+            continue
+    return stats
+
+
 # No-information upper-ontology TOKENS + SUFFIXES (PATTERN-based, subject-agnostic). These are
 # generic placeholder categories that carry no real classification signal — a chain must terminate
 # at the REAL category one rung BELOW them (e.g. `emotion`), never climb into them. Closed set,
@@ -4329,6 +4554,74 @@ def _validate_bridge_placement(child_a: str, child_b: str, proposed_lca: str,
     if ta and tb and ta not in ("unknown", "") and tb not in ("unknown", "") and ta != tb:
         return False, f"type_mismatch:{ta}!={tb}"
     return True, "ok"
+
+
+def _is_coherent_category_token(name: str, roots: set) -> bool:
+    """PURE gate — is ``name`` a COHERENT GROWN-ROOT category token (no DB, no LLM, no cosine)?
+
+    A grown root is "coherent" (GRACE TO INTENT, over ISLANDS) iff it is a GENUINE category one
+    could file things under — NOT a seeded root (those terminate PRIMARILY, handled by the caller),
+    NOT a scalar/loose-phrase, NOT a bare/­no-information upper-ontology placeholder. We reuse the
+    SAME rung-4 category validator the seeded roots implicitly satisfy: passing it (or the expected
+    self-bridge ``lca_equals_child``, since we validate the token AS its own candidate root) means
+    the token carries real classification signal. A SEEDED root returns False here because the
+    caller's PRIMARY seeded-root termination owns that case — this gate is only the GROWN backstop.
+
+    Deterministic/pure so it is unit-testable alongside ``_validate_bridge_placement``."""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in roots:
+        return False  # seeded root → PRIMARY termination, not the grown-root backstop
+    ok, why = _validate_bridge_placement(n, n, n, child_a_type="", child_b_type="")
+    return bool(ok or why == "lca_equals_child")
+
+
+def _is_coherent_grown_root(db_conn, node_id: Optional[str], node_name: str, roots: set) -> bool:
+    """DB gate — is this walked chain TIP a COHERENT GROWN ROOT we may terminate at GRACEFULLY?
+
+    Lever 1 of "GRACE TO INTENT, over ISLANDS": when the ±6 climb builds a coherent vertical chain
+    that does NOT reach a SEEDED backbone root within the bound, we accept the deepest coherent
+    GROWN root the chain reached as a valid terminus (a coherent standalone grouping is first-class)
+    rather than QUARANTINING a perfectly good chain (minecraft→…→program: program is a real category,
+    just not a seeded root). The node stays PLACED + walkable; it just tops out at a grown root.
+
+    A tip qualifies iff ALL hold (structural/identity — NO cosine):
+      • its name is a coherent category token (``_is_coherent_category_token`` — genuine category,
+        not seeded/scalar/phrase/no-info-upper-root);
+      • it is NOT a NAMED INSTANCE (``_token_resolves_to_named_instance`` — THE HARD LINE: a name /
+        memory can never be an L4 place, even as a terminus);
+      • it already PARTICIPATES in the tenant hierarchy as a real node (is the subject OR object of a
+        live hierarchy edge) — i.e. the proposed terminus resolved BY IDENTITY to an EXISTING node,
+        not a bare LLM token. A walked chain tip satisfies this by construction; we assert it so the
+        gate is honest and reusable.
+    Read-only, fail-safe (False on any error → fall through to QUARANTINE, never a bad placement)."""
+    n = (node_name or "").strip().lower()
+    if not _is_coherent_category_token(n, roots):
+        return False
+    if _token_resolves_to_named_instance(db_conn, n):
+        return False  # HARD LINE — a memory/name is never a place, not even a terminus
+    rels = list(_HIERARCHY_RELS)
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM facts"
+                "  WHERE (subject_id = %s OR object_id = %s) AND rel_type = ANY(%s)"
+                "    AND superseded_at IS NULL AND archived_at IS NULL"
+                " UNION"
+                " SELECT 1 FROM staged_facts"
+                "  WHERE (subject_id = %s OR object_id = %s) AND rel_type = ANY(%s)"
+                "    AND promoted_at IS NULL AND deleted_at IS NULL"
+                " LIMIT 1",
+                (str(node_id), str(node_id), rels, str(node_id), str(node_id), rels),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 def _propose_lca_bridge(child_a: str, child_b: str, qwen_api_url: str) -> Optional[dict]:
@@ -4949,6 +5242,465 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
     # Invalidate the canonical/alias cache for this tenant so the new alias rows + folded
     # category are visible to the next in-flow resolve without a restart.
     if stats["reconciled"] > 0:
+        try:
+            _reset_canon_caches(schema_name)
+        except Exception:
+            pass
+
+    return stats
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# ENGINE SYNONYM CONVERGENCE — deterministic-gated collapse of a LIFTED novel rel onto a SEEDED rel
+# when it is a SEMANTIC synonym the morphology-fold could NOT see ("marry"→spouse, "adopt"→has_pet).
+# Companion to drain_pending_placement_by_morphology (which only folds MORPHOLOGY matches).
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Flag-gated (default ON, env-configurable). OFF → the pass is a no-op (leaves every novel rel novel).
+_ENGINE_SYNONYM_CONVERGENCE = _flag("ENGINE_SYNONYM_CONVERGENCE", "true")
+
+
+def _synonym_conv_min_conf() -> float:
+    """Confidence floor the LLM equivalence PROPOSAL must clear before Gate-3 write. Env-configurable.
+    The LLM only PROPOSES; this is a deterministic accept-gate ON TOP of the type rail — never a
+    cosine/similarity score. Fail-safe: unparseable env → 0.75."""
+    try:
+        return float(os.getenv("ENGINE_SYNONYM_CONVERGENCE_MIN_CONF", "0.75"))
+    except (TypeError, ValueError):
+        return 0.75
+
+
+def _synonym_conv_batch() -> int:
+    """Bounded count of novel rels that reach the (LLM) equivalence gate per tenant per cycle — an
+    LLM-cost bound only; Gate-1 type filtering is deterministic and runs on all of them first."""
+    try:
+        return max(1, int(os.getenv("ENGINE_SYNONYM_CONVERGENCE_BATCH", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+# Sentinels for the "attempted → left novel" memo parked in ontology_evaluations so a non-converging
+# rel is not re-sent to the LLM every cycle (the unique key is (candidate_rel_type, sample_subject_id,
+# sample_object); NULLs are distinct in a UNIQUE index so we use concrete sentinel strings).
+_SYNONYM_CONV_METHOD = "synonym_convergence"
+_SYNONYM_CONV_MEMO_SUBJ = "__synonym_convergence__"
+_SYNONYM_CONV_MEMO_OBJ = "__memo__"
+
+
+def _type_set(arr) -> set:
+    """Lowercased set of a Postgres TEXT[] type column (None/empty → empty set)."""
+    if not arr:
+        return set()
+    return {str(t).strip().lower() for t in arr if t and str(t).strip()}
+
+
+def _side_compatible(observed: set, allowed: set) -> bool:
+    """Is the OBSERVED entity-type set on one slot compatible with a candidate seed's ALLOWED types?
+      • allowed contains 'any'  → unconstrained side, auto-pass (does NOT validate anything).
+      • else                    → observed must be NON-EMPTY and EVERY observed type must be allowed.
+    Fail-closed by construction: an empty/unknown observed set on a CONSTRAINED side returns False."""
+    if "any" in allowed:
+        return True
+    if not observed:
+        return False
+    return observed.issubset(allowed)
+
+
+def _seed_is_discriminating(head_allowed: set, tail_allowed: set) -> bool:
+    """A seed is a valid convergence TARGET only if at least one slot carries a CONCRETE type
+    constraint (a type other than the 'any' wildcard). A fully-unconstrained ('ANY','ANY') seed —
+    e.g. the loose ``related_to`` catch-all — provides NO type rail to validate against, so converging
+    onto it would launder a specific lifted verb into a generic link. Excluding it is the type rail
+    doing its job WITHOUT a literal rel-name check (subject-agnostic)."""
+    concrete_head = head_allowed - {"any"}
+    concrete_tail = tail_allowed - {"any"}
+    return bool(concrete_head or concrete_tail)
+
+
+def _observed_entity_types(db_conn, rel_type: str, which: str) -> set:
+    """Resolve the DISTINCT entity types actually observed on the LIVE facts of ``rel_type`` for the
+    subject (which='subject') or object (which='object') slot, per-tenant (search_path bound by the
+    caller). Joins facts+staged_facts → entities.entity_type; drops NULL/'unknown' (unresolved). A
+    scalar object_id (a literal value, never registered as an entity) simply does not join, so a
+    scalar-tail rel yields an EMPTY object set → fail-closed (never converged). Fail-safe → empty set."""
+    col = "subject_id" if which == "subject" else "object_id"
+    types: set = set()
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT e.entity_type"
+                f"  FROM facts f JOIN entities e ON e.id = f.{col}"
+                f" WHERE f.rel_type = %s AND f.superseded_at IS NULL AND f.archived_at IS NULL"
+                f" UNION"
+                f" SELECT DISTINCT e.entity_type"
+                f"  FROM staged_facts sf JOIN entities e ON e.id = sf.{col}"
+                f" WHERE sf.rel_type = %s",
+                (rel_type, rel_type),
+            )
+            for (et,) in cur.fetchall():
+                _et = (et or "").strip().lower()
+                if _et and _et != "unknown":
+                    types.add(_et)
+    except Exception as e:
+        log.debug(f"re_embedder.synonym_conv_observed_types_failed rel={rel_type} slot={which}: {str(e)[:120]}")
+        return set()
+    return types
+
+
+def _llm_propose_equivalence(
+    novel_rel: str,
+    novel_nl: str,
+    subj_types: set,
+    obj_types: set,
+    candidates: dict,
+    qwen_api_url: str,
+) -> dict:
+    """GATE 2 — the LLM PROPOSES (never decides) whether ``novel_rel`` is DEFINITIONALLY THE SAME
+    relation as ONE of the already type-compatible ``candidates`` (a strict bidirectional synonym —
+    "X novel Y" is true IFF "X candidate Y" is true), NOT merely related/narrower/broader. Bounded,
+    low-token, existing LLM stack (LLMTimeouts — no hardcoded timeout). Returns the parsed dict or {}.
+    Fail-safe: any error / no valid JSON → {} (caller leaves the rel novel)."""
+    _cand_lines = "\n".join(
+        f'  - {pk}: {(meta.get("nl") or pk.replace("_", " "))}'
+        + (" (symmetric)" if meta.get("is_symmetric") else "")
+        for pk, meta in candidates.items()
+    )
+    _readable = (novel_rel or "").replace("_", " ")
+    prompt = f"""{_FAULTLINE_INTERNAL_PREFIX} You are an ontology EQUIVALENCE checker.
+
+A novel relation was observed in data:
+  relation: "{novel_rel}"  (reads: "X {_readable} Y")
+  {("meaning: " + novel_nl) if novel_nl else ""}
+  subject entity types: {sorted(subj_types) or "unknown"}
+  object entity types:  {sorted(obj_types) or "unknown"}
+
+Candidate STANDARD relations (all already type-compatible):
+{_cand_lines}
+
+Pick AT MOST ONE candidate that is DEFINITIONALLY THE SAME relation as the novel one — i.e.
+"X {_readable} Y" is TRUE if and only if "X <candidate> Y" is TRUE (a strict, bidirectional
+synonym / redundancy, interchangeable in BOTH directions). Do NOT pick a candidate that is merely
+RELATED, a SUB-TYPE, a SUPER-TYPE, a CONSEQUENCE, or only sometimes true. If unsure → answer null.
+
+Respond with ONLY valid JSON (no markdown):
+{{"equivalent_to": "<one candidate rel_type exactly, or null>", "confidence": 0.0-1.0, "reason": "<short>"}}"""
+    try:
+        result = call_llm_with_retry_sync(
+            messages=[{"role": "user", "content": prompt}],
+            model=LLMModels.get("ENRICHMENT"),
+            user_id="re_embedder",
+            timeout=LLMTimeouts.get("ENRICHMENT"),
+            operation="ENRICHMENT",
+        )
+        if isinstance(result, dict):
+            return result
+    except Exception as e:
+        log.debug(f"re_embedder.synonym_conv_llm_failed rel={novel_rel}: {type(e).__name__}: {str(e)[:120]}")
+    return {}
+
+
+def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: str = None) -> dict:
+    """DETERMINISTIC-GATED synonym convergence for LIFTED novel rels the morphology-fold MISSED.
+
+    Companion to ``drain_pending_placement_by_morphology``. The morphology drain folds a novel rel onto
+    a seed when their NORMALIZED FORMS match (``live_in`` → ``lives_in``). A novel rel that is a
+    SEMANTIC synonym of a seeded rel but NOT a morphological one (``marry`` → ``spouse``, ``adopt`` →
+    ``has_pet``) falls through it — this pass catches that class, behind three FAIL-CLOSED gates run
+    IN ORDER (any gate fails → LEAVE IT NOVEL, never converge):
+
+      GATE 1 — DETERMINISTIC TYPE-CONSTRAINT MATCH (no LLM, runs first):
+        Resolve the novel rel's OBSERVED subject/object entity types from its LIVE facts, then keep
+        only SEEDED candidate rels whose head_types/tail_types are (a) DISCRIMINATING (not the ANY/ANY
+        catch-all) and (b) compatible with the observed types. ``affect(cve, product)`` → ``located_in``
+        dies HERE (product is not a Location) with NO LLM. Unresolvable types → fail-closed (empty
+        candidate set → leave novel).
+
+      GATE 2 — EQUIVALENCE, not similarity (LLM PROPOSES ONLY, tightly bounded):
+        Only over the small type-compatible set, one bounded LLM call proposes STRICT bidirectional
+        equivalence; the answer must resolve BY IDENTITY (canonical resolver) to a candidate PK and
+        clear a confidence floor. "Related but distinct"/null/ambiguous → no convergence.
+
+      GATE 3 — STRUCTURAL SANITY before the (non-destructive) write:
+        Hierarchy parity (graph↔graph, hierarchy↔hierarchy) and symmetry compatibility (never drop a
+        symmetric novel rel's reverse edge onto an asymmetric seed). On pass, mirror the morphology
+        drain EXACTLY: adopt the seed's category, join the seed's taxonomies, then
+        ``record_alias(novel → seed, source='engine')`` — a REVERSIBLE alias row (the same
+        ``rel_type_aliases`` synonym table morphology uses; existing facts convert at read time via
+        ``_get_canonical_rel_type``, which is alias-first, so they read back AS the seed). Stored facts
+        are NOT rewritten/destroyed.
+
+    A non-converging rel that REACHED the LLM gate is memoized (ontology_evaluations,
+    method='synonym_convergence', decision='left_novel') so it is not re-sent to the LLM each cycle.
+    Bias: FALSE-NEGATIVE (leave novel) is always preferred over a FALSE-POSITIVE tenant-wide corruption.
+
+    Per-tenant (caller bound search_path, NO public); deterministic gates own the decision; fail-safe
+    per rel (savepoint) and per pass. Returns {"converged": int, "scanned": int, "left_novel": int,
+    "errors": int}.
+    """
+    stats = {"converged": 0, "scanned": 0, "left_novel": 0, "errors": 0}
+    if not _ENGINE_SYNONYM_CONVERGENCE:
+        return stats
+
+    try:
+        from src.ontology.canonical import (
+            resolve_seeded_by_morphology as _resolve_seeded_morph,
+            resolve_canonical as _resolve_canonical,
+            record_alias as _record_alias,
+            reset_caches as _reset_canon_caches,
+            normalize_rel as _normalize_rel,
+            _SEEDED_SOURCES,
+        )
+    except Exception as e:
+        log.error(f"re_embedder.synonym_conv_import_failed: {e}")
+        return stats
+
+    # 0. Candidate NOVEL rels: NOT seeded, and either quarantined pending OR engine-generated.
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT rel_type, is_symmetric, is_hierarchy_rel, natural_language, category"
+                "  FROM rel_types"
+                " WHERE lower(COALESCE(source, '')) NOT IN %s"
+                "   AND (category = %s OR engine_generated = true)",
+                (tuple(_SEEDED_SOURCES), _CATEGORY_PENDING_RE),
+            )
+            novel_rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.synonym_conv_fetch_failed schema={schema_name}: {str(e)[:160]}")
+        return stats
+
+    if not novel_rows:
+        return stats
+
+    # SEEDED candidate universe (with metadata) — fetched once per pass.
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT rel_type, head_types, tail_types, is_symmetric, is_hierarchy_rel,"
+                "       inverse_rel_type, natural_language, category"
+                "  FROM rel_types WHERE lower(COALESCE(source, '')) IN %s",
+                (tuple(_SEEDED_SOURCES),),
+            )
+            seeded_rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.synonym_conv_seed_fetch_failed schema={schema_name}: {str(e)[:160]}")
+        return stats
+
+    seeded = {}
+    for (pk, ht, tt, sym, hier, inv, nl, cat) in seeded_rows:
+        _pk = (pk or "").strip().lower()
+        if not _pk:
+            continue
+        seeded[_pk] = {
+            "head": _type_set(ht),
+            "tail": _type_set(tt),
+            "is_symmetric": bool(sym),
+            "is_hierarchy": bool(hier),
+            "inverse": (inv or "").strip().lower() or None,
+            "nl": nl or "",
+            "category": (cat or "").strip().lower() or None,
+        }
+
+    llm_budget = _synonym_conv_batch()
+    min_conf = _synonym_conv_min_conf()
+
+    for (rel, novel_sym, novel_hier, novel_nl, novel_cat) in novel_rows:
+        _rel = (rel or "").strip().lower()
+        if not _rel:
+            continue
+        stats["scanned"] += 1
+        try:
+            # Skip if the morphology-fold OWNS it (the drain will/does converge it).
+            if _resolve_seeded_morph(_rel, dsn, schema_name):
+                continue
+            # Skip if it is ALREADY aliased (converged on a prior cycle) OR memoized as left-novel.
+            with db_conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM rel_type_aliases WHERE alias = %s", (_rel,))
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    "SELECT 1 FROM ontology_evaluations"
+                    " WHERE candidate_rel_type = %s AND extraction_method = %s"
+                    "   AND re_embedder_decision = 'left_novel'",
+                    (_rel, _SYNONYM_CONV_METHOD),
+                )
+                if cur.fetchone():
+                    continue
+
+            # ── GATE 1 (deterministic) — observed types + type-compatible discriminating seeds ──
+            subj_types = _observed_entity_types(db_conn, _rel, "subject")
+            obj_types = _observed_entity_types(db_conn, _rel, "object")
+            if not subj_types or not obj_types:
+                # No resolvable observed types on one/both slots → fail-closed, leave novel.
+                continue
+
+            candidates = {}
+            for pk, meta in seeded.items():
+                if pk == _rel:
+                    continue
+                if bool(novel_hier) != meta["is_hierarchy"]:
+                    continue  # never collapse a graph rel onto a classification rel (or vice-versa)
+                if not _seed_is_discriminating(meta["head"], meta["tail"]):
+                    continue  # ANY/ANY catch-all (e.g. related_to) — no type rail → excluded
+                if not _side_compatible(subj_types, meta["head"]):
+                    continue
+                if not _side_compatible(obj_types, meta["tail"]):
+                    continue
+                candidates[pk] = meta
+
+            if not candidates:
+                # Gate 1 killed every candidate deterministically (the affect→located_in class).
+                log.info(
+                    f"re_embedder.synonym_conv_type_reject schema={schema_name} rel={_rel} "
+                    f"subj={sorted(subj_types)} obj={sorted(obj_types)} candidates=0 (Gate1)"
+                )
+                continue
+
+            if llm_budget <= 0:
+                continue  # per-cycle LLM bound reached — retry next cycle
+            llm_budget -= 1
+
+            # ── GATE 2 (LLM proposes, deterministic accept) ──
+            proposal = _llm_propose_equivalence(
+                _rel, novel_nl or "", subj_types, obj_types, candidates, qwen_api_url
+            )
+            _ans = (proposal.get("equivalent_to") if isinstance(proposal, dict) else None)
+            _ans = (_ans or "").strip().lower() if isinstance(_ans, str) else ""
+            try:
+                _conf = float(proposal.get("confidence", 0.0)) if isinstance(proposal, dict) else 0.0
+            except (TypeError, ValueError):
+                _conf = 0.0
+
+            # Resolve the proposal BY IDENTITY to a candidate PK (reuse the canonical resolver).
+            target = None
+            if _ans and _ans not in ("null", "none"):
+                if _ans in candidates:
+                    target = _ans
+                else:
+                    _n = _normalize_rel(_ans)
+                    if _n in candidates:
+                        target = _n
+                    else:
+                        try:
+                            _rc = (_resolve_canonical(_ans, dsn, schema_name) or {}).get("canonical")
+                            if _rc in candidates:
+                                target = _rc
+                        except Exception:
+                            target = None
+
+            if not target or _conf < min_conf:
+                # Reached the LLM and did NOT converge → memo so we don't re-LLM every cycle.
+                stats["left_novel"] += 1
+                _reason = (
+                    f"no strict-equivalence match (ans={_ans!r} conf={_conf:.2f} "
+                    f"floor={min_conf:.2f} candidates={sorted(candidates)})"
+                )
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO ontology_evaluations"
+                            "  (candidate_rel_type, extraction_method, sample_subject_id, sample_object,"
+                            "   occurrence_count, last_seen_at, re_embedder_decision, decision_reason,"
+                            "   decision_timestamp)"
+                            " VALUES (%s, %s, %s, %s, 1, now(), 'left_novel', %s, now())"
+                            " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                            " DO UPDATE SET last_seen_at = now(),"
+                            "   re_embedder_decision = 'left_novel',"
+                            "   decision_reason = EXCLUDED.decision_reason",
+                            (_rel, _SYNONYM_CONV_METHOD, _SYNONYM_CONV_MEMO_SUBJ,
+                             _SYNONYM_CONV_MEMO_OBJ, _reason[:500]),
+                        )
+                    db_conn.commit()
+                except Exception:
+                    try:
+                        db_conn.rollback()
+                        with db_conn.cursor() as _spc:
+                            _spc.execute(f"SET search_path TO {schema_name}")
+                    except Exception:
+                        pass
+                log.info(
+                    f"re_embedder.synonym_conv_left_novel schema={schema_name} rel={_rel} "
+                    f"ans={_ans!r} conf={_conf:.2f} floor={min_conf:.2f}"
+                )
+                continue
+
+            tgt_meta = candidates[target]
+
+            # ── GATE 3 (structural sanity) ──
+            if bool(novel_hier) != tgt_meta["is_hierarchy"]:
+                stats["left_novel"] += 1
+                continue
+            # Never collapse a SYMMETRIC novel usage onto an ASYMMETRIC seed (would silently drop the
+            # reverse edge). Adopting a seed's OWN symmetry (asymmetric novel → symmetric seed) is fine
+            # — the alias inherits the seed's metadata at read time.
+            if bool(novel_sym) and not tgt_meta["is_symmetric"]:
+                stats["left_novel"] += 1
+                log.info(
+                    f"re_embedder.synonym_conv_symmetry_reject schema={schema_name} "
+                    f"rel={_rel} target={target} (symmetric novel → asymmetric seed)"
+                )
+                continue
+
+            # ── WRITE (mirror the morphology drain: category adopt → taxonomy join → alias) ──
+            with db_conn.cursor() as cur:
+                cur.execute("SAVEPOINT sp_synonym_conv")
+                try:
+                    if tgt_meta["category"] and tgt_meta["category"] != _CATEGORY_PENDING_RE:
+                        cur.execute(
+                            "UPDATE rel_types SET category = %s"
+                            " WHERE rel_type = %s AND category = %s",
+                            (tgt_meta["category"], _rel, _CATEGORY_PENDING_RE),
+                        )
+                    cur.execute(
+                        "UPDATE entity_taxonomies"
+                        " SET rel_types_defining_group ="
+                        "     array_append(rel_types_defining_group, %s)"
+                        " WHERE (rel_types_defining_group @> ARRAY[%s]::TEXT[])"
+                        "   AND NOT (rel_types_defining_group @> ARRAY[%s]::TEXT[])",
+                        (_rel, target, _rel),
+                    )
+                    cur.execute("RELEASE SAVEPOINT sp_synonym_conv")
+                except Exception as _inner:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_synonym_conv")
+                    stats["errors"] += 1
+                    log.error(
+                        f"re_embedder.synonym_conv_write_failed rel={_rel} target={target} "
+                        f"schema={schema_name}: {str(_inner)[:160]}"
+                    )
+                    continue
+
+            # record_alias commits on its own connection (canonical.py); same-direction equivalence
+            # (Gate-2 slot order) → requires_inversion=False. Non-destructive + reversible.
+            try:
+                _record_alias(_rel, target, False, "engine", dsn, schema_name)
+            except Exception as _ae:
+                log.warning(
+                    f"re_embedder.synonym_conv_alias_failed rel={_rel} target={target}: {str(_ae)[:120]}"
+                )
+
+            db_conn.commit()
+            stats["converged"] += 1
+            log.info(
+                f"re_embedder.synonym_converged schema={schema_name} rel={_rel} -> {target} "
+                f"conf={_conf:.2f} subj={sorted(subj_types)} obj={sorted(obj_types)} "
+                f"symmetric={tgt_meta['is_symmetric']} category={tgt_meta['category']}"
+            )
+        except Exception as e:
+            try:
+                db_conn.rollback()
+                with db_conn.cursor() as _spc:
+                    _spc.execute(f"SET search_path TO {schema_name}")
+            except Exception:
+                pass
+            stats["errors"] += 1
+            log.error(
+                f"re_embedder.synonym_conv_error rel={_rel} schema={schema_name}: {str(e)[:160]}"
+            )
+
+    # Invalidate the in-process canonical/alias cache so the new alias rows are visible to the next
+    # in-flow resolve without a restart. The caller marks the schema changed so the BACKEND overlay
+    # (separate process) is refreshed via /internal/refresh-intent-pattern-caches (mirrors the drain).
+    if stats["converged"] > 0:
         try:
             _reset_canon_caches(schema_name)
         except Exception:
@@ -7334,6 +8086,10 @@ def main():
                 # so has_pending_ontology_work() returned False and the loop was permanently
                 # severed. We iterate ready_schemas on dedicated per-user connections.
                 _approved_any = False
+                # Synonym-convergence writes a rel_type_aliases row (cross-process invisible until the
+                # backend overlay is refreshed) — track it separately so the refresh POST fires even
+                # when NO ontology approval / head-tail sweep happened this cycle.
+                _converged_any = False
                 _sweep_updated_total = 0
                 # Per-tenant overlay coordination: collect the schemas whose rel_types
                 # actually changed so the refresh endpoint invalidates ONLY those
@@ -7391,6 +8147,35 @@ def main():
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.pending_placement_drain_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+
+                            # ── ENGINE SYNONYM CONVERGENCE (deterministic-gated, per-user schema) ──
+                            # Companion to the morphology drain above: converge a LIFTED novel rel that
+                            # is a SEMANTIC synonym of a SEEDED rel the morphology-fold could NOT see
+                            # (marry→spouse, adopt→has_pet) onto that seed, behind three FAIL-CLOSED
+                            # gates (Gate 1 deterministic type-constraint match kills the fuzzy-coercion
+                            # class WITHOUT the LLM; Gate 2 LLM proposes STRICT equivalence only; Gate 3
+                            # structural sanity), then mirror the drain's alias + category + taxonomy
+                            # write. Bias FALSE-NEGATIVE over FALSE-POSITIVE. Self-isolating (failure
+                            # never crashes the tenant sweep). Touches rel_types/entity_taxonomies +
+                            # writes a rel_type_aliases row → mark the schema changed AND flip
+                            # _converged_any so the cross-process overlay refresh fires.
+                            try:
+                                if _ENGINE_SYNONYM_CONVERGENCE:
+                                    _synconv = converge_lifted_synonyms(
+                                        _ont_db, postgres_dsn, _schema, qwen_api_url)
+                                    if _synconv.get("converged", 0) > 0:
+                                        log.info(
+                                            f"re_embedder.synonym_convergence schema={_schema} "
+                                            f"converged={_synconv['converged']} "
+                                            f"scanned={_synconv['scanned']} "
+                                            f"left_novel={_synconv['left_novel']} "
+                                            f"errors={_synconv['errors']}"
+                                        )
+                                        _converged_any = True
+                                        _changed_schemas.add(_schema)
+                            except Exception as e:
+                                _rollback_and_reapply_search_path(_ont_db, _schema)
+                                log.error(f"re_embedder.synonym_convergence_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
                             # ── MISS-PUSHBACK "what is X?" concept classify (per-user schema) ──
                             # SECONDARY strengthen for the ingest miss-pushback path: type+ground
@@ -7589,7 +8374,7 @@ def main():
                 # constraints live in the DB but are invisible to the backend uvicorn process
                 # (separate OS process) until it reloads _REL_TYPE_META. Trigger the cross-process
                 # refresh endpoint ONCE per cycle if anything changed across any user schema.
-                if _approved_any or _sweep_updated_total > 0:
+                if _approved_any or _converged_any or _sweep_updated_total > 0:
                     try:
                         # Pass the changed schemas so the backend invalidates ONLY those
                         # tenants' rel_type overlays (isolation; minimal rebuild). If the

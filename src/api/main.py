@@ -5412,6 +5412,165 @@ def _verb_lift_edges_for_spans(
     return out
 
 
+def _relabel_coerced_rels(
+    triples: list,
+    source_text: str,
+    schema_name: str | None,
+    seen_keys: set | None = None,
+) -> list:
+    """Deterministic verb-lift RELABEL post-pass for the LLM ``/extract/rewrite`` lane.
+
+    THE PROBLEM: the LLM names relations by picking from the SEEDED ``rel_types`` menu
+    (``_build_extraction_prompt``). A domain's characteristic predicate that has NO seeded rel
+    (a CVE *affects* a product, an enzyme *phosphorylates* a substrate, a case *overrules*
+    another) has nothing on the menu to pick, so the LLM SNAPS it to the nearest generic —
+    ``located_in`` / ``related_to``. That mislabels the cross-hierarchy edge (so "what CVEs
+    apply to <os>" can't walk) AND the genuinely-novel relation is never proposed for growth.
+    It also lets the LLM nominalize the verb into a junk ENTITY ("affect" instance_of concept).
+
+    THE FIX (subject-agnostic, deterministic — NO cosine, NO domain literals): for each LLM
+    edge whose subject AND object both appear verbatim in ``source_text``, lift the user's OWN
+    governing content verb between the pair (``predicate_span.lift_predicate`` with
+    ``content_verb_only`` — copula / auxiliary / light / naming heads are SKIPPED so the seeded
+    copula / possessive / scalar / naming seams keep their edges), then apply the FIT-GATE:
+
+      • lift is None (copula/light/naming/scalar-tail/…)  → leave the LLM edge (a seam owns it).
+      • lifted == the LLM's rel                           → agreement — leave it.
+      • lifted resolves BY IDENTITY to a seeded/tenant rel (``resolve_canonical.canonical`` set)
+                                                          → a seeded rel genuinely fits → leave
+                                                             the LLM edge (do NOT over-lift).
+      • lifted is genuinely NOVEL (canonical None) AND differs from the LLM's rel
+                                                          → the LLM COERCED a novel predicate to
+                                                             a generic → REPLACE the rel_type with
+                                                             the lifted user-verb token. It then
+                                                             flows through the EXISTING growth
+                                                             path at /ingest (novel rel → Class C
+                                                             + ontology_evaluations, category
+                                                             ``pending_placement``) — NOT a
+                                                             parallel mechanism.
+
+    JUNK-ENTITY KILL: once a verb is lifted as a rel, any OTHER edge whose subject/object IS
+    that verb's lemma (the LLM nominalized "affects" → entity "affect") is DROPPED — a lifted
+    verb is a RELATION, never an L4 node (THE HARD LINE).
+
+    Guardrail rationale: first-person / user-anchored SEEDED constructions ("my mother is X" →
+    parent_of, "I live in X" → lives_in, "I have a dog" → has_pet, "my favorite color is X" →
+    favorite_color) are left untouched — their subject renders as "user" (absent from the source
+    surface → lift bails) and/or their governing verb is a copula/light verb (content-verb-only
+    bails) and/or resolves to a seeded rel (fit-gate bails). Verb-lift is the FALLBACK for a
+    genuinely-novel predicate, never a replacement for the seeded ontology.
+
+    Mutates the rel_type of coerced edges in ``triples`` in place, keeps ``seen_keys`` in sync,
+    drops junk verb-as-entity edges, and returns the (possibly filtered) list. Fail-safe: any
+    error leaves today's behavior (the original ``triples`` untouched).
+    """
+    if not triples or not source_text:
+        return triples
+    try:
+        from src.extraction import predicate_span
+        from src.ontology import canonical
+    except Exception as e:  # import problem → leave triples as-is
+        log.debug("relabel_coerced.import_failed", error=str(e)[:120])
+        return triples
+
+    if seen_keys is None:
+        seen_keys = set()
+    _dsn = os.environ.get("POSTGRES_DSN")
+    _scalar_rels = _SCALAR_REL_TYPES_CACHE or set()
+    lifted_lemmas: set[str] = set()
+    relabeled = 0
+
+    for _t in triples:
+        if not isinstance(_t, dict):
+            continue
+        _s = (_t.get("subject") or "").strip()
+        _o = (_t.get("object") or "").strip()
+        _rel = (_t.get("rel_type") or "").strip().lower()
+        if not (_s and _o and _rel):
+            continue
+        # Skip scalar edges (value objects) — those route to entity_attributes, never a verb-rel.
+        if _rel in _scalar_rels or (_t.get("object_type") or "").strip().upper() == "SCALAR":
+            continue
+        # Lift the user's OWN governing content verb between this pair from the source.
+        try:
+            _lifted = predicate_span.lift_predicate(
+                source_text, _s, _o, content_verb_only=True)
+        except Exception as _le:
+            log.debug("relabel_coerced.lift_error", error=str(_le)[:120])
+            continue
+        if not _lifted or _lifted == _rel:
+            continue  # copula/light/naming/no-verb, or already agrees with the LLM
+        # FIT-GATE: does the user's verb resolve to a seeded/tenant rel? If so a seeded rel
+        # genuinely fits → do NOT over-lift; keep the LLM edge. Only a GENUINELY NOVEL verb is a
+        # coercion we correct. Two deterministic resolvers (NO cosine): (1) resolve_canonical —
+        # RUNG-2 exact PK / RUNG-3 alias; (2) resolve_seeded_by_morphology — normalized-form fold
+        # onto a SEEDED rel (so the lifted "live_in" folds onto seeded "lives_in" and is NOT
+        # lifted). Either hit ⇒ a seeded rel fits ⇒ leave the LLM/seam edge.
+        _canonical = None
+        if schema_name:
+            try:
+                _res = canonical.resolve_canonical(_lifted, dsn=_dsn, schema=schema_name)
+                _canonical = _res.get("canonical")
+                if not _canonical:
+                    _canonical = canonical.resolve_seeded_by_morphology(
+                        _lifted, dsn=_dsn, schema=schema_name)
+            except Exception as _ce:
+                log.debug("relabel_coerced.resolve_error", error=str(_ce)[:120])
+                _canonical = None
+        if _canonical:
+            continue  # the user's verb IS a known rel — the LLM/seam edge stands
+        # Genuinely novel predicate the LLM coerced → REPLACE with the user's verb-rel.
+        _old_key = (_s.lower(), _rel, _o.lower())
+        seen_keys.discard(_old_key)
+        _t["rel_type"] = _lifted
+        seen_keys.add((_s.lower(), _lifted, _o.lower()))
+        lifted_lemmas.add(canonical._lemmatize(_lifted))
+        relabeled += 1
+        log.info("extract_rewrite.rel_relabeled_to_user_verb",
+                 subject=_s[:48], object=_o[:48],
+                 coerced_rel=_rel, lifted_rel=_lifted, schema=(schema_name or "")[:24])
+
+    if not relabeled:
+        return triples
+
+    # JUNK-ENTITY KILL + final dedup: drop any edge whose subject/object is a lifted verb's lemma
+    # (LLM nominalized the verb into an entity), and collapse duplicate (subject, rel, object).
+    _out: list = []
+    _seen_final: set = set()
+    for _t in triples:
+        if not isinstance(_t, dict):
+            _out.append(_t)
+            continue
+        _s = (_t.get("subject") or "").strip().lower()
+        _o = (_t.get("object") or "").strip().lower()
+        _rel = (_t.get("rel_type") or "").strip().lower()
+        # A single-token subject/object that lemmatizes to a lifted verb is the verb-as-entity
+        # leak — but never drop the lifted edge itself (its subject/object are the real entities).
+        _is_junk = False
+        for _side in (_s, _o):
+            if _side and " " not in _side:
+                try:
+                    if canonical._lemmatize(_side) in lifted_lemmas and _rel not in lifted_lemmas:
+                        _is_junk = True
+                        break
+                except Exception:
+                    pass
+        if _is_junk:
+            log.info("extract_rewrite.dropped_verb_as_entity",
+                     subject=_s[:48], rel=_rel, object=_o[:48])
+            continue
+        _dk = (_s, _rel, _o)
+        if _dk in _seen_final:
+            continue
+        _seen_final.add(_dk)
+        _out.append(_t)
+
+    log.info("extract_rewrite.relabel_pass_complete",
+             relabeled=relabeled, kept=len(_out),
+             dropped=len(triples) - len(_out), schema=(schema_name or "")[:24])
+    return _out
+
+
 def _build_rel_type_meta(dsn: str, schema_name: str | None = None) -> dict:
     """Load rel_types metadata as public seed ∪ (optional) tenant schema overlay.
 
@@ -18064,6 +18223,28 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             except Exception as e:
                 log.warning("extract_rewrite.trigger_span_pass_failed",
                             user_id=req.user_id, error=str(e))
+
+        # === VERB-LIFT RELABEL POST-PASS (coerced novel predicate → user's own verb) ===
+        # The LLM picks relations from the SEEDED menu, so a domain predicate with no seeded rel
+        # ("CVE affects Exchange") SNAPS to a generic (located_in/related_to) instead of GROWING.
+        # This deterministic post-pass reparses the source, lifts the user's OWN governing content
+        # verb for each edge's S→O pair, and — only when that verb is GENUINELY NOVEL (no seeded
+        # rel resolves by identity) and differs from the LLM's coerced rel — REPLACES the coerced
+        # rel with the lifted verb (routes to growth / pending_placement via /ingest) and kills the
+        # verb-as-entity leak. Seeded rels still win (fit-gate); fail-safe → today's behavior.
+        # Flag VERB_LIFT_RELABEL (default on) is the kill switch.
+        if os.getenv("VERB_LIFT_RELABEL", "true").lower() not in ("0", "false", "no"):
+            try:
+                from src.provisioning.schema_manager import (
+                    derive_user_slug_from_uuid as _dvs_rl)
+                _rl_schema = (
+                    f"faultline_{_dvs_rl(user_id)}"
+                    if user_id and user_id != "anonymous" else None)
+                triples = _relabel_coerced_rels(
+                    triples, _reframe_text or req.text or "", _rl_schema, seen_keys)
+            except Exception as _rle:
+                log.warning("extract_rewrite.relabel_pass_failed",
+                            user_id=req.user_id, error=str(_rle)[:120])
 
         # LLM-extracted triples are llm_inferred — the LLM parsed them from conversation,
         # they are NOT direct user statements. Validation gates apply normally.
