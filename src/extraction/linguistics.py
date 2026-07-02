@@ -3352,9 +3352,33 @@ def _collect_eventive_heads(tok, text: str) -> list:
     heads: list = []
     seen: set = set()
 
+    def _is_quantity_unit_head(_g) -> bool:
+        # A "<num> <unit> of <substance>" partitive ("500 milligrams of metformin") is a QUANTITY,
+        # NOT an eventive occurrence — the UNIT noun bearing a NUM nummod (DIGIT-gated) + an "of"-PP
+        # naming the substance is owned by the deriver's quantity-of scalar chain (which grounds the
+        # SUBSTANCE relationally). Emitting participated_in(user, <unit>) here re-introduces the exact
+        # mangle the quantity chain fixes. Structural (nummod digit + "of" prep with a NOUN/PROPN
+        # pobj), subject-agnostic, NO unit/domain word-list. Fail-safe → not a quantity.
+        try:
+            if _g is None or _g.pos_ not in ("NOUN", "PROPN"):
+                return False
+            if not any(c.dep_ == "nummod" and c.pos_ == "NUM"
+                       and any(ch.isdigit() for ch in (c.text or "")) for c in _g.children):
+                return False
+            for c in _g.children:
+                if c.dep_ == "prep" and (c.text or "").strip().lower() == "of" \
+                        and any(gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN")
+                                for gc in c.children):
+                    return True
+        except Exception:  # noqa: BLE001 — fail-safe
+            return False
+        return False
+
     def _add(_g):
         if _g is None or _g.i in seen:
             return
+        if _is_quantity_unit_head(_g):
+            return  # a "<num> <unit> of <substance>" quantity — the deriver's scalar chain owns it
         seen.add(_g.i)
         heads.append(_g)
 
@@ -5307,6 +5331,105 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     except Exception:  # noqa: BLE001 — fail-safe: has-measure detection is best-effort
         _has_measure_binds, _has_measure_suppress = [], set()
 
+    # ── QUANTITY-OF-SUBSTANCE PRE-PASS (SCALAR "<num> <unit> [of <substance>]") ────────────────────
+    # "I take 500 milligrams of metformin", "my NAS has 40 terabytes of storage", "humans have 23
+    # pairs of chromosomes", "the server has 64 gigabytes of RAM", "lisinopril 10 milligrams" — a
+    # UNIT/COUNT noun carrying a NUM nummod (DIGIT-gated) is NEVER a relationship object: the
+    # number+unit is a SCALAR VALUE and the of-noun (or the appositive head) names the SUBSTANCE /
+    # attribute. Without this the SVO / appositive chains bind the UNIT as the object and DROP BOTH the
+    # number and the substance (live DB: ``take(user, milligrams)`` — 500 + metformin gone;
+    # ``owns(humans, pairs)`` — 23 + chromosomes gone). Companion to the has-measure pre-pass, which
+    # owns the INVERSE shape "has a score OF 9.8" (the DIGIT is the of-object); HERE the digit is a
+    # nummod ON the unit noun and the of-object is the (non-digit) substance — the two never collide.
+    # THREE grammatical readings, routed by the governing verb (grammar, not a domain word list):
+    #   • POSSESSION ("have" dobj / "with" pobj + "of <noun>") → the of-noun NAMES the attribute; the
+    #     SCALAR "<num> <unit>" attaches to the SUBJECT ("server has 64 gigabytes of RAM" → ram=
+    #     "64 gigabytes"; "humans have 23 pairs of chromosomes" → chromosomes="23 pairs").
+    #   • CONTENT verb ("take"/"contains" + "of <substance>") → the of-substance is the REAL OBJECT
+    #     (emitted relationally so it grounds as its own L4 entity: take(user, metformin)) and the
+    #     SCALAR "<num> <unit>" attaches to the SUBSTANCE. The attribute name is the unit's unit_scalar
+    #     cue-map value if the unit is known there, else a generic "quantity" (never dropped).
+    #   • APPOSITIVE ("<substance> <num> <unit>": "lisinopril 10 milligrams") → SCALAR on the head noun.
+    # DIGIT-gated (never fires without a numeral). Subject-agnostic — spaCy dependency shape + the DB
+    # unit_scalar map, NO drug/unit/domain literal. The suppress sets step the SVO/appositive twins
+    # aside (else the mangled UNIT-as-object edge is re-emitted). Fail-safe → no binds, legacy path.
+    _quantity_binds: list = []
+    _quantity_verb_suppress: set = set()
+    _quantity_appos_suppress: set = set()
+    try:
+        _POSSESSION_LIGHT = {"have"}  # grammatical stative-possession light verb (NOT a domain word)
+        for _u in doc:
+            if _u.pos_ not in ("NOUN", "PROPN"):
+                continue
+            # DIGIT-GATED unit/count noun: a NUM nummod child carrying an actual numeral.
+            _num = next((c for c in _u.children
+                         if c.dep_ == "nummod" and c.pos_ == "NUM"
+                         and any(ch.isdigit() for ch in (c.text or ""))), None)
+            if _num is None:
+                continue
+            # the of-PP substance/attribute, if any: "<unit> of <noun>".
+            _ofnoun = None
+            for _c in _u.children:
+                if _c.dep_ == "prep" and (_c.text or "").strip().lower() == "of":
+                    _ofnoun = next((g for g in _c.children
+                                    if g.dep_ == "pobj" and g.pos_ in ("NOUN", "PROPN")), None)
+                    if _ofnoun is not None:
+                        break
+            # VALUE span = "<num> … <unit>" sliced verbatim (keeps an intervening amod: "40 usable TB").
+            try:
+                _qval = (sentence[_num.idx:_u.idx + len(_u.text)] or "").strip()
+            except Exception:  # noqa: BLE001
+                _qval = f"{(_num.text or '').strip()} {(_u.text or '').strip()}".strip()
+            if not _qval:
+                continue
+            _dep = _u.dep_
+            # (A) UNIT as the dobj/obj of a verb → possession (have) vs content (any other verb).
+            if _dep in ("dobj", "obj") and _u.head is not None and _u.head.pos_ in ("VERB", "AUX"):
+                _v = _u.head
+                if _v.i in _ni_suppress or _v.i in _has_measure_suppress:
+                    continue
+                if _ofnoun is None:
+                    continue  # a bare count ("3 cats", "23 chromosomes") — SVO/possessive own it
+                _vlemma = (_v.lemma_ or "").strip().lower()
+                _sj = next((c for c in _v.children if c.dep_ in ("nsubj", "nsubjpass")), None) \
+                    or _carried_subject_token(_v)
+                if _sj is None:
+                    continue
+                if _vlemma in _POSSESSION_LIGHT:
+                    _quantity_binds.append({"mode": "possession", "subj": _sj, "attr_tok": _ofnoun,
+                                            "value": _qval, "unit": _u, "num": _num, "verb": _v})
+                else:
+                    _quantity_binds.append({"mode": "content", "subj": _sj, "substance": _ofnoun,
+                                            "value": _qval, "unit": _u, "num": _num, "verb": _v})
+                _quantity_verb_suppress.add(_v.i)
+            # (B) UNIT as the pobj of a prep ("comes WITH 40 terabytes of storage") → possession.
+            elif _dep == "pobj" and _u.head is not None and _u.head.dep_ == "prep":
+                if _ofnoun is None:
+                    continue
+                _gov = _u.head.head
+                _hops = 0
+                while _gov is not None and _gov.pos_ not in ("VERB", "AUX") and _hops < 6:
+                    if _gov.head is _gov:
+                        break
+                    _gov = _gov.head
+                    _hops += 1
+                if _gov is None or _gov.pos_ not in ("VERB", "AUX") or _gov.i in _ni_suppress:
+                    continue
+                _sj = next((c for c in _gov.children if c.dep_ in ("nsubj", "nsubjpass")), None) \
+                    or _carried_subject_token(_gov)
+                if _sj is None:
+                    continue
+                _quantity_binds.append({"mode": "possession", "subj": _sj, "attr_tok": _ofnoun,
+                                        "value": _qval, "unit": _u, "num": _num, "verb": _gov})
+                _quantity_verb_suppress.add(_gov.i)
+            # (C) UNIT as an appositive of a substance noun ("lisinopril 10 milligrams") → scalar on it.
+            elif _dep == "appos" and _u.head is not None and _u.head.pos_ in ("NOUN", "PROPN"):
+                _quantity_binds.append({"mode": "appos", "owner_tok": _u.head,
+                                        "value": _qval, "unit": _u, "num": _num, "verb": None})
+                _quantity_appos_suppress.add(_u.i)
+    except Exception:  # noqa: BLE001 — fail-safe: quantity detection is best-effort
+        _quantity_binds, _quantity_verb_suppress, _quantity_appos_suppress = [], set(), set()
+
     # ── CAPTURE CHAINS (gap-2 §10.1) ─────────────────────────────────────────────────────────────
     # The deriver is NOT a fixed sequence of capture rules. Each capture chain is a self-contained
     # match-condition + builder: it walks the parse and, wherever its GRAMMATICAL SHAPE (and/or a
@@ -5726,6 +5849,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the employment chain owns this verb ("work as … at …") — no SVO dup
             if tok.i in _has_measure_suppress:
                 continue  # the has-measure chain owns this verb ("has a score of 9.8") — scalar, no SVO
+            if tok.i in _quantity_verb_suppress:
+                continue  # the quantity-of chain owns this verb ("take 500 mg of metformin") — scalar
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -5820,6 +5945,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the named-instance nickname relcl ("who goes by Theo") — not a state
             if tok.i in _emp_suppress:
                 continue  # the employment chain owns this verb — never "(user, has_state, work)"
+            if tok.i in _quantity_verb_suppress:
+                continue  # the quantity-of chain owns this verb ("NAS has 40 TB of storage") — scalar
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -6893,6 +7020,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # ("a son Alex, a daughter …" parses daughter as appos of son: both are bound types).
             if tok.i in _ni_suppress or head.i in _ni_suppress:
                 continue
+            if tok.i in _quantity_appos_suppress:
+                continue  # "lisinopril 10 milligrams" — the quantity-of chain owns this measure appos
             role = _np_phrase(tok)
             named = (head.text or head.lemma_ or "").strip().lower()
             if not role or not named or role == named or len(role) < 2:
@@ -7388,6 +7517,63 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _emit(subject, mapped, value, subj_tok=subj_tok, obj_tok=num, scalar_datatype="string")
             _claim(adj, unit, num, described)
 
+    def _chain_quantity_of(doc):
+        # QUANTITY-OF-SUBSTANCE SCALAR — emits off the ``_quantity_binds`` pre-pass. The "<num> <unit>"
+        # is a SCALAR VALUE (scalar_datatype="string" → entity_attributes), NEVER a relationship object;
+        # in CONTENT mode the of-substance is ALSO grounded RELATIONALLY so it becomes its own L4 entity
+        # (typed by GLiNER2, queued for the what-is/climb classification). Subject-agnostic, digit-gated.
+        _units = _unit_scalar_map()
+
+        def _resolve_subject(_tok):
+            if _is_first_person_personal_pronoun(_tok):
+                return "user"
+            _s = (_tok.text or _tok.lemma_ or "").strip().lower()
+            _cr = _coref(_tok)
+            return _cr or _s
+
+        def _attr_for_unit(_unit_tok):
+            # the unit's unit_scalar cue-map value (grown per-tenant) if known, else generic "quantity".
+            _ul = (_unit_tok.lemma_ or _unit_tok.text or "").strip().lower()
+            _ut = (_unit_tok.text or "").strip().lower()
+            return _units.get(_ul) or _units.get(_ut) or "quantity"
+
+        for _b in _quantity_binds:
+            _mode = _b["mode"]
+            _value = _b["value"]
+            if _mode == "possession":
+                _subj_tok = _b["subj"]
+                _subject = _resolve_subject(_subj_tok)
+                _attr = _np_phrase(_b["attr_tok"])
+                if not _subject or not _attr:
+                    continue
+                _emit(_subject, _attr.replace(" ", "_"), _value,
+                      subj_tok=_subj_tok, obj_tok=None, scalar_datatype="string")
+                _claim(_b["attr_tok"], _b["unit"], _b["num"], _b["verb"])
+            elif _mode == "content":
+                _subj_tok = _b["subj"]
+                _subject = _resolve_subject(_subj_tok)
+                _subst_tok = _b["substance"]
+                _substance = _np_phrase(_subst_tok)
+                if not _subject or not _substance:
+                    continue
+                # the SUBSTANCE is the REAL object of the verb — grounded as its own entity.
+                _pred = (_b["verb"].lemma_ or _b["verb"].text or "").strip().lower()
+                if _pred:
+                    _emit(_subject, _pred, _substance, verb_tok=_b["verb"],
+                          obj_tok=_subst_tok, subj_tok=_subj_tok)
+                # the "<num> <unit>" dose/amount is a SCALAR on the SUBSTANCE.
+                _emit(_substance, _attr_for_unit(_b["unit"]), _value,
+                      subj_tok=_subst_tok, obj_tok=None, scalar_datatype="string")
+                _claim(_b["unit"], _b["num"])
+            elif _mode == "appos":
+                _owner_tok = _b["owner_tok"]
+                _owner = _resolve_subject(_owner_tok)
+                if not _owner:
+                    continue
+                _emit(_owner, _attr_for_unit(_b["unit"]), _value,
+                      subj_tok=_owner_tok, obj_tok=None, scalar_datatype="string")
+                _claim(_b["unit"], _b["num"])
+
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
     # "all the shapes the deriver knows", not "the order to try them in". Add a shape → add a chain.
@@ -7408,6 +7594,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_copula_measure, _chain_dash_specifier,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
          _chain_has_measure, _chain_measure_pp, _chain_attributive_measure,
+         _chain_quantity_of,
          _chain_geo_containment_list,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
