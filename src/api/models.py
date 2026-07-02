@@ -62,6 +62,7 @@ class IngestRequest(BaseModel):
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution during extraction
     is_correction: bool = False  # dBug-041: User correction flag — bypass blocklist validation
     idempotency_key: Optional[str] = None  # Phase 2: Deduplicate retried requests via idempotency cache
+    source_ref: Optional[str] = None  # Migration 128: citable provenance (URL/filename/title) from the ingest_document lane; NULL for conversational facts
 
 
 class EntityResult(BaseModel):
@@ -129,8 +130,25 @@ class StoreContextRequest(BaseModel):
 
 
 class StoreContextResponse(BaseModel):
-    status: str  # "stored" or "error"
-    point_id: str  # Qdrant point UUID
+    # "stored" | "disabled" | "deferred" (embed/Qdrant failed — text degraded to
+    # episodic_log, not yet vector-indexed) | "error"
+    status: str
+    point_id: str  # Qdrant point UUID ("" unless status == "stored")
+
+
+class EpisodicAppendRequest(BaseModel):
+    """Append one verbatim ingest input to the per-tenant episodic_log.
+
+    Durable, append-only raw-text safety net captured BEFORE extraction so that
+    short fragments, misrouted queries, and no-triple ramblings are never lost.
+    Purely additive — does NOT touch the WGM gate, class assignment, or query scope.
+    """
+    user_id: str
+    raw_text: str
+    source: str = "mcp"
+    source_ref: Optional[str] = None
+    intent: Optional[str] = None
+    extracted_fact_count: Optional[int] = None
 
 
 class LearnTopicRequest(BaseModel):

@@ -1,11 +1,19 @@
 import psycopg2
+import structlog
+
+log = structlog.get_logger()
+
+# Canonical fact_provenance values (see main.py provenance routing, ~line 10282).
+# Anything else is a caller bug — coerce to the weakest tier so a malformed
+# value can never masquerade as (or overwrite) user_stated.
+_CANONICAL_FACT_PROVENANCE = ("user_stated", "llm_inferred", "llm_learned")
 
 
 class FactStoreManager:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A", fact_provenance: str = "llm_inferred") -> int:
+    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A", fact_provenance: str = "llm_inferred", source_ref: str | None = None) -> int:
         """
         Insert edges into facts with temporal metadata.
         connections: list of tuples with varying length:
@@ -16,10 +24,25 @@ class FactStoreManager:
                      (with temporal: ...taxonomies, statement_date, valid_until, temporal_confidence) - 16 elements
         unified_confidence: blended confidence from LLMOutputValidator (frequency + llm_confidence).
                            Defaults to confidence if not provided.
+        source_ref: citable provenance (URL/filename/title) applied to EVERY row in this
+                    batch (migration 128) — a kwarg, NOT a tuple element, because the tuples
+                    are positionally unpacked at several call sites. None (default) leaves
+                    behavior byte-identical; ON CONFLICT never nulls an existing citation.
         Returns count of rows attempted. Rolls back and re-raises on psycopg2.Error.
         """
         if unified_confidence is None:
             unified_confidence = confidence
+        # Canonical-value guard: a non-canonical fact_provenance is a caller bug.
+        # Coerce to 'llm_inferred' (weakest reasonable tier) and log loudly —
+        # never let a malformed value reach the upgrade-only ON CONFLICT logic.
+        if fact_provenance not in _CANONICAL_FACT_PROVENANCE:
+            log.error(
+                "fact_store.non_canonical_fact_provenance",
+                fact_provenance=fact_provenance,
+                coerced_to="llm_inferred",
+                allowed=list(_CANONICAL_FACT_PROVENANCE),
+            )
+            fact_provenance = "llm_inferred"
         count = 0
         try:
             with self.db_conn.cursor() as cur:
@@ -71,8 +94,8 @@ class FactStoreManager:
 
                     cur.execute(
                         "INSERT INTO facts"
-                        " (subject_id, object_id, rel_type, provenance, confidence, unified_confidence, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, valid_from, valid_until, fact_class, fact_provenance)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " (subject_id, object_id, rel_type, provenance, confidence, unified_confidence, is_preferred_label, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, valid_from, valid_until, fact_class, fact_provenance, source_ref)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   fact_class = CASE"
@@ -90,8 +113,18 @@ class FactStoreManager:
                         "   taxonomies = COALESCE(EXCLUDED.taxonomies, facts.taxonomies),"
                         "   valid_from = COALESCE(EXCLUDED.valid_from, facts.valid_from),"
                         "   valid_until = COALESCE(EXCLUDED.valid_until, facts.valid_until),"
-                        "   fact_provenance = EXCLUDED.fact_provenance",
-                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class, fact_provenance),
+                        # CITABLE PROVENANCE (migration 128): a citation-less re-ingest never
+                        # nulls an existing citation; a new citation wins.
+                        "   source_ref = COALESCE(EXCLUDED.source_ref, facts.source_ref),"
+                        # UPGRADE-ONLY provenance: user_stated is a one-way door. A later
+                        # llm_inferred/llm_learned re-ingest of the same triple must NEVER
+                        # downgrade a fact the user personally stated (the fact_class CASE
+                        # above already keeps class A sticky; this keeps provenance sticky).
+                        "   fact_provenance = CASE"
+                        "       WHEN EXCLUDED.fact_provenance = 'user_stated' THEN 'user_stated'"
+                        "       ELSE facts.fact_provenance"
+                        "   END",
+                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class, fact_provenance, source_ref),
                     )
                     count += 1
             self.db_conn.commit()

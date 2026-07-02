@@ -45,6 +45,13 @@ class RememberRequest(BaseModel):
     user_id: str = ""
 
 
+class IngestDocumentRequest(BaseModel):
+    text: str = Field(..., description="The FULL text of the document, article, PDF extraction, or long-form note to store, copied VERBATIM — do NOT summarize, shorten, or pre-extract facts from it. FaultLine chunks and extracts everything itself; it needs the raw text. Required — never leave empty.")
+    source_ref: str = Field("", description="OPTIONAL: where this document came from — a URL, filename, or citation string (e.g. 'https://example.com/article', 'meeting-notes-2026-06.pdf'). Stored with every fact extracted from the document so recall can cite its source.")
+    title: str = Field("", description="OPTIONAL: the document's title. Used as the source reference when source_ref is not provided.")
+    user_id: str = ""
+
+
 class RetractRequest(BaseModel):
     text: str
     user_id: str = ""
@@ -273,6 +280,41 @@ async def rest_remember_facts(
              "committed": 0}
         )
     result = await _mcp.remember_facts_tool(text=body.text, user_id=user_id)
+    return JSONResponse(result)
+
+
+@app.post(
+    "/ingest_document",
+    summary="Store a document or long-form content into FaultLine knowledge graph",
+    description=(
+        "Store a document, article, PDF text, or long-form content in memory. Use when "
+        "the user shares or pastes a document, article, notes, or any multi-paragraph "
+        "body of text and wants it remembered — the whole text is chunked, retained "
+        "verbatim, and mined for facts automatically. Pass the FULL text verbatim as "
+        "`text`; do NOT summarize or pre-extract facts yourself. Provide `source_ref` "
+        "(URL/filename) or `title` when known so extracted facts carry a citation. "
+        "Not for conversational messages — use remember_facts for those."
+    ),
+)
+async def rest_ingest_document(
+    request: Request, body: IngestDocumentRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    _log(f"REST ingest_document user_id={user_id[:8]}... chars={len(body.text)} ref={body.source_ref!r}")
+    # Provisioning gate — wait out provisioning on the REST path so a fresh tenant's first
+    # document does not race the schema. Backend _ensure_tenant_ready is the authoritative guard.
+    if not await _mcp._ensure_provisioned(user_id):
+        return JSONResponse(
+            {"status": "provisioning",
+             "message": "Memory is being set up for you — please retry in a moment.",
+             "chunks": 0}
+        )
+    result = await _mcp.ingest_document_tool(
+        text=body.text,
+        user_id=user_id,
+        source_ref=body.source_ref,
+        title=body.title,
+    )
     return JSONResponse(result)
 
 
