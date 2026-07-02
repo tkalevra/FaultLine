@@ -27,7 +27,7 @@ from src.api import rel_type_overlay
 from src.api import taxonomy_overlay
 from src.api import temporal_pattern_overlay
 from src.api import linguistic_cue_overlay
-from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, ConversationMessage, QueryPath, QueryResponse
+from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, ConversationMessage, QueryPath, QueryResponse
 from .llm_client import get_llm_headers, build_llm_payload, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from .llm_calls import call_llm_with_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
 from .idempotency import IdempotencyManager
@@ -6711,6 +6711,7 @@ def _commit_staged(
     rows: list[tuple],
     fact_class: str,
     confidence: float,
+    source_ref: str | None = None,
 ) -> int:
     """
     Stage Class B facts (behavioral/contextual) for later promotion to facts table.
@@ -6723,6 +6724,11 @@ def _commit_staged(
 
     Input rows: list of (user_id, subject_id, object_id, rel_type, provenance, [definition],
                         [storage_type], [is_hierarchy_rel], [taxonomies], [fact_provenance])
+
+    source_ref (kwarg, migration 128): citable provenance (URL/filename/title) applied to
+    EVERY row in this batch — a kwarg, NOT a tuple element, because the row tuples are
+    positionally unpacked at several call sites. None (default) = byte-identical behavior;
+    ON CONFLICT never nulls an existing citation (COALESCE(EXCLUDED, existing)).
 
     CRITICAL: Confirmation Tracking via PostgreSQL ON CONFLICT UPSERT
     ─────────────────────────────────────────────────────────────────
@@ -6797,8 +6803,8 @@ def _commit_staged(
                 cur.execute(
                     "INSERT INTO staged_facts"
                     " (subject_id, object_id, rel_type, fact_class,"
-                    "  provenance, fact_provenance, confidence, expires_at, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, now() + interval '30 days', %s, %s, %s, %s, %s, %s, %s, %s)"
+                    "  provenance, fact_provenance, confidence, expires_at, rel_type_definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity, source_ref)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, now() + interval '30 days', %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                     " ON CONFLICT (subject_id, object_id, rel_type)"
                     " DO UPDATE SET"
                     "   confirmed_count = staged_facts.confirmed_count + 1,"
@@ -6806,13 +6812,23 @@ def _commit_staged(
                     "   expires_at      = now() + interval '30 days',"
                     "   confidence      = GREATEST(staged_facts.confidence, EXCLUDED.confidence),"
                     "   qdrant_synced   = false,"
-                    "   fact_provenance = EXCLUDED.fact_provenance,"
+                    # PROVENANCE AUTHORITY LADDER — upgrade-only, NEVER downgrade: a later
+                    # llm_inferred/llm_learned re-ingest of the SAME triple must not overwrite
+                    # user_stated (the plain `= EXCLUDED.fact_provenance` overwrite silently
+                    # demoted Class-A-eligible rows on every LLM re-extraction). Only an
+                    # incoming user_stated may raise the stored value; everything else keeps it.
+                    "   fact_provenance = CASE WHEN EXCLUDED.fact_provenance = 'user_stated'"
+                    "                          THEN 'user_stated'"
+                    "                          ELSE staged_facts.fact_provenance END,"
                     "   rel_type_definition = EXCLUDED.rel_type_definition,"
                     "   storage_type = COALESCE(EXCLUDED.storage_type, staged_facts.storage_type),"
                     "   taxonomies = COALESCE(EXCLUDED.taxonomies, staged_facts.taxonomies),"
                     "   temporal_status = EXCLUDED.temporal_status,"
                     "   event_date = COALESCE(EXCLUDED.event_date, staged_facts.event_date),"
                     "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity, staged_facts.event_date_granularity),"
+                    # CITABLE PROVENANCE (migration 128): a re-ingest WITHOUT a citation must
+                    # never null out an existing one; a new citation wins (COALESCE on EXCLUDED).
+                    "   source_ref = COALESCE(EXCLUDED.source_ref, staged_facts.source_ref),"
                     # ASSERTION POLARITY (Q1): a re-asserted negated state must keep its negated
                     # polarity; a later affirmed re-ingest of the SAME triple flips it back to
                     # 'affirmed' (the latest assertion wins, mirroring temporal_status). EXCLUDED
@@ -6821,7 +6837,7 @@ def _commit_staged(
                     # FREEZE TOMBSTONE (Phase 4): a tombstoned row must NOT be resurrected /
                     # have its expiry+counters reset by a re-ingest hit. Skip the UPDATE for it.
                     "   WHERE staged_facts.deleted_at IS NULL",
-                    (subject, obj, rel_type, fact_class, prov, fact_prov, confidence, definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity),
+                    (subject, obj, rel_type, fact_class, prov, fact_prov, confidence, definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity, source_ref),
                 )
 
                 # Log confirmation tracking via ON CONFLICT UPSERT
@@ -6884,7 +6900,7 @@ def _immediate_sync_class_c_staged(db_conn, user_id: str, limit: int = 50) -> in
     try:
         with db_conn.cursor() as cur:
             cur.execute(
-                "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class"
+                "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class, source_ref"
                 " FROM staged_facts"
                 " WHERE qdrant_synced = false AND promoted_at IS NULL AND expires_at > now()"
                 "   AND fact_class = 'C' AND deleted_at IS NULL"
@@ -6896,7 +6912,7 @@ def _immediate_sync_class_c_staged(db_conn, user_id: str, limit: int = 50) -> in
             return 0
         collection = derive_collection(user_id)
         ensure_collection(collection, qdrant_url)
-        for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class in fresh:
+        for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in fresh:
             text = f"{sf_subj} {sf_rel} {sf_obj}"
             vector = embed_text(text, _LLM_URL, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
             if vector is None:
@@ -6916,6 +6932,8 @@ def _immediate_sync_class_c_staged(db_conn, user_id: str, limit: int = 50) -> in
                 "contradicted_by": None,
                 # Class C only (the SELECT enforces it); pass it through.
                 "fact_class": sf_class or "C",
+                # Citable provenance (migration 128) — carried into the Qdrant payload.
+                "source_ref": sf_source_ref,
             }
             if upsert_to_qdrant(s_row, vector, collection, qdrant_url, source_table="staged_facts"):
                 with db_conn.cursor() as _mark:
@@ -9470,6 +9488,18 @@ QUERY_WALK_READS_ATTRIBUTES = os.environ.get(
 # unstructured fallback path entirely. Default true (enabled).
 _SHORT_TERM_MEMORY = os.environ.get("SHORT_TERM_MEMORY", "true").strip().lower() not in ("false", "0", "no")
 
+# INGEST_ENABLED — master freeze switch ("knowledge-store mode"). When false, EVERY
+# graph-mutating path pauses: the write endpoints (/ingest, /store_context,
+# /episodic/append, /retract, /retract/correct, /forget, /unforget, /learn,
+# /ontology/rel_types) and the ingest-feeder extraction endpoints that write
+# knowledge rows as a side effect (/extract/rewrite entity strengthen,
+# /harvest-spans residue store) return 200-shaped "ingest_disabled" responses
+# (NOT 4xx — the MCP raise_for_status()s and must surface a message, not crash),
+# and the /query read path becomes genuinely read-only (confirmed_count /
+# hit_count bumps and their expires_at resets are skipped). Read ONCE per process
+# (same convention as _SHORT_TERM_MEMORY above). Default true (normal behavior).
+_INGEST_ENABLED = os.environ.get("INGEST_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
 # D4: Class C query-scoped HIT threshold. A Qdrant Class C fact is a genuine HIT (→ hit_count+1,
 # expiry reset, promote-at-3 by re_embedder) only when its cosine score >= this STRICTER
 # threshold (higher than the loose 0.3 inclusion threshold used to populate full scope) OR its
@@ -11380,7 +11410,13 @@ def ingest_route_config():
     Fail-safe contract for the consumer: if this endpoint is unreachable, the MCP defaults to
     "rewrite" (today's behavior) — the new spine route NEVER engages on a brain it can't confirm.
     """
-    return {"statement_extractor": "spine" if SENTENCE_PIPELINE else "rewrite"}
+    # ingest_enabled: backend-authoritative freeze-switch state (knowledge-store mode).
+    # Consumers (MCP _learn_via_llm and any fire-and-forget writer) read it here instead
+    # of their own env — avoids split-brain config between containers. Purely additive.
+    return {
+        "statement_extractor": "spine" if SENTENCE_PIPELINE else "rewrite",
+        "ingest_enabled": _INGEST_ENABLED,
+    }
 
 
 @app.get("/provisioning/status")
@@ -11515,6 +11551,12 @@ def add_rel_type(req: RelTypeRequest):
     User-asserted rel_type registration. Source is always 'user'.
     Wikidata and builtin types cannot be overwritten via this endpoint.
     """
+    # Freeze switch (knowledge-store mode): rel_types IS the ontology — a frozen
+    # store accepts no ontology mutations either. 200-shaped disabled response.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/ontology/rel_types")
+        return {"status": "ingest_disabled", "rel_type": req.rel_type.lower(), "source": "user"}
+
     dsn = os.environ.get("POSTGRES_DSN")
     if not dsn:
         raise HTTPException(status_code=503, detail="DB unavailable")
@@ -16596,6 +16638,14 @@ async def harvest_spans(req: RewriteRequest) -> dict:
     standalone so the recall path can fire it without the (expensive) LLM extraction pass.
     """
     user_id = _require_resolvable_user_id(req.user_id, "/harvest-spans")
+    # Freeze switch (knowledge-store mode): the harvest is an INGEST FEEDER — it exists
+    # solely to produce edges the caller ingests, and it writes knowledge rows itself
+    # (spine deriver entity registration; residue→Class-C store_context floor). Gating it
+    # here also spares the LLM atomizer/detect spend on every frozen recall turn.
+    # 200-shaped, zero-edge response so callers simply have nothing to ingest.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/harvest-spans")
+        return {"edges": [], "spans": 0, "status": "ingest_disabled"}
     # BLOCK until the tenant schema is provisioned-AND-ready — the spine deriver reads the
     # linguistic_cue overlay and inserts entities; it must never run against a missing schema.
     await _ensure_tenant_ready(user_id, "/harvest-spans")
@@ -17222,6 +17272,12 @@ async def ground_self_predication_endpoint(req: RewriteRequest) -> dict:
     yield nothing, so a bare-copula self-statement ("I am worried", "I am Alex") is grounded
     and routed to the right relation instead of dropped or mis-filed. Fail-safe → {edges:[]}."""
     user_id = _require_resolvable_user_id(req.user_id, "/ground-self-predication")
+    # Freeze switch (knowledge-store mode): pure ingest feeder (its ONLY caller ingests
+    # the returned edges). No DB writes of its own, but gating spares the LLM grounding
+    # call whose output could not be stored anyway. 200-shaped zero-edge response.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/ground-self-predication")
+        return {"edges": [], "status": "ingest_disabled"}
     try:
         edges = await _ground_self_predication(req.text or "", user_id)
         return {"edges": edges}
@@ -17331,6 +17387,16 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     """
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool path).
     user_id = _require_resolvable_user_id(req.user_id, "/extract/rewrite")
+
+    # Freeze switch (knowledge-store mode): /extract/rewrite is NOT pure compute — its
+    # GLiNER2 "immediate strengthen" phase registers entities (EntityRegistry.resolve →
+    # entities/entity_aliases INSERTs) and UPDATEs entities.entity_type. A frozen store
+    # accepts none of that, and the extraction only exists to feed /ingest (also frozen),
+    # so gate the front door: no knowledge writes AND no wasted LLM extraction spend.
+    # 200-shaped, zero-edge response (MCP raise_for_status()s — never 4xx here).
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/extract/rewrite")
+        return {"status": "ingest_disabled", "edges": []}
 
     # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready ===
     # The rel_types overlay drives the extraction prompt — must not read a missing schema.
@@ -19041,6 +19107,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     CRITICAL: This endpoint owns the entire pipeline. Filter is dumb — it just sends text here.
     """
+    # Freeze switch (knowledge-store mode): reject cleanly with the normal response
+    # shape — 200-shaped, NOT 4xx/5xx (the MCP server raise_for_status()s and must
+    # surface a message, not crash).
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/ingest")
+        return IngestResponse(status="ingest_disabled", committed=0, staged=0, entities=[], facts=[])
+
     # SECURITY (Phase 0): fail loud on absent identity instead of the silent
     # "anonymous" shared-pool collapse (which also skipped SET search_path).
     user_id = _require_resolvable_user_id(req.user_id, "/ingest")
@@ -22204,7 +22277,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 edge.rel_type.lower(), "ingest_type_inconsistent_quarantine",
                                 "", "relational", False, [],
                                 getattr(edge, "fact_provenance", "llm_inferred"),
-                            )], "C", confidence=0.3)
+                            )], "C", confidence=0.3, source_ref=req.source_ref)
                             try:
                                 # MISS-PUSHBACK rows carry a distinct extraction_method so the
                                 # engine "what is X?" classifier picks up ONLY genuine
@@ -22740,7 +22813,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                             canonical_rel_type, "ingest_type_mismatch",
                                             "", "relational", False, [],
                                             edge.fact_provenance,
-                                        )], "C", confidence=0.4)
+                                        )], "C", confidence=0.4, source_ref=req.source_ref)
                                         log.info("ingest.type_mismatch_staged_class_c",
                                                 subject=fact_subject, rel_type=canonical_rel_type,
                                                 object=canonical_object)
@@ -22758,7 +22831,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         canonical_rel_type, "ingest_type_mismatch",
                                         "", "relational", False, [],
                                         edge.fact_provenance,
-                                    )], "C", confidence=0.4)
+                                    )], "C", confidence=0.4, source_ref=req.source_ref)
                                     log.info("ingest.type_mismatch_staged_class_c",
                                             subject=fact_subject, rel_type=canonical_rel_type,
                                             object=canonical_object)
@@ -23496,7 +23569,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         else "llm_inferred"
                     )
                     if class_a_rows:
-                        committed += manager.commit(class_a_rows, fact_class="A", fact_provenance=_commit_provenance)
+                        committed += manager.commit(class_a_rows, fact_class="A", fact_provenance=_commit_provenance,
+                                                    source_ref=req.source_ref)
                         log.info("ingest.class_a_committed", count=len(class_a_rows))
 
                         # TEMPORAL MODEL: stamp temporal_status/event_date on the just-committed
@@ -23734,6 +23808,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                             "contradicted_by": None,
                                             # facts-table rows committed here are Class A.
                                             "fact_class": "A",
+                                            # Citable provenance (migration 128): these are the rows
+                                            # THIS request just committed, so req.source_ref is theirs.
+                                            "source_ref": req.source_ref,
                                         }
                                         if upsert_to_qdrant(row, vector, collection, qdrant_url, source_table="facts"):
                                             mark_synced(db, fact_id)
@@ -23750,7 +23827,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                        note="PostgreSQL facts committed; Qdrant sync will retry in re_embedder poll")
 
                     if class_b_rows:
-                        staged_b = _commit_staged(db, class_b_rows, "B", confidence=0.8)
+                        staged_b = _commit_staged(db, class_b_rows, "B", confidence=0.8,
+                                                  source_ref=req.source_ref)
                         staged += staged_b
                         log.info("ingest.class_b_staged", count=staged_b)
 
@@ -23776,7 +23854,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # removed. Class C immediate sync lives in the class_c_rows branch below.
 
                     if class_c_rows:
-                        staged_c = _commit_staged(db, class_c_rows, "C", confidence=0.4)
+                        staged_c = _commit_staged(db, class_c_rows, "C", confidence=0.4,
+                                                  source_ref=req.source_ref)
                         staged += staged_c
                         log.info("ingest.class_c_staged", count=staged_c)
 
@@ -23792,7 +23871,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             upserted_c = 0
                             with db.cursor() as cur:
                                 cur.execute(
-                                    "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class FROM staged_facts "
+                                    "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class, source_ref FROM staged_facts "
                                     "WHERE qdrant_synced = false AND promoted_at IS NULL AND expires_at > now() "
                                     "AND fact_class = 'C' "
                                     "ORDER BY id DESC LIMIT %s",
@@ -23802,7 +23881,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 if staged_fresh:
                                     collection = derive_collection(req.user_id)
                                     ensure_collection(collection, qdrant_url)
-                                    for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class in staged_fresh:
+                                    for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in staged_fresh:
                                         text = f"{sf_subj} {sf_rel} {sf_obj}"
                                         vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
                                         if vector is None:
@@ -23822,6 +23901,8 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                             "contradicted_by": None,
                                             # Class C only (the SELECT enforces it); pass it through.
                                             "fact_class": sf_class or "C",
+                                            # Citable provenance (migration 128) — carried into the Qdrant payload.
+                                            "source_ref": sf_source_ref,
                                         }
                                         if upsert_to_qdrant(s_row, vector, collection, qdrant_url, source_table="staged_facts"):
                                             with db.cursor() as _mark:
@@ -30562,7 +30643,9 @@ def fetch_facts_from_anchor(
                     # Fix 2 / migration 063 "any hit resets the clock": reset expires_at on bump
                     # (mirrors the hit_count path ~main.py:14744) so a frequently-recalled staged
                     # fact can't decay/expire while still actively in use.
-                    if staged_hit_ids:
+                    # INGEST_ENABLED freeze: skip the bump (and its expires_at reset) so
+                    # the query path is genuinely read-only in knowledge-store mode.
+                    if staged_hit_ids and _INGEST_ENABLED:
                         try:
                             cur.execute(
                                 "UPDATE staged_facts SET confirmed_count = confirmed_count + 1,"
@@ -33965,7 +34048,9 @@ async def query(request: QueryRequest) -> QueryResponse:
                         _hit_staged_ids.add(int(_fid))
                     except (TypeError, ValueError):
                         log.warning("query.classc_hit.bad_fact_id", fact_id=_fid)
-            if _hit_staged_ids:
+            # INGEST_ENABLED freeze: skip the bump (and its expires_at reset) so the
+            # query path is genuinely read-only in knowledge-store mode.
+            if _hit_staged_ids and _INGEST_ENABLED:
                 with db.cursor() as _hit_cur:
                     _hit_cur.execute(
                         "UPDATE staged_facts"
@@ -35134,6 +35219,15 @@ def correct_fact(req: FactCorrectionRequest):
     User truth principle: Class A facts (user-stated) always override immutability.
     Zero custom validation: uses same WGMValidationGate as /ingest.
     """
+    # Freeze switch (knowledge-store mode): a frozen store accepts NO mutations,
+    # including corrections/retractions. 200-shaped so callers surface the message.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/retract/correct")
+        return FactCorrectionResponse(
+            status="ingest_disabled",
+            message="Memory ingest is disabled (knowledge-store mode) — corrections and retractions are paused. No changes were made.",
+        )
+
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool write).
     user_id = _require_resolvable_user_id(req.user_id, "/retract/correct")
 
@@ -37229,6 +37323,16 @@ def correct_fact(req: FactCorrectionRequest):
 
 @app.post("/retract", response_model=RetractResponse)
 def retract_fact(req: RetractRequest):
+    # Freeze switch (knowledge-store mode): a frozen store accepts NO mutations,
+    # including retractions. 200-shaped so callers surface the message.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/retract")
+        return RetractResponse(
+            status="ingest_disabled",
+            retracted=0,
+            mode="none",
+            note="Memory ingest is disabled (knowledge-store mode) — retractions are paused. No changes were made.",
+        )
     # BLOCK until the tenant schema is provisioned-AND-ready (sync) before touching
     # {schema}.rel_types / facts — never run a retraction against a missing schema.
     _ensure_tenant_ready_sync(req.user_id, "/retract")
@@ -37405,6 +37509,17 @@ def unforget_fact(req: RetractRequest):
     BOUNDED TARGET ONLY: operates on the resolved (subject, rel_type[, old_value]) target —
     no wildcard / "un-forget everything" verb. Never physically deletes.
     """
+    # Freeze switch (knowledge-store mode): un-forgetting RESTORES a fact into the live
+    # view — a store mutation like any other. A frozen store accepts NO mutations,
+    # restore included. 200-shaped so callers surface the message.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/unforget")
+        return RetractResponse(
+            status="ingest_disabled",
+            retracted=0,
+            mode="none",
+            note="Memory ingest is disabled (knowledge-store mode) — un-forget is paused. No changes were made.",
+        )
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         manager = FactStoreManager(db)
@@ -37498,6 +37613,16 @@ def forget_fact(req: RetractRequest):
     there is NO wildcard / "forget everything" / bulk verb. A forget that resolves to no
     target is a no-op (retracted=0) with a clear note, never a broadening delete.
     """
+    # Freeze switch (knowledge-store mode): the forget tombstone is a store mutation.
+    # A frozen store accepts NO mutations. 200-shaped so callers surface the message.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/forget")
+        return RetractResponse(
+            status="ingest_disabled",
+            retracted=0,
+            mode="none",
+            note="Memory ingest is disabled (knowledge-store mode) — forget is paused. No changes were made.",
+        )
     try:
         db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
         manager = FactStoreManager(db)
@@ -37591,13 +37716,140 @@ def forget_fact(req: RetractRequest):
                 pass
 
 
+@app.post("/episodic/append")
+def episodic_append(req: EpisodicAppendRequest):
+    """Append one verbatim ingest input to the per-tenant episodic_log.
+
+    Durable, append-only raw-text safety net captured BEFORE extraction, so that
+    short fragments, misrouted queries, and no-triple ramblings are never lost and
+    can be re-mined later by a better model. Purely additive — no WGM gate, no class
+    assignment, no query scope. Resilient by design: an unprovisioned schema or a
+    missing table logs and returns a soft status rather than raising, and this must
+    NEVER 500 or otherwise block the caller's ingest (no _ensure_tenant_ready 503
+    gate here for the same reason — a not-yet-provisioned tenant soft-fails).
+    """
+    # Freeze switch (knowledge-store mode): the episodic archive is also a write
+    # surface — full write freeze is deliberate, coherent freeze semantics.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/episodic/append")
+        return {"status": "ingest_disabled", "id": None}
+
+    user_id = req.user_id or "anonymous"
+
+    # Derive the tenant schema (mirrors /retract: immutable slug from UUID → schema).
+    schema_name = None
+    if user_id != "anonymous":
+        try:
+            from src.provisioning.schema_manager import derive_schema_name, derive_user_slug_from_uuid
+            schema_name = derive_schema_name(derive_user_slug_from_uuid(user_id))
+        except Exception as e:
+            log.error("episodic_append.schema_derive_failed", error=str(e), user_id=user_id[:8])
+            return {"status": "soft_error", "id": None}
+
+    if schema_name is None:
+        # No resolvable tenant schema — nothing to write to. Soft, non-fatal.
+        log.error("episodic_append.no_schema", user_id=user_id[:8] if user_id else "")
+        return {"status": "soft_error", "id": None}
+
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            # Per-request tenant scoping — search_path WITHOUT public (per-tenant isolation).
+            cur.execute(f"SET search_path TO {schema_name}")
+            cur.execute(
+                """
+                INSERT INTO episodic_log
+                    (user_id, raw_text, source, source_ref, intent, extracted_fact_count)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    req.raw_text,
+                    req.source,
+                    req.source_ref,
+                    req.intent,
+                    req.extracted_fact_count,
+                ),
+            )
+            new_id = cur.fetchone()[0]
+        _db.commit()
+        log.info(
+            "episodic_append.stored",
+            user_id=user_id[:8],
+            schema=schema_name,
+            episodic_id=new_id,
+            source=req.source,
+            intent=req.intent,
+            text_length=len(req.raw_text),
+        )
+        return {"status": "stored", "id": new_id}
+    except Exception as e:
+        # Unprovisioned schema / missing table / any DB failure must NOT block ingest.
+        # Fail loud in the log, soft to the caller.
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.error(
+            "episodic_append.write_failed",
+            error=str(e),
+            user_id=user_id[:8],
+            schema=schema_name,
+        )
+        return {"status": "soft_error", "id": None}
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+
+
+def _defer_context_to_episodic(req: StoreContextRequest, reason: str) -> StoreContextResponse:
+    """Degrade /store_context to the durable episodic_log instead of losing the text.
+
+    Embed/Qdrant failures used to raise HTTP 500 — and the text was GONE. Instead,
+    write it to the tenant's episodic_log via the same INSERT + soft-fail posture as
+    /episodic/append (source='store_context_deferred') and return status='deferred':
+    "not yet vector-indexed", not "lost". A future episodic backfill re-mines it.
+    """
+    result = episodic_append(
+        EpisodicAppendRequest(
+            user_id=req.user_id,
+            raw_text=req.text,
+            source="store_context_deferred",
+        )
+    )
+    log.info(
+        "store_context.deferred_to_episodic",
+        user_id=req.user_id,
+        reason=reason,
+        episodic_status=result.get("status"),
+        episodic_id=result.get("id"),
+        text_length=len(req.text),
+    )
+    return StoreContextResponse(status="deferred", point_id="")
+
+
 @app.post("/store_context", response_model=StoreContextResponse)
 def store_context(req: StoreContextRequest):
     """
     Store unstructured text directly to Qdrant when no typed edges can be extracted.
     No WGM gate, no Postgres write, direct Qdrant upsert only.
+
+    Degrades instead of losing text: on embed or Qdrant failure the text is written
+    to the tenant's episodic_log and status='deferred' is returned (never HTTP 500).
     """
     try:
+        # Freeze switch (knowledge-store mode): no Qdrant context writes either —
+        # Qdrant is a derived index and must not grow while Postgres is frozen.
+        if not _INGEST_ENABLED:
+            log.info("ingest.disabled_rejected", endpoint="/store_context")
+            return StoreContextResponse(status="ingest_disabled", point_id="")
+
         if not _SHORT_TERM_MEMORY:
             log.info("store_context.disabled", user_id=req.user_id)
             return StoreContextResponse(status="disabled", point_id="")
@@ -37610,13 +37862,13 @@ def store_context(req: StoreContextRequest):
         # Ensure collection exists
         if not ensure_collection(collection, qdrant_url):
             log.error("store_context.collection_ensure_failed", collection=collection)
-            raise HTTPException(status_code=500, detail="Collection unavailable")
+            return _defer_context_to_episodic(req, "collection_unavailable")
 
         # Embed the text (use cached embedding URL if available)
         vector = embed_text(req.text, qwen_api_url, timeout=10.0, fallback=False, embedding_url=_EMBEDDING_API_URL)
         if vector is None:
             log.error("store_context.embed_failed", user_id=req.user_id, text_length=len(req.text))
-            raise HTTPException(status_code=500, detail={"status": "error", "point_id": ""})
+            return _defer_context_to_episodic(req, "embed_failed")
 
         # Generate point ID
         point_id = str(uuid.uuid4())
@@ -37653,7 +37905,7 @@ def store_context(req: StoreContextRequest):
                 status=response.status_code,
                 text_length=len(req.text),
             )
-            raise HTTPException(status_code=500, detail="Qdrant upsert failed")
+            return _defer_context_to_episodic(req, "qdrant_upsert_failed")
 
         log.info(
             "store_context.stored",
@@ -37668,8 +37920,10 @@ def store_context(req: StoreContextRequest):
     except HTTPException:
         raise
     except Exception as e:
+        # An unexpected exception here (e.g. Qdrant network error mid-upsert) would
+        # otherwise lose the text — degrade to episodic_log instead of a 500.
         log.error("store_context.error", error=str(e), user_id=req.user_id)
-        raise HTTPException(status_code=500, detail=str(e))
+        return _defer_context_to_episodic(req, f"exception:{type(e).__name__}")
 
 # ── /learn endpoint ────────────────────────────────────────────────────────────
 # LearnTopicRequest imported from .models (topic, user_id, source_text, source_url)
@@ -38235,6 +38489,14 @@ async def learn_topic(req: LearnTopicRequest):
       • Deliberate growth is a SOLID Class B (`LEARN_DURABLE_CLASS_B`, default ON) — a novel
         rel_type emitted in a /learn batch floors to Class B (never Class C → never ages out).
     """
+    # Freeze switch (knowledge-store mode): the in-process ingest calls below are
+    # already frozen, but /learn ALSO does direct entity_type UPDATEs after ingest —
+    # gate the front door so no graph mutation (and no LLM spend) happens at all.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/learn")
+        return {"status": "ingest_disabled", "topic": req.topic.strip(),
+                "committed": 0, "staged": 0, "total": 0}
+
     topic = req.topic.strip()
     user_id = req.user_id
 

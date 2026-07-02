@@ -404,7 +404,7 @@ def fetch_unsynced(db_conn, user_id: str, confidence_threshold: float = 0.0) -> 
             f"""
             SELECT id, subject_id, object_id, rel_type, provenance,
                    confidence, confirmed_count, last_seen_at, contradicted_by,
-                   fact_class
+                   fact_class, source_ref
             FROM facts
             WHERE qdrant_synced = false AND (superseded_at IS NULL)
             AND confidence >= %s
@@ -429,6 +429,8 @@ def fetch_unsynced(db_conn, user_id: str, confidence_threshold: float = 0.0) -> 
             # facts-table rows default to 'A' (only Class A/promoted-B live here);
             # carry it into the Qdrant payload so read-back tiering is correct.
             "fact_class": row[9] or "A",
+            # Citable provenance (migration 128) — NULL for conversational facts.
+            "source_ref": row[10],
         }
         for row in rows
     ]
@@ -443,7 +445,7 @@ def fetch_unsynced_staged(db_conn, user_id: str) -> list[dict]:
         cur.execute(
             """
             SELECT id, subject_id, object_id, rel_type, provenance,
-                   confidence, confirmed_count, last_seen_at, fact_class
+                   confidence, confirmed_count, last_seen_at, fact_class, source_ref
             FROM staged_facts
             WHERE qdrant_synced = false
               AND promoted_at IS NULL
@@ -467,6 +469,8 @@ def fetch_unsynced_staged(db_conn, user_id: str) -> list[dict]:
             "contradicted_by": None,
             "staged_id": row[0],
             "fact_class": row[8],
+            # Citable provenance (migration 128) — NULL for conversational facts.
+            "source_ref": row[9],
         }
         for row in rows
     ]
@@ -762,6 +766,10 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
         # promoted 'B'); staged rows carry their own 'B'/'C'. Fall back by table:
         # facts → 'A' (only A/promoted-B live there), staged → 'C'.
         "fact_class": row.get("fact_class") or ("A" if source_table == "facts" else "C"),
+        # Citable provenance (migration 128): document/web citation carried into the
+        # vector payload so a Qdrant-lane recall can surface where a fact came from.
+        # None for conversational facts.
+        "source_ref": row.get("source_ref"),
     }
     # Collision-free point id derived from (source_table, fact_id) — never the bare
     # table id, which would alias facts#N onto staged#N in the shared collection.
@@ -1086,7 +1094,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                 """
                 SELECT id, subject_id, object_id, rel_type,
                        provenance, COALESCE(fact_provenance, 'llm_inferred'), confidence,
-                       temporal_status, event_date, event_date_granularity
+                       temporal_status, event_date, event_date_granularity, source_ref
                 FROM staged_facts
                 WHERE fact_class = 'B'
                   AND confirmed_count >= %s
@@ -1097,7 +1105,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
             candidates = cur.fetchall()
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, fact_prov, conf, temporal_status, event_date, event_date_granularity = row
+            sid, subject, obj, rel_type, prov, fact_prov, conf, temporal_status, event_date, event_date_granularity, source_ref = row
             # user_id is implicit in per-user schema context (set by SET search_path)
             try:
                 log.info(
@@ -1111,9 +1119,9 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                         "INSERT INTO facts"
                         " (subject_id, object_id, rel_type, provenance,"
                         "  confidence, fact_class, fact_provenance, qdrant_synced,"
-                        "  temporal_status, event_date, event_date_granularity)"
+                        "  temporal_status, event_date, event_date_granularity, source_ref)"
                         " VALUES (%s, %s, %s, %s, %s, 'B', %s, false,"
-                        "  COALESCE(%s, 'now'), %s, %s)"
+                        "  COALESCE(%s, 'now'), %s, %s, %s)"
                         " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
@@ -1126,9 +1134,12 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                         "                          THEN facts.temporal_status"
                         "                          ELSE EXCLUDED.temporal_status END,"
                         "   event_date = COALESCE(EXCLUDED.event_date, facts.event_date),"
-                        "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity, facts.event_date_granularity)",
+                        "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity, facts.event_date_granularity),"
+                        # CITABLE PROVENANCE (migration 128): promotion carries the staged
+                        # citation into facts; a citation-less promotion never nulls one.
+                        "   source_ref = COALESCE(EXCLUDED.source_ref, facts.source_ref)",
                         (subject, obj, rel_type, prov, conf, fact_prov,
-                         temporal_status, event_date, event_date_granularity)
+                         temporal_status, event_date, event_date_granularity, source_ref)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET promoted_at = now() WHERE id = %s",
@@ -1421,7 +1432,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                 SELECT id, subject_id, object_id, rel_type, provenance,
                        COALESCE(fact_provenance, 'llm_inferred'),
                        confidence, hit_count, rel_type_definition,
-                       temporal_status, event_date, event_date_granularity
+                       temporal_status, event_date, event_date_granularity, source_ref
                 FROM staged_facts
                 WHERE fact_class = 'C'
                   AND hit_count >= %s
@@ -1437,7 +1448,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
             return promoted
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, fact_prov, conf, hits, rel_def, temporal_status, event_date, event_date_granularity = row
+            sid, subject, obj, rel_type, prov, fact_prov, conf, hits, rel_def, temporal_status, event_date, event_date_granularity, source_ref = row
             required_classification = False
             try:
                 # ── Default B-2: classify rough/unclassified memory before promotion ──
@@ -1504,9 +1515,9 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                         "INSERT INTO facts"
                         " (subject_id, object_id, rel_type, provenance,"
                         "  confidence, fact_class, fact_provenance, qdrant_synced,"
-                        "  temporal_status, event_date, event_date_granularity)"
+                        "  temporal_status, event_date, event_date_granularity, source_ref)"
                         " VALUES (%s, %s, %s, %s, %s, 'B', %s, false,"
-                        "  COALESCE(%s, 'now'), %s, %s)"
+                        "  COALESCE(%s, 'now'), %s, %s, %s)"
                         " ON CONFLICT (subject_id, object_id, rel_type)"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
@@ -1518,9 +1529,12 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                         "                          THEN facts.temporal_status"
                         "                          ELSE EXCLUDED.temporal_status END,"
                         "   event_date = COALESCE(EXCLUDED.event_date, facts.event_date),"
-                        "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity, facts.event_date_granularity)",
+                        "   event_date_granularity = COALESCE(EXCLUDED.event_date_granularity, facts.event_date_granularity),"
+                        # CITABLE PROVENANCE (migration 128): promotion carries the staged
+                        # citation into facts; a citation-less promotion never nulls one.
+                        "   source_ref = COALESCE(EXCLUDED.source_ref, facts.source_ref)",
                         (subject, obj, rel_type, prov, promote_conf, fact_prov,
-                         temporal_status, event_date, event_date_granularity)
+                         temporal_status, event_date, event_date_granularity, source_ref)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET fact_class = 'B', promoted_at = now() WHERE id = %s",
@@ -1563,6 +1577,263 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
         log.error(f"re_embedder.class_c_promote_error: {e}")
 
     return promoted
+
+
+# Schemas already logged as missing episodic_log (pre-migration-127) — log ONCE per
+# schema per process, then silently skip (the table appears after the migration runs).
+_episodic_log_missing_schemas: set = set()
+
+
+def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
+                         statement_route: str) -> list:
+    """Extract edges for ONE episodic_log row through the normal front door.
+
+    Mirrors the document lane's route-once-then-per-row pattern (server.py
+    _ingest_statement_via_spine): when the backend brain routed "spine", try the
+    deterministic spine extractor (/harvest-spans) FIRST and fall back to the
+    legacy LLM extractor (/extract/rewrite) when the spine yields nothing;
+    route "rewrite" (default / brain unreachable) goes straight to /extract/rewrite
+    — byte-identical to the plain backfill. Low-confidence edges are dropped
+    (same filter the MCP applies before /ingest).
+
+    PROVENANCE HARD RULE: every returned edge has fact_provenance FORCED to
+    'llm_inferred'. Spine edges arrive stamped user_stated (the live path IS the
+    user speaking) — but here the LLM/deriver is re-reading OLD text, not the user
+    restating it, and the /ingest provenance router preserves a canonical
+    fact_provenance carried on the edge. Without this override a backfilled spine
+    edge would land user_stated → Class A. source="reextract" alone is not enough.
+    """
+    edges: list = []
+    if statement_route == "spine":
+        try:
+            resp = httpx.post(
+                f"{backend_url}/harvest-spans",
+                json={"text": raw_text, "user_id": user_id},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            _data = resp.json()
+            # Split-brain guard: the embedder's own INGEST_ENABLED said "enabled" but
+            # the BACKEND is frozen (separate containers, separate env). A gated
+            # extraction returns zero edges — stamping the row as "uncastable" would
+            # be a silent loss. Raise → the row stays NULL and retries next cycle.
+            if _data.get("status") == "ingest_disabled":
+                raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+            edges = [e for e in (_data.get("edges", []) or [])
+                     if not e.get("low_confidence", False)]
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning(f"re_embedder.reextract_spine_failed user_id={user_id[:8]} "
+                        f"(falling back to /extract/rewrite): {e}")
+            edges = []
+    if not edges:
+        # Spine yielded nothing (or route == "rewrite") → the legacy LLM extractor.
+        resp = httpx.post(
+            f"{backend_url}/extract/rewrite",
+            json={"text": raw_text, "user_id": user_id},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        _data = resp.json()
+        # Same split-brain guard as the spine branch above.
+        if _data.get("status") == "ingest_disabled":
+            raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+        edges = [e for e in (_data.get("edges", []) or [])
+                 if not e.get("low_confidence", False)]
+    for e in edges:
+        e["fact_provenance"] = "llm_inferred"
+    return edges
+
+
+def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str = None,
+                       batch_size: int = 5, statement_route: str = "rewrite") -> int:
+    """
+    Periodic episodic re-extraction backfill (the "retry the cast" operator).
+
+    FaultLine's memory IS the per-tenant PostgreSQL knowledge graph; Qdrant is only
+    the fallback net for content the ontology could not cast into the graph yet.
+    Text that failed to structure at time T failed because the ontology AT T could
+    not type it — but the per-tenant ontology self-grows (new rel_types, hierarchy,
+    taxonomies). This job re-mines raw episodic_log text through the NORMAL front
+    door (spine /harvest-spans or /extract/rewrite → /ingest) so previously-
+    uncastable content can land in the graph, shrinking the fallback net over time.
+
+    Batch discipline: LIMIT `batch_size` rows per cycle (each row costs an LLM
+    extraction call — keep it modest). Only rows older than 1 hour are eligible:
+    re-mining text the live pipeline just processed with the SAME ontology has no
+    value; the value comes from ontology growth in between.
+
+    Row outcomes:
+      • intent RETRACTION/CORRECTION → stamped WITHOUT re-ingest (re-ingesting a
+        retraction as a statement would resurrect the retracted fact).
+      • extract + ingest 2xx        → stamped, extracted_fact_count recorded.
+      • zero non-low-confidence edges → stamped as SUCCESS with count 0: the
+        ontology still can't cast it. The raw text stays in episodic_log forever
+        (raw substrate is never deleted); a future "re-mine all" admin action can
+        clear reextracted_at in bulk. Retrying every cycle forever is waste.
+      • extract/ingest FAILURE      → reextracted_at left NULL (retry next cycle),
+        EXCEPT rows older than 30 days, which get stamped after this one
+        best-effort pass so a poison row cannot clog the LIMIT-N batch forever.
+
+    Provenance: source="reextract" falls through the /ingest provenance router to
+    fact_provenance="llm_inferred" (NOT user_stated Class A) — the LLM is re-reading
+    old text, not the user restating it. _reextract_row_edges additionally FORCES
+    llm_inferred on every edge (spine edges arrive stamped user_stated and a
+    canonical carried provenance is preserved by the router). The cast always pays
+    the validation toll: this function never touches the WGM gate, class
+    assignment, or query code.
+
+    Facts are NOT forced to be user-tied: raw_text passes through untouched
+    (e.g. network diagrams describe machines, not the user).
+
+    Caller contract: runs INSIDE the main loop's INGEST_ENABLED guard (Feature 1) —
+    a frozen store never re-mines (and the gated backend would refuse the /ingest
+    anyway). Per-tenant error isolation mirrors promote_staged_facts: any failure
+    rolls back this tenant's connection and returns; it never poisons the loop.
+
+    Args:
+        db_conn: PostgreSQL connection (per-user schema context via search_path)
+        backend_url: FaultLine backend API base URL (FAULTLINE_API_URL)
+        user_id: tenant user UUID (scoping key for extraction + /ingest)
+        schema_name: user schema; if provided, sets search_path (house style)
+        batch_size: max rows re-mined per cycle (REEXTRACT_BATCH_SIZE, default 5)
+        statement_route: "spine" | "rewrite" — the backend brain's STATEMENT
+            extractor decision (GET /internal/ingest-route), resolved ONCE per
+            cycle by the caller (document-lane parity; default "rewrite").
+
+    Returns:
+        Count of rows stamped (re-extracted, skipped-as-retraction, or zero-edge).
+    """
+    processed = 0
+    try:
+        # Optional per-user search_path (mirror promote_staged_facts house style).
+        if schema_name:
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}")
+                db_conn.commit()
+            except Exception as e:
+                log.warning(f"re_embedder.reextract_search_path_failed schema={schema_name}: {e}")
+                # Continue with current search_path
+
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, raw_text, source_ref, intent, created_at
+                    FROM episodic_log
+                    WHERE reextracted_at IS NULL
+                      AND created_at < now() - INTERVAL '1 hour'
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    """,
+                    (batch_size,)
+                )
+                rows = cur.fetchall()
+        except psycopg2.Error as e:
+            # Older schemas may predate migration 127 — not an error, just skip.
+            # Roll back + re-apply the tenant search_path so the aborted txn cannot
+            # poison the rest of this tenant's cycle (per-tenant isolation, f4839d4).
+            _rollback_and_reapply_search_path(db_conn, schema_name)
+            if getattr(e, "pgcode", None) == "42P01":  # undefined_table
+                key = schema_name or user_id
+                if key not in _episodic_log_missing_schemas:
+                    _episodic_log_missing_schemas.add(key)
+                    log.info(f"re_embedder.reextract_no_episodic_log schema={schema_name} "
+                             f"(migration 127 not applied — skipping)")
+                return 0
+            raise
+
+        if not rows:
+            return 0
+
+        for row_id, raw_text, source_ref, intent, created_at in rows:
+            # RETRACTION/CORRECTION rows must NOT be re-ingested as statements —
+            # that would resurrect the very facts they retracted. Stamp and skip.
+            if (intent or "").upper() in ("RETRACTION", "CORRECTION"):
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE episodic_log SET reextracted_at = now() WHERE id = %s",
+                        (row_id,)
+                    )
+                db_conn.commit()
+                processed += 1
+                log.info(f"re_embedder.reextract_skipped_retraction episodic_id={row_id} "
+                         f"user_id={user_id[:8]} intent={intent} (stamped without re-ingest)")
+                continue
+
+            # QUERY / STATEMENT / NULL intents are fair game — queries often carry
+            # embedded facts and were misrouted; that's part of why we captured them.
+            try:
+                edges = _reextract_row_edges(raw_text, user_id, backend_url, statement_route)
+
+                if edges:
+                    ingest_resp = httpx.post(
+                        f"{backend_url}/ingest",
+                        json={
+                            "text": raw_text,
+                            "user_id": user_id,
+                            "edges": edges,
+                            # source="reextract" → provenance router else-branch →
+                            # llm_inferred (never user_stated Class A).
+                            "source": "reextract",
+                            # Citable provenance rides along (migration 128).
+                            "source_ref": source_ref,
+                        },
+                        timeout=30.0,
+                    )
+                    ingest_resp.raise_for_status()
+                    # Split-brain guard (same as _reextract_row_edges): a frozen backend
+                    # returns 200-shaped ingest_disabled — nothing stored → do NOT stamp.
+                    if ingest_resp.json().get("status") == "ingest_disabled":
+                        raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+                    log.info(f"re_embedder.reextract_ingested episodic_id={row_id} "
+                             f"user_id={user_id[:8]} edges={len(edges)} route={statement_route}")
+                else:
+                    # Zero-edge = SUCCESS: the ontology still can't cast it. Stamp it
+                    # (raw text is retained forever; bulk re-mine can reset the stamp).
+                    log.info(f"re_embedder.reextract_zero_edges episodic_id={row_id} "
+                             f"user_id={user_id[:8]} (stamped — still uncastable)")
+
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE episodic_log SET reextracted_at = now(), extracted_fact_count = %s WHERE id = %s",
+                        (len(edges), row_id)
+                    )
+                db_conn.commit()
+                processed += 1
+
+            except Exception as e:
+                log.error(f"re_embedder.reextract_row_failed episodic_id={row_id} user_id={user_id[:8]}: {e}")
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                # Poison-row guard: rows > 30 days old get exactly one best-effort
+                # pass — stamp on failure so they can't clog the LIMIT-N batch
+                # forever. Younger rows stay NULL and retry next cycle.
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE episodic_log SET reextracted_at = now()
+                            WHERE id = %s AND created_at < now() - INTERVAL '30 days'
+                            """,
+                            (row_id,)
+                        )
+                        stamped_old = cur.rowcount
+                    db_conn.commit()
+                    if stamped_old:
+                        log.warning(f"re_embedder.reextract_poison_row_stamped episodic_id={row_id} "
+                                    f"user_id={user_id[:8]} (>30d old, one best-effort pass done)")
+                except Exception as guard_err:
+                    log.error(f"re_embedder.reextract_poison_guard_failed episodic_id={row_id}: {guard_err}")
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                continue
+
+    except Exception as e:
+        log.error(f"re_embedder.reextract_error user_id={user_id[:8] if user_id else 'unknown'} schema={schema_name}: {e}")
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+
+    return processed
 
 
 def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
@@ -7694,6 +7965,26 @@ def main():
     interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
+    # Episodic re-extraction backfill config. backend_api_url is the FaultLine API
+    # front door (docker-compose service name `faultline`, port 8000 — the same
+    # host the cache-refresh POSTs below already target).
+    reextract_enabled = os.getenv("REEXTRACT_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+    reextract_batch_size = int(os.getenv("REEXTRACT_BATCH_SIZE", "5"))
+    backend_api_url = os.getenv("FAULTLINE_API_URL", "http://faultline:8000").rstrip("/")
+
+    # INGEST_ENABLED — master freeze switch ("knowledge-store mode"). When false, ALL
+    # knowledge-mutating lifecycle jobs pause: promotion, expiry/decay, episodic
+    # re-extraction, ontology candidate evaluation/decay/type-constraint sweep,
+    # pending-placement drain, synonym convergence, what-is classify, classify-climb,
+    # rung-6 convergence, async taxonomy discovery, hierarchy reconciliation staging,
+    # staged C→B rel_type upgrades, name-conflict resolution, orphan rel_type stub
+    # minting, and the inverted-staged-hierarchy startup sweep.
+    # KEEPS RUNNING: Qdrant embedding/upsert of already-committed unsynced rows,
+    # qdrant_synced bookkeeping, and reconcile_qdrant — these converge the derived
+    # index toward the frozen Postgres truth (anti-drift maintenance, not knowledge).
+    # Telemetry/pattern/presentation phases also keep running (see per-phase notes).
+    ingest_enabled = os.getenv("INGEST_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+
     if not postgres_dsn:
         log.error("POSTGRES_DSN not configured - re_embedder cannot start")
         log.error("re_embedder.startup_failed reason=missing_postgres_dsn")
@@ -7716,11 +8007,15 @@ def main():
     # (e.g. "person instance_of alexander") that were created before the ingest-path
     # cleanup was in place.  Gated here so it runs once per process start, not every
     # 60-second poll cycle.
-    try:
-        _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url)
-    except Exception as _sweep_err:
-        # Never block startup — sweep failure is non-fatal.
-        log.warning(f"re_embedder.inverted_sweep.startup_error error={_sweep_err}")
+    if ingest_enabled:
+        try:
+            _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url)
+        except Exception as _sweep_err:
+            # Never block startup — sweep failure is non-fatal.
+            log.warning(f"re_embedder.inverted_sweep.startup_error error={_sweep_err}")
+    else:
+        # Freeze: the sweep DELETEs staged_facts rows (knowledge mutation) — skipped.
+        log.info("re_embedder.ingest_disabled.inverted_sweep_skipped")
 
     # Initialize Redis client for event queue
     redis_url = os.getenv("REDIS_URL")
@@ -7736,6 +8031,36 @@ def main():
             breaker_status = _get_circuit_breaker_status()
             if breaker_status["is_open"]:
                 log.warning("re_embedder.circuit_breaker_open skipping_llm_work_this_cycle")
+
+            # INGEST_ENABLED freeze — ONE summary line per cycle (not per user/phase):
+            # all knowledge-mutating lifecycle phases below are skipped this cycle;
+            # Qdrant sync + reconciliation + telemetry/pattern phases keep running.
+            if not ingest_enabled:
+                log.info(
+                    "re_embedder.ingest_disabled.lifecycle_paused "
+                    "skipped=promotion,expiry,class_c_decay,reextract_episodic,"
+                    "ontology_eval,ontology_decay,head_tail_sweep,pending_placement_drain,"
+                    "synonym_convergence,whatis_classify,classify_climb,rung6_convergence,"
+                    "taxonomy_discovery,hierarchy_reconcile,staged_rel_upgrade,"
+                    "name_conflicts,orphan_rel_stub_mint "
+                    "running=qdrant_sync,reconcile_qdrant,gate_adjustment,pattern_jobs,"
+                    "natural_language_fill,cache_eviction"
+                )
+
+            # Resolve the backend brain's STATEMENT extractor route ONCE per cycle for
+            # the episodic re-extraction backfill (document-lane parity: route once,
+            # then per-row spine-first with /extract/rewrite fallback). Fail-safe:
+            # unreachable brain → "rewrite" (the plain backfill path). Skipped when
+            # frozen or backfill-disabled — no point probing a route we won't take.
+            reextract_route = "rewrite"
+            if ingest_enabled and reextract_enabled:
+                try:
+                    _route_resp = httpx.get(f"{backend_api_url}/internal/ingest-route", timeout=5.0)
+                    _route_resp.raise_for_status()
+                    _route = (_route_resp.json().get("statement_extractor") or "rewrite").strip().lower()
+                    reextract_route = _route if _route in ("spine", "rewrite") else "rewrite"
+                except Exception as _route_err:
+                    log.debug(f"re_embedder.reextract_route_fallback (rewrite): {_route_err}")
 
             # At the top of every iteration, before any DB query, ensure the default
             # collection exists. This recovers a deleted collection within one loop
@@ -7764,35 +8089,57 @@ def main():
                             cur.execute(f"SET search_path TO {schema_name}")
                         db_per_user.commit()
 
-                        # Promote staged facts for this user
-                        n_promoted = promote_staged_facts(db_per_user, qdrant_url, user_id=user_id, schema_name=schema_name)
-                        if n_promoted:
-                            log.info(f"re_embedder.promotion_complete user_id={user_id[:8]} schema={schema_name} promoted={n_promoted}")
+                        # INGEST_ENABLED freeze: the whole staged-fact lifecycle block
+                        # (promotion, expiry, Class C hit promotion/decay, episodic
+                        # re-extraction) mutates knowledge rows — paused as a unit.
+                        # (Cycle-level pause already logged once above, not per user.)
+                        if ingest_enabled:
+                            # Promote staged facts for this user
+                            n_promoted = promote_staged_facts(db_per_user, qdrant_url, user_id=user_id, schema_name=schema_name)
+                            if n_promoted:
+                                log.info(f"re_embedder.promotion_complete user_id={user_id[:8]} schema={schema_name} promoted={n_promoted}")
 
-                        # Expire stale Class C facts for this user
-                        n_expired = expire_staged_facts(db_per_user, qdrant_url, user_id=user_id)
-                        if n_expired:
-                            log.info(f"re_embedder.expiry_complete user_id={user_id[:8]} expired={n_expired}")
+                            # Expire stale Class C facts for this user
+                            n_expired = expire_staged_facts(db_per_user, qdrant_url, user_id=user_id)
+                            if n_expired:
+                                log.info(f"re_embedder.expiry_complete user_id={user_id[:8]} expired={n_expired}")
 
-                        # JOB 2 — Promote Class C rows that earned hit_count >= 3 (query-scoped
-                        # hits) to Class B. Classify-if-needed (default B-2). Run BEFORE the
-                        # hit-decay sweep so a row that just reached threshold promotes instead
-                        # of being decremented in the same cycle.
-                        n_c_promoted = promote_class_c_hits(
-                            db_per_user, qdrant_url, qwen_api_url,
-                            user_id=user_id, schema_name=schema_name
-                        )
-                        if n_c_promoted:
-                            log.info(f"re_embedder.class_c_promotion_complete user_id={user_id[:8]} promoted={n_c_promoted}")
+                            # Episodic re-extraction backfill: re-mine raw episodic_log
+                            # text through the normal front door (spine /harvest-spans or
+                            # /extract/rewrite → /ingest) so content the ontology couldn't
+                            # cast at capture time gets another chance after the per-tenant
+                            # ontology has grown. The cast always pays the WGM validation toll.
+                            if reextract_enabled:
+                                try:
+                                    n_reextracted = reextract_episodic(
+                                        db_per_user, backend_api_url, user_id=user_id,
+                                        schema_name=schema_name, batch_size=reextract_batch_size,
+                                        statement_route=reextract_route,
+                                    )
+                                    if n_reextracted:
+                                        log.info(f"re_embedder.reextract_complete user_id={user_id[:8]} schema={schema_name} rows={n_reextracted}")
+                                except Exception as _rex_err:
+                                    log.warning(f"re_embedder.reextract_cycle_error user_id={user_id[:8]}: {_rex_err}")
 
-                        # JOB 1 — Decay Class C query-hit counter for idle rows (30d window
-                        # elapsed with no hit): hit_count -= 1, reset window, DROP at <= 0.
-                        c_decay = decay_class_c_hits(db_per_user, qdrant_url, user_id=user_id)
-                        if c_decay["decremented"] or c_decay["dropped"]:
-                            log.info(
-                                f"re_embedder.class_c_decay user_id={user_id[:8]} "
-                                f"decremented={c_decay['decremented']} dropped={c_decay['dropped']}"
+                            # JOB 2 — Promote Class C rows that earned hit_count >= 3 (query-scoped
+                            # hits) to Class B. Classify-if-needed (default B-2). Run BEFORE the
+                            # hit-decay sweep so a row that just reached threshold promotes instead
+                            # of being decremented in the same cycle.
+                            n_c_promoted = promote_class_c_hits(
+                                db_per_user, qdrant_url, qwen_api_url,
+                                user_id=user_id, schema_name=schema_name
                             )
+                            if n_c_promoted:
+                                log.info(f"re_embedder.class_c_promotion_complete user_id={user_id[:8]} promoted={n_c_promoted}")
+
+                            # JOB 1 — Decay Class C query-hit counter for idle rows (30d window
+                            # elapsed with no hit): hit_count -= 1, reset window, DROP at <= 0.
+                            c_decay = decay_class_c_hits(db_per_user, qdrant_url, user_id=user_id)
+                            if c_decay["decremented"] or c_decay["dropped"]:
+                                log.info(
+                                    f"re_embedder.class_c_decay user_id={user_id[:8]} "
+                                    f"decremented={c_decay['decremented']} dropped={c_decay['dropped']}"
+                                )
 
                         # Fetch and embed unsynced facts for this user.
                         # TIER REALIGNMENT: the `facts` table is the HARD A/B tier, served by
@@ -7864,23 +8211,26 @@ def main():
                                 except Exception as e:
                                     log.error(f"re_embedder.staged_row_error staged_id={row['staged_id']} user_id={user_id[:8]}: {e}")
 
-                        # Post-expand reconciliation: create missing instance_of links
-                        # for entities whose entity_type matches a hierarchy node alias.
-                        try:
-                            n_reconciled = _reconcile_hierarchy_links(postgres_dsn, schema_name)
-                            if n_reconciled:
-                                log.info(f"re_embedder.hierarchy_reconciled user_id={user_id[:8]} schema={schema_name} created={n_reconciled}")
-                        except Exception as _recon_err:
-                            log.warning(f"re_embedder.hierarchy_reconcile_error user_id={user_id[:8]}: {_recon_err}")
+                        # INGEST_ENABLED freeze: both blocks below INSERT/UPDATE
+                        # knowledge rows (facts/staged_facts) — paused in knowledge-store mode.
+                        if ingest_enabled:
+                            # Post-expand reconciliation: create missing instance_of links
+                            # for entities whose entity_type matches a hierarchy node alias.
+                            try:
+                                n_reconciled = _reconcile_hierarchy_links(postgres_dsn, schema_name)
+                                if n_reconciled:
+                                    log.info(f"re_embedder.hierarchy_reconciled user_id={user_id[:8]} schema={schema_name} created={n_reconciled}")
+                            except Exception as _recon_err:
+                                log.warning(f"re_embedder.hierarchy_reconcile_error user_id={user_id[:8]}: {_recon_err}")
 
-                        # Upgrade Class C staged_facts to Class B when their rel_type
-                        # now exists in the rel_types table (approved by ontology eval).
-                        try:
-                            n_upgraded = _upgrade_staged_facts_with_known_rels(postgres_dsn, schema_name)
-                            if n_upgraded:
-                                log.info(f"re_embedder.staged_upgraded_c_to_b user_id={user_id[:8]} schema={schema_name} upgraded={n_upgraded}")
-                        except Exception as _upg_err:
-                            log.warning(f"re_embedder.staged_upgrade_error user_id={user_id[:8]}: {_upg_err}")
+                            # Upgrade Class C staged_facts to Class B when their rel_type
+                            # now exists in the rel_types table (approved by ontology eval).
+                            try:
+                                n_upgraded = _upgrade_staged_facts_with_known_rels(postgres_dsn, schema_name)
+                                if n_upgraded:
+                                    log.info(f"re_embedder.staged_upgraded_c_to_b user_id={user_id[:8]} schema={schema_name} upgraded={n_upgraded}")
+                            except Exception as _upg_err:
+                                log.warning(f"re_embedder.staged_upgrade_error user_id={user_id[:8]}: {_upg_err}")
 
                 except Exception as e:
                     # Per-tenant isolation (fail-loud, never poison the loop): a tenant with
@@ -8108,8 +8458,10 @@ def main():
                             _ont_db.commit()
 
                             # ── Ontology candidate evaluation (per-user schema) ──
+                            # INGEST_ENABLED freeze: mutates rel_types/ontology_evaluations
+                            # (ontology growth) — paused in knowledge-store mode.
                             try:
-                                if has_pending_ontology_work(_ont_db):
+                                if ingest_enabled and has_pending_ontology_work(_ont_db):
                                     ontology_stats = evaluate_ontology_candidates(_ont_db, qwen_api_url)
                                     if any(v > 0 for v in ontology_stats.values()):
                                         log.info(
@@ -8138,9 +8490,11 @@ def main():
                             # rel is LEFT for the freq>=3/LLM path. Self-isolating (failure never
                             # crashes the tenant sweep). Touches rel_types/entity_taxonomies → mark
                             # the schema changed so its overlay refreshes.
+                            # INGEST_ENABLED freeze: mutates rel_types/entity_taxonomies —
+                            # paused in knowledge-store mode.
                             try:
-                                _drain = drain_pending_placement_by_morphology(
-                                    _ont_db, postgres_dsn, _schema)
+                                _drain = (drain_pending_placement_by_morphology(
+                                    _ont_db, postgres_dsn, _schema) if ingest_enabled else {})
                                 if _drain.get("reconciled", 0) > 0:
                                     log.info(
                                         f"re_embedder.pending_placement_drain schema={_schema} "
@@ -8163,8 +8517,10 @@ def main():
                             # never crashes the tenant sweep). Touches rel_types/entity_taxonomies +
                             # writes a rel_type_aliases row → mark the schema changed AND flip
                             # _converged_any so the cross-process overlay refresh fires.
+                            # INGEST_ENABLED freeze: mutates rel_types/entity_taxonomies/
+                            # rel_type_aliases — paused in knowledge-store mode.
                             try:
-                                if _ENGINE_SYNONYM_CONVERGENCE:
+                                if ingest_enabled and _ENGINE_SYNONYM_CONVERGENCE:
                                     _synconv = converge_lifted_synonyms(
                                         _ont_db, postgres_dsn, _schema, qwen_api_url)
                                     if _synconv.get("converged", 0) > 0:
@@ -8189,8 +8545,10 @@ def main():
                             # self-isolating (failure never crashes the tenant sweep). Touching the
                             # schema's rel_types/entities/staged_facts → mark it changed so its
                             # overlay refreshes.
+                            # INGEST_ENABLED freeze: mutates rel_types/entities/staged_facts —
+                            # paused in knowledge-store mode.
                             try:
-                                if _ENGINE_WHATIS_CLASSIFY:
+                                if ingest_enabled and _ENGINE_WHATIS_CLASSIFY:
                                     _whatis = classify_unknown_concepts(_ont_db, qwen_api_url, user_id=_user_id, schema_name=_schema)
                                     if _whatis.get("classified", 0) > 0:
                                         log.info(
@@ -8218,8 +8576,10 @@ def main():
                             # (llm_learned — below user_stated, above llm_inferred). Background,
                             # bounded, self-isolating: failure never crashes the tenant sweep.
                             # Touches staged_facts/facts/ontology_evaluations → mark schema changed.
+                            # INGEST_ENABLED freeze: mutates staged_facts/facts/
+                            # ontology_evaluations — paused in knowledge-store mode.
                             try:
-                                if _ENGINE_CLASSIFY_CLIMB:
+                                if ingest_enabled and _ENGINE_CLASSIFY_CLIMB:
                                     _climb = climb_classification_chains(_ont_db, qwen_api_url, user_id=_user_id, schema_name=_schema)
                                     if _climb.get("climbed", 0) > 0 or _climb.get("quarantined", 0) > 0:
                                         log.info(
@@ -8241,8 +8601,10 @@ def main():
                             # name node by IDENTITY (no cosine). Runs every cycle; cheap (one node
                             # scan + targeted edge repoints). Self-isolating: failure never crashes
                             # the tenant sweep. This is the primary collapse that retires cosine-map.
+                            # INGEST_ENABLED freeze: repoints facts hierarchy edges —
+                            # paused in knowledge-store mode.
                             try:
-                                if _RUNG6_CONVERGENCE:
+                                if ingest_enabled and _RUNG6_CONVERGENCE:
                                     _conv = converge_hierarchy_by_identity(_ont_db, schema_name=_schema)
                                     if _conv.get("edges_repointed", 0) > 0:
                                         log.info(
@@ -8261,8 +8623,11 @@ def main():
                             # cycle (NOT gated by has_pending_ontology_work) so un-reinforced
                             # one-off candidates age out even when nothing is at threshold.
                             # Per-user schema context: search_path already set above.
+                            # INGEST_ENABLED freeze: mutates/deletes ontology_evaluations
+                            # candidate rows — paused in knowledge-store mode.
                             try:
-                                _ont_decay = decay_ontology_candidates(_ont_db, user_id=_user_id)
+                                _ont_decay = (decay_ontology_candidates(_ont_db, user_id=_user_id)
+                                              if ingest_enabled else {"decayed": 0, "forgotten": 0})
                                 if _ont_decay["decayed"] or _ont_decay["forgotten"]:
                                     log.info(
                                         f"re_embedder.ontology_candidate_decay schema={_schema} "
@@ -8316,17 +8681,21 @@ def main():
                             # Severance #2, Phase 2: self-heal rel_types rows with NULL/empty
                             # head_types/tail_types. Bounded batch per cycle (LIMIT 10). Uses the
                             # SAME LLM metadata call so type constraints come from inference.
+                            # INGEST_ENABLED freeze: the sweep UPDATEs rel_types type
+                            # constraints (ontology mutation) — no rows selected when frozen.
                             try:
-                                with _ont_db.cursor() as cur:
-                                    cur.execute(
-                                        "SELECT rel_type, head_types, tail_types, natural_language"
-                                        " FROM rel_types"
-                                        " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
-                                        "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
-                                        " ORDER BY confidence DESC NULLS LAST"
-                                        " LIMIT 10"
-                                    )
-                                    _sweep_rows = cur.fetchall()
+                                _sweep_rows = []
+                                if ingest_enabled:
+                                    with _ont_db.cursor() as cur:
+                                        cur.execute(
+                                            "SELECT rel_type, head_types, tail_types, natural_language"
+                                            " FROM rel_types"
+                                            " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
+                                            "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                                            " ORDER BY confidence DESC NULLS LAST"
+                                            " LIMIT 10"
+                                        )
+                                        _sweep_rows = cur.fetchall()
 
                                 for _rt, _ht, _tt, _nl in _sweep_rows:
                                     try:
@@ -8416,7 +8785,9 @@ def main():
                     from src.api.main import _llm_discover_taxonomy_from_facts, _load_taxonomy_cache
                     from src.api.llm_client import build_llm_payload
 
-                    for _tx_user_id, _tx_schema in ready_schemas:
+                    # INGEST_ENABLED freeze: taxonomy discovery INSERTs entity_taxonomies
+                    # rows (ontology growth) — iterate no schemas in knowledge-store mode.
+                    for _tx_user_id, _tx_schema in (ready_schemas if ingest_enabled else []):
                         try:
                             with psycopg2.connect(postgres_dsn) as _tx_db:
                                 with _tx_db.cursor() as _spc:
@@ -8526,8 +8897,10 @@ def main():
 
                             # dprompt-121: Resolve name conflicts via LLM context evaluation
                             # Event-driven: only run if there are pending conflicts
+                            # INGEST_ENABLED freeze: conflict arbitration mutates entities/
+                            # entity_aliases (preferred flags, merges) — paused when frozen.
                             try:
-                                if has_pending_name_conflicts(_gw_db):
+                                if ingest_enabled and has_pending_name_conflicts(_gw_db):
                                     conflict_stats = resolve_name_conflicts(_gw_db, qwen_api_url)
                                     if conflict_stats["resolved"] > 0:
                                         log.info(
@@ -8677,33 +9050,38 @@ def main():
                             with psycopg2.connect(postgres_dsn) as _stub_db:
                                 with _stub_db.cursor() as _spc:
                                     _spc.execute(f"SET search_path TO {_us_schema}")
-                                with _stub_db.cursor() as _scur:
-                                    _scur.execute(
-                                        """
-                                        -- source MUST satisfy rel_types_source_check
-                                        -- (wikidata|builtin|engine|user|expand); an
-                                        -- engine-minted stub is 'engine'. A non-allowed
-                                        -- literal fails the INSERT every cycle → the
-                                        -- orphan rel never back-mints, renders verb-less.
-                                        INSERT INTO rel_types (rel_type, label, confidence, source, engine_generated, created_at)
-                                        SELECT used.rel_type,
-                                               initcap(replace(used.rel_type, '_', ' ')),
-                                               0.6, 'engine', true, now()
-                                        FROM (
-                                            SELECT DISTINCT lower(rel_type) AS rel_type FROM facts
-                                            WHERE rel_type IS NOT NULL
-                                            UNION
-                                            SELECT DISTINCT lower(rel_type) AS rel_type FROM staged_facts
-                                            WHERE rel_type IS NOT NULL
-                                        ) AS used
-                                        LEFT JOIN rel_types rt ON rt.rel_type = used.rel_type
-                                        WHERE rt.rel_type IS NULL
-                                          AND used.rel_type <> 'context'
-                                        ON CONFLICT (rel_type) DO NOTHING
-                                        """
-                                    )
-                                    _orphan_stubs = _scur.rowcount
-                                _stub_db.commit()
+                                # INGEST_ENABLED freeze: the stub mint INSERTs new rel_types
+                                # rows (ontology growth) — skipped when frozen. The FILL below
+                                # (presentation-metadata columns on EXISTING rows) keeps running.
+                                _orphan_stubs = 0
+                                if ingest_enabled:
+                                    with _stub_db.cursor() as _scur:
+                                        _scur.execute(
+                                            """
+                                            -- source MUST satisfy rel_types_source_check
+                                            -- (wikidata|builtin|engine|user|expand); an
+                                            -- engine-minted stub is 'engine'. A non-allowed
+                                            -- literal fails the INSERT every cycle → the
+                                            -- orphan rel never back-mints, renders verb-less.
+                                            INSERT INTO rel_types (rel_type, label, confidence, source, engine_generated, created_at)
+                                            SELECT used.rel_type,
+                                                   initcap(replace(used.rel_type, '_', ' ')),
+                                                   0.6, 'engine', true, now()
+                                            FROM (
+                                                SELECT DISTINCT lower(rel_type) AS rel_type FROM facts
+                                                WHERE rel_type IS NOT NULL
+                                                UNION
+                                                SELECT DISTINCT lower(rel_type) AS rel_type FROM staged_facts
+                                                WHERE rel_type IS NOT NULL
+                                            ) AS used
+                                            LEFT JOIN rel_types rt ON rt.rel_type = used.rel_type
+                                            WHERE rt.rel_type IS NULL
+                                              AND used.rel_type <> 'context'
+                                            ON CONFLICT (rel_type) DO NOTHING
+                                            """
+                                        )
+                                        _orphan_stubs = _scur.rowcount
+                                    _stub_db.commit()
                                 if _orphan_stubs and _orphan_stubs > 0:
                                     log.info(f"re_embedder.orphan_rel_stubs_minted schema={_us_schema} count={_orphan_stubs}")
                                     _changed_schemas.add(_us_schema)

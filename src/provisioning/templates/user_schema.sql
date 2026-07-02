@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS facts (
     -- NULL = live; non-NULL = forgotten (hidden from ALL reads, purge target). A forget sets
     -- archived_at + deleted_at together (recoverable for the grace window); un-forget clears both.
     deleted_at TIMESTAMPTZ,
+    -- Citable provenance (migration 128): document/web source reference (URL, filename,
+    -- title) threaded from the ingest_document lane. NULL for conversational facts.
+    source_ref TEXT,
     UNIQUE(subject_id, object_id, rel_type),
     CONSTRAINT chk_facts_fact_provenance CHECK (fact_provenance IN ('user_stated', 'llm_inferred', 'llm_learned')),
     CONSTRAINT chk_facts_temporal_status CHECK (temporal_status IN ('now', 'past', 'future')),
@@ -92,6 +95,8 @@ ALTER TABLE facts ADD COLUMN IF NOT EXISTS event_date_granularity TEXT;
 ALTER TABLE facts ADD COLUMN IF NOT EXISTS polarity TEXT NOT NULL DEFAULT 'affirmed';
 -- Idempotent backfill for tenant schemas created before migration 097 (tombstone).
 ALTER TABLE facts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- Idempotent backfill for tenant schemas created before migration 128 (citable provenance).
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS source_ref TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_facts_deleted_at
     ON facts (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -148,6 +153,9 @@ CREATE TABLE IF NOT EXISTS staged_facts (
     -- A tombstoned staged row is frozen from lifecycle bumps (no expires_at reset / no
     -- confirmed_count / hit_count bump) so it cannot re-promote or un-expire; un-forget clears it.
     deleted_at TIMESTAMPTZ,
+    -- Citable provenance (migration 128): mirror of facts.source_ref — document/web source
+    -- reference threaded from the ingest_document lane; survives B→facts promotion.
+    source_ref TEXT,
     UNIQUE(subject_id, object_id, rel_type),
     CONSTRAINT chk_staged_facts_fact_provenance CHECK (fact_provenance IN ('user_stated', 'llm_inferred', 'llm_learned')),
     CONSTRAINT chk_staged_facts_temporal_status CHECK (temporal_status IN ('now', 'past', 'future')),
@@ -164,6 +172,8 @@ ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS event_date_granularity TEXT;
 ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS polarity TEXT NOT NULL DEFAULT 'affirmed';
 -- Idempotent backfill for tenant schemas created before migration 097 (tombstone).
 ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- Idempotent backfill for tenant schemas created before migration 128 (citable provenance).
+ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS source_ref TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_staged_facts_deleted_at
     ON staged_facts (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -1068,3 +1078,39 @@ CREATE INDEX IF NOT EXISTS idx_entity_synonyms_term
 -- per-entity sweep (CASCADE/merge/entity-scoped CRUD, and the density-count join in IMPL-3)
 CREATE INDEX IF NOT EXISTS idx_entity_synonyms_entity
     ON {schema_name}.entity_synonyms (entity_id);
+
+-- ============================================================================
+-- episodic_log — durable, append-only, VERBATIM record of every ingest input,
+--   captured BEFORE extraction. When extraction is weak (short fragments,
+--   misrouted queries, no-triple ramblings) the original words are otherwise
+--   lost forever. This is a pure safety net: it does NOT touch the WGM gate,
+--   class assignment, or query scope, and writes to it must never block or
+--   fail ingest. reextracted_at + the partial index support a future
+--   re-mining backfill scan.
+--
+-- Per-tenant: search_path has NO public, so this table MUST exist in every
+--   tenant schema. NO public seed — episodic rows are inherently user-specific
+--   (created empty per tenant). user_id is stored for traceability (per the
+--   entity_attributes/staged_facts convention); row isolation is provided by
+--   the schema, not user_id scoping.
+-- (migration 127 backfills this table into existing provisioned schemas)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS {schema_name}.episodic_log (
+    id                   BIGSERIAL   PRIMARY KEY,
+    user_id              TEXT        NOT NULL,
+    raw_text             TEXT        NOT NULL,
+    source               TEXT,
+    source_ref           TEXT,
+    intent               TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    extracted_fact_count INTEGER     DEFAULT NULL,
+    reextracted_at       TIMESTAMPTZ DEFAULT NULL
+);
+
+-- Partial index supporting the future re-extraction backfill scan.
+CREATE INDEX IF NOT EXISTS idx_episodic_log_reextract
+    ON {schema_name}.episodic_log (reextracted_at) WHERE reextracted_at IS NULL;
+
+-- Chronological scan index.
+CREATE INDEX IF NOT EXISTS idx_episodic_log_created_at
+    ON {schema_name}.episodic_log (created_at);
