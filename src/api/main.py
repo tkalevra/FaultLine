@@ -700,7 +700,7 @@ def _detect_event_states(text: str, reference=None) -> list[dict]:
         # MULTIPLE OCCURRENCES PER CLAUSE (Q2 PRIMARY): enumerate EVERY eventive head so a titled
         # sibling occurrence ("…workshops, like the workshop on 'Effective Time Management'") is no
         # longer dropped. analyze_event used to return only the first head.
-        _evs = analyze_events(_es_text)
+        _evs = analyze_events(_es_text, dated=bool(_es_iso))
         # INCHOATIVE FALLBACK (q7 gap): "I started <item> on DATE" / "I began <item>" — the event
         # meaning is on the VERB (ingressive aspect), not an eventive noun, so the LVC lane misses
         # it. analyze_inchoative recognizes the ingressive-verb + concrete-direct-object shape and
@@ -1588,7 +1588,7 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
         # two titled occurrences). analyze_events enumerates EVERY eventive head; the old single-head
         # analyze_event dropped all but the first. Each occurrence carries the clause's peeled date.
         try:
-            _evs = analyze_events(_residue)
+            _evs = analyze_events(_residue, dated=bool(c_iso))
             # INCHOATIVE FALLBACK (q7 gap): "started <item> on DATE" — the event meaning is on the
             # ingressive VERB, not an eventive noun, so the LVC lane misses it. Recognize the
             # ingressive-verb + concrete-direct-object shape per clause so the dated start reifies as
@@ -15670,6 +15670,30 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # type-NP with no closer antecedent resolves back to it (consolidate onto ONE entity). None until
     # set / when ambiguous (coordinated competing subjects) → no cross-sentence rebinding.
     _discourse_topic = None
+    # TURN-LEVEL PERSON ANTECEDENT POOL (atom-order-INDEPENDENT object-pronoun coref). Computed ONCE
+    # from the WHOLE marker-stripped turn via spaCy PERSON NER — the SAME pool regardless of how the
+    # non-deterministic LLM atomizer splits / reorders / drops atoms. Threaded into every atom's
+    # derive_sentence_facts so a 3rd-person object pronoun ("…started working with HER") resolves to the
+    # turn's UNAMBIGUOUS person ("Rachel", introduced in a SIBLING atom) DETERMINISTICALLY — the fix for
+    # the 2c63a862 flake, where the prior-atom ``_prior_nps`` accumulator only carried "Rachel" on the
+    # runs the atomizer happened to emit it first. The deriver uses it ONLY when a single distinct person
+    # is present (else defers). Lowercased surfaces, deduped. Fail-safe: NER unavailable / any error →
+    # empty pool → today's prior_nps behavior (never blocks capture).
+    _turn_persons: list[str] = []
+    try:
+        from src.extraction.linguistics import _get_nlp_ner as _tp_ner
+        _ner = _tp_ner()
+        if _ner is not None and text:
+            _tp_seen: set = set()
+            for _e in _ner(text).ents:
+                if _e.label_ == "PERSON":
+                    _ps = (_e.text or "").strip().lower()
+                    if _ps and _ps not in _tp_seen:
+                        _tp_seen.add(_ps)
+                        _turn_persons.append(_ps)
+    except Exception as _tpe:  # noqa: BLE001 — NER hiccup never blocks capture
+        log.debug("sentence_pipeline.turn_persons_failed", error=str(_tpe)[:120])
+        _turn_persons = []
     # gap-2 §10.3: a declarative content-bearing sentence that yields ZERO edges even AFTER the
     # chains + the gated LLM relation-fill is the failure-residue → the MINIMIZED last resort
     # (Class C via the EXISTING store_context). We collect those sentences here and route them once,
@@ -15700,7 +15724,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 _facts = derive_sentence_facts(
                     _typed_doc if _typed_doc is not None else _sent,
                     reference, prior_nps=list(_prior_nps),
-                    discourse_topic=_discourse_topic)
+                    discourse_topic=_discourse_topic,
+                    turn_persons=_turn_persons)
             except Exception as _de:  # noqa: BLE001 — per-sentence fail-safe
                 log.debug("sentence_pipeline.derive_failed", error=str(_de)[:120])
                 _facts = []
@@ -33285,6 +33310,34 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
             log.debug("convert_to_prose.occurrence_about_index_failed", error=str(_smi)[:120])
             occurrence_about_id = {}
 
+        # SUBJECT-MATTER STANDALONE-RENDER SUPPRESSION (presentation dedup — the ALLOWED read-time
+        # exception). The occurrence's subject-matter (<occurrence>, related_to, <specific>) edge is
+        # FOLDED INTO the participated_in occurrence line below ("You participated in issue WITH gps
+        # system"). Left alone, that SAME edge ALSO renders as its own bare "<occurrence> is related
+        # to <specific>" line — a redundant/stray noise line for content already shown on the
+        # occurrence. De-dup at RENDER: collect the (occurrence_id, subject-matter_id) pairs that a
+        # participated_in occurrence PRESENT IN THIS fact set consumes, and skip the standalone render
+        # of exactly those edges. UUID-keyed (never display names), subject-agnostic. The subject-
+        # matter CONTENT is preserved (it reads on the occurrence line); only the duplicate bare edge
+        # is dropped. Fail-safe: no occurrence / no subject-matter → empty set → every edge renders as
+        # today. Gated on the participated_in edge being present so a related_to that is NOT an
+        # occurrence's subject-matter (an ordinary loose link) is never suppressed.
+        _subject_matter_consumed: set = set()
+        try:
+            _participated_occ_ids: set = set()
+            for _f in facts:
+                if (_f.get("rel_type", "").lower() == "participated_in"):
+                    _poid = _f.get("_object_id") or _f.get("object_id") or _f.get("object")
+                    if _poid:
+                        _participated_occ_ids.add(_poid)
+            _subject_matter_consumed = {
+                (_occ, _about) for _occ, _about in occurrence_about_id.items()
+                if _occ in _participated_occ_ids and _about
+            }
+        except Exception as _smc:
+            log.debug("convert_to_prose.subject_matter_consumed_index_failed", error=str(_smc)[:120])
+            _subject_matter_consumed = set()
+
         # NAMED-INSTANCE TYPE INDEX (lean-query rendering, generalized): the SAME
         # (<entity>, instance_of, <type>) machinery that lets a participated_in occurrence
         # render with its type word ("…webinar") also lets a RELATIONAL named instance render
@@ -33341,6 +33394,18 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         and not _REL_TYPE_META.get(rel_type, {}).get("is_hierarchy_rel")):
                     log.debug("convert_to_prose.group_scaffold_suppressed",
                               rel_type=rel_type, object=str(object_id)[:8])
+                    continue
+
+                # SUBJECT-MATTER REDUNDANCY SUPPRESSION (presentation dedup): this edge is an
+                # occurrence's subject-matter that the participated_in render already FOLDS into the
+                # occurrence line ("…with <specific>"). Skip its redundant STANDALONE render so the
+                # subject-matter reads ONCE, cleanly, without the bare "<occurrence> is related to
+                # <specific>" noise line. UUID-keyed on the consumed set built above (the participated_in
+                # occurrence for this pair is present in the fact set); the CONTENT is not dropped — it
+                # stays on the occurrence line. Fail-safe: empty set → renders as today.
+                if (subject_id, object_id) in _subject_matter_consumed:
+                    log.debug("convert_to_prose.subject_matter_standalone_suppressed",
+                              occurrence=str(subject_id)[:8], about=str(object_id)[:8])
                     continue
 
                 # Get natural_language template — fall back to label then rel_type

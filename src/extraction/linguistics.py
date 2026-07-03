@@ -2305,6 +2305,41 @@ def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
     return None
 
 
+def _svo_object_pronoun(verb_tok, exclude_idx=None):
+    """The 3rd-person PERSONAL-PRONOUN object a verb governs (``dobj``/``obj``, or the ``pobj`` of a
+    load-bearing preposition), or ``None`` — the pronoun COMPANION to ``_svo_object_head``.
+
+    ``_svo_object_head`` deliberately returns only NOUN/PROPN objects ("a pronoun/clause object is not
+    a mergeable entity"), which DROPS an object-pronoun clause entirely: "I started working with HER on
+    2/15" yields no object → no edge → the date on that clause has nothing to bind to. This surfaces the
+    object PRONOUN so the caller can resolve it by COREFERENCE to a named person (nearest preceding
+    PROPN / prior-atom NP) BEFORE emitting — grounding "work_with her" to (user, work_with, rachel).
+
+    Grammar/morphology only (``_is_third_person_pronoun`` — Person=3, PronType=Prs), subject-agnostic,
+    NO token list. ``exclude_idx`` skips peeled date-span tokens (parity with ``_svo_object_head``).
+    Fail-safe: any miss/parse error → ``None`` (the caller keeps today's drop, never a guessed name)."""
+    try:
+        _excl = exclude_idx or ()
+
+        def _ok(_t):
+            return _t is not None and _t.i not in _excl and _is_third_person_pronoun(_t)
+
+        # Direct object pronoun ("she helped HER") first.
+        for c in verb_tok.children:
+            if c.dep_ in ("dobj", "obj") and _ok(c):
+                return c
+        # Prepositional object pronoun of a load-bearing preposition ("working WITH her").
+        _particles = _svo_keep_particles()
+        for c in verb_tok.children:
+            if c.dep_ == "prep" and (c.text or "").strip().lower() in _particles:
+                for gc in c.children:
+                    if gc.dep_ == "pobj" and _ok(gc):
+                        return gc
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
 def _carried_subject_token(verb_tok):
     r"""The COREFERENCE-CARRIED subject token for a SUBORDINATE / COORDINATED predicate that lacks its
     OWN grammatical subject — the deterministic key to DENSE multi-predicate decomposition.
@@ -2427,6 +2462,33 @@ def _verb_realizes_resultant_state(verb_tok) -> bool:
         if "Past" in _morph.get("Tense") or "Perf" in _morph.get("Aspect"):
             return True
     except Exception:  # noqa: BLE001 — fail-safe: undecidable → not provably a resultant state
+        return False
+    return False
+
+
+def _verb_is_present_simple(verb_tok) -> bool:
+    """True when a verb is realized in the PRESENT SIMPLE (finite, non-perfective, non-progressive)
+    — the STATIVE-possession frame of a light verb ("I HAVE a car", "I ATTEND a class"), as opposed
+    to a realized PAST/perfective occurrence ("I HAD a meeting", "I ATTENDED a webinar") or an
+    ongoing progressive ("I have been ATTENDING …").
+
+    Grammar/morphology ONLY (spaCy ``tag_``/``morph`` — NO verb list): present-simple finite
+    realization is ``tag_ ∈ {VBP, VBZ}``, or ``Tense=Pres`` with ``VerbForm=Fin`` and NO
+    ``Aspect=Perf/Prog``. A present-simple LIGHT verb governing a concrete direct object is
+    overwhelmingly STATIVE POSSESSION, not an eventive occurrence — the discriminator the LVC
+    direct-object lane uses to avoid minting a bogus ``(user, participated_in, car)`` on "have a car"
+    while keeping every DATED or realized-PAST occurrence. GROUNDING: spaCy ``tag_`` (Penn Treebank
+    VBP/VBZ = non-3rd/3rd-person present) + Universal-Features Tense/Aspect/VerbForm (spaCy
+    glossary/UD). Subject-agnostic, fail-safe (undecidable → False → today's behavior: the occurrence
+    is KEPT — never drop a genuine occurrence on a parse miss)."""
+    try:
+        if (verb_tok.tag_ or "") in ("VBP", "VBZ"):
+            return True
+        _m = verb_tok.morph
+        if ("Pres" in _m.get("Tense") and "Fin" in _m.get("VerbForm")
+                and "Perf" not in _m.get("Aspect") and "Prog" not in _m.get("Aspect")):
+            return True
+    except Exception:  # noqa: BLE001 — fail-safe: undecidable → not present-simple (keep occurrence)
         return False
     return False
 
@@ -3527,7 +3589,7 @@ def _is_first_person_possessed(pobj_tok) -> bool:
         return False
 
 
-def _collect_eventive_heads(tok, text: str) -> list:
+def _collect_eventive_heads(tok, text: str, dated: bool = False) -> list:
     r"""Enumerate EVERY eventive head NP reachable from a support verb ``tok`` (T1 PRIMARY fix).
 
     THE GAP (Q2): the old single-head selection returned the FIRST support-verb object and dropped
@@ -3663,6 +3725,19 @@ def _collect_eventive_heads(tok, text: str) -> list:
         # (a) direct object — NOUN only (PROPN dobj of have/get is possession, not an event).
         for c in tok.children:
             if c.dep_ in ("dobj", "obj") and c.pos_ == "NOUN" and not _is_date_tok(c):
+                # OVER-CAPTURE GATE (present-simple STATIVE POSSESSION): a light verb in the PRESENT
+                # SIMPLE governing a concrete direct object is stative possession ("I HAVE a car"),
+                # NOT an eventive occurrence — minting (user, participated_in, car) is junk. Admit the
+                # direct-object occurrence only when it is EVENT-FRAMED: the clause carries a real date
+                # (``dated`` — the occurrence seam's raison d'être: a dated event) OR the verb is a
+                # realized past/perfective/progressive occurrence ("HAD a meeting", "ATTENDED a
+                # webinar", "been ATTENDING"). Grammar-only (tense/aspect morphology via
+                # _verb_is_present_simple), subject-agnostic, NO noun/verb list; fail-safe (undecidable
+                # tense → kept). A genuine dated/past occurrence is untouched — only a present-simple
+                # UNDATED possession clause is dropped here. The prep/pobj/conj branches below are the
+                # inherently-directional/eventive constructions ("went TO a concert") and are NOT gated.
+                if not dated and _verb_is_present_simple(tok):
+                    continue
                 _add(c)
         # (b) governed-prep objects — every NOUN pobj, plus a QUOTED PROPN pobj (named occurrence).
         # Governed preps hang DIRECTLY off the verb ("went TO a concert") OR off its prt/advmod in a
@@ -3944,9 +4019,16 @@ def _build_event_analysis(event_noun, tok, text: str):
         return None
 
 
-def analyze_events(text: str) -> list:
+def analyze_events(text: str, dated: bool = False) -> list:
     r"""Deterministic capture of ALL light-verb + eventive-noun occurrences in ``text`` (T1 PRIMARY).
     Returns a ``list[EventAnalysis]`` (possibly empty) — one entry per distinct eventive head.
+
+    ``dated`` (default False) — the CALLER's signal that this clause carried a real, peeled
+    ``event_date``. It relaxes the present-simple stative-possession gate on the LVC direct-object
+    lane (a DATED present-tense event — "I have a meeting on Jan 15" — is a genuine occurrence),
+    while a present-simple UNDATED direct-object clause ("I have a car") is dropped as possession.
+    The date is peeled UPSTREAM (out of ``text``), so the gate cannot see it here — the caller,
+    which HAS the peeled date, passes ``dated=bool(iso)``.
 
     THE RULE (subject-agnostic, dependency-driven — NO event word-list):
       Find a SUPPORT verb (lemma in the bounded LVC support-verb class) whose subject
@@ -3993,7 +4075,7 @@ def analyze_events(text: str) -> list:
             )
             if not subj_self:
                 continue
-            for _head in _collect_eventive_heads(tok, text):
+            for _head in _collect_eventive_heads(tok, text, dated=dated):
                 _ea = _build_event_analysis(_head, tok, text)
                 if _ea is None:
                     continue
@@ -4883,7 +4965,7 @@ def _thin_type_for_token(tok) -> str | None:
 
 
 def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_only=False,
-                          named_role_only=False, discourse_topic=None):
+                          named_role_only=False, discourse_topic=None, turn_persons=None):
     r"""Derive the FULL structured fact set for ONE clean sentence (ClausIE-lite, deterministic).
 
     Returns ``list[SentenceFact]``. This is the clean-sentence deriver the harvest's
@@ -5244,6 +5326,27 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # Resolve a 3rd-person pronoun (it/they/them) with no in-sentence antecedent to the most-recent
     # compatible prior-turn NP. Fail-safe: no antecedent → leave the pronoun. (Was "Rule 1".)
     _prior = [p for p in (prior_nps or []) if p and str(p).strip()]
+    # TURN-LEVEL PERSON ANTECEDENT POOL (atom-order-INDEPENDENT coref). The atomizer split of a turn
+    # is non-deterministic: the ``prior_nps`` accumulator (built from EARLIER-ATOM edge OBJECTS) only
+    # carries a name like "Rachel" when the earlier atom happened to emit an edge with that object AND
+    # the atomizer kept that atom BEFORE the pronoun's atom. When it doesn't, a 3rd-person object
+    # pronoun ("…started working with HER") has no antecedent and the dated edge is dropped on SOME
+    # runs (the 2c63a862 flake). ``turn_persons`` is the turn's PERSON proper-noun mentions computed
+    # ONCE from the WHOLE turn (spaCy PERSON NER, upstream in the harvest) — the SAME pool regardless of
+    # how the atomizer splits/reorders/loses atoms. A pronoun with no closer antecedent resolves to the
+    # turn's UNAMBIGUOUS person (exactly one distinct PERSON in the turn). Type-agreement is inherent
+    # (a PERSON-NER pool + a 3rd-person PERSONAL pronoun). Multiple persons → ambiguous → NOT used here
+    # (fall through to prior_nps / defer — never guess). Lowercased, deduped, order-preserved.
+    _turn_persons: list[str] = []
+    try:
+        _seen_tp: set[str] = set()
+        for _p in (turn_persons or []):
+            _pl = str(_p or "").strip().lower()
+            if _pl and _pl not in _seen_tp:
+                _seen_tp.add(_pl)
+                _turn_persons.append(_pl)
+    except Exception:  # noqa: BLE001 — fail-safe: bad pool → no turn-person coref
+        _turn_persons = []
 
     def _coref(tok):
         try:
@@ -6608,6 +6711,22 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             obj_tok = _svo_object_head(svo_head, exclude_idx=_date_token_idx, include_agent=True)
             if obj_tok is None:
+                # OBJECT-PRONOUN COREF RESCUE: a 3rd-person personal pronoun in object position
+                # ("I started working with HER on 2/15") is not a mergeable entity, so
+                # _svo_object_head returns None and the clause — WITH ITS DATE — is dropped
+                # (the "her" reading of the Rachel-start event, the LongMemEval 2c63a862 miss).
+                # Resolve the pronoun to the nearest preceding named person (intra-doc PROPN, else
+                # the prior-atom NP) via the SAME _person_coref the copula-measure / passive-event
+                # chains already use, and emit the edge with the RESOLVED NAME so it grounds to
+                # (user, work_with, rachel) @ event_date. Grammar-only (PronType=Prs, Person=3
+                # inside _person_coref); fail-safe: no antecedent → no edge (today's drop, never a
+                # guessed name). obj_tok is the pronoun token so the date still binds to this clause.
+                _pron = _svo_object_pronoun(svo_head, exclude_idx=_date_token_idx)
+                if _pron is not None:
+                    _res = _person_coref(_pron)
+                    if _res:
+                        _emit(subject, predicate, _res, verb_tok=svo_head,
+                              obj_tok=_pron, subj_tok=subj_tok)
                 continue
             for _ct in _np_conjuncts(obj_tok):  # conjunct/dash-list distribution
                 if _ct.i in _ni_suppress:
@@ -7223,6 +7342,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         best = (_t.text or "").strip().lower()
             if best:
                 return best
+            # TURN-LEVEL PERSON (atom-order-INDEPENDENT): no closer antecedent in THIS atom → resolve to
+            # the turn's UNAMBIGUOUS person (exactly one distinct PERSON across the WHOLE turn, computed
+            # upstream by PERSON NER and threaded in). This binds "…started working with HER" → "Rachel"
+            # (introduced in a SIBLING atom) on EVERY run regardless of how the atomizer split / reordered
+            # / lost atoms — the deterministic resolve of the 2c63a862 flake (the ``_prior`` accumulator
+            # only carried "Rachel" when an earlier atom happened to emit it as an edge object first).
+            # Type-agreeing by construction (a PERSON-NER pool + a 3rd-person PERSONAL pronoun) and
+            # preferred over the untyped ``_prior`` NP fallback (which could bind a non-person NP). Two or
+            # more distinct persons → ambiguous → fall through (never guess); zero → fall through.
+            if len(_turn_persons) == 1:
+                return _turn_persons[0]
             # else fall back to the most-recent cross-sentence antecedent (a bound name from a prior atom)
             for cand in reversed(_prior):
                 c = str(cand).strip().lower()
