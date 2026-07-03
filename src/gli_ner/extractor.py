@@ -16,9 +16,16 @@ class GLiNERAdapter:
 
 
 def load_default_model(labels=None) -> "GLiNERAdapter":
-    """Load the real GLiNER model from HuggingFace and wrap it in GLiNERAdapter."""
+    """Load the real GLiNER model from HuggingFace and wrap it in GLiNERAdapter.
+
+    [it branch] MULTILINGUAL default. GLiNER purity (Pitfall 11) is unchanged — the labels
+    stay concise zero-shot type names; only the underlying weights become multilingual so
+    Italian (and any language) entity typing works. Env-overridable via GLINER_MODEL. NOTE:
+    audit for OTHER GLiNER load sites before relying on this (see DEV/DESIGN-italian-lang.md)."""
+    import os
     from gliner import GLiNER
-    base = GLiNER.from_pretrained("urchade/gliner_medium-v2.1")
+    _model = os.environ.get("GLINER_MODEL", "urchade/gliner_multi-v2.1")
+    base = GLiNER.from_pretrained(_model)
     return GLiNERAdapter(base, labels=labels)
 
 

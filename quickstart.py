@@ -243,7 +243,7 @@ _DEFAULT_MODEL = {
 
 def configure_backend():
     backend = choose(
-        "Which LLM are you already running? (FaultLine connects to it — it doesn't host one)",
+        "Quale LLM stai già usando? (FaultLine si collega ad esso — non ne ospita uno)",
         _BACKENDS,
     )
     cfg = {"LLM_BACKEND_TYPE": backend, "LLM_API_KEY": "", "WGM_LLM_MODEL": "", "LLM_BASE_URL": ""}
@@ -325,7 +325,7 @@ def configure_embeddings(llm_cfg):
     embed model might be on another box), then we do an ACTUAL model pull against
     it (probe → pick from the served list, no blind typing).
     """
-    print(bold("Embeddings") + dim("  (vectorize facts for the Class-C short-term recall lane)"))
+    print(bold("Embedding") + dim("  (vettorizza i fatti per la corsia di richiamo a breve termine, Classe C)"))
     print(dim("  FaultLine has a built-in LOCAL CPU embedder (nomic) — works out of the box,"))
     print(dim("  offline, no setup."))
     if not ask_yes("Choose your own embedding model, or use the standard built-in one?", default_yes=False):
@@ -402,7 +402,7 @@ def configure_identity():
         opts.insert(0, ("reuse", f"Keep the id already in .env  ({existing})"))
 
     while True:
-        mode = choose("Set your FAULTLINE_USER_ID (the memory tenant owner):", opts)
+        mode = choose("Imposta il tuo FAULTLINE_USER_ID (il proprietario del tenant di memoria):", opts)
 
         if mode == "reuse":
             return existing
@@ -483,7 +483,7 @@ def configure_naming():
     Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
     DB that isn't up yet (the stack may not be built).
     """
-    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix, Qdrant collection)"))
+    print(bold("Nomi delle risorse") + dim("  (DB Postgres, prefisso schema per-tenant, collezione Qdrant)"))
     print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
     base_dsn = _default_dsn()
 
@@ -564,7 +564,7 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
 # ── next steps ────────────────────────────────────────────────────────────────
 def print_next_steps(mcp_key):
     hr()
-    print(bold("You're set. Next steps:\n"))
+    print(bold("Tutto pronto. Prossimi passi:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
     print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
     print(f"       expect: {dim(chr(34) + 'database:ok, qdrant:ok, llm:ok' + chr(34))}")
@@ -794,9 +794,10 @@ def main():
     # LANGUAGE FIRST — before prereqs / .env. Italian switches to the `it` branch and re-execs.
     language_gate()
 
-    print(bold(cyan("\n  FaultLine — quickstart setup\n")))
-    print("  A per-tenant, write-validated knowledge-graph memory for your LLM.")
-    print(dim("  Connects to your LLM, confirms it, and writes a ready-to-use .env.\n"))
+    print(bold(cyan("\n  FaultLine — installazione rapida  (ramo IT — sperimentale)\n")))
+    print("  Una memoria a grafo della conoscenza, per tenant e validata in scrittura, per il tuo LLM.")
+    print(dim("  Si collega al tuo LLM, lo verifica e scrive un file .env pronto all'uso."))
+    print(yellow("  ⚠ Versione sperimentale e non ufficiale — vedi LEGGIMI-it.md. Usare a proprio rischio.\n"))
     hr()
     check_prereqs()
     hr()
@@ -807,12 +808,12 @@ def main():
     embed_overrides = configure_embeddings(cfg)
 
     hr()
-    print(bold("MCP API key") + dim("  (secures the MCP server on :8002 — recommended)"))
-    if ask_yes("Generate a strong MCP_API_KEY for you now?", default_yes=True):
+    print(bold("Chiave API MCP") + dim("  (protegge il server MCP su :8002 — consigliata)"))
+    if ask_yes("Genero subito una MCP_API_KEY robusta?", default_yes=True):
         mcp_key = secrets.token_urlsafe(32)
-        print(green(f"  ✓ generated: {mcp_key}"))
+        print(green(f"  ✓ generata: {mcp_key}"))
     else:
-        mcp_key = ask("Enter an MCP_API_KEY (blank = leave open, dev only)", "")
+        mcp_key = ask("Inserisci una MCP_API_KEY (vuoto = aperta, solo sviluppo)", "")
 
     hr()
     faultline_user_id = configure_identity()
@@ -825,12 +826,12 @@ def main():
     print_next_steps(mcp_key)
 
     print()
-    if ask_yes("Build + start the stack now (docker compose up -d --build)?", default_yes=False):
+    if ask_yes("Compilo e avvio lo stack ora (docker compose up -d --build)?", default_yes=False):
         try:
             subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=HERE, check=False)
             _poll_health()
         except Exception as e:
-            print(red(f"  could not launch docker compose: {e}"))
+            print(red(f"  impossibile avviare docker compose: {e}"))
 
     print_integration_guide(mcp_key, faultline_user_id)
 
