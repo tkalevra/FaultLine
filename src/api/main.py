@@ -25455,14 +25455,28 @@ def _resolve_possession_by_type(db, owner_uuid: str, type_word: str) -> str | No
     if not word:
         return None
     try:
-        # Possession rels = relational connectivity rels (NOT hierarchy/classification,
-        # NOT scalar). Read from metadata so the set grows with the ontology.
+        # Possession / connectivity rels = every rel that is NOT a TYPE-CLASSIFICATION
+        # rel and NOT scalar-valued. We EXCLUDE ONLY the classification rels
+        # (instance_of / subclass_of / is_a — the individual→class + class→class axes
+        # that build the is-a TYPE LADDER, identified by their Wikidata classification
+        # PIDs P31/P279 via _get_classification_rels) — NOT every ``is_hierarchy_rel``.
+        # WHY not the hierarchy flag: per-tenant ontology GROWTH can drift a genuine
+        # possession rel's ``is_hierarchy_rel`` to TRUE (observed: ``owns`` mutated to
+        # category=family / is_hierarchy_rel=true in a tenant while the public seed has
+        # it FALSE). Keying the exclusion on the DEFINITIVE classification signal
+        # (rdf:type P31 / rdfs:subClassOf P279) instead of the drift-prone flag keeps
+        # "my <type>" reaching the possessed INSTANCE (the rdf:type-inverse target)
+        # even when a possession rel was mis-flagged. Deterministic, metadata-driven,
+        # subject-agnostic; no rel-name literal. Read from metadata so the set grows
+        # with the ontology.
+        _class_rels = sorted(_get_classification_rels(db))
         possession_rels: list[str] = []
         with db.cursor() as cur:
             cur.execute(
                 "SELECT rel_type FROM rel_types"
-                " WHERE COALESCE(is_hierarchy_rel, false) = false"
-                "   AND NOT ('SCALAR' = ANY(COALESCE(tail_types, ARRAY[]::text[])))"
+                " WHERE rel_type <> ALL(%s)"
+                "   AND NOT ('SCALAR' = ANY(COALESCE(tail_types, ARRAY[]::text[])))",
+                (_class_rels,),
             )
             possession_rels = [r[0].lower() for r in cur.fetchall() if r[0]]
         if not possession_rels:
@@ -25524,6 +25538,100 @@ def _resolve_possession_by_type(db, owner_uuid: str, type_word: str) -> str | No
     except Exception as e:
         log.warning("resolve_possession_by_type.failed",
                     type_word=word, error=str(e)[:120])
+        return None
+
+
+def _resolve_named_instance_of_type(db, type_uuid: str, user_id: str | None = None) -> str | None:
+    """Resolve the single NAMED INDIVIDUAL whose rdf:type is ``type_uuid`` — the
+    INVERSE of the individual→class edge (``<instance> instance_of <type>``).
+
+    KG SEMANTICS (why this is the right layer for a NAME question): in RDF/OWL,
+    ``rdf:type`` (Wikidata P31) types an INDIVIDUAL against a CLASS and is the layer
+    that carries the individual's identity/label, whereas ``rdfs:subClassOf``
+    (Wikidata P279) relates one CLASS to another and is pure taxonomy — never the
+    answer to "what is this individual's name". So a "name of <type>" question must
+    walk the ``rdf:type``-INVERSE to the individual, NOT the class's own label nor its
+    ``subClassOf`` ladder. See https://www.w3.org/TR/rdf-schema/#ch_type and
+    https://www.w3.org/TR/rdf-schema/#ch_subclassof (rdf:type vs rdfs:subClassOf).
+
+    Only the ``rdf:type`` (P31 — instance_of / is_a) rels are followed, NOT
+    ``subclass_of`` (P279): a subclass is another CLASS, never a named individual.
+
+    Disambiguation (deterministic, never guess): exactly one candidate → return it.
+    More than one → restrict to individuals CONNECTED to ``user_id`` by ANY
+    connectivity edge (owner-as-subject) and require exactly one; otherwise return
+    None (caller does NOT redirect → falls through unchanged). Indexed equality reads,
+    per-tenant search_path, no LLM/cosine/ILIKE. Fail-safe None.
+    """
+    if not db or not type_uuid:
+        return None
+    try:
+        # rdf:type (P31) rels ONLY — the individual→class axis. subclass_of (P279) is
+        # class→class taxonomy and is deliberately excluded (a subclass is not a named
+        # individual). Metadata-driven: read the P31-tagged classification rels.
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT rel_type FROM rel_types"
+                " WHERE is_hierarchy_rel = true AND wikidata_pid = 'P31'"
+            )
+            instance_rels = [r[0].lower() for r in cur.fetchall() if r[0]]
+        if not instance_rels:
+            # W3C-aligned fallback — never disable the rdf:type-inverse walk.
+            instance_rels = ["instance_of", "is_a"]
+
+        candidates: set[str] = set()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM facts"
+                " WHERE object_id = %s AND rel_type = ANY(%s)"
+                "   AND superseded_at IS NULL AND archived_at IS NULL"
+                "   AND deleted_at IS NULL",
+                (type_uuid, instance_rels),
+            )
+            candidates.update(r[0] for r in cur.fetchall() if r[0] and r[0] != type_uuid)
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM staged_facts"
+                " WHERE object_id = %s AND rel_type = ANY(%s)"
+                "   AND promoted_at IS NULL AND deleted_at IS NULL"
+                "   AND (expires_at IS NULL OR expires_at > now())",
+                (type_uuid, instance_rels),
+            )
+            candidates.update(r[0] for r in cur.fetchall() if r[0] and r[0] != type_uuid)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return next(iter(candidates))
+
+        # >1 named individual of this type → prefer the one the querying user is
+        # CONNECTED to (owner-as-subject over any connectivity edge). "User is truth":
+        # a name question in the user's own context means the user's instance.
+        if user_id and user_id != "anonymous":
+            owned: set[str] = set()
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT object_id FROM facts"
+                    " WHERE subject_id = %s AND object_id = ANY(%s)"
+                    "   AND superseded_at IS NULL AND archived_at IS NULL"
+                    "   AND deleted_at IS NULL",
+                    (user_id, list(candidates)),
+                )
+                owned.update(r[0] for r in cur.fetchall() if r[0])
+                cur.execute(
+                    "SELECT DISTINCT object_id FROM staged_facts"
+                    " WHERE subject_id = %s AND object_id = ANY(%s)"
+                    "   AND promoted_at IS NULL AND deleted_at IS NULL"
+                    "   AND (expires_at IS NULL OR expires_at > now())",
+                    (user_id, list(candidates)),
+                )
+                owned.update(r[0] for r in cur.fetchall() if r[0])
+            if len(owned) == 1:
+                return next(iter(owned))
+        log.info("resolve_named_instance_of_type.ambiguous_defer",
+                 type_uuid=str(type_uuid)[:8], candidates=len(candidates))
+        return None
+    except Exception as e:
+        log.warning("resolve_named_instance_of_type.failed",
+                    type_uuid=str(type_uuid)[:8], error=str(e)[:120])
         return None
 
 
@@ -26273,6 +26381,31 @@ def resolve_typed_walk(
             visited.add(cur_uuid)
             last_owner_word = rel_word
             idx += 1
+
+        # ── TYPE-NODE NAME REDIRECT (rdf:type identity layer). ─────────────────
+        # When the resolved owner is a CLASS/TYPE node (individuals point AT it via
+        # rdf:type/instance_of) and the asked terminal is a NAME slot, the answer is
+        # NOT the class's own label ("the vulnerability's name is vulnerability") nor
+        # its subClassOf ladder — a NAME belongs to an INDIVIDUAL. rdf:type (P31,
+        # individual→class) carries the individual's identity/label; rdfs:subClassOf
+        # (P279, class→class) is taxonomy and is never an individual's name. So
+        # redirect to the type's NAMED INSTANCE (the rdf:type-INVERSE), preferring the
+        # one connected to the querying user. Fires for the OWNER-IS-TYPE phrasing
+        # ("the vulnerability's name") and, defensively, whenever the owner chain
+        # landed on a type node. Keyed on graph structure (instance_of-inverse) +
+        # name-intent, subject-agnostic, no rel/type literal. Fail-safe: no single
+        # named instance → no redirect (fall through unchanged, e.g. "my server's
+        # name" already lands on the instance apollo, which has no instances → inert).
+        if cur_uuid and _slot_is_name(db, [_canonical_scalar_name(db, terminal)]):
+            _inst = _resolve_named_instance_of_type(db, cur_uuid, user_id)
+            if _inst and _inst != cur_uuid:
+                if last_owner_word is None:
+                    # Owner was named directly as the type (first step), not reached via
+                    # a relational hop — frame the answer with that type word.
+                    last_owner_word = first if first not in ("my", "mine") else None
+                log.info("walk.type_name_redirect", type_node=str(cur_uuid)[:8],
+                         instance=str(_inst)[:8], query=query_text[:50])
+                cur_uuid = _inst
 
         # ── Terminal step. Type it: SCALAR attribute vs RELATIONAL role-noun. ──
         # Prefer SCALAR (the common "...'s age/ip/birthday" case). If the word is
