@@ -32987,6 +32987,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         rel_type_templates = {}      # rel_type → 3p template
         rel_type_templates_2p = {}   # rel_type → 2p template (or None)
         rel_type_labels = {}         # rel_type → label (or None)
+        rel_type_tail = {}           # rel_type → tail_types (for scalar-render discernment)
         # Resolve templates from the PER-TENANT rel_type overlay (public seed ∪ tenant
         # rows, tenant overriding) bound to this request's schema via the ContextVar.
         # CLAUDE.md HARD RULE: per-tenant search_path has NO public; public.* is
@@ -33005,6 +33006,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 rel_type_templates[_rt] = _m.get("natural_language")
                 rel_type_templates_2p[_rt] = _m.get("natural_language_2p")
                 rel_type_labels[_rt] = _m.get("label")
+                rel_type_tail[_rt] = _m.get("tail_types")
 
         # OCCURRENCE-TYPE INDEX (lean-query rendering): a reified dated occurrence is filed at its
         # bare type via an (<occurrence>, instance_of, <type>) edge that the walk already carried into
@@ -33254,9 +33256,39 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                                   has_X=_has_X, has_Y=_has_Y, has_object=bool(object_name))
                         template = f"X {_label_for_fb} Y"
 
+                # SCALAR-ATTRIBUTE render (subject-agnostic, deterministic, presentation-only).
+                # A value from entity_attributes (source=="attributes": "64 gigabytes", "23 pairs")
+                # is a POSSESSED MEASUREMENT, not a relationship. Curated scalar seeds (age/height/
+                # has_ip — tail_types={SCALAR}) already carry hand-written templates ("X is Y years
+                # old", "X's height is Y"), so leave those alone. But an ENGINE-GROWN attribute rel
+                # is minted tail_types={ANY} and the re_embedder backfills a stiff relational
+                # template ("X is the ram of Y", "X has chromosome Y"). For that case ONLY —
+                # scalar fact whose rel is NOT {SCALAR}-tailed — render the clean possessive
+                # "<subject>'s <attr> is <value>" (2p: "Your <attr> is …"), matching the curated
+                # scalar style. Built directly (word-safe) so a label containing x/y never corrupts
+                # via the naive X/Y replace below. THE HARD LINE: the value stays verbatim.
+                _scalar_prose = None
+                if fact.get("source") == "attributes" and object_name:
+                    _tt = rel_type_tail.get(rel_type) or []
+                    _tt_scalar = any((str(_t).strip().upper() == "SCALAR") for _t in _tt)
+                    if not _tt_scalar:
+                        # attribute noun reads naturally lowercased ("ram", not "Ram").
+                        _sa_label = (rel_type_labels.get(rel_type)
+                                     or rel_type.replace("_", " ")).strip().lower()
+                        if _sa_label:
+                            if subject_is_you:
+                                _scalar_prose = f"Your {_sa_label} is {object_name}"
+                            elif subject_name:
+                                # possessive: a subject ending in 's' takes a bare
+                                # apostrophe ("Humans'"), else "'s" ("Server's").
+                                _poss = "'" if subject_name.endswith("s") else "'s"
+                                _scalar_prose = f"{subject_name}{_poss} {_sa_label} is {object_name}"
+
                 # Format prose using X/Y placeholders (from natural_language templates)
                 try:
-                    if subject_is_you and template_2p:
+                    if _scalar_prose is not None:
+                        prose = _scalar_prose
+                    elif subject_is_you and template_2p:
                         # 2p template has the subject baked in (no X slot). Substitute
                         # only the object into the Y placeholder. The baked subject
                         # "You"/"Your" CONTAINS a literal 'Y', so a naive str.replace
