@@ -446,6 +446,31 @@ def is_third_person_pronoun(text: str) -> bool:
     return _is_third_person_pronoun(toks[0])
 
 
+def _adj_has_numeric_measure(adj_tok) -> bool:
+    """True when an ADJ predicate is measured by a NUMBER — the age/height idiom ("34 years old",
+    "6 feet tall"), owned by the copula-measure chain, NOT a feeling. The number sits on a unit
+    noun modifying the ADJ (npadvmod/nmod ← nummod NUM) or modifies the ADJ directly. A bare
+    feeling ("I am sad") has no such child; a number that measures NOTHING on the adjective ("I am
+    45, sad" — the 45 is a separate ``attr`` of the copula, not a modifier of "sad") does NOT trip
+    it, so a real feeling co-occurring with a number is preserved. Grammar-driven, subject-agnostic,
+    NO unit/emotion word list. Fail-safe → False."""
+    try:
+        if adj_tok is None or adj_tok.pos_ != "ADJ":
+            return False
+        for ch in adj_tok.children:
+            # a unit noun / adverbial measure modifying the ADJ, itself carrying a NUMBER (or a bare
+            # numeric modifier directly on the ADJ).
+            if ch.dep_ in ("npadvmod", "nmod", "obl", "advmod", "quantmod", "nummod"):
+                if ch.pos_ == "NUM" or ch.like_num:
+                    return True
+                for g in ch.children:
+                    if g.dep_ == "nummod" or g.pos_ == "NUM" or g.like_num:
+                        return True
+    except Exception:  # noqa: BLE001 — fail-safe
+        return False
+    return False
+
+
 def analyze_copula(text: str):
     r"""Deterministic first-cut for a copular self-predication. Returns ``CopulaAnalysis`` or ``None``.
 
@@ -511,6 +536,13 @@ def analyze_copula(text: str):
             # A QUESTION ("what am I?", "who are you?") is not a value statement — skip an
             # interrogative complement (grammatical: PronType=Int / wh-tags, not a word list).
             if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                continue
+            # MEASURED-ADJECTIVE GUARD: "I am 34 years old" / "I am 6 feet tall" predicates a
+            # MEASUREMENT (age/height), not a feeling — the ADJ is modified by a numeric measure.
+            # Decline the self-predication so the copula-measure chain owns it as a scalar. Fires
+            # ONLY when the number measures the adjective itself; a bare feeling ("I am sad") or a
+            # separate co-occurring number ("I am 45, sad") is untouched. Subject-agnostic, grammar.
+            if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
                 continue
             rel = _COMPLEMENT_POS_TO_REL.get(comp.pos_)  # None for VERB / other → ambiguous residue
             # DETERMINER OVERRIDE (casing-robust): a complement introduced by an article
@@ -591,6 +623,8 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
             for m in sorted(members, key=lambda t: t.i):
                 if any(ch.dep_ == "neg" for ch in m.children):
                     continue  # this conjunct is negated → skip
+                if m.pos_ == "ADJ" and _adj_has_numeric_measure(m):
+                    continue  # "34 years old" → age/measurement (copula-measure chain), not a feeling
                 surf = (m.text or m.lemma_ or "").strip().lower()
                 if surf and surf not in seen:
                     seen.add(surf)
@@ -7099,21 +7133,27 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             head = tok.head
             if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
                 continue
-            # SUBJECT: a 1st-person self is owned by the self/feeling seam — never a 3rd-party scalar
-            # here (kept parity with the copula-state chain). "I am 40" still routes via the identity/
-            # self path; this chain handles a NON-self measured subject.
-            if _is_first_person_personal_pronoun(tok):
-                continue
+            # SUBJECT: a 1st-person self ("I am 34 years old") is the USER — resolve to "user" and let
+            # the measurement detection below decide. (Previously this chain SKIPPED all 1st-person and
+            # punted to the "self path", but that path reads the ADJ "old" as a FEELING and DROPPED the
+            # age — first-person age fell through the crack.) A NON-measured 1st-person copula ("I am
+            # happy") finds no NUM below and emits NOTHING, so the feeling/self path still owns it; the
+            # feeling seam itself now steps aside for a MEASURED adjective (analyze_copula's
+            # measured-adjective guard). Grammar-gated, subject-agnostic.
+            _first_person_self = _is_first_person_personal_pronoun(tok)
             # ATTRIBUTE-SCALAR GUARD (Defect 1): a possessed-attribute literal ("my employee id is
             # 4471", "the laptop's serial is XR7-9920") is NOT a measured person — step aside so the
             # bare NUM is captured VERBATIM by _chain_attr_scalar, never mis-read as ``age``. Kinship
             # subjects ("my daughter is 28") are EXCLUDED from the binding, so their age still lands.
             if _attr_scalar_binding(tok) is not None:
                 continue
-            subject = (tok.text or tok.lemma_ or "").strip().lower()
-            _cr = _person_coref(tok)
-            if _cr:
-                subject = _cr
+            if _first_person_self:
+                subject = "user"
+            else:
+                subject = (tok.text or tok.lemma_ or "").strip().lower()
+                _cr = _person_coref(tok)
+                if _cr:
+                    subject = _cr
             if not subject:
                 continue
             # Find a measurement: a NUM with a governing UNIT noun (year/foot/pound) anywhere under the
