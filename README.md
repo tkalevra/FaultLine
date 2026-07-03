@@ -179,13 +179,15 @@ git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
 ```
 
-**Guided setup (recommended).** An interactive wizard picks your LLM backend, **tests the connection and lists your available models to choose from**, generates a secret `MCP_API_KEY`, sorts out your tenant id, and writes a ready-to-use `.env` — then prints exactly what to paste into your client:
+**Guided setup (recommended).** An interactive wizard first asks **Language / Lingua**, then picks your LLM backend, **tests the connection and lists your available models to choose from**, generates a secret `MCP_API_KEY`, sorts out your tenant id, and writes a ready-to-use `.env` — then prints exactly what to paste into your client:
 
 ```bash
 ./setup.sh            # Linux / macOS
 setup.bat             # Windows
 #  or, on any platform:  python3 quickstart.py
 ```
+
+> **🌍 Language.** The wizard opens with a language choice. **English** continues on `main`. **Italiano** (experimental) switches to the `it` branch — an unofficial, work-in-progress Italian instance (Italian setup + `LEGGIMI-it.md`); extraction there rides the LLM path. Not production-ready — use at your own risk; for the stable version stay on English/`main`.
 
 **Or configure manually:**
 
