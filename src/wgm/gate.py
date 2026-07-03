@@ -31,6 +31,61 @@ def _flag_on(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
 
 
+# ── AUTHORITY GUARD — engine growth must never re-classify a SEEDED rel's structure ──
+# Structural CLASSIFICATION fields that are IMMUTABLE to engine growth (user > SEED > growth).
+# head_types / tail_types are DELIBERATELY excluded: the gate's type-constraint EXPANSION path
+# legitimately WIDENS them (union) to admit a new subject/object type — that additive growth
+# must keep working. Mirrors main._SEED_STRUCTURAL_FIELDS (a local copy avoids the main<->gate
+# import cycle — the same rationale as the re_embedder copy, a separate module boundary).
+_SEED_STRUCTURAL_FIELDS = (
+    "is_hierarchy_rel", "category", "tail_types", "fact_class",
+    "storage_target", "inverse_rel_type", "is_symmetric",
+)
+
+
+def _seed_structural_flags(db_conn, rel_type: str) -> dict | None:
+    """Return the AUTHORITATIVE structural flags of a SEEDED rel from the ``public`` template,
+    or ``None`` when the rel is not seeded (genuinely novel — engine growth owns its structure).
+
+    AUTHORITY ORDER — user > SEED > engine-growth. A rel present in ``public.rel_types`` has an
+    IMMUTABLE structural CLASSIFICATION against the gate's growth writes (novel-type approval +
+    type-constraint expansion): the gate may STRENGTHEN confidence and WIDEN head_types/tail_types
+    (additive type-admission — the whole point of the expansion path) but must NEVER re-classify a
+    seeded rel's structure (is_hierarchy_rel / category / fact_class / storage_target /
+    inverse_rel_type / is_symmetric). This is the drift the guard closes: a Person-object ``owns``
+    edge made the enrichment LLM re-resolve owns' category → family (a hierarchical taxonomy →
+    is_hierarchy_rel=true), and the ``EXCLUDED.is_hierarchy_rel`` / ``EXCLUDED.category`` writes
+    below persisted that OVER the clean seed (public owns = relational, uncategorized).
+
+    KG grounding: RDFS ``rdf:type`` (Wikidata P31, is_hierarchy_rel) and ``rdfs:subClassOf``
+    (P279) are DEFINITIONAL axes fixed by the ontology author, not derivable/mutable from instance
+    data — https://www.w3.org/TR/rdf-schema/#ch_type , #ch_subclassof.
+
+    ``public`` is read ONLY here as the seed-authority reference (fully-qualified, always readable
+    regardless of tenant search_path). Subject-agnostic — keyed on public PRESENCE, never a
+    rel-name literal. Fail-safe: any error → log + None (caller keeps its computed values; the
+    reconcile migration 130 is the backstop), never crashes ingest/gate.
+    """
+    rt = (rel_type or "").strip().lower()
+    if not rt:
+        return None
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_hierarchy_rel, category, tail_types, fact_class,"
+                "       storage_target, inverse_rel_type, is_symmetric"
+                "  FROM public.rel_types WHERE rel_type = %s",
+                (rt,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(_SEED_STRUCTURAL_FIELDS, row))
+    except Exception as e:
+        log.warning("wgm.seed_structural_flags_read_failed", rel_type=rt, error=str(e)[:160])
+        return None
+
+
 # TAIL/HEAD-TYPE MISMATCH VETO (lowest-risk slice of the spine strength-gating design):
 # A high-confidence edge whose OBJECT (or SUBJECT) entity_type GENUINELY does NOT satisfy
 # the rel's tail_types/head_types — after the legitimate hierarchy-reachability check (a
@@ -2006,7 +2061,12 @@ class WGMValidationGate:
                     " (rel_type, label, engine_generated, confidence, source, fact_class)"
                     " VALUES (%s, %s, true, 0.7, 'engine', 'B')"
                     " ON CONFLICT (rel_type) DO UPDATE SET"
-                    "  fact_class = CASE WHEN rel_types.fact_class = 'C' THEN 'B' ELSE rel_types.fact_class END",
+                    # AUTHORITY GUARD: freeze fact_class for a SEEDED rel — a C-tier SEED (e.g. the
+                    # inferred-tier `feels` marker) must not be bumped C→B by engine approval. The
+                    # C→B promotion is for GROWN rels only. public read = seed authority; subject-agnostic.
+                    "  fact_class = CASE WHEN rel_types.fact_class = 'C'"
+                    "                     AND NOT EXISTS (SELECT 1 FROM public.rel_types _s WHERE _s.rel_type = rel_types.rel_type)"
+                    "                    THEN 'B' ELSE rel_types.fact_class END",
                     (rel_type, rel_type.replace('_', ' ').title()),
                 )
             self.db_conn.commit()
@@ -2076,6 +2136,20 @@ Respond with ONLY the JSON, no explanation."""
                 # Insert into rel_types with full metadata.
                 # fact_class defaults to 'B' — gate-approved novel types enter the C→B→A
                 # promotion loop; never default to 'C' which routes to 30-day expiry.
+                # AUTHORITY GUARD (user > SEED > growth): freeze the structural CLASSIFICATION
+                # of a SEEDED rel to the public seed so this enrichment write cannot re-classify
+                # it (is_hierarchy_rel/category/is_symmetric/inverse). head_types/tail_types keep
+                # their COALESCE behaviour. Novel rels (pin None) keep the inferred metadata.
+                _seed_pin = _seed_structural_flags(self.db_conn, rel_type)
+                _is_hier = result.get("is_hierarchy_rel", False)
+                _category = result.get("category", "other")
+                _is_symmetric = result.get("is_symmetric", False)
+                _inverse = result.get("inverse_rel_type")
+                if _seed_pin is not None:
+                    _is_hier = _seed_pin["is_hierarchy_rel"]
+                    _category = _seed_pin["category"]
+                    _is_symmetric = _seed_pin["is_symmetric"]
+                    _inverse = _seed_pin["inverse_rel_type"]
                 with self.db_conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO rel_types"
@@ -2091,18 +2165,23 @@ Respond with ONLY the JSON, no explanation."""
                         "  is_hierarchy_rel = COALESCE(EXCLUDED.is_hierarchy_rel, rel_types.is_hierarchy_rel),"
                         "  category = COALESCE(EXCLUDED.category, rel_types.category),"
                         "  confidence = GREATEST(rel_types.confidence, EXCLUDED.confidence),"
-                        "  fact_class = CASE WHEN rel_types.fact_class = 'C' THEN 'B' ELSE rel_types.fact_class END",
+                        # AUTHORITY GUARD: freeze fact_class for a SEEDED rel — a C-tier SEED (e.g. the
+                    # inferred-tier `feels` marker) must not be bumped C→B by engine approval. The
+                    # C→B promotion is for GROWN rels only. public read = seed authority; subject-agnostic.
+                    "  fact_class = CASE WHEN rel_types.fact_class = 'C'"
+                    "                     AND NOT EXISTS (SELECT 1 FROM public.rel_types _s WHERE _s.rel_type = rel_types.rel_type)"
+                    "                    THEN 'B' ELSE rel_types.fact_class END",
                         (
                             rel_type,
                             result.get("label", rel_type),
                             result.get("wikidata_pid"),
                             result.get("confidence", 0.7),
-                            result.get("is_symmetric", False),
-                            result.get("inverse_rel_type"),
+                            _is_symmetric,                     # seed-pinned when seeded
+                            _inverse,                          # seed-pinned when seeded
                             result.get("head_types", ["Any"]),
                             result.get("tail_types", ["Any"]),
-                            result.get("is_hierarchy_rel", False),
-                            result.get("category", "other"),
+                            _is_hier,                          # seed-pinned when seeded
+                            _category,                         # seed-pinned when seeded
                             "engine"
                         )
                     )
@@ -2229,6 +2308,23 @@ Respond with ONLY the JSON, no explanation."""
             True if stored successfully, False otherwise
         """
         try:
+            # AUTHORITY GUARD (user > SEED > growth): this expansion path exists to WIDEN
+            # head_types/tail_types (admit a new subject/object type — additive growth, KEPT
+            # below), but it also re-wrote the LLM's is_hierarchy_rel/category/is_symmetric/
+            # inverse OVER the row. For a SEEDED rel that structural CLASSIFICATION is immutable
+            # to growth — pin it to the public seed so a Person-object `owns` (or any seeded rel
+            # used with a new type) can no longer be re-classified to hierarchy/family. Novel
+            # rels (absent from public → pin is None) keep the inferred metadata as-is.
+            _seed_pin = _seed_structural_flags(self.db_conn, rel_type)
+            _is_hier = metadata.get("is_hierarchy_rel", False)
+            _category = metadata.get("category", "other")
+            _is_symmetric = metadata.get("is_symmetric", False)
+            _inverse = metadata.get("inverse_rel_type")
+            if _seed_pin is not None:
+                _is_hier = _seed_pin["is_hierarchy_rel"]
+                _category = _seed_pin["category"]
+                _is_symmetric = _seed_pin["is_symmetric"]
+                _inverse = _seed_pin["inverse_rel_type"]
             with self.db_conn.cursor() as cur:
                 # CONSTRAINT EXPANSION IS WIDEN-ONLY, NEVER NARROW (subject-agnostic, metadata-driven).
                 # This path exists to ADMIT an edge a constraint rejected — i.e. WIDEN head/tail to
@@ -2281,12 +2377,12 @@ Respond with ONLY the JSON, no explanation."""
                         rel_type,
                         metadata.get("label") or rel_type.replace("_", " ").title(),
                         metadata.get("natural_language"),
-                        metadata.get("is_symmetric", False),
-                        metadata.get("inverse_rel_type"),
-                        metadata.get("head_types", ["ANY"]),
-                        metadata.get("tail_types", ["ANY"]),
-                        metadata.get("is_hierarchy_rel", False),
-                        metadata.get("category", "other"),
+                        _is_symmetric,                       # seed-pinned when seeded
+                        _inverse,                            # seed-pinned when seeded
+                        metadata.get("head_types", ["ANY"]),  # WIDEN — kept (type admission)
+                        metadata.get("tail_types", ["ANY"]),  # WIDEN — kept (type admission)
+                        _is_hier,                            # seed-pinned when seeded
+                        _category,                           # seed-pinned when seeded
                         metadata.get("confidence", 0.5),
                     )
                 )
