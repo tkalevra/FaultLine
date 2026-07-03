@@ -4556,6 +4556,67 @@ def _select_domain_relational_rel_types(dsn: str, detected_entity_types: set) ->
     return selected
 
 
+# ── Structural fields of a rel_type that ENGINE GROWTH must never re-classify ──
+# is_hierarchy_rel drives storage routing (classify_fact_type: hierarchy→facts vs
+# relational) + traversal; category places the rel in a taxonomy layer; tail_types /
+# fact_class / storage_target / inverse_rel_type / is_symmetric are the rel's fixed
+# ontology shape. head_types is DELIBERATELY excluded — growth may WIDEN it by union
+# (additive), so it is never frozen here.
+_SEED_STRUCTURAL_FIELDS = (
+    "is_hierarchy_rel", "category", "tail_types", "fact_class",
+    "storage_target", "inverse_rel_type", "is_symmetric",
+)
+
+
+def _seed_structural_flags(db, rel_type: str) -> dict | None:
+    """Return the AUTHORITATIVE structural ontology flags of a SEEDED rel from the
+    ``public`` template, or ``None`` when the rel is NOT seeded (genuinely novel —
+    engine growth legitimately owns its structure).
+
+    AUTHORITY ORDER — user > SEED > engine-growth. A rel present in the ``public.rel_types``
+    SEED has an IMMUTABLE structural classification against ENGINE GROWTH (±6 climb /
+    re-embedder ontology evaluation / synonym convergence). Growth may still STRENGTHEN
+    confidence and WIDEN head_types by union (additive), but must NEVER re-classify a
+    seeded rel's structure (is_hierarchy_rel / category / tail_types / fact_class /
+    storage_target / inverse_rel_type / is_symmetric). This extends "user is truth" to the
+    ontology STRUCTURE — the same truth-firewall as THE HARD LINE: the engine grows PLACES,
+    it never corrupts the grounded structural definition. (Observed drift this guards:
+    ``owns`` grown to is_hierarchy_rel=true / category=family / inverse_rel_type=owned_by in
+    one tenant while the seed keeps it relational, uncategorized, no inverse.)
+
+    KG grounding: in RDF Schema, ``rdf:type`` (Wikidata P31 — the is_hierarchy_rel
+    individual→class axis) and ``rdfs:subClassOf`` (P279 — class→class taxonomy) are
+    DEFINITIONAL axes fixed by the ontology author, not derivable or mutable from instance
+    data — https://www.w3.org/TR/rdf-schema/#ch_type and #ch_subclassof. So a seeded rel's
+    is_hierarchy_rel is authoritative and an engine growth pass must not flip it.
+
+    ``public`` is read ONLY here as the seed-authority reference (this is the sanctioned
+    exception — no runtime query path reads public). Subject-agnostic: keyed on public
+    PRESENCE, never a rel-name literal. Fail-safe: any error → log_crit + return None, so
+    the caller keeps its computed growth values (the reconcile migration + ON CONFLICT
+    backfill remain as backstops) and ingest never crashes.
+    """
+    rt = (rel_type or "").strip().lower()
+    if not rt:
+        return None
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT is_hierarchy_rel, category, tail_types, fact_class,"
+                "       storage_target, inverse_rel_type, is_symmetric"
+                "  FROM public.rel_types WHERE rel_type = %s",
+                (rt,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(_SEED_STRUCTURAL_FIELDS, row))
+    except Exception as e:
+        log_crit("ontology.seed_structural_flags_read_failed",
+                 rel_type=rt, error=str(e)[:160])
+        return None
+
+
 def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: float,
                              source: str = "engine") -> bool:
     """
@@ -4602,6 +4663,26 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
         # is_hierarchy_rel is structural — infer from the rel_type name (metadata-driven heuristic).
         is_hierarchy = _infer_hierarchy_from_rel_type(rt_lower)
         label = rt_lower.replace("_", " ").title()
+        fact_class = "B"
+
+        # ── AUTHORITY GUARD (user > SEED > growth) ──────────────────────────────
+        # If this rel is SEEDED (present in the public template), its structural
+        # classification is IMMUTABLE to engine growth. Pin the structural fields to the
+        # seed BEFORE the write so neither the fresh INSERT (fresh-insert race on a
+        # process-global _REL_TYPE_META read) nor the ON CONFLICT DO UPDATE below can drift
+        # them. head_types stays computed (growth may WIDEN it — the ON CONFLICT only
+        # backfills empties). A USER override goes through /ontology/rel_types (source='user'),
+        # NOT this growth helper, so user-is-truth is preserved. See _seed_structural_flags.
+        _seed_pin = _seed_structural_flags(db, rt_lower)
+        if _seed_pin is not None:
+            is_hierarchy = _seed_pin["is_hierarchy_rel"]
+            category = _seed_pin["category"]
+            category_pending = False  # a seeded rel is already placed — never quarantine it
+            is_symmetric = _seed_pin["is_symmetric"]
+            inverse_rel_type = _seed_pin["inverse_rel_type"]
+            if _seed_pin["tail_types"]:
+                tail_types = _seed_pin["tail_types"]
+            fact_class = _seed_pin["fact_class"] or "B"
 
         with db.cursor() as cur:
             cur.execute(
@@ -4630,7 +4711,7 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
                 (
                     rt_lower, label, natural_language, natural_language_2p, confidence, source, category,
                     is_symmetric, inverse_rel_type, is_hierarchy,
-                    tail_types, head_types, "B",
+                    tail_types, head_types, fact_class,
                     "supersede",
                 ),
             )
@@ -4767,6 +4848,24 @@ def _insert_novel_rel_type(db, rel_type: str, confidence: float,
         is_symmetric = _infer_symmetry_from_rel_type(rt_lower)
         inverse = _infer_inverse_rel_type(rt_lower)
         is_hierarchy = _infer_hierarchy_from_rel_type(rt_lower)
+        tail_types = ["ANY"]
+        fact_class = "B"
+
+        # AUTHORITY GUARD (user > SEED > growth): a SEEDED rel's structural flags are
+        # immutable to engine growth — pin them to the public seed so this fresh INSERT can
+        # never drift a rel that already has an authoritative definition. See
+        # _seed_structural_flags (this call site mints with ANY/ANY, so a race that re-mints
+        # a seed here would otherwise wipe its real head/tail types + hierarchy flag).
+        _seed_pin = _seed_structural_flags(db, rt_lower)
+        if _seed_pin is not None:
+            is_hierarchy = _seed_pin["is_hierarchy_rel"]
+            category = _seed_pin["category"]
+            category_pending = False
+            is_symmetric = _seed_pin["is_symmetric"]
+            inverse = _seed_pin["inverse_rel_type"]
+            if _seed_pin["tail_types"]:
+                tail_types = _seed_pin["tail_types"]
+            fact_class = _seed_pin["fact_class"] or "B"
 
         # Humanize label from rel_type name
         label = rt_lower.replace("_", " ").title()
@@ -4791,9 +4890,9 @@ def _insert_novel_rel_type(db, rel_type: str, confidence: float,
                 is_symmetric,              # is_symmetric
                 inverse,                   # inverse_rel_type
                 is_hierarchy,              # is_hierarchy_rel
-                ["ANY"],                   # tail_types (default)
+                tail_types,                # tail_types (seed-pinned, else ANY default)
                 ["ANY"],                   # head_types (default)
-                "B",                       # fact_class (LLM-inferred following ontology)
+                fact_class,                # fact_class (seed-pinned, else B)
                 "supersede",               # correction_behavior
                 False,                     # engine_generated
                 confidence                 # confidence (for ON CONFLICT)
