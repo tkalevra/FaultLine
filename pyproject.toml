@@ -26,6 +26,13 @@ dependencies = [
     # VALIDATES each against a reference (RELATIVE_BASE) — a non-date span → None → dropped.
     # NO date guessing: a miss yields NULL event_date, never a fabricated "today".
     "dateparser>=1.2,<2.0",
+    # Deterministic calendar delta-arithmetic for the recall EXPOSE+CALC derivation
+    # (src/api/main.py::_whole_years_since → dateutil.relativedelta): whole completed
+    # years between a stored birth/creation date and today = age / elapsed. Leap- and
+    # month-length-correct (unlike naive days/365). Pure-Python, BSD/Apache. Already
+    # present transitively via dateparser; declared here because relativedelta is used
+    # directly. See DEV/DESIGN-ingest-hardening-grounding.md.
+    "python-dateutil>=2.8,<3.0",
     # Phonetic a/an article selection for the recall prose composer (convert_to_prose →
     # _indefinite_article). Pure-Python, MIT, no ML/GPU. Handles the OPEN lexical class
     # correctly (hour/honest→an, university/unicorn/one→a, X-ray→an); the CLOSED 26-letter

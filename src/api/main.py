@@ -3134,6 +3134,20 @@ def _resolve_query_axis(path: "QueryPath", query_text: str, db) -> Optional[str]
 # Loaded at startup, queries DB at runtime for fresh aliases from re_embedder
 _REL_TYPE_ALIASES: dict = {}
 
+
+def _bind_alias_search_path(cur, schema: Optional[str]) -> None:
+    """Bind the tenant search_path (NO public) before a rel_type_aliases read.
+
+    Per-tenant isolation: rel_type_aliases is seeded INTO each tenant schema at
+    provisioning, so binding the tenant schema resolves seed∪tenant (grown aliases
+    become visible) WITHOUT ever falling through to public. Mirrors
+    ``ontology.canonical._connect``. No-op when ``schema`` is falsy — keeps today's
+    default search_path so an anonymous / un-derivable request degrades to prior
+    behavior rather than crashing (fail-safe). NEVER adds public.
+    """
+    if schema:
+        cur.execute(f'SET search_path TO "{schema}"')
+
 def _load_rel_type_aliases() -> dict:
     """
     Load rel_type_aliases from database (alias → canonical mapping).
@@ -3152,12 +3166,17 @@ def _load_rel_type_aliases() -> dict:
             log.warning("rel_type_aliases.load_failed", error=str(e))
     return {}
 
-def _get_canonical_rel_type(rel_type_alias: str) -> str:
+def _get_canonical_rel_type(rel_type_alias: str, schema: Optional[str] = None) -> str:
     """
     Normalize LLM rel_type variations to canonical form via database aliases.
     Queries DB first (fresh), falls back to startup cache.
     Returns canonical rel_type or original if no alias found.
     dprompt-125: DB-driven, no hardcoded mappings.
+
+    ``schema`` (per-tenant): when given, every rel_type_aliases read binds
+    ``SET search_path TO "<schema>"`` (NO public) so a TENANT-GROWN alias resolves
+    seed∪tenant — an unbound read defaults to public and misses grown aliases.
+    Falsy schema keeps the prior default-search_path behavior (fail-safe).
     """
     if not rel_type_alias:
         return rel_type_alias
@@ -3170,6 +3189,7 @@ def _get_canonical_rel_type(rel_type_alias: str) -> str:
         try:
             with psycopg2.connect(dsn) as conn:
                 with conn.cursor() as cur:
+                    _bind_alias_search_path(cur, schema)
                     cur.execute(
                         "SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s",
                         (alias_lower,)
@@ -3211,6 +3231,7 @@ def _get_canonical_rel_type(rel_type_alias: str) -> str:
                 try:
                     with psycopg2.connect(dsn) as conn:
                         with conn.cursor() as cur:
+                            _bind_alias_search_path(cur, schema)
                             cur.execute(
                                 "SELECT canonical_rel_type FROM rel_type_aliases WHERE alias = %s",
                                 (_root,),
@@ -3230,7 +3251,7 @@ def _get_canonical_rel_type(rel_type_alias: str) -> str:
     return rel_type_alias
 
 
-def _get_canonical_rel_type_with_directionality(rel_type_alias: str) -> tuple[str, bool]:
+def _get_canonical_rel_type_with_directionality(rel_type_alias: str, schema: Optional[str] = None) -> tuple[str, bool]:
     """
     Normalize LLM rel_type variations to canonical form and preserve directionality.
 
@@ -3245,6 +3266,11 @@ def _get_canonical_rel_type_with_directionality(rel_type_alias: str) -> tuple[st
         "son_of" → ("parent_of", True) — swap child/parent to parent/child
         "has_child" → ("parent_of", False) — already same direction
         "spouse_of" → ("spouse", False) — symmetric, direction doesn't matter
+
+    ``schema`` (per-tenant): when given, the rel_type_aliases read binds
+    ``SET search_path TO "<schema>"`` (NO public) so a TENANT-GROWN alias resolves
+    seed∪tenant — an unbound read defaults to public and misses grown aliases.
+    Falsy schema keeps the prior default-search_path behavior (fail-safe).
     """
     if not rel_type_alias:
         return rel_type_alias, False
@@ -3257,6 +3283,7 @@ def _get_canonical_rel_type_with_directionality(rel_type_alias: str) -> tuple[st
         try:
             with psycopg2.connect(dsn) as conn:
                 with conn.cursor() as cur:
+                    _bind_alias_search_path(cur, schema)
                     cur.execute(
                         """SELECT canonical_rel_type, requires_inversion
                            FROM rel_type_aliases
@@ -18190,11 +18217,24 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                 except Exception:
                     pass
 
-        # dprompt-126: Phase 1 — Normalize rel_type aliases with directionality preservation
+        # dprompt-126: Phase 1 — Normalize rel_type aliases with directionality preservation.
+        # Per-tenant: derive this request's tenant schema so the alias read resolves
+        # seed∪tenant (grown aliases visible), NOT public. Fail-safe: un-derivable → None
+        # → helper keeps default search_path (prior behavior).
+        _canon_schema = None
+        if user_id and user_id != "anonymous":
+            try:
+                from src.provisioning.schema_manager import (
+                    derive_user_slug_from_uuid as _dslug_canon,
+                    derive_schema_name as _dschema_canon,
+                )
+                _canon_schema = _dschema_canon(_dslug_canon(user_id))
+            except Exception:
+                _canon_schema = None
         for triple in triples:
             rel_type_raw = (triple.get("rel_type") or "").lower().strip()
             if rel_type_raw:
-                canonical, requires_inversion = _get_canonical_rel_type_with_directionality(rel_type_raw)
+                canonical, requires_inversion = _get_canonical_rel_type_with_directionality(rel_type_raw, schema=_canon_schema)
 
                 if canonical and canonical != rel_type_raw:
                     triple["rel_type"] = canonical
@@ -19669,7 +19709,10 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     for t in rewrite_data.get("edges", []):
                         rel_type_original = (t.get("rel_type") or "").lower().strip()
                         if rel_type_original:
-                            canonical = _get_canonical_rel_type(rel_type_original)
+                            # Per-tenant: bind this request's schema so a tenant-grown alias
+                            # resolves seed∪tenant (not public). schema_name may be None
+                            # (anonymous/fallback) → helper keeps default search_path.
+                            canonical = _get_canonical_rel_type(rel_type_original, schema=schema_name)
                             if canonical != rel_type_original and canonical:
                                 t["rel_type"] = canonical
                                 log.info("ingest.rel_type_aliased",
@@ -19929,7 +19972,9 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
         # mis-converging by surface shape. Subject-agnostic; reuses the seeded aliases only.
         _rt = (edge.rel_type or "").lower().strip()
         if _rt:
-            _canon = _get_canonical_rel_type(_rt)
+            # Per-tenant: bind this request's schema so a tenant-grown alias resolves
+            # seed∪tenant (not public). schema_name may be None → default search_path.
+            _canon = _get_canonical_rel_type(_rt, schema=schema_name)
             if _canon and _canon != _rt:
                 edge.rel_type = _canon
                 log.info("ingest.rel_type_aliased", original=_rt, canonical=_canon,
@@ -25451,6 +25496,129 @@ _WALK_NO_SLOT = object()      # the slot is not applicable to this entity's sche
 _WALK_KNOWN_GAP = object()    # the slot IS valid but the entity has no stored value
 
 
+# ── Deterministic date-arithmetic derivation (subject-agnostic, no fabrication) ──
+# EXPOSE + CALC: any entity scalar whose stored VALUE is a calendar date carries a
+# DERIVABLE quantity — the whole calendar years elapsed to "today" (a person's/pet's
+# AGE, a server's elapsed-since-provisioning). We compute it with dateutil's
+# relativedelta, the standard rule-based calendar-delta library: relativedelta(ref,
+# birth).years is the COMPLETED-year age (it already floors the partial final year —
+# empirically 2015-06-12 → 10 on 2026-06-11 but 11 on 2026-06-12; leap-safe). See
+# https://dateutil.readthedocs.io/en/stable/relativedelta.html and
+# DEV/DESIGN-ingest-hardening-grounding.md. Subject-agnostic: the derivation keys ONLY
+# on "the VALUE parses as a date", NEVER on the attribute NAME — so born_on / born_in /
+# a provisioning date all derive identically. NO fabrication: a non-date value → None; a
+# FUTURE date → None (never a negative age). The value-parse is STRICT ISO/year (not
+# dateparser's greedy free-text) so an IP ("192.168.1.50"), a size ("40 tb") or a rate
+# ("72 bpm") can NEVER be mistaken for a date.
+_ISO_DATE_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})(?:[T ].*)?$")
+_YEAR_ONLY_RE = re.compile(r"^\s*(\d{4})\s*$")
+
+
+def _scalar_value_as_date(value):
+    """STRICTLY parse a stored scalar value into a datetime.date, or None.
+    Accepts ISO ``YYYY-MM-DD`` (optionally with a trailing time) and a bare 4-digit
+    year (→ Jan 1). Deterministic — no dateparser greediness. Fail-safe None."""
+    if value is None:
+        return None
+    from datetime import date as _d
+    s = str(value).strip()
+    m = _ISO_DATE_RE.match(s)
+    if m:
+        try:
+            return _d(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = _YEAR_ONLY_RE.match(s)
+    if m:
+        y = int(m.group(1))
+        if 1000 <= y <= 9999:
+            return _d(y, 1, 1)
+    return None
+
+
+def _whole_years_since(d, ref=None):
+    """Whole (completed) calendar years from date ``d`` to ``ref`` (default today),
+    via dateutil.relativedelta (leap/month-length correct). Returns int >= 0, or
+    None for a future date (no fabricated negative age)."""
+    from datetime import date as _d
+    try:
+        from dateutil.relativedelta import relativedelta
+    except Exception:  # pragma: no cover — dependency present (declared in pyproject)
+        return None
+    ref = ref or _d.today()
+    if d > ref:
+        return None
+    return relativedelta(ref, d).years
+
+
+def _derive_age_from_value(value):
+    """Whole-years-since for a stored scalar VALUE if it is a (non-future) calendar
+    date, else None. The one public entry the render + walk lanes share."""
+    d = _scalar_value_as_date(value)
+    if d is None:
+        return None
+    return _whole_years_since(d)
+
+
+def _entity_date_scalar(db, owner_uuid):
+    """Return (attribute, iso_value) for the entity's birth/creation DATE scalar, or
+    None. The 'is a date' test is on the VALUE (subject-agnostic — no attribute-name
+    list), so a birth date stored under any rel (born_on OR the mis-typed born_in, a
+    provisioning date, …) is found. Prefers a temporal-category rel, else the earliest
+    date; a single date scalar is the norm. Fail-safe None."""
+    if not db or not owner_uuid:
+        return None
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT ea.attribute,"
+                "       COALESCE(ea.value_date::text, ea.value_text) AS val,"
+                "       rt.category"
+                "  FROM entity_attributes ea"
+                "  LEFT JOIN rel_types rt ON rt.rel_type = ea.attribute"
+                " WHERE ea.entity_id = %s AND ea.superseded_at IS NULL",
+                (owner_uuid,),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log.warning("walk.entity_date_scalar_failed", owner=str(owner_uuid)[:8],
+                    error=str(e)[:120])
+        return None
+    dated = []
+    for attr, val, cat in rows:
+        d = _scalar_value_as_date(val)
+        if d is not None:
+            dated.append((d, attr, val, (cat or "").lower()))
+    if not dated:
+        return None
+    # Prefer a temporal-category date rel; else the earliest date (birth/creation is
+    # normally the oldest date on the entity). Deterministic tie-break, no guessing.
+    dated.sort(key=lambda t: (t[3] != "temporal", t[0]))
+    _d, attr, val, _cat = dated[0]
+    return (attr, _d.isoformat())
+
+
+def _annotate_date_derivation(fact: dict, prose: str) -> str:
+    """Append the DERIVED age/elapsed to a scalar fact's prose IFF its object value is
+    a (non-future) calendar date — e.g. "…born on 2020-04-03" → "…born on 2020-04-03
+    (age 5)". Universal + subject-agnostic: runs on the rendered line of ANY lane
+    (walk / legacy scalar / descent), keyed only on the value being a date. Idempotent
+    (skips if an "(age …)" tail is already present). Fail-safe: returns prose unchanged."""
+    try:
+        if not prose or not isinstance(fact, dict):
+            return prose
+        if fact.get("source") != "attributes":
+            return prose
+        if "(age " in prose:
+            return prose
+        years = _derive_age_from_value(fact.get("object"))
+        if years is None:
+            return prose
+        return f"{prose} (age {years})"
+    except Exception:
+        return prose
+
+
 def _decompose_query_steps(query_text: str, intent: dict | None = None) -> list[str] | None:
     """Decompose a possessive/attribute question into an ordered list of step
     TOKENS, off SYNTAX (possessive ``'s``/``’s``, the connector "of", and "my"),
@@ -25514,10 +25682,15 @@ def _decompose_query_steps(query_text: str, intent: dict | None = None) -> list[
         return None
 
     # Strip leading interrogative scaffolding so the residue is the possessive
-    # chain itself. "what is X" / "what's X" / "tell me about X" / "whose X".
+    # chain itself. "what is X" / "what's X" / "tell me about X" / "whose X" /
+    # "when is X's birthday" / "where is X's …". WHEN/WHERE are query-NLU scaffolding
+    # (what is ASKED), not a fact word-list — stripping them lets the SAME possessive
+    # decomposition reach the entity's dated/scalar slot (bug: "when is Rex's
+    # birthday" left "when"/"is" as junk owner steps → the walk defers → recall misses).
     _lead = re.match(
         r"^(?:what(?:'s| is| are| was| were)?|who(?:'s| is)?|"
-        r"tell me(?: about)?|show me|whats)\s+(.+)$", q
+        r"when(?:'s| is| was| are| were)?|where(?:'s| is| was| are| were)?|"
+        r"whose|tell me(?: about)?|show me|whats)\s+(.+)$", q
     )
     core = _lead.group(1).strip() if _lead else q
 
@@ -25905,6 +26078,34 @@ def _resolve_compound_rel_terminal(db, anchor_uuid: str, rel_tokens: list[str]) 
         return None
 
 
+def _walk_date_age_intent(db, terminal: str, query_text: str) -> str | None:
+    """Classify the walk terminal as a birth/creation-DATE ask ("when is X's birthday",
+    "when was X born") or an AGE ask ("how old is X") — else None. Query-NLU only (what
+    is ASKED), NOT a fact word-list: the 'how old'→'age' bridge sets terminal='age'; a
+    leading "when" marks a date ask; otherwise the terminal is a date ask iff it
+    canonicalizes to a TEMPORAL-category SCALAR rel (birthday→born_on) — metadata-driven.
+    Fail-safe None."""
+    try:
+        w = _strip_possessive_suffix(terminal or "").strip().lower()
+        if w == "age":
+            return "age"
+        if (query_text or "").strip().lower().startswith("when"):
+            return "date"
+        canon = _canonical_scalar_name(db, w)
+        if canon and db is not None:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM rel_types WHERE rel_type = %s"
+                    " AND category = 'temporal' AND 'SCALAR' = ANY(tail_types) LIMIT 1",
+                    (canon,),
+                )
+                if cur.fetchone():
+                    return "date"
+    except Exception:
+        return None
+    return None
+
+
 def resolve_typed_walk(
     query_text: str,
     user_id: str,
@@ -26046,6 +26247,36 @@ def resolve_typed_walk(
             log.info("walk.scalar_answer", owner=str(cur_uuid)[:8],
                      attr=attr_name, query=query_text[:50])
             return {"status": "answer", "facts": [fact], "anchor": cur_uuid}
+
+        # ── DATE / AGE DERIVATION FALLBACK (expose + calc, subject-agnostic) ──────
+        # The exact asked slot missed, but this is a birth/creation-DATE or AGE ask
+        # and the entity DOES carry a date-valued scalar — possibly under a
+        # differently-typed rel (a birth date mis-stored as born_in, a provisioning
+        # date, …). Surface that date fact and STOP; the render lane appends the
+        # derived age. This is what makes "how old is Leo" (age slot empty, born
+        # date present) and "when is Rex's birthday" (stored under born_in, not
+        # born_on) answer instead of defer. Keyed on the ASK class + the VALUE being a
+        # date, never an attribute-name list. Fail-safe: no date scalar → fall through.
+        if scalar_res in (_WALK_KNOWN_GAP, _WALK_NO_SLOT):
+            _da = _walk_date_age_intent(db, terminal, query_text)
+            if _da:
+                _ds = _entity_date_scalar(db, cur_uuid)
+                if _ds:
+                    _dattr, _dval = _ds
+                    fact = {
+                        "subject": cur_uuid,
+                        "rel_type": _dattr,
+                        "object": _dval,
+                        "confidence": 1.0,
+                        "fact_class": "A",
+                        "source": "attributes",
+                        "category": _get_rel_type_category(_dattr),
+                        "valid_from": None,
+                        "valid_until": None,
+                    }
+                    log.info("walk.date_derivation_answer", owner=str(cur_uuid)[:8],
+                             ask=_da, attr=_dattr, query=query_text[:50])
+                    return {"status": "answer", "facts": [fact], "anchor": cur_uuid}
 
         if scalar_res is _WALK_KNOWN_GAP:
             # Slot is valid for this entity but no value stored → KNOWN GAP, DEFER.
@@ -26205,7 +26436,15 @@ def resolve_anchor(
             if word.lower() in possessive_keywords:
                 # Look at word AFTER possessive
                 if i + 1 < len(words):
-                    next_word = words[i + 1]
+                    # SCOPE FIX (possessive-named entity): "my router's IP" carries the
+                    # possessive 's ON the entity word ("router's"), so the raw alias
+                    # lookup below missed it and the anchor DEFAULTED to the user — which
+                    # then firehosed the whole profile (the over-expose bug). Strip the
+                    # trailing possessive suffix so "router's"/"NAS's" resolve to the
+                    # OWNING entity (the scalar question is ABOUT that entity). No-op when
+                    # there is no possessive suffix (byte-for-byte unchanged). Subject-
+                    # agnostic, deterministic (literal suffix strip only).
+                    next_word = _strip_possessive_suffix(words[i + 1])
                     semantic = _get_semantic_word_mappings(db, next_word)
 
                     # If next word is a taxonomy keyword → user
@@ -31137,7 +31376,26 @@ def fetch_facts_from_anchor(
 
                             # Domain-scoped fetch: per-user schema IS the scope. All facts
                             # with taxonomy rel_types belong to this user — fetch them all.
-                            if category_rels:
+                            #
+                            # SCOPE-LEAK FIX (over-expose): this tenant-WIDE fetch ignores
+                            # the anchor (WHERE rel_type = ANY(...), no anchor predicate) and
+                            # then pulls EVERY discovered entity's scalars. That is correct for
+                            # a BROAD self/group recall ("tell me about my family" → anchor is
+                            # the user; every family fact + member scalar is wanted), but it is
+                            # the LEAK for a NARROW question anchored on a CONCRETE non-user
+                            # entity: "how old is Leo" resolves the anchor to Leo, scope-
+                            # deference maps Leo's child_of → the family taxonomy, and this
+                            # lane then floods the WHOLE family domain + everyone's scalars
+                            # (Carol, the user's address/heart-rate). For a concrete non-user
+                            # anchor the anchor-BOUNDED taxonomy_query above + the descent +
+                            # the non-user scalar lane already surface the right subtree, so
+                            # gate the tenant-wide flood to the broad case only. Subject-
+                            # agnostic (anchor identity + explicit fetch-all, no rel/domain
+                            # literal); fail-safe (narrow non-user anchor → simply skipped).
+                            _domain_wide_ok = (
+                                anchor_uuid == user_id or path.fetch_all_details
+                            )
+                            if category_rels and _domain_wide_ok:
                                 try:
                                     cur.execute("""
                                         SELECT subject_id, object_id, rel_type, confidence, fact_class
@@ -33156,6 +33414,14 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 # prefix leaked an internal token to the user-facing string. The
                 # softening is shaped downstream by the recall preamble using the
                 # fact's `fact_class` field (which survives on the fact dict).
+                # EXPOSE + CALC (correct-by-construction seam): append the DERIVED
+                # age/elapsed to a date-valued scalar line HERE — where the fact and its
+                # rendered prose are together — so the derivation can never misalign with
+                # the wrong line (convert_to_prose skips + dedups facts, so a post-pass
+                # keyed on list index would drift). Subject-agnostic, source-guarded
+                # (attributes-only), keyed on the value being a date.
+                prose = _annotate_date_derivation(fact, prose)
+
                 # Accumulate for the post-passes (inverse-dedup keyed on UUIDs +
                 # rel_type; titlecase keyed on the resolved DISPLAY-NAME aliases —
                 # entity names only, never "you" or a SCALAR value/type word).
@@ -33813,12 +34079,25 @@ async def query(request: QueryRequest) -> QueryResponse:
         # no new traversal. Flag-gated + fail-safe (degrades to today's behavior on error).
         if QUERY_WALK_READS_ATTRIBUTES and db:
             try:
+                # SCOPE FIX (over-expose): when the anchor is a CONCRETE non-user entity
+                # ("my router"), the SELF surfaces here as a traversed neighbour via the
+                # inverse ownership edge (you→owns→router). Reading the self's scalars then
+                # dumps the WHOLE user profile (address / heart-rate / meds) onto a narrow
+                # device question — the reported leak. The self's identity scalars are
+                # in-scope only for a SELF-anchored / broad recall, so exclude the self from
+                # the traversed-scalar read unless the anchor IS the user. The relational
+                # "you own router" edge still surfaces; only the self's unrelated SCALAR
+                # profile is withheld. Subject-agnostic (keys on anchor identity, no
+                # attribute/domain literal); no regression to "tell me about my family"
+                # (anchor == user there → self not excluded).
+                _exclude_self = anchor != user_id
                 _traversed_uuids: set[str] = set()
                 for _tf in db_facts:
                     for _slot in (_tf.get("subject") or _tf.get("_subject_id"),
                                   _tf.get("object") or _tf.get("_object_id")):
                         if (_slot and isinstance(_slot, str) and len(_slot) == 36
-                                and _slot != anchor):
+                                and _slot != anchor
+                                and not (_exclude_self and _slot == user_id)):
                             _traversed_uuids.add(_slot)
                 if _traversed_uuids:
                     _trav_attrs = _fetch_traversed_entity_attributes(
