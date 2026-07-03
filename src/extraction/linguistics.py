@@ -4831,6 +4831,14 @@ class SentenceFact:
     # entity_attributes (the SCALAR storage path), never resolving it to a UUID. Default None (every
     # relational/hierarchical fact). Mirrors how event_date/negated ride their own fields.
     scalar_datatype: str | None = None
+    # OBJECT-PRONOUN PROVENANCE (2c63a862 date-reattach). When this fact's OBJECT was coref-resolved
+    # from a 3rd-person object PRONOUN ("…working with HER" → object "rachel"), this carries the
+    # ORIGINAL pronoun surface ("her"). The harvest threads it onto the edge's ``object_pronoun`` so
+    # the entry-peel date reattach (``_reattach_clause_dates``) can bind the peeled date to THIS edge:
+    # its resolved object ("rachel") is NOT in the clause residue (which still says "her"), but the
+    # PRONOUN is — matching by the pronoun is precise (only a pronoun-object edge, only to the clause
+    # containing that pronoun; no over-bind on a named edge). Default None (object was a real surface).
+    object_pronoun: str | None = None
 
 
 # ── NAME↔TYPE BINDER vs ATTR-SCALAR PRECEDENCE ────────────────────────────────────────────────────
@@ -5143,7 +5151,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 pass
 
     def _emit(subject, rel, obj, verb_tok=None, obj_tok=None, subj_tok=None, tentative=False,
-              negated=False, scalar_datatype=None, distribute=True):
+              negated=False, scalar_datatype=None, distribute=True, object_pronoun=None):
         subj = (subject or "").strip().lower()
         rel = (rel or "").strip().lower()
         obj = (obj or "").strip().lower()
@@ -5276,6 +5284,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             thin_type=thin, provenance="user_stated",
             tentative=bool(tentative), negated=bool(negated),
             scalar_datatype=(scalar_datatype or None),
+            object_pronoun=(object_pronoun or None),
         ))
 
         # ── GENERAL COORDINATED-CONJUNCT DISTRIBUTION (rel-agnostic) ────────────────────────────
@@ -6725,8 +6734,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if _pron is not None:
                     _res = _person_coref(_pron)
                     if _res:
+                        # Tag the ORIGINAL pronoun surface so the entry-peel date reattach can bind
+                        # this clause's date to the resolved-name edge (the residue still says "her",
+                        # not "rachel"). Whole-token pronoun, morphology already gated by _person_coref.
                         _emit(subject, predicate, _res, verb_tok=svo_head,
-                              obj_tok=_pron, subj_tok=subj_tok)
+                              obj_tok=_pron, subj_tok=subj_tok,
+                              object_pronoun=(_pron.text or "").strip().lower() or None)
                 continue
             for _ct in _np_conjuncts(obj_tok):  # conjunct/dash-list distribution
                 if _ct.i in _ni_suppress:
@@ -6820,8 +6833,32 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # promoted to Class B). We discriminate STRUCTURALLY (dep_/tag_/morph only, NO verb list):
             #   (1a) REJECT a verb that IS ITSELF an embedded clausal complement — it predicates
             #        about the matrix clause, not a top-level state of this subject ("…I will WAIT").
+            #        CARVE-OUT — RESULTATIVE PAST-PARTICIPLE SMALL CLAUSE (subject-agnostic, structural):
+            #        the periphrastic-causative / resultative "I got my bike REPAIRED [in mid-February]",
+            #        "I had my car SERVICED last week" parse the participle as a ccomp of the light verb
+            #        ("got"/"had") whose OWN nsubj is the PATIENT ("bike"/"car"). That participle IS a
+            #        genuine dated STATE/event ABOUT the patient (the bike underwent repair — the exact
+            #        twin of "the gps BROKE"), NOT a control/mental complement ("I will WAIT"/"I think
+            #        X"). Admit it ONLY when the complement is a PAST PARTICIPLE (VerbForm=Part ∧
+            #        Past/Perfective) carrying its OWN CONCRETE NOUN/PROPN nsubj — so the state files on
+            #        a resolvable entity (a bare-pronoun patient "I want IT done" has no unambiguous
+            #        antecedent → DEFER, never guess). Every infinitival/finite control complement
+            #        ("wait"/"think") lacks Part → still falls through to the reject. spaCy morph + dep
+            #        only, no verb/lemma list; the date binds via the shared governing-verb map (the PP
+            #        "in mid-February" attaches to the participle). Fail-safe → today's reject.
             if tok.dep_ in ("ccomp", "xcomp"):
-                continue
+                _resultative_small_clause = False
+                try:
+                    _own_subj = next(
+                        (c for c in tok.children
+                         if c.dep_ in ("nsubj", "nsubjpass") and c.pos_ in ("NOUN", "PROPN")), None)
+                    if _own_subj is not None and "Part" in tok.morph.get("VerbForm") and (
+                            "Past" in tok.morph.get("Tense") or "Perf" in tok.morph.get("Aspect")):
+                        _resultative_small_clause = True
+                except Exception:  # noqa: BLE001 — undecidable → keep the reject
+                    _resultative_small_clause = False
+                if not _resultative_small_clause:
+                    continue
             #   (1b) REJECT a control/mental/raising verb outright — its objectlessness is illusory;
             #        the content is in the embedded clause, not a state of the subject.
             if _verb_has_clausal_complement(tok):
