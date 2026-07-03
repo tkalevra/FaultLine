@@ -122,6 +122,56 @@ _HIERARCHY_RELS = ("instance_of", "is_a", "subclass_of", "part_of", "member_of")
 # TYPE-bearing alias for classification and (b) refuse to climb a pure named instance into L4.
 _NAMING_RELS = ("pref_name", "also_known_as")
 
+# ── AUTHORITY GUARD — engine growth must never re-classify a SEEDED rel's structure ──
+# Structural fields of a rel_type that are IMMUTABLE to engine growth (user > SEED > growth).
+# head_types is DELIBERATELY excluded — growth may WIDEN it by union (additive). Mirrors
+# main._SEED_STRUCTURAL_FIELDS (this is a separate OS process, so the constant is duplicated).
+_SEED_STRUCTURAL_FIELDS = (
+    "is_hierarchy_rel", "category", "tail_types", "fact_class",
+    "storage_target", "inverse_rel_type", "is_symmetric",
+)
+
+
+def _seed_structural_flags(db_conn, rel_type: str) -> dict | None:
+    """Return the AUTHORITATIVE structural flags of a SEEDED rel from the ``public``
+    template, or ``None`` when the rel is not seeded (genuinely novel — growth owns it).
+
+    AUTHORITY ORDER — user > SEED > engine-growth. A rel present in ``public.rel_types`` has
+    an IMMUTABLE structural classification against the re-embedder's ontology-evaluation /
+    class-C-promotion / synonym-convergence writes: they may STRENGTHEN confidence and
+    WIDEN head_types (additive) but must never re-classify a seeded rel's structure
+    (is_hierarchy_rel / category / tail_types / fact_class / storage_target /
+    inverse_rel_type / is_symmetric). Extends "user is truth" to the ontology STRUCTURE —
+    the engine grows PLACES, never corrupts the grounded structural definition.
+
+    KG grounding: RDFS ``rdf:type`` (Wikidata P31, is_hierarchy_rel) and ``rdfs:subClassOf``
+    (P279) are DEFINITIONAL axes fixed by the ontology author, not mutable from instance data
+    — https://www.w3.org/TR/rdf-schema/#ch_type , #ch_subclassof.
+
+    ``public`` is read ONLY here as the seed-authority reference. Subject-agnostic — keyed on
+    public PRESENCE, never a rel-name literal. Fail-safe: any error → log + None (caller keeps
+    its computed values; the reconcile migration is the backstop), never crashes the sweep.
+    """
+    rt = (rel_type or "").strip().lower()
+    if not rt:
+        return None
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_hierarchy_rel, category, tail_types, fact_class,"
+                "       storage_target, inverse_rel_type, is_symmetric"
+                "  FROM public.rel_types WHERE rel_type = %s",
+                (rt,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(_SEED_STRUCTURAL_FIELDS, row))
+    except Exception as e:
+        log.error(f"re_embedder.seed_structural_flags_read_failed rel_type={rt}: {str(e)[:160]}")
+        return None
+
+
 # Lazy-loaded local embedder — initialized on first use, None if fastembed not installed
 _local_embedder = None
 
@@ -1484,6 +1534,19 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                     category = llm_md.get("llm_category", "other")
                     head_types = llm_md.get("llm_head_types") or ["ANY"]
                     tail_types = llm_md.get("llm_tail_types") or ["ANY"]
+                    # AUTHORITY GUARD (user > SEED > growth): candidate_rel here is the SEED
+                    # 'related_to'. Pin the structural fields to the public seed so the
+                    # unconditional `category = EXCLUDED.category` (and the is_symmetric/inverse
+                    # writes) below can NEVER re-classify the seed — they converge it back to the
+                    # authoritative definition instead. head_types stays LLM-inferred (backfill
+                    # only). See _seed_structural_flags.
+                    _seed_pin = _seed_structural_flags(db_conn, candidate_rel)
+                    if _seed_pin is not None:
+                        category = _seed_pin["category"]
+                        is_symmetric = _seed_pin["is_symmetric"]
+                        inverse_rel_type = _seed_pin["inverse_rel_type"]
+                        if _seed_pin["tail_types"]:
+                            tail_types = _seed_pin["tail_types"]
                     label = candidate_rel.replace('_', ' ').title()
                     with db_conn.cursor() as cur:
                         cur.execute(
@@ -5218,6 +5281,21 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     # Low confidence (< 0.5) → Class C (ephemeral)
                     llm_confidence = llm_metadata.get("llm_confidence", 0.6)
                     assigned_fact_class = "B" if llm_confidence >= 0.5 else "C"
+
+                    # AUTHORITY GUARD (user > SEED > growth): if this candidate is actually a
+                    # SEED (defense-in-depth — ontology_evaluations should hold novel rels only),
+                    # pin the structural fields to the public seed so the unconditional
+                    # is_symmetric/inverse/category/fact_class writes below can never re-classify
+                    # it. head_types stays backfill-only (additive). See _seed_structural_flags.
+                    _seed_pin = _seed_structural_flags(db_conn, candidate_rel)
+                    if _seed_pin is not None:
+                        is_hierarchy = _seed_pin["is_hierarchy_rel"]
+                        is_symmetric = _seed_pin["is_symmetric"]
+                        inverse_rel_type = _seed_pin["inverse_rel_type"]
+                        category = _seed_pin["category"]
+                        assigned_fact_class = _seed_pin["fact_class"] or assigned_fact_class
+                        if _seed_pin["tail_types"]:
+                            tail_types = _seed_pin["tail_types"]
 
                     # Severance #2: backfill head/tail types only when currently empty —
                     # never clobber existing good constraints (CASE guards in the UPDATE).
