@@ -740,6 +740,10 @@ def _switch_branch_and_reexec(targets, note):
         if r and r.returncode == 0:
             _git("pull", "--ff-only", "origin", t)
             print(green(f"  ✓ {t}"))
+            # Skip the gate on the re-exec (no double-prompt) + FLUSH so the messages above survive
+            # os.execv (which replaces the process image without flushing Python's stdout buffer).
+            os.environ["_FL_LANG_SWITCHED"] = "1"
+            sys.stdout.flush()
             # checkout replaced quickstart.py on disk → re-exec runs the NEW branch's version.
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
     print(red("  ✗ Could not switch branch (uncommitted changes? offline?). Continuing as-is."
@@ -750,6 +754,8 @@ def language_gate():
     """FIRST prompt, before anything else. English → the `main`/`master` (en) code; Italian → the
     EXPERIMENTAL `it` branch (multilingual code + Italian prompts) via checkout + re-exec. The branch
     IS the language, so there is no bilingual-string refactor. Bilingual prompt, fail-safe."""
+    if os.environ.get("_FL_LANG_SWITCHED"):
+        return  # re-exec after a branch switch — language already chosen, don't re-prompt.
     lang = choose("Language / Lingua",
                   [("en", "English"), ("it", "Italiano  (sperimentale — experimental)")])
     on_it = (_current_branch() == "it")
