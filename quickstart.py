@@ -708,6 +708,62 @@ def _load_env(path):
     return cfg
 
 
+# ── language gate (runs FIRST — Italian pulls the experimental `it` branch) ────
+_EN_BRANCHES = ("main", "master")
+
+
+def _git(*args, timeout=60):
+    try:
+        return subprocess.run(["git", *args], cwd=HERE, capture_output=True,
+                              text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def _current_branch():
+    r = _git("rev-parse", "--abbrev-ref", "HEAD", timeout=8)
+    return r.stdout.strip() if (r and r.returncode == 0) else None
+
+
+def _switch_branch_and_reexec(targets, note):
+    """Fetch + checkout the first reachable target branch, then RE-EXEC this script (now the target
+    branch's version, with that branch's language). Fail-safe: not a git checkout / all targets fail
+    → print a note and return so setup continues in the current branch's language."""
+    if _current_branch() is None:
+        print(yellow("  ! Not a git checkout — cannot switch language automatically."
+                     "  (Non e un checkout git — impossibile cambiare lingua automaticamente.)"))
+        return
+    print(dim(f"  {note}"))
+    for t in targets:
+        _git("fetch", "origin", t)
+        r = _git("checkout", t, timeout=30)
+        if r and r.returncode == 0:
+            _git("pull", "--ff-only", "origin", t)
+            print(green(f"  ✓ {t}"))
+            # checkout replaced quickstart.py on disk → re-exec runs the NEW branch's version.
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+    print(red("  ✗ Could not switch branch (uncommitted changes? offline?). Continuing as-is."
+              "  (Impossibile cambiare ramo — continuo cosi com'e.)"))
+
+
+def language_gate():
+    """FIRST prompt, before anything else. English → the `main`/`master` (en) code; Italian → the
+    EXPERIMENTAL `it` branch (multilingual code + Italian prompts) via checkout + re-exec. The branch
+    IS the language, so there is no bilingual-string refactor. Bilingual prompt, fail-safe."""
+    lang = choose("Language / Lingua",
+                  [("en", "English"), ("it", "Italiano  (sperimentale — experimental)")])
+    on_it = (_current_branch() == "it")
+    if lang == "it" and not on_it:
+        _switch_branch_and_reexec(
+            ["it"],
+            "Passo al ramo italiano (sperimentale) e riavvio l'installazione…  "
+            "(Switching to the experimental Italian branch and restarting…)")
+    elif lang == "en" and on_it:
+        _switch_branch_and_reexec(list(_EN_BRANCHES),
+                                  "Switching to the English branch and restarting setup…")
+    # else: already on the branch for the chosen language → continue.
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--validate", action="store_true")
@@ -734,6 +790,9 @@ def main():
         else:
             print(red(f"  ✗ {detail}"))
         sys.exit(0 if ok else 2)
+
+    # LANGUAGE FIRST — before prereqs / .env. Italian switches to the `it` branch and re-execs.
+    language_gate()
 
     print(bold(cyan("\n  FaultLine — quickstart setup\n")))
     print("  A per-tenant, write-validated knowledge-graph memory for your LLM.")
