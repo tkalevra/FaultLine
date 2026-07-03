@@ -1678,16 +1678,33 @@ def _bound_name_for_type(type_tok, _naming):
         except Exception:  # noqa: BLE001
             pass
         return c, "appos"
-    # (2) naming verb (reduced relative "dog named Rex")
+    # (2) naming verb (reduced relative "dog named Rex" / "server named apollo"). The object-predicate
+    #     (``oprd``) complement of a naming verb is DEFINITIONALLY the assigned name — a complex-
+    #     transitive naming construction "name/call/dub <X> <Name>" whose object complement spaCy tags
+    #     ``oprd`` ("object predicate"; see spaCy glossary — https://github.com/explosion/spaCy glossary.py).
+    #     CASING-ROBUST, mirroring the copula branch (3) below: en_core_web_sm tags a LOWERCASE name
+    #     ("apollo"/"rex"/"mittens") as NOUN, not PROPN, so a PROPN-ONLY match silently dropped every
+    #     lowercase named instance on the possessed form ("I have a server named apollo") — the diagnosed
+    #     drop. Accept a PROPN complement always, and a NOUN complement too: the naming construction leaves
+    #     no ambiguity — the post-naming-verb object-predicate complement IS the name regardless of its POS
+    #     tag. Exclude a determiner-introduced complement ("named a successor" — a TYPE, not a name) and the
+    #     wh-interrogative. Structural + the naming_verb cue class only; subject-agnostic, no name word-list.
     for c in type_tok.children:
         if c.dep_ not in ("acl", "relcl", "vfin"):
             continue
         if (c.lemma_ or "").strip().lower() not in _naming or c.pos_ not in ("VERB", "AUX"):
             continue
-        proper = next((g for g in c.children
-                       if g.dep_ in ("oprd", "attr", "dobj", "obj") and g.pos_ == "PROPN"), None)
-        if proper is not None:
-            return proper, "named"
+        for g in c.children:
+            if g.dep_ not in ("oprd", "attr", "dobj", "obj") or g.pos_ not in ("PROPN", "NOUN"):
+                continue
+            if any(d.dep_ == "det" for d in g.children):
+                continue  # "named a successor" — det-introduced type, not a name
+            try:
+                if "Int" in g.morph.get("PronType") or g.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            return g, "named"
     # (3) copula "my friend is Sam" — the type is the nsubj of a copula whose complement is a NAME.
     #     Casing-robust: the sm model may tag a person name as NOUN ("Sam" → NOUN); we accept a
     #     NOUN complement as a NAME *only* when (a) the subject role is 1st-person POSSESSED ("my
@@ -7624,6 +7641,29 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     pass
                 return None
 
+            def _type_ner_for():
+                # GLiNER2 type on the TYPE-noun head (the AUTHORITATIVE L4 place), read from doc.ents —
+                # NO GLiNER2 injection, just the native label already seeded. THE HARD LINE: the instance's
+                # KIND is authoritatively its TYPE (server→Object, dog→Animal), NOT the name's surface-based
+                # NER guess — GLiNER2 reads a "server named apollo" name as a Person, but the instance is an
+                # OBJECT because its TYPE is "server". Keying the relation on the TYPE (the place) keeps a
+                # non-animal object out of the person carve-out. Matches the ent whose text is the type head
+                # or that contains the type-head token (surface or lemma). None if the type is untyped.
+                try:
+                    for _ent in getattr(doc, "ents", []) or []:
+                        if not _ent.label_:
+                            continue
+                        if (_ent.text or "").strip().lower() in (type_head, type_head_raw):
+                            return _ent.label_.upper()
+                        for _tk in _ent:
+                            _tkl = (_tk.lemma_ or "").strip().lower()
+                            _tks = (_tk.text or "").strip().lower()
+                            if _tkl == type_head or _tks == type_head_raw:
+                                return _ent.label_.upper()
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+
             def _emit_category(nk, nk_ner):
                 # 3. the relation from the TYPE'S CATEGORY (the only place domains differ) — metadata.
                 #    Resolution order (each layer is DB-grown metadata, NO domain literal in code):
@@ -7632,6 +7672,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 #      (c) self-possessed NON-person type → the possession rel that fits the type
                 #          (animal→has_pet, object→owns) via the rel_types overlay.
                 #      (d) else → a self-subject activity verb (user, <verb>, name), if any.
+                # The INSTANCE's authoritative entity-class is its TYPE (the place), not the name's
+                # surface-based NER: prefer the TYPE-noun's GLiNER2 label, and only fall back to the
+                # name's NER when the TYPE is untyped (an ungrown role like "my colleague Sam" where
+                # GLiNER2 typed only the person name). This keeps a concretely-typed OBJECT ("server
+                # named apollo") OUT of the person carve-out below even when the name reads as a Person.
+                _inst_tag = _type_ner_for() or nk_ner
                 _social_rel = _social_map.get(type_head)
                 if type_head in _kin_set:
                     _kin = _inherent_relation_for_noun(type_head)
@@ -7643,16 +7689,21 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 elif _social_rel:
                     # a PERSON social role → the social tie to the speaker (friend_of / knows).
                     _emit(nk, _social_rel, "user", subj_tok=None, obj_tok=None)
-                elif nk_ner == "PERSON":
+                elif _inst_tag == "PERSON":
                     # CARVE-OUT FAIL-SAFE DEGRADE: a PERSON-typed named instance introduced by a common-
                     # noun role that is NEITHER kinship NOR an already-grown social role ("my colleague
-                    # Sam"). The social_role class is GROWN per-tenant and is empty/missing here, so we
-                    # DEGRADE to the generic walkable ``related_to(name, user)`` (a PERSON is NEVER
-                    # ``owns``) — captured, NOT dropped — and QUEUE the role noun for freq-gated growth.
+                    # Sam"). Gated on the TYPE's class (or the name's NER only when the type is untyped),
+                    # so a non-person object never lands here. The social_role class is GROWN per-tenant
+                    # and is empty/missing here, so we DEGRADE to the generic walkable
+                    # ``related_to(name, user)`` (a PERSON is NEVER ``owns``) — captured, NOT dropped —
+                    # and QUEUE the role noun for freq-gated growth.
                     _emit(nk, "related_to", "user", subj_tok=None, obj_tok=None)
                     _record_cue_candidate(type_head, "social_role")
                 elif b.possessor_is_self:
-                    _poss = _possession_rel_for_type(type_head, instance_type_tag=nk_ner)
+                    # self-possessed NON-person type → the possession rel that FITS THE TYPE (animal→
+                    # has_pet, object→owns) via the rel_types overlay, keyed on the TYPE-authoritative
+                    # instance class (falls back to owns).
+                    _poss = _possession_rel_for_type(type_head, instance_type_tag=_inst_tag)
                     _emit("user", _poss, nk, subj_tok=None, obj_tok=None)
                 else:
                     # NO stated possessor, but the named instance may be the OBJECT of a SELF-subject
