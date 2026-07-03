@@ -678,6 +678,25 @@ def analyze_possessive_predication(text: str):
             if comp.pos_ == "VERB":
                 continue
 
+            # TYPED-DEVICE + STRUCTURED-ATOMIC GUARD (ingest-hardening). "My router is a UniFi at
+            # 192.168.1.1" is NOT a preference — it is a CLASSIFICATION ("router is a UniFi", an
+            # indefinite-article NOUN/PROPN complement) carrying a trailing STRUCTURED SCALAR (the IP).
+            # Reading it as a preference mints rel_type == the possessed noun ("router"), which then
+            # COLLIDES with the router ENTITY the atomic detector needs to host (router, has_ip, <IP>)
+            # → the IP is dropped (rel_type-as-entity rejection). So DEFER here: the deriver's
+            # possessed-typed-atomic chain owns this construction (owns + instance_of, freeing the noun
+            # as an entity), and the /ingest atomic detector binds the scalar. Gated on BOTH signals
+            # (indefinite-article classification complement AND a structured-atomic pobj in the clause)
+            # so a plain preference ("my favorite colour is blue") is untouched. Subject-agnostic,
+            # grammatical (article + POS) + format-grammar (the atomic shape), no domain vocabulary.
+            _comp_is_class = comp.pos_ in ("NOUN", "PROPN") and any(
+                c.dep_ == "det" and (c.text or "").strip().lower() in ("a", "an")
+                for c in comp.children
+            )
+            if _comp_is_class and any(
+                    d.dep_ == "pobj" and _is_structured_atomic_value(d.text) for d in doc):
+                return None
+
             # A QUESTION ("what is my favorite colour?") is not a statement of value — its
             # interrogative complement ("what"/"which"/"who") must NOT be captured as a fact.
             # Grammatical + subject-agnostic: wh-words carry PronType=Int / WP|WP$|WDT|WRB tags.
@@ -847,6 +866,34 @@ def _np_phrase(tok) -> str:
     mods = [c for c in tok.children if c.dep_ in ("compound", "amod") and c.i < tok.i]
     parts = [m.text for m in sorted(mods, key=lambda m: m.i)] + [tok.text]
     return " ".join(p.strip() for p in parts if p and p.strip()).lower()
+
+
+# ── STRUCTURED-ATOMIC VALUE SHAPE (format-grammar routing gate — NOT the rel_type mapping) ──────────
+# A ROUTING shape-check for a structured atomic literal (an IP / MAC / email / URL / CIDR) that spaCy
+# keeps as a single token. It exists ONLY to let the deriver DECIDE ROUTING for the possessed-typed
+# construction ("my router is a UniFi at 192.168.1.1") — so the trailing "at <IP>" is treated as a
+# device scalar on the entity, NOT swallowed into the copula VALUE (the attr-scalar/preference twin).
+# The AUTHORITATIVE rel_type (has_ip/has_mac/…) is still assigned downstream by the /ingest atomic
+# detector (``_detect_atomic_values``) — this is the same universal format-grammar it harnesses, used
+# here only as a boolean discriminator. Subject-agnostic, no domain vocabulary. A plain-word locative
+# ("in the closet") / a bare time ("at 3pm") never matches (needs an internal ``.``/``:``/``@``).
+_STRUCTURED_ATOMIC_RE = re.compile(
+    r'^(?:'
+    r'(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:/\d{1,2})?'  # IPv4 / CIDR
+    r'|(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}'                     # IPv6 (loose)
+    r'|[0-9a-fA-F]{2}(?:[:\-][0-9a-fA-F]{2}){5}'                       # MAC (colon/dash)
+    r'|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}'              # email
+    r'|https?://\S+'                                                   # URL
+    r')$'
+)
+
+
+def _is_structured_atomic_value(text: str) -> bool:
+    """True when ``text`` is a single-token structured atomic literal (IP/MAC/email/URL/CIDR)."""
+    try:
+        return bool(_STRUCTURED_ATOMIC_RE.match((text or "").strip()))
+    except Exception:  # noqa: BLE001 — fail-safe: shape miss → not structured
+        return False
 
 
 def _object_value_phrase(tok) -> str:
@@ -5290,14 +5337,52 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     _passive_suppress: set = set()
     try:
         for _v in doc:
-            # PASSIVE PARTICIPLE, purely morphological: a past-participle verb (VBN / VerbForm=Part)
-            # with a 'be' ``auxpass`` child — the general "was/were <Xed>" passive. No lemma list.
+            # PASSIVE PARTICIPLE, purely morphological: a past-participle verb (VBN / VerbForm=Part).
             if _v.tag_ != "VBN" and "Part" not in str(_v.morph):
                 continue
-            if not any(c.dep_ == "auxpass" and (c.lemma_ or "").strip().lower() == "be"
-                       for c in _v.children):
+            _has_auxpass = any(c.dep_ == "auxpass" and (c.lemma_ or "").strip().lower() == "be"
+                               for c in _v.children)
+            # TWO subject shapes reach this lane:
+            #   (i)  FINITE passive ("was/were <Xed>") — a 'be' ``auxpass`` child + an nsubjpass subject.
+            #   (ii) REDUCED-RELATIVE / COORDINATED participle ("a dog named Rex, BORN in 2020") — the
+            #        participle is an ``acl``/``relcl`` modifying a NOUN/PROPN with NO auxpass and NO
+            #        nsubjpass; its logical subject IS the modified head noun (Rex). spaCy attaches the
+            #        second, coordinated participle ("born") as an ``acl`` of the appositive NAME, so the
+            #        finite-passive branch above never sees it and the intransitive chain mis-reads it as
+            #        (rex, has_state, bear). Admit the reduced participle so its date binds to the head.
+            # Purely morphological/structural (VBN + acl/relcl + nominal head), subject- & predicate-
+            # agnostic (no lemma/role list); the objectless + date guards below still gate BOTH shapes.
+            _is_reduced_participle = (
+                not _has_auxpass and _v.dep_ in ("acl", "relcl")
+                and _v.head is not None and _v.head.pos_ in ("NOUN", "PROPN")
+            )
+            if not _has_auxpass and not _is_reduced_participle:
                 continue
-            _psubj = next((c for c in _v.children if c.dep_ in ("nsubjpass", "nsubj")), None)
+            if _has_auxpass:
+                _psubj = next((c for c in _v.children if c.dep_ in ("nsubjpass", "nsubj")), None)
+            else:
+                # The reduced participle predicates its head noun (the modified instance). PREFER the
+                # bound PROPER NAME (THE HARD LINE — the event files at the NAME, not the bare type):
+                # the head may be a PROPN itself ("dog named Rex, BORN" → head IS Rex), carry an appos
+                # PROPN, or be named by a sibling naming-verb acl ("server called Apollo, PROVISIONED"
+                # → head "server" has a ``called`` acl whose PROPN object is Apollo). Resolve the name
+                # so the date lands on Apollo, not "server". Structural, subject-agnostic, no lemma list.
+                _head = _v.head
+                if _head is not None and _head.pos_ == "PROPN":
+                    _psubj = _head
+                else:
+                    _nm = next((g for g in _head.children
+                                if g.dep_ == "appos" and g.pos_ == "PROPN"), None) if _head else None
+                    if _nm is None and _head is not None:
+                        for _sib in _head.children:
+                            if _sib.dep_ in ("acl", "relcl") and _sib.pos_ == "VERB":
+                                _op = next((g for g in _sib.children
+                                            if g.dep_ in ("oprd", "dobj", "attr") and g.pos_ == "PROPN"),
+                                           None)
+                                if _op is not None:
+                                    _nm = _op
+                                    break
+                    _psubj = _nm or _head
             if _psubj is None:
                 continue
             # AGENT / OBJECT guard — our lane is the OBJECTLESS dated passive (born / hired /
@@ -5321,6 +5406,71 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _passive_suppress.add(_v.i)  # the intransitive chain must never mint (x, has_state, <part>)
     except Exception:  # noqa: BLE001 — fail-safe: passive-event detection never blocks capture
         _passive_binds, _passive_suppress = [], set()
+
+    # ── POSSESSED-TYPED + STRUCTURED-ATOMIC PRE-PASS (device-classification + scalar routing) ─────
+    # "My router is a UniFi at 192.168.1.1." — a possessed NOUN classified with an indefinite-article
+    # TYPE ("a UniFi") that carries a trailing STRUCTURED-ATOMIC literal (the IP). Today the attr-scalar
+    # / preference twins read the WHOLE copula complement as one scalar VALUE keyed by the possessed
+    # noun → rel_type == "router", which (a) buries the IP inside the value string and (b) BLOCKS the
+    # router ENTITY the /ingest atomic detector needs to host (router, has_ip, <IP>) — the has_ip edge
+    # is dropped as a rel_type-as-entity collision. THE FIX (deterministic, subject-agnostic): read the
+    # construction as a CLASSIFICATION — (possessor, owns, <noun>) + (<noun>, instance_of, <Type>) —
+    # so the noun grounds as a first-class ENTITY, and LEAVE the trailing atomic to the /ingest atomic
+    # seam (which now binds the scalar to the freed entity). Detected purely by grammar (possessed noun
+    # + copula + indefinite-article NOUN/PROPN type) + the format-grammar atomic shape; NO rel_type is
+    # decided here (that stays with the atomic detector). The possessed noun + type head are suppressed
+    # from the attr-scalar / copula-state twins (own-the-construction / suppress-twins). Gated on the
+    # structured-atomic signal so a plain "my router is a UniFi" (no scalar) is UNTOUCHED (still a
+    # preference/attr scalar). Kinship heads are excluded (their age/kin readings are unaffected).
+    _typed_atomic_binds: list = []
+    _typed_atomic_suppress: set = set()
+    try:
+        _kin = _kinship_nouns()
+        for _tok in doc:
+            if _tok.dep_ not in ("nsubj", "nsubjpass") or _tok.pos_ != "NOUN":
+                continue
+            _hd = _tok.head
+            if _hd is None or not (_hd.lemma_ == "be" and _hd.pos_ == "AUX"):
+                continue
+            # POSSESSOR: 1st-person poss determiner → user; genitive NOUN/PROPN possessor → that noun.
+            _pos = None
+            for _c in _tok.children:
+                if _c.dep_ != "poss":
+                    continue
+                try:
+                    if _c.morph.get("Person") == ["1"] and "Yes" in _c.morph.get("Poss"):
+                        _pos = "user"
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                if _c.pos_ in ("NOUN", "PROPN"):
+                    _pos = (_c.text or _c.lemma_ or "").strip().lower()
+                    break
+            if not _pos:
+                continue
+            if (_tok.lemma_ or _tok.text or "").strip().lower() in _kin:
+                continue
+            # NEGATED copula → defer (absence modeling, parity with the scalar chains).
+            if any(_c.dep_ == "neg" for _c in _hd.children):
+                continue
+            # A trailing STRUCTURED-ATOMIC pobj must be present in the clause (the routing signal).
+            if not any(_d.dep_ == "pobj" and _is_structured_atomic_value(_d.text) for _d in doc):
+                continue
+            # TYPE = an indefinite-article NOUN/PROPN complement of the copula ("a UniFi") — OPTIONAL
+            # ("my router is at 192.168.1.1" has no type; the owns edge alone still frees the entity).
+            _type_tok = None
+            for _c in _hd.children:
+                if _c.dep_ in ("attr", "oprd") and _c.pos_ in ("NOUN", "PROPN") and any(
+                        _g.dep_ == "det" and (_g.text or "").strip().lower() in ("a", "an")
+                        for _g in _c.children):
+                    _type_tok = _c
+                    break
+            _typed_atomic_binds.append((_tok, _pos, _type_tok))
+            _typed_atomic_suppress.add(_tok.i)
+            if _type_tok is not None:
+                _typed_atomic_suppress.add(_type_tok.i)
+    except Exception:  # noqa: BLE001 — fail-safe: never blocks capture
+        _typed_atomic_binds, _typed_atomic_suppress = [], set()
 
     # ── DATE-VALUED ATTRIBUTE PRE-PASS (construction-agnostic date-value binding) ────────────────
     # The date-valued sibling of the numeric copula-measure layer. A DATE is a VALUE: when a clause
@@ -5678,6 +5828,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 return None
             if nsubj_tok.dep_ not in ("nsubj", "nsubjpass"):
                 return None
+            # POSSESSED-TYPED-ATOMIC DEFERRAL: the device-classification pre-pass OWNS the
+            # "my <noun> is a <Type> at <structured-atomic>" construction (owns + instance_of, freeing
+            # the noun as an entity so the atomic detector can host the scalar). Step aside so the whole
+            # copula complement is NOT swallowed as one scalar keyed by the possessed noun.
+            if nsubj_tok.i in _typed_atomic_suppress:
+                return None
             head = nsubj_tok.head
             if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
                 return None
@@ -5754,6 +5910,31 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         except Exception as e:  # noqa: BLE001 — fail-safe: never break the deriver
             log.warning("linguistics.attr_scalar_binding_failed", error=str(e)[:160])
             return None
+
+    def _chain_possessed_typed_atomic(doc):
+        # POSSESSED-TYPED + STRUCTURED-ATOMIC (device classification). Emits the CLASSIFICATION read of
+        # "my <noun> is a <Type> at <structured-atomic>" (pre-pass ``_typed_atomic_binds``):
+        #   (possessor, owns, <noun>)         — grounds the noun as a first-class ENTITY, and
+        #   (<noun>, instance_of, <Type>)     — the device type, when an indefinite-article Type is present.
+        # The trailing structured-atomic literal (the IP/MAC/…) is deliberately NOT emitted here — the
+        # /ingest atomic detector binds it as the typed scalar to the now-freed entity. Subject-agnostic;
+        # no rel_type/domain literals (owns/instance_of are seeded hierarchy rels). Claims the subject +
+        # type head so the attr-scalar / copula-state twins never re-read the swallowed value.
+        for _tok, _pos, _type_tok in _typed_atomic_binds:
+            _noun = _np_phrase(_tok) or (_tok.text or "").strip().lower()
+            if not _noun:
+                continue
+            _emit(_pos, "owns", _noun, subj_tok=None, obj_tok=_tok)
+            if _type_tok is not None:
+                _tval = _np_phrase(_type_tok) or (_type_tok.text or "").strip().lower()
+                if _tval and _tval != _noun:
+                    _emit(_noun, "instance_of", _tval, subj_tok=_tok, obj_tok=_type_tok)
+            try:
+                _claim(_tok)
+                if _type_tok is not None:
+                    _claim(_type_tok)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _chain_attr_scalar(doc):
         # ATTRIBUTE-SCALAR (Defect 1) — owns the possessive-attribute copula "my <attr> is <literal>"
@@ -7930,6 +8111,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_svo, _chain_intransitive, _chain_passive_event, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_measure, _chain_date_attribute, _chain_dash_specifier,
+         _chain_possessed_typed_atomic,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
          _chain_has_measure, _chain_measure_pp, _chain_attributive_measure,
          _chain_quantity_of,

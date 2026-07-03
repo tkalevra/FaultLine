@@ -20119,6 +20119,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # participated_in, <occurrence>) [date-hosting] + (<occurrence>, instance_of, <type>) [files at
     # the place]. Gated so the LLM never fires when the fast-path already hosted the date. See
     # _classify_occurrence_residue.
+    #
+    # DATED-SCALAR HOST GUARD (ingest-hardening): a DATE is also "hosted" when the spine already
+    # bound it as a dated SCALAR on an entity — "My web server Apollo was provisioned on 2021-08-15"
+    # lands (apollo, provisioned, 2021-08-15) with an ``event_date`` on the passive-event scalar edge,
+    # NOT a participated_in/has_state edge. Without this guard the residue LLM re-fires on that same
+    # date and mints a SPURIOUS occurrence entity ("occurrence: apollo server web") that competes with
+    # the real server entity. So treat ANY edge already carrying an ``event_date`` as a date host: the
+    # "what occurred?" escalation must not re-reify a date the deterministic spine already grounded.
+    # Subject-agnostic, structural (the presence of a bound event_date), no rel/verb literals.
+    if not _event_edges_found:
+        try:
+            if any(getattr(_e, "event_date", None) for _e in edges_dict.values()):
+                _event_edges_found = True
+        except Exception:  # noqa: BLE001 — fail-safe: guard miss falls back to today's behavior
+            pass
     if not _event_edges_found:
         try:
             for _ee in await _classify_occurrence_residue(req.text, user_id):
@@ -20241,6 +20256,51 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         log.warning("ingest.atomic_llm_resolution_failed", error=str(_lle))
         except Exception as _ae:
             log.warning("ingest.atomic_supplementation_failed", error=str(_ae))
+
+    # ── ATOMIC-OWNER vs REL_TYPE-COLLISION RECONCILIATION (ingest-hardening) ─────────────────────
+    # "My router is a UniFi at 192.168.1.1." — the LLM atomizer SEVERS this into two atoms ("My
+    # router is a UniFi." + the IP clause), so the possessive-scalar seam reads atom 1 as (user,
+    # router, unifi) → minting rel_type "router", while the atomic detector correctly resolves
+    # (router, has_ip, <IP>) from the other atom. At commit the has_ip edge is then DROPPED because
+    # "router" is now a rel_type name and cannot register as the entity it needs (rel_type-as-entity
+    # HARD CONSTRAINT). The two atoms only re-converge HERE, so this is where the collision is
+    # resolvable: when an atomic scalar's OWNER entity S is ALSO used as a rel_type by a possessive
+    # scalar edge (owner, S, V) in this same batch, S is really a DEVICE ENTITY and V its TYPE —
+    # promote it: (owner, owns, S) + (S, instance_of, V), freeing S so the atomic scalar commits.
+    # Deterministic, subject-agnostic (no rel/domain literals; keyed on the has_* atomic scalar +
+    # the structural collision), fail-safe. The atomic scalar edge itself is left untouched.
+    try:
+        _atomic_owner_subjects = {
+            (e.subject or "").strip().lower()
+            for e in edges_dict.values()
+            if (e.rel_type or "").strip().lower().startswith("has_")
+            and (e.subject or "").strip().lower() not in ("", "user")
+        }
+        for _S in _atomic_owner_subjects:
+            _collided = [k for k, e in edges_dict.items()
+                         if (e.rel_type or "").strip().lower() == _S]
+            for _k in _collided:
+                _e = edges_dict.pop(_k)
+                _owner = (_e.subject or "user").strip()
+                _typ = (_e.object or "").strip()
+                _prov = getattr(_e, "fact_provenance", None) or "user_stated"
+                _own_key = (_owner, _S, "owns")
+                if _own_key not in edges_dict:
+                    edges_dict[_own_key] = EdgeInput(
+                        subject=_owner, object=_S, rel_type="owns",
+                        fact_provenance=_prov, is_correction=False)
+                if _typ:
+                    _cls_key = (_S, _typ, "instance_of")
+                    if _cls_key not in edges_dict:
+                        edges_dict[_cls_key] = EdgeInput(
+                            subject=_S, object=_typ, rel_type="instance_of",
+                            fact_provenance=_prov, is_correction=False)
+                log.info("ingest.atomic_owner_rel_collision_reconciled",
+                         user_id=str(req.user_id)[:8], entity=_S, promoted_type=_typ,
+                         note="possessive scalar mis-minted the device noun as a rel_type; promoted "
+                              "to owns + instance_of so the atomic scalar can host on the entity")
+    except Exception as _rce:  # noqa: BLE001 — fail-safe: reconciliation never blocks the commit
+        log.warning("ingest.atomic_owner_collision_reconcile_failed", error=str(_rce)[:120])
 
     # ── TEMPORAL MODEL (DESIGN-memory-temporal-lifecycle §5, §7) ──
     # Deterministic, request-text-level: derive temporal_status (verb tense) +
