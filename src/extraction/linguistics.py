@@ -1990,6 +1990,44 @@ def _norm_rel_identity(surface: str) -> str:
         return (surface or "").strip().lower()
 
 
+# ── RESIDENCE-PREDICATE IDENTITIES (composite-address bridge, DEV/DESIGN-address-composite.md) ──
+# The normalized-identity set of LOCATION-category, MUTABLE residence rel_types (lives_in / lives_at /
+# located_in / located_at) — the predicates a residence/address clause folds. Resolved PRIMARY from the
+# per-tenant rel_types overlay (a tenant-grown location rel is picked up for free) and UNIONed with a
+# canonical code-fallback so a DB-down / unwarmed-overlay / str-input turn still bridges. ``born_in`` is
+# category='location' but correction_behavior='immutable' (a birthplace never MOVES) → EXCLUDED here, so
+# "I was born at X in Riverton" is never mistaken for a residence. Metadata-driven, subject-agnostic;
+# mirrors ``_svo_keep_particles()`` (DB-resolve ∪ code-fallback, never empty). These are RELATION
+# IDENTITIES (like ``_STATE_REL``), not a domain word zoo — the residence VERBS (live/reside/dwell) are a
+# small closed English class; the fuller build grows a ``residence_verb`` cue class on the same rail.
+_RESIDENCE_REL_FALLBACK = frozenset({
+    "live_in", "live_at", "reside_in", "reside_at", "dwell_in", "dwell_at", "locate_at",
+})
+
+
+def _residence_predicate_identities() -> frozenset:
+    """LOCATION-category, MUTABLE residence-predicate identities (tenant overlay ∪ code-fallback).
+
+    Fail-safe: any import/read failure / unbound schema → the code-fallback seed (never empty), so a
+    residence clause still bridges when the overlay is cold. ``born_in`` (immutable) is excluded."""
+    try:
+        from src.api import rel_type_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        meta = rel_type_overlay.resolve_current(dsn) if dsn else {}
+        ids: set = set()
+        for _rt, _m in (meta or {}).items():
+            try:
+                if (_m.get("category") == "location"
+                        and (_m.get("correction_behavior") or "supersede") != "immutable"):
+                    ids.add(_norm_rel_identity(_rt))
+            except Exception:  # noqa: BLE001
+                continue
+        return frozenset(ids | set(_RESIDENCE_REL_FALLBACK))
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.residence_rels_resolve_failed", error=str(e)[:160])
+        return _RESIDENCE_REL_FALLBACK
+
+
 def _predicate_is_novel_to_ontology(predicate: str) -> bool:
     """Is ``predicate`` (an SVO verb-lemma predicate like ``affect`` / ``live_in`` / ``marry``) NOVEL to
     the per-tenant ontology — i.e. it resolves to NO seeded/known rel_type (RUNG 2 exact ∪ RUNG 3 alias ∪
@@ -6171,6 +6209,143 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             for _a, _b in zip(_chain, _chain[1:]):
                 _emit_pair(_a.text, _b.text, child_tok=_a, parent_tok=_b)
 
+    def _chain_residence_geo_bridge(doc):
+        # RESIDENCE→CITY BRIDGE (composite address) — DEV/DESIGN-address-composite.md §5 first slice.
+        # "I live at <street> in <city>[, <prov>]" folds ONLY the first prep (at→street SCALAR); the
+        # one-prep break in _svo_predicate_token (~1911) DROPS the 2nd locative PP "in <city>", so the
+        # city floats — _chain_geo_containment_list builds located_in(city, prov) rooted at the CITY,
+        # never linked to the user (the ORPHAN). This bridge ADOPTS the orphan: it emits the RELATIONAL
+        # residence edge lives_in(<subject>, <city>) ALONGSIDE the verbatim residence scalar, so the walk
+        # from the subject reaches the whole nested place (subject →lives_in→ city →located_in→ prov).
+        #
+        # THE HARD LINE: the verbatim address stays the SCALAR (the memory — emitted by _chain_svo /
+        # _chain_attr_scalar); the city/province are L4 PLACES (located_in, geo-list); this chain adds
+        # ONLY the relational lives_in bridge — NO street decomposition, NO place word zoo, NO parser
+        # library. The city is GLiNER2 Location-typed (LOCATION/GPE/LOC ents) — the SAME typing the
+        # geo-containment chain uses.
+        #
+        # Fires ONLY for a RESIDENCE construction, discriminated by METADATA (NOT a verb list):
+        #   • PATH A (residence verb): a content verb whose folded SVO predicate is a location-category,
+        #     MUTABLE residence rel (_residence_predicate_identities — born_in EXCLUDED as immutable),
+        #     with a PERSON subject (first-person→user, or a PROPN name — lives_in head_types=Person).
+        #     An employment/acquisition clause ("work at Google in Mountain View", "bought a house in
+        #     Riverton") folds a NON-residence predicate → never bridged. The single-city case ("I live
+        #     in Toronto") is already the SVO object → skipped here (no duplicate lives_in).
+        #   • PATH B (address scalar): a possessed attribute-scalar copula ("my address is <street>,
+        #     <city>, <prov>", _attr_scalar_binding) whose VALUE span carries a city that HEADS a
+        #     located_in chain (>=2 nested Location ents) → adopt the leading (most-specific) city for
+        #     the possessor. ("my favorite city is Toronto" is not even an attr-scalar — the scalar-
+        #     literal gate drops a bare single-word value — so it never bridges.)
+        # Subject-agnostic, deterministic, fail-safe.
+        _loc_ents = []
+        try:
+            for _e in (getattr(doc, "ents", []) or []):
+                if (_e.label_ or "").strip().upper() in ("LOCATION", "GPE", "LOC"):
+                    _loc_ents.append(_e)
+        except Exception:  # noqa: BLE001
+            _loc_ents = []
+        if not _loc_ents:
+            return
+        _loc_ents = sorted(_loc_ents, key=lambda e: e.start)
+
+        _LOC_PREPS = ("in", "within", "inside", "at")  # closed locative-preposition primitive
+
+        def _under_locative_prep(_tok):
+            # True when _tok is the pobj of a locative preposition (a genuine "in <city>" PP).
+            try:
+                _h = _tok.head
+                return (_h is not None and _h.dep_ == "prep" and _tok.dep_ == "pobj"
+                        and (_h.text or "").strip().lower() in _LOC_PREPS)
+            except Exception:  # noqa: BLE001
+                return False
+
+        # PATH A — residence VERB with a dropped locative city PP.
+        _res_ids = _residence_predicate_identities()
+        for tok in doc:
+            if tok.pos_ != "VERB":
+                continue
+            _lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            if not _lemma or _lemma == "be" or _lemma in _naming_verbs():
+                continue
+            _pred = _svo_predicate_token(tok, exclude_idx=_date_token_idx)
+            if not _pred or _norm_rel_identity(_pred) not in _res_ids:
+                continue  # not a residence clause (work/meet/buy/born → never bridged)
+            _subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None) \
+                or _carried_subject_token(tok)
+            if _subj_tok is None:
+                continue
+            # PERSON subject only (lives_in head_types=Person): first-person→user, or a PROPN name.
+            if _is_first_person_personal_pronoun(_subj_tok):
+                subject = "user"
+            elif _subj_tok.pos_ == "PROPN":
+                subject = (_subj_tok.text or _subj_tok.lemma_ or "").strip().lower()
+                _cr = _coref(_subj_tok)
+                if _cr:
+                    subject = _cr
+            else:
+                continue  # a non-person subject (server/office/company) is not a residence
+            if not subject:
+                continue
+            _svo_obj = _svo_object_head(tok, exclude_idx=_date_token_idx)
+            _subtree_idx = {t.i for t in tok.subtree}
+            _city_ent = None
+            for _e in _loc_ents:
+                if not any(t.i in _subtree_idx for t in _e):
+                    continue  # a Location outside this residence clause's subtree
+                _root = _e.root
+                if _svo_obj is not None and _root.i == _svo_obj.i:
+                    continue  # the city IS already the SVO object (single-city "live in Toronto")
+                if not _under_locative_prep(_root):
+                    continue  # only a genuine dropped locative PP "in <city>"
+                _city_ent = _e
+                break
+            if _city_ent is None:
+                continue
+            _city = (_city_ent.text or "").strip().lower()
+            if not _city or _city == subject:
+                continue
+            # distribute=False: adopt ONLY the leading city — the province (an appos/conj of the city)
+            # is reached via located_in(city, province), NOT a second lives_in(user, province).
+            _emit(subject, "lives_in", _city, subj_tok=_subj_tok, obj_tok=_city_ent.root,
+                  distribute=False)
+            for _t in _city_ent:  # claim the adopted city span (geo-list already did — idempotent)
+                _claim(_t)
+            return  # one residence bridge per clean sentence
+
+        # PATH B — "my address is <street>, <city>, <province>" attribute-scalar: adopt the leading city.
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            _b = _attr_scalar_binding(tok)
+            if not _b:
+                continue
+            _comp = _b.get("comp")
+            _possessor = _b.get("possessor")
+            if _comp is None or not _possessor:
+                continue
+            try:
+                _comp_idx = {t.i for t in _comp.subtree}
+            except Exception:  # noqa: BLE001
+                continue
+            _cities = [_e for _e in _loc_ents if any(t.i in _comp_idx for t in _e)]
+            if len(_cities) < 2:
+                continue  # require a genuine city⊂container composite (not a lone place value)
+            _cities = sorted(_cities, key=lambda e: e.start)
+            # Adopt the leading typed place that is NOT the STREET/address line. GLiNER2 often types the
+            # whole "156 Cedar Street South" as a Location too — but a street/address line carries a
+            # house/unit NUMBER, so we skip a leading Location bearing a numeric token and take the first
+            # numberless place = the CITY. A digit is a closed grammatical primitive (no street-suffix
+            # word zoo); deterministic, subject-agnostic. Fail-safe → the leading place if all carry
+            # digits (still adopts a real place; the located_in chain reaches the rest).
+            _city_ent = next((_e for _e in _cities
+                              if not any(ch.isdigit() for ch in (_e.text or ""))), _cities[0])
+            _city = (_city_ent.text or "").strip().lower()
+            if not _city or _city == _possessor:
+                continue
+            _emit(_possessor, "lives_in", _city, subj_tok=tok, obj_tok=_city_ent.root,
+                  distribute=False)
+            return
+
     def _chain_employment(doc):
         # EMPLOYMENT construction (role-predication + affiliation). Consumes the bindings the
         # ``_emp_binds`` pre-pass computed (verb in the ``employment_verb`` cue class + a grammatical
@@ -8115,7 +8290,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
          _chain_has_measure, _chain_measure_pp, _chain_attributive_measure,
          _chain_quantity_of,
-         _chain_geo_containment_list,
+         _chain_geo_containment_list, _chain_residence_geo_bridge,
          _chain_named_instance, _claim_named_instance_collectives, _chain_appositive)
     )
 
