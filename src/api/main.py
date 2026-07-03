@@ -1187,6 +1187,12 @@ def _reattach_clause_dates(edges: list[dict], clause_dates: list[dict]) -> list[
                     continue
                 _obj = (_edge.get("object") or "").strip().lower()
                 _subj = (_edge.get("subject") or "").strip().lower()
+                # COREF-PRONOUN provenance (2c63a862): when this edge's object was resolved from a
+                # 3rd-person object pronoun, the resolved name ("rachel") is NOT in the residue (which
+                # still says "her") — but the ORIGINAL pronoun IS. Match the clause by the pronoun as a
+                # WHOLE token: precise (only a pronoun-object edge, only to the clause containing that
+                # pronoun) so it never over-binds a named edge (e.g. the undated "met" edge).
+                _pron = (_edge.get("object_pronoun") or "").strip().lower()
                 _match = None
                 for _cd in clause_dates:
                     _res = _cd.get("residue_lc") or ""
@@ -1196,7 +1202,7 @@ def _reattach_clause_dates(edges: list[dict], clause_dates: list[dict]) -> list[
                     if (_obj and _surface_overlaps_residue(_obj, _res, _res_tokens)) or (
                         _subj and _subj != "user"
                         and _surface_overlaps_residue(_subj, _res, _res_tokens)
-                    ):
+                    ) or (_pron and _pron in _res_tokens):
                         _match = _cd
                         break
                 if _match is None:
@@ -15810,6 +15816,10 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 # of resolving it to a UUID entity. The value is captured exactly as the user wrote it.
                 if getattr(_f, "scalar_datatype", None):
                     _edge["object_datatype"] = _f.scalar_datatype
+                if getattr(_f, "object_pronoun", None):
+                    # coref-resolved pronoun object → carry the ORIGINAL pronoun so the entry-peel
+                    # date reattach can bind this clause's date to the resolved-name edge (2c63a862).
+                    _edge["object_pronoun"] = _f.object_pronoun
                 if _f.event_date:
                     _edge["event_date"] = _f.event_date
                     _edge["event_date_granularity"] = _f.event_date_granularity or "day"
