@@ -702,6 +702,33 @@ def analyze_possessive_predication(text: str):
             if comp is None:
                 continue
 
+            # MEASURED-ADJECTIVE GUARD (parallel to analyze_copula's guard, linguistics.py:545).
+            # "my daughter is 10 years old", "my house is 100 years old" predicate a MEASUREMENT
+            # (age/duration), NEVER a preference. The ADJ complement is modified by a numeric measure
+            # (a unit noun npadvmod ← nummod NUM — "10 years old"). Reading it as a preference mints
+            # junk (user, <possessed>, "old"); worse, the possessed noun then canonicalizes to a
+            # rel_type (a kinship noun → parent_of/child_of) and the bare adjective "old" registers as
+            # a PHANTOM entity — the live (user, parent_of, old) leak. The copula-measure chain in
+            # derive_sentence_facts OWNS this idiom as a scalar (age lands on the entity). So DECLINE
+            # here. Fires ONLY when the number measures the adjective ITSELF; a plain single-word
+            # preference ("my favorite colour is blue") has no numeric measure on the ADJ and is
+            # untouched. Grammar-driven (_adj_has_numeric_measure), subject-agnostic, NO word list.
+            if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
+                return None
+
+            # KINSHIP-POSSESSIVE GUARD (metadata-driven, kinship_noun cue class). "my daughter is …",
+            # "my mother is …" possess a PERSON (a kin ROLE), never a preference AXIS. The deriver's
+            # kinship + copula-measure/state chains OWN the kin construction ((daughter, child_of,
+            # user) + age/state). Read as a preference it mints (user, <kin-noun>, value), and the kin
+            # noun canonicalizes to a kin rel_type binding the value as a phantom entity — the same
+            # (user, parent_of, X) leak class. So DECLINE when the possessed HEAD NOUN is a kinship
+            # role. Subject-agnostic (per-tenant kinship_noun cue class via _kinship_nouns), fail-safe
+            # (empty/unbound set → no decline; strictly no worse than today — the measured-ADJ guard
+            # above still covers the reported "N years old" case regardless).
+            _head_lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            if _head_lemma and _head_lemma in _kinship_nouns():
+                return None
+
             # PASSIVE-PARTICIPLE PREDICATE GUARD (subject-agnostic, morphological). "My wife was born
             # on …", "my server was provisioned in …", "my company was founded in …" — here the copula/
             # auxpass branch makes the PARTICIPLE VERB the complement, so this seam would mis-capture the
