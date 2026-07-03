@@ -33560,6 +33560,108 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
 # - Promoted facts get confidence 0.8, visible in future queries
 # - This is the self-strengthening loop
 
+
+def _fetch_location_grounding(db, user_id: str, schema_name: str | None) -> dict | None:
+    """NO-ANSWER GROUNDING FALLBACK (DEV/DESIGN-ingest-hardening-grounding.md).
+
+    When the deterministic L4 walk resolves NOTHING for a genuinely-unanswerable query
+    (empty facts + NO concrete stored entity anchored — the "weight on query"), surface
+    the user's grounded LOCATION as a HELD (Class C voice) fact instead of a bare
+    "No relevant facts found." This is the ONE true thing a downstream model most often
+    lacks to reach its own answer — e.g. "what's the weather tomorrow?" needs WHERE the
+    user is (the model already owns the date + the weather capability). We do NOT fetch
+    weather or chain tools; we answer the missing MEMORY sub-question (location), held.
+
+    Postgres-native adaptation (NOT RAG): RAG falls back to a fuzzy chunk; we fall back to
+    a DETERMINISTIC structured fact. Subject-agnostic + metadata-driven — location rels are
+    resolved FROM METADATA (rel_types.category == 'location'; NO literal rel-name list).
+    CURRENT-RESIDENCE is preferred over BIRTHPLACE deterministically by metadata: birthplace
+    (born_in) carries correction_behavior == 'immutable'; residence (lives_in/lives_at/
+    located_in) is 'supersede', so the non-immutable group is consulted first.
+
+    NEVER fabricates: no stored location → None → the caller's honest empty answer stands.
+    Returns a render-ready fact dict (definition set, fact_class == 'C') or None.
+    """
+    if db is None or not user_id:
+        return None
+    try:
+        with db.cursor() as cur:
+            # Location rel_types FROM METADATA (per-tenant, on the bound search_path). No
+            # hardcoded rel-name list — a tenant-grown location rel is picked up for free.
+            cur.execute(
+                "SELECT rel_type, COALESCE(correction_behavior, '') "
+                "FROM rel_types WHERE category = 'location'"
+            )
+            _rows = cur.fetchall()
+        if not _rows:
+            return None
+        # Residence (non-immutable) preferred over birthplace (immutable), by metadata only.
+        _residence = [r[0] for r in _rows if (r[1] or "").lower() != "immutable"]
+        _birth = [r[0] for r in _rows if (r[1] or "").lower() == "immutable"]
+
+        _found: tuple | None = None  # (rel_type, object_id_or_value, confidence)
+        for _rels in (_residence, _birth):
+            if not _rels:
+                continue
+            with db.cursor() as cur:
+                # Relational location (facts table): object is an entity UUID (e.g. lives_in Toronto).
+                cur.execute(
+                    "SELECT rel_type, object_id, COALESCE(confidence, 0.5) FROM facts "
+                    "WHERE subject_id = %s AND rel_type = ANY(%s) "
+                    "AND superseded_at IS NULL AND archived_at IS NULL "
+                    "ORDER BY COALESCE(last_seen_at, created_at) DESC NULLS LAST LIMIT 1",
+                    (user_id, _rels),
+                )
+                _row = cur.fetchone()
+                if _row:
+                    _found = (_row[0], _row[1], float(_row[2]))
+                    break
+                # Scalar location (entity_attributes): value is a string (e.g. lives_at address).
+                cur.execute(
+                    "SELECT attribute, value_text FROM entity_attributes "
+                    "WHERE entity_id = %s AND attribute = ANY(%s) "
+                    "AND value_text IS NOT NULL AND value_text <> '' LIMIT 1",
+                    (user_id, _rels),
+                )
+                _arow = cur.fetchone()
+                if _arow:
+                    _found = (_arow[0], _arow[1], 0.6)
+                    break
+        if not _found:
+            return None
+
+        _rel_type, _obj, _conf = _found
+        # Render via the SAME prose path (perspective "you" + per-tenant template overlay);
+        # convert_to_prose resolves the object display from the UUID / uses the scalar value
+        # verbatim. fact_class 'C' → the MCP _emit HELD lane presents it tentatively — never
+        # as the literal answer to the asked question.
+        _syn = {
+            "subject": "you", "object": _obj,
+            "_subject_id": user_id, "_object_id": _obj,
+            "rel_type": _rel_type, "fact_class": "C", "confidence": _conf,
+            "source": "location_grounding", "event_date": None,
+        }
+        _tok = rel_type_overlay.set_current_schema(schema_name) if schema_name else None
+        try:
+            _prose = convert_to_prose([dict(_syn)], db, anchor=user_id, user_id=user_id)
+        finally:
+            if _tok is not None:
+                rel_type_overlay.reset_current_schema(_tok)
+        if not _prose:
+            return None
+        _out = dict(_syn)
+        _out["definition"] = _prose[0]
+        _out["category"] = "location"
+        _out.pop("_subject_id", None)
+        _out.pop("_object_id", None)
+        log.info("query.phase5.location_grounding_fetched",
+                 rel_type=_rel_type, user=str(user_id)[:8])
+        return _out
+    except Exception as _e:  # noqa: BLE001 — fail-safe: any error → no grounding → honest empty
+        log.warning("query.location_grounding_failed", error=str(_e)[:160])
+        return None
+
+
 @app.post("/query")
 async def query(request: QueryRequest) -> QueryResponse:
     """
@@ -33795,9 +33897,19 @@ async def query(request: QueryRequest) -> QueryResponse:
                      query=query_text[:60], anchor_method=_anchor_meta.get("method"),
                      note="anchorless, no concept scope, no 1st/2nd-person reference, no temporal "
                           "intent → chitchat/greeting; returning empty instead of fetch-all")
+            # NO-ANSWER GROUNDING FALLBACK: the walk resolved nothing and no concrete entity
+            # anchored (default → user). Rather than a bare empty, surface the user's grounded
+            # LOCATION HELD (the deictic anchor a model most often lacks — "weather tomorrow?"
+            # needs WHERE the user is). Deterministic, metadata-resolved, never fabricated; no
+            # location stored → None → the empty answer below stands. See _fetch_location_grounding.
+            _loc_ground = _fetch_location_grounding(db, user_id, locals().get("schema_name"))
+            _gate_facts = [_loc_ground] if _loc_ground else []
+            if _loc_ground:
+                log.info("query.phase5.location_grounding_surfaced",
+                         site="broad_recall_gate", rel_type=_loc_ground.get("rel_type"))
             return QueryResponse(
                 anchor=anchor or "",
-                facts=[],
+                facts=_gate_facts,
                 preferred_names={},
                 canonical_identity=anchor or "",
                 confidence_applied=True,
@@ -35345,6 +35457,24 @@ async def query(request: QueryRequest) -> QueryResponse:
                          status=_meta.get("status"),
                          fact_class=_meta.get("fact_class"),
                          info_need=_meta.get("info_need"))
+
+        # NO-ANSWER GROUNDING FALLBACK (Site B): the full walk produced NO renderable fact
+        # and the query anchored on the user by default/self-reference (no concrete distinct
+        # entity resolved) with NO concept scope active. Surface the user's grounded LOCATION
+        # HELD — the one memory sub-question a model most often needs to reach its own answer
+        # ("weather tomorrow?" → WHERE are you). Guard so it fires ONLY on a genuine no-answer:
+        # a resolved anchor+fact returns normally; a concrete-entity ask that came back empty
+        # (anchor != user) is NOT grounded with location; a scoped-concept ask (scope_active)
+        # is left as an honest empty rather than substituting an off-topic location. Never
+        # fabricates. Subject-agnostic, deterministic, metadata-resolved.
+        if (not facts_with_definition
+                and anchor == user_id
+                and not getattr(path, "scope_active", False)):
+            _loc_ground = _fetch_location_grounding(db, user_id, schema_name)
+            if _loc_ground:
+                facts_with_definition.append(_loc_ground)
+                log.info("query.phase5.location_grounding_surfaced",
+                         site="final", rel_type=_loc_ground.get("rel_type"))
 
         staged_count = sum(1 for f in resolved_facts if f.get("fact_class") == "C")
         log.info("query.phase5.prose_converted", facts=len(facts_with_definition), staged=staged_count)
