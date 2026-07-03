@@ -1012,13 +1012,33 @@ def _np_conjuncts(head_tok) -> list:
         nxt = []
         for t in frontier:
             for c in t.children:
-                if c.i in seen or c.pos_ not in ("NOUN", "PROPN"):
+                if c.i in seen:
                     continue
+                _is_nominal = c.pos_ in ("NOUN", "PROPN")
                 # conj is always a coordinated sibling. appos is a coordinated list member ONLY for the
                 # PROPN↔PROPN proper-noun-list quirk above (never a common-noun apposition rename).
-                _is_member = c.dep_ == "conj" or (
+                #
+                # OOV-CONJUNCT RECOVERY: the statistical tagger frequently MIS-POS-tags an
+                # out-of-vocabulary coordinated member — "iOS"→NUM, "android"→ADJ, a novel product
+                # name→X — so a bare ``pos_ in {NOUN,PROPN}`` filter SILENTLY DROPS it (and, when the
+                # tail of the list hangs off that dropped token, the members after it too). The ``conj``
+                # DEPENDENCY is the reliable structural signal in a nominal coordination; the POS is what
+                # the tagger gets wrong on an unknown token. So a ``conj`` sibling is a member when it is
+                # nominal OR a CONTENT token the tagger merely mis-typed (has an alphabetic char, and is
+                # not a function-word/number/punctuation POS) — never a genuine number/punct/conjunction.
+                # "we don't forget": a mis-tagged member is captured, not dropped. Structural, subject-
+                # agnostic, NO name/type list.
+                _conj_member = c.dep_ == "conj" and (
+                    _is_nominal or (
+                        c.pos_ not in ("PUNCT", "CCONJ", "SCONJ", "DET", "ADP", "PART",
+                                       "AUX", "PRON", "SPACE", "SYM", "NUM")
+                        and any(ch.isalpha() for ch in (c.text or ""))) or (
+                        # NUM only when it carries an alphabetic char (the OOV mis-tag "iOS"→NUM),
+                        # never a bare numeral ("42") — a numeral conjunct is a scalar, not an entity.
+                        c.pos_ == "NUM" and any(ch.isalpha() for ch in (c.text or ""))))
+                _appos_member = (
                     c.dep_ == "appos" and c.pos_ == "PROPN" and t.pos_ == "PROPN")
-                if _is_member:
+                if _conj_member or _appos_member:
                     seen.add(c.i)
                     out.append(c)
                     nxt.append(c)
@@ -2188,6 +2208,37 @@ def _content_verb_beats_mint(verb_tok, rel: str, minted: str) -> bool:
         return False
 
 
+def _object_candidate_is_temporal(tok) -> bool:
+    """True if an object candidate token is a DATE/TIME entity — the temporal lane owns it, not the graph.
+
+    A date/relative-time is NEVER a relationship object (CLAUDE.md: it is an ``event_date`` scalar). Two
+    object-selection branches leak a BARE weekday/month as a relational object because the deriver's own
+    date-span peel (``_collect_date_spans`` → ``_date_token_idx``) enrolls only a prep-/numeric-anchored
+    span and MISSES a bare weekday, so ``exclude_idx`` never covers it:
+      • the capitalized-advmod object recovery ("crashed Monday" → "Monday" as ``advmod``/``npadvmod``);
+      • the prepositional-object branch ("released on Tuesday" → "Tuesday" as ``pobj`` of "on", which
+        would otherwise fold "on" into a ``release_on`` predicate and bind the weekday as the object).
+    We gate BOTH on the SAME spaCy DATE NER the temporal layer uses (``_get_nlp_ner``) — deterministic,
+    subject-agnostic, NO weekday/month literal list. The parser-only deriver Doc carries no ``ent_type_``,
+    so we consult the shared NER singleton on the token's sentence and test whether the token falls inside
+    a DATE/TIME span. GROUNDING: spaCy EntityRecognizer ``ent.label_ == "DATE"`` (spaCy NER / OntoNotes
+    label scheme). Fail-safe → False (unavailable NER → keep the capture; a rare date-as-object is a
+    lesser evil than dropping a real OOV object — "we don't forget")."""
+    try:
+        if (getattr(tok, "ent_type_", "") or "").upper() in ("DATE", "TIME"):
+            return True
+        _ner = _get_nlp_ner()
+        if _ner is None:
+            return False
+        _doc = _ner(tok.doc.text)
+        for _e in _doc.ents:
+            if _e.label_ in ("DATE", "TIME") and _e.start_char <= tok.idx < _e.end_char:
+                return True
+    except Exception:  # noqa: BLE001 — fail-safe: an NER hiccup never drops the capture
+        return False
+    return False
+
+
 def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
     """Return the OBJECT head noun token a verb governs, or ``None``.
 
@@ -2214,7 +2265,8 @@ def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
         for c in verb_tok.children:
             if c.dep_ == "prep" and (c.text or "").strip().lower() in _particles and _ok(c):
                 for gc in c.children:
-                    if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and _ok(gc):
+                    if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and _ok(gc) \
+                            and not _object_candidate_is_temporal(gc):
                         return gc
         # Attribute complement of a non-copula linking verb ("became a manager").
         for c in verb_tok.children:
@@ -2229,6 +2281,25 @@ def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
                     for gc in c.children:
                         if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and _ok(gc):
                             return gc
+        # OOV PROPER-NOUN OBJECT MIS-PARSE (last resort — reached ONLY when no genuine object matched
+        # above). On a SHORT clause with an out-of-vocabulary proper-noun object the parser routinely
+        # DEMOTES the object to a non-object dependency and mis-POS-tags it: "The vulnerability affects
+        # Android." parses "Android" as ``advmod`` (not ``dobj``); "affects iOS" parses "iOS" as a PRON
+        # ``advmod``. There is no genuine adverb in object position — a CAPITALISED (proper-noun
+        # orthography) post-verbal token the parser could not attach as the object IS the direct object.
+        # We recover it by SHAPE (an uppercase letter = proper-noun form) so an OOV name is never dropped
+        # and the objectless-state chain (which gates on this function returning None) does not mis-fire a
+        # junk ``has_state`` on it. Grammar/orthography-driven, subject-agnostic, NO name list: a genuine
+        # adverb ("crashed yesterday") is lowercase → untouched, and a date span is excluded via
+        # ``exclude_idx`` before we get here. GROUNDING: spaCy ``token.dep_``/``pos_`` (UD/ClearNLP
+        # labels, spaCy glossary) — capture no longer depends on GLiNER2 typing the span.
+        for c in verb_tok.children:
+            if c.dep_ in ("advmod", "npadvmod", "nmod", "dep") and _ok(c) \
+                    and c.pos_ not in ("ADV", "PART", "ADP", "SCONJ", "CCONJ", "DET",
+                                       "PUNCT", "AUX", "SPACE", "SYM") \
+                    and (c.pos_ == "PROPN" or any(ch.isupper() for ch in (c.text or ""))) \
+                    and not _object_candidate_is_temporal(c):
+                return c
     except Exception:  # noqa: BLE001 — fail-safe
         return None
     return None
