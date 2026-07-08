@@ -13859,6 +13859,38 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
     return all_matches
 
 
+def _suppress_atomic_claimed_twins(edges: list[dict], atomic: list[dict]) -> tuple[list[dict], int]:
+    """Drop deriver edges whose OBJECT is EXACTLY a claimed atomic-scalar value (the spine's
+    own-the-construction / suppress-twin rule for the scalar_atomic format-grammar).
+
+    ``atomic`` is ``_detect_atomic_values`` output (dates already filtered by the caller — the
+    temporal lane owns dates). An edge is suppressed iff its object equals a claimed VALUE by
+    EXACT normalized (strip+lower) comparison — NO substring/ILIKE heuristics — UNLESS the edge
+    already carries the detector's own rel_type for that value (a correct has_ip/has_mac/… capture
+    is never dropped). This is what frees the value so the atomic lane (the residue binder here,
+    /ingest's atomic supplementation as the backstop) can host it on the seeded has_* rel instead
+    of a deriver twin eating it first (the live ``age="172.16.5.9"`` corruption). Pure/deterministic;
+    returns (kept_edges, dropped_count)."""
+    if not edges or not atomic:
+        return edges, 0
+    claimed = {
+        (_av.get("value") or "").strip().lower(): (_av.get("rel_type") or "").strip().lower()
+        for _av in atomic if (_av.get("value") or "").strip()
+    }
+    if not claimed:
+        return edges, 0
+    kept: list[dict] = []
+    dropped = 0
+    for _e in edges:
+        _eo = (_e.get("object") or "").strip().lower()
+        _er = (_e.get("rel_type") or "").strip().lower()
+        if _eo in claimed and _er != claimed[_eo]:
+            dropped += 1
+            continue
+        kept.append(_e)
+    return kept, dropped
+
+
 def _parse_relative_date(text: str, reference):
     """Deterministic relative-time → absolute date parser (NO LLM, NO heavy dep).
 
@@ -16470,6 +16502,67 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
         edges = _drop_temporal_object_edges(edges)
     except Exception as _te:  # noqa: BLE001
         log.debug("sentence_pipeline.drop_temporal_failed", error=str(_te)[:120])
+
+    # ── ATOMIC-SCALAR CLAIM (spine parity with the rewrite/ingest lane) ──────────────────────────
+    # The spine returned early and NEVER ran the atomic pre-flight, so a structured literal (an
+    # IP / MAC / email / FQDN / URL) was eaten by a deriver copula/attr twin FIRST (the live
+    # ``age="172.16.5.9"`` corruption) — and /ingest's post-hoc atomic supplementation (~20349)
+    # then SKIPPED ``has_ip`` because the value was already an edge object (its ``_existing_objects``
+    # dedup). Claim the atomics here, REUSING the existing machinery (never a re-implementation):
+    #   1. ``_detect_atomic_values`` on the marker-stripped statement text — the SAME seeded
+    #      scalar_atomic format-grammar the rewrite/ingest lane runs (per-tenant
+    #      extraction_patterns, deterministic regex, <1ms). DATES are exempt (temporal lane).
+    #   2. SUPPRESS deriver twins via ``_suppress_atomic_claimed_twins`` — EXACT normalized-value
+    #      comparison only, correct has_* captures kept (own-the-construction / suppress-twin).
+    #   3. UNION the typed atomic edges via the EXISTING ``_classify_value_subject_residue`` (the
+    #      SAME residue binder the /harvest-spans lane uses: identical edge shape with
+    #      object_datatype + llm_inferred provenance; ONE bounded LLM call binds only the missing
+    #      SUBJECT slot; self-gated by MISSING_SLOT_CAPTURE; the WGM gate still validates).
+    # FAIL-SAFE: detector/DB/LLM miss → edges unchanged and /ingest's atomic supplementation
+    # remains the backstop (the value is no longer masked by a twin, so it fires there).
+    try:
+        _sp_atomic_db = None
+        try:
+            _sp_atomic_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        except Exception:  # noqa: BLE001 — detector falls back to bootstrap patterns
+            _sp_atomic_db = None
+        try:
+            _sp_atomic = _detect_atomic_values(text, _sp_atomic_db) or []
+        finally:
+            if _sp_atomic_db is not None:
+                try:
+                    _sp_atomic_db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Dates ride the temporal lane (event_date), never the scalar claim.
+        _sp_atomic = [_av for _av in _sp_atomic if (_av.get("type") or "").lower() != "date"]
+        if _sp_atomic:
+            edges, _at_dropped = _suppress_atomic_claimed_twins(edges, _sp_atomic)
+            if _at_dropped:
+                seen = {(_e.get("subject"), _e.get("rel_type"),
+                         (_e.get("object") or "").strip().lower()) for _e in edges}
+                log.info("sentence_pipeline.atomic_twin_suppressed",
+                         user_id=user_id[:8], dropped=_at_dropped,
+                         note="deriver edge object was a claimed atomic-scalar value (IP/MAC/…); "
+                              "the scalar_atomic format-grammar owns the value — the typed has_* "
+                              "edge is unioned via the residue binder")
+            try:
+                _sp_atomic_edges = await _classify_value_subject_residue(text, edges, user_id)
+            except Exception as _are:  # noqa: BLE001 — fail-safe: /ingest supplementation backstops
+                log.debug("sentence_pipeline.atomic_residue_failed", error=str(_are)[:120])
+                _sp_atomic_edges = []
+            for _ae in (_sp_atomic_edges or []):
+                _key = (_ae.get("subject"), _ae.get("rel_type"),
+                        (_ae.get("object") or "").strip().lower())
+                if all(_key) and _key not in seen:
+                    seen.add(_key)
+                    edges.append(_ae)
+            if _sp_atomic_edges:
+                log.info("sentence_pipeline.atomic_values_claimed",
+                         user_id=user_id[:8], added=len(_sp_atomic_edges))
+    except Exception as _spae:  # noqa: BLE001 — fail-safe: the atomic claim never breaks the harvest
+        log.debug("sentence_pipeline.atomic_claim_failed", error=str(_spae)[:160])
+
     # RELATION-FIT GUARDRAIL — every candidate must ground to a classifiable rel_type (parity with
     # the legacy path's relation_fit). Malformed fragments are dropped BY CONSTRUCTION.
     try:
