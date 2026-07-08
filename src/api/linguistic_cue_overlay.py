@@ -356,6 +356,50 @@ _BOOTSTRAP_SOCIAL_ROLE_MAP: dict[str, str] = {
     "friend": "friend_of",
 }
 
+# ── ROLE-NOUN → REL_TYPE MAP (copula predicate-nominal role chain) — DB-DOWN SAFETY NET ──
+# A MAP (first-person-possessed role noun → rel_type) for the predicate-nominal role chain:
+# "Globex Industries is my employer" → employer → works_for → (user, works_for, globex industries).
+# CONVENTION — DISTINCT from the kinship/social_role maps (which run FILLER→user, e.g. mother→
+# parent_of ⇒ (mother, parent_of, user)): here the value is the rel_type FROM the POSSESSOR (the
+# user) TO the FILLER entity (the copula SUBJECT NP). Do NOT merge the two conventions into one
+# category — that is a direction bug waiting to happen. Seeded SMALL (the universal employment
+# primitives, all landing on the seeded ``works_for`` rel, P108, tail_types={Organization,Person});
+# growth adds domain roles per-tenant. ``employee`` is INTENTIONALLY ABSENT: works_for has NO
+# seeded inverse rel_type (inverse_rel_type=NULL), so "<Name> is my employee" has no honest
+# user→filler rel to map — we no-op rather than fabricate. Stored on the SAME (cue, category)
+# rail: `cue` = the role noun lemma, `description` = the rel_type. DB-DOWN code-fallback seed
+# only — mirrors migration 142's public seed.
+_BOOTSTRAP_ROLE_NOUN_MAP: dict[str, str] = {
+    "employer": "works_for",
+    "boss": "works_for",
+    "manager": "works_for",
+    "supervisor": "works_for",
+}
+
+# ── ALIAS-PREDICATE (verb → licensing PP particle) MAP — DB-DOWN SAFETY NET ONLY ─────
+# The bounded GRAMMATICAL class of PHRASAL alias/naming predicates: a verb whose lexical semantics,
+# TOGETHER WITH a specific licensing preposition, predicates that a subject is KNOWN BY / GOES BY a
+# name ("she GOES BY Dee", "he is KNOWN AS Sammy", "she is REFERRED TO AS Liv"). The MAP value is the
+# licensing PARTICLE the verb must govern for the alias reading (go→"by", know→"as", refer→"as") — it
+# is the disambiguator that separates the alias reading from a same-verb NON-naming use ("she GOES to
+# work" — "go" without a "by"-PP naming a proper noun is motion, not an alias). This is DISTINCT from
+# the ``naming_verb`` SET (call/name/title/dub/…), which are single naming VERBS that take the name as
+# a direct complement ("prefers to be CALLED Liv") and need no licensing particle.
+#
+# ⚠️ FLAGGED BOUNDED LEXICAL/PHRASAL CLASS, honestly documented — like naming/kinship, the phrasal
+# alias reading cannot be made purely structural: "go by X" (alias) and "go by the store" (motion via)
+# share the verb+``by`` dep shape; only the verb's phrasal semantics + a PROPER-NOUN pobj distinguishes
+# them. It is firewalled downstream by the parse the SAME way (a licensing particle whose ``pobj`` is a
+# PROPN name, subject resolved by grammatical person/coref), and it is DB-HELD + per-tenant + GROWABLE
+# (category='alias_predicate') so a tenant grows its own alias idioms freq-gated without code edits.
+# Mirrors the codebase's existing go-by nickname idiom (linguistics._nickname_run). This in-code map
+# is the DB-DOWN code-fallback seed only, NOT the authority. Mirrors migration 146's public seed.
+_BOOTSTRAP_ALIAS_PREDICATE_MAP: dict[str, str] = {
+    "go": "by",
+    "know": "as",
+    "refer": "as",
+}
+
 # ── BOOTSTRAP MEASUREMENT-UNIT → SCALAR REL_TYPE MAP — DB-DOWN SAFETY NET ONLY ───────
 # A MAP (measurement-unit head lemma → the SCALAR rel_type it measures) for the copula measurement
 # chain: "she is 62 years old" → unit "year" → age; "he is 6 feet tall" → unit "foot" → height; "it
@@ -416,6 +460,14 @@ KINSHIP_GENDER_CATEGORY = "kinship_gender"
 # social_role is a KEYED class (person-social-role noun → rel_type) on the SAME rail (cue=noun,
 # description=rel), resolved by resolve_social_role_map() into a {noun: rel_type} dict.
 SOCIAL_ROLE_CATEGORY = "social_role"
+# role_noun is a KEYED class (possessed role noun → rel_type, USER→FILLER direction — see
+# _BOOTSTRAP_ROLE_NOUN_MAP) on the SAME rail, resolved by resolve_role_noun_map() into a dict.
+ROLE_NOUN_CATEGORY = "role_noun"
+# alias_predicate is a KEYED class (phrasal alias verb → licensing PP particle) on the SAME rail
+# (cue=verb lemma, description=particle), resolved by resolve_alias_predicate_map() into a
+# {verb: particle} dict. Used by the third-party nickname/alias deriver chain ("goes by X",
+# "known as X"). DISTINCT from naming_verb (single naming verbs taking the name as a direct object).
+ALIAS_PREDICATE_CATEGORY = "alias_predicate"
 
 # Per-category DB-DOWN fallback seed. resolve_cues consults this when a category resolves empty / the
 # read fails, so EVERY category fails safe to its own evidenced floor (never the wrong class, never
@@ -853,6 +905,29 @@ def resolve_social_role_map(dsn: str) -> dict[str, str]:
     driven; a role OUTSIDE the map falls to a generic role slot (never a fabricated social tie). Same
     contract as resolve_kinship_gender_map. Fail-safe: bootstrap floor (`_BOOTSTRAP_SOCIAL_ROLE_MAP`)."""
     return _resolve_keyed_map(dsn, SOCIAL_ROLE_CATEGORY, _BOOTSTRAP_SOCIAL_ROLE_MAP)
+
+
+def resolve_alias_predicate_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE phrasal-alias-predicate → licensing-particle MAP for the
+    ContextVar-bound current request schema. Reads the alias_predicate rows ({verb_lemma: particle}).
+    Used by the third-party nickname/alias deriver chain so "she goes by Dee" (go→'by') / "he is known
+    as Sammy" (know→'as') bind (person, also_known_as, <Name>). The value is the licensing preposition
+    the verb must govern with a PROPER-NOUN pobj for the alias reading — the disambiguator that keeps a
+    non-naming same-verb use ("go to work") out. Metadata-driven (seeded migration 146, grown
+    per-tenant), NOT an in-code verb literal. Same contract as resolve_role_noun_map. Fail-safe:
+    bootstrap floor (`_BOOTSTRAP_ALIAS_PREDICATE_MAP`)."""
+    return _resolve_keyed_map(dsn, ALIAS_PREDICATE_CATEGORY, _BOOTSTRAP_ALIAS_PREDICATE_MAP)
+
+
+def resolve_role_noun_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE role-noun → rel_type MAP for the ContextVar-bound current
+    request schema. Reads the role_noun rows ({noun: rel_type}, USER→FILLER direction — see
+    ``_BOOTSTRAP_ROLE_NOUN_MAP``). Used by the copula predicate-nominal role chain so "Globex
+    Industries is my employer" binds the SUBJECT NP as the entity via the mapped rel (employer →
+    works_for ⇒ (user, works_for, globex industries)) instead of minting (user, owns, "employer").
+    Same contract as resolve_social_role_map. Fail-safe: bootstrap floor
+    (`_BOOTSTRAP_ROLE_NOUN_MAP`)."""
+    return _resolve_keyed_map(dsn, ROLE_NOUN_CATEGORY, _BOOTSTRAP_ROLE_NOUN_MAP)
 
 
 # ── CARVED-CLASS GROWTH ACCUMULATOR (request-scoped cue-candidate side-channel) ──────
