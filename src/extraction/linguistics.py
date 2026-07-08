@@ -531,6 +531,23 @@ def analyze_copula(text: str):
                 c.dep_ == "neg" for c in comp.children
             )
             complement = (comp.text or "").strip().lower()
+            # FULL-NP NOMINAL COMPLEMENT (premodifier fix): "I am a principal network architect"
+            # parses architect(NOUN, attr) ← amod(principal) + compound(network); taking only
+            # ``comp.text`` truncated the occupation to "architect". Build the complement from the
+            # head's NP span (``_np_phrase``: head + left compound/amod modifiers, det/poss
+            # excluded — the SAME NP-construction rule the deriver chains use). SCOPED to NOMINAL
+            # complements (NOUN/PROPN) ONLY: an ADJ/VERB complement stays the bare head so the
+            # copula-feeling capture ("I am excited" → feels excited) is byte-identical. The UD
+            # copula analysis treats the NONVERBAL PREDICATE (the full predicate-nominal NP) as
+            # the clause's predicate — the modifiers are part of it, not discardable
+            # (universaldependencies.org/u/dep/cop.html; spaCy attr = predicate "attribute").
+            if comp.pos_ in ("NOUN", "PROPN"):
+                try:
+                    _np = (_np_phrase(comp) or "").strip().lower()
+                    if _np:
+                        complement = _np
+                except Exception:  # noqa: BLE001 — fail-safe: NP-build miss → bare head (today's value)
+                    pass
             if not complement:
                 continue
             # A QUESTION ("what am I?", "who are you?") is not a value statement — skip an
@@ -4622,6 +4639,56 @@ def _social_role_map() -> dict:
             return {}
 
 
+def _role_noun_map() -> dict:
+    """Resolve the per-tenant role-noun → rel_type MAP via the overlay (the role_noun rows'
+    ``description``: {noun: rel_type}). CONVENTION (distinct from the kinship/social_role maps,
+    which run FILLER→user): the value is the rel_type from the POSSESSOR (the user) TO the FILLER
+    entity — ``employer → works_for`` reads "<Filler> is my employer" as (user, works_for, <Filler>).
+    Used by the copula predicate-nominal role chain so "Globex Industries is my employer" binds the
+    SUBJECT NP as the entity instead of minting (user, owns, "employer"). Metadata-driven (seeded
+    migration 142, grown per-tenant), NOT an in-code literal. Fail-safe: any failure / empty → the
+    ``_BOOTSTRAP_ROLE_NOUN_MAP`` code-fallback seed. Mirrors ``_social_role_map()``."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        m = linguistic_cue_overlay.resolve_role_noun_map(dsn)
+        if m:
+            return m
+        return dict(linguistic_cue_overlay._BOOTSTRAP_ROLE_NOUN_MAP)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.role_noun_map_resolve_failed", error=str(e)[:160])
+        try:
+            from src.api import linguistic_cue_overlay
+            return dict(linguistic_cue_overlay._BOOTSTRAP_ROLE_NOUN_MAP)
+        except Exception:  # noqa: BLE001
+            return {}
+
+
+def _alias_predicate_map() -> dict:
+    """Resolve the per-tenant phrasal-alias-predicate → licensing-particle MAP via the overlay (the
+    alias_predicate rows' ``description``: {verb_lemma: particle}). Used by the third-party nickname/
+    alias deriver chain so "she goes by Dee" (go→'by') / "he is known as Sammy" (know→'as') bind the
+    proper name as an ``also_known_as`` alias of the coref'd person. The value is the licensing
+    preposition the verb must govern (with a PROPN pobj) for the alias reading — the disambiguator that
+    keeps a non-naming same-verb use ("go to work") out. Metadata-driven (seeded migration 146, grown
+    per-tenant), NOT an in-code verb literal. Fail-safe: any failure / empty → the
+    ``_BOOTSTRAP_ALIAS_PREDICATE_MAP`` code-fallback seed. Mirrors ``_role_noun_map()``."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        m = linguistic_cue_overlay.resolve_alias_predicate_map(dsn)
+        if m:
+            return m
+        return dict(linguistic_cue_overlay._BOOTSTRAP_ALIAS_PREDICATE_MAP)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never crash the linguistic layer
+        log.warning("linguistics.alias_predicate_map_resolve_failed", error=str(e)[:160])
+        try:
+            from src.api import linguistic_cue_overlay
+            return dict(linguistic_cue_overlay._BOOTSTRAP_ALIAS_PREDICATE_MAP)
+        except Exception:  # noqa: BLE001
+            return {}
+
+
 def _possession_rel_for_type(type_lemma: str | None, instance_type_tag: str | None = None) -> str:
     """Resolve the POSSESSION rel_type that fits a common-noun TYPE, metadata-driven — the deriver-side
     twin of ``main._possession_rel_for_head_type`` (the SAME selection-by-metadata-specificity, reading
@@ -5706,6 +5773,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     except Exception:  # noqa: BLE001 — fail-safe: passive-event detection never blocks capture
         _passive_binds, _passive_suppress = [], set()
 
+    # ── ALIAS-PREDICATE VERB SUPPRESS SET ────────────────────────────────────────────────────────
+    # ``_chain_alias_predicate`` (the third-party nickname/alias chain) OWNS the verb of an alias
+    # construction ("she GOES by Dee", "he is KNOWN as Sammy"). It records that verb's index here so
+    # the intransitive / copula-state / SVO chains never ALSO mint a junk (she, has_state, go) /
+    # (she, has_state, know) twin for the SAME verb. Populated by the alias chain (which runs before
+    # those chains in the ``_chains`` tuple); read by them via ``if tok.i in _alias_suppress``.
+    _alias_suppress: set = set()
+
     # ── POSSESSED-TYPED + STRUCTURED-ATOMIC PRE-PASS (device-classification + scalar routing) ─────
     # "My router is a UniFi at 192.168.1.1." — a possessed NOUN classified with an indefinite-article
     # TYPE ("a UniFi") that carries a trailing STRUCTURED-ATOMIC literal (the IP). Today the attr-scalar
@@ -6674,6 +6749,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the has-measure chain owns this verb ("has a score of 9.8") — scalar, no SVO
             if tok.i in _quantity_verb_suppress:
                 continue  # the quantity-of chain owns this verb ("take 500 mg of metformin") — scalar
+            if tok.i in _alias_suppress:
+                continue  # the alias chain owns this verb ("goes by Dee") — no (she, go_by, dee)
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -6792,6 +6869,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the quantity-of chain owns this verb ("NAS has 40 TB of storage") — scalar
             if tok.i in _passive_suppress:
                 continue  # the dated passive-event chain owns "was <Xed>" — never (x, has_state, <part>)
+            if tok.i in _alias_suppress:
+                continue  # the alias chain owns this verb ("goes by"/"known as") — no has_state twin
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
@@ -7019,6 +7098,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         and _n.head.lemma_ == "be" and _n.head.pos_ == "AUX")
             if head.dep_ == "poss" and _is_name_copula_nsubj(head.head):
                 continue   # (a) possessor leg of "my mother's name is Carol"
+            # (a2) APOSTROPHE-STRIPPED possessor leg (Failure 1). When the atomizer drops the genitive
+            # apostrophe ("my wife's name" → "my wifes name") the role noun attaches to "name" as a
+            # ``compound``/``nmod`` (not ``poss``) — so guard (a) misses it and this chain would mint
+            # the PHANTOM (wifes, spouse, user) off the surface. Step aside for the SAME frame the
+            # genitive-name chain now recovers: a compound/nmod role of a "name"-copula nsubj whose
+            # lemma is a kinship/relational cue. Cue-gated so an ordinary compound ("my user name is
+            # Bob") keeps its reading. Grammar + cue-class driven, subject-agnostic, no noun literal.
+            if head.dep_ in ("compound", "nmod") and _is_name_copula_nsubj(head.head) \
+                    and (head.lemma_ or head.text or "").strip().lower() in (
+                        _kinship_nouns() | _relational_nouns()):
+                continue
             if _is_name_copula_nsubj(head):
                 continue   # (b) naming leg — head IS "name"; never (name, related_to, role)
             # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Sarah" is owned by the
@@ -7034,6 +7124,26 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                        and not any(_g.dep_ == "det" for _g in _c.children)
                        for _c in head.head.children):
                     continue   # the copula-name chain owns "my sister is Sarah"
+            # INTERPLAY GUARD (predicate-nominal role): "<Filler NP> is my <role-noun>" ("Globex
+            # Industries is my employer") is owned by ``_chain_copula_role_predicate`` — the
+            # possessed head is the copula's attr/oprd COMPLEMENT (the nonverbal predicate) and the
+            # nsubj is the FILLER NP the role binds to. Step aside ONLY when that chain will
+            # actually fire (1st-person possessive + role_noun map hit + a nominal non-pronoun
+            # subject), so the (user, owns, "employer") twin is never minted; any other shape keeps
+            # today's reading (no capture is ever lost). Same guard style as the genitive-name /
+            # copula-name interplay guards above. Grammatical + metadata-driven, no noun literal.
+            if head.dep_ in ("attr", "oprd") and head.head is not None \
+                    and head.head.lemma_ == "be" and head.head.pos_ == "AUX":
+                try:
+                    _g_first = (tok.morph.get("Person") == ["1"]
+                                and "Yes" in tok.morph.get("Poss"))
+                except Exception:  # noqa: BLE001
+                    _g_first = False
+                if _g_first and (head.lemma_ or head.text or "").strip().lower() in _role_noun_map():
+                    if any(_s.dep_ in ("nsubj", "nsubjpass") and _s.pos_ in ("PROPN", "NOUN")
+                           and not _is_first_person_personal_pronoun(_s)
+                           for _s in head.head.children):
+                        continue   # the copula-role chain owns "Globex Industries is my employer"
             head_phrase = _np_phrase(head)
             if not head_phrase or len(head_phrase) < 2:
                 continue
@@ -7261,6 +7371,192 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # COLLAPSE the role noun: claim it so the residue guard never flags it as a dropped entity.
             _claim(tok)
 
+    def _chain_copula_role_predicate(doc):
+        # COPULA PREDICATE-NOMINAL ROLE ("<Filler NP> is my <role-noun>"). "Globex Industries is my
+        # employer" is a textbook copular clause whose NONVERBAL PREDICATE is the first-person-
+        # possessed role noun — live spaCy parse: Industries(nsubj, PROPN, compound Globex) ← is
+        # (AUX, lemma be, ROOT) → employer(attr, NOUN) carrying poss "my" (Person=1|Poss=Yes|
+        # PronType=Prs). Grounding: UD's copula analysis makes the predicate NOMINAL the clause's
+        # nonverbal predicate (universaldependencies.org/u/dep/cop.html); spaCy's ``attr`` is the
+        # copular predicate "attribute" label (github.com/explosion/spacy/blob/master/spacy/
+        # glossary.py). This construction previously had NO owning chain: ``_chain_possessive``
+        # read only "my employer" → (user, owns, "employer"), the SUBJECT NP was never bound, and
+        # the lone role noun got GLiNER2-mistyped downstream (Animal → has_pet junk).
+        #
+        # THE FIX mirrors the kinship/copula-name precedent: the ROLE is a slot resolved via a DB
+        # cue map (role_noun cue class, ``_role_noun_map``: {noun: rel_type}, seeded migration 142,
+        # grown per-tenant); the FILLER (the copula SUBJECT NP) is the entity. Map CONVENTION:
+        # the rel runs FROM the user TO the filler — employer→works_for ⇒ (user, works_for,
+        # "globex industries"). A role noun OUTSIDE the map → NO emit (honest no-op; never
+        # fabricate a relation), and the possessive chain's interplay guard also steps aside ONLY
+        # on a map hit, so unmapped constructions keep today's behavior byte-identical.
+        # Grammatical (Poss=Yes ∧ Person=1 morphology — never a token list), metadata-driven,
+        # subject-agnostic, deterministic. NO GLiNER2 mistype fix needed: binding the subject NP
+        # removes the lone role-noun node that seeded the mistype.
+        _rmap = _role_noun_map()
+        if not _rmap:
+            return
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            head = tok.head
+            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+                continue
+            # The FILLER is a nominal subject NP (PROPN "Globex Industries", or a lowercase-robust
+            # common-noun NP); a pronoun / 1st-person subject is NOT this construction.
+            if tok.pos_ not in ("PROPN", "NOUN") or _is_first_person_personal_pronoun(tok):
+                continue
+            # the ROLE noun: the copula's attr/oprd COMMON-NOUN complement. (A PROPN complement is
+            # a NAME — the copula-name/naming seams own that; never this lane.)
+            comp = None
+            for c in head.children:
+                if c.dep_ in ("attr", "oprd") and c.pos_ == "NOUN":
+                    comp = c
+                    break
+            if comp is None:
+                continue
+            # the role noun must be FIRST-PERSON-POSSESSED ("my"/"our" — Person=1 ∧ Poss=Yes read
+            # from morphology, never a token list): that is what anchors the role to the user.
+            _poss_self = False
+            for c in comp.children:
+                try:
+                    if (c.dep_ == "poss" and c.morph.get("Person") == ["1"]
+                            and "Yes" in c.morph.get("Poss")):
+                        _poss_self = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not _poss_self:
+                continue
+            role_lemma = (comp.lemma_ or comp.text or "").strip().lower()
+            rel = _rmap.get(role_lemma)
+            if not rel:
+                continue  # unmapped role → honest no-op (the possessive chain keeps its reading)
+            # NEGATION ("Globex is not my employer") → absence; skip (parity with sibling chains).
+            if any(c.dep_ == "neg" for c in head.children):
+                continue
+            filler = _np_phrase(tok)
+            if not filler or filler == role_lemma:
+                continue
+            # (user, <mapped_rel>, <filler NP>). obj_tok=tok so GLiNER2's live type on the subject
+            # NP (Organization/Person) rides the edge; verb_tok=head so a clause date could bind.
+            _emit("user", rel, filler, verb_tok=head, obj_tok=tok)
+            # COLLAPSE the role noun: claim it so no other chain / the residue guard reads the lone
+            # "employer" as a standalone entity (the seed of the GLiNER2 Animal mistype).
+            _claim(comp)
+
+    def _chain_alias_predicate(doc):
+        r"""THIRD-PARTY / NAMED-SUBJECT ALIAS PREDICATE (Failure 2). Capture a NON-first-person
+        subject's nickname/alias and file it via ``also_known_as`` on that person:
+            "She prefers to be called Liv"   → (olivia, also_known_as, liv)   [she → Olivia by coref]
+            "She goes by Dee"                → (dana,  also_known_as, dee)
+            "He is known as Sammy"           → (sam,   also_known_as, sammy)
+            "Dana goes by Dee"               → (dana,  also_known_as, dee)    [named subject]
+
+        THE HARD LINE: a NAME is FILED via the alias registry (``also_known_as``), NEVER classified
+        into L4. First-person self-naming ("I prefer to be called Max") is OWNED by the affect/
+        preference seam (analyze_naming / _detect_preference_states on the UNION path) and is SKIPPED
+        here to avoid a double capture.
+
+        SUBJECT RESOLUTION is grammatical, NOT a token list. A 3rd-person PERSONAL pronoun subject
+        (she/he/they — UD ``PronType=Prs`` ∧ ``Person=3``; see UD feature spec
+        https://universaldependencies.org/u/feat/Person.html and
+        https://universaldependencies.org/u/feat/PronType.html, exposed on spaCy ``Token.morph`` per
+        https://spacy.io/api/morphologizer) is resolved by ``_person_coref`` to the NEAREST PRECEDING
+        named person — the classic recency/salience heuristic of pronominal anaphora resolution
+        ("the most recent antecedent that agrees in gender and number"; Jurafsky & Martin, *Speech and
+        Language Processing* 3rd ed., ch. Coreference Resolution; Hobbs 1978, "Resolving Pronoun
+        References"). A PROPN subject is used directly; a non-name common-noun subject → no-op (never
+        guess).
+
+        TWO grammatical shapes, both deterministic + metadata-driven (NO name/verb literal):
+          (A) NAMING-VERB complement — a verb whose lemma is in the ``naming_verb`` cue class
+              (call/name/title/…) governing the assigned name as an ``oprd``/``attr``/``dobj`` PROPN.
+              Covers the passive xcomp "prefers to be called <Name>" (subject on the matrix verb) and
+              the direct "is called <Name>" (subject = the verb's own nsubjpass).
+          (B) ALIAS-PP idiom — a verb whose lemma is in the ``alias_predicate`` cue MAP
+              ({verb: particle}; go→by, know→as, refer→as) governing a ``prep`` whose surface == the
+              mapped particle with a PROPN ``pobj``. Covers "goes by <Name>", "is known as <Name>",
+              "referred to as <Name>". Mirrors the codebase's existing go-by nickname idiom
+              (``_nickname_run``); the phrasal alias vocabulary is DB-held/growable, never in code.
+        """
+        _naming = _naming_verbs()
+        _alias_pp = _alias_predicate_map()
+
+        def _alias_subject(verb):
+            # the alias construction's SUBJECT token: the verb's own nsubj/nsubjpass, else — when the
+            # verb is a clausal complement ("prefers TO BE CALLED X") — the matrix head's nsubj.
+            st = next((c for c in verb.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            if st is None and verb.dep_ in ("xcomp", "ccomp", "acl", "relcl", "advcl") \
+                    and verb.head is not None:
+                st = next((c for c in verb.head.children
+                           if c.dep_ in ("nsubj", "nsubjpass")), None)
+            return st
+
+        def _resolve_alias_subject(st):
+            # → (subject_surface | None, is_first_person). First-person self is flagged so the caller
+            # defers to the preference/naming seam. A 3rd-person pronoun resolves via _person_coref;
+            # a PROPN is used directly; anything else → None (never guess a non-name subject).
+            if st is None:
+                return None, False
+            if _is_first_person_personal_pronoun(st):
+                return None, True
+            if st.pos_ == "PROPN":
+                return (st.text or "").strip().lower(), False
+            _cr = _person_coref(st)
+            if _cr:
+                return _cr, False
+            return None, False
+
+        def _own_alias_verb(verb, name_tok, st):
+            # The verb + name complement ARE an alias construction. ALWAYS own the verb (suppress the
+            # intransitive/copula-state/SVO has_state twin + claim) so "goes by Dee" never degrades to
+            # (she, has_state, go) — even when the subject cannot be resolved. Then EMIT the alias edge
+            # only when the subject resolved to a concrete person and is NOT first-person (the self case
+            # is owned by the preference/naming seam). A negated construction is skipped (absence).
+            _alias_suppress.add(verb.i)
+            _claim(verb, name_tok)
+            if any(c.dep_ == "neg" for c in verb.children):
+                return
+            subj_surface, is_first = _resolve_alias_subject(st)
+            if is_first or not subj_surface:
+                return
+            name = (name_tok.text or "").strip().lower()
+            if not name or name == subj_surface:
+                return
+            _emit(subj_surface, "also_known_as", name, obj_tok=None, subj_tok=st)
+
+        for tok in doc:
+            if tok.pos_ not in ("VERB", "AUX"):
+                continue
+            lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            if not lemma:
+                continue
+            st = _alias_subject(tok)
+
+            # (A) NAMING-VERB complement — "called/named <PROPN>".
+            if lemma in _naming:
+                name_tok = next(
+                    (c for c in tok.children
+                     if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN"), None)
+                if name_tok is not None:
+                    _own_alias_verb(tok, name_tok, st)
+                continue
+
+            # (B) ALIAS-PP idiom — "<verb> <particle> <PROPN>" (go→by, know→as, refer→as).
+            _particle = _alias_pp.get(lemma)
+            if _particle:
+                name_tok = None
+                for c in tok.children:
+                    if c.dep_ != "prep" or (c.text or "").strip().lower() != _particle:
+                        continue
+                    name_tok = next((g for g in c.children
+                                     if g.dep_ == "pobj" and g.pos_ == "PROPN"), None)
+                    if name_tok is not None:
+                        break
+                if name_tok is not None:
+                    _own_alias_verb(tok, name_tok, st)
+
     def _chain_genitive_name(doc):
         # GENITIVE NAME-BINDING (Fix 2). "[poss] <relational-noun>'s name is <PROPN>"
         #   "my mother's name is Carol"     → (carol, parent_of, user)   [Carol is the named entity]
@@ -7283,9 +7579,32 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if (tok.lemma_ or "").strip().lower() != "name":
                 continue
-            # the role-noun: a poss child of "name" (mother/son/wife/…)
+            # the role-noun: a poss child of "name" (mother/son/wife/…). The genitive apostrophe
+            # (``'s``, spaCy PART dep=case) makes the role a ``poss`` dependent — unambiguous.
             role = next((c for c in tok.children
                          if c.dep_ == "poss" and c.pos_ in ("NOUN", "PROPN")), None)
+            # APOSTROPHE-STRIPPED GENITIVE ROBUSTNESS (Failure 1 root cause). The LLM atomizer /
+            # normalization sometimes DROPS the genitive apostrophe ("my wife's name" → "my wifes
+            # name"). spaCy then re-parses the role noun as a ``compound``/``nmod`` dependent of
+            # "name" (tag NNS, but the LEMMA is still the singular kin noun — "wifes"→lemma "wife"),
+            # and the 1st-person possessive ("my") attaches to the ROLE noun itself, not to "name".
+            # Without this the genitive-name frame never matches → the role is not collapsed and
+            # ``_chain_possessive`` mis-mints (wifes, spouse, user) off the surface "wifes" (a
+            # PHANTOM entity) while a copula seam reads "wifes name" as a type. We accept the compound
+            # frame ONLY when the role lemma is a KINSHIP/relational cue — so an ordinary noun-noun
+            # compound ("my user name is Bob", "the code name is X") is NEVER mistaken for a collapsed
+            # genitive. The possessor ("my"/"John's") may attach to EITHER the role noun ("my wifes
+            # name" → my→wifes) OR the "name" nsubj directly ("my sisters name" → my→name); the
+            # possessor lookup below checks both, and a frame with NO possessor is dropped there.
+            # Grammar (dep/pos/lemma) + cue-class gated, subject-agnostic, NO noun literal. The kin/
+            # relational vocab lives in the DB cue classes (kinship_noun / relational_noun), overlay.
+            if role is None:
+                _kin_rel_nouns = _kinship_nouns() | _relational_nouns()
+                role = next(
+                    (c for c in tok.children
+                     if c.dep_ in ("compound", "nmod") and c.pos_ in ("NOUN", "PROPN")
+                     and (c.lemma_ or c.text or "").strip().lower() in _kin_rel_nouns),
+                    None)
             if role is None:
                 continue
             role_lemma = (role.lemma_ or role.text or "").strip().lower()
@@ -7307,8 +7626,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not proper_name or proper_name == role_lemma:
                 continue
             # the POSSESSOR of the role-noun: 1st-person poss pronoun → user; a PROPN → that person.
+            # It attaches to the role noun ("my wifes name" → my→wifes) OR, in the apostrophe-stripped
+            # compound frame, to the "name" nsubj itself ("my sisters name" → my→name) — check both.
             possessor = None
             poss_tok = next((c for c in role.children if c.dep_ == "poss"), None)
+            if poss_tok is None:
+                poss_tok = next((c for c in tok.children
+                                 if c.dep_ == "poss" and c is not role), None)
             if poss_tok is not None:
                 try:
                     _is_first = (poss_tok.morph.get("Person") == ["1"]
@@ -7487,8 +7811,23 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if rel is None:
                 for c in head.children:
                     if c.pos_ == "NUM" and c.dep_ in ("attr", "acomp", "dobj", "obj"):
+                        # PLAIN-CARDINAL SHAPE GATE (IP-as-age fix). POS alone CANNOT separate a
+                        # bare age ("Sarah is 28") from a STRUCTURED numeric literal: UD tags
+                        # formatted numerics (dates "11/11/1918", times "11:00" — and a dotted-quad
+                        # IP "172.16.5.9", live-parsed NUM/CD dep=attr) as NUM exactly like a plain
+                        # cardinal (UD NUM: universaldependencies.org/u/pos/NUM.html; spaCy glossary:
+                        # attr = the copular predicate "attribute", NUM/CD = numeral/cardinal —
+                        # github.com/explosion/spacy/blob/master/spacy/glossary.py). A bare-NUM *age*
+                        # is a PLAIN INTEGER CARDINAL; any internal structure ('.', ':', '-', '/')
+                        # marks a formatted literal (IP / version / MAC / range) owned by the
+                        # atomic-scalar detector (has_ip/has_mac/… format-grammar) — NEVER an
+                        # age/measure, in any domain. Deterministic value-shape check on the token
+                        # surface, subject-agnostic; keep scanning for a genuine plain cardinal.
+                        _num_surf = (c.text or "").strip()
+                        if any(_ch in _num_surf for _ch in (".", ":", "-", "/")):
+                            continue  # structured literal → the atomic lane owns it, never a scalar age
                         rel = "age"
-                        value = (c.text or "").strip()
+                        value = _num_surf
                         num_tok = c
                         break
             if rel is None or not value:
@@ -8639,8 +8978,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         () if named_role_only else
         (_chain_dash_specifier,) if dash_specifier_only else
         (_chain_employment,
+         _chain_alias_predicate,
          _chain_svo, _chain_intransitive, _chain_passive_event, _chain_copula_state,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
+         _chain_copula_role_predicate,
          _chain_copula_measure, _chain_date_attribute, _chain_dash_specifier,
          _chain_possessed_typed_atomic,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,
