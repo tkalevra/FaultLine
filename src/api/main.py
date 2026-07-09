@@ -10050,6 +10050,20 @@ def _pin_rel_type_to_known(cur, subject_id: str, corrected_rel: str,
             "  AND archived_at IS NULL",
             (subject_id, subject_id))
         known = [r[0] for r in cur.fetchall() if r[0]]
+        # Staged-aware: grown Class-B/C rels (e.g. `favorite_color`) live in staged_facts
+        # until promoted. Union the subject's ACTIVE staged rels so a correction can pin to
+        # a rel the subject holds even before it's committed to `facts`.
+        try:
+            cur.execute(
+                "SELECT DISTINCT rel_type FROM staged_facts "
+                "WHERE (subject_id = %s OR object_id = %s) AND promoted_at IS NULL "
+                "  AND (expires_at IS NULL OR expires_at > now())",
+                (subject_id, subject_id))
+            for _sr in cur.fetchall():
+                if _sr[0] and _sr[0] not in known:
+                    known.append(_sr[0])
+        except Exception:
+            pass
     except Exception:
         return cr
     if not known or cr in known:
@@ -11257,12 +11271,20 @@ If extraction is impossible or ambiguous, return {{}}."""
     # Load rel_types with natural_language from database
     try:
         with db.cursor() as cur:
+            # No LIMIT: a truncated menu hid grown rels (e.g. `favorite_color`, category
+            # pending_placement) from the extractor so it mislabelled them onto a shown rel
+            # (has_interest_in) → the rel-keyed correction lookups all missed. Present the
+            # full active ontology; usage-ordered so the most-relevant rels lead.
             cur.execute("""
-                SELECT rel_type, natural_language, category
-                FROM rel_types
-                WHERE natural_language IS NOT NULL
-                ORDER BY category, rel_type
-                LIMIT 20
+                SELECT r.rel_type, r.natural_language, r.category
+                FROM rel_types r
+                LEFT JOIN (
+                    SELECT rel_type, count(*) AS n FROM facts
+                    WHERE superseded_at IS NULL AND archived_at IS NULL
+                    GROUP BY rel_type
+                ) u ON u.rel_type = r.rel_type
+                WHERE r.natural_language IS NOT NULL
+                ORDER BY COALESCE(u.n, 0) DESC, r.category, r.rel_type
             """)
             rel_types_list = cur.fetchall()
             rel_types_str = "\n".join(
@@ -11448,12 +11470,19 @@ If extraction is impossible or confidence < 0.70, return {{}}."""
 
     try:
         with db.cursor() as cur:
+            # No LIMIT: same defect as the correction extractor — a truncated menu hides grown
+            # rels so the extractor mislabels them, breaking the rel-keyed lookups. Present the
+            # full active ontology, usage-ordered.
             cur.execute("""
-                SELECT rel_type, natural_language, category
-                FROM rel_types
-                WHERE natural_language IS NOT NULL
-                ORDER BY category, rel_type
-                LIMIT 20
+                SELECT r.rel_type, r.natural_language, r.category
+                FROM rel_types r
+                LEFT JOIN (
+                    SELECT rel_type, count(*) AS n FROM facts
+                    WHERE superseded_at IS NULL AND archived_at IS NULL
+                    GROUP BY rel_type
+                ) u ON u.rel_type = r.rel_type
+                WHERE r.natural_language IS NOT NULL
+                ORDER BY COALESCE(u.n, 0) DESC, r.category, r.rel_type
             """)
             rel_types_list = cur.fetchall()
             rel_types_str = "\n".join(
@@ -37241,6 +37270,64 @@ def correct_fact(req: FactCorrectionRequest):
                     old_fact_row = cur.fetchone()
                     if old_fact_row:
                         found_via = f"subject_staged({old_rel_type})"
+
+                # 7. OLD-VALUE-ANCHORED, REL-AGNOSTIC supersession (user-is-truth).
+                # Every rel-keyed step above trusts the LLM's `old_rel_type`. When the
+                # correction-extractor mislabels the rel (e.g. emits `has_interest_in` for a
+                # stored, grown `favorite_color` because its prompt menu was truncated), all
+                # rel-keyed lookups miss and a real, correctable memory is lost. But the user
+                # named the OLD VALUE ("...red, NOT blue") and it resolved to a concrete UUID —
+                # that is the deterministic anchor. Match by (subject, object) IGNORING rel_type
+                # across BOTH the authoritative `facts` table and `staged_facts`; the stored rel
+                # is whatever the row actually holds. Correction-only (a retraction removes broadly
+                # and has its own semantic fallback); guarded to exactly ONE candidate so we can
+                # NEVER corrupt the wrong memory (>1 → clarify).
+                if (not old_fact_row and object_uuid and not is_retraction
+                        and not is_temporal_correction):
+                    _ov_candidates = []  # (fact_id, stored_rel, is_staged)
+                    cur.execute("""
+                        SELECT id, rel_type FROM facts
+                        WHERE subject_id = %s AND object_id = %s
+                          AND superseded_at IS NULL AND archived_at IS NULL
+                    """, (subject_uuid, object_uuid))
+                    for _r in cur.fetchall():
+                        _ov_candidates.append((_r[0], _r[1], False))
+                    cur.execute("""
+                        SELECT id, rel_type FROM staged_facts
+                        WHERE subject_id = %s AND object_id = %s
+                          AND promoted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > now())
+                    """, (subject_uuid, object_uuid))
+                    for _r in cur.fetchall():
+                        _ov_candidates.append((_r[0], _r[1], True))
+
+                    if len(_ov_candidates) == 1:
+                        _ov_id, _ov_rel, _ov_staged = _ov_candidates[0]
+                        # Pure value correction = only the VALUE changed (the extractor kept the
+                        # rel the same on both sides). Adopt the STORED rel for BOTH the old-match
+                        # and the new re-ingest, else blue is archived but red re-lands under the
+                        # mislabelled rel and the fact re-splits. If the user genuinely changed the
+                        # rel (old_rel_type != new_rel_type), leave new_rel_type as intended.
+                        _was_pure_value = (new_rel_type == old_rel_type)
+                        old_fact_row = (_ov_id, object_uuid)
+                        old_rel_type = _ov_rel
+                        if _was_pure_value:
+                            new_rel_type = _ov_rel
+                        found_via = (f"old_value_object({_ov_rel})"
+                                     + ("_staged" if _ov_staged else ""))
+                        log.info("correct_fact.old_value_anchored_match",
+                                 subject=subject_uuid, object=object_uuid,
+                                 stored_rel=_ov_rel, staged=_ov_staged,
+                                 pure_value=_was_pure_value)
+                    elif len(_ov_candidates) > 1:
+                        log.warning("correct_fact.ambiguous_old_value_object",
+                                    subject=subject_uuid, object=object_uuid,
+                                    candidates=len(_ov_candidates))
+                        return FactCorrectionResponse(
+                            status="clarification_needed",
+                            message=(f"You have several facts with that value and I "
+                                     f"couldn't tell which one to correct. Could you name "
+                                     f"the specific relationship you mean?"))
 
                 if not old_fact_row:
                     # Semantic fallback for retractions — when all 6 pattern-match steps
