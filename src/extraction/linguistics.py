@@ -5781,6 +5781,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # those chains in the ``_chains`` tuple); read by them via ``if tok.i in _alias_suppress``.
     _alias_suppress: set = set()
 
+    # ── DATED-OCCURRENCE SUPPRESS SET ─────────────────────────────────────────────────────────────
+    # ``_chain_dated_occurrence`` (below) OWNS a date-postmodified eventive NP ("my team meeting on
+    # the 17th"): it mints the (user, participated_in, <NP>) dated-event edge and records the NP's
+    # scattered modifier tokens here so ``_chain_possessive`` never ALSO mints the mis-scoped
+    # (user, owns, "upcoming team") twin off the same possessed noun. Populated by the occurrence
+    # chain (which runs BEFORE the possessive chain in the ``_chains`` tuple); read via ``in``.
+    _occ_suppress: set = set()
+
     # ── POSSESSED-TYPED + STRUCTURED-ATOMIC PRE-PASS (device-classification + scalar routing) ─────
     # "My router is a UniFi at 192.168.1.1." — a possessed NOUN classified with an indefinite-article
     # TYPE ("a UniFi") that carries a trailing STRUCTURED-ATOMIC literal (the IP). Today the attr-scalar
@@ -7054,6 +7062,110 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                   subj_tok=(_etok if _etok is not None else _psubj),
                   scalar_datatype=_dt, distribute=False)
 
+    def _chain_dated_occurrence(doc):
+        # DATED OCCURRENCE / EVENT NP → (user, participated_in, <NP>) @ event_date. A NOMINAL that is
+        # directly postmodified by a date PP ("<NP> on/at <DATE>") is a SCHEDULED OCCURRENCE, not an
+        # owned thing — an object does not carry an "on <date>"; an EVENT does. This is the eventive-
+        # noun TWIN of the dated SVO capture ("I attended a <workshop> on <date>"): when the eventive
+        # noun heads its own clause ("my team meeting on the 17th", "I have a meeting on the 17th",
+        # "…in my upcoming team meeting on the 17th") spaCy mis-tags it as a gerund VERB with no
+        # object, so neither the SVO chain (no verb-borne object) nor the possessive chain (binds the
+        # date-less possessed noun) attaches the WHEN — the occurrence's date is silently dropped and a
+        # duration walk that needs two event dates comes up one short. The host token DOUBLES as the
+        # date's governing verb in ``_date_by_verb``, so emitting with ``verb_tok=host`` binds the
+        # resolved ``event_date`` via the SAME ``_date_for_verb`` path the workshop's dated SVO uses.
+        #
+        # Subject-agnostic + grammar-driven — NO event-noun word list. The trigger is purely: (1) the
+        # host of a RESOLVED date PP is a NOMINAL occurrence host (a NOUN, or a gerund-noun spaCy
+        # mis-tagged VERB whose only nominal dependents are compound/nsubj NOUN modifiers) with NO
+        # object and NO personal/proper subject — so a genuine dated action clause ("I attended … on
+        # <date>", governed by a real content verb with a dobj/subject) is EXCLUDED and never
+        # double-minted; and (2) 1st-person framing (a "my/our" possessive in the host's NP, or a
+        # governing clause whose subject is "I"/"we") so the occurrence is the user's — an arbitrary
+        # third-party dated noun stays residue for the growth path rather than being force-anchored.
+        for _gov_i, _dv in list(_date_by_verb.items()):
+            try:
+                _host = doc[_gov_i]
+                _iso_o, _gran_o = _dv
+            except Exception:  # noqa: BLE001 — per-host fail-safe
+                continue
+            if not _iso_o:
+                continue
+            _kids = list(_host.children)
+            # (1a) a real object or a personal/proper SUBJECT ⇒ genuine action clause, not a bare
+            #      occurrence NP → leave the date to the SVO/passive chains (no double-mint).
+            if any(_c.dep_ in ("dobj", "dative", "attr", "oprd", "obj", "iobj") for _c in _kids):
+                continue
+            if any(_c.dep_ in ("nsubj", "nsubjpass") and _c.pos_ in ("PRON", "PROPN")
+                   for _c in _kids):
+                continue
+            # (1b) the host must be a NOMINAL occurrence head: a NOUN outright, or a gerund-noun
+            #      mis-tagged VERB. The gerund test is morphological and load-bearing: a mis-tagged
+            #      eventive noun ("meeting", "gathering") is a NON-FINITE gerund/participle
+            #      (VerbForm=Ger|Part, tag VBG) whereas a genuine finite clause verb ("car BROKE last
+            #      week") is VerbForm=Fin — so a real dated action clause is EXCLUDED and never minted
+            #      as a bogus (user, participated_in, "car broke"). We also require a compound/nsubj
+            #      NOUN modifier (the scattered NP, e.g. "team") and NO auxiliary ("was meeting …").
+            if _host.pos_ == "NOUN":
+                pass
+            elif _host.pos_ == "VERB":
+                try:
+                    _vf = _host.morph.get("VerbForm")
+                except Exception:  # noqa: BLE001
+                    _vf = []
+                if not ("Ger" in _vf or "Part" in _vf):
+                    continue
+                if any(_c.dep_ in ("aux", "auxpass") for _c in _kids):
+                    continue
+                if not any(_c.dep_ in ("compound", "nsubj") and _c.pos_ == "NOUN"
+                           for _c in _kids):
+                    continue
+            else:
+                continue
+            # (2) 1st-person framing: a possessive in the host's subtree, or a governing "I"/"we" clause.
+            _first_person = False
+            try:
+                for _d in _host.subtree:
+                    _mp = _d.morph
+                    if _mp.get("Person") == ["1"] and "Yes" in _mp.get("Poss"):
+                        _first_person = True
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            if not _first_person:
+                _cur = _host
+                for _ in range(6):
+                    if _cur is None or _cur.head is _cur:
+                        break
+                    _cur = _cur.head
+                    if any(_c.dep_ in ("nsubj", "nsubjpass")
+                           and _is_first_person_personal_pronoun(_c) for _c in _cur.children):
+                        _first_person = True
+                        break
+            if not _first_person:
+                continue
+            # (3) Reconstruct the occurrence NP: the host surface + its left compound/nsubj NOUN
+            #     modifiers (spaCy scattered "team" as an nsubj/compound of the mis-tagged "meeting").
+            #     Descriptive ADJ modifiers (e.g. the temporal "upcoming") are left OUT so the event
+            #     name is its canonical noun compound ("team meeting"), not "upcoming team meeting".
+            _mods = sorted(
+                (_c for _c in _kids
+                 if _c.dep_ in ("compound", "nsubj") and _c.pos_ == "NOUN" and _c.i < _host.i),
+                key=lambda t: t.i)
+            _np = " ".join([(_m.text or "").strip() for _m in _mods]
+                           + [(_host.text or _host.lemma_ or "").strip()]).strip().lower()
+            if not _np:
+                continue
+            _emit("user", "participated_in", _np, verb_tok=_host, obj_tok=_host)
+            # Cover the scattered NP-modifier nouns folded into the occurrence object so the residue
+            # guard does not false-alarm on them (they ARE captured, as part of "team meeting").
+            _claim(*_mods)
+            # Suppress the possessive/SVO junk for the scattered NP-modifier nouns (e.g. the
+            # mis-scoped (user, owns, "upcoming team") from _chain_possessive off the "team" nsubj).
+            _occ_suppress.add(_host.i)
+            for _m in _mods:
+                _occ_suppress.add(_m.i)
+
     def _chain_possessive(doc):
         # POSSESSIVE (relational-vs-sortal split). ``my X`` (1st-person poss pronoun) → (user, owns, X).
         # ``X's Y`` genitive → relational/sortal split via the relational_noun cue class (overlay):
@@ -7064,6 +7176,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             head = tok.head
             if head is None or head.pos_ not in ("NOUN", "PROPN"):
+                continue
+            # DATED-OCCURRENCE GUARD: the possessed noun is a scattered modifier of a date-postmodified
+            # eventive NP already claimed by ``_chain_dated_occurrence`` ("my … team meeting on the
+            # 17th" → the (user, participated_in, "team meeting") @date edge). Skip so the mis-scoped
+            # (user, owns, "upcoming team") twin is never minted alongside it.
+            if head.i in _occ_suppress or tok.i in _occ_suppress:
                 continue
             # NAMED-INSTANCE GUARD: "My dog Rex is a poodle" — "dog" is a bound TYPE (Rex is its
             # appositive name) owned by the named-instance chain, NOT an ``owns`` of a bare type. Skip a
@@ -8980,6 +9098,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         (_chain_employment,
          _chain_alias_predicate,
          _chain_svo, _chain_intransitive, _chain_passive_event, _chain_copula_state,
+         _chain_dated_occurrence,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
          _chain_copula_role_predicate,
          _chain_copula_measure, _chain_date_attribute, _chain_dash_specifier,
