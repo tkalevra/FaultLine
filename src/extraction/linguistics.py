@@ -3108,10 +3108,37 @@ def _inchoative_crop_anchors(verb_tok, item_tok, text: str) -> tuple[tuple[str, 
             except Exception:  # noqa: BLE001
                 return
 
-        # (a) leaf-most compound-modifier crops anywhere in the verb's clause.
+        # The item head and anything coordinated WITH it ("seeds", "seeds and bulbs") are the only
+        # nouns a compound crop may modify. Scoping rule (a) to these is what the docstring always
+        # claimed; without it, ANY compound noun in the verb's subtree was admitted as a "crop" —
+        # so "under GROW lights" minted a crop called `grow`. An instrument adjunct is not a crop.
+        _item_heads = {item_tok}
+        try:
+            _item_heads |= set(getattr(item_tok, "conjuncts", ()) or ())
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _compound_chain_head(t):
+            """Climb the noun-COMPOUND chain and return where it lands.
+
+            spaCy can chain a crop several compounds deep ("tomato → seeds → indoors"), so the
+            crop's immediate head is not always the item. We follow `compound` links only — never
+            through a preposition — so "grow → lights" lands on `lights` (a pobj of "under"),
+            NOT on the item. Instrument adjuncts are thereby excluded by STRUCTURE, not a stoplist.
+            """
+            cur, guard = t, 0
+            while (cur.dep_ == "compound" and cur.head is not None
+                   and cur.head.pos_ in ("NOUN", "PROPN") and guard < 6):
+                cur = cur.head
+                guard += 1
+            return cur
+
+        # (a) compound-modifier crops OF THE ITEM HEAD ("marigold seeds" → marigold), including
+        #     multi-deep chains. The chain must TERMINATE at the item head to count.
         for t in verb_tok.subtree:
             if (t.pos_ in ("NOUN", "PROPN") and t.dep_ == "compound"
                     and t.head is not None and t.head.pos_ in ("NOUN", "PROPN")
+                    and _compound_chain_head(t) in _item_heads
                     and not _has_compound_noun_child(t)):
                 _add(t)
         # (a2) verb-attached xcomp/amod/nmod NOUN immediately LEFT of the item head — the "marigold
@@ -3120,13 +3147,21 @@ def _inchoative_crop_anchors(verb_tok, item_tok, text: str) -> tuple[tuple[str, 
             if (c.pos_ in ("NOUN", "PROPN") and c.dep_ in ("xcomp", "amod", "nmod")
                     and c.i == item_tok.i - 1 and not _has_compound_noun_child(c)):
                 _add(c)
-        # (b) coordination / apposition list members (each its own crop) + the list head.
+        # (b) coordination / apposition list members (each its own crop) + the LIST HEAD.
+        #
+        # The list head used to be admitted only if its OWN dep_ was in a whitelist
+        # (conj/appos/dobj/obj). That is a category error: what makes a token the head of an
+        # enumeration is that it HEADS a conj/appos chain — not the grammatical role the chain
+        # happens to fill in the wider clause. In "…since February 20th - tomatoes, peppers, and
+        # cucumbers", the dash makes `tomatoes` a `pobj`, so the whitelist silently discarded the
+        # FIRST member of the list while keeping its children. Half a list is worse than none: the
+        # dropped operand then has no dated fact, and the comparison walk answers with whichever
+        # operand survived. Structure decides membership, not the dep label.
         for t in verb_tok.subtree:
             if t.pos_ in ("NOUN", "PROPN") and t.dep_ in ("conj", "appos"):
                 _add(t)
                 h = t.head
                 if (h is not None and h is not item_tok and h.pos_ in ("NOUN", "PROPN")
-                        and h.dep_ in ("conj", "appos", "dobj", "obj")
                         and any(ch.dep_ in ("conj", "appos") for ch in h.children)):
                     _add(h)
 
