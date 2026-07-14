@@ -6,7 +6,7 @@
 <p align="center"><strong>Validated, private, shareable memory for your AI.</strong></p>
 
 <p align="center">
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-AGPL%20v3-blue.svg" alt="License: AGPL v3"/></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+"/>
   <img src="https://img.shields.io/badge/OpenWebUI-0.6%2B%20(0.10.x%20tested)-green" alt="OpenWebUI"/>
   <img src="https://img.shields.io/badge/MCP-2025--03--26-purple" alt="MCP"/>
@@ -144,7 +144,7 @@ Expand once and every future conversation in that domain benefits automatically.
 | Web-grounded learning | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Dead-naming / preferred name support | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Per-user private memory | ✅ | ✅ Account | ✅ | ✅ | ❌ Shared |
-| Open source | ✅ Apache 2.0 | ❌ | ✅ MIT | Partial | ✅ MIT |
+| Open source | ✅ AGPLv3 | ❌ | ✅ MIT | Partial | ✅ MIT |
 
 ---
 
@@ -370,13 +370,34 @@ See [`.env.example`](.env.example) for the full list with descriptions.
 
 ---
 
-## License
+## Licensing
 
-Apache 2.0 — see [LICENSE](./LICENSE).
+FaultLine is **open core**, licensed under the **[GNU AGPLv3](./LICENSE)**.
+
+**If you are a user, this changes nothing for you.** Run it, modify it, self-host it — for yourself
+or for your company — forever, for free. That is what it is for.
+
+The AGPL asks for one thing back: **if you modify FaultLine and offer it to others over a network,
+your users get your modified source.** Improvements to the commons stay in the commons. Don't modify
+it, and you owe nothing but the licence notice.
+
+If that doesn't suit you — you want to build a closed-source product on FaultLine, or embed it in a
+proprietary offering — **a commercial licence is available.** Open an issue or get in touch.
+
+> **Licence history:** FaultLine was Apache-2.0 through commit `433daf1`. That grant is perpetual and
+> is not revoked — copies obtained under it stay Apache-2.0. Everything from the relicensing commit
+> onward is AGPLv3. See [NOTICE](./NOTICE).
 
 ## Contributing
 
+Contributions are welcome, and there is **one gate: a signed [CLA](./CLA.md)**. It exists so the
+project can keep dual-licensing, which is what funds the open engine — the reasoning is laid out
+honestly in **[CONTRIBUTING.md](./CONTRIBUTING.md)**. You keep the copyright in your work.
+
+House rules, in short:
+
 - New relationship types belong in the `rel_types` database table, not in code
-- GLiNER2 zero-shot descriptions should never be modified to include extraction patterns
+- GLiNER2 zero-shot labels are never modified to carry extraction patterns or descriptions
 - No UUIDs in anything a user sees
+- Strong ingest, lean query — if recall is wrong, fix it at ingest
 - All tests pass: `pytest tests/`

@@ -1,11 +1,19 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]   # >=77 for PEP 639 SPDX `license` + `license-files`
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "faultline-wgm"
 version = "0.1.0"
 requires-python = ">=3.11"
+# SPDX licence expression (PEP 639). Deliberately AGPL-3.0-ONLY, not "-or-later": we do not
+# pre-commit the project to the terms of an FSF licence version that does not exist yet.
+# NOTE: PEP 639 forbids pairing this with a legacy "License ::" classifier — setuptools>=77
+# errors on the combination. The SPDX field is the single source of truth.
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Christopher Thompson" }]
+classifiers = ["Programming Language :: Python :: 3.11"]
 dependencies = [
     "gliner2",
     "huggingface_hub>=0.23.0,<1.0.0",
