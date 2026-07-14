@@ -4392,7 +4392,7 @@ def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
 
     natural_language = meta.get("natural_language")
     if isinstance(natural_language, str):
-        natural_language = natural_language.strip() or None
+        natural_language = _strip_template_hint(natural_language.strip()) or None
     else:
         natural_language = None
 
@@ -4400,7 +4400,7 @@ def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
     # must not reintroduce X — _create_rel_type_in_flow re-validates as a backstop.
     natural_language_2p = meta.get("natural_language_2p")
     if isinstance(natural_language_2p, str):
-        natural_language_2p = natural_language_2p.strip() or None
+        natural_language_2p = _strip_template_hint(natural_language_2p.strip()) or None
         if natural_language_2p and ("Y" not in natural_language_2p or "X" in natural_language_2p):
             natural_language_2p = None
     else:
@@ -14483,7 +14483,7 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
     * X MUST be a literal, named entity (a real name). If X is only a pronoun ("I call HER my Y"),
       DO NOT emit synonym_of — fall back to normal handling (omit).
     * Example: "call Robert my ace" → (robert, synonym_of, "ace", is_preferred_label=false)
-    * Example: "my box is the truenas server" → (truenas server, synonym_of, "box", is_preferred_label=false)
+    * Example: "my box is the nas server" → (nas server, synonym_of, "box", is_preferred_label=false)
     * Distinguish from pref_name/also_known_as: synonym_of is how the SPEAKER talks ABOUT X
       (a nickname/slang/referential word), NOT an alternate proper name X is publicly known by.
 
@@ -25447,7 +25447,7 @@ def resolve_entity_synonym(term: str, anchor: str, db) -> str | None:
 
     try:
         # ---- 1/2. EXACT-TERM LOOKUP (approved-only, live-only). Qualifier-first is
-        # structural: a qualified phrase ("truenas box") is its OWN normalized key and
+        # structural: a qualified phrase ("nas box") is its OWN normalized key and
         # never collides into the bare term. No substring/fuzzy (the ex-wife trap). ----
         with db.cursor() as cur:
             cur.execute(
@@ -26975,7 +26975,7 @@ def resolve_anchor(
                                 _mark("alias", term=phrase)
                                 return row[0]
                     # SYNONYM SEAM (IMPL-3 secondary): after the per-phrase alias MISS,
-                    # same helper / same gate so multi-word synonyms ("truenas box")
+                    # same helper / same gate so multi-word synonyms ("nas box")
                     # resolve identically. None continues the n-gram loop unchanged.
                     _syn_anchor = resolve_entity_synonym(phrase, user_id, db)
                     if _syn_anchor is not None:
@@ -29494,6 +29494,9 @@ def _decompose_cross_hinge_steps(query_text: str, intent: dict) -> list[dict] | 
                         "op": _op,
                         "anchor": _calc.get("anchor"),
                         "anchor_b": None,
+                        # Same class of bug as the pair branch above: without the asked-in unit
+                        # the elapsed/duration render drifts to weeks on a 7-multiple.
+                        "requested_unit": _calc.get("requested_unit"),
                     })
 
         # Hinge 3 — temporal PIVOT (before/after <pivot> + ordinal). "first issue after
@@ -29685,6 +29688,12 @@ def _recursive_query_walk(query_text: str, intent: dict, gated_facts: list[dict]
                     "relation": _hop.get("relation"),
                     "granule": _hop.get("granule"),
                     "ordinal_n": _hop.get("ordinal_n"),
+                    # The unit the USER asked in. Dropping it here sent _humanize_delta into
+                    # AMBIGUOUS mode, which re-expresses week-multiples ("21 days" → "3 weeks")
+                    # — so the walk's render diverged from the single pass's, the [:24] dedup
+                    # missed it, and BOTH shipped as Class-A. Answer the question in the unit
+                    # it was asked in.
+                    "requested_unit": _hop.get("requested_unit"),
                 }}
                 _calc_result = _apply_temporal_calc(_walk_facts, _calc_intent, user_id)
                 _hops_run += 1
@@ -33102,6 +33111,31 @@ def _compose_object_clause(
         # domain word-list (same justification as _NEGATE_AUX). Value kept verbatim.
         if tail_types == ["SCALAR"] and object_name is not None:
             import re as _re
+            # A CURATED 2p TEMPLATE WINS — never clobber a hand-written second-person rendering.
+            # This shape exists to RESCUE scalar rels whose template is NULL or whose label bakes
+            # the predicate in ("Has IP Address"). A `natural_language_2p` row is, by contract, a
+            # COMPLETE 2p sentence, so the composer has nothing to add — fall through to the
+            # template path. Without this guard Shape 4 fired unconditionally and overwrote the
+            # correct prose the template had already produced:
+            #     "You go by Chris"            -> "your preferred name is Chris"
+            #     "You were born on 1980-04-02" -> "your born on is 1980-04-02"
+            # and for `also_known_as` it rendered the rel's LABEL DOC-COMMENT verbatim to the user
+            # ("your also known as (skos:altLabel; use pref_name for preferred display name) is …"),
+            # an ontology-metadata leak straight through the "NO rel_type tokens leak" contract.
+            # SYMMETRIC: a curated template wins in EITHER person. The 2p guard alone fixed only
+            # the user's OWN facts and left every fact about ANYONE ELSE still clobbered:
+            #     "Diane was born on 1980-04-02" -> "Diane's born on is 1980-04-02"
+            #     "Diane is also known as Di"    -> "Diane's also known as is Di"
+            #     "Diane is 62 years old"        -> "Diane's age is 62"
+            # CLAUDE.md's own worked example ("my mother's birthday?") lands on exactly this path.
+            # Shape 4 exists to RESCUE a scalar rel with NO curated template (has_ip:
+            # natural_language IS NULL, label "Has IP Address" -> "apollo's ip address is …").
+            # When a template IS curated, there is nothing to rescue — fall through to it.
+            if (subject_is_you and template_2p) or (not subject_is_you and template):
+                return None
+            # Drop any parenthetical from the label before it can reach the reader. `rel_types.label`
+            # carries doc-comments for US, not for the user; the 3p path leaked them the same way.
+            label = _re.sub(r'\s*\([^)]*\)', '', label).strip() or label
             attr = _re.sub(r'^(?:has|have|had|is|are|was|were)\b\s*', '',
                            label.lower(), flags=_re.IGNORECASE).strip() or label.lower()
             poss = "your" if subject_is_you else "%s's" % subject_name
@@ -33309,6 +33343,26 @@ def _dedup_inverse_pairs(rendered: list[dict], overlay_meta: dict) -> list[str]:
         return [r.get("prose", "") for r in rendered]
 
 
+def _strip_template_hint(t):
+    """Strip a maintainer DOC-HINT parenthetical from a user-facing rendering template.
+
+    Several SEED templates carry a hint written for US, and it rendered VERBATIM to the reader:
+        "X lives in Y (residence)"       -> "Diane lives in Toronto (residence)"
+        "X was born on Y (date)"         -> "Diane was born on 1980-04-02 (date)"
+        "X lives at Y (address)" · "X is an instance of Y (type)"
+    Same class of leak as the rel_type LABEL doc-comment ("…(skos:altLabel; use pref_name…)"):
+    metadata written for maintainers escaping into what a USER reads, straight through the
+    convert_to_prose contract ("NO rel_type tokens leak").
+
+    Applied where the template is LOADED FOR RENDER — i.e. BEFORE X/Y substitution — so a VALUE
+    containing parentheses is never touched. Fail-safe: if stripping would empty the template,
+    keep the original (a hinted sentence beats no sentence).
+    """
+    if not isinstance(t, str):
+        return t
+    return re.sub(r"\s*\([^)]*\)", "", t).strip() or t
+
+
 def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = None,
                      preferred_alias_map: dict = None,
                      anchor_matched_term: str = None) -> list[str]:
@@ -33392,8 +33446,10 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         for _rt in set(f.get("rel_type", "").lower() for f in facts if f.get("rel_type")):
             _m = _overlay_meta.get(_rt)
             if _m:
-                rel_type_templates[_rt] = _m.get("natural_language")
-                rel_type_templates_2p[_rt] = _m.get("natural_language_2p")
+                # Strip maintainer doc-hints BEFORE render — "(residence)"/"(date)"/"(type)"
+                # were reaching the reader verbatim. See _strip_template_hint.
+                rel_type_templates[_rt] = _strip_template_hint(_m.get("natural_language"))
+                rel_type_templates_2p[_rt] = _strip_template_hint(_m.get("natural_language_2p"))
                 rel_type_labels[_rt] = _m.get("label")
                 rel_type_tail[_rt] = _m.get("tail_types")
 
@@ -35898,10 +35954,26 @@ async def query(request: QueryRequest) -> QueryResponse:
         _meta = locals().get("_recursive_meta")
         if _meta and _meta.get("definition"):
             _meta_def = _meta["definition"]
-            _already = any(
+            # STRUCTURAL guard (was: a [:24] prefix compare). The prefix compare deduped by how
+            # the answer HAPPENED TO RENDER, so two renders of the SAME computation that differ
+            # in wording ("3 weeks…" vs "21 days…") both survived and shipped as contradictory
+            # Class-A lines. Authority is not a string prefix: if the single pass already
+            # ANSWERED this computation, the walk does not get to answer it a second time — in
+            # any wording. The walk still injects for PARTIAL/MISSING, which is the gap-naming
+            # only it can produce.
+            _calc_answered = any(
                 (f.get("source") == "temporal_calc"
-                 and str(f.get("definition") or "")[:24] == str(_meta_def)[:24])
+                 and f.get("rel_type") == "temporal_computation")
                 for f in facts_with_definition)
+            _meta_is_answer = (_meta.get("status") == "answered")
+            if _calc_answered and _meta_is_answer:
+                log.info("query.recursive_walk.metacog_suppressed reason=calc_already_answered")
+                _already = True
+            else:
+                _already = any(
+                    (f.get("source") == "temporal_calc"
+                     and str(f.get("definition") or "")[:24] == str(_meta_def)[:24])
+                    for f in facts_with_definition)
             if not _already:
                 facts_with_definition.insert(0, {
                     "subject": anchor,
