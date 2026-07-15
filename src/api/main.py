@@ -15484,6 +15484,43 @@ def _head_token_index_for_surface(doc, surface: str):
     return None
 
 
+def _reconcile_residue_against_seam(
+    residue_sentences: list[str],
+    captured_objects: set,
+) -> tuple[list[str], int]:
+    """Drop a residue sentence the post-loop affect/preference/relational-predicate seams ALREADY
+    captured as a structured edge, so the SAME statement is never stored BOTH as that edge AND as a
+    verbatim Class-C store_context blob (the negation/absence double-capture leak).
+
+    A residue sentence is COVERED (dropped) iff a seam-captured OBJECT (lowercased) appears in it as a
+    WORD-BOUNDARY token — deterministic regex, case-insensitive; a multi-word object is matched whole.
+    Precise by construction: it drops ONLY a sentence a seam owns, never a genuine untypeable residue
+    (whose content no seam captured). Subject-agnostic, no cosine, no domain list. Pure function
+    (no I/O) so it is directly unit-testable. Returns (kept_sentences, dropped_count)."""
+    if not residue_sentences or not captured_objects:
+        return list(residue_sentences), 0
+    kept: list[str] = []
+    dropped = 0
+    for _rs in residue_sentences:
+        _rs_l = (_rs or "").lower()
+        _covered = False
+        for _obj in captured_objects:
+            _o = (_obj or "").strip().lower()
+            if not _o:
+                continue
+            try:
+                if re.search(r"\b" + re.escape(_o) + r"\b", _rs_l):
+                    _covered = True
+                    break
+            except Exception:  # noqa: BLE001 — bad pattern → treat as not-covered (keep the residue)
+                continue
+        if _covered:
+            dropped += 1
+        else:
+            kept.append(_rs)
+    return kept, dropped
+
+
 async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     """SENTENCE-PIPELINE harvest ("feed it the clean sentence"). Returns the standard
     ``{"edges": [...], "spans": N}`` dict, or ``None`` to signal the caller to fall through to today's
@@ -15766,6 +15803,15 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # (Class C via the EXISTING store_context). We collect those sentences here and route them once,
     # after the loop. Success = how LITTLE lands here; this is never aimed-at, only a non-drop floor.
     _residue_sentences: list[str] = []
+    # RESIDUE↔SEAM RECONCILE (negation/absence fix, Part 1): the post-loop affect/preference/
+    # relational-predicate seams capture a sentence the per-sentence deriver loop already booked as
+    # zero-edge residue ("I am allergic to penicillin" → the deriver emits nothing, so the sentence
+    # is marked residue; the relpred seam THEN mints (user, allergic_to, penicillin)). Without
+    # reconciliation the SAME sentence lands BOTH as a structured edge AND a verbatim Class-C
+    # store_context blob — the contradictory-recall leak. We record every seam-captured edge OBJECT
+    # here (lowercased) and, before the store_context floor, drop any residue sentence whose text
+    # carries a captured object as a WORD-BOUNDARY token. Deterministic, no cosine, subject-agnostic.
+    _seam_captured_objects: set = set()
     # Fix B, Part 1 (flag-gated): accumulate the NAMED-INSTANCE / NAMING-VERB seam edges per
     # declarative sentence. The spine deriver never invokes analyze_naming / analyze_named_instance,
     # so "I have a dog named Rex" / "My dog Rex is a poodle" lose the named instance on this
@@ -16308,6 +16354,41 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                         _add_feeling(_comp)
                 except Exception:  # noqa: BLE001 — fail-safe: copula miss never breaks the harvest
                     pass
+                # (2b) RELATIONAL-PREDICATE capture (DATA-LOSS fix): "I am allergic to penicillin" is a
+                #     predicate adjective carrying a PREPOSITIONAL OBJECT — a RELATION with an object,
+                #     NOT a bare feeling. The affect seams above now DECLINE it (analyze_copula /
+                #     analyze_copula_affect_complements prep-object guards), so WITHOUT this the object
+                #     (penicillin) would drop entirely and the "feels allergic" junk would vanish with
+                #     nothing in its place. Emit (user, <adj>_<prep>, <object>) — e.g. (user,
+                #     allergic_to, penicillin) — a NOVEL rel_type the ontology growth engine grounds
+                #     (miss→grow). Subject-agnostic, deterministic (grammar: prep→pobj), NO medical /
+                #     adjective word list. user_stated so /ingest lands it durably (Class A/B).
+                _relpred_edges_sp: list[dict] = []
+                try:
+                    from src.extraction.linguistics import (
+                        analyze_copula_relational_predicate as _rel_pred)
+                    for _rp in (_rel_pred(_affect_text) or []):
+                        _rp_rel = (_rp.get("rel_type") or "").strip().lower()
+                        _rp_obj = (_rp.get("object") or "").strip().lower()
+                        if not _rp_rel or not _rp_obj:
+                            continue
+                        # NEGATION-AS-ABSENCE (design-negation-and-absence-facts, polarity option):
+                        # "I'm not allergic to penicillin" is NOT dropped — it is CAPTURED as the SAME
+                        # structured relation carrying polarity='negated'. Ingest's ON CONFLICT
+                        # (subject_id, object_id, rel_type) DO UPDATE polarity=EXCLUDED.polarity then
+                        # flips the prior affirmed row to negated (supersede-in-place, latest assertion
+                        # wins); a later re-affirmation flips it back — the identical mechanism the
+                        # has_state negated-state lane (Q1 GPS) already ships. convert_to_prose reads
+                        # the polarity column back and renders the negation (_negate_prose). NEVER a
+                        # Class-C blob; the state is one authoritative, traceable row. Subject-agnostic
+                        # (grammar-driven negation cue on ANY relational predicate, no domain list).
+                        _rp_edge = {"subject": "user", "rel_type": _rp_rel, "object": _rp_obj,
+                                    "fact_provenance": "user_stated"}
+                        if _rp.get("negated"):
+                            _rp_edge["polarity"] = "negated"
+                        _relpred_edges_sp.append(_rp_edge)
+                except Exception:  # noqa: BLE001 — fail-safe: relpred miss never breaks the harvest
+                    _relpred_edges_sp = []
                 # TEMPORAL STAMP + PROVENANCE: a USER-STATED feeling is DURABLE — fact_provenance=
                 # "user_stated" so /ingest's provenance router + assign_class land it at Class B (the
                 # feels rel's defined class is C, so user_stated → B, NOT A; NEVER force C — see
@@ -16404,8 +16485,12 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                                 _dropped_junk += 1
                                 continue
                         # (b) (<X-head>, has_state, <value>) where the value matches a captured
-                        #     preference value ("color" has_state "blue").
-                        if _er == "has_state" and _eo in _pref_values and _es != "user":
+                        #     preference value ("color" has_state "blue"). Token-aware so a WIDENED
+                        #     multi-token preference value ("o negative") still drops the deriver's
+                        #     has_state twin whose object is the bare ADJ head ("negative") — the twin
+                        #     carries only the copula-complement LEMMA, not the full value phrase.
+                        if _er == "has_state" and _es != "user" and _eo and any(
+                                _eo == _pv or _eo in _pv.split() for _pv in _pref_values):
                             _dropped_junk += 1
                             continue
                         _kept_pref.append(_e)
@@ -16420,16 +16505,22 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
 
                 # UNION the seam edges (deduped on `seen`). Feelings carry the seeded `feels` rel;
                 # preferences carry the snake-cased favorite_<x>/<x> rel. NO object resolution here.
-                for _se in (_feeling_edges_sp + _preference_edges_sp):
-                    _key = (_se.get("subject"), _se.get("rel_type"),
-                            (_se.get("object") or "").strip().lower())
+                for _se in (_feeling_edges_sp + _preference_edges_sp + _relpred_edges_sp):
+                    _se_obj = (_se.get("object") or "").strip().lower()
+                    _key = (_se.get("subject"), _se.get("rel_type"), _se_obj)
+                    # RESIDUE↔SEAM RECONCILE (Part 1): remember this seam's OBJECT so the store_context
+                    # floor below drops the residue sentence that ALSO produced this edge (no double
+                    # capture: a structured edge AND a verbatim C blob for the same statement).
+                    if _se_obj:
+                        _seam_captured_objects.add(_se_obj)
                     if all(_key) and _key not in seen:
                         seen.add(_key)
                         edges.append(dict(_se))
-                if _feeling_edges_sp or _preference_edges_sp:
+                if _feeling_edges_sp or _preference_edges_sp or _relpred_edges_sp:
                     log.info("sentence_pipeline.affect_preference_captured",
                              user_id=user_id[:8],
-                             feelings=len(_feeling_edges_sp), preferences=len(_preference_edges_sp))
+                             feelings=len(_feeling_edges_sp), preferences=len(_preference_edges_sp),
+                             relational_predicates=len(_relpred_edges_sp))
         except Exception as _ape:  # noqa: BLE001 — fail-safe: seam miss never breaks the spine harvest
             log.debug("sentence_pipeline.affect_preference_failed",
                       user_id=user_id[:8], error=str(_ape)[:120])
@@ -16906,6 +16997,23 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # carries the verbatim sentence (no rewrite), and the count is log_crit-surfaced so a growing C is
     # visible. The loop's real job is to grow the ontology so this trends toward empty. Fail-safe:
     # any store_context error is swallowed — a C miss never breaks the harvest's structured edges.
+    # RESIDUE↔SEAM RECONCILE (negation/absence fix, Part 1): drop any residue sentence the post-loop
+    # affect/preference/relational-predicate seams ALREADY captured as a structured edge — otherwise
+    # the SAME statement lands BOTH as that edge AND as a verbatim Class-C store_context blob (the
+    # contradictory-recall leak this fix closes). A residue sentence is covered iff a seam-captured
+    # OBJECT appears in it as a WORD-BOUNDARY token (deterministic regex, case-insensitive; multi-word
+    # objects matched whole). This is precise: it drops ONLY the sentence a seam owns, never a genuine
+    # untypeable residue (regression-guarded). Subject-agnostic, no cosine.
+    if _residue_sentences and _seam_captured_objects:
+        _kept_residue, _reconciled = _reconcile_residue_against_seam(
+            _residue_sentences, _seam_captured_objects)
+        if _reconciled:
+            log.info("sentence_pipeline.residue_seam_reconciled",
+                     user_id=user_id[:8], dropped=_reconciled, kept=len(_kept_residue),
+                     note="residue sentence(s) already captured as an affect/preference/relational "
+                          "seam edge → NOT re-stored as a Class-C blob (no double capture)")
+        _residue_sentences = _kept_residue
+
     if _residue_sentences and _SHORT_TERM_MEMORY:
         _c_held = 0
         for _rs in _residue_sentences:
