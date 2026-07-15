@@ -471,6 +471,67 @@ def _adj_has_numeric_measure(adj_tok) -> bool:
     return False
 
 
+# Topic-marking prepositions that follow an AFFECTIVE predicate adjective — "worried/excited/nervous
+# ABOUT X" names the emotion's TOPIC, not a relational complement. A closed-class function-word set (a
+# grammatical primitive like the copula "be"), NOT a domain/emotion word list. Kept minimal: "about"
+# is the dominant topic-of-state marker; genuine relational complements use "to"/"of"/"from"/…
+_ADJ_TOPIC_PREPS: frozenset[str] = frozenset({"about"})
+
+
+def _adj_prep_objects(adj_tok) -> list:
+    """The prepositional-object token(s) an ADJ predicate governs — "allergic TO penicillin",
+    "afraid OF spiders", "married TO Sam" → the ``pobj`` head(s) under the ADJ's ``prep`` child(ren),
+    with the preposition surface. Returns a list of ``(prep_surface, pobj_tok)`` (usually one; more
+    for a coordinated object "allergic to penicillin and sulfa").
+
+    THE CLASS RULE (subject-agnostic, dependency-driven — NO domain/adjective word list): a predicate
+    adjective that takes a prepositional COMPLEMENT ("<adj> <prep> <object>") is a RELATION carrying an
+    object, NOT a bare affective state — so the feeling/affect seam must NOT claim it; the object is
+    captured on the ``<adj>_<prep>`` relation (grown via the ontology growth engine). Grammatical
+    primitive only (the ``prep``→``pobj`` dependency chain), so it holds in any domain.
+
+    THE ONE EXCLUSION — the TOPIC-marking preposition "about" (a closed-class function word, the same
+    kind of grammatical primitive as the copula "be"): "I am worried ABOUT the migration" / "excited
+    ABOUT the trip" is a FEELING whose "about"-phrase is the emotion's TOPIC, NOT a relational
+    complement — so it stays with the affect seam ("feels worried"). "about" is the canonical
+    topic-of-state marker in English; a genuine relational complement uses "to"/"of"/"from"/… ("allergic
+    TO", "afraid OF"). Excluding this one topic preposition is grammatical, not a domain word list.
+    Fail-safe → []."""
+    out: list = []
+    try:
+        if adj_tok is None or adj_tok.pos_ != "ADJ":
+            return out
+        for ch in adj_tok.children:
+            if ch.dep_ != "prep" or ch.pos_ != "ADP":
+                continue
+            prep_surf = (ch.text or "").strip().lower()
+            if prep_surf in _ADJ_TOPIC_PREPS:
+                continue  # "worried/excited about X" → feeling's TOPIC, not a relational object
+            for g in ch.children:
+                if g.dep_ == "pobj" and g.pos_ in ("NOUN", "PROPN", "PRON"):
+                    # a wh/interrogative pobj ("allergic to what?") is not a value — skip.
+                    try:
+                        if "Int" in g.morph.get("PronType") or g.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    out.append((prep_surf, g))
+                    # coordinated objects ("penicillin and sulfa") — the conj siblings of the pobj.
+                    for gg in g.children:
+                        if gg.dep_ == "conj" and gg.pos_ in ("NOUN", "PROPN"):
+                            out.append((prep_surf, gg))
+    except Exception:  # noqa: BLE001 — fail-safe
+        return out
+    return out
+
+
+def _adj_has_prep_object(adj_tok) -> bool:
+    """True when an ADJ predicate governs a prepositional object ("allergic to X", "afraid of X").
+    See ``_adj_prep_objects`` — such a clause is a RELATION with an object, NOT a bare feeling, so the
+    affect/feeling seam must decline it. Grammar-driven, subject-agnostic. Fail-safe → False."""
+    return bool(_adj_prep_objects(adj_tok))
+
+
 def analyze_copula(text: str):
     r"""Deterministic first-cut for a copular self-predication. Returns ``CopulaAnalysis`` or ``None``.
 
@@ -561,6 +622,15 @@ def analyze_copula(text: str):
             # separate co-occurring number ("I am 45, sad") is untouched. Subject-agnostic, grammar.
             if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
                 continue
+            # RELATIONAL-PREDICATE GUARD (data-loss fix): "I am allergic TO penicillin" / "I am afraid
+            # OF spiders" is a predicate adjective carrying a PREPOSITIONAL OBJECT — a RELATION with an
+            # object, NOT a bare feeling. Reading it as ``feels`` both mis-types it AND drops the object
+            # (penicillin). DECLINE the self-predication here so the copula-feeling capture never claims
+            # it; the object is captured on the ``<adj>_<prep>`` relation by the relational-predicate
+            # seam (analyze_copula_relational_predicate). Grammar-driven (prep→pobj), subject-agnostic,
+            # NO adjective/domain word list — mirrors the measured-adjective guard directly above.
+            if comp.pos_ == "ADJ" and _adj_has_prep_object(comp):
+                continue
             rel = _COMPLEMENT_POS_TO_REL.get(comp.pos_)  # None for VERB / other → ambiguous residue
             # DETERMINER OVERRIDE (casing-robust): a complement introduced by an article
             # ("a"/"an"/"the" — a ``det`` child) is a COMMON NOUN describing a role, NEVER a proper
@@ -642,6 +712,8 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
                     continue  # this conjunct is negated → skip
                 if m.pos_ == "ADJ" and _adj_has_numeric_measure(m):
                     continue  # "34 years old" → age/measurement (copula-measure chain), not a feeling
+                if m.pos_ == "ADJ" and _adj_has_prep_object(m):
+                    continue  # "allergic to X" / "afraid of X" → a RELATION w/ an object, not a feeling
                 surf = (m.text or m.lemma_ or "").strip().lower()
                 if surf and surf not in seen:
                     seen.add(surf)
@@ -651,6 +723,85 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
         log.warning("linguistics.analyze_copula_affect_complements_failed", error=str(e)[:160])
         return []
     return []
+
+
+def analyze_copula_relational_predicate(text: str) -> list[dict]:
+    r"""Capture a 1st-person copular predicate ADJECTIVE that carries a PREPOSITIONAL OBJECT as a
+    RELATION with an object — the construction the feeling/affect seam MUST NOT claim.
+
+    "I am allergic to penicillin"  → [{subject:'user', rel_type:'allergic_to', object:'penicillin'}]
+    "I am afraid of spiders"       → [{subject:'user', rel_type:'afraid_of',  object:'spiders'}]
+    "I'm allergic to penicillin and sulfa" → two edges (one per coordinated object).
+
+    THE RULE (subject-agnostic, dependency-driven — NO adjective/medical/domain word list):
+      • A copula ``be`` clause with a genuine 1st-person PERSONAL-pronoun subject ("I"/"we") — the
+        SAME grammatical self-binding the affect seam uses (``_is_first_person_personal_pronoun``).
+      • The complement is an ``acomp`` ADJECTIVE that governs a ``prep``→``pobj`` (see
+        ``_adj_prep_objects``). A bare adjective ("I am excited" — no prep object) is NOT this lane
+        (it stays a feeling); a MEASURED adjective ("I am 34 years old") is excluded by the numeric
+        guard so an age is never mis-read here.
+      • The RELATION is the user's OWN words: ``<adjective-lemma>_<preposition>`` ("allergic_to",
+        "afraid_of") — a NOVEL rel_type that the ontology growth engine grounds/approves (miss→grow),
+        never a hardcoded rel constant. The OBJECT is the pobj NP (head + left compound/amod mods).
+      • A ``neg`` on the copula head or the adjective ("I am not allergic to penicillin") → the edge
+        carries ``negated=True`` (negation/absence modeling is deferred downstream; the caller may
+        drop it, parity with the other affect seams). Interrogatives are already excluded.
+
+    Returns growth-ready edges ``[{subject:'user', rel_type, object, negated}]`` (empty when no such
+    clause exists). Fail-safe: any error → ``[]``. Never resolves the object (strong ingest, lean
+    query). The complementary half of the ``analyze_copula`` / ``analyze_copula_affect_complements``
+    guards, which now DECLINE this construction so it is captured here instead of dropped as a feeling."""
+    if not text or not text.strip():
+        return []
+    doc = _parse(text)
+    if doc is None:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+    try:
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            if not _is_first_person_personal_pronoun(tok):
+                continue
+            head = tok.head
+            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+                continue
+            comp = None
+            for child in head.children:
+                if child.dep_ == "acomp" and child.pos_ == "ADJ":
+                    comp = child
+                    break
+            if comp is None:
+                continue
+            # a MEASURED adjective ("34 years old") is a scalar, never a relational predicate.
+            if _adj_has_numeric_measure(comp):
+                continue
+            prep_objs = _adj_prep_objects(comp)
+            if not prep_objs:
+                continue
+            adj_lemma = (comp.lemma_ or comp.text or "").strip().lower()
+            if not adj_lemma:
+                continue
+            negated = any(c.dep_ == "neg" for c in head.children) or any(
+                c.dep_ == "neg" for c in comp.children)
+            for prep_surf, pobj in prep_objs:
+                if not prep_surf:
+                    continue
+                obj = _np_phrase(pobj)
+                if not obj:
+                    continue
+                rel = f"{adj_lemma}_{prep_surf}".strip("_")
+                key = (rel, obj)
+                if not rel or key in seen:
+                    continue
+                seen.add(key)
+                out.append({"subject": "user", "rel_type": rel, "object": obj,
+                            "negated": bool(negated)})
+    except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest
+        log.warning("linguistics.analyze_copula_relational_predicate_failed", error=str(e)[:160])
+        return []
+    return out
 
 
 @dataclass(frozen=True)
@@ -785,7 +936,9 @@ def analyze_possessive_predication(text: str):
             negated = any(c.dep_ == "neg" for c in head.children) or any(
                 c.dep_ == "neg" for c in comp.children
             )
-            value = (comp.text or "").strip().lower()
+            # FULL multi-token value ("O negative", "dark blue"), not just the complement head —
+            # see _complement_value_phrase (the "blood type is O negative" → "O" drop fix).
+            value = _complement_value_phrase(comp)
             if not value:
                 continue
             # Possessed-noun PHRASE = the nsubj NOUN plus its left compound/amod modifiers,
@@ -944,6 +1097,38 @@ def _np_phrase(tok) -> str:
     mods = [c for c in tok.children if c.dep_ in ("compound", "amod") and c.i < tok.i]
     parts = [m.text for m in sorted(mods, key=lambda m: m.i)] + [tok.text]
     return " ".join(p.strip() for p in parts if p and p.strip()).lower()
+
+
+def _complement_value_phrase(comp) -> str:
+    """The FULL copula-complement VALUE phrase, lowercased — the head plus its qualifying modifier
+    children, in source order ("O negative", "dark blue", "type 2"), not just the head token.
+
+    THE WHY (multi-token value truncation): "my blood type is O negative" parses the complement as the
+    ADJ head "negative" with "O" as a left ``advmod`` — taking only ``comp.text`` dropped the "O" and
+    read the value as "negative". This collects the complement's contiguous qualifying children
+    (``compound``/``amod``/``advmod``/``nummod``/``nmod``/``npadvmod``/``quantmod``/``det`` when it is a
+    numeric/letter grade, NOT an article) and rebuilds the span in index order. Determiners that are
+    ARTICLES ("a"/"an"/"the") and punctuation/negation/prepositional children are excluded so a plain
+    value ("blue") is unchanged and an article-classification complement is untouched. Structural,
+    subject-agnostic, NO value word list. Fail-safe → ``comp.text`` lowercased."""
+    try:
+        _MOD = {"compound", "amod", "advmod", "nummod", "nmod", "npadvmod", "quantmod"}
+        _ARTICLES = {"a", "an", "the"}
+        mods = []
+        for c in comp.children:
+            if c.is_punct or c.dep_ == "neg":
+                continue
+            if c.dep_ in _MOD:
+                mods.append(c)
+            elif c.dep_ == "det" and (c.text or "").strip().lower() not in _ARTICLES:
+                # a non-article determiner used as a grade token ("O" in "O negative" tags DT/det) —
+                # keep it (it is part of the value), but never fold in an article.
+                mods.append(c)
+        toks = sorted(mods + [comp], key=lambda t: t.i)
+        phrase = " ".join((t.text or "").strip() for t in toks if (t.text or "").strip()).lower()
+        return phrase or (comp.text or "").strip().lower()
+    except Exception:  # noqa: BLE001 — fail-safe
+        return (comp.text or "").strip().lower()
 
 
 # ── STRUCTURED-ATOMIC VALUE SHAPE (format-grammar routing gate — NOT the rel_type mapping) ──────────
@@ -1854,7 +2039,21 @@ def analyze_name_type_bindings(text):
             if name_tok is None:
                 continue
             type_noun = _np_phrase(type_tok)
-            name = (name_tok.text or "").strip()
+            # FULL PROPER-NAME SPAN (truncation fix): a multi-token name ("David Chen", "John Smith")
+            # parses as name_tok = the head PROPN ("Chen"/"Smith") with the given name as a left PROPN
+            # ``compound`` child ("David"/"John"). Taking only ``name_tok.text`` dropped the given name
+            # ("my son David Chen" → "Chen"). Rebuild the contiguous proper-name span = left PROPN
+            # compound modifiers + the head, PRESERVING surface case (the registry lowercases at
+            # ingest). A single-token name ("Rex") is unchanged. Structural (PROPN compound),
+            # subject-agnostic, NO name word list. Fail-safe → the bare head surface.
+            try:
+                _name_mods = [c for c in name_tok.children
+                              if c.dep_ == "compound" and c.pos_ == "PROPN" and c.i < name_tok.i]
+                name = " ".join(
+                    [m.text for m in sorted(_name_mods, key=lambda m: m.i)]
+                    + [(name_tok.text or "")]).strip()
+            except Exception:  # noqa: BLE001 — fail-safe
+                name = (name_tok.text or "").strip()
             if not type_noun or not name or name.lower() == type_noun:
                 continue
             _key = (name.lower(), type_noun)
@@ -7979,6 +8178,15 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         _num_surf = (c.text or "").strip()
                         if any(_ch in _num_surf for _ch in (".", ":", "-", "/")):
                             continue  # structured literal → the atomic lane owns it, never a scalar age
+                        # YEAR-NOT-AGE GUARD (data-loss fix): a BARE 4-digit cardinal in calendar-year
+                        # range ("diagnosed in 2019" reframed to a copula → "diagnosis is 2019") is a
+                        # DATE/year owned by the temporal event_date lane, NEVER a person's age (a human
+                        # age is at most 3 digits — 0–150). Reading 2019 as ``age`` mints a junk scalar
+                        # and buries the year. Decline so the temporal layer captures it as event_date.
+                        # Deterministic value-shape, subject-agnostic, no word list; a genuine 2-/3-digit
+                        # age ("Sarah is 28", "the tree is 120") is untouched — keep scanning.
+                        if len(_num_surf) == 4 and _num_surf.isdigit() and 1000 <= int(_num_surf) <= 2999:
+                            continue
                         rel = "age"
                         value = _num_surf
                         num_tok = c
