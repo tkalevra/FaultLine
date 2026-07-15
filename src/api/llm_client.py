@@ -83,6 +83,26 @@ def get_backend_response_format() -> str:
     return _BACKEND_RESPONSE_FORMAT.get(get_backend_type(), "openai")
 
 
+def _thinking_kwarg_backends() -> set[str]:
+    """
+    Backends that accept the `chat_template_kwargs={"enable_thinking": False}`
+    top-level field on the request payload.
+
+    This is NOT universally safe. Strict OpenAI-compatible providers reject
+    unknown top-level fields with an HTTP 400 rather than silently ignoring
+    them — e.g. Cerebras returns 400 ("chat_template_kwargs ... is unsupported",
+    code=wrong_api_format), and OpenAI / Groq / most hosted gateways behave the
+    same way. Injecting the field unconditionally 400s EVERY LLM call for those
+    users. So we gate the injection to the OpenWebUI/vLLM family (default just
+    "openwebui") and rely on the post-hoc `_strip_think_tags` net elsewhere.
+
+    Env-extensible via LLM_CHAT_TEMPLATE_KWARGS_BACKENDS (comma-separated) for
+    self-hosted vLLM/OpenWebUI-style backends that DO honour the field.
+    """
+    raw = os.environ.get("LLM_CHAT_TEMPLATE_KWARGS_BACKENDS", "openwebui")
+    return {b.strip().lower() for b in raw.split(",") if b.strip()}
+
+
 def get_llm_headers() -> dict:
     """
     Return HTTP headers for LLM authentication.
@@ -197,13 +217,21 @@ def build_llm_payload(
     # (LM Studio, llama.cpp) have known bugs where the default is ignored.
     # Explicit suppression is required.  See BUGS/qwen3-thinking-mode/.
     #
-    # chat_template_kwargs is the Qwen3.5 / vLLM / OpenAI-compat mechanism.
-    # Unknown fields are silently ignored by backends that don't support them.
+    # chat_template_kwargs is the Qwen3.5 / vLLM / OpenWebUI mechanism.
     #
-    # anthropic is the ONLY exclusion: its API has no chat_template_kwargs and
-    # handles thinking via the dedicated `thinking` field, normalized in the
+    # This field is NOT universally safe: strict OpenAI-compatible providers
+    # reject unknown top-level fields with an HTTP 400 instead of ignoring them
+    # (Cerebras: "chat_template_kwargs ... is unsupported", code=wrong_api_format;
+    # OpenAI / Groq / most hosted gateways do the same). Injecting it
+    # unconditionally 400s EVERY call for a user on such a provider. So gate the
+    # injection to the OpenWebUI/vLLM family (default "openwebui", env-extensible
+    # via LLM_CHAT_TEMPLATE_KWARGS_BACKENDS); strict providers get a clean payload
+    # and rely on the post-hoc `_strip_think_tags` net.
+    #
+    # anthropic never gets it: its API has no chat_template_kwargs and handles
+    # thinking via the dedicated `thinking` field, normalized in the
     # anthropic-specific block below (disabled == field absent).
-    if backend != "anthropic":
+    if backend in _thinking_kwarg_backends():
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     # Anthropic-specific request shape adjustments
