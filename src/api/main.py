@@ -30606,6 +30606,36 @@ def _aspect_candidate_attrs(cur, anchor_uuid) -> list:
         return []
 
 
+def _aspect_candidate_rels(cur, anchor_uuid) -> list:
+    """The RELATIONAL twin of _aspect_candidate_attrs — the anchor's OWN relationship
+    rel_types (the ones it ACTUALLY HOLDS a fact under, facts ∪ staged_facts, subject OR
+    object side), as the BOUNDED candidate set for a relational aspect miss ("traveled" →
+    visit). SCALAR-tail rels are excluded (those are _aspect_candidate_attrs' lane). This
+    grounding IS the leak bound: the mapper may pick ONE of these or NONE, and only the
+    single grown rel is admitted — never a group/taxonomy, and never a rel the anchor does
+    not use (exactly the RELSCOPE bound). Mirrors RELSCOPE's grounding query. Returns
+    [(rel_type, nl)]."""
+    try:
+        cur.execute(
+            "SELECT DISTINCT f.rel_type, rt.natural_language "
+            "  FROM ( "
+            "    SELECT rel_type FROM facts "
+            "     WHERE (subject_id = %s OR object_id = %s) "
+            "       AND superseded_at IS NULL AND archived_at IS NULL "
+            "       AND deleted_at IS NULL "
+            "    UNION "
+            "    SELECT rel_type FROM staged_facts "
+            "     WHERE (subject_id = %s OR object_id = %s) "
+            "  ) f "
+            "  JOIN rel_types rt ON rt.rel_type = f.rel_type "
+            " WHERE rt.tail_types::text NOT ILIKE '%%SCALAR%%'",
+            (anchor_uuid, anchor_uuid, anchor_uuid, anchor_uuid),
+        )
+        return [(str(r).strip().lower(), (nl or "")) for r, nl in cur.fetchall() if r]
+    except Exception:
+        return []
+
+
 def _aspect_word_memoized_unmapped(cur, aspect_word: str) -> bool:
     """True if the brain already judged this aspect word as mapping to NONE of the anchor's
     attributes (decision='left_unmapped') — so we never re-ask on a subsequent fetch-all
@@ -30624,27 +30654,32 @@ def _aspect_word_memoized_unmapped(cur, aspect_word: str) -> bool:
 
 def _aspect_map_via_llm(aspect_word: str, candidates: list):
     """ONE bounded, single-attempt (no-retry) brain call under a HARD TIMEOUT: does
-    '<aspect_word>' refer to EXACTLY ONE of the anchor's actual attributes, or NONE?
-    Returns (attribute|None, confidence, called_ok). ``called_ok`` distinguishes a genuine
-    "NONE" judgement (memoize) from a timeout/failure (async backstop). Any failure →
+    '<aspect_word>' refer to EXACTLY ONE of the things this user actually tracks (a stored
+    scalar attribute OR a relationship the anchor holds), or NONE? Returns
+    (canonical|None, confidence, called_ok). ``called_ok`` distinguishes a genuine "NONE"
+    judgement (memoize) from a timeout/failure (async backstop). Any failure →
     (None, 0.0, False) so the caller degrades gracefully (SaaS cost-safe: an unconfigured
-    tenant brain returns nothing, ZERO spend)."""
+    tenant brain returns nothing, ZERO spend). The candidate list is the BOUND — it holds
+    ONLY things the anchor really has (scalar attrs and/or relationship rels it uses), so a
+    confident pick can never name something the anchor doesn't hold."""
     _names = {c[0] for c in candidates}
     _lines = "\n".join(
         f'  - {a}: {(nl or a.replace("_", " "))}' for a, nl in candidates
     )
     prompt = (
-        "[FaultLine-Internal] You are an attribute-synonym resolver.\n\n"
+        "[FaultLine-Internal] You are a memory-aspect synonym resolver.\n\n"
         f'A user asked about the aspect word: "{aspect_word}".\n\n'
-        "That word is NOT the stored name of any of this user's attributes. Decide whether "
-        "it refers to EXACTLY ONE of the user's ACTUAL attributes below (a lexical synonym "
-        '— e.g. "tall" refers to a person\'s height), or to NONE of them.\n\n'
-        "The user's attributes:\n"
+        "That word is NOT the stored name of anything this user tracks. Decide whether it "
+        "refers to EXACTLY ONE of the user's ACTUAL memory aspects below — a scalar "
+        "attribute or a relationship they hold (a lexical synonym — e.g. \"tall\" refers to "
+        "a person's height, \"traveled\" refers to places they visited) — or to NONE of "
+        "them.\n\n"
+        "The user's memory aspects:\n"
         f"{_lines}\n\n"
-        f'Pick AT MOST ONE attribute name that "{aspect_word}" refers to. If it refers to '
-        "none of them, answer null. Do NOT invent an attribute that is not in the list.\n\n"
+        f'Pick AT MOST ONE name that "{aspect_word}" refers to. If it refers to '
+        "none of them, answer null. Do NOT invent one that is not in the list.\n\n"
         "Respond with ONLY valid JSON (no markdown):\n"
-        '{"attribute": "<one attribute name exactly, or null>", "confidence": 0.0-1.0}'
+        '{"attribute": "<one name exactly, or null>", "confidence": 0.0-1.0}'
     )
     try:
         result = call_llm_no_retry_sync(
@@ -31034,20 +31069,41 @@ def determine_path(
             # table the typed multi-hop walk uses). Indexed equality, metadata-driven,
             # no fuzziness — a non-matching keyword simply contributes no scope (the
             # legacy taxonomy / GLiNER2 lanes below still run for it).
+            try:
+                from src.ontology.canonical import normalize_rel as _normalize_rel_kw
+            except Exception:
+                _normalize_rel_kw = None
             for keyword in keywords:
                 if len(keyword) < 3:
                     continue
                 # Exact rel_type name, then alias → canonical rel_type. Carry
                 # tail_types so SCALAR vs relationship routing is unchanged.
+                # The alias match tries BOTH the raw keyword AND its NORMALIZED form:
+                # record_alias stores aliases NORMALIZED (resolve_canonical reads them that
+                # way), and normalize_rel is a light stemmer ("traveled" → "travele",
+                # "visited" → "visit"), so a raw-only match would miss an engine-grown
+                # alias whose surface word normalizes differently — e.g. the ASPECT-SYNONYM
+                # GROWTH row "traveled"→visit would never read back deterministically and
+                # the brain would re-fire on every query. Matching the normalized form here
+                # aligns this lane with the rest of the alias-read machinery; additive (the
+                # raw form is still tried) and metadata-driven.
+                _kw_alias_forms = {keyword}
+                if _normalize_rel_kw:
+                    try:
+                        _kw_norm = _normalize_rel_kw(keyword)
+                        if _kw_norm:
+                            _kw_alias_forms.add(_kw_norm)
+                    except Exception:
+                        pass
                 cur.execute(
                     "SELECT rel_type, tail_types FROM rel_types"
                     " WHERE rel_type = %s"
                     " UNION"
                     " SELECT r.rel_type, r.tail_types FROM rel_type_aliases a"
                     "   JOIN rel_types r ON r.rel_type = a.canonical_rel_type"
-                    "  WHERE a.alias = %s"
+                    "  WHERE a.alias = ANY(%s)"
                     " LIMIT 1",
-                    (keyword, keyword),
+                    (keyword, list(_kw_alias_forms)),
                 )
                 row = cur.fetchone()
                 if row:
@@ -31229,19 +31285,41 @@ def determine_path(
 
             # ── ASPECT-SYNONYM GROWTH (inline map-and-grow on a genuine aspect MISS) ────
             # Fires ONLY when every cheap deterministic lane above (keyword→rel_type alias,
-            # ATTRSCOPE scalar, relational-aspect) resolved NOTHING for this anchor — i.e.
+            # ATTRSCOPE scalar, RELSCOPE relational) resolved NOTHING for this anchor — i.e.
             # scope is still empty and the query WOULD dump the whole profile — AND the
-            # anchor actually HOLDS scalar attributes to map to. The aspect word is neither
-            # an attribute NAME nor a template word (else ATTRSCOPE caught it), so we ask the
-            # brain ONCE whether it is a lexical synonym of one of the anchor's attributes,
-            # GROW the per-tenant alias on a confident hit, and resolve THIS query in-place.
-            # Once grown, the keyword→rel_type alias lane resolves the word deterministically
-            # on every future query (no model call — the dumb walk). See the engine header.
+            # anchor actually HOLDS memory aspects (scalar attributes and/or relationships)
+            # to map to. The aspect word is neither a NAME nor a template word of any of
+            # them (else ATTRSCOPE/RELSCOPE caught it), so we ask the brain ONCE whether it
+            # is a lexical synonym of one of the anchor's ACTUAL aspects, GROW the per-tenant
+            # alias on a confident hit, and resolve THIS query in-place.
+            #
+            # SCALAR **and** RELATIONAL twin (the relational half — "traveled" → visit):
+            # the candidate set UNIONS the anchor's scalar attrs (_aspect_candidate_attrs)
+            # with the relationship rels it actually holds (_aspect_candidate_rels). ONE
+            # brain call ranks the whole set (cheaper than two, and a genuine "NONE" now
+            # means NONE-of-either — correct memo semantics). The grown alias routes to
+            # scalar_rels vs relationship_rels by which candidate matched. Once grown, the
+            # keyword→rel_type alias lane (the UNION SELECT above) resolves the word
+            # deterministically on every future query, routing by tail_types — no model call.
+            #
+            # THE LEAK BOUND (crux, identical to RELSCOPE): the relational candidates are
+            # ONLY relationship rels the ANCHOR ACTUALLY HOLDS (facts ∪ staged, subject or
+            # object side); the mapper picks ONE of those or NONE (validated in-list); we
+            # admit that SINGLE grown rel into relationship_rels and NEVER touch
+            # taxonomy_groups — so no group/member expansion, no cross-group drag. The walk
+            # then projects by allowed_rels (rel_type = ANY), so only the named rel's own
+            # facts pass. A word mapping to NONE grows nothing and the broad fallback stands.
             if (_ASPECT_SYNONYM_GROWTH and anchor_resolved_uuid and _aspect_words
                     and not (path.scalar_rels or path.relationship_rels
                              or path.taxonomy_groups)):
                 try:
-                    _asp_candidates = _aspect_candidate_attrs(cur, anchor_resolved_uuid)
+                    _asp_scalar_cands = _aspect_candidate_attrs(cur, anchor_resolved_uuid)
+                    _asp_rel_cands = _aspect_candidate_rels(cur, anchor_resolved_uuid)
+                    # Names that route to SCALAR (entity_attributes) vs relationship
+                    # (facts). Disjoint by construction: a SCALAR-tail rel stores its value
+                    # in entity_attributes, a relationship rel in facts.
+                    _asp_scalar_names = {a for a, _ in _asp_scalar_cands}
+                    _asp_candidates = _asp_scalar_cands + _asp_rel_cands
                     if _asp_candidates:
                         _asp_schema = _current_tenant_schema_from_db(db)
                         _asp_snapshot = ",".join(a for a, _ in _asp_candidates)
@@ -31256,13 +31334,21 @@ def determine_path(
                             _attr, _conf, _called = _aspect_map_via_llm(_asp_w, _asp_candidates)
                             if _attr and _conf >= _ASPECT_SYNONYM_MIN_CONF:
                                 # GROW the per-tenant link (one-time) + resolve THIS query.
+                                # Route by which candidate matched: a scalar attr → the
+                                # scalar lane (entity_attributes), else the relationship
+                                # lane (facts, projected by allowed_rels).
                                 _grew = _aspect_grow_link(_asp_w, _attr, _asp_schema)
-                                if _attr not in path.scalar_rels:
-                                    path.scalar_rels.append(_attr)
+                                _asp_target = (path.scalar_rels
+                                               if _attr in _asp_scalar_names
+                                               else path.relationship_rels)
+                                if _attr not in _asp_target:
+                                    _asp_target.append(_attr)
                                 path.aspect_grown = _attr
                                 log.info("determine_path.aspect_synonym_grown",
                                          anchor=str(anchor_resolved_uuid)[:8],
                                          aspect=_asp_w, canonical=_attr,
+                                         lane=("scalar" if _attr in _asp_scalar_names
+                                               else "relational"),
                                          confidence=round(_conf, 3), fresh_insert=_grew,
                                          query=query_text[:50])
                             elif _called:

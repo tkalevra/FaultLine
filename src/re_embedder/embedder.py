@@ -5698,22 +5698,23 @@ def _aspect_syn_min_conf_emb() -> float:
 
 def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: str):
     """Background (retry-OK) brain call mirroring main._aspect_map_via_llm: does '<aspect_word>'
-    refer to EXACTLY ONE of the anchor's actual attributes, or NONE? Returns (attribute|None,
-    confidence). Fail-safe → (None, 0.0). Bounded, low-token; existing LLM stack (no hardcoded
-    timeout)."""
+    refer to EXACTLY ONE of the things this user actually tracks (a scalar attribute OR a
+    relationship the anchor holds), or NONE? Returns (canonical|None, confidence). Fail-safe →
+    (None, 0.0). Bounded, low-token; existing LLM stack (no hardcoded timeout)."""
     _names = {c[0] for c in candidates}
     _lines = "\n".join(f'  - {a}: {(nl or a.replace("_", " "))}' for a, nl in candidates)
     prompt = (
-        f"{_FAULTLINE_INTERNAL_PREFIX} You are an attribute-synonym resolver.\n\n"
+        f"{_FAULTLINE_INTERNAL_PREFIX} You are a memory-aspect synonym resolver.\n\n"
         f'A user asked about the aspect word: "{aspect_word}".\n\n'
-        "That word is NOT the stored name of any of this user's attributes. Decide whether it "
-        'refers to EXACTLY ONE of the user\'s ACTUAL attributes below (a lexical synonym — e.g. '
-        '"tall" refers to a person\'s height), or to NONE of them.\n\n'
-        f"The user's attributes:\n{_lines}\n\n"
-        f'Pick AT MOST ONE attribute name that "{aspect_word}" refers to. If it refers to none of '
-        "them, answer null. Do NOT invent an attribute that is not in the list.\n\n"
+        "That word is NOT the stored name of anything this user tracks. Decide whether it "
+        "refers to EXACTLY ONE of the user's ACTUAL memory aspects below — a scalar attribute "
+        "or a relationship they hold (a lexical synonym — e.g. \"tall\" refers to a person's "
+        "height, \"traveled\" refers to places they visited) — or to NONE of them.\n\n"
+        f"The user's memory aspects:\n{_lines}\n\n"
+        f'Pick AT MOST ONE name that "{aspect_word}" refers to. If it refers to none of '
+        "them, answer null. Do NOT invent one that is not in the list.\n\n"
         "Respond with ONLY valid JSON (no markdown):\n"
-        '{"attribute": "<one attribute name exactly, or null>", "confidence": 0.0-1.0}'
+        '{"attribute": "<one name exactly, or null>", "confidence": 0.0-1.0}'
     )
     try:
         result = call_llm_with_retry_sync(
@@ -5785,7 +5786,12 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
                     db_conn.commit()
                     stats["grown"] += 1
                     continue
-                # BOUNDED candidate set: the anchor's LIVE scalar attributes that are rel_types.
+                # BOUNDED candidate set (leak bound, identical to the inline path): the
+                # anchor's LIVE scalar attributes that are rel_types, UNIONed with the
+                # relationship rels it actually HOLDS (facts ∪ staged, subject or object
+                # side) — the relational twin. Grow maps to ONE of these or NONE; a grown
+                # relationship alias is read back model-free by the query walk's
+                # keyword→rel_type alias lane (routed to relationship_rels by tail_types).
                 cur.execute(
                     "SELECT DISTINCT ea.attribute, rt.natural_language FROM entity_attributes ea "
                     "  JOIN rel_types rt ON rt.rel_type = ea.attribute "
@@ -5793,6 +5799,22 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
                     (anchor_uuid,),
                 )
                 candidates = [(str(a).strip().lower(), (nl or "")) for a, nl in cur.fetchall() if a]
+                cur.execute(
+                    "SELECT DISTINCT f.rel_type, rt.natural_language "
+                    "  FROM ( "
+                    "    SELECT rel_type FROM facts "
+                    "     WHERE (subject_id = %s OR object_id = %s) "
+                    "       AND superseded_at IS NULL AND archived_at IS NULL "
+                    "       AND deleted_at IS NULL "
+                    "    UNION "
+                    "    SELECT rel_type FROM staged_facts "
+                    "     WHERE (subject_id = %s OR object_id = %s) "
+                    "  ) f "
+                    "  JOIN rel_types rt ON rt.rel_type = f.rel_type "
+                    " WHERE rt.tail_types::text NOT ILIKE '%%SCALAR%%'",
+                    (anchor_uuid, anchor_uuid, anchor_uuid, anchor_uuid),
+                )
+                candidates += [(str(r).strip().lower(), (nl or "")) for r, nl in cur.fetchall() if r]
             if not candidates:
                 with db_conn.cursor() as cur:
                     cur.execute(
