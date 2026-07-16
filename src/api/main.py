@@ -30867,6 +30867,80 @@ def determine_path(
                     else:
                         path.relationship_rels.append(rel_type)
 
+            # ── SCALAR-ASPECT ANCHOR GROUNDING (attribute under/over-scope fix) ──────────
+            # A scalar-attribute question about the anchor ("how old am I", "how much do I
+            # earn", "what car do I have") must NARROW to the asked aspect — the anchor's
+            # matching entity_attribute — instead of the two reported failure modes:
+            #   • UNDER-SCOPE: the exact keyword→rel_type match above admits an aspect only
+            #     when the query word IS a rel_type NAME *and* that rel is tail_types=SCALAR.
+            #     A growth-minted attribute rel that isn't SCALAR-flagged routes to
+            #     relationship_rels (or, when the surface word ≠ the stored attribute name,
+            #     resolves nothing), so scope_active flips True but the user-anchor scalar
+            #     fetch (WHERE attribute = ANY(scalar_rels), main.py ~32978) never sees the
+            #     attribute → "No relevant facts found."
+            #   • OVER-SCOPE: a surface word that is no rel_type NAME/alias and no taxonomy
+            #     name ("old") resolves nothing → fetch_all_details → the UNSCOPED lane dumps
+            #     the ENTIRE profile instead of narrowing to age.
+            #
+            # FIX (scope resolution, not a cleanup layer): ground the scalar aspect in the
+            # ANCHOR'S OWN stored attributes. For each query content-word, admit an attribute
+            # into path.scalar_rels when the word (a) equals the stored attribute NAME
+            # (word-boundary) — catches a non-SCALAR-flagged/renamed grown rel — or (b) is a
+            # whole CONTENT word of that attribute's rel_type natural_language template
+            # ("old" ∈ "X is Y years old" → age) — the precise, word-boundary successor to
+            # the retired fuzzy `natural_language ILIKE '%kw%'` substring match (which grabbed
+            # age→manage). SCALAR-ONLY is the safety boundary: an admitted scalar is the
+            # entity's OWN value (entity_attributes), so it cannot introduce a cross-group
+            # RELATIONSHIP leak — the same boundary the scalar-transitive block below relies
+            # on. This NARROWS (never widens to a group), so it honours the aspect-precision
+            # firewall (398a4fb0), and it fires _explicit_aspect below so the fuzzy taxonomy
+            # guess cannot re-widen a scope the user already named. Deterministic (word-
+            # boundary tokenisation, no cosine/LLM); metadata-driven (entity_attributes +
+            # rel_types.natural_language, grown per-tenant); subject-agnostic (no attribute/
+            # rel/domain literal — resolves whatever the anchor actually stored). Grounded to
+            # the anchor's own attributes, so a word that matches nothing the anchor HAS
+            # resolves no aspect and the broad fetch-all fallback is preserved.
+            _aspect_words = {k for k in keywords if len(k) >= 3}
+            if anchor_resolved_uuid and _aspect_words:
+                try:
+                    cur.execute(
+                        "SELECT ea.attribute, rt.natural_language "
+                        "  FROM entity_attributes ea "
+                        "  LEFT JOIN rel_types rt ON rt.rel_type = ea.attribute "
+                        " WHERE ea.entity_id = %s",
+                        (anchor_resolved_uuid,),
+                    )
+                    _anchor_attr_rows = cur.fetchall()
+                    # Placeholder/functor tokens carry no aspect meaning — never a match key.
+                    _tmpl_stop = {
+                        'is', 'are', 'was', 'were', 'be', 'the', 'a', 'an', 'of', 'in',
+                        'on', 'to', 'and', 'or', 'has', 'have', 'had', 'his', 'her',
+                        'its', 'their', 'this', 'that', 'for', 'with', 'x', 'y', 'z',
+                    }
+                    _admitted_aspect: list[str] = []
+                    for _attr, _nl in _anchor_attr_rows:
+                        if not _attr:
+                            continue
+                        _attr_lc = str(_attr).strip().lower()
+                        _hit = _attr_lc in _aspect_words
+                        if not _hit and _nl:
+                            _nl_tokens = {
+                                _t for _t in re.findall(r'[a-z]+', str(_nl).lower())
+                                if len(_t) >= 3 and _t not in _tmpl_stop
+                            }
+                            _hit = bool(_aspect_words & _nl_tokens)
+                        if _hit and _attr_lc not in path.scalar_rels:
+                            path.scalar_rels.append(_attr_lc)
+                            _admitted_aspect.append(_attr_lc)
+                    if _admitted_aspect:
+                        log.info("determine_path.scalar_aspect_anchor_grounding",
+                                 anchor=str(anchor_resolved_uuid)[:8],
+                                 admitted=_admitted_aspect[:8],
+                                 query=query_text[:50])
+                except Exception as _sag_err:
+                    log.warning("determine_path.scalar_aspect_grounding_failed",
+                                error=str(_sag_err)[:120])
+
             # Match against entity_taxonomies.taxonomy_name — exact match first
             for keyword in keywords:
                 cur.execute(
