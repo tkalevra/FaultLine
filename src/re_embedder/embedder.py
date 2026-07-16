@@ -5075,6 +5075,12 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                 # carry the cue CATEGORY (e.g. 'social_role'), NOT a real rel_type. Excluding them here
                 # prevents the rel-type evaluator from minting a bogus rel_type named after the category.
                 "     AND extraction_method IS DISTINCT FROM 'linguistic_cue_candidate'"
+                # CARVE-OUT firewall: aspect_synonym_miss rows are QUERY-ASPECT synonym
+                # candidates owned by evaluate_aspect_synonym_candidates — sample_object
+                # carries an aspect SURFACE word ("tall"), candidate_rel_type is the fixed
+                # sentinel 'aspect_synonym', NOT a novel rel. Excluding them stops the
+                # rel-type evaluator minting a bogus rel named after the sentinel.
+                "     AND extraction_method IS DISTINCT FROM 'aspect_synonym_miss'"
                 "   GROUP BY candidate_rel_type"
                 " ) agg"
                 " JOIN LATERAL ("
@@ -5085,6 +5091,7 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                 "     AND oe.re_embedder_decision IS NULL"
                 "     AND oe.extraction_method IS DISTINCT FROM 'ingest_miss_pushback'"
                 "     AND oe.extraction_method IS DISTINCT FROM 'linguistic_cue_candidate'"
+                "     AND oe.extraction_method IS DISTINCT FROM 'aspect_synonym_miss'"
                 "   ORDER BY oe.occurrence_count DESC, oe.last_seen_at DESC"
                 "   LIMIT 1"
                 " ) rep ON true"
@@ -5665,6 +5672,167 @@ def _synonym_conv_batch() -> int:
 _SYNONYM_CONV_METHOD = "synonym_convergence"
 _SYNONYM_CONV_MEMO_SUBJ = "__synonym_convergence__"
 _SYNONYM_CONV_MEMO_OBJ = "__memo__"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# ASPECT-SYNONYM GROWTH — ASYNC BACKSTOP for the query-side inline map-and-grow.
+# The inline path (main.determine_path) grows tall→height on the FIRST miss when the tenant brain
+# answers within the hard hot-path timeout; when it TIMES OUT it parks the miss in
+# ontology_evaluations (extraction_method='aspect_synonym_miss'). This pass drains those so the
+# NEXT query is deterministic regardless. Grown link = a rel_type_aliases row read by the EXISTING
+# keyword→rel_type alias lane (query walk stays model-free). Per-tenant, confidence-gated, bounded
+# to attributes the anchor actually holds, subject-agnostic. Companion to the rel synonym-convergence.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+_ASPECT_SYNONYM_GROWTH_ENABLED = _flag("ASPECT_SYNONYM_GROWTH", "true")
+_ASPECT_SYN_METHOD_EMB = "aspect_synonym_miss"  # must match main._ASPECT_SYN_METHOD
+
+
+def _aspect_syn_min_conf_emb() -> float:
+    """Confidence floor for the async aspect-map GROW. Env-configurable; fail-safe → 0.75."""
+    try:
+        return float(os.getenv("ASPECT_SYNONYM_MIN_CONF", "0.75"))
+    except (TypeError, ValueError):
+        return 0.75
+
+
+def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: str):
+    """Background (retry-OK) brain call mirroring main._aspect_map_via_llm: does '<aspect_word>'
+    refer to EXACTLY ONE of the anchor's actual attributes, or NONE? Returns (attribute|None,
+    confidence). Fail-safe → (None, 0.0). Bounded, low-token; existing LLM stack (no hardcoded
+    timeout)."""
+    _names = {c[0] for c in candidates}
+    _lines = "\n".join(f'  - {a}: {(nl or a.replace("_", " "))}' for a, nl in candidates)
+    prompt = (
+        f"{_FAULTLINE_INTERNAL_PREFIX} You are an attribute-synonym resolver.\n\n"
+        f'A user asked about the aspect word: "{aspect_word}".\n\n'
+        "That word is NOT the stored name of any of this user's attributes. Decide whether it "
+        'refers to EXACTLY ONE of the user\'s ACTUAL attributes below (a lexical synonym — e.g. '
+        '"tall" refers to a person\'s height), or to NONE of them.\n\n'
+        f"The user's attributes:\n{_lines}\n\n"
+        f'Pick AT MOST ONE attribute name that "{aspect_word}" refers to. If it refers to none of '
+        "them, answer null. Do NOT invent an attribute that is not in the list.\n\n"
+        "Respond with ONLY valid JSON (no markdown):\n"
+        '{"attribute": "<one attribute name exactly, or null>", "confidence": 0.0-1.0}'
+    )
+    try:
+        result = call_llm_with_retry_sync(
+            messages=[{"role": "user", "content": prompt}],
+            model=LLMModels.get("ENRICHMENT"),
+            user_id="re_embedder",
+            timeout=LLMTimeouts.get("ENRICHMENT"),
+            operation="ENRICHMENT",
+        )
+        if isinstance(result, dict):
+            attr = result.get("attribute")
+            try:
+                conf = float(result.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            if attr and str(attr).strip().lower() in _names:
+                return str(attr).strip().lower(), conf
+    except Exception as e:
+        log.debug(f"re_embedder.aspect_map_llm_failed aspect={aspect_word}: {type(e).__name__}: {str(e)[:120]}")
+    return None, 0.0
+
+
+def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen_api_url: str) -> dict:
+    """Drain enqueued aspect-synonym misses (timed-out inline maps) and GROW the confident ones.
+
+    Per-tenant (caller-bound search_path, NO public); confidence-gated; BOUNDED to the anchor's
+    LIVE scalar attributes that are real rel_types (map to one or NONE — no invented links);
+    subject-agnostic (no attr/aspect literal). Grown link is a rel_type_aliases row read
+    deterministically by the query walk (no query-time model call). Fail-safe per row.
+    Returns {"grown","unmapped","skipped","errors"}.
+    """
+    stats = {"grown": 0, "unmapped": 0, "skipped": 0, "errors": 0}
+    if not _ASPECT_SYNONYM_GROWTH_ENABLED:
+        return stats
+    try:
+        from src.ontology.canonical import record_alias as _record_alias
+    except Exception as e:
+        log.error(f"re_embedder.aspect_synonym_import_failed: {e}")
+        return stats
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, sample_subject_id, sample_object FROM ontology_evaluations "
+                " WHERE extraction_method = %s AND re_embedder_decision IS NULL "
+                " ORDER BY last_seen_at DESC LIMIT 25",
+                (_ASPECT_SYN_METHOD_EMB,),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"re_embedder.aspect_synonym_fetch_failed schema={schema_name}: {str(e)[:160]}")
+        return stats
+    if not rows:
+        return stats
+
+    min_conf = _aspect_syn_min_conf_emb()
+    for (row_id, anchor_uuid, aspect_word) in rows:
+        aspect_word = (aspect_word or "").strip().lower()
+        if not aspect_word or not anchor_uuid:
+            stats["skipped"] += 1
+            continue
+        try:
+            with db_conn.cursor() as cur:
+                # Already grown (inline path or a prior cycle)? → resolve the row, no LLM.
+                cur.execute("SELECT 1 FROM rel_type_aliases WHERE alias = %s", (aspect_word,))
+                if cur.fetchone():
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET re_embedder_decision = 'aspect_grown',"
+                        " decision_timestamp = now() WHERE id = %s", (row_id,))
+                    db_conn.commit()
+                    stats["grown"] += 1
+                    continue
+                # BOUNDED candidate set: the anchor's LIVE scalar attributes that are rel_types.
+                cur.execute(
+                    "SELECT DISTINCT ea.attribute, rt.natural_language FROM entity_attributes ea "
+                    "  JOIN rel_types rt ON rt.rel_type = ea.attribute "
+                    " WHERE ea.entity_id = %s AND rt.tail_types::text ILIKE '%%SCALAR%%'",
+                    (anchor_uuid,),
+                )
+                candidates = [(str(a).strip().lower(), (nl or "")) for a, nl in cur.fetchall() if a]
+            if not candidates:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET re_embedder_decision = 'no_candidates',"
+                        " decision_timestamp = now() WHERE id = %s", (row_id,))
+                db_conn.commit()
+                stats["skipped"] += 1
+                continue
+
+            attr, conf = _aspect_map_via_llm_async(aspect_word, candidates, qwen_api_url)
+            names = {c[0] for c in candidates}
+            if attr and attr in names and conf >= min_conf:
+                grew = _record_alias(alias=aspect_word, canonical=attr, requires_inversion=False,
+                                     source="engine", dsn=dsn, schema=schema_name)
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET re_embedder_decision = 'aspect_grown',"
+                        " created_rel_type = %s, re_embedder_confidence = %s, decision_timestamp = now()"
+                        " WHERE id = %s", (attr, conf, row_id))
+                db_conn.commit()
+                stats["grown"] += 1
+                log.info(f"re_embedder.aspect_synonym_grown schema={schema_name} "
+                         f"aspect={aspect_word} canonical={attr} conf={conf:.2f} fresh={grew}")
+            else:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE ontology_evaluations SET re_embedder_decision = 'left_unmapped',"
+                        " re_embedder_confidence = %s, decision_timestamp = now() WHERE id = %s",
+                        (conf, row_id))
+                db_conn.commit()
+                stats["unmapped"] += 1
+        except Exception as e:
+            try:
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+            except Exception:
+                pass
+            stats["errors"] += 1
+            log.warning(f"re_embedder.aspect_synonym_row_failed schema={schema_name} "
+                        f"aspect={aspect_word}: {str(e)[:140]}")
+    return stats
 
 
 def _type_set(arr) -> set:
@@ -8602,6 +8770,28 @@ def main():
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.ontology_eval_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+
+                            # ── Aspect-synonym GROWTH backstop (per-user schema) ──
+                            # Drains timed-out inline aspect misses (tall→height) and grows the
+                            # per-tenant rel_type_aliases link so the NEXT query resolves
+                            # deterministically. INGEST_ENABLED freeze: grows ontology (aliases) —
+                            # paused in knowledge-store/serve mode. Writes rel_type_aliases →
+                            # mark the schema changed so its overlay refreshes.
+                            try:
+                                if ingest_enabled:
+                                    _asp_stats = evaluate_aspect_synonym_candidates(
+                                        _ont_db, postgres_dsn, _schema, qwen_api_url)
+                                    if _asp_stats.get("grown", 0) > 0:
+                                        log.info(
+                                            f"re_embedder.aspect_synonym schema={_schema} "
+                                            f"grown={_asp_stats['grown']} "
+                                            f"unmapped={_asp_stats['unmapped']} "
+                                            f"skipped={_asp_stats['skipped']} "
+                                            f"errors={_asp_stats['errors']}")
+                                        _changed_schemas.add(_schema)
+                            except Exception as e:
+                                _rollback_and_reapply_search_path(_ont_db, _schema)
+                                log.error(f"re_embedder.aspect_synonym_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
                             # ── PENDING-PLACEMENT morphology DRAIN (deterministic, per-user schema) ──
                             # Reconcile EXISTING `pending_placement` rels onto their SEEDED canonical
