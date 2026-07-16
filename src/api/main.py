@@ -30941,6 +30941,100 @@ def determine_path(
                     log.warning("determine_path.scalar_aspect_grounding_failed",
                                 error=str(_sag_err)[:120])
 
+            # ── RELATIONAL-ASPECT ANCHOR GROUNDING (relationship under/over-scope fix) ──
+            # The scalar sibling above (ATTRSCOPE) narrows a SCALAR-attribute question to
+            # the anchor's own entity_attribute. Its relationship twin was deliberately
+            # left out because it carries a leak risk the scalar case cannot: admitting a
+            # relationship rel opens a graph edge to ANOTHER entity, so a loose admission
+            # (a group/taxonomy, or a rel the anchor doesn't actually hold) drags in
+            # cross-group facts. This block adds the relationship narrowing under a TIGHT
+            # bound so it can't leak.
+            #
+            # THE GAP: "what did I switch to" resolved NOTHING — the aspect verb "switch"
+            # is no SCALAR attribute (ATTRSCOPE skips it), no exact rel_type NAME
+            # ("switch" ≠ the grown compound rel "switch_to"), and no taxonomy name — so
+            # scope_active stayed False → fetch_all_details → the WHOLE profile (location,
+            # spouse, occupation, earnings, car…) dumped instead of the switch target
+            # (user, switch_to, gcp).
+            #
+            # FIX (scope resolution, mirrors ATTRSCOPE, relationship variant): admit a
+            # RELATIONSHIP rel into path.relationship_rels ONLY when BOTH hold —
+            #   (1) a query content-word (len ≥ 3) NAMES the rel, matched word-boundary
+            #       against either a content TOKEN of the rel's own name (the compound rel
+            #       "switch_to" tokenises to {switch}; the relational analogue of
+            #       ATTRSCOPE's single-word attribute NAME) OR a content word of the rel's
+            #       natural_language template — same deterministic tokeniser + _tmpl_stop
+            #       as ATTRSCOPE (no cosine/LLM, no substring fuzz), AND
+            #   (2) the ANCHOR ACTUALLY HOLDS a fact under that rel — verified against the
+            #       anchor's OWN rows in facts ∪ staged_facts (Class-B facts live in
+            #       staged_facts), subject OR object side.
+            #
+            # THE LEAK BOUND (the crux — why this can't cross groups):
+            #   • GROUNDED: (2) means a word matching a rel the anchor does NOT use resolves
+            #     nothing → broad fetch-all fallback preserved; nothing outside the anchor's
+            #     real edge set is ever admitted.
+            #   • SINGLE-REL, NEVER A GROUP: we admit ONLY the specific matched rel(s) into
+            #     relationship_rels — we NEVER touch path.taxonomy_groups here, so no
+            #     rel_types_defining_group / member-attribute expansion fires. The walk then
+            #     projects by allowed_rels (rel_type = ANY), so only the named rel's own
+            #     facts pass — spouse/lives_in/works_for are silently excluded because their
+            #     name/template words weren't in the query. This is the aspect-precision
+            #     firewall (398a4fb0): an EXPLICIT aspect the user named beats a fuzzy group.
+            #   • SCALAR rels are excluded here (owned by ATTRSCOPE / entity_attributes).
+            # Metadata-driven (facts/staged_facts + rel_types.natural_language, grown
+            # per-tenant); subject-agnostic (no rel/verb/domain literal). Fail-safe: any
+            # error leaves scope unchanged.
+            if anchor_resolved_uuid and _aspect_words:
+                try:
+                    cur.execute(
+                        "SELECT DISTINCT f.rel_type, rt.natural_language, rt.tail_types "
+                        "  FROM ( "
+                        "    SELECT rel_type FROM facts "
+                        "     WHERE (subject_id = %s OR object_id = %s) "
+                        "       AND superseded_at IS NULL AND archived_at IS NULL "
+                        "       AND deleted_at IS NULL "
+                        "    UNION "
+                        "    SELECT rel_type FROM staged_facts "
+                        "     WHERE (subject_id = %s OR object_id = %s) "
+                        "  ) f "
+                        "  LEFT JOIN rel_types rt ON rt.rel_type = f.rel_type",
+                        (anchor_resolved_uuid, anchor_resolved_uuid,
+                         anchor_resolved_uuid, anchor_resolved_uuid),
+                    )
+                    _anchor_rel_rows = cur.fetchall()
+                    _admitted_rel_aspect: list[str] = []
+                    for _rel, _rel_nl, _rel_tail in _anchor_rel_rows:
+                        if not _rel:
+                            continue
+                        _rel_lc = str(_rel).strip().lower()
+                        # SCALAR rels belong to the ATTRSCOPE lane — skip here.
+                        if _rel_tail and 'SCALAR' in str(_rel_tail):
+                            continue
+                        # (1a) content TOKENS of the rel's OWN name (compound → verb stem).
+                        _name_tokens = {
+                            _t for _t in re.findall(r'[a-z]+', _rel_lc)
+                            if len(_t) >= 3 and _t not in _tmpl_stop
+                        }
+                        _hit = bool(_aspect_words & _name_tokens)
+                        # (1b) content words of the rel's natural_language template.
+                        if not _hit and _rel_nl:
+                            _rel_nl_tokens = {
+                                _t for _t in re.findall(r'[a-z]+', str(_rel_nl).lower())
+                                if len(_t) >= 3 and _t not in _tmpl_stop
+                            }
+                            _hit = bool(_aspect_words & _rel_nl_tokens)
+                        if _hit and _rel_lc not in path.relationship_rels:
+                            path.relationship_rels.append(_rel_lc)
+                            _admitted_rel_aspect.append(_rel_lc)
+                    if _admitted_rel_aspect:
+                        log.info("determine_path.relational_aspect_anchor_grounding",
+                                 anchor=str(anchor_resolved_uuid)[:8],
+                                 admitted=_admitted_rel_aspect[:8],
+                                 query=query_text[:50])
+                except Exception as _rag_err:
+                    log.warning("determine_path.relational_aspect_grounding_failed",
+                                error=str(_rag_err)[:120])
+
             # Match against entity_taxonomies.taxonomy_name — exact match first
             for keyword in keywords:
                 cur.execute(
