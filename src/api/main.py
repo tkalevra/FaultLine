@@ -33,7 +33,7 @@ from src.api import temporal_pattern_overlay
 from src.api import linguistic_cue_overlay
 from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, ConversationMessage, QueryPath, QueryResponse
 from .llm_client import get_llm_headers, build_llm_payload, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
-from .llm_calls import call_llm_with_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
+from .llm_calls import call_llm_with_retry_sync, call_llm_no_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
 from .idempotency import IdempotencyManager
 
 log = structlog.get_logger()
@@ -30530,6 +30530,198 @@ def _query_has_occurrence_intent(query_text: str) -> bool:
     return False
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ASPECT-SYNONYM GROWTH ENGINE (query-aspect resolution)
+# ══════════════════════════════════════════════════════════════════════════════════════
+# Recall OVER-SCOPES ("how tall am I" dumps the whole profile) when the query's aspect word
+# is neither the attribute's NAME nor a word in its natural_language template — "tall" ∉
+# height's name and ∉ "X is Y feet tall"? (it isn't). ATTRSCOPE then admits nothing → scope
+# stays empty → fetch-all → dump. The FIX is the GROWTH engine, NOT a hardcoded tall→height
+# map and NOT a seed: on the MISS, ask the tenant's own brain ONCE "does '<aspect word>'
+# refer to ONE of {the anchor's ACTUAL scalar attributes} or NONE?"; on a confident hit
+# GROW a per-tenant rel_type_aliases row (tall → height, source='engine') AND resolve THIS
+# query in-place (the first query gets the real answer, not a degraded fallback). Because we
+# WRITE the link, the brain fires only on the FIRST encounter of a novel aspect word — every
+# hit after is the EXISTING keyword→rel_type alias lane resolving it with NO model call (the
+# dumb deterministic walk). Subject-agnostic (the MODEL maps, the ENGINE records — zero
+# aspect/attr literal), per-tenant (grown, never seeded — public is template-only),
+# confidence-gated + BOUNDED to attributes the anchor actually holds (map to one or NONE, no
+# invented links), fail-safe (timeout/failure → today's broad fallback + an async backstop
+# enqueue so the NEXT query is deterministic regardless; a genuine NONE is memoized so the
+# brain is never re-asked for that word → no per-hit cost, no sprawl).
+#
+# MAPPER = the LLM, not GLiNER2 (evaluated): GLiNER2 is a zero-shot TYPE tagger — it labels a
+# span that IS an instance/VALUE of a type ("6 ft" → height), not an adjective that MEANS an
+# attribute. "tall"→height is a lexical-synonym judgement, outside GLiNER2's job, and feeding
+# adjective labels violates GLiNER2 purity (Pitfall 11: concise TYPE labels only). So the
+# synonym judgement is the LLM's — but it is spent ONCE and RECORDED; steady state is
+# model-free. Inline (not async-only) so the first query resolves; a HARD TIMEOUT keeps a
+# slow brain off the hot path, with the async grower as a backstop.
+_ASPECT_SYNONYM_GROWTH = os.environ.get("ASPECT_SYNONYM_GROWTH", "true").lower() in (
+    "1", "true", "yes", "on")
+_ASPECT_SYNONYM_MIN_CONF = float(os.environ.get("ASPECT_SYNONYM_MIN_CONF", "0.75"))
+_ASPECT_INLINE_TIMEOUT_S = float(os.environ.get("ASPECT_INLINE_TIMEOUT_S", "8"))
+# ontology_evaluations.extraction_method marker for the async backstop rows. FIREWALLED out
+# of the rel-type evaluator (evaluate_ontology_candidates) — these carry an aspect SURFACE
+# word in sample_object, never a novel rel candidate.
+_ASPECT_SYN_METHOD = "aspect_synonym_miss"
+# Bound the per-query inline cost: never map more than this many novel aspect words in one
+# query (usually there is exactly one, e.g. "tall").
+_ASPECT_MAX_INLINE_WORDS = 2
+
+
+def _current_tenant_schema_from_db(db) -> Optional[str]:
+    """The tenant schema bound on THIS request connection (first non-public/$user entry of
+    search_path) — so the aspect GROW + async enqueue target the SAME tenant the query is
+    scoped to. Fail-safe → None (grow/enqueue skip; broad fallback preserved)."""
+    try:
+        with db.cursor() as cur:
+            cur.execute("SHOW search_path")
+            raw = (cur.fetchone() or [""])[0] or ""
+        for part in raw.split(","):
+            s = part.strip().strip('"')
+            if s and s.lower() not in ("public", "$user"):
+                return s
+    except Exception:
+        return None
+    return None
+
+
+def _aspect_candidate_attrs(cur, anchor_uuid) -> list:
+    """The anchor's OWN scalar attributes that are ALSO real SCALAR rel_types — the BOUNDED
+    candidate set the mapper may pick from (map to ONE or NONE, no invented links). Only
+    rel_type-backed attributes qualify: rel_type_aliases.canonical_rel_type is FK→rel_types,
+    so a non-rel attribute can never be a valid alias target. Returns [(attribute, nl)]."""
+    try:
+        cur.execute(
+            "SELECT DISTINCT ea.attribute, rt.natural_language "
+            "  FROM entity_attributes ea "
+            "  JOIN rel_types rt ON rt.rel_type = ea.attribute "
+            " WHERE ea.entity_id = %s "
+            "   AND rt.tail_types::text ILIKE '%%SCALAR%%'",
+            (anchor_uuid,),
+        )
+        return [(str(a).strip().lower(), (nl or "")) for a, nl in cur.fetchall() if a]
+    except Exception:
+        return []
+
+
+def _aspect_word_memoized_unmapped(cur, aspect_word: str) -> bool:
+    """True if the brain already judged this aspect word as mapping to NONE of the anchor's
+    attributes (decision='left_unmapped') — so we never re-ask on a subsequent fetch-all
+    query. Keeps the brain ONE-TIME even for a genuinely-unmappable word (no per-hit cost)."""
+    try:
+        cur.execute(
+            "SELECT 1 FROM ontology_evaluations "
+            " WHERE extraction_method = %s AND sample_object = %s "
+            "   AND re_embedder_decision = 'left_unmapped' LIMIT 1",
+            (_ASPECT_SYN_METHOD, aspect_word),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _aspect_map_via_llm(aspect_word: str, candidates: list):
+    """ONE bounded, single-attempt (no-retry) brain call under a HARD TIMEOUT: does
+    '<aspect_word>' refer to EXACTLY ONE of the anchor's actual attributes, or NONE?
+    Returns (attribute|None, confidence, called_ok). ``called_ok`` distinguishes a genuine
+    "NONE" judgement (memoize) from a timeout/failure (async backstop). Any failure →
+    (None, 0.0, False) so the caller degrades gracefully (SaaS cost-safe: an unconfigured
+    tenant brain returns nothing, ZERO spend)."""
+    _names = {c[0] for c in candidates}
+    _lines = "\n".join(
+        f'  - {a}: {(nl or a.replace("_", " "))}' for a, nl in candidates
+    )
+    prompt = (
+        "[FaultLine-Internal] You are an attribute-synonym resolver.\n\n"
+        f'A user asked about the aspect word: "{aspect_word}".\n\n'
+        "That word is NOT the stored name of any of this user's attributes. Decide whether "
+        "it refers to EXACTLY ONE of the user's ACTUAL attributes below (a lexical synonym "
+        '— e.g. "tall" refers to a person\'s height), or to NONE of them.\n\n'
+        "The user's attributes:\n"
+        f"{_lines}\n\n"
+        f'Pick AT MOST ONE attribute name that "{aspect_word}" refers to. If it refers to '
+        "none of them, answer null. Do NOT invent an attribute that is not in the list.\n\n"
+        "Respond with ONLY valid JSON (no markdown):\n"
+        '{"attribute": "<one attribute name exactly, or null>", "confidence": 0.0-1.0}'
+    )
+    try:
+        result = call_llm_no_retry_sync(
+            messages=[{"role": "user", "content": prompt}],
+            model=LLMModels.get("ENRICHMENT"),
+            user_id="aspect_synonym",
+            timeout=min(_ASPECT_INLINE_TIMEOUT_S, float(LLMTimeouts.get("ENRICHMENT") or 15)),
+            operation="ENRICHMENT",
+        )
+    except Exception:
+        return None, 0.0, False
+    if not isinstance(result, dict):
+        return None, 0.0, False  # timeout / connection / parse failure → async backstop
+    attr = result.get("attribute")
+    try:
+        conf = float(result.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if attr and str(attr).strip().lower() in _names:
+        return str(attr).strip().lower(), conf, True
+    return None, conf, True  # brain answered NONE (or an off-list value) → memoize
+
+
+def _aspect_grow_link(aspect_word: str, canonical_attr: str, schema: Optional[str]) -> bool:
+    """GROW the per-tenant aspect-synonym as a rel_type_aliases row via the SAME
+    deterministic synonym table rel-convergence uses (record_alias, source='engine',
+    ON CONFLICT no-op). Returns True on a fresh insert. Fail-safe → False."""
+    try:
+        from src.ontology.canonical import record_alias
+        return bool(record_alias(
+            alias=aspect_word, canonical=canonical_attr,
+            requires_inversion=False, source="engine",
+            dsn=os.environ.get("POSTGRES_DSN"), schema=schema,
+        ))
+    except Exception as _e:
+        log.warning("aspect_synonym.grow_failed", aspect=aspect_word,
+                    canonical=canonical_attr, error=str(_e)[:120])
+        return False
+
+
+def _aspect_record_miss(schema: Optional[str], anchor_uuid: str, aspect_word: str,
+                        candidate_snapshot: str, decision: Optional[str]) -> None:
+    """Autonomous, per-tenant write into ontology_evaluations for the aspect-synonym engine.
+    ``decision`` None → an ENQUEUE for the async grower (inline map timed out/failed).
+    ``decision`` 'left_unmapped' → a MEMO (brain judged NONE) so the brain is never re-asked.
+    Idempotent per (candidate_rel_type sentinel, anchor, aspect_word). Never touches the
+    request transaction (own connection); fail-safe."""
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn or not schema:
+        return
+    try:
+        with psycopg2.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'SET search_path TO "{schema}"')
+                cur.execute(
+                    "INSERT INTO ontology_evaluations "
+                    "  (candidate_rel_type, candidate_subject_type, candidate_object_type, "
+                    "   sample_subject_id, sample_object, first_text_snippet, "
+                    "   extraction_method, re_embedder_decision, decision_reason, "
+                    "   occurrence_count, last_seen_at) "
+                    "  VALUES ('aspect_synonym', 'unknown', 'SCALAR', %s, %s, %s, %s, %s, "
+                    "          'query aspect miss — map to one of the anchor attrs or NONE', "
+                    "          1, now()) "
+                    "  ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object) "
+                    "  DO UPDATE SET occurrence_count = ontology_evaluations.occurrence_count + 1, "
+                    "    last_seen_at = now(), "
+                    "    re_embedder_decision = COALESCE(EXCLUDED.re_embedder_decision, "
+                    "                                    ontology_evaluations.re_embedder_decision)",
+                    (str(anchor_uuid), aspect_word, (candidate_snapshot or "")[:480],
+                     _ASPECT_SYN_METHOD, decision),
+                )
+            conn.commit()
+    except Exception as _e:
+        log.warning("aspect_synonym.record_miss_failed", aspect=aspect_word,
+                    error=str(_e)[:120])
+
+
 def determine_path(
     query_text: str,
     db,
@@ -31034,6 +31226,62 @@ def determine_path(
                 except Exception as _rag_err:
                     log.warning("determine_path.relational_aspect_grounding_failed",
                                 error=str(_rag_err)[:120])
+
+            # ── ASPECT-SYNONYM GROWTH (inline map-and-grow on a genuine aspect MISS) ────
+            # Fires ONLY when every cheap deterministic lane above (keyword→rel_type alias,
+            # ATTRSCOPE scalar, relational-aspect) resolved NOTHING for this anchor — i.e.
+            # scope is still empty and the query WOULD dump the whole profile — AND the
+            # anchor actually HOLDS scalar attributes to map to. The aspect word is neither
+            # an attribute NAME nor a template word (else ATTRSCOPE caught it), so we ask the
+            # brain ONCE whether it is a lexical synonym of one of the anchor's attributes,
+            # GROW the per-tenant alias on a confident hit, and resolve THIS query in-place.
+            # Once grown, the keyword→rel_type alias lane resolves the word deterministically
+            # on every future query (no model call — the dumb walk). See the engine header.
+            if (_ASPECT_SYNONYM_GROWTH and anchor_resolved_uuid and _aspect_words
+                    and not (path.scalar_rels or path.relationship_rels
+                             or path.taxonomy_groups)):
+                try:
+                    _asp_candidates = _aspect_candidate_attrs(cur, anchor_resolved_uuid)
+                    if _asp_candidates:
+                        _asp_schema = _current_tenant_schema_from_db(db)
+                        _asp_snapshot = ",".join(a for a, _ in _asp_candidates)
+                        # Only genuinely-unresolved words (>=3 chars), not already memoized
+                        # as unmappable, bounded to a few per query.
+                        _asp_todo = [
+                            w for w in sorted(_aspect_words)
+                            if len(w) >= 3
+                            and not _aspect_word_memoized_unmapped(cur, w)
+                        ][:_ASPECT_MAX_INLINE_WORDS]
+                        for _asp_w in _asp_todo:
+                            _attr, _conf, _called = _aspect_map_via_llm(_asp_w, _asp_candidates)
+                            if _attr and _conf >= _ASPECT_SYNONYM_MIN_CONF:
+                                # GROW the per-tenant link (one-time) + resolve THIS query.
+                                _grew = _aspect_grow_link(_asp_w, _attr, _asp_schema)
+                                if _attr not in path.scalar_rels:
+                                    path.scalar_rels.append(_attr)
+                                path.aspect_grown = _attr
+                                log.info("determine_path.aspect_synonym_grown",
+                                         anchor=str(anchor_resolved_uuid)[:8],
+                                         aspect=_asp_w, canonical=_attr,
+                                         confidence=round(_conf, 3), fresh_insert=_grew,
+                                         query=query_text[:50])
+                            elif _called:
+                                # Brain judged NONE → memoize so we never re-ask (no sprawl).
+                                _aspect_record_miss(_asp_schema, anchor_resolved_uuid,
+                                                    _asp_w, _asp_snapshot, "left_unmapped")
+                                log.info("determine_path.aspect_synonym_unmapped",
+                                         aspect=_asp_w, confidence=round(_conf, 3),
+                                         query=query_text[:50])
+                            else:
+                                # Inline call timed out/failed → async backstop grows it so
+                                # the NEXT query is deterministic (belt-and-suspenders).
+                                _aspect_record_miss(_asp_schema, anchor_resolved_uuid,
+                                                    _asp_w, _asp_snapshot, None)
+                                log.info("determine_path.aspect_synonym_deferred_async",
+                                         aspect=_asp_w, query=query_text[:50])
+                except Exception as _asp_err:
+                    log.warning("determine_path.aspect_synonym_failed",
+                                error=str(_asp_err)[:120])
 
             # Match against entity_taxonomies.taxonomy_name — exact match first
             for keyword in keywords:

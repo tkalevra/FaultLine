@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 
 from pydantic import BaseModel
@@ -43,6 +43,15 @@ class EdgeInput(BaseModel):
     # never produce an edge). Threaded into facts/staged_facts.polarity at ingest, exactly like
     # temporal_status/event_date ride their own columns. Mirrors the facts.polarity DEFAULT.
     polarity: str = "affirmed"                     # affirmed | negated
+
+    # PER-EDGE TEMPORAL STATUS OVERRIDE (relocation / past-habitual residence). Normally
+    # temporal_status (now|past|future) is derived at request level from the parsed event_date vs now
+    # (purely date-driven). A GRAMMATICALLY-past residence ("I used to live in London") carries NO
+    # event_date, so the date-driven detector reads it 'now'. A deriver chain that recognizes such a
+    # grammatical past marker sets this override to 'past'; the ingest row-build PREFERS it over the
+    # request-level status. None → the request-level derivation (every normal edge). Mirrors how
+    # polarity/event_date ride their own fields.
+    temporal_status: Optional[str] = None          # now | past | future (per-edge override)
 
 
 class ExtractContext(BaseModel):
@@ -149,6 +158,34 @@ class EpisodicAppendRequest(BaseModel):
     source_ref: Optional[str] = None
     intent: Optional[str] = None
     extracted_fact_count: Optional[int] = None
+
+
+class CortexNoteRequest(BaseModel):
+    """Write an AGENT-CORTEX operational note (the /iremember manual door).
+
+    The cortex is the operating-agent's OWN persistent operational memory — gotchas,
+    failed commands, pitfalls, corrections, how-tos, overruns. A note is NEVER a user
+    fact and is NEVER served as one — it lands in the firewalled ``flagent_<uuid>``
+    schema, source ``agent_manual``, durable. Stance is always "my operational note,"
+    never "you told me."
+    """
+    user_id: str
+    note: str
+    # EVIDENCE (optional) — the artifact that produced this claim: {sha, ref, command, output}.
+    # A note is a CLAIM; a claim with no proof rots into a TRAP that manufactures phantom work.
+    # `sha` makes staleness DECIDABLE (git merge-base --is-ancestor <sha> HEAD), and an evidenced
+    # note outranks an unevidenced one at recall. Optional — a note without it is still recorded.
+    evidence: Optional[Union[dict, str]] = None   # dict, or a JSON string (MCP clients vary)
+    category: Optional[str] = None                  # gotcha|failed_command|pitfall|correction|howto|overrun
+    tags: Optional[list[str]] = None                # triggers/topics the note guards
+    context: Optional[dict] = None                  # optional: {command, fix, file, path, ...}
+
+
+class CortexRecallRequest(BaseModel):
+    """Read AGENT-CORTEX operational notes (the /irecall manual door)."""
+    user_id: str
+    query: Optional[str] = None
+    limit: int = 8
 
 
 class LearnTopicRequest(BaseModel):
@@ -270,6 +307,30 @@ class QueryPath(BaseModel):
     #   (network ⊃ subnets, body ⊃ parts behave identically). Empty for a plain concept/
     #   temporal query → that projection is byte-for-byte unchanged.
     nesting_rels: list[str] = []
+    # hierarchy_intent: True when the QUERY REFERENCE asks for a hierarchy / map / full
+    #   grouping and the walk should DESCEND the containment/membership tree from the
+    #   anchor ("the network hierarchy under dc-toronto", "the org tree from acme",
+    #   "tell me about my family" — a grouping WORD in the query). False for a bare
+    #   single-entity reference ("tell me about core-1"), which returns the anchor's
+    #   TIGHT neighbourhood (own edges + scalars + immediate container + its type) and
+    #   does NOT climb the full type ladder or fan the tree out to siblings.
+    #
+    #   BREADTH is thus reference-determined, NOT a fixed policy for every concrete
+    #   anchor. Set in determine_path from (a) minimal hierarchy/map SURFACE cues and
+    #   (b) a taxonomy resolved by a grouping WORD in the query text. Subject-agnostic
+    #   (names the SHAPE of the answer, never a domain). Consumed by
+    #   fetch_facts_from_anchor to gate the container-seeded descent + the multi-rung
+    #   ladder climb. Default False → a plain query stays tight unless it references a
+    #   hierarchy; user-anchored recall (anchor == user) descends regardless.
+    hierarchy_intent: bool = False
+    # aspect_grown: when the aspect-synonym GROWTH engine (determine_path inline path)
+    #   maps a novel query aspect word to one of the anchor's ACTUAL scalar attributes on
+    #   a MISS ("tall" → height), it (a) writes the per-tenant rel_type_aliases link so
+    #   every future query reads it deterministically (model-free) and (b) resolves THIS
+    #   query in-place by admitting the attribute to scalar_rels. This field carries the
+    #   grown canonical attribute for observability/tests only — None on the steady-state
+    #   (deterministic) path and on a non-grow miss. NOT part of allowed_rels.
+    aspect_grown: Optional[str] = None
 
     @property
     def allowed_rels(self) -> set[str]:
