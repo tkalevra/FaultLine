@@ -31149,6 +31149,18 @@ def determine_path(
             # the anchor's own attributes, so a word that matches nothing the anchor HAS
             # resolves no aspect and the broad fetch-all fallback is preserved.
             _aspect_words = {k for k in keywords if len(k) >= 3}
+            # Placeholder/functor tokens carry no aspect meaning — never a match key.
+            # Hoisted here so BOTH the anchor-stored grounding (ATTRSCOPE, below) and the
+            # scalar-aspect VOCABULARY grounding (VOCABSCOPE, further below) share ONE
+            # template-word stop set (they cannot drift). Second-person template functors
+            # ("your"/"you") are included so a 2p natural_language form never leaks a
+            # functor as an aspect key.
+            _tmpl_stop = {
+                'is', 'are', 'was', 'were', 'be', 'the', 'a', 'an', 'of', 'in',
+                'on', 'to', 'and', 'or', 'has', 'have', 'had', 'his', 'her',
+                'its', 'their', 'this', 'that', 'for', 'with', 'x', 'y', 'z',
+                'your', 'you', 'my', 'our',
+            }
             if anchor_resolved_uuid and _aspect_words:
                 try:
                     cur.execute(
@@ -31159,12 +31171,6 @@ def determine_path(
                         (anchor_resolved_uuid,),
                     )
                     _anchor_attr_rows = cur.fetchall()
-                    # Placeholder/functor tokens carry no aspect meaning — never a match key.
-                    _tmpl_stop = {
-                        'is', 'are', 'was', 'were', 'be', 'the', 'a', 'an', 'of', 'in',
-                        'on', 'to', 'and', 'or', 'has', 'have', 'had', 'his', 'her',
-                        'its', 'their', 'this', 'that', 'for', 'with', 'x', 'y', 'z',
-                    }
                     _admitted_aspect: list[str] = []
                     for _attr, _nl in _anchor_attr_rows:
                         if not _attr:
@@ -31188,6 +31194,73 @@ def determine_path(
                 except Exception as _sag_err:
                     log.warning("determine_path.scalar_aspect_grounding_failed",
                                 error=str(_sag_err)[:120])
+
+            # ── SCALAR-ASPECT VOCABULARY GROUNDING (VOCABSCOPE) ─────────────────────────
+            # ATTRSCOPE (above) grounds an aspect ONLY when the anchor ALREADY stored that
+            # entity_attribute. But a scalar aspect the user NAMES ("what is my gender /
+            # nationality / weight") must bind scope even before a value is stored — else
+            # scope stays inert (scope_active False) and the query falls to the UNSCOPED
+            # fetch-all FIREHOSE (the ~150-line profile dump). Today a bare scalar aspect
+            # binds ONLY by the lucky coincidence that its word EQUALS the rel_type NAME
+            # ("nationality" == the `nationality` rel); the STRUCTURALLY-IDENTICAL question
+            # "what is my gender" firehoses because the word ("gender") != the rel NAME
+            # ("has_gender"). That name-coincidence is the bug: the scalar-aspect VOCABULARY
+            # was never part of scope resolution — only the anchor's already-stored attrs
+            # (ATTRSCOPE) and exact rel-name/alias hits (the keyword loop) were.
+            #
+            # FIX (scope resolution, VOCABULARY twin of ATTRSCOPE): admit a SCALAR rel_type
+            # to path.scalar_rels when a query content-word (len ≥ 3) equals the rel_type
+            # NAME or a whole CONTENT word of its natural_language template ("gender" ∈
+            # "X's gender is Y" → has_gender). Read from the tenant's OWN SCALAR rel
+            # vocabulary (rel_types WHERE 'SCALAR' = ANY(tail_types)), grown per-tenant.
+            #
+            # WHY IT CANNOT LEAK / WIDEN (same boundary ATTRSCOPE relies on):
+            #   • SCALAR-ONLY — an admitted scalar projects entity_attributes on the
+            #     ANCHOR'S OWN values (main.py ~33684); it opens NO relationship edge to
+            #     another entity, so no cross-group leak.
+            #   • NARROWS, never a taxonomy group — we touch path.scalar_rels only, never
+            #     path.taxonomy_groups, so no rel_types_defining_group fan-out. It fires
+            #     _explicit_aspect below → the fuzzy GLiNER2 taxonomy guess is suppressed
+            #     (aspect-precision firewall 398a4fb0).
+            #   • HONEST EMPTY, never a firehose — when the anchor HAS the value it
+            #     surfaces; when it does NOT, the scoped-empty answer stands (scope_active
+            #     stays True). A query naming NO scalar aspect admits nothing → the broad
+            #     fetch-all fallback is preserved unchanged (the regression boundary).
+            # Deterministic (word-boundary tokenisation, no cosine/LLM/substring),
+            # metadata-driven (rel_types.tail_types + natural_language via the tenant
+            # table), subject-agnostic (no attribute/rel/domain literal). Not anchor-gated:
+            # "what is Sarah's nationality" binds the aspect the same way, scoped to Sarah.
+            if _aspect_words:
+                try:
+                    cur.execute(
+                        "SELECT rel_type, natural_language FROM rel_types "
+                        "WHERE 'SCALAR' = ANY(tail_types)"
+                    )
+                    _scalar_vocab_rows = cur.fetchall()
+                    _admitted_vocab: list[str] = []
+                    for _rt, _nl in _scalar_vocab_rows:
+                        if not _rt:
+                            continue
+                        _rt_lc = str(_rt).strip().lower()
+                        if _rt_lc in path.scalar_rels:
+                            continue
+                        _hit = _rt_lc in _aspect_words
+                        if not _hit and _nl:
+                            _nl_tokens = {
+                                _t for _t in re.findall(r'[a-z]+', str(_nl).lower())
+                                if len(_t) >= 3 and _t not in _tmpl_stop
+                            }
+                            _hit = bool(_aspect_words & _nl_tokens)
+                        if _hit:
+                            path.scalar_rels.append(_rt_lc)
+                            _admitted_vocab.append(_rt_lc)
+                    if _admitted_vocab:
+                        log.info("determine_path.scalar_aspect_vocabulary_grounding",
+                                 admitted=_admitted_vocab[:8],
+                                 query=query_text[:50])
+                except Exception as _sv_err:
+                    log.warning("determine_path.scalar_aspect_vocabulary_failed",
+                                error=str(_sv_err)[:120])
 
             # ── RELATIONAL-ASPECT ANCHOR GROUNDING (relationship under/over-scope fix) ──
             # The scalar sibling above (ATTRSCOPE) narrows a SCALAR-attribute question to
