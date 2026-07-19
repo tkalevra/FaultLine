@@ -7958,7 +7958,10 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
                           AND promoted_at IS NULL
                         RETURNING id
                         """,
-                        (_SYSTEM_ALIASES,),
+                        # psycopg2 adapts a Python list as a PostgreSQL ARRAY[...] (what
+                        # ANY() needs); a tuple adapts as a row constructor ('a','b',...)
+                        # → "op ANY/ALL (array) requires array on right side". Pass a list.
+                        (list(_SYSTEM_ALIASES),),
                     )
                     deleted_ids = [r[0] for r in cur.fetchall()]
                 db.commit()
