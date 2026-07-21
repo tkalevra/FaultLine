@@ -28264,6 +28264,89 @@ def _query_scoped_to_absent_concept(query_text: str, db, user_id: str,
         return False
 
 
+# Functor / interrogative stop set for the possessive-self-scalar head match below.
+# Mirrors determine_path's ATTRSCOPE `_tmpl_stop` (functors) plus the query-NLU
+# interrogative scaffolding ("how"/"what"/"long"/…) so a query token set and an
+# attribute-name token set are reduced to their CONTENT constituents the same way.
+_SELF_SCALAR_STOP = frozenset({
+    "is", "are", "was", "were", "be", "the", "a", "an", "of", "in", "on", "to",
+    "and", "or", "has", "have", "had", "his", "her", "its", "their", "this",
+    "that", "for", "with", "your", "you", "my", "our", "how", "what", "who",
+    "when", "where", "do", "does", "did", "long", "much", "tell", "show",
+    "about", "me", "i", "mine",
+})
+
+
+def _self_scalar_content_tokens(text: str) -> set[str]:
+    """Content tokens of a query/attribute-name: [a-z]+ runs, len>=3, functors dropped."""
+    return {t for t in re.findall(r"[a-z]+", (text or "").lower())
+            if len(t) >= 3 and t not in _SELF_SCALAR_STOP}
+
+
+def _attr_head_token(attr: str) -> str | None:
+    """RIGHTMOST content constituent of a (possibly compound) attribute NAME — its HEAD
+    under Williams (1981)'s Right-hand Head Rule for English compounds ("daily_commute"
+    → commute, "new_internet_plan" → plan, "take_on" → take). None when the name is all
+    functors. Deterministic word-boundary tokenisation; no cosine/LLM/word-zoo.
+    """
+    seq = [t for t in re.findall(r"[a-z]+", (attr or "").lower())
+           if len(t) >= 3 and t not in _SELF_SCALAR_STOP]
+    return seq[-1] if seq else None
+
+
+def _possessive_self_scalar_anchor(
+    query_text: str, user_scalar_attrs: list[str], is_dative: bool
+) -> bool:
+    """DETERMINISTIC anchor decision: does a FIRST-PERSON POSSESSIVE query ("my <NP>")
+    name one of the USER's OWN scalar aspects, so the anchor should be the USER (letting
+    the ATTRSCOPE scalar lane surface that attribute) rather than an owned/fragment
+    ENTITY that shadows it?
+
+    WHY THIS EXISTS: the n-gram anchor resolver (Rule 3) is longest-match-wins, so a
+    trailing goal/purpose PP that got entity-ised ("my daily commute TO WORK" → a barren
+    'daily commute to work' entity the user merely owns) HIJACKS the anchor away from the
+    user's own ``daily_commute`` scalar — the walk from that dead-end entity is empty and
+    recall returns "No relevant facts found", even though "what is my daily commute" HITS
+    the same scalar. This routes such a query back to the user so ATTRSCOPE surfaces it.
+
+    Fires ONLY when ALL hold (each gate is what keeps it from over-firing):
+      • the query is a first-person possessive ("my"/"mine" present) and NOT a dative
+        ("tell me about …") — the self-reference gate;
+      • NO apostrophe-possessive chain token ("brother's") is present — a chain aspect may
+        belong to ANOTHER entity ("my brother's height"), which this must NOT swallow;
+      • a user SCALAR attribute's HEAD token (Right-hand Head Rule) appears among the
+        query's content tokens — the SAME head match ATTRSCOPE uses, so a lone generic
+        MODIFIER ("my DAILY mood" vs daily_commute; "my NEW job title" vs new_internet_plan)
+        never fires (a modifier is never the head).
+
+    Subject-agnostic (heads come from the query + the user's stored attribute names only,
+    no domain/rel literal), deterministic (exact token-set match, no cosine/ILIKE/LLM).
+    Fail-safe: any miss → False (Rule 3 runs unchanged).
+    """
+    if is_dative or not query_text or not user_scalar_attrs:
+        return False
+    try:
+        _ql = query_text.lower()
+        _words = {w.strip(".,!?;:").replace("'", "").replace("’", "")
+                  for w in _ql.split()}
+        # First-person possessive gate.
+        if not ({"my", "mine"} & _words):
+            return False
+        # Apostrophe-possessive CHAIN → the aspect may belong to another entity; decline.
+        if re.search(r"\b\w+['’]s\b", _ql):
+            return False
+        _qtokens = _self_scalar_content_tokens(query_text)
+        if not _qtokens:
+            return False
+        for _attr in user_scalar_attrs:
+            _head = _attr_head_token(_attr)
+            if _head and _head in _qtokens:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def resolve_anchor(
     query_text: str,
     conversation_history: list[ConversationMessage],
@@ -28388,6 +28471,35 @@ def resolve_anchor(
                                      possessive=word, term=next_word, anchor=_syn_anchor)
                             _mark("synonym")
                             return _syn_anchor
+
+        # Rule 2.5: POSSESSIVE SELF-SCALAR head-match anchor (Right-hand Head Rule).
+        # A first-person possessive query naming one of the USER's OWN scalar aspects
+        # ("how long is my daily commute to work" → user.daily_commute) must anchor the
+        # USER so the ATTRSCOPE scalar lane surfaces it — BEFORE Rule 3's longest-match
+        # n-gram grabs an owned/fragment ENTITY that merely shares the surface (the barren
+        # "daily commute to work" entity → dead-end walk → "No relevant facts found").
+        # Gated hard (possessive + no dative + no apostrophe chain + user-scalar HEAD in
+        # query) so it fires only for a genuine own-aspect ask; a generic modifier or a
+        # "my X's Y" chain never trips it. Deterministic, subject-agnostic, fail-safe.
+        if not _is_dative:
+            _ql_words = set(query_lower.replace("'", " ").replace("’", " ").split())
+            if {"my", "mine"} & _ql_words:
+                try:
+                    with db.cursor() as _sc:
+                        _sc.execute(
+                            "SELECT attribute FROM entity_attributes WHERE entity_id = %s",
+                            (user_id,),
+                        )
+                        _uattrs = [r[0] for r in _sc.fetchall() if r and r[0]]
+                    if _uattrs and _possessive_self_scalar_anchor(
+                            query_text, _uattrs, _is_dative):
+                        log.info("resolve_anchor.possessive_self_scalar",
+                                 query=query_text[:50], anchor=user_id)
+                        _mark("self_scalar")
+                        return user_id
+                except Exception as _sse:
+                    log.warning("resolve_anchor.self_scalar_failed",
+                                error=str(_sse)[:120])
 
         # Rule 3: N-gram entity resolution (longest match wins)
         # Handles multi-word entities: "prime minister", "house of commons", etc.
