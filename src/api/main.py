@@ -7,7 +7,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from functools import lru_cache, wraps
+from functools import wraps
 from time import time as time_now
 from typing import Optional, Union
 import httpx
@@ -19,19 +19,25 @@ from src.api.logging_config import set_log_level, get_log_level, LogLevel, log_c
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry
 from src.entity_registry.entity_type_cache import initialize_entity_type_cache, get_entity_type_cache
-# OBSERVED DISPLAY CASE (migration 214): resolves the casing this request's verbatim turn showed
-# for a lowercase alias, or None. Used by the two /ingest alias writers that bypass
-# EntityRegistry.register_alias. See src/extraction/display_case.py.
-from src.extraction.display_case import display_form_for as _display_form_for
 from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
+from src.api.qdrant_partition import (
+    resolve_partition as qp_resolve_partition,
+    require_tenant as qp_require_tenant,
+    apply_tenant_filter as qp_apply_tenant_filter,
+    build_delete_body as qp_build_delete_body,
+    resolve_point_id as qp_resolve_point_id,
+    stamp_tenant as qp_stamp_tenant,
+    qdrant_headers as qp_qdrant_headers,
+)
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
 from src.api import rel_type_overlay
 from src.api import taxonomy_overlay
 from src.api import temporal_pattern_overlay
 from src.api import linguistic_cue_overlay
-from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, ConversationMessage, QueryPath, QueryResponse
+from src.api import cortex as _cortex  # Agent Cortex — firewalled agent operational memory, fail-safe
+from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, DocumentEnqueueRequest, ConversationMessage, QueryPath, QueryResponse, CortexNoteRequest, CortexRecallRequest
 from .llm_client import get_llm_headers, build_llm_payload, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from .llm_calls import call_llm_with_retry_sync, call_llm_no_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
 from .idempotency import IdempotencyManager
@@ -487,7 +493,7 @@ def _detect_naming_states(text: str) -> list[dict]:
 def _detect_named_instance_states(text: str) -> list[dict]:
     r"""Deterministic NAMED-INSTANCE copula+appositive detector (the "Rex/poodle" seam).
 
-    Captures "My dog Rex is a poodle." / "My cat Mittens is a tabby." / "My car Betsy is a
+    Captures "My dog Rex is a poodle." / "My cat Whiskers is a tabby." / "My car Betsy is a
     Subaru." — the appositive-name + copula type-predication construction the live LLM relation
     extractor (/extract/rewrite) drops (returns []) and the GLiNER2 lane only half-captures
     ("my dog" → owns dog), losing the named instance, its type, and the type→kind rung.
@@ -605,6 +611,30 @@ def _acquisition_lane_edges(text: str, iso: str | None, gran: str | None) -> lis
         out.append(_owns)
         log.info("acquisition_lane.owns", device=_device[:48],
                  date=iso, location=(_acq.location or "")[:32])
+        # DATED ACQUISITION EVENT (symmetry with the matrix-verb case). A PLAIN acquisition
+        # ("I bought a camera two months ago") is lifted by the spine deriver's SVO as
+        # ``(user, buy, camera)`` — an EVENT-class verb edge the ordering render treats as a
+        # dated occurrence. But a RELATIVE-CLAUSE acquisition ("mastering my lens that I got a
+        # month ago") has the acquisition verb BURIED in the relcl, so the deriver's SVO lifts the
+        # MATRIX verb ("master") instead and NO dated acquisition event is minted — leaving only
+        # the stative ``owns`` (which the temporal-event ordering render EXCLUDES, temporal_class
+        # != 'event'). So the "which happened first, A or B" operator has no orderable event for
+        # this operand. Mint the SAME verb-lemma event edge the deriver would have — ``(user,
+        # <acq-verb>, <device>)`` carrying the peeled acquisition date, user_stated to match the
+        # deriver's SVO provenance — so the relcl acquisition is orderable exactly like the matrix
+        # one. Gated on ``via_relcl`` so a plain matrix acquisition (already event-covered by the
+        # deriver) is NOT double-emitted. Subject-agnostic (the verb lemma is whatever the DB-grown
+        # acquisition-verb class matched), deterministic, no rel/word hardcoding. THE HARD LINE:
+        # the DATE is the event_date SCALAR on this edge; the device stays the acquired Object.
+        if getattr(_acq, "via_relcl", False) and (_acq.verb or "").strip():
+            _evt = {"subject": "user", "rel_type": (_acq.verb or "").strip().lower(),
+                    "object": _device, "fact_provenance": "user_stated"}
+            if iso:
+                _evt["event_date"] = iso
+                _evt["event_date_granularity"] = gran or "day"
+            out.append(_evt)
+            log.info("acquisition_lane.event", device=_device[:48],
+                     verb=(_acq.verb or "")[:24], date=iso)
         # ALIAS: the appositive proper name ("Dell XPS 13") → also_known_as of the device so
         # the comparison operand resolves by either surface. NAMING layer, never L4.
         _alias = (_acq.alias or "").strip()
@@ -621,6 +651,49 @@ def _acquisition_lane_edges(text: str, iso: str | None, gran: str | None) -> lis
     # FIRED (even if the device was too short to keep an edge): the caller must SUPPRESS its
     # occurrence lane for this clause — an acquisition is NOT a participated_in event, and the only
     # thing the occurrence lane would mint here is the bogus locative-as-event.
+    return out
+
+
+def _encounter_companion_edges(ev, iso, gran, seen_handles: set) -> list[dict]:
+    r"""Emit ``(user, met, <co-participant>)`` DATED encounter edges for a social activity's
+    COMITATIVE ``with``-PP co-participant(s) — the person-event ordering keystone.
+
+    "I had lunch WITH Boris on Jan 5", "a meeting WITH Sarah last Tuesday", "a lovely conversation
+    WITH a jam maker two weeks ago": the comitative ``with``-PP marks a SOCIAL co-participant of the
+    event (comitative case; Stanford "Event Extraction as Dependency Parsing", dmcc-acl-2011). The
+    occurrence itself reifies at its bland type ("lunch"/"meeting"); the co-participant would
+    otherwise land only on an UNDATED companion (also_known_as title / related_to), so a
+    "who did I meet first, A or B" ordering — which scopes by the PERSON operand — finds NO dated edge
+    for them. This lane files the person as ``(user, met, <person>)`` carrying the occurrence's
+    ``event_date``, MIRRORING the clean-SVO ``(user, met, <person>)@date`` that a plain "I met a
+    tourist" already produces — so the operand becomes a dated, comparison-reachable Allen point-event
+    the existing min/max operator (``_apply_get_first_last``) can order.
+
+    ``ev.companions`` is populated at the deriver (``_build_event_analysis``) ONLY for a genuine social
+    activity — a possessed inanimate device-issue ("an issue WITH my car's GPS system") carries NO
+    companion (it is the ``has_state`` affected thing, not a co-participant). ``met`` is the seeded
+    canonical symmetric social-encounter rel (looked up by SEMANTICS, not a hardcoded validation
+    check). Deduped by a ``met``-keyed handle across clauses. Subject-agnostic, deterministic,
+    fail-safe → ``[]``."""
+    out: list[dict] = []
+    try:
+        for _comp in (getattr(ev, "companions", ()) or ()):
+            _c = (_comp or "").strip().lower()
+            if not _c or len(_c) < 2:
+                continue
+            _handle = "met:" + _c
+            if _handle in seen_handles:
+                continue
+            seen_handles.add(_handle)
+            _edge = {"subject": "user", "rel_type": "met", "object": _c,
+                     "fact_provenance": "user_stated"}
+            if iso:
+                _edge["event_date"] = iso
+                _edge["event_date_granularity"] = gran or "day"
+            out.append(_edge)
+            log.info("event_states.comitative_encounter", person=_c[:48], date=iso)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest on the encounter lane
+        log.warning("encounter_companion_edges.failed", error=str(e)[:120])
     return out
 
 
@@ -714,16 +787,30 @@ def _detect_event_states(text: str, reference=None) -> list[dict]:
         if not _evs:
             _inch = analyze_inchoative(_es_text)
             _evs = [_inch] if _inch is not None else []
+        # TITLED-WORK FALLBACK (cluster A3): a telic completive engagement with a QUOTED named work
+        # ("finished reading 'The Hate U Give'", "started watching 'Game of Thrones'"). Outside the LVC
+        # class + a quoted-PROPN object → both lanes above miss it. Reify each titled work as its own
+        # occurrence so a "which FIRST" / "how long" query has a dated operand. Only when the prior
+        # lanes produced nothing. Grammatical (quoted-title object + 1st-person governing subject via
+        # subject control), NO verb/domain word-list. Legacy-path parity with the reified seam.
+        if not _evs:
+            from src.extraction.linguistics import analyze_titled_work_occurrences as _atw
+            _evs = _atw(_es_text)
     except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest
         log.warning("detect_event_states.failed", error=str(e)[:120])
         return []
     _seen_events: set[str] = set()
+    _seen_handles_es: set[str] = set()
     for ev in _evs:
         if ev is None or ev.negated:
             continue
         event = (ev.event or "").strip().lower()
         if not event or len(event) < 3:
             continue
+        # COMITATIVE SOCIAL ENCOUNTER (legacy-fast-path parity with the reified seam): emit
+        # (user, met, <with-PP co-participant>)@date so a "who did I meet first" ordering reaches the
+        # person operand. Additive; deduped by a met-keyed handle. See _encounter_companion_edges.
+        out.extend(_encounter_companion_edges(ev, _es_iso, _es_gran, _seen_handles_es))
         _backbone = {"subject": "user", "rel_type": "participated_in", "object": event,
                      "fact_provenance": "user_stated"}
         if _es_iso:
@@ -1524,6 +1611,7 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
     try:
         from src.extraction.linguistics import (
             analyze_events, extract_event_date_and_residue as _peel_date, linguistics_available,
+            segment_finite_clauses as _segment_clauses,
         )
         if not linguistics_available():
             return []
@@ -1532,6 +1620,45 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
     except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest
         log.warning("detect_event_states_reified.setup_failed", error=str(e)[:120])
         return []
+
+    # ── DATE-BLEED GUARD: per-clause date SCOPING via the dependency parse ────────────────────────
+    # ``decompose`` splits SENTENCES, so a COMPOUND turn ("I ordered her gift on June 8th and her
+    # birthday party is on June 15th", "I bought the shoes on Jan 18 and noticed the lace broke on
+    # Feb 1") arrives as ONE clause. The per-clause peel below binds only the FIRST date to EVERY
+    # occurrence in the clause, so the second event inherits the first event's date (date-bleed) and
+    # the elapsed/ordering math misses. Re-segment such a clause into its finite/coordinated
+    # sub-clauses (each date attaches to its GOVERNING predicate via the parse — Zhang & Xue temporal
+    # dependency, arXiv:1809.00370 — NOT linear proximity) so each event gets ITS OWN clause's date.
+    #
+    # GATED to genuine bleed (behavior-preserving): a clause is only re-segmented when the parse
+    # yields ≥2 segment heads AND ≥2 of the resulting sub-clauses independently resolve DISTINCT
+    # dates. A single-date clause, a date-less coordination ("I like pizza and pasta"), or any
+    # segment that does not cleanly separate two dates is left WHOLE (today's behavior). Deterministic,
+    # subject-agnostic (parser + dateparser, no word list), fail-safe → the original clause on error.
+    if reference is not None:
+        _scoped: list[str] = []
+        for _clause in clauses:
+            try:
+                _subs = _segment_clauses(_clause)
+            except Exception:  # noqa: BLE001 — segmentation miss → keep the whole clause
+                _subs = [_clause]
+            if len(_subs) >= 2:
+                _sub_dates: set[str] = set()
+                for _sub in _subs:
+                    try:
+                        _sd, _sg, _sr = _peel_date(_sub, reference)
+                    except Exception:  # noqa: BLE001
+                        _sd = None
+                    if _sd:
+                        _sub_dates.add(_sd)
+                if len(_sub_dates) >= 2:
+                    log.info("detect_event_states_reified.date_bleed_split",
+                             clause=(_clause or "")[:64], subclauses=len(_subs),
+                             distinct_dates=len(_sub_dates))
+                    _scoped.extend(_subs)
+                    continue
+            _scoped.append(_clause)
+        clauses = _scoped or clauses
 
     out: list[dict] = []
     seen_handles: set[str] = set()
@@ -1607,6 +1734,20 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
                 from src.extraction.linguistics import analyze_inchoative as _analyze_inchoative
                 _inch = _analyze_inchoative(_residue)
                 _evs = [_inch] if _inch is not None else []
+            # TITLED-WORK FALLBACK (cluster A3): "I finished reading 'The Hate U Give'", "I started
+            # watching 'Game of Thrones'", "I've been reading 'The Nightingale'" — a TELIC completive
+            # engagement with a QUOTED, bounded named work. The verb is outside the LVC class and its
+            # object is a quoted PROPN (not an eventive noun), so both lanes above miss it and the
+            # titled work never becomes a dated occurrence for a "which FIRST" / "how long" query to
+            # order/measure. Reify each titled work as its own occurrence (verb lemma = activity type,
+            # quoted run = name), carrying THIS clause's peeled date. Only when the LVC + inchoative
+            # lanes produced nothing (no double-capture of an LVC titled event). Grammatical (quoted-
+            # title object + 1st-person governing subject via subject control), NO verb/domain list.
+            if not _evs:
+                from src.extraction.linguistics import (
+                    analyze_titled_work_occurrences as _analyze_titled_work,
+                )
+                _evs = _analyze_titled_work(_residue)
         except Exception:  # noqa: BLE001 — per-clause fail-safe
             _evs = []
         for ev in _evs:
@@ -1615,6 +1756,14 @@ def _detect_event_states_reified(text: str, reference) -> list[dict]:
             event = (ev.event or "").strip().lower()
             if not event or len(event) < 3:
                 continue
+            # COMITATIVE SOCIAL ENCOUNTER (person-event ordering keystone): the with-PP co-participant
+            # of this social activity ("meeting/lunch/conversation WITH <person>") is someone the user
+            # MET at this dated occurrence — emit (user, met, <person>)@THIS-clause-date so the person
+            # is a DATED operand a "who did I meet first, A or B" ordering can compare. Fires once per
+            # ev, INDEPENDENT of which occurrence-shape branch runs below; deduped by a met-keyed
+            # handle. Gated at the deriver to social activities only (a possessed device-issue carries
+            # NO companion). Subject-agnostic, deterministic, additive (never suppresses the occurrence).
+            out.extend(_encounter_companion_edges(ev, c_iso, c_gran, seen_handles))
             title = (ev.title or "").strip() or None
             if title and title.lower() == event:
                 title = None
@@ -2659,7 +2808,6 @@ async def _classify_value_subject_residue(text: str, edges: list[dict], user_id:
     _unresolved = [
         _av for _av in _atomic
         if _av["value"].strip().lower() not in _existing_objects
-        and not _atomic_claim_is_run_fragment(_av["value"], _existing_objects)
     ]
     if not _unresolved:
         return []
@@ -2734,7 +2882,7 @@ _NEGATION_PATTERNS_CACHE: list = []
 _PREFERENCE_PATTERNS_CACHE: list = []
 
 # ── CORRECTION BYPASS GATE (pre-GLiNER2) ──────────────────────────────────────
-# DESIGN (Alexander 2026-06-14): a correction is a BYPASS GATE, not a post-hoc
+# DESIGN (Christopher 2026-06-14): a correction is a BYPASS GATE, not a post-hoc
 # supersede. GLiNER2 stays PURE and good at its strengths (QUERY vs STATEMENT, entity
 # typing/matching) — it is NEVER asked to judge negation it is bad at. When confident the
 # intent is a fix/omission — LLM-driven, hinged on the validated postgres cache — we SKIP
@@ -2800,12 +2948,31 @@ def _get_graph_rels() -> frozenset:
         )
     return frozenset()
 
-def _get_hierarchy_rels() -> frozenset:
+def _get_hierarchy_rels(db_conn=None) -> frozenset:
     """
     Return all hierarchy relationship types (is_hierarchy_rel=true).
     Queries DB directly to include novel rel_types approved by re_embedder.
     Falls back to cache if DB unreachable.
+
+    PER-TENANT (subject-agnostic gap fix): when ``db_conn`` is supplied, read
+    ``rel_types`` under the CALLER's already-bound search_path (the per-tenant
+    schema), so a TENANT-GROWN composition hierarchy rel (e.g. a networking
+    ``mounted_in``/``contains`` minted by ``/expand``, is_hierarchy_rel=true but
+    absent from the ``public`` seed) is VISIBLE to the deterministic walk. Without a
+    conn this opens its OWN connection with the default (public) search_path — the
+    legacy behaviour — so every existing call site is byte-for-byte unchanged and a
+    grown-rel-agnostic caller still gets the seed set. Mirrors
+    ``_get_classification_rels(db_conn)``. Fail-safe: any error → cache/empty.
     """
+    if db_conn is not None:
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rel_type FROM rel_types WHERE is_hierarchy_rel = true"
+                )
+                return frozenset(row[0] for row in cur.fetchall())
+        except Exception as e:
+            log.warning("hierarchy_rels.tenant_query_failed", error=str(e), using_fallback=True)
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
         try:
@@ -3055,6 +3222,70 @@ _CLASSIFICATION_QUERY_CUES = (
     "what species", "what breed", "is a", "classify", "categor",
 )
 
+# ── HIERARCHY / MAP REFERENCE cues (breadth is REFERENCE-determined) ─────────────
+# A query that REFERENCES a hierarchy / map / full grouping ("the network hierarchy
+# under X", "the org tree from Y", "everything under Z", "the layout of W") asks the
+# deterministic walk to DESCEND the containment/membership tree from the anchor. A bare
+# single-entity reference ("tell me about core-1") does NOT — it wants the entity's own
+# TIGHT neighbourhood (its edges + scalars + immediate container + its type). These are
+# minimal SURFACE cues in the same style as _CLASSIFICATION_QUERY_CUES — the SHAPE of the
+# answer (a tree / map / everything-under / descent-from), never a subject or rel name.
+# NOT a domain/keyword zoo: no "networking"/"biology"/rel-type literals, so the signal is
+# subject-agnostic (it fires identically for a datacentre, an org chart, or a taxonomy).
+_HIERARCHY_QUERY_CUES = (
+    "hierarchy", "topology", "map of", "org chart", "orgchart", "tree",
+    "structure of", "breakdown", "layout of", "everything under",
+    "everything in", "all under", "under ", "beneath ", "nested", "descend",
+)
+
+
+def _query_has_hierarchy_intent(query_text: str) -> bool:
+    """True iff the query REFERENCES a hierarchy/map/full-grouping SHAPE — i.e. it asks
+    the walk to descend the containment/membership tree from the anchor rather than
+    return the anchor's tight neighbourhood.
+
+    Minimal surface-cue detector (mirror of the _CLASSIFICATION_QUERY_CUES style):
+    structure-shape words + descent prepositions. Subject-agnostic — no domain/rel
+    literals. Fail-safe: falsy query → False (stay tight)."""
+    if not query_text:
+        return False
+    q = query_text.lower()
+    return any(cue in q for cue in _HIERARCHY_QUERY_CUES)
+
+
+def _query_references_grouping(query_text: str, db) -> bool:
+    """True iff the query REFERENCES a hierarchy/map/grouping and should DESCEND.
+
+    Two subject-agnostic signals, resolved from the query REFERENCE (not the anchor's
+    incidental structure):
+      (a) a minimal hierarchy/map SURFACE cue (``_query_has_hierarchy_intent``), or
+      (b) a GROUPING WORD in the query text that NAMES a taxonomy — i.e. the query itself
+          utters a group name ("tell me about my FAMILY / my PETS / my WORK"). The group
+          names are read from the per-tenant ``entity_taxonomies`` table (metadata-driven,
+          no in-code group/domain list), so a grown grouping is recognised too.
+
+    This distinguishes a grouping REFERENCE from a taxonomy merely INFERRED from the
+    anchor's incidental rels (e.g. a person's ``member_of`` maps to a "household" taxonomy
+    the user never uttered) — the latter must stay TIGHT. Fail-safe: any DB error →
+    the surface-cue result only (never raises)."""
+    if _query_has_hierarchy_intent(query_text):
+        return True
+    if not query_text or db is None:
+        return False
+    q = query_text.lower()
+    try:
+        with db.cursor() as _c:
+            _c.execute("SELECT taxonomy_name FROM entity_taxonomies")
+            for (_name,) in _c.fetchall():
+                if not _name:
+                    continue
+                _n = _name.lower()
+                if _n in q or _n.replace("_", " ") in q:
+                    return True
+    except Exception:
+        pass
+    return False
+
 
 def _rel_is_classification(rel_type: str, classification_rels: frozenset) -> bool:
     """True iff rel_type is on the CLASSIFICATION axis (is_hierarchy_rel, P31/P279:
@@ -3089,6 +3320,58 @@ def _member_fact_passes_axis(
     # classification axis (or anything else): keep all (the classification chain is the
     # answer; membership edges merely connect the walk).
     return True
+
+
+def _is_user_anchored_topic_classification(anchor_uuid, user_id, path) -> bool:
+    """True when a classification question about a TOPIC grouping fell back to anchor=USER.
+
+    "What is espresso a type of?" — the topic word is a taxonomy, so resolve_anchor
+    declines to anchor on it (taxonomy words anchor the user, so "what is my family"
+    works) and the anchor defaults to the user. The classification SUBJECT is the topic
+    (in `path.taxonomy_groups`, handled by the named-group branch that returns its is-a
+    ladder), NOT the user — so the user's OWN is-a chain must not be re-admitted (it would
+    seed Step 3c's downward fan-out over `person` → the user's whole family). Fires ONLY
+    when the anchor IS the user AND a taxonomy scope resolved; a NON-user anchor
+    ("what is router-1") and scopeless classification return False. Subject-agnostic."""
+    return bool(anchor_uuid == user_id and getattr(path, "taxonomy_groups", None))
+
+
+def _group_edge_is_outward_to_user(
+    subject_id: str, object_id: str, group_id: str, user_id: str
+) -> bool:
+    """True when a group-node edge's NON-group endpoint is the querying user.
+
+    Bounds the named-group grown-grouping walk: an /expand TOPIC is commonly anchored to
+    the user via an interest/ownership edge (`chris has_interest_in espresso`). That edge
+    is the OUTWARD link — surfacing it injects the user node into the result set and the
+    downstream /query expansions (Step 3c `_anchor_connected` fan-out, the traversed-scalar
+    read) then cascade into the user's UNRELATED personal profile (occupation, family,
+    address). The user is the SUBJECT asking, never a STRUCTURAL member of a topic
+    grouping; their interest in the topic is a PERSONAL fact for a self-anchored query.
+    Cut it here. Subject-agnostic (identity only, no rel literal)."""
+    other = object_id if subject_id == group_id else subject_id
+    return bool(user_id) and other == user_id
+
+
+def _untyped_grouping_member_admitted(fact: dict) -> bool:
+    """Taxonomy node-gate — the `not _signals` (NO resolved type) branch (audit site #1).
+
+    A foreign entity that resolves to NO type signal is admitted iff it is a user
+    correction (Class A / user_stated) OR it was reached from the anchor via the
+    grouping's OWN defining rels (``_grouping_reachable`` — a GROWN member by
+    construction: staged-B, ``entity_type='unknown'``, its ``instance_of`` ladder still
+    unpromoted). This is the fix for the reported user-anchored `/expand` grouping
+    ``members=0``.
+
+    LOAD-BEARING SEPARATION: this rule governs ONLY the no-type-signal branch. The
+    typed-MISMATCH drop (audit site #5 / RC2 `fatty member_of you`, milestone 398a4fb0)
+    lives in the sibling `else` branch and is NOT touched here — an entity that HAS a
+    type signal never reaches this rule, so the fuzzy-taxonomy firewall is intact.
+    Subject-agnostic (no rel/domain literal).
+    """
+    fc = (fact.get("fact_class") or "").upper()
+    prov = (fact.get("fact_provenance") or (fact.get("provenance") or "")).lower()
+    return fc == "A" or prov == "user_stated" or bool(fact.get("_grouping_reachable"))
 
 
 def _resolve_query_axis(path: "QueryPath", query_text: str, db) -> Optional[str]:
@@ -3376,7 +3659,7 @@ def get_user_schema_context(user_id: str, db) -> dict:
     Returns:
         {
             "user_id": user_id,
-            "schema_name": "faultline_example",  # from users.slug
+            "schema_name": "faultline_christopher",  # from users.slug
             "status": "ready"
         }
 
@@ -3632,7 +3915,8 @@ def _retraction_semantic_fallback(
     """
     try:
         qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-        collection = derive_collection(user_id)
+        collection, _tflt = qp_resolve_partition(user_id, "memory")
+        qp_require_tenant(_tflt, op="search", collection=collection)
 
         # SF-1: Embed the retraction text (QUERY side → nomic search_query prefix)
         embedding = embed_text(
@@ -3651,13 +3935,14 @@ def _retraction_semantic_fallback(
         try:
             qdrant_response = httpx.post(
                 f"{qdrant_url}/collections/{collection}/points/query",
-                json={
+                json=qp_apply_tenant_filter({
                     "query": {"nearest": embedding},
                     "score_threshold": 0.35,
                     "limit": 8,
                     "with_payload": True,
                     "with_vectors": False,
-                },
+                }, _tflt),
+                headers=qp_qdrant_headers(),
                 timeout=10.0,
             )
         except Exception as _qe:
@@ -4623,106 +4908,9 @@ def _seed_structural_flags(db, rel_type: str) -> dict | None:
             return None
         return dict(zip(_SEED_STRUCTURAL_FIELDS, row))
     except Exception as e:
-        log_crit(log, "ontology.seed_structural_flags_read_failed",
+        log_crit("ontology.seed_structural_flags_read_failed",
                  rel_type=rt, error=str(e)[:160])
         return None
-
-
-# ── FUNCTION-WORD REL_TYPE GUARD (growth refuses a closed-class relation name) ────────────────────
-# MEASURED DEFECT: an edge carrying ``rel_type="not"`` was accepted by /ingest, MINTED into the
-# tenant's ``rel_types`` (``source='engine'``, ``engine_generated=true``) and committed as a Class-A
-# fact ``(aurora, not, dog)`` stored with ``polarity='affirmed'``. A NEGATION PARTICLE had become a
-# permanent ontology entry, and the assertion it encoded was stored as its own opposite. Any tenant
-# whose extractor emits a stray function word accretes that junk rel_type forever.
-#
-# THE RULE, and why it is grammar rather than a word list: a RELATION NAME must be predicative — it
-# has to denote something. Universal Dependencies splits the POS inventory into an OPEN (content /
-# lexical) class — ADJ, ADV, NOUN, PROPN, VERB — and a CLOSED (function / grammatical) class — ADP,
-# AUX, CCONJ, DET, NUM, PART, PRON, SCONJ (UD v2, "POS tags"; the open/closed distinction is the
-# inventory's own top-level organising principle). A candidate whose tokens are ALL closed-class
-# carries no predicate at all: ``not``, ``is``, ``of``, ``and``, ``that`` name nothing that could be
-# a relation. INTJ is excluded from the admitted set for the same reason: UD defines an interjection
-# as an element that "does not have grammatical relations to other words", which is precisely what a
-# rel_type must have. NUM/X stay admitted (fail toward capture on anything unanalysable).
-#
-# SAFETY — this can only ever refuse a rel_type the system does not already know. The caller applies
-# it ONLY where ``_rel_meta()`` fails to resolve, so a seeded or already-grown rel is NEVER
-# evaluated, let alone dropped. On the dev line this was verified by measurement across every
-# ``rel_types`` row in every tenant schema on the box (216 distinct rel_types): exactly two are
-# all-closed-class — ``not`` (the junk this guard exists to stop) and ``is_a``, which is
-# ``source='builtin'`` in the public seed and is therefore resolved by ``_rel_meta`` and never
-# reaches the guard.
-#
-# HONEST RESIDUAL: ``never`` tags ADV and ``none`` tags NOUN, so a rel_type by either name would
-# still be admitted. Both are genuinely open-class under UD, and tightening past the grammar would
-# mean the negation word-list this repo forbids. Stated, not papered over.
-#
-# FAIL-SAFE: flag OFF, spaCy unavailable, an empty parse, or ANY error → False (admit), i.e.
-# byte-identical to today's behaviour.
-REL_TYPE_FUNCTION_WORD_GUARD: bool = os.environ.get(
-    "REL_TYPE_FUNCTION_WORD_GUARD", "true").strip().lower() not in ("0", "false", "no")
-
-# UD open/content classes admitted as a relation name (INTJ deliberately absent — see above).
-_REL_TYPE_CONTENT_POS = frozenset({"ADJ", "ADV", "NOUN", "PROPN", "VERB", "NUM", "X"})
-
-
-@lru_cache(maxsize=2048)
-def _rel_type_is_function_word_only(rel_type: str) -> bool:
-    """True iff EVERY token of ``rel_type`` is a closed-class (function) word — i.e. the candidate
-    names no predicate and must not become an ontology entry. Grammar-driven (UD open/closed POS),
-    subject-agnostic, NO word list. Fail-safe: any failure → False (admit)."""
-    if not REL_TYPE_FUNCTION_WORD_GUARD:
-        return False
-    rt = (rel_type or "").strip().lower()
-    if not rt:
-        return False
-    try:
-        from src.extraction.linguistics import (
-            _parse as _ling_parse,
-            linguistics_available as _ling_ok,
-        )
-        if not _ling_ok():
-            return False
-        doc = _ling_parse(rt.replace("_", " "))
-        if doc is None:
-            return False
-        toks = [t for t in doc if not t.is_punct and not t.is_space]
-        if not toks:
-            return False
-        return not any(t.pos_ in _REL_TYPE_CONTENT_POS for t in toks)
-    except Exception:  # noqa: BLE001 — fail-safe: never let a parse failure sink a capture
-        return False
-
-
-def _drop_function_word_rel_edges(edges: list) -> list:
-    """Drop edges whose rel_type is an UNKNOWN, all-closed-class candidate.
-
-    Applied at the single point where the turn's edge set is finalised, so it covers BOTH ingest
-    lanes (the ``/extract/rewrite`` LLM relations and the caller-supplied ``req.edges`` the spine
-    posts). An edge whose rel_type the overlay ALREADY resolves is never examined — the guard
-    constrains ONLY ontology GROWTH, never established metadata. Logs every drop (fail loud);
-    returns the kept edges."""
-    if not REL_TYPE_FUNCTION_WORD_GUARD or not edges:
-        return edges
-    kept = []
-    for _e in edges:
-        _rt = (getattr(_e, "rel_type", "") or "").strip().lower()
-        # An ALREADY-KNOWN rel_type is authoritative metadata — never second-guess it here.
-        if not _rt or _rel_meta(_rt):
-            kept.append(_e)
-            continue
-        if _rel_type_is_function_word_only(_rt):
-            log_crit(log,
-                     "ingest.function_word_rel_type_rejected",
-                     rel_type=_rt[:40],
-                     subject=str(getattr(_e, "subject", ""))[:40],
-                     object=str(getattr(_e, "object", ""))[:40],
-                     reason=("candidate rel_type is entirely closed-class (function) words — it "
-                             "names no predicate; refusing to mint it into the ontology or store a "
-                             "fact under it. See _rel_type_is_function_word_only (UD open/closed POS)."))
-            continue
-        kept.append(_e)
-    return kept
 
 
 def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: float,
@@ -4740,18 +4928,6 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
         rt_lower = (rel_type or "").lower().strip()
         if not rt_lower:
             log.warning("ingest.create_rel_type_in_flow.empty_rel_type")
-            return False
-        # FUNCTION-WORD REL_TYPE GUARD, at the MINT itself. The /ingest edge filter already refuses
-        # these before they reach here, but this function is ALSO called by the /expand (learn) lane,
-        # which never passes through that filter. Guarding the mint makes the invariant hold for
-        # EVERY growth path: a closed-class candidate never becomes an ontology row. Returning False
-        # is the existing "mint failed" contract every caller already handles non-fatally.
-        if _rel_type_is_function_word_only(rt_lower):
-            log_crit(log,
-                     "ontology.function_word_rel_type_mint_refused",
-                     rel_type=rt_lower[:40], source=source,
-                     reason=("candidate rel_type is entirely closed-class (function) words — it "
-                             "names no predicate. See _rel_type_is_function_word_only."))
             return False
 
         norm = metadata or {}
@@ -4780,8 +4956,17 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
                         rel_type=rt_lower, value=natural_language_2p,
                         reason="missing_Y_or_has_X — dropping 2p form")
             natural_language_2p = None
-        # is_hierarchy_rel is structural — infer from the rel_type name (metadata-driven heuristic).
-        is_hierarchy = _infer_hierarchy_from_rel_type(rt_lower)
+        # is_hierarchy_rel is structural — infer from the rel_type name (metadata-driven heuristic),
+        # UNLESS the caller supplied an EXPLICIT is_hierarchy_rel in metadata. The explicit flag is
+        # for a DELIBERATE structural classification the caller made (e.g. /expand identifying a
+        # domain's CONTAINMENT/composition relation as a walkable tree axis) that a name-only
+        # heuristic can't see — subject-agnostic (the caller's structural decision, not a rel-name
+        # literal). A SEEDED rel still overrides both below (authority: user > seed > growth).
+        _explicit_hier = norm.get("is_hierarchy_rel")
+        is_hierarchy = (
+            bool(_explicit_hier) if _explicit_hier is not None
+            else _infer_hierarchy_from_rel_type(rt_lower)
+        )
         label = rt_lower.replace("_", " ").title()
         fact_class = "B"
 
@@ -4958,15 +5143,6 @@ def _insert_novel_rel_type(db, rel_type: str, confidence: float,
         if not rt_lower:
             log.warning("insert_novel_rel_type: empty rel_type provided")
             return False
-        # FUNCTION-WORD REL_TYPE GUARD — the heuristic sibling of _create_rel_type_in_flow's mint.
-        # Both mint seams are covered so no growth path can register a closed-class relation name.
-        if _rel_type_is_function_word_only(rt_lower):
-            log_crit(log,
-                     "ontology.function_word_rel_type_mint_refused",
-                     rel_type=rt_lower[:40], source=source,
-                     reason=("candidate rel_type is entirely closed-class (function) words — it "
-                             "names no predicate. See _rel_type_is_function_word_only."))
-            return False
 
         # Layer placement: taxonomy-driven (subject-agnostic, hierarchy-aware), not the
         # keyword zoo. This call site mints with no typed entity pair (head/tail default to
@@ -5081,7 +5257,7 @@ def _extract_identity(text: str) -> str | None:
 
     LOOSE ON INPUT (CLAUDE.md "dumb registry / smart query"): registration accepts
     the captured candidate RAW. We do NOT gate on capitalization here — a legitimate
-    lowercase "my name is alex" must register, and a loose candidate like "worried"
+    lowercase "my name is chris" must register, and a loose candidate like "worried"
     is allowed to land as just-another alias (hundreds of also_known_as cost nothing;
     they all hang off the one user). Discernment about whether a stored alias is junk
     happens ONLY at READ time, when the user's name is surfaced (see the owner-identity
@@ -5118,7 +5294,7 @@ def _extract_preferred_name(text: str) -> str | None:
 
     LOOSE ON INPUT, same as _extract_identity: registration accepts the captured
     candidate RAW (no capitalization gate), so a lowercase explicit "I prefer to be
-    called alex" registers, and a loose candidate like "worried" is allowed to land
+    called chris" registers, and a loose candidate like "worried" is allowed to land
     as a preferred alias. The smart filtering — refusing to SURFACE a junk preferred
     name as the user's display name — happens at READ time in /query. The only ingest
     guard kept is the single-character length floor (a bare initial is not a name).
@@ -5145,13 +5321,13 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
     GLiNER2 returns: {
         "relation_extraction": {
             "spouse": [("ada", "user")],
-            "instance_of": [("theo", "person")],
+            "instance_of": [("des", "person")],
         }
     }
 
     Convert to: [
         {"subject": "ada", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
-        {"subject": "theo", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
+        {"subject": "des", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
     ]
 
     Severance #4 (Phase 1): carry subject_type/object_type on each edge, sourced from the
@@ -6694,6 +6870,7 @@ def _queue_concept_for_grounding(
     subject_id: str,
     first_text_snippet: str | None = None,
     subject_display: str | None = None,
+    user_id: str | None = None,
 ) -> bool:
     """Queue a NOVEL CONCEPT-OBJECT for the background 'what is X?' is-a grounding.
 
@@ -6745,8 +6922,14 @@ def _queue_concept_for_grounding(
     concept = (concept_display or "").strip()
     if not concept or not concept_object_id:
         return False
-    # The object must NOT be the user/anchor or the subject itself.
-    if concept_object_id in (subject_id, "user"):
+    # The object must NOT be the user/anchor or the subject itself. THE HARD LINE: the user anchor
+    # is the grounded self (a NAMED INSTANCE, never a type) — recognize it BY IDENTITY
+    # (concept_object_id == user_id, the tenant anchor UUID), not just the literal "user" surface.
+    # A relational edge whose OBJECT is the user (e.g. pre-directionality `(priya, related_to, user)`)
+    # would otherwise queue the anchor's UUID as a "novel concept", and the what-is climb then mints
+    # `(user, subclass_of, role)`. `_attach_to_seeded_backbone` already guards the anchor this way;
+    # this mirrors it. Subject-agnostic: user_id is the runtime anchor, not a hardcoded subject.
+    if concept_object_id in (subject_id, "user") or (user_id and concept_object_id == user_id):
         return False
     try:
         with db_conn.cursor() as _cur:
@@ -7187,7 +7370,7 @@ def _immediate_sync_class_c_staged(db_conn, user_id: str, limit: int = 50) -> in
             fresh = cur.fetchall()
         if not fresh:
             return 0
-        collection = derive_collection(user_id)
+        collection, _ = qp_resolve_partition(user_id, "memory")
         ensure_collection(collection, qdrant_url)
         for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in fresh:
             text = f"{sf_subj} {sf_rel} {sf_obj}"
@@ -7247,7 +7430,7 @@ def get_gliner_model():
 # The gate's own call is preserved as belt-and-suspenders for the non-MCP path.
 
 # Generic ontology-token entity names — subjects that appear in inverted rows
-# (e.g. "person instance_of alexander").  These should never be subjects of
+# (e.g. "person instance_of christopher").  These should never be subjects of
 # hierarchy facts; rows where they ARE the subject are deleted.
 # Mirrors WGMValidationGate._SYSTEM_ENTITY_NAMES.
 _SYSTEM_ENTITY_NAMES: frozenset = frozenset({
@@ -7384,19 +7567,17 @@ def _purge_conflicting_staged_hierarchy_facts(
     if deleted_ids and user_id:
         try:
             _qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-            collection = derive_collection(user_id)
+            collection, _tflt = qp_resolve_partition(user_id, "memory")
+            qp_require_tenant(_tflt, op="delete", collection=collection)
             # Filtered delete (new points with source_table payload field)
             for _did in deleted_ids:
                 _http_client_sync.post(
                     f"{_qdrant_url}/collections/{collection}/points/delete",
-                    json={
-                        "filter": {
-                            "must": [
-                                {"key": "source_table", "match": {"value": "staged_facts"}},
-                                {"key": "fact_id",     "match": {"value": _did}},
-                            ]
-                        }
-                    },
+                    json=qp_build_delete_body(_tflt, must=[
+                        {"key": "source_table", "match": {"value": "staged_facts"}},
+                        {"key": "fact_id",     "match": {"value": _did}},
+                    ]),
+                    headers=qp_qdrant_headers(),
                     timeout=5.0,
                 )
             # Fallback by derived point ID (new (source_table, fact_id) scheme). Legacy
@@ -7405,7 +7586,10 @@ def _purge_conflicting_staged_hierarchy_facts(
             # takes no body kwarg (json/content), so the call must POST to /points/delete.
             _http_client_sync.post(
                 f"{_qdrant_url}/collections/{collection}/points/delete",
-                json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
+                json=qp_build_delete_body(_tflt, point_ids=[
+                    qp_resolve_point_id(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
+                ]),
+                headers=qp_qdrant_headers(),
                 timeout=5.0,
             )
             log.info(
@@ -8472,6 +8656,97 @@ def _collect_descendant_layered_facts(
     _visited: set[str] = set(_seeds)
     frontier: list[str] = list(_seeds)
     _depth = max(1, int(depth_cap))
+
+    def _collect_own(_did):
+        """Collect ONE entity's OWN outbound state/relationship facts + scalars into ``out``,
+        under the SAME membership-axis + concept-scope projection the BFS descent applies.
+
+        Factored out of the BFS loop so it can ALSO run for the pre-visited SEEDS (see the
+        up-front loop below). A seed that is ALSO the genuine part_of/member_of descendant of
+        another seed (user owns car AND owns gps; gps part_of car) is subtracted by
+        ``_next -= _visited`` and would otherwise NEVER have its own state/scalar edges
+        collected — silently dropping e.g. ``(gps, has_state, issue)``. Deterministic: real
+        edges only, unchanged SQL/axis/scope; no new literal, no fuzzy match."""
+        cur.execute(
+            "SELECT subject_id, object_id, rel_type, confidence, fact_class, event_date"
+            "  FROM facts"
+            " WHERE subject_id = %s"
+            "   AND superseded_at IS NULL"
+            "   AND archived_at IS NULL AND deleted_at IS NULL"
+            " UNION ALL"
+            " SELECT subject_id, object_id, rel_type, confidence, fact_class, event_date"
+            "  FROM staged_facts"
+            " WHERE subject_id = %s"
+            "   AND promoted_at IS NULL AND deleted_at IS NULL",
+            (_did, _did),
+        )
+        for row in cur.fetchall():
+            _rel = (row[2] or "").lower()
+            # MEMBERSHIP axis: drop the descendant's classification chain
+            # ("gps instance_of device") — a different question than its state.
+            if not _member_fact_passes_axis(_rel, query_axis, classification_rels):
+                continue
+            # Concept-scope projection: when a concrete scope is active, admit the
+            # descended fact iff its rel is in scope OR it is the descent edge itself
+            # OR it is a dated EVENT/STATE edge of the reached descendant
+            # (``has_state``/``feels`` — admitted on its own temporal tier, NOT by
+            # taxonomy). Off-scope non-descent/non-state rels are dropped (no bleed).
+            if _scope is not None:
+                _admit = (
+                    _rel in _scope
+                    or _rel in _descent
+                    or _rel in _state_rels
+                )
+                if not _admit:
+                    continue
+            out.append({
+                "subject": row[0],
+                "object": row[1],
+                "rel_type": _rel,
+                "confidence": float(row[3]) if row[3] else 0.8,
+                "fact_class": row[4] or "B",
+                "source": "db",
+                "category": _get_rel_type_category(_rel),
+                "event_date": row[5].isoformat() if row[5] else None,
+                "_hierarchy_admitted": True,
+            })
+        # ── the entity's scalars (firmware version, age, ip, …) ──
+        cur.execute(
+            "SELECT entity_id, attribute, value_text, value_int, value_float, value_date"
+            "  FROM entity_attributes WHERE entity_id = %s",
+            (_did,),
+        )
+        for row in cur.fetchall():
+            _val = row[2]
+            if _val is None and row[3] is not None:
+                _val = str(row[3])
+            if _val is None and row[4] is not None:
+                _val = str(row[4])
+            if _val is None and row[5] is not None:
+                _val = str(row[5])
+            if _val is not None:
+                out.append({
+                    "subject": row[0],
+                    "rel_type": row[1],
+                    "object": _val,
+                    "confidence": 1.0,
+                    "fact_class": "A",
+                    "source": "attributes",
+                    "category": _get_rel_type_category(row[1]),
+                    "valid_from": None,
+                    "valid_until": None,
+                    "_hierarchy_admitted": True,
+                })
+
+    # SEED PRE-COLLECTION (the seed/visited-collision fix): the seeds are pre-marked _visited
+    # for cycle-safety, so the BFS collection below never runs for them. Collect each NON-ANCHOR
+    # seed's own facts up-front. Anchor EXCLUDED — the caller already fetched the anchor's direct
+    # facts. Seeds stay in _visited (no re-collection in the loop → no double-emit; dedup on
+    # (subject,rel,object) covers residual).
+    for _sid in (seed_entities or set()):
+        if _sid and _sid != anchor_uuid:
+            _collect_own(_sid)
+
     try:
         while frontier and _depth > 0:
             # Direct descendants of the frontier: (descendant, descent_rel, parent) — the
@@ -8495,84 +8770,7 @@ def _collect_descendant_layered_facts(
                 break
             for _did in _next:
                 _visited.add(_did)
-                # ── the descended entity's OWN outbound facts (its states / relationships) ──
-                # Both tables: the descended has_state edge is staged-B until promotion.
-                cur.execute(
-                    "SELECT subject_id, object_id, rel_type, confidence, fact_class, event_date"
-                    "  FROM facts"
-                    " WHERE subject_id = %s"
-                    "   AND superseded_at IS NULL"
-                    "   AND archived_at IS NULL AND deleted_at IS NULL"
-                    " UNION ALL"
-                    " SELECT subject_id, object_id, rel_type, confidence, fact_class, event_date"
-                    "  FROM staged_facts"
-                    " WHERE subject_id = %s"
-                    "   AND promoted_at IS NULL AND deleted_at IS NULL",
-                    (_did, _did),
-                )
-                for row in cur.fetchall():
-                    _rel = (row[2] or "").lower()
-                    # MEMBERSHIP axis: drop the descendant's classification chain
-                    # ("gps instance_of device") — a different question than its state.
-                    if not _member_fact_passes_axis(_rel, query_axis, classification_rels):
-                        continue
-                    # Concept-scope projection: when a concrete scope is active, admit the
-                    # descended fact iff its rel is in scope OR it is the descent edge itself
-                    # (already walked) OR it is a dated EVENT/STATE edge of the reached
-                    # descendant (``has_state``/``feels`` — the grounded "what happened"
-                    # layer the walk descended to find, admitted on its own temporal tier,
-                    # NOT by taxonomy; see _get_event_state_rels). A descended relationship
-                    # that is off-scope AND not a descent/state edge is dropped (no scope
-                    # bleed). Scalars are handled below (always pass — the leaf data).
-                    if _scope is not None:
-                        _admit = (
-                            _rel in _scope
-                            or _rel in _descent
-                            or _rel in _state_rels
-                        )
-                        if not _admit:
-                            continue
-                    out.append({
-                        "subject": row[0],
-                        "object": row[1],
-                        "rel_type": _rel,
-                        "confidence": float(row[3]) if row[3] else 0.8,
-                        "fact_class": row[4] or "B",
-                        "source": "db",
-                        "category": _get_rel_type_category(_rel),
-                        "event_date": row[5].isoformat() if row[5] else None,
-                        # Proven via the deterministic composition/membership descent —
-                        # exempt from the membership/taxonomy projection (axis still applied
-                        # above). Confidence gating still applies downstream.
-                        "_hierarchy_admitted": True,
-                    })
-                # ── the descended entity's scalars (firmware version, age, ip, …) ──
-                cur.execute(
-                    "SELECT entity_id, attribute, value_text, value_int, value_float, value_date"
-                    "  FROM entity_attributes WHERE entity_id = %s",
-                    (_did,),
-                )
-                for row in cur.fetchall():
-                    _val = row[2]
-                    if _val is None and row[3] is not None:
-                        _val = str(row[3])
-                    if _val is None and row[4] is not None:
-                        _val = str(row[4])
-                    if _val is None and row[5] is not None:
-                        _val = str(row[5])
-                    if _val is not None:
-                        out.append({
-                            "subject": row[0],
-                            "rel_type": row[1],
-                            "object": _val,
-                            "confidence": 1.0,
-                            "fact_class": "A",
-                            "source": "attributes",
-                            "category": _get_rel_type_category(row[1]),
-                            "valid_from": None,
-                            "valid_until": None,
-                            "_hierarchy_admitted": True,
-                        })
+                _collect_own(_did)
             frontier = list(_next)
             _depth -= 1
     except Exception as e:
@@ -8778,6 +8976,46 @@ def _hierarchy_expand(
         return {entity_id}
 
 
+# ── THE HARD LINE — provenance firewall on the recall WALK ───────────────────
+# A MEMORY = what the user told you (a user-subject grounded fact / a grounded leaf
+# instance). The engine-GROWN L4 type ladder (subclass_of type→type rungs; is-a rows
+# minted by /expand, what-is classification, the classify-climb, and hierarchy
+# reconciliation) is the PLACE to FILE and WALK a memory — never a memory itself. The
+# grown ladder is WALKED to reach a grounded leaf, but its type nodes (dog→canine→mammal,
+# pla→filament) must NOT be RETURNED to convert_to_prose as "your memory."
+#
+# Provenances minted by the growth engine — never by a user statement. Subject-agnostic
+# (keyed on PROVENANCE, never a domain/type literal).
+_ENGINE_GROWN_PROVENANCES: frozenset[str] = frozenset({
+    "llm_learn", "llm_learned",           # /expand self-growth
+    "engine_whatis_classify",             # what-is classification (subclass_of C)
+    "engine_classify_climb",              # classify-ladder climb (subclass_of B)
+    "hierarchy_reconciliation",           # re_embedder is-a reconciliation
+})
+
+
+def _is_grown_ontology_row(rel_type, provenance) -> bool:
+    """True when a WALKED hierarchy row is engine-GROWN ontology (the PLACE), which the walk
+    may traverse but must NOT return as the user's memory (THE HARD LINE).
+
+    A row is grown-ontology when EITHER:
+      • its provenance is engine-minted (llm_learn/llm_learned, engine_*,
+        hierarchy_reconciliation) — grown by the engine, never stated by the user; OR
+      • it is a bare type→type ``subclass_of`` edge — the grown class ladder
+        (dog→canine→mammal, pla→filament) is STRUCTURE, never user content.
+
+    User-grounded leaf rows (user_stated ``instance_of``/``has_pet``/``part_of``/``owns`` …)
+    are NOT grown-ontology and are returned normally — so a leaf reached THROUGH the ladder
+    (my family → pets → Fraggle) still surfaces. Deterministic; no domain literals.
+    """
+    _prov = (provenance or "").strip().lower()
+    if _prov in _ENGINE_GROWN_PROVENANCES or _prov.startswith("engine_"):
+        return True
+    if (rel_type or "").strip().lower() == "subclass_of":
+        return True
+    return False
+
+
 # ── dprompt-59: Semantic Conflict Detection ──────────────────────────────────
 # Detects when new facts contradict existing graph structure and auto-resolves.
 # The graph IS the source of truth — hierarchy/type relationships define what
@@ -8801,7 +9039,7 @@ _SCALAR_REL_TYPES_CACHE: set[str] = set()
 # System / ontology entity names that must never be written as personal facts into
 # a user schema.  These appear as subjects/objects of LLM-generated hierarchy edges
 # (e.g. /expand FaultLine) and, if allowed through, surface as garbled query results
-# ("alex is a subclass of theo").  frozenset gives O(1) membership tests.
+# ("chris is a subclass of des").  frozenset gives O(1) membership tests.
 # Primary guard — entity_type ('Concept'/'Object') is the metadata-driven secondary guard
 # applied in learn_topic() alongside this name list.
 _SYSTEM_ENTITY_NAMES: frozenset[str] = frozenset({
@@ -9638,11 +9876,6 @@ QUERY_MIN_CONFIDENCE = float(os.environ.get("QUERY_MIN_CONFIDENCE", "0.35"))
 # never breaks.
 VECTOR_CLASS_C_ONLY = os.environ.get("VECTOR_CLASS_C_ONLY", "true").strip().lower() not in ("false", "0", "no")
 
-# User-memory vector lane retirement (ratified 2026-07-31). When OFF (default), /query stops
-# reading Class-C user memory from Qdrant (C surfaces from staged_facts in Postgres instead) and
-# the re-embedder stops writing it. Default OFF = retirement active (the ratified direction).
-USER_MEMORY_VECTOR_LANE = os.environ.get("USER_MEMORY_VECTOR_LANE", "false").strip().lower() not in ("false", "0", "no")
-
 # When the deterministic typed multi-hop walk DEFERS (no authoritative A/B answer for a
 # decomposable chain), fall through to the legacy scope path so the Class-C / Qdrant
 # short-term backstop still runs, instead of returning empty immediately. A/B authority
@@ -10116,6 +10349,102 @@ def _spacy_cue_route(text: str) -> tuple:
     return (None, None)
 
 
+def _is_source_goal_transition_statement(text: str) -> bool:
+    """Deterministic PRE-GLiNER2 guard: a declarative source→goal TRANSITION
+    ("I switched from Python to Rust", "She moved from Toronto to Berlin") is a
+    narrated STATEMENT, NOT a correction.
+
+    GLiNER2's CORRECTION label ("replacing a previously stated value with a
+    different one") mis-scores the "<subject> <verb> from A to B" construction at
+    high confidence ("I switched from Python to Rust" → CORRECTION@0.96, "I
+    upgraded my laptop from an old model to a MacBook" → CORRECTION@1.00), so
+    remember_facts diverted the whole statement to the retract/correct path and
+    stored NOTHING. The spaCy correction cue does NOT fire here (no negation, no
+    repair marker, verb ∉ {mean, correct}), so nothing routed it to STATEMENT and
+    GLiNER2's mis-read won.
+
+    Grammar only, subject-agnostic (NO verb/domain word-list): a VERB ROOT with an
+    EXPLICIT subject that is NOT 2nd-person "you" (a declarative — an imperative
+    "change it from A to B" correction directive has no overt subject / a "you"
+    subject and is EXCLUDED) whose clause carries BOTH a "from"-source prep AND a
+    "to"-goal prep. A genuine repair is still owned by the correction dual-gate
+    ABOVE (it runs first): if a contrastive negation / repair marker / "I meant" /
+    cessation / delete-imperative cue is present, this guard returns False and
+    defers. Fail-safe: layer unavailable / parse miss / any error → False (fall
+    through to GLiNER2, never a silent drop).
+    """
+    try:
+        from src.extraction.linguistics import (
+            _parse as _ling_parse,
+            analyze_directive,
+            is_interrogative_clause as _is_interro,
+            linguistics_available as _ling_ok,
+        )
+        if not _ling_ok():
+            return False
+        # A real question is never a narrated transition — leave it for GLiNER2.
+        if _is_interro(text) is True:
+            return False
+        doc = _ling_parse(text)
+        if doc is None:
+            return False
+        roots = [t for t in doc if t.dep_ == "ROOT" and t.pos_ == "VERB"]
+        if not roots:
+            return False
+        root = roots[0]
+        # Declarative gate: an EXPLICIT subject that is not a 2nd-person pronoun.
+        # An imperative correction directive ("Change X from A to B") has no overt
+        # nsubj → excluded; a "you"-addressed directive ("You change X from A to B")
+        # carries a 2nd-person pronoun subject → excluded. Both leave a real
+        # correction to the dual-gate / GLiNER2, never here. 2nd-person is detected
+        # by MORPHOLOGY (Person=2 ∧ PronType=Prs), NOT a token literal — mirrors the
+        # grammatical self-detection in _is_first_person_personal_pronoun (the deleted
+        # _SELF_SUBJECT_LEMMAS token list, f7d6995; subject-agnostic hard rule).
+        # spaCy en_core_web_sm reliably tags "you" PRON/Prs/Person=2 (verified).
+        subs = [c for c in root.children if c.dep_ in ("nsubj", "nsubjpass")]
+        if not subs:
+            return False
+
+        def _is_second_person_pronoun(tok) -> bool:
+            morph = tok.morph
+            return (
+                tok.pos_ == "PRON"
+                and "Prs" in morph.get("PronType")
+                and morph.get("Person") == ["2"]
+            )
+
+        if any(_is_second_person_pronoun(s) for s in subs):
+            return False
+        # Source→goal shape: BOTH a "from"-source prep AND a "to"-goal prep in the
+        # clause (a plain goal-only "I went to the store" carries only "to" → not a
+        # transition). Grammar, not a word-list.
+        prep_lemmas = {
+            (t.lemma_ or t.text or "").strip().lower()
+            for t in doc if t.dep_ == "prep"
+        }
+        if not ({"from", "to"} <= prep_lemmas):
+            return False
+        # Defer to the correction dual-gate for any genuine repair cue (belt-and-
+        # suspenders — that gate already ran, but never route a real correction to
+        # STATEMENT here). Reuses the SAME closed cue inventories as _spacy_cue_route.
+        d = analyze_directive(text)
+        if d is not None:
+            if d.has_contrastive_negation:
+                return False
+            if d.clause_initial_markers & _CORRECTION_MARKER_LEMMAS:
+                return False
+            if d.root_verb_lemma in _CORRECTION_VERB_LEMMAS and d.root_subject_is_self:
+                return False
+            if (d.imperative_root_lemma in _RETRACTION_CUE_LEMMAS
+                    and not d.imperative_root_negated):
+                return False
+            if d.cessation_advmod_lemmas & _CESSATION_ADVMOD_LEMMAS:
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — fail-safe: never block GLiNER2 on a parse miss
+        return False
+
+
 def _pin_scalar_attribute_to_known(cur, entity_id: str, corrected_attr: str,
                                    dsn: str = None, schema: str = None) -> str:
     """User-is-truth: a correction rectifies a KNOWN thing, so PIN the corrected scalar
@@ -10290,35 +10619,6 @@ async def lifespan(app: FastAPI):
 
     # dprompt-41: validate startup config (fail fast)
     _validate_startup_config()
-
-    # FOSS control plane: apply the persisted LLM Brain override (written by the
-    # webui) BEFORE the chat URL is resolved, so a config saved from the console
-    # is authoritative across restarts. Idempotent + fail-safe.
-    try:
-        from src.api.dashboard import apply_persisted_llm_override
-        apply_persisted_llm_override()
-    except Exception as e:  # noqa: BLE001 — must never block startup
-        log.warning("startup.llm_override_apply_failed", error=str(e)[:160])
-
-    # FOSS control plane: ensure an operator bearer exists. If FAULTLINE_ADMIN_TOKEN
-    # is unset, mint a random one for this process and log it ONCE (the webui's login
-    # help documents this first-boot behaviour). Operators who want a known token set
-    # it in .env / the compose environment block.
-    if not (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip():
-        import secrets as _secrets
-        os.environ["FAULTLINE_ADMIN_TOKEN"] = _secrets.token_urlsafe(32)
-        log.info("startup.admin_token_auto_minted",
-                 token=os.environ["FAULTLINE_ADMIN_TOKEN"])
-        print(
-            "====================================================================\n"
-            "FAULTLINE_ADMIN_TOKEN (auto-generated for this instance):\n"
-            f"  {os.environ['FAULTLINE_ADMIN_TOKEN']}\n"
-            "Paste this into the control-plane webui sign-in. To pin a known\n"
-            "token, set FAULTLINE_ADMIN_TOKEN in the environment and restart.\n"
-            "====================================================================",
-            flush=True,
-        )
-
     _LLM_URL = _get_llm_url()
 
     # Initialize persistent HTTP clients for pooled connections
@@ -10396,6 +10696,40 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_provisioning_reaper_worker())
     log.info("startup.provisioning_reaper_started")
+
+    # SELF-SERVE RETENTION reaper + operator digest (migration 179) — SAAS_MODE ONLY.
+    # Individuals are not kept beyond a grace window past the free trial (privacy). This loop
+    # runs one retention SWEEP (DRY-RUN by default — deletes NOTHING unless the operator armed
+    # SAAS_RETENTION_PURGE_ENABLED) and fires the time-cadenced operator digest when due. The whole
+    # loop is a no-op when SaaS is off (it never imports the saas.* modules in that case).
+    async def _retention_worker():
+        try:
+            from saas.config import saas_mode_enabled as _saas_on
+        except Exception:
+            return
+        if not _saas_on():
+            return
+        # Poll interval: default 6h (retention is a daily-grain policy; sub-hour precision is
+        # pointless). Env-overridable for tests / tuning.
+        interval = int(os.environ.get("SAAS_RETENTION_POLL_SECONDS", str(6 * 60 * 60)))
+        log.info("startup.retention_worker_started", poll_seconds=interval)
+        while True:
+            try:
+                from saas import retention as _retention
+                from saas import retention_report as _retention_report
+                summary = _retention.run_reaper()   # DRY-RUN unless armed by env
+                if summary.get("candidates"):
+                    log.info("retention_sweep",
+                             armed=summary.get("armed"),
+                             candidates=summary.get("candidates"),
+                             purged=len(summary.get("purged", [])),
+                             would_purge=len(summary.get("would_purge", [])))
+                _retention_report.maybe_send_auto_report()   # fires only when the day cadence is due
+            except Exception as e:
+                log.error("retention_worker_error", error=str(e))
+            await asyncio.sleep(interval)
+
+    asyncio.create_task(_retention_worker())
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
@@ -11170,7 +11504,66 @@ async def _enqueue_reembedder_event(
         return False
 
 
-app = FastAPI(title="FaultLine WGM", lifespan=lifespan)
+def _saas_mode_enabled() -> bool:
+    """SAAS_MODE gate — pure env read (mirrors saas.config._truthy). Imports NOTHING, so a
+    public deployment with no saas/ dir and SAAS_MODE off is byte-for-byte unchanged."""
+    return str(os.environ.get("SAAS_MODE") or "").strip().lower() not in ("", "false", "0", "no", "off")
+
+
+async def _saas_bind_tenant_brain(request: Request):
+    """SHARED backend request seam (Gap-B): bind THIS request's tenant BYO engine-brain so every
+    backend LLM call within the request (extraction, /learn, correction extraction, enrichment,
+    …) resolves to the tenant's own configured seat brain instead of the process-global env brain.
+
+    A global FastAPI dependency (NOT BaseHTTPMiddleware): reading the body in a dependency reuses
+    FastAPI's cached ``request._body``, so the endpoint's own body model still parses (the
+    body-consumption hang that plagues BaseHTTPMiddleware does not apply here).
+
+    PRIVATE-SAFE + SAAS-gated: when SAAS_MODE is off this is a pure no-op (no body read, no import,
+    byte-for-byte today's behavior). All account/DB logic lives in ``saas.llm_context`` and is
+    LAZILY imported INSIDE the gate, so a public deployment (no saas/ dir) never imports it.
+    """
+    if not _saas_mode_enabled():
+        yield
+        return
+    token = None
+    try:
+        # Resolve the tenant user uuid the backend already folds into requests: prefer an
+        # explicit query param, else the JSON body's user_id. Body is read defensively and
+        # never re-raised; FastAPI's cache makes the downstream model parse the same bytes.
+        user_id = request.query_params.get("user_id")
+        if not user_id:
+            try:
+                raw = await request.body()
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        uid = data.get("user_id")
+                        if uid:
+                            user_id = str(uid)
+            except Exception:
+                user_id = None
+        if user_id:
+            from saas.llm_context import bind_request_brain
+            token = bind_request_brain(user_id)
+    except Exception:
+        token = None
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                from saas.llm_context import reset_llm_config
+                reset_llm_config(token)
+            except Exception:
+                pass
+
+
+app = FastAPI(
+    title="FaultLine WGM",
+    lifespan=lifespan,
+    dependencies=[Depends(_saas_bind_tenant_brain)],
+)
 
 
 @app.post("/internal/refresh-intent-pattern-caches")
@@ -11307,75 +11700,6 @@ async def refresh_intent_pattern_caches(request: Request):
 
 
 # ── Surgical Fact Correction Helper ──────────────────────────────────────────
-def _recover_alnum_identifier_in_text(source: str, fragment: str) -> str:
-    """Recover the FULL alphanumeric identifier when an LLM extraction returned only a
-    FRAGMENT of it. The correction/rewrite LLM routinely truncates out-of-distribution
-    identifiers ("X9K 8Z7" → "x9", "AB-1234" → "ab"); this finds ``fragment`` in the
-    source statement and expands to the maximal whitespace-separated alphanumeric run
-    containing it, when that run carries a digit (the identifier signal).
-
-    Subject-agnostic and structural — a digit-bearing token run, never a domain pattern.
-    Conservative: returns ``fragment`` UNCHANGED unless a strictly longer digit-bearing
-    run is recovered, so a correct extraction is never altered and word values
-    ("dark blue", "negative" — no digit) are never touched.
-    """
-    if not source or not fragment:
-        return fragment
-    frag = fragment.strip()
-    # the fragment must be a purely-alphanumeric token (a shard of an identifier)
-    if not frag or not re.fullmatch(r'[A-Za-z0-9]+', frag):
-        return fragment
-    m = re.search(re.escape(frag), source, re.IGNORECASE)
-    if not m:
-        return fragment
-    # alnum words with positions
-    words = [(wm.start(), wm.end(), wm.group()) for wm in re.finditer(r'[A-Za-z0-9]+', source)]
-    # locate the word containing the fragment match
-    idx = next((i for i, (s, e, _w) in enumerate(words) if s <= m.start() < e), None)
-    if idx is None:
-        return fragment
-    # only recover when the fragment anchors at the word's LEFT edge or is the whole word
-    # (LLM truncation is left-anchored; a mid-word substring match is almost certainly spurious)
-    containing = words[idx][2]
-    if not (containing.lower() == frag.lower() or containing.lower().startswith(frag.lower())):
-        return fragment
-
-    def _is_ident_word(w: str) -> bool:
-        # a token that can be part of an identifier: digit-bearing, OR a short non-lowercase
-        # fragment of the kind identifiers are made of (mirrors _is_ident_fragment)
-        return any(c.isdigit() for c in w) or (len(w) <= 3 and w != w.lower())
-
-    # gate: the fragment must sit in an identifier-shaped word (digit-bearing or a short
-    # non-lowercase code token in the SOURCE), or itself carry a digit — otherwise a plain
-    # word like "is"/"a" matching inside prose would spuriously extend into a nearby number
-    if not (_is_ident_word(containing) or any(c.isdigit() for c in frag)):
-        return fragment
-
-    lo = hi = idx
-    # extend right through whitespace-only gaps to adjacent identifier words
-    j = idx
-    while j + 1 < len(words):
-        gap = source[words[j][1]:words[j + 1][0]]
-        if gap.strip() == '' and _is_ident_word(words[j + 1][2]):
-            hi = j + 1
-            j += 1
-        else:
-            break
-    # extend left
-    j = idx
-    while j - 1 >= 0:
-        gap = source[words[j - 1][1]:words[j][0]]
-        if gap.strip() == '' and _is_ident_word(words[j - 1][2]):
-            lo = j - 1
-            j -= 1
-        else:
-            break
-    run = source[words[lo][0]:words[hi][1]]
-    if len(run) > len(frag) and any(c.isdigit() for c in run):
-        return run.strip().lower()
-    return fragment
-
-
 def _unified_correction_extraction_llm(
     text: str,
     user_id: str,
@@ -11407,7 +11731,7 @@ someone user-adjacent.
 Examples of subject extraction:
 - "I am not a doctor" → subject_name: "user" (speaker/user)
 - "I'm not 18, I'm 23" → subject_name: "user" (speaker/user)
-- "Riverton University is not a person, it is an organization" → subject_name: "Riverton University"
+- "University of Guelph is not a person, it is an organization" → subject_name: "University of Guelph"
 - "Wren is an LLM model, not a person" → subject_name: "Wren"
 - "Computing and Communication Services is an organization" → subject_name: "Computing and Communication Services"
 - "Ottawa is the capital of Canada, not a person" → subject_name: "Ottawa"
@@ -11464,7 +11788,7 @@ RULES:
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
    - Update facts.object_id with hierarchy semantics
    - Example: instance_of dog → cat
-   - Example: "Riverton University is not a person" → subject_name="Riverton University", old_value="person", new_value="organization"
+   - Example: "University of Guelph is not a person" → subject_name="University of Guelph", old_value="person", new_value="organization"
 
 4. SUBJECT dimension (wrong entity):
    - subject_uuid MUST CHANGE
@@ -11555,18 +11879,6 @@ If extraction is impossible or ambiguous, return {{}}."""
                     subject=extraction.get("subject_uuid"),
                     old_rel_type=extraction.get("old_rel_type"),
                     confidence=extraction.get("confidence"))
-            # VALUE RECOVERY: the correction LLM truncates out-of-distribution alphanumeric
-            # identifiers ("X9K 8Z7" → "x9"). If new_value is a fragment of a longer digit-
-            # bearing identifier in the source statement, recover the full span so the
-            # corrected scalar lands whole (mirrors the spine's identifier-context rebuild,
-            # applied here on the LLM string output). Conservative — no-op on a clean value.
-            _nv = extraction.get("new_value")
-            if isinstance(_nv, str) and _nv:
-                _recovered = _recover_alnum_identifier_in_text(text, _nv)
-                if _recovered != _nv:
-                    log.info("correction_extraction.identifier_recovered",
-                             user_id=user_id, fragment=_nv, recovered=_recovered)
-                    extraction["new_value"] = _recovered
             return extraction
         else:
             log.warning("correction_extraction.llm_no_json", user_id=user_id)
@@ -11623,7 +11935,7 @@ Examples of subject extraction:
 - "I don't have any pets" → subject: "user"
 - "I'm not 42" → subject: "user"
 - "Spot is not a bunny" → subject: "Spot"
-- "Riverton University is not a person" → subject: "Riverton University"
+- "University of Guelph is not a person" → subject: "University of Guelph"
 - "forget that Wren is a person" → subject: "Wren"
 - "Computing and Communication Services is not an organization" → subject: "Computing and Communication Services"
 - "Remove the name Rex" → subject: "user" (self-alias removal)
@@ -11677,7 +11989,7 @@ RULES:
    - rel_type = the hierarchy rel (instance_of, member_of, part_of)
    - object = the type/class being removed
    - Example: "Spot is not a bunny" → subject="Spot", rel_type="instance_of", object="bunny"
-   - Example: "Riverton University is not a person" → subject="Riverton University", rel_type="instance_of", object="person"
+   - Example: "University of Guelph is not a person" → subject="University of Guelph", rel_type="instance_of", object="person"
 
 4. ENTITY (alias removal):
    - dimension = ENTITY
@@ -12725,12 +13037,42 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     if not text or len(text) < 2:
         return {"intent": "STATEMENT", "confidence": 0.0}
 
+    # === PRE-GLINER2 INTERROGATIVE (QUERY) ROUTE ===
+    # A grammatically INTERROGATIVE turn is a QUESTION — never a correction/retraction/statement-
+    # to-ingest. GLiNER2's verbose CORRECTION label ("replacing a previously stated value with a
+    # different one") mis-scores the "…switch/change/move to Y" / "…to Y" shape at high confidence
+    # EVEN when the turn is a question, so recall_memory_tool / remember_facts_tool diverted the
+    # question to /retract/correct and recall returned nothing. Route to QUERY deterministically
+    # BEFORE GLiNER2 (kept pure — no label edits, Pitfall 11), by GRAMMAR/morphology only
+    # (is_interrogative_clause: wh-morph / subject-aux inversion / trailing "?", NO word-list).
+    # Runs FIRST: a genuine correction is DECLARATIVE (is_interrogative → False) and a real
+    # imperative retraction ("forget my dog") has no wh / inversion / "?", so neither can be
+    # swallowed here — this only rescues questions. Fail-safe: layer unavailable / parse miss /
+    # error → fall through to GLiNER2 (never a silent misroute).
+    if QUERY_INTERROGATIVE_PREROUTE:
+        try:
+            from src.extraction.linguistics import (
+                is_interrogative_clause as _is_interro_q0,
+                linguistics_available as _ling_ok_q0,
+            )
+            if _ling_ok_q0() and _is_interro_q0(text) is True:
+                log.info("classify_intent.interrogative_query_preroute",
+                         user_id=user_id[:8],
+                         note="grammatically interrogative turn → QUERY (GLiNER2 skipped, kept "
+                              "pure); a question is never a correction/retraction")
+                print("[/classify-intent] INTERROGATIVE PRE-ROUTE: → QUERY "
+                      "(question grammar; GLiNER2 skipped)", flush=True)
+                return {"intent": "QUERY", "confidence": 0.95}
+        except Exception as _iq_err:  # noqa: BLE001 — fail-safe: never block GLiNER2 on a parse miss
+            log.debug("classify_intent.interrogative_preroute_failed",
+                      user_id=user_id[:8], error=str(_iq_err)[:120])
+
     # === PRE-GLINER2 CORRECTION BYPASS GATE ===
     # A correction BYPASSES GLiNER2 intent classification (classify_text) — GLiNER2 stays pure
     # for its strengths and is never made to judge negation. We skip ONLY the GLiNER2 intent
     # step; the downstream correction path (/retract/correct) still runs EXTRACT/QUERY where
     # GLiNER2 matches the target ("what are we fixing") and the supersede/delete/update lands.
-    # Order (Alexander 2026-06-14 — DB matching + model-strength, NO brittle keyword list):
+    # Order (Christopher 2026-06-14 — DB matching + model-strength, NO brittle keyword list):
     #   (1) DB MATCH — the memoized, confidence-WEIGHTED classification store (curated
     #       correction_patterns + engine-grown negation_patterns / intent_pattern_cache). A
     #       confident match routes by the STORED weight, no LLM. The weight is scrutinizable /
@@ -12878,8 +13220,8 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
 
     # === PRE-GLINER2 DECLARATIVE-STATEMENT ROUTE (intent-misroute fix) ===
     # A first-person declarative that ASSERTS facts ("I wanted to tell you about my family. My
-    # wife's name is Ada. We have three kids: Mia, Theo, and Leo.") is mis-scored QUERY
-    # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Theo/Leo drop.
+    # wife's name is Ada. We have three kids: Gabriella, Des, and Cyrus.") is mis-scored QUERY
+    # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Des/Cyrus drop.
     # Mirror the affect/correction pre-gates: when the turn carries >= 2 GRAMMATICAL assertions
     # (count_declarative_assertions — explicit-subject copula/transitive predicates; imperatives
     # like "tell me about my family" and questions are excluded by construction), route STATEMENT
@@ -12906,6 +13248,32 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         except Exception as _decl_err:  # noqa: BLE001 — fail-safe: never block GLiNER2
             log.debug("classify_intent.declarative_preroute_failed",
                       user_id=user_id[:8], error=str(_decl_err)[:120])
+
+    # === PRE-GLINER2 SOURCE→GOAL TRANSITION ROUTE (from→to narration fix) ===
+    # A declarative narrated transition ("I switched from Python to Rust", "I upgraded my laptop
+    # from an old model to a MacBook") is mis-scored CORRECTION by GLiNER2's "replacing a previously
+    # stated value with a different one" label at high confidence (0.96–1.00) — so remember_facts
+    # diverted the STATEMENT to /retract/correct and stored NOTHING ("Old relational fact not
+    # found"). The spaCy correction dual-gate ABOVE does not fire on a plain from→to (no negation /
+    # repair marker), so nothing rescued it. Route STATEMENT deterministically BEFORE GLiNER2 (kept
+    # pure, no label edits — Pitfall 11) when the grammar is a clear source→goal transition: a VERB
+    # root with an EXPLICIT non-"you" subject + BOTH a from-source and a to-goal prep + NO repair cue
+    # (imperative "change it from A to B" correction directives are excluded by construction). This
+    # runs AFTER the correction gate, so a genuine correction still routes correctly. Fail-safe:
+    # layer unavailable / parse miss / any error → fall through to GLiNER2 (never a drop).
+    if TRANSITION_STATEMENT_PREROUTE:
+        try:
+            if _is_source_goal_transition_statement(text):
+                log.info("classify_intent.transition_statement_preroute",
+                         user_id=user_id[:8],
+                         note="declarative source→goal transition → STATEMENT (GLiNER2 skipped, kept "
+                              "pure); a narrated 'from A to B' is a stated fact, not a correction")
+                print("[/classify-intent] TRANSITION PRE-ROUTE: → STATEMENT "
+                      "(from→to narration; GLiNER2 skipped)", flush=True)
+                return {"intent": "STATEMENT", "confidence": 0.95}
+        except Exception as _tr_err:  # noqa: BLE001 — fail-safe: never block GLiNER2
+            log.debug("classify_intent.transition_preroute_failed",
+                      user_id=user_id[:8], error=str(_tr_err)[:120])
 
     try:
         # ENHANCEMENT: Build semantic-rich intent descriptions from DB patterns
@@ -14058,13 +14426,13 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
         (r'\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b',                            'mac_address','has_mac'),
         (r'\b[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}\b',                            'mac_address','has_mac'),
         (r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',               'email',      'has_email'),
-        (r'\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b',        'phone',      'has_phone'),
+        (r'(?<!\d)(?:\+\d{1,3}[\s\-.]?\(?\d{1,4}\)?[\s\-.]?\d{3,4}[\s\-.]?\d{3,4}|\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})\b', 'phone', 'has_phone'),
         (r'\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b',                'date',       'born_on'),
         (r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', 'uuid', 'has_uuid'),
         (r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b', 'fqdn', 'has_fqdn'),
-        # Generic reference/identifier CODE — an alphanumeric (letters+digits+[#/-]separators)
+        # Generic reference/identifier CODE (ticket/case/docket/order/invoice numbers): a
         # letters+digits+separators token — the SHAPE the LLM/deriver would mangle on its
-        # separators exactly like an IP. DB-mirror of the migration-147 seeded scalar_atomic
+        # separators exactly like an IP. DB-mirror of the migration-185 seeded scalar_atomic
         # row (public.extraction_patterns → per-tenant); the seeded per-tenant pattern OVERRIDES
         # this fallback (used only when db_conn is unavailable). Deterministic gate (NO IGNORECASE
         # here — parity with _detect_atomic_values' case-sensitive finditer): require >=1 UPPERCASE
@@ -14134,54 +14502,6 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
 
     all_matches.sort(key=lambda x: x["start"])
     return all_matches
-
-
-# An identifier RUN part: alphanumerics optionally joined by the separators the scalar_atomic
-# format-grammar itself admits. Structural, case-folded — no format list, no country/postal literal.
-_IDENT_RUN_PART_RE = re.compile(r"^[0-9a-z]+(?:[#/-][0-9a-z]+)*$")
-
-
-def _is_identifier_run(value: str) -> bool:
-    """True iff ``value`` is a whitespace-separated IDENTIFIER RUN: every part is identifier-shaped
-    AND every part carries a digit.
-
-    The digit-on-EVERY-part requirement is the whole safety of ``_atomic_claim_is_run_fragment``: it
-    is what separates a shattered single identifier ("X9K 8Z7", "K1A 0B1") from ordinary prose that
-    merely happens to contain a code ("ab123 thing" — "thing" has no digit, so the run test fails and
-    the atomic claim is left alone to rescue the value). Subject-agnostic: shape only."""
-    parts = (value or "").strip().lower().split()
-    if not parts:
-        return False
-    return all(_IDENT_RUN_PART_RE.match(p) and any(ch.isdigit() for ch in p) for p in parts)
-
-
-def _atomic_claim_is_run_fragment(value: str, hosted_objects) -> bool:
-    """True iff a claimed atomic value is a PROPER FRAGMENT of an identifier RUN already captured as
-    an edge object — i.e. the format-grammar claimed HALF of a value a cue-gated lane captured WHOLE.
-
-    THE DEFECT THIS CLOSES: the generic identifier pattern (migration 147) requires >= 2 digits, so on
-    "My postal code is X9K 8Z7." it rejects "X9K" (one digit) and matches "8Z7" ALONE. Every guard
-    downstream compared values by EQUALITY — the twin-suppressor,
-    ``_classify_value_subject_residue``'s ``_existing_objects``, /ingest's supplementation — so
-    "8z7" was never seen as already-hosted by "x9k 8z7" and a SECOND, WRONG has_reference_id was
-    minted beside the correct one. The user ends up holding two reference identifiers, one of which
-    is half of the other. A fragment of a captured value is not a different value; equality was the
-    wrong test and containment is the right one, for every format, not just this one.
-
-    Deliberately ONE-DIRECTIONAL: it only ever drops the SHORTER CLAIM, never the longer capture, so
-    the failure mode is "the whole value survives", never "the value is lost"."""
-    v = (value or "").strip().lower()
-    if not v:
-        return False
-    for _o in (hosted_objects or ()):
-        o = (_o or "").strip().lower()
-        if not o or len(o) <= len(v):
-            continue
-        if not _is_identifier_run(o):
-            continue
-        if v in o.split() or v in o:
-            return True
-    return False
 
 
 def _suppress_atomic_claimed_twins(edges: list[dict], atomic: list[dict]) -> tuple[list[dict], int]:
@@ -14779,7 +15099,7 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
     * X MUST be a literal, named entity (a real name). If X is only a pronoun ("I call HER my Y"),
       DO NOT emit synonym_of — fall back to normal handling (omit).
     * Example: "call Robert my ace" → (robert, synonym_of, "ace", is_preferred_label=false)
-    * Example: "my box is the nas server" → (nas server, synonym_of, "box", is_preferred_label=false)
+    * Example: "my box is the truenas server" → (truenas server, synonym_of, "box", is_preferred_label=false)
     * Distinguish from pref_name/also_known_as: synonym_of is how the SPEAKER talks ABOUT X
       (a nickname/slang/referential word), NOT an alternate proper name X is publicly known by.
 
@@ -15315,6 +15635,22 @@ HARVEST_ENTRY_PEEL = os.getenv("HARVEST_ENTRY_PEEL", "true").lower() not in ("0"
 HARVEST_RECALL_INTERRO_PREFILTER = os.getenv(
     "HARVEST_RECALL_INTERRO_PREFILTER", "true").lower() not in ("0", "false", "no")
 
+# POSSESSIVE-PRESUPPOSITION RECOVERY (sentence-pipeline harvest) — DEFAULT ON. The interrogative
+# firewall above (and the post-atomizer interrogative gate) DROP a whole question clause so the
+# question's OWN asked predicate is never minted on a recall turn. But a first-person POSSESSIVE
+# inside that question ("recommend a flash for my Sony A7R IV?", "how do I clean my Sony 24-70mm
+# lens?") is NOT the asked predicate — it is a GIVEN the user PRESUPPOSES (they own that gear),
+# and a presupposition PROJECTS out of a question. Dropping the clause wholesale discarded these
+# owned-thing facts, so a later "suggest accessories for my photography setup" recalled nothing.
+# When ON, the dropped interrogative clauses are RE-DERIVED and ONLY the edges the deriver marked
+# ``presupposed`` (its first-person possessive owns/kinship emits — grammar-driven Person=1 ∧
+# Poss=Yes, NO word list) are kept; the asked SVO ("what car do I own?") is never marked and stays
+# dropped. Subject-agnostic, deterministic, fail-safe (any error / no presupposed edge → today's
+# behavior). Applied at BOTH interrogative gates + the final return, so a presupposed owned-thing
+# survives regardless of which gate dropped its clause.
+HARVEST_POSSESSIVE_PRESUPPOSITION = os.getenv(
+    "HARVEST_POSSESSIVE_PRESUPPOSITION", "true").lower() not in ("0", "false", "no")
+
 # SENTENCE PIPELINE ("feed it the clean sentence") — DEFAULT OFF, fail-safe to today's harvest path.
 # ROOT CAUSE it fixes: the legacy harvest feeds spaCy the LLM's leftovers — _llm_detect_factbearing_
 # spans → join → _peel_dates_at_entry (date stripped) → THEN the spaCy lanes, so spaCy never sees a
@@ -15370,6 +15706,37 @@ AFFECT_STATEMENT_PREROUTE = os.getenv("AFFECT_STATEMENT_PREROUTE", "true").lower
 # only (count_declarative_assertions: explicit-subject copula/transitive assertions, imperatives
 # and questions excluded), BEFORE GLiNER2 (kept pure, no label edits). Fail-safe → GLiNER2.
 DECLARATIVE_STATEMENT_PREROUTE = os.getenv("DECLARATIVE_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
+# TRANSITION-STATEMENT PRE-ROUTE (source→goal-narration fix): a declarative
+# "<subject> <verb> from A to B" transition ("I switched from Python to Rust", "I
+# upgraded my laptop from an old model to a MacBook", "She moved from Toronto to
+# Berlin") is mis-scored CORRECTION by GLiNER2's "replacing a previously stated
+# value" label at high confidence, so remember_facts diverted the STATEMENT to the
+# retract/correct path and stored nothing. The spaCy correction cue does not fire
+# on a plain from→to (no negation/repair marker), so nothing rescued it. Grammar-
+# only (VERB root + explicit non-"you" subject + BOTH a from-source and to-goal
+# prep, no repair cue — see _is_source_goal_transition_statement), BEFORE GLiNER2
+# (kept pure, no label edits — Pitfall 11). An imperative "change it from A to B"
+# correction directive (no overt subject) is EXCLUDED, so real corrections still
+# route correctly. Fail-safe → GLiNER2. Default ON.
+TRANSITION_STATEMENT_PREROUTE = os.getenv("TRANSITION_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
+
+# === PRE-GLINER2 INTERROGATIVE (QUERY) ROUTE (…-to-Y question misroute fix) ===
+# A grammatically INTERROGATIVE turn ("What programming language did I switch to?",
+# "Which database do I use now?", "Where did I move to?") is mis-scored CORRECTION by
+# GLiNER2's "replacing a previously stated value with a different one" label — the
+# "…switch/change/move to Y" / "…to Y" shape scores high EVEN as a question — so both
+# recall_memory_tool and remember_facts_tool diverted the question to /retract/correct
+# (returned "failed"/facts_superseded) and recall returned NOTHING. A QUESTION is never a
+# correction/retraction/statement-to-ingest: route it to QUERY deterministically BEFORE
+# GLiNER2 (kept pure, no label edits — Pitfall 11), short-circuiting the mis-rank. Detected
+# by GRAMMAR/morphology only via linguistics.is_interrogative_clause (wh-morph PronType=Int /
+# WP·WP$·WDT·WRB main-clause dependent, OR subject-aux inversion, OR trailing "?"), NO
+# verb/wh-word string list. A genuine correction is DECLARATIVE (is_interrogative → False), so
+# this guard cannot swallow one; a real imperative retraction ("forget my dog") carries no wh /
+# inversion / "?" → also untouched. Runs FIRST (a question can precede every other route) and
+# fail-safe: layer unavailable / parse miss / any error → fall through to GLiNER2 (never a
+# silent misroute the other way). Default ON.
+QUERY_INTERROGATIVE_PREROUTE = os.getenv("QUERY_INTERROGATIVE_PREROUTE", "true").lower() not in ("0", "false", "no")
 
 
 def _resolve_head_noun_type(head_name: str | None) -> str | None:
@@ -15685,8 +16052,8 @@ def _build_typed_doc(sentence: str, gmodel, labels):
             if not _lab:
                 continue
             # COORDINATED-SURFACE SPLIT (subject-agnostic, deterministic): GLiNER2 sometimes returns a
-            # comma/"and"-joined LIST of names as ONE surface ("Mia, Theo") — seeding that whole
-            # span as a single entity GLUES the names into one merged entity ("mia theo") and the
+            # comma/"and"-joined LIST of names as ONE surface ("Gabriella, Des") — seeding that whole
+            # span as a single entity GLUES the names into one merged entity ("gabriella des") and the
             # tail member is lost. Split such a surface on its coordinating commas / " and " into the
             # individual names and seed EACH as its own typed span. A surface with no internal
             # coordinator is unchanged. Pure punctuation/coordinator split — NO fuzzy/similarity.
@@ -15817,6 +16184,87 @@ def _reconcile_residue_against_seam(
     return kept, dropped
 
 
+async def _recover_possessive_presupposition_edges(
+        clauses: list[str], user_id: str, reference, seen: set) -> list[dict]:
+    """Recover FIRST-PERSON POSSESSIVE presupposition edges from interrogative clauses the harvest
+    DROPPED (the recall read-only firewall / post-atomizer interrogative gate).
+
+    The dropped clause's OWN asked predicate ("what car do I own?") must stay dropped — a recall turn
+    is read-only for the question's content. But a first-person POSSESSIVE inside the question ("…for
+    my Sony A7R IV?", "…clean my Sony 24-70mm lens?") is a PRESUPPOSITION: the user asserts they OWN
+    that thing as a GIVEN, independent of what they are asking. A presupposition PROJECTS out of a
+    question, so the owned-thing fact is user truth even though the clause is interrogative.
+
+    We RE-DERIVE each dropped clause and keep ONLY the edges the deriver marked ``presupposed`` (its
+    first-person possessive owns/kinship emits — grammar-driven Person=1 ∧ Poss=Yes, NO word list).
+    The asked SVO is never marked, so it is never recovered. Deduped against ``seen`` (shared with the
+    main harvest loop). Subject-agnostic, deterministic, fail-safe: any error / no presupposed edge →
+    ``[]`` (today's behavior — nothing added)."""
+    if not HARVEST_POSSESSIVE_PRESUPPOSITION or not clauses:
+        return []
+    try:
+        from src.extraction.linguistics import derive_sentence_facts, linguistics_available
+    except Exception:  # noqa: BLE001 — layer import failure → nothing recovered
+        return []
+    if not linguistics_available():
+        return []
+    from src.provisioning.schema_manager import derive_user_slug_from_uuid
+    schema_name = f"faultline_{derive_user_slug_from_uuid(user_id)}"
+    _tok = rel_type_overlay.set_current_schema(schema_name)
+    _recovered: list[dict] = []
+    try:
+        gmodel = get_gliner_model()
+        _labels = _gliner2_entity_labels(source="user") if gmodel is not None else None
+        for _cl in clauses:
+            _c = (_cl or "").strip()
+            if not _c:
+                continue
+            # Build the SAME typed Doc the main loop uses (GLiNER2 type WINS; empty → thin tag) so a
+            # recovered owned-thing carries its type for the walk. Fail-safe to the str path.
+            try:
+                _typed = _build_typed_doc(_c, gmodel, _labels)
+            except Exception:  # noqa: BLE001
+                _typed = None
+            try:
+                _facts = derive_sentence_facts(
+                    _typed if _typed is not None else _c, reference)
+            except Exception as _de:  # noqa: BLE001 — per-clause fail-safe
+                log.debug("presupposition_recover.derive_failed", error=str(_de)[:120])
+                _facts = []
+            for _f in (_facts or []):
+                if not getattr(_f, "presupposed", False):
+                    continue  # keep ONLY presupposed edges; the asked predicate stays dropped
+                _key = (_f.subject, _f.rel_type, (_f.object or "").strip().lower())
+                if not all(_key) or _key in seen:
+                    continue
+                seen.add(_key)
+                _edge = {
+                    "subject": _f.subject,
+                    "rel_type": _f.rel_type,
+                    "object": _f.object,
+                    "fact_provenance": "user_stated",
+                    "confidence": 0.8,
+                }
+                if _f.subject == "user":
+                    _edge["subject_type"] = "Person"
+                if _f.thin_type:
+                    _edge["object_type"] = _f.thin_type
+                _recovered.append(_edge)
+        if _recovered:
+            log.info("presupposition_recover.kept", user_id=user_id[:8],
+                     edges=len(_recovered), clauses=len(clauses),
+                     note="first-person possessive presupposition survived a DROPPED interrogative "
+                          "clause (the asked predicate stayed dropped)")
+    except Exception as _pe:  # noqa: BLE001 — recovery never blocks the harvest
+        log.warning("presupposition_recover.failed", user_id=user_id[:8], error=str(_pe)[:160])
+    finally:
+        try:
+            rel_type_overlay.reset_current_schema(_tok)
+        except Exception:  # noqa: BLE001
+            pass
+    return _recovered
+
+
 async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     """SENTENCE-PIPELINE harvest ("feed it the clean sentence"). Returns the standard
     ``{"edges": [...], "spans": N}`` dict, or ``None`` to signal the caller to fall through to today's
@@ -15857,6 +16305,14 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     if not text:
         return {"edges": [], "spans": 0}
 
+    # POSSESSIVE-PRESUPPOSITION RECOVERY accumulators. Every interrogative clause the firewall/gate
+    # DROPS is collected here so its first-person possessive presupposition ("…for my Sony A7R IV?")
+    # is re-derived and kept while the question's OWN asked predicate stays dropped. ``_presup_seen``
+    # dedups recovered edges across the two gates. Empty unless a clause is actually dropped → zero
+    # behavior change on a fully-declarative turn.
+    _dropped_interro_clauses: list[str] = []
+    _presup_seen: set = set()
+
     # 1b. RECALL READ-ONLY FIREWALL — DROP interrogative clauses from the RAW source text BEFORE the
     #     LLM atomizer runs. The atomizer (step 2) REWRITES a question into a declarative atom ("do you
     #     know what kind of car I own?" → "I own a car"), which LAUNDERS the interrogative grammar the
@@ -15880,18 +16336,24 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     _rv = None
                 if _rv is True:
                     _pre_dropped += 1
+                    _dropped_interro_clauses.append(_rc.strip())
                     continue
                 _decl_clauses.append(_rc.strip())
             if _pre_dropped:
                 # The gate ACTIVELY dropped >=1 question clause. Rebuild the harvest input from the
                 # surviving DECLARATIVE clauses only — NEVER fall back to the raw turn (that would
                 # re-admit the question's content). If nothing declarative remains → pure question →
-                # zero harvest (recall is read-only for the question's own content).
+                # zero harvest (recall is read-only for the question's own content) — EXCEPT the
+                # first-person possessive presupposition inside the question ("…for my Sony A7R IV?"),
+                # which is a GIVEN the user owns and survives the drop (the asked predicate does not).
                 if not _decl_clauses:
+                    _presup = await _recover_possessive_presupposition_edges(
+                        _dropped_interro_clauses, user_id, reference, _presup_seen)
                     log.info("sentence_pipeline.interrogative_prefilter_all_dropped",
                              user_id=user_id[:8], dropped=_pre_dropped,
-                             note="pure question on the recall path — zero facts harvested")
-                    return {"edges": [], "spans": 0}
+                             presupposed_recovered=len(_presup),
+                             note="pure question on the recall path — only possessive presuppositions kept")
+                    return {"edges": _presup, "spans": len(_presup)}
                 text = " ".join(_decl_clauses).strip()
                 log.info("sentence_pipeline.interrogative_prefiltered",
                          user_id=user_id[:8], dropped=_pre_dropped, kept=len(_decl_clauses),
@@ -16052,11 +16514,15 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             _v = None
         if _v is True:
             _dropped += 1
+            _dropped_interro_clauses.append(_s)
             continue
         _declarative.append(_s)
     if not _declarative:
-        # nothing declarative to harvest (pure question) → empty, but still a valid result.
-        return {"edges": [], "spans": 0}
+        # nothing declarative to harvest (pure question) → empty, EXCEPT any first-person possessive
+        # presupposition inside the dropped question(s), which is user-owned truth that survives.
+        _presup = await _recover_possessive_presupposition_edges(
+            _dropped_interro_clauses, user_id, reference, _presup_seen)
+        return {"edges": _presup, "spans": len(_presup)}
 
     gmodel = get_gliner_model()
     from src.provisioning.schema_manager import derive_user_slug_from_uuid
@@ -16094,6 +16560,17 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     except Exception as _tpe:  # noqa: BLE001 — NER hiccup never blocks capture
         log.debug("sentence_pipeline.turn_persons_failed", error=str(_tpe)[:120])
         _turn_persons = []
+    # CAP2DUP cross-atom role->name: scan the WHOLE turn once for role-noun->proper-name bindings
+    # ("my mother is named Sarah") so a SIBLING atom the atomizer split off ("My mother is 62",
+    # pronoun-resolved) binds its kin/scalar edges onto the NAMED person, not a standalone role
+    # entity. Mirrors _turn_persons; fail-safe {} -> today's behavior.
+    _turn_role_names: dict = {}
+    try:
+        from src.extraction.linguistics import build_turn_role_name_map as _btrn
+        _turn_role_names = _btrn(text) or {}
+    except Exception as _rre:  # noqa: BLE001 — never blocks capture
+        log.debug("sentence_pipeline.turn_role_names_failed", error=str(_rre)[:120])
+        _turn_role_names = {}
     # gap-2 §10.3: a declarative content-bearing sentence that yields ZERO edges even AFTER the
     # chains + the gated LLM relation-fill is the failure-residue → the MINIMIZED last resort
     # (Class C via the EXISTING store_context). We collect those sentences here and route them once,
@@ -16127,6 +16604,11 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             # it (Pitfall 11: concise labels, typing only), then hand the TYPED Doc to the deriver so
             # it reads ``token.ent_type_`` natively — GLiNER2 type WINS, empty → deriver thin tag.
             _typed_doc = _build_typed_doc(_sent, gmodel, _labels)
+            # PART B ("we don't forget"): collect the deriver's PER-SPAN uncovered residue for THIS
+            # sentence — a content NOUN/PROPN no capture chain claimed (a dropped scalar/name/unt-typed
+            # span). Routed to the Class-C short-term lane below EVEN IF this sentence also produced
+            # edges, so a PARTIAL capture no longer silently forgets the missed span.
+            _sentence_residue: list[str] = []
             # The deterministic deriver — SVO + possessive + date→verb + the four local rules. Pass
             # the typed Doc when built; else fall back to the str (deriver re-parses, thin-tag fill).
             try:
@@ -16134,7 +16616,9 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     _typed_doc if _typed_doc is not None else _sent,
                     reference, prior_nps=list(_prior_nps),
                     discourse_topic=_discourse_topic,
-                    turn_persons=_turn_persons)
+                    turn_persons=_turn_persons,
+                    turn_role_names=_turn_role_names,
+                    residue_out=_sentence_residue)
             except Exception as _de:  # noqa: BLE001 — per-sentence fail-safe
                 log.debug("sentence_pipeline.derive_failed", error=str(_de)[:120])
                 _facts = []
@@ -16223,6 +16707,13 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     # coref-resolved pronoun object → carry the ORIGINAL pronoun so the entry-peel
                     # date reattach can bind this clause's date to the resolved-name edge (2c63a862).
                     _edge["object_pronoun"] = _f.object_pronoun
+                if getattr(_f, "temporal_status", None):
+                    # PER-EDGE temporal_status override (relocation past-habitual "used to live in X"):
+                    # a GRAMMATICALLY-past residence carrying NO event_date. The request-level date-driven
+                    # detector reads it as 'now'; this override marks the FORMER residence 'past' so the
+                    # dual-clock query orders it behind the current one. Row-build prefers it over the
+                    # request-level status; None → today's request-level derivation (every normal fact).
+                    _edge["temporal_status"] = _f.temporal_status
                 if _f.event_date:
                     _edge["event_date"] = _f.event_date
                     _edge["event_date_granularity"] = _f.event_date_granularity or "day"
@@ -16319,8 +16810,14 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 except Exception as _nse:  # noqa: BLE001 — fail-safe: seam miss never breaks harvest
                     log.debug("sentence_pipeline.naming_seam_failed", error=str(_nse)[:120])
 
+            # PART B ("we don't forget"): route THIS sentence to the Class-C short-term lane when it
+            # produced NO durable edge, when it yielded only a withheld tentative state, OR when the
+            # deriver flagged a PER-SPAN uncovered residue (a dropped scalar/name/untyped span) — even
+            # if the sentence ALSO produced other edges. The last clause closes the partial-capture hole
+            # where a genuine per-span miss silently vanished because the sentence wasn't zero-edge.
             _no_durable_edge = (len(edges) == _edges_before_sentence)
-            if (_no_durable_edge or _sentence_has_tentative) and _sent.strip():
+            _has_span_residue = bool(_sentence_residue)
+            if (_no_durable_edge or _sentence_has_tentative or _has_span_residue) and _sent.strip():
                 _rs = _sent.strip()
                 if _rs not in _residue_sentences:
                     _residue_sentences.append(_rs)
@@ -16545,8 +17042,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             log.debug("sentence_pipeline.named_role_recovery_failed", error=str(_nrre)[:120])
 
         # ── PERSON-SUBJECT SCALAR RECONCILIATION (cross-atom, metadata-driven) ───────────────────────
-        # The atomizer SPLITS a per-member attribute onto its own micro-atom ("Mia is 10."), where
-        # GLiNER2 mis-types the bare name (Mia→Animal, Theo→Organization). That noisy type rides the
+        # The atomizer SPLITS a per-member attribute onto its own micro-atom ("Gabriella is 10."), where
+        # GLiNER2 mis-types the bare name (Gabriella→Animal, Des→Organization). That noisy type rides the
         # SCALAR edge's ``subject_type`` and the WGM gate then QUARANTINES the Person-scoped scalar (age
         # head_types={Person}) to Class C — even though the SAME turn established the member as a PERSON
         # via a kin/person relation ("…child_of user", head/tail Person). Reconcile across the batch:
@@ -16641,7 +17138,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 #     edges, not just "busy"). DETERMINISTIC (analyze_copula_affect_complements: grammar
                 #     + ADJ/VBN-complement POS + the conj coordination — NO LLM, NO emotion word list),
                 #     gated to a genuine 1st-person PERSONAL-pronoun subject, not negated. A NOUN
-                #     complement ("I am a teacher" → occupation) / PROPN ("I am Alex" → also_known_as)
+                #     complement ("I am a teacher" → occupation) / PROPN ("I am Chris" → also_known_as)
                 #     are NOT this lane. Deduped via _add_feeling. Subject-agnostic.
                 try:
                     from src.extraction.linguistics import (
@@ -16685,6 +17182,31 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                         _relpred_edges_sp.append(_rp_edge)
                 except Exception:  # noqa: BLE001 — fail-safe: relpred miss never breaks the harvest
                     _relpred_edges_sp = []
+                # DESIRE / PREFERENCE capture (CAPTURE-GAP fix): a 1st-person volition/preference
+                # predication ("I want to learn Spanish", "I'd love to attend the festival", "I like
+                # jazz") is DELIBERATELY rejected by the occurrence lanes (an intention is not a thing
+                # the user DID — the _CATENATIVE/_MENTAL_STATE INTENT firewall), so WITHOUT this the
+                # whole preference DROPS. Emit (user, <verb>, <object>) — a novel rel the ontology
+                # growth engine grounds (miss→grow). Subject-agnostic, deterministic (grammar: the
+                # bounded volition-verb class + xcomp/dobj), NO domain word list. Negated preferences
+                # are skipped (negation-as-absence for preferences deferred, parity with the affect
+                # seams). user_stated so /ingest lands it durably (Class A/B).
+                _desire_edges_sp: list[dict] = []
+                try:
+                    from src.extraction.linguistics import (
+                        analyze_desire_predication as _desire_pred)
+                    for _dp in (_desire_pred(_affect_text) or []):
+                        if _dp.get("negated"):
+                            continue
+                        _dp_rel = (_dp.get("rel_type") or "").strip().lower()
+                        _dp_obj = (_dp.get("object") or "").strip().lower()
+                        if not _dp_rel or not _dp_obj:
+                            continue
+                        _desire_edges_sp.append(
+                            {"subject": "user", "rel_type": _dp_rel, "object": _dp_obj,
+                             "fact_provenance": "user_stated"})
+                except Exception:  # noqa: BLE001 — fail-safe: desire miss never breaks the harvest
+                    _desire_edges_sp = []
                 # TEMPORAL STAMP + PROVENANCE: a USER-STATED feeling is DURABLE — fact_provenance=
                 # "user_stated" so /ingest's provenance router + assign_class land it at Class B (the
                 # feels rel's defined class is C, so user_stated → B, NOT A; NEVER force C — see
@@ -16801,7 +17323,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
 
                 # UNION the seam edges (deduped on `seen`). Feelings carry the seeded `feels` rel;
                 # preferences carry the snake-cased favorite_<x>/<x> rel. NO object resolution here.
-                for _se in (_feeling_edges_sp + _preference_edges_sp + _relpred_edges_sp):
+                for _se in (_feeling_edges_sp + _preference_edges_sp + _relpred_edges_sp
+                            + _desire_edges_sp):
                     _se_obj = (_se.get("object") or "").strip().lower()
                     _key = (_se.get("subject"), _se.get("rel_type"), _se_obj)
                     # RESIDUE↔SEAM RECONCILE (Part 1): remember this seam's OBJECT so the store_context
@@ -16812,17 +17335,19 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     if all(_key) and _key not in seen:
                         seen.add(_key)
                         edges.append(dict(_se))
-                if _feeling_edges_sp or _preference_edges_sp or _relpred_edges_sp:
+                if (_feeling_edges_sp or _preference_edges_sp or _relpred_edges_sp
+                        or _desire_edges_sp):
                     log.info("sentence_pipeline.affect_preference_captured",
                              user_id=user_id[:8],
                              feelings=len(_feeling_edges_sp), preferences=len(_preference_edges_sp),
-                             relational_predicates=len(_relpred_edges_sp))
+                             relational_predicates=len(_relpred_edges_sp),
+                             desires=len(_desire_edges_sp))
         except Exception as _ape:  # noqa: BLE001 — fail-safe: seam miss never breaks the spine harvest
             log.debug("sentence_pipeline.affect_preference_failed",
                       user_id=user_id[:8], error=str(_ape)[:120])
 
     # ── NAME↔TYPE BINDER vs ATTR-SCALAR PRECEDENCE (possessive-attribute copula) ───────────────────
-    # The unified name↔type binding detector fires on "my address is 123 Main Street, Riverton,
+    # The unified name↔type binding detector fires on "my address is 123 Main Street, Kitchener,
     # Ontario" when LIVE GLiNER2 types the value-span head ("Street") as a NAMED INSTANCE of the
     # attribute noun ("address") read as a TYPE — minting junk twins ((street, also_known_as|
     # instance_of|has_role, address), (user, owns, street), (street, age, 123)) that COMPETE with the
@@ -16830,7 +17355,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # carrying object_datatype). The attr-scalar chain OWNS this construction. Mirror the preference-
     # seam attr-scalar deferral above: union-level, DETERMINISTIC whole-word token membership against
     # the claimed scalar VALUE — drop the binder twins, KEEP the geo-containment `located_in` chain
-    # (it shares value words like "riverton"/"ontario" but is desired; located_in is not a twin rel).
+    # (it shares value words like "kitchener"/"ontario" but is desired; located_in is not a twin rel).
     # FAIL-SAFE: no attr-scalar claim in the batch → no change (the leak only arises with live GLiNER2).
     try:
         _before_bn = len(edges)
@@ -16952,25 +17477,77 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     pass
         # Dates ride the temporal lane (event_date), never the scalar claim.
         _sp_atomic = [_av for _av in _sp_atomic if (_av.get("type") or "").lower() != "date"]
-        # OVERCLAIM GUARD — drop a claim that is only a FRAGMENT of an identifier run the cue-gated
-        # deriver already captured WHOLE (see _atomic_claim_is_run_fragment). This must run BEFORE the
-        # possessive-attribute connect below, because that connect mints an edge straight off this
-        # list — by the time _suppress_atomic_claimed_twins sees it, the wrong edge already exists and
-        # carries the detector's own rel_type, which that function deliberately never drops.
-        try:
-            _sp_hosted = [(_e.get("object") or "") for _e in edges]
-            _sp_kept = [_av for _av in _sp_atomic
-                        if not _atomic_claim_is_run_fragment(_av.get("value"), _sp_hosted)]
-            if len(_sp_kept) != len(_sp_atomic):
-                log.info("sentence_pipeline.atomic_fragment_claim_dropped",
-                         user_id=user_id[:8], dropped=len(_sp_atomic) - len(_sp_kept),
-                         note="scalar_atomic matched only PART of an identifier run already captured "
-                              "whole by a cue-gated chain — the half-value claim is discarded so it "
-                              "cannot mint a second, wrong identifier beside the correct one")
-                _sp_atomic = _sp_kept
-        except Exception as _fre:  # noqa: BLE001 — fail-safe: keep today's claims
-            pass
         if _sp_atomic:
+            # ── POSSESSIVE-ATTRIBUTE CONNECT (typed scalar → its ANCHOR, deterministic) ───────────
+            # "My phone number is 519-555-0123" / "My email address is X@Y" — the atomic value is the
+            # POSSESSOR's attribute. Bind it to the grammatical possessor of its possessive-attribute
+            # copula (user for 1st-person, else the genitive owner) and emit the TYPED atomic edge on
+            # THAT anchor, so the dumb walk surfaces it (the lean walk only reads a scalar anchored ON
+            # the querying entity — a scalar the LLM binder orphaned onto a spun-off "my phone"
+            # sub-entity is unreachable, the live recall miss). This PRE-EMPTS the LLM residue binder
+            # for these values and drops the deriver's mangled numeric FRAGMENT twin ("0123" carved
+            # out of the phone by spaCy's hyphen split). Grammar-only, subject-agnostic, fail-safe.
+            _pa_bound: dict = {}  # value_lower -> possessor
+            try:
+                from src.extraction.linguistics import possessor_of_possessive_attribute as _poss_of
+                for _av in _sp_atomic:
+                    _av_val = (_av.get("value") or "").strip()
+                    _av_rel = (_av.get("rel_type") or "").strip().lower()
+                    if not _av_val or not _av_rel:
+                        continue
+                    _poss = _poss_of(text, _av_val)
+                    if not _poss:
+                        continue
+                    # RE-ANCHOR unconditionally (do NOT skip an already-hosted value): the deriver
+                    # commonly hosts the FULL atomic on the WRONG subject — a spun-off sub-entity
+                    # ("my email") or a grown-rel twin on the anchor ("email_address") — and the
+                    # value being "already an object" is exactly the orphan we must correct. Drop any
+                    # existing edge that hosts THIS value on a NON-possessor subject (the sub-entity
+                    # orphan), then emit the TYPED atomic on the possessor. A same-value grown-rel
+                    # twin already ON the possessor is left for twin-suppression (rel != atomic_rel).
+                    edges = [
+                        _e for _e in edges
+                        if not ((_e.get("object") or "").strip().lower() == _av_val.lower()
+                                and (_e.get("subject") or "").strip().lower() != _poss)
+                    ]
+                    edges.append({
+                        "subject": _poss,
+                        "rel_type": _av_rel,
+                        "object": _av_val,
+                        "object_datatype": _datatype_for_detector_label(_av.get("type")),
+                        "fact_provenance": "user_stated",
+                    })
+                    _pa_bound[_av_val.lower()] = _poss
+                    log.info("sentence_pipeline.possessive_attribute_connect",
+                             user_id=user_id[:8], rel=_av_rel, possessor=_poss[:24],
+                             note="typed atomic scalar bound to its possessive-attribute anchor "
+                                  "so the dumb walk surfaces it (not orphaned on a sub-entity)")
+                # Drop the deriver's mangled NUMERIC FRAGMENT twin of a bound atomic (same anchor,
+                # object is a pure-digit PROPER substring of the bound value's digits — e.g. "0123"
+                # from "519-555-0123"). Scoped + deterministic (never touches a full/other value).
+                if _pa_bound:
+                    _kept_pa = []
+                    for _e in edges:
+                        _es = (_e.get("subject") or "").strip().lower()
+                        _eo = (_e.get("object") or "").strip().lower()
+                        _eod = _eo.replace("-", "").replace(" ", "")
+                        _drop = False
+                        if _eod and _eod.isdigit():
+                            for _bv, _bp in _pa_bound.items():
+                                _bvd = _bv.replace("-", "").replace(" ", "")
+                                if _es == _bp and _eo != _bv and len(_eod) < len(_bvd) \
+                                        and _eod in _bvd:
+                                    _drop = True
+                                    break
+                        if not _drop:
+                            _kept_pa.append(_e)
+                    edges = _kept_pa
+            except Exception as _pae:  # noqa: BLE001 — fail-safe: never break the harvest
+                log.debug("sentence_pipeline.possessive_attribute_connect_failed",
+                          error=str(_pae)[:160])
+            # SNAPSHOT the deriver edges BEFORE suppression — the coordination fallback below restores
+            # any dropped scalar the residue binder fails to replace, so a claimed value is NEVER lost.
+            _edges_pre_atomic = list(edges)
             edges, _at_dropped = _suppress_atomic_claimed_twins(edges, _sp_atomic)
             if _at_dropped:
                 seen = {(_e.get("subject"), _e.get("rel_type"),
@@ -16994,6 +17571,48 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             if _sp_atomic_edges:
                 log.info("sentence_pipeline.atomic_values_claimed",
                          user_id=user_id[:8], added=len(_sp_atomic_edges))
+            # ── COORDINATION FALLBACK ("we don't forget", the scalar lane) ───────────────────────
+            # A claimed atomic value whose deriver twin was suppressed but which the residue binder
+            # did NOT replace would otherwise be LOST (the live edges=0 / entity_attributes=0 bug).
+            # For every claimed value not now present as an edge object: (1) RESTORE the deriver's own
+            # edge (the spine's ``(core-1, ip_address, "10.0.0.1")`` — already an object_datatype scalar
+            # leaf that lands in entity_attributes), else (2) if the deriver never produced one either,
+            # route the sentence to Class C (store_context) so the dropped scalar is never silently
+            # forgotten. Deterministic, subject-agnostic, fail-safe.
+            _present_vals = {(_e.get("object") or "").strip().lower() for _e in edges}
+            _restored = 0
+            for _av in _sp_atomic:
+                _val = (_av.get("value") or "").strip().lower()
+                if not _val or _val in _present_vals:
+                    continue
+                for _pe in _edges_pre_atomic:
+                    if (_pe.get("object") or "").strip().lower() != _val:
+                        continue
+                    _key = (_pe.get("subject"), _pe.get("rel_type"), _val)
+                    if all(_key) and _key not in seen:
+                        seen.add(_key)
+                        edges.append(_pe)
+                        _restored += 1
+                    _present_vals.add(_val)
+            _orphaned_vals = [
+                (_av.get("value") or "").strip()
+                for _av in _sp_atomic
+                if (_av.get("value") or "").strip()
+                and (_av.get("value") or "").strip().lower() not in _present_vals
+            ]
+            if _restored:
+                log.info("sentence_pipeline.atomic_twin_restored",
+                         user_id=user_id[:8], restored=_restored,
+                         note="residue binder produced no replacement for a suppressed scalar twin — "
+                              "restored the deriver's own scalar edge so the value lands in "
+                              "entity_attributes (never lost)")
+            if _orphaned_vals and text and text.strip() and text.strip() not in _residue_sentences:
+                # No deriver edge and no residue-binder edge carried this value → hold it in Class C.
+                _residue_sentences.append(text.strip())
+                log_crit(log, "sentence_pipeline.atomic_value_orphaned_to_c",
+                         user_id=(user_id or "")[:8], values=_orphaned_vals[:10],
+                         note="a claimed atomic scalar could not be bound to any subject/edge — "
+                              "routed to Class C (store_context) so it is not silently forgotten")
     except Exception as _spae:  # noqa: BLE001 — fail-safe: the atomic claim never breaks the harvest
         log.debug("sentence_pipeline.atomic_claim_failed", error=str(_spae)[:160])
 
@@ -17015,7 +17634,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # clean-sentence path returns edges to the caller for /ingest but never fires those helpers,
     # so the rung never lands. We mirror those call sites HERE, before returning the edges.
     #
-    # THIN LEAF ON THE EXISTING SEEDED BACKBONE (Alexander's nuance): we do NOT grow a fresh
+    # THIN LEAF ON THE EXISTING SEEDED BACKBONE (Christopher's nuance): we do NOT grow a fresh
     # deep ladder per entity. _attach_to_seeded_backbone stages exactly ONE depth-1 endpoint rung
     # (<concept> <hier_rel> <seeded_taxonomy_anchor>) connecting the leaf to the already-seeded
     # canonical backbone the walk traverses; the bounded mid-chain stays the async re_embedder's
@@ -17347,6 +17966,28 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                            "even after the chains + LLM fill → held in Class C (store_context), the "
                            "minimized last resort. GROW the ontology so this trends to zero (§10.3)."))
 
+    # POSSESSIVE-PRESUPPOSITION RECOVERY (mixed turn): a turn with BOTH a declarative aside AND a
+    # dropped question clause reaches here — the dropped clause's first-person possessive ("…for my
+    # Sony A7R IV?") is still user-owned truth. Re-derive the accumulated dropped clauses and union
+    # ONLY their presupposed edges, deduped against what the main loop already emitted. No-op when no
+    # interrogative clause was dropped (empty accumulator) → byte-identical to today.
+    if _dropped_interro_clauses:
+        try:
+            _existing_keys = {
+                (e.get("subject"), e.get("rel_type"), (e.get("object") or "").strip().lower())
+                for e in edges
+            }
+            _presup = await _recover_possessive_presupposition_edges(
+                _dropped_interro_clauses, user_id, reference, _presup_seen)
+            for _pe in _presup:
+                _k = (_pe.get("subject"), _pe.get("rel_type"),
+                      (_pe.get("object") or "").strip().lower())
+                if _k not in _existing_keys:
+                    _existing_keys.add(_k)
+                    edges.append(_pe)
+        except Exception as _pre:  # noqa: BLE001 — recovery never blocks the harvest result
+            log.debug("sentence_pipeline.presupposition_recover_failed", error=str(_pre)[:120])
+
     log.info("sentence_pipeline.done", user_id=user_id[:8],
              sentences=len(_declarative), dropped_interro=_dropped, edges=len(edges),
              residue_to_c=len(_residue_sentences))
@@ -17568,6 +18209,26 @@ async def harvest_spans(req: RewriteRequest) -> dict:
             _preference_edges = _detect_preference_states(_declarative_text)
         except Exception:
             _preference_edges = []
+        # DESIRE / PREFERENCE capture (CAPTURE-GAP fix): a 1st-person volition predication
+        # ("I want to learn Spanish", "I'd love to attend the festival", "I like jazz") — the
+        # construction the occurrence lanes deliberately REJECT (intention ≠ occurrence), so the
+        # preference would otherwise DROP entirely. Deterministic (bounded volition-verb class +
+        # xcomp/dobj grammar, NO domain list); negated preferences skipped. Emits (user, <verb>,
+        # <object>) — grown by the ontology engine (miss→grow). Runs on the same buried-fact path so
+        # a preference stated INSIDE a question turn is captured too.
+        _desire_edges: list[dict] = []
+        try:
+            from src.extraction.linguistics import analyze_desire_predication as _desire_pred_h
+            for _dp in (_desire_pred_h(_declarative_text) or []):
+                if _dp.get("negated"):
+                    continue
+                _dp_rel = (_dp.get("rel_type") or "").strip().lower()
+                _dp_obj = (_dp.get("object") or "").strip().lower()
+                if _dp_rel and _dp_obj:
+                    _desire_edges.append({"subject": "user", "rel_type": _dp_rel,
+                                          "object": _dp_obj, "fact_provenance": "user_stated"})
+        except Exception:
+            _desire_edges = []
         # NAMING capture (RC2 seam): "I have a dog named Rex" / "a server called Apollo" — the
         # verb-lift over-strips "named"→"nam" and drops the name; this deterministic seam OWNS the
         # naming construction → a valid (head-noun, also_known_as, ProperName) edge. The verb-lift
@@ -17624,7 +18285,7 @@ async def harvest_spans(req: RewriteRequest) -> dict:
         if not spans:
             # No clause at all, but a feeling/preference/naming/named-instance/event may still be
             # present → alone.
-            _seam_edges = (_feeling_edges + _preference_edges + _naming_edges
+            _seam_edges = (_feeling_edges + _preference_edges + _desire_edges + _naming_edges
                            + _named_instance_edges + _event_edges)
             # MISSING-SLOT residue: even with no fact-bearing span, a hostless DATE ("...on March 3")
             # or a hostless structured VALUE ("My server has ip 192.168.1.50") can still parse and
@@ -17677,7 +18338,7 @@ async def harvest_spans(req: RewriteRequest) -> dict:
             # GLiNER2 unavailable → still rescue a hostless DATE / structured VALUE via the
             # missing-slot gap-filler (the deterministic seams + atomic format-grammar do not need
             # GLiNER2). Guarded against the deterministic seam edges already captured above.
-            _seam_edges = (_feeling_edges + _preference_edges + _naming_edges
+            _seam_edges = (_feeling_edges + _preference_edges + _desire_edges + _naming_edges
                            + _named_instance_edges + _event_edges)
             try:
                 _seam_edges = _seam_edges + await _fill_missing_slots(_declarative_text, _seam_edges, user_id)
@@ -17754,6 +18415,12 @@ async def harvest_spans(req: RewriteRequest) -> dict:
             if _key not in seen:
                 seen.add(_key)
                 edges.append(_pe)
+        # Merge desire/volition preference edges (capture-gap seam), deduped by (subject, rel, object).
+        for _de in _desire_edges:
+            _key = (_de["subject"], _de["rel_type"], _de["object"])
+            if _key not in seen:
+                seen.add(_key)
+                edges.append(_de)
         # Merge naming edges (RC2 seam), deduped against `seen` by (subject, rel, object).
         # Object is the proper name verbatim (the alias) — NOT lowercased into the dedup key on
         # the same footing as the others, but the seam already emits a clean surface; key on the
@@ -17974,7 +18641,7 @@ async def _ground_self_predication(text: str, user_id: str) -> list[dict]:
                 "The user is describing THEMSELF with 'I am X' / \"I'm X\". Decide what X represents "
                 "about the user and pick the single best-fit relation:\n"
                 "- feels: an emotion / mood / transient affective state (worried, anxious, happy, exhausted).\n"
-                "- also_known_as: their name, nickname, or what they go by (Alex, Ace).\n"
+                "- also_known_as: their name, nickname, or what they go by (Chris, Ace).\n"
                 "- occupation: their job / role / profession (teacher, engineer, student).\n"
                 "- none: anything else, a NEGATION ('I am not X'), or unclear.\n"
                 'Respond with STRICT JSON only: {"relation":"' + _rels + ' | none","object":"<the core word, lowercase>"}.'
@@ -18005,7 +18672,7 @@ async def _ground_self_predication(text: str, user_id: str) -> list[dict]:
 async def ground_self_predication_endpoint(req: RewriteRequest) -> dict:
     """Backend seam for the self-predication grounding router (see _ground_self_predication).
     The MCP ingest path calls this as a last resort when /extract/rewrite + /harvest-spans
-    yield nothing, so a bare-copula self-statement ("I am worried", "I am Alex") is grounded
+    yield nothing, so a bare-copula self-statement ("I am worried", "I am Chris") is grounded
     and routed to the right relation instead of dropped or mis-filed. Fail-safe → {edges:[]}."""
     user_id = _require_resolvable_user_id(req.user_id, "/ground-self-predication")
     # Freeze switch (knowledge-store mode): pure ingest feeder (its ONLY caller ingests
@@ -18342,10 +19009,13 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
         # one env var). FAIL-SAFE: detect-only never zeroes extraction — the trigger-span +
         # verb-lift + scalar lanes below remain the relation source and are themselves
         # fail-safe (any failure leaves prior edges untouched).
+        # PER-REQUEST OVERRIDE: the async DOCUMENT lane forces LLM relation extraction
+        # (documents are dense domain prose the deterministic spine mis-parses) even when the
+        # GLOBAL flag is detect-only — WITHOUT flipping extraction for the interactive path.
         _LLM_RELATION_EXTRACTION = (
             os.getenv("LLM_RELATION_EXTRACTION", "true").lower()
             not in ("0", "false", "no")
-        )
+        ) or bool(getattr(req, "force_relation_extraction", False))
 
         async def _extract_chunk(chunk_sentences: list[str], chunk_idx: int) -> list[dict]:
             """Extract triples from a single chunk."""
@@ -19272,6 +19942,7 @@ def _delete_from_qdrant(
     collection: str,
     qdrant_url: str,
     source_table: str = "facts",
+    user_id: str = None,
 ) -> None:
     """Collision-safe Qdrant cleanup for retracted facts.
 
@@ -19292,6 +19963,12 @@ def _delete_from_qdrant(
     """
     if not fact_ids:
         return
+    # Partition scope: in shared_payload mode every delete is AND-ed with the seat's
+    # tenant filter (require_tenant throws if unresolved). None in collection_per_seat →
+    # byte-for-byte the legacy per-seat delete shapes.
+    from src.api.qdrant_partition import tenant_filter_for as _qp_tflt_for
+    _tflt = _qp_tflt_for(user_id)
+    qp_require_tenant(_tflt, op="delete", collection=collection)
     _tables = ("facts", "staged_facts") if source_table == "both" else (source_table,)
     for _st in _tables:
         # Primary: filtered delete by (source_table, fact_id) — collision-safe.
@@ -19299,14 +19976,11 @@ def _delete_from_qdrant(
             for _fid in fact_ids:
                 _http_client_sync.post(
                     f"{qdrant_url}/collections/{collection}/points/delete",
-                    json={
-                        "filter": {
-                            "must": [
-                                {"key": "source_table", "match": {"value": _st}},
-                                {"key": "fact_id", "match": {"value": _fid}},
-                            ]
-                        }
-                    },
+                    json=qp_build_delete_body(_tflt, must=[
+                        {"key": "source_table", "match": {"value": _st}},
+                        {"key": "fact_id", "match": {"value": _fid}},
+                    ]),
+                    headers=qp_qdrant_headers(),
                     timeout=5.0,
                 )
         except Exception as e:
@@ -19319,7 +19993,10 @@ def _delete_from_qdrant(
             # POST /points/delete with a points-selector body; httpx .delete() takes no body.
             resp = _http_client_sync.post(
                 f"{qdrant_url}/collections/{collection}/points/delete",
-                json={"points": [derive_qdrant_point_id(_st, _fid) for _fid in fact_ids]},
+                json=qp_build_delete_body(_tflt, point_ids=[
+                    qp_resolve_point_id(user_id, _st, _fid, "memory") for _fid in fact_ids
+                ]),
+                headers=qp_qdrant_headers(),
                 timeout=5.0,
             )
             if resp.status_code not in (200, 404):
@@ -19839,6 +20516,139 @@ def _idempotency_cached_facts_present(schema_name: Optional[str], cached_respons
             conn.close()
 
 
+# ── THE HARD LINE (ingest enforcement): a TYPE-word is not a NAME ────────────────
+# A common noun ("ticket", "issue", "refund", "address") is a TYPE — an L4 place, what a
+# thing IS. A NAME is a proper name / user-given label (Diane, Fraggle, "Capital One") — the
+# naming layer (is_preferred alias). On the /extract/rewrite LLM path a dense multi-entity
+# sentence can emit relational edges whose subject/object is a bare common noun; the dumb
+# registry mints EVERY new entity surface is_preferred=true unconditionally (entity_registry/
+# registry.py:214-218), so those bare type-nouns land as preferred NAMES — a category error
+# across the hard line that renders as garbage recall ("Issues is address").
+#
+# We enforce the line at INGEST — NOT in the dumb registry, and NOT in the re-embedder — for a
+# load-bearing reason: the ONLY reliable type-vs-name signal is spaCy NER on the ORIGINAL-CASED
+# surface, and casing exists only here. entity_aliases lowercases at storage (registry.py:256),
+# and lowercasing DESTROYS the NER signal (empirically: "Capital One" -> ORG, but "capital one"
+# -> [NOUN, NUM] with NO entity span — indistinguishable from a common-noun phrase). A
+# re-embedder pass over the stored (lowercased) aliases would therefore false-positive DEMOTE a
+# real org name, violating "never strip a real name" / authority(user>seed>growth). So the
+# decision is made here, on the cased surface, and the registry stays dumb (told, not detecting).
+def _surface_is_bare_common_type_noun(surface: str) -> bool:
+    """Deterministic THE-HARD-LINE test on the ORIGINAL-CASED surface — is `surface` a bare
+    COMMON TYPE-NOUN (a place / what-a-thing-IS) rather than a NAME (what it is CALLED)?
+
+    Signal (spaCy en_core_web_sm POS + NER, NO name/noun word list — subject-agnostic). Uses
+    BOTH complementary singletons: `_get_nlp_ner()` is NER-only (tagger/parser disabled → gives
+    entity spans, no POS); `_get_nlp()` is POS/parse-only (NER disabled → gives POS tags). We
+    need both — NER to catch a proper name (Diane/"Capital One"), POS to confirm a common noun:
+      NAME  -> any NER named-entity span (PERSON/ORG/GPE/PRODUCT/…) OR any PROPN token
+               -> return False (STAYS a name; the naming layer owns it).
+      TYPE  -> at least one common-NOUN token, NO PROPN token, NO NER entity span, and every
+               token is a common lexical class (NOUN/ADJ/DET/ADP/compound glue)
+               -> return True (a type-word, must not be a preferred NAME).
+
+    Fail-safe (authority: user > seed > growth — never strip a real name): empty surface,
+    a value/identifier (digit-bearing), EITHER spaCy singleton unavailable, a parse error, or
+    any ambiguity (e.g. a bare word spaCy tags VERB) -> return False (leave as-is). Conservative
+    by construction: it only ever RECLASSIFIES a confidently-common noun; anything uncertain
+    keeps its name status. NER being unavailable is treated as fail-safe leave (we refuse to
+    demote without the name-signal), so we can never strip a real name for lack of the check.
+    """
+    if not surface or not surface.strip():
+        return False
+    s = surface.strip()
+    # A value/identifier (contains a digit) is NEVER a bare type-noun — it is a scalar/value
+    # binding and must keep whatever the value lane assigned. Fail-safe leave.
+    if any(ch.isdigit() for ch in s):
+        return False
+    # A token whose NON-INITIAL characters carry an uppercase (i.e. not plain Titlecase) is a
+    # styled proper/product name — CamelCase ("iPhone", "TrueNAS"), acronym-prefixed
+    # ("OPNsense"), or all-caps ("ITIL") — that NER often misses on a bare surface. Deterministic
+    # casing marker, NO word list. Fail-safe leave (a common type-noun is lower/Titlecase only).
+    if any(any(ch.isupper() for ch in tok[1:]) for tok in s.split()):
+        return False
+    try:
+        from src.extraction.linguistics import _get_nlp, _get_nlp_ner
+        nlp_pos = _get_nlp()      # POS/parse (NER disabled)
+        nlp_ner = _get_nlp_ner()  # NER (tagger/parser disabled)
+    except Exception:
+        return False
+    # Require BOTH signals — without the NER name-signal we refuse to demote (fail-safe leave).
+    if nlp_pos is None or nlp_ner is None:
+        return False
+    try:
+        doc_ner = nlp_ner(s)
+        # NAME signal 1: spaCy NER recognized a proper named-entity anywhere in the surface.
+        if len(doc_ner.ents) > 0:
+            return False
+        doc_pos = nlp_pos(s)
+    except Exception:
+        return False
+    toks = [t for t in doc_pos if not t.is_space]
+    if not toks:
+        return False
+    # NAME signal 2: any proper-noun token (PROPN) — a proper name (e.g. "Fraggle").
+    if any(t.pos_ == "PROPN" for t in toks):
+        return False
+    # TYPE signal: at least one common NOUN and every token is a common lexical class.
+    # (DET/ADJ/ADP/PUNCT are common-noun-phrase glue; NUM/VERB/PROPN excluded → any of them
+    #  makes the surface ambiguous → fail-safe leave.)
+    _COMMON_POS = {"NOUN", "ADJ", "DET", "ADP", "PUNCT", "CCONJ", "PART"}
+    if not any(t.pos_ == "NOUN" for t in toks):
+        return False
+    if any(t.pos_ not in _COMMON_POS for t in toks):
+        return False
+    return True
+
+
+def _demote_bare_type_word_alias(db, entity_id: str, alias_lower: str) -> bool:
+    """THE HARD LINE enforcement (non-destructive): a bare common TYPE-noun surface must not be
+    a preferred NAME. Flip its `is_preferred` alias to false so the read-time preferred-name
+    resolver (main.py:~165, ORDER BY is_preferred DESC) no longer renders it as a chosen name.
+
+    NON-DESTRUCTIVE: the alias row is kept (we never delete user data) — only `is_preferred`
+    flips and `preference_source` is stamped 'inferred' (engine decision, not user choice).
+
+    AUTHORITY GUARD (user > seed > growth): only demotes an alias whose `preference_source` is
+    ENGINE-weak ('unspecified'/'inferred'/'provisioned'/'merge') — a resolve()-minted default.
+    A user-chosen name (`preference_source='user_stated'`, e.g. an explicit pref_name) or a
+    rel-default is NEVER touched, even if the surface happens to be a common noun the user chose.
+
+    SAVEPOINT-guarded + fail-safe: any error rolls back only this probe and returns False; a
+    failure never demotes and never leaves the shared connection aborted. Returns True on demote.
+    """
+    if not entity_id or not alias_lower:
+        return False
+    try:
+        with db.cursor() as _dc:
+            _dc.execute("SAVEPOINT sp_hardline_demote")
+            try:
+                _dc.execute(
+                    "UPDATE entity_aliases SET is_preferred = false, "
+                    "preference_source = 'inferred' "
+                    "WHERE entity_id = %s AND alias = %s AND is_preferred = true "
+                    "AND preference_source IN "
+                    "  ('unspecified', 'inferred', 'provisioned', 'merge')",
+                    (entity_id, alias_lower),
+                )
+                _demoted = _dc.rowcount > 0
+                _dc.execute("RELEASE SAVEPOINT sp_hardline_demote")
+                if _demoted:
+                    log.info("ingest.hardline_type_word_demoted",
+                             entity=str(entity_id)[:16], alias=alias_lower,
+                             reason="bare_common_type_noun_is_not_a_name")
+                return _demoted
+            except Exception as _de:
+                _dc.execute("ROLLBACK TO SAVEPOINT sp_hardline_demote")
+                log.error("ingest.hardline_demote_failed",
+                          entity=str(entity_id)[:16], alias=alias_lower, error=str(_de)[:200])
+                return False
+    except Exception as _de2:
+        log.error("ingest.hardline_demote_failed",
+                  entity=str(entity_id)[:16], alias=alias_lower, error=str(_de2)[:200])
+        return False
+
+
 @app.post("/ingest")
 async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     """
@@ -19866,31 +20676,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # SECURITY (Phase 0): fail loud on absent identity instead of the silent
     # "anonymous" shared-pool collapse (which also skipped SET search_path).
     user_id = _require_resolvable_user_id(req.user_id, "/ingest")
-
-    # ── OBSERVED DISPLAY CASE (migration 214) ──────────────────────────────────────────
-    # `req.text` is the VERBATIM user turn and is the LAST place the original casing of a
-    # name still exists: by the time an edge reaches the registry the surface has been
-    # `.strip().lower()`-ed at several hundred independent sites, because "all string compares
-    # on pre-lowercased values" is a load-bearing invariant of this pipeline (measured on the
-    # dev line: `entity_registry.resolve_start` logs `original_name=diane`, never `Diane`). So
-    # the casing is RETAINED here, at ingest, from the raw turn — not reconstructed at render
-    # time, which would be truecasing and cannot recover `eBay`/`IBM`/`iPhone`. See
-    # src/extraction/display_case.py for the two HARD-LINE guards (sentence-initial evidence is
-    # discarded; only PROPN runs are observed) and the rejected alternative.
-    #
-    # Bound as a ContextVar rather than threaded as a parameter because `EntityRegistry` is
-    # constructed at dozens of points inside this handler and one missed site silently reverts
-    # that entity to lowercase — the same reasoning as `rel_type_overlay._current_schema`.
-    # NOT reset in a `finally`: contextvars are copied per asyncio Task, so a value set inside
-    # this handler cannot escape to another request, and EVERY /ingest binds its own map before
-    # any alias write, so no request can inherit a previous one's. Fail-safe: no spaCy / parse
-    # error → `{}` → every display_form is NULL → the renderer falls back to `alias`, i.e.
-    # byte-identical to today.
-    try:
-        from src.extraction.display_case import observe_display_forms, set_display_forms
-        set_display_forms(observe_display_forms(req.text or ""))
-    except Exception as _dce:  # noqa: BLE001 — casing is presentation; never fail an ingest
-        log.warning("ingest.display_case_observe_failed", error=str(_dce)[:160])
 
     # Derive immutable slug from UUID (never from mutable user attributes)
     if user_id != "anonymous":
@@ -20878,7 +21663,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             )
 
     # Guard: if another named entity is mentioned with a preference signal
-    # (e.g., "Theodore prefers alice"), skip auto-synthesis for the user.
+    # (e.g., "Desmond prefers alice"), skip auto-synthesis for the user.
     # The LLM already extracted the correct entity assignment.
     _third_party_pref = re.compile(
         r'([A-Z][a-z]+)\s+(?:prefers?|goes\s+by|known\s+as|prefer[s]?\s+to\s+be\s+called)\s+([a-z]+)',
@@ -20934,7 +21719,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 _unresolved = [
                     _av for _av in _atomic
                     if _av["value"].lower() not in _existing_objects
-                    and not _atomic_claim_is_run_fragment(_av["value"], _existing_objects)
                 ]
                 if _unresolved:
                     try:
@@ -21073,6 +21857,25 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
             # fabricate precision for a NULL date.
             if _req_event_date and not _req_event_date_granularity:
                 _req_event_date_granularity = _event_date_granularity(_req_event_date)
+            # DURATIVE-INCEPTION OVERRIDE (duration-since-now cluster, possession-edge + stray-
+            # future-date fix): a "for <N> <unit> [now]" durative ("I've HAD my cat for 9 months
+            # now") makes dateparser mis-read the bare "9 months now" as a FUTURE date
+            # (reference + 3mo) — which then stamps every SECONDARY edge lacking its own date (the
+            # possession has_pet/owns edge, the instance_of type edge) with a spurious upcoming
+            # date, so "how long have I had X" resolves the possession anchor to the future and
+            # computes "upcoming". The state's real INCEPTION is reference − duration (PAST) — the
+            # SAME value the deriver binds to the governing verb. Resolve it here and use it as the
+            # request event_date so the secondary edges inherit the inception, never the future
+            # garbage. Deterministic, subject-agnostic; only fires on the durative construction.
+            try:
+                from src.extraction.linguistics import durative_inception_from_text as _dift
+                _dur_iso, _dur_gran = _dift(_text_for_temporal, _ingest_reference)
+                if _dur_iso:
+                    _req_event_date = _dur_iso
+                    _req_event_date_granularity = _dur_gran or _req_event_date_granularity
+                    _req_temporal_status = "past"
+            except Exception:  # noqa: BLE001 — fail-safe: keep the resolver's result
+                pass
             if _ttemp_db:
                 try:
                     _ttemp_db.close()
@@ -21096,12 +21899,6 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     pass
 
     edges = list(edges_dict.values())
-
-    # FUNCTION-WORD REL_TYPE GUARD. Both lanes (LLM /extract/rewrite relations and caller-supplied
-    # req.edges) converge here, BEFORE the novel-rel mint below — so an unknown, all-closed-class
-    # candidate ("not") is refused once, in one place, and can neither become a rel_types row nor
-    # carry a stored fact. Known rel_types are untouched. See _drop_function_word_rel_edges.
-    edges = _drop_function_word_rel_edges(edges)
 
     # DATE HOST-SELECTION (the Feb-27 mis-host fix): when an OCCURRENCE edge (temporal_class='event'
     # — e.g. participated_in) exists in THIS request, the parsed request-level event_date BELONGS to
@@ -21624,7 +22421,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         else:
                             # Pre-check: if this alias is already registered to the user anchor,
                             # short-circuit here — prevents ghost entity creation for the user's
-                            # own names (e.g., "Alex" resolving to 43033395 instead of user UUID).
+                            # own names (e.g., "Chris" resolving to 43033395 instead of user UUID).
                             _subject_is_user_alias = False
                             # SAVEPOINT-guard so a probe failure rolls back ONLY the probe
                             # and never leaves the shared db connection aborted (fail-loud).
@@ -21674,6 +22471,15 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                  error=str(_e),
                                  traceback=traceback.format_exc())
                         raise HTTPException(status_code=500, detail="Unexpected error resolving entity")
+
+                    # ── THE HARD LINE: a bare common TYPE-noun subject is not a NAME ──
+                    # If the CASED subject surface is a bare common noun (not a proper name /
+                    # NER entity), the dumb registry just minted it is_preferred=true — demote
+                    # it (non-destructive, authority-guarded) so a type-word never stands as a
+                    # chosen NAME. Never touches the user anchor. Cased surface = _raw_subject.
+                    if (canonical_subject and canonical_subject != user_entity_id
+                            and _surface_is_bare_common_type_noun(_raw_subject)):
+                        _demote_bare_type_word_alias(db, canonical_subject, _subj_lower)
 
                     # ── STRONG-INGEST ENTITY GROUNDING: RE-TYPE mis-slotted edges ──
                     # POSITION-CRITICAL: this runs BEFORE the scalar/relational object
@@ -21887,6 +22693,16 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                      error=str(_e),
                                      tb=tb_str)
                             raise HTTPException(status_code=500, detail="Unexpected error resolving entity")
+
+                    # ── THE HARD LINE: a bare common TYPE-noun object is not a NAME ──
+                    # Only for RELATIONAL objects (scalar objects are STRING values, never
+                    # entities). A bare common-noun object surface (incl. a type/class object of
+                    # instance_of) must not stand as a preferred NAME. Proper names (Fraggle,
+                    # Diane, "Capital One") return False from the test and are left untouched.
+                    if (not _is_scalar_rel_type(edge.rel_type)
+                            and canonical_object and canonical_object != user_entity_id
+                            and _surface_is_bare_common_type_noun(_raw_object)):
+                        _demote_bare_type_word_alias(db, canonical_object, _obj_lower)
 
                     # Record display name mapping for alias sync (Bug #3 fix)
                     # Only record for relationship facts where canonical_object is a UUID
@@ -22140,7 +22956,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # Type inference for hierarchy facts (dprompt-127 strengthening + dprompt-127-Layer2-bidirectional)
                     # When is_hierarchy_rel=true (instance_of, subclass_of), infer subject's type from object
-                    # Pattern: (mittens, instance_of, cat) → look up cat's type, or infer from entity_taxonomies
+                    # Pattern: (whiskers, instance_of, cat) → look up cat's type, or infer from entity_taxonomies
                     # Metadata-driven: Uses entity_taxonomies to map entity names to types (e.g., "cat" → Animal)
                     # GROWTH LAYER: When object has misclassified type (Location for an animal name), correct it bidirectionally
                     if rel_meta.get("is_hierarchy_rel"):
@@ -22375,17 +23191,33 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # pref_name edges are ALWAYS preferred — the rel_type itself is the signal.
                         # For also_known_as: only preferred if explicitly flagged or if the object
                         # was marked preferred by a scalar identity rel_type edge in the same batch.
+                        #
+                        # SKOS Reference §5 (Labels), integrity conditions S13/S14
+                        # (https://www.w3.org/TR/skos-reference/#L1567): skos:prefLabel and
+                        # skos:altLabel are PAIRWISE DISJOINT (S13) and a resource has at most ONE
+                        # prefLabel per language (S14) — an altLabel is NEVER the preferred display
+                        # label. pref_name carries prefLabel semantics; also_known_as carries
+                        # altLabel semantics. BOTH declare tail_types={SCALAR} (also_known_as is
+                        # scalar since migration 039), so the OLD `is_scalar_identity` term
+                        # force-preferred EVERY altLabel: a title-cased common noun ("Ideas" /
+                        # "Zorptron") mis-tagged PROPN → (user, also_known_as, ideas) then became the
+                        # user's display NAME (a HARD LINE / SKOS violation — and it then blocked the
+                        # user's real-name correction from landing). Preferred-ness is the edge's OWN
+                        # prefLabel signal (is_preferred_label — set True on pref_name and on an
+                        # explicitly-preferred name, False on a plain also_known_as) OR the same-batch
+                        # scalar-identity marker (preferred_objects), NOT the SCALAR tail alone. This
+                        # realigns the code with its own contract stated three lines above.
+                        # Edge/metadata-concept driven (constraint 5): NO rel-name equality gate.
                         edge_rel_meta = _rel_meta(edge.rel_type.lower()) or None
                         is_scalar_identity = edge_rel_meta and "SCALAR" in edge_rel_meta.get("tail_types", [])
                         is_pref = (
-                            is_scalar_identity or
                             edge.is_preferred_label or
                             edge.object.lower() in preferred_objects
                         )
                         # ROLE-ALIAS NON-PREFERENCE (Fix B, Part 2 — flag-gated): a ROLE noun
                         # (mother/sister/colleague) registered as an also_known_as alias of a NAMED
                         # person is a SLOT, not the display name — it must NEVER win the preferred
-                        # display over the proper NAME (so recall renders "Carol", not "mother").
+                        # display over the proper NAME (so recall renders "Diane", not "mother").
                         # When the alias object is in the kinship/relational cue class, register it
                         # NON-preferred. THE HARD LINE: the role is a slot on the named instance; the
                         # NAME is the display. Metadata-driven (cue overlay), subject-agnostic, NO
@@ -22478,7 +23310,22 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                         # dBug-076: Block pref_name/also_known_as alias registration
                         # if the entity has an unresolved name conflict. Writing identity
                         # aliases to a potentially-split entity poisons display names.
-                        if edge.rel_type.lower() in ('pref_name', 'also_known_as'):
+                        #
+                        # USER-IS-TRUTH EXCEPTION (fix b): an AUTHORITATIVE edge — a user-stated
+                        # correction / explicit preferred name (rank 5) — must NEVER be `continue`d
+                        # past by a pending conflict that is BLOCKING it; otherwise the user's own
+                        # correction can never resolve the very conflict freezing it out (recall
+                        # stays stuck on the wrong name). Only NON-authoritative edges defer while a
+                        # conflict is pending. The registry collision path (registry.py) then
+                        # deterministically demotes the weaker incumbent via _PREFERENCE_RANK instead
+                        # of re-staging. pref_source is derived above (~21840); is_correction rides
+                        # on the edge. Fail-safe: unknown/weak source → defer (today's behavior).
+                        _edge_is_authoritative = (
+                            bool(getattr(edge, 'is_correction', False))
+                            or pref_source == 'user_stated'
+                        )
+                        if (edge.rel_type.lower() in ('pref_name', 'also_known_as')
+                                and not _edge_is_authoritative):
                             _has_pending_conflict = False
                             # SAVEPOINT-guard so a probe failure (e.g. table not yet seeded)
                             # rolls back ONLY the probe and never leaves the shared db
@@ -22880,7 +23727,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             # A novel rel_type emitted inside a /learn (/extend) batch would
                             # otherwise fall to Class C (30-day expiry) on its low llm_learned
                             # confidence and AGE OUT, even though the user explicitly asked the
-                            # system to learn this domain. Alexander: "if we tell it to grow,
+                            # system to learn this domain. Christopher: "if we tell it to grow,
                             # we don't want it aging out — it's not A, but a solid B for
                             # consistency." Floor to Class B so it lands in staged_facts on the
                             # promotion track (confirmed_count) and is EXEMPT from the Class-C
@@ -23274,7 +24121,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                             if match:
                                 relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                                entity_name = match.group(2).lower()  # alice, Slinky, Spot, etc.
+                                entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
 
                                 # Resolve the mentioned entity to its canonical ID
                                 resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -23429,7 +24276,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                     # PHASE 3b: instance_of inversion guard
                     # instance_of semantics: (individual) instance_of (type/class).
-                    # If GLiNER2 inverts the direction (e.g., "person instance_of alexander"),
+                    # If GLiNER2 inverts the direction (e.g., "person instance_of christopher"),
                     # the subject is a known type name and the object is the individual — swap them.
                     # Guard uses _SYSTEM_ENTITY_NAMES (DB-driven frozenset of known type tokens).
                     # Zero hardcoded entity names: detection is purely set-membership.
@@ -23496,6 +24343,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                     # and the undated copy shadows the dated one at recall.
                     _gate_ed, _gate_gran = _gated_event_date(canonical_rel_type, edge)
 
+                    # PER-EDGE temporal_status override: a deriver chain that recognized a GRAMMATICAL
+                    # past/future marker with no event_date (the relocation past-habitual "used to live
+                    # in X") carries its own temporal_status on the edge — PREFER it over the request-
+                    # level (date-driven) status. None → the request-level derivation (every normal edge).
+                    _edge_temporal_status = getattr(edge, "temporal_status", None) or _req_temporal_status
+
                     # User corrections about themselves are axiomatically valid.
                     # The gate exists to filter inferred/external data — not to override
                     # explicit user intent. Bypass validation entirely for user self-corrections.
@@ -23509,7 +24362,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             confidence=confidence,  # reassessed confidence (1.0 for user-stated), not raw edge.confidence
                             is_correction=edge.is_correction,  # dprompt-136: Gate needs to know if this is a correction
                             fact_provenance=edge.fact_provenance,  # user-is-truth: user_stated edges are EXEMPT from the type-mismatch veto (grow, don't quarantine)
-                            temporal_status=_req_temporal_status,  # verb tense (now|past|future), not gated
+                            temporal_status=_edge_temporal_status,  # per-edge override else request-level (now|past|future), not gated
                             event_date=_gate_ed,                   # event_date ISO, gated by temporal_class
                             event_date_granularity=_gate_gran,     # granularity, matched to event_date
                             polarity=("negated" if getattr(edge, "polarity", "affirmed") == "negated"
@@ -23644,7 +24497,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                         object_type=edge.object_type,
                                         is_correction=edge.is_correction,
                                         fact_provenance=edge.fact_provenance,  # user-is-truth: exempt user_stated from type-veto
-                                        temporal_status=_req_temporal_status,
+                                        temporal_status=_edge_temporal_status,  # per-edge override else request-level
                                         event_date=_gate_ed,
                                         event_date_granularity=_gate_gran,
                                         polarity=("negated" if getattr(edge, "polarity", "affirmed") == "negated"
@@ -23893,7 +24746,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             getattr(edge, 'valid_until', None),    # ISO 8601: when fact expires
                             getattr(edge, 'temporal_confidence', None),  # Confidence in temporal extraction
                             edge.fact_provenance,  # Canonical provenance: user_stated/llm_inferred/llm_learned
-                            _req_temporal_status,  # [17] TEMPORAL MODEL: now|past|future (verb tense, NOT gated)
+                            _edge_temporal_status,  # [17] TEMPORAL MODEL: now|past|future (per-edge override else request-level, NOT gated)
                             _gated_ed_main,        # [18] TEMPORAL MODEL: event_date ISO (gated by temporal_class)
                             _gated_gran_main,      # [19] TEMPORAL MODEL: event_date_granularity (gated, matched to [18])
                             # [20] ASSERTION POLARITY (Q1): 'negated' for a negated genuine state,
@@ -24009,6 +24862,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     # word. Both in scope here; None → today's behavior.
                                     first_text_snippet=req.text,
                                     subject_display=_raw_subject,
+                                    user_id=req.user_id,
                                 ):
                                     log.info("ingest.concept_queued_for_grounding",
                                              object=str(canonical_object)[:16],
@@ -24646,7 +25500,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 )
                                 fresh_facts = cur.fetchall()
                                 if fresh_facts:
-                                    collection = derive_collection(req.user_id)
+                                    collection, _ = qp_resolve_partition(req.user_id, "memory")
                                     ensure_collection(collection, qdrant_url)
                                     for fact_id, subject, obj, rel_type in fresh_facts:
                                         text = f"{subject} {rel_type} {obj}"
@@ -24739,7 +25593,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 )
                                 staged_fresh = cur.fetchall()
                                 if staged_fresh:
-                                    collection = derive_collection(req.user_id)
+                                    collection, _ = qp_resolve_partition(req.user_id, "memory")
                                     ensure_collection(collection, qdrant_url)
                                     for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in staged_fresh:
                                         text = f"{sf_subj} {sf_rel} {sf_obj}"
@@ -24839,21 +25693,13 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             # Resolve display name from canonical UUID (Bug #3 fix)
                             _display_name = _canonical_to_display.get(_obj, _obj)
 
-                            # Upsert alias into entity_aliases.
-                            # display_form (migration 214): this writer bypasses
-                            # EntityRegistry.register_alias, so it must carry the observed
-                            # casing itself or a name arriving through the also_known_as /
-                            # pref_name lane would render lowercase while the same name
-                            # arriving through the registry rendered correctly. COALESCE on
-                            # conflict so a turn that observes nothing never ERASES casing
-                            # already captured.
+                            # Upsert alias into entity_aliases
                             cur.execute(
-                                "INSERT INTO entity_aliases (entity_id, alias, is_preferred, display_form) "
-                                "VALUES (%s, %s, %s, %s) "
+                                "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
+                                "VALUES (%s, %s, %s) "
                                 "ON CONFLICT (entity_id, alias) "
-                                "DO UPDATE SET is_preferred = EXCLUDED.is_preferred, "
-                                "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
-                                (_subj, _display_name, _is_pref, _display_form_for(_display_name)),
+                                "DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
+                                (_subj, _display_name, _is_pref),
                             )
 
                             # If this is a hard preference, demote all other aliases for this entity
@@ -24978,17 +25824,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 # Set the corrected object as preferred
                                 _corrected_obj_display = _canonical_to_display.get(
                                     correction_object, correction_object)
-                                # display_form (migration 214) — see the also_known_as upsert
-                                # above; this identity-correction writer likewise bypasses
-                                # register_alias and must carry the observed casing itself.
                                 cur.execute(
-                                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, display_form) "
-                                    "VALUES (%s, %s, true, %s) "
+                                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
+                                    "VALUES (%s, %s, true) "
                                     "ON CONFLICT (entity_id, alias) DO UPDATE SET "
-                                    "is_preferred = true, "
-                                    "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
-                                    (correction_subject, _corrected_obj_display,
-                                     _display_form_for(_corrected_obj_display)),
+                                    "is_preferred = true",
+                                    (correction_subject, _corrected_obj_display),
                                 )
                                 log.info("ingest.pref_name_correction_aliases_updated",
                                          entity=correction_subject,
@@ -25311,8 +26152,8 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
       when allowed_rels is set, filtered to the in-scope attributes only.
 
     anchor_uuid: When provided, skip facts where the connected entity points back at
-    the anchor (e.g., theo→child_of→user). These anchor-inverse facts are already
-    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→theo).
+    the anchor (e.g., des→child_of→user). These anchor-inverse facts are already
+    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→des).
     Surfacing them again creates dual-direction render in the memory block.
     """
     results: list[dict] = []
@@ -25342,9 +26183,9 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
                 )
                 for r in cur.fetchall():
                     # Skip facts where the connected entity points back at the anchor.
-                    # These are anchor-inverse facts (e.g., theo→child_of→user) already handled
+                    # These are anchor-inverse facts (e.g., des→child_of→user) already handled
                     # by fetch_facts_from_anchor()'s inverse query which inverted them to
-                    # (user→parent_of→theo). Surfacing them again creates dual-direction render.
+                    # (user→parent_of→des). Surfacing them again creates dual-direction render.
                     if anchor_uuid and role_col == "subject_id" and r[1] == anchor_uuid:
                         continue
                     key = (r[0], r[1], r[2])
@@ -25365,36 +26206,51 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
                             "polarity": (r[7] if len(r) > 7 else None) or "affirmed",
                         })
 
-            # Staged facts (Class B short-term) — subject side only (avoids explosion)
-            cur.execute(
-                f"SELECT subject_id, object_id, rel_type, confidence, fact_class,"
-                f" temporal_status, event_date, polarity"
-                f" FROM staged_facts"
-                f" WHERE subject_id IN ({placeholders})"
-                f"{'   AND rel_type = ANY(%s)' if _rel_scope else ''}"
-                f"   AND (expires_at IS NULL OR expires_at > now())"
-                f"   AND promoted_at IS NULL"
-                # TOMBSTONE (Phase 4): staged_facts has no archived_at, so hide forgotten rows here.
-                f"   AND deleted_at IS NULL",
-                entity_list + ([_rel_scope] if _rel_scope else []),
-            )
-            for r in cur.fetchall():
-                key = (r[0], r[1], r[2])
-                if key not in seen:
-                    seen.add(key)
-                    results.append({
-                        "subject": r[0], "object": r[1], "rel_type": r[2],
-                        "confidence": float(r[3]) if r[3] else 0.6,
-                        "fact_class": r[4] or "B",
-                        "source": "staged",
-                        "category": _get_rel_type_category(r[2]),
-                        "valid_from": None, "valid_until": None,
-                        # Fix B: carry the temporal layer (staged dated edge keeps its date).
-                        "temporal_status": (r[5] if len(r) > 5 else None) or "now",
-                        "event_date": r[6].isoformat() if len(r) > 6 and r[6] else None,
-                        # ASSERTION POLARITY (Q1): keep a negated state negated on this lane too.
-                        "polarity": (r[7] if len(r) > 7 else None) or "affirmed",
-                    })
+            # Staged facts (Class B/C short-term) — subject OR object side, MIRRORING the
+            # committed (facts) fetch above. AUDIT7: the staged fetch was subject-side ONLY,
+            # so a staged edge with the anchored entity as the OBJECT (e.g.
+            # (X, related_to, <entity>)) was invisible on the entity-centric lane even
+            # though the committed lane already returns both directions. Mirror the
+            # committed lane's EXACT filters — the same scope projection (_rel_scope) and
+            # the same anchor-inverse skip — so nothing over-widens; the shared `seen` set
+            # dedups object-side staged rows against the committed rows.
+            for role_col in ("subject_id", "object_id"):
+                _staged_rel_clause = "   AND rel_type = ANY(%s)" if _rel_scope else ""
+                _staged_params = entity_list + ([_rel_scope] if _rel_scope else [])
+                cur.execute(
+                    f"SELECT subject_id, object_id, rel_type, confidence, fact_class,"
+                    f" temporal_status, event_date, polarity"
+                    f" FROM staged_facts"
+                    f" WHERE {role_col} IN ({placeholders})"
+                    f"{_staged_rel_clause}"
+                    f"   AND (expires_at IS NULL OR expires_at > now())"
+                    f"   AND promoted_at IS NULL"
+                    # TOMBSTONE (Phase 4): staged_facts has no archived_at, so hide forgotten rows here.
+                    f"   AND deleted_at IS NULL",
+                    _staged_params,
+                )
+                for r in cur.fetchall():
+                    # Mirror the committed lane's anchor-inverse skip: a subject-side row
+                    # whose object points back at the anchor is already handled by
+                    # fetch_facts_from_anchor()'s inverse query (dual-direction render).
+                    if anchor_uuid and role_col == "subject_id" and r[1] == anchor_uuid:
+                        continue
+                    key = (r[0], r[1], r[2])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({
+                            "subject": r[0], "object": r[1], "rel_type": r[2],
+                            "confidence": float(r[3]) if r[3] else 0.6,
+                            "fact_class": r[4] or "B",
+                            "source": "staged",
+                            "category": _get_rel_type_category(r[2]),
+                            "valid_from": None, "valid_until": None,
+                            # Fix B: carry the temporal layer (staged dated edge keeps its date).
+                            "temporal_status": (r[5] if len(r) > 5 else None) or "now",
+                            "event_date": r[6].isoformat() if len(r) > 6 and r[6] else None,
+                            # ASSERTION POLARITY (Q1): keep a negated state negated on this lane too.
+                            "polarity": (r[7] if len(r) > 7 else None) or "affirmed",
+                        })
 
             # ─── Fetch SCALAR ATTRIBUTES for all entity_uuids ───
             # entity_attributes stores scalars (has_ip, age, occupation, etc.) keyed by entity_id.
@@ -25914,7 +26770,7 @@ def resolve_entity_synonym(term: str, anchor: str, db) -> str | None:
 
     try:
         # ---- 1/2. EXACT-TERM LOOKUP (approved-only, live-only). Qualifier-first is
-        # structural: a qualified phrase ("nas box") is its OWN normalized key and
+        # structural: a qualified phrase ("truenas box") is its OWN normalized key and
         # never collides into the bare term. No substring/fuzzy (the ex-wife trap). ----
         with db.cursor() as cur:
             cur.execute(
@@ -26576,7 +27432,7 @@ def _decompose_query_steps(query_text: str, intent: dict | None = None) -> list[
     # chain itself. "what is X" / "what's X" / "tell me about X" / "whose X" /
     # "when is X's birthday" / "where is X's …". WHEN/WHERE are query-NLU scaffolding
     # (what is ASKED), not a fact word-list — stripping them lets the SAME possessive
-    # decomposition reach the entity's dated/scalar slot (bug: "when is Rex's
+    # decomposition reach the entity's dated/scalar slot (bug: "when is Fraggle's
     # birthday" left "when"/"is" as junk owner steps → the walk defers → recall misses).
     _lead = re.match(
         r"^(?:what(?:'s| is| are| was| were)?|who(?:'s| is)?|"
@@ -27169,8 +28025,8 @@ def resolve_typed_walk(
         # and the entity DOES carry a date-valued scalar — possibly under a
         # differently-typed rel (a birth date mis-stored as born_in, a provisioning
         # date, …). Surface that date fact and STOP; the render lane appends the
-        # derived age. This is what makes "how old is Leo" (age slot empty, born
-        # date present) and "when is Rex's birthday" (stored under born_in, not
+        # derived age. This is what makes "how old is Cyrus" (age slot empty, born
+        # date present) and "when is Fraggle's birthday" (stored under born_in, not
         # born_on) answer instead of defer. Keyed on the ASK class + the VALUE being a
         # date, never an attribute-name list. Fail-safe: no date scalar → fall through.
         if scalar_res in (_WALK_KNOWN_GAP, _WALK_NO_SLOT):
@@ -27279,6 +28135,133 @@ def _has_first_or_second_person_reference(query_text: str) -> bool:
         return False
     except Exception:  # noqa: BLE001 — fail-safe: never blank a possible real recall
         return True
+
+
+def _query_scoped_to_absent_concept(query_text: str, db, user_id: str,
+                                    probe_out: set | None = None) -> bool:
+    """True when the query is scoped to a CONCRETE ENTITY CONCEPT the user never mentioned —
+    the signal that /query should ABSTAIN ("no record") rather than fall through to the
+    unscoped fetch-all lane and DUMP the user's unrelated facts as if they answered.
+
+    The broad-recall relevance gate blanks only ANCHORLESS chitchat with no 1st/2nd-person
+    reference and no temporal intent, so a scoped-but-absent ask that carries "my"/"I" OR a
+    "how long" temporal intent ("how long was I in Korea for", "what is the name of my
+    hamster") is EXEMPTED and wrongly dumps the firehose. This is the deterministic,
+    subject-agnostic complement: it fires ONLY when the query NAMES a concrete concept noun
+    (spaCy NOUN/PROPN) that grounds to NEITHER a stored entity (``entity_aliases.alias``)
+    NOR an ontology SLOT word (``rel_types`` rel_type/label, ``entity_attributes.attribute``,
+    ``entity_taxonomies.taxonomy_name`` — whole-word). No domain / rel / pronoun literal:
+    grounding is judged against THIS tenant's own registry + ontology.
+
+    Must NOT fire for: a pure self-recall with no concept noun ("tell me about me"), an
+    attribute-slot ask ("what is my age" — 'age' is a slot), a known taxonomy ("tell me
+    about my family"), or a concept the user DID mention ("how long was I in Japan for" when
+    Japan is a stored alias). FAIL-SAFE: no db / empty query / empty user_id / spaCy layer
+    unavailable / any parse or DB error → False (keep today's behaviour; never blank on
+    uncertainty).
+
+    ``probe_out`` (optional): when a set is passed AND the gate fires (returns True), it is
+    populated with the ABSENT concept tokens (the concrete nouns that grounded to neither a
+    stored entity nor an ontology slot — e.g. ``{"hamster"}``). This lets the caller build an
+    INFORMATIVE abstention (climb the absent noun's type to its L4 place, surface the real
+    neighbours, state the specific absence) without re-parsing. Back-compat: callers that pass
+    no set are unaffected; the tokens are never written on a False return."""
+    if not query_text or not query_text.strip() or not db or not user_id:
+        return False
+    try:
+        from src.extraction.linguistics import _parse as _ling_parse, linguistics_available
+        if not linguistics_available():
+            return False  # layer off → cannot judge → keep today's behaviour
+        # Strip a leading harness reference marker so its tokens never parse as concepts.
+        _text = query_text
+        try:
+            _, _stripped = _compute_ingest_reference_and_text(query_text)
+            if _stripped:
+                _text = _stripped
+        except Exception:  # noqa: BLE001 — fail-safe: keep the raw text
+            pass
+        doc = _ling_parse(_text)
+        if doc is None:
+            return False
+        # The concrete concept nouns the query names (common + proper). Pronouns
+        # ("me"/"I"/"you") are not NOUN/PROPN, so a pure self-recall names none.
+        _concept_toks = [t for t in doc if t.pos_ in ("NOUN", "PROPN")]
+        if not _concept_toks:
+            return False
+
+        # Build the tenant's ONTOLOGY SLOT vocabulary (whole words) — a concept noun that
+        # names a slot ("age", "name", "family") is an ASPECT ask, not an absent entity.
+        _slot_words: set[str] = set()
+
+        def _add_words(_val) -> None:
+            if not _val:
+                return
+            for _w in re.split(r"[^a-z0-9]+", str(_val).lower()):
+                if _w:
+                    _slot_words.add(_w)
+
+        with db.cursor() as cur:
+            cur.execute("SELECT rel_type, label FROM rel_types")
+            for _row in cur.fetchall() or []:
+                _add_words(_row[0])
+                if len(_row) > 1:
+                    _add_words(_row[1])
+            cur.execute("SELECT DISTINCT attribute FROM entity_attributes")
+            for _row in cur.fetchall() or []:
+                _add_words(_row[0])
+            cur.execute("SELECT taxonomy_name FROM entity_taxonomies")
+            for _row in cur.fetchall() or []:
+                _add_words(_row[0])
+
+            # Concept nouns that are NOT ontology slot words → candidate absent entities.
+            _probe: set[str] = set()
+            for _tok in _concept_toks:
+                _forms = {_tok.text.lower(), _tok.lemma_.lower()}
+                if _forms & _slot_words:
+                    continue  # grounded as an ontology slot/aspect
+                _probe |= {_f for _f in _forms if _f}
+            if not _probe:
+                return False  # every concept noun is a known slot → not an absent entity
+
+            # Does ANY probed concept token ground to a stored entity alias? If so, the
+            # query names a concept the user DID mention → do NOT abstain (conservative:
+            # prefer returning facts when anything grounds).
+            cur.execute(
+                "SELECT 1 FROM entity_aliases WHERE user_id = %s AND alias = ANY(%s) LIMIT 1",
+                (user_id, list(_probe)),
+            )
+            if cur.fetchone():
+                return False
+            # WORD-BOUNDARY grounding (ADDITIVE to the exact match above): a user's entity is
+            # routinely stored as a MULTI-WORD phrase ("stunning crystal chandelier",
+            # "beautiful vintage armchair"), so the query's head noun ("chandelier",
+            # "armchair") never EQUALS the stored alias — an exact-only check wrongly judges a
+            # genuinely-mentioned concept ABSENT, yielding a false "you did not mention that"
+            # abstention that ALSO short-circuits the temporal-calc lane before it can answer.
+            # It also races the ASYNC re_embedder: the bare type node ("chandelier") is created
+            # later, but the compound alias is written SYNCHRONOUSLY at ingest — so grounding
+            # must not depend on the type node existing yet. Match each probe form (>=3 chars)
+            # on WORD BOUNDARIES (Postgres `~* \m…\M` — the SAME matcher the calc-anchor
+            # resolver + _calc_subject_head_grounds use) so a head noun living INSIDE a compound
+            # alias counts as mentioned. Deterministic, subject-agnostic (judged against THIS
+            # tenant's own aliases), NO cosine/LLM/domain list. Strictly conservative: only ADDS
+            # grounding → fewer false abstentions, never more.
+            _ground_forms = sorted({_f for _f in _probe if _f and len(_f) >= 3})
+            if _ground_forms:
+                _alt = "|".join(re.escape(_f) for _f in _ground_forms)
+                cur.execute(
+                    "SELECT 1 FROM entity_aliases WHERE user_id = %s AND alias ~* %s LIMIT 1",
+                    (user_id, r"\m(" + _alt + r")\M"),
+                )
+                if cur.fetchone():
+                    return False
+        # A concrete concept noun neither slot nor stored entity → absent concept → abstain.
+        # Surface the absent tokens for an INFORMATIVE abstention (never written on False).
+        if probe_out is not None:
+            probe_out.update(_probe)
+        return True
+    except Exception:  # noqa: BLE001 — fail-safe: never blank on uncertainty
+        return False
 
 
 def resolve_anchor(
@@ -27423,10 +28406,40 @@ def resolve_anchor(
                      "does", "can", "could", "would", "know"} | set(_LEADING_DETERMINERS)
             _clean_words = [w.lower().strip('.,!?') for w in words if w.lower().strip('.,!?') not in _stop and len(w) >= 2]
 
+            # CONTAINMENT-ANCHOR (hierarchy descent): for a "give me the tree UNDER X"
+            # query ("the full network hierarchy under datacenter dc-toronto",
+            # "everything in row-a", "the layout of dc-toronto"), the ANCHOR is the
+            # container X after the containment preposition — NOT a class-node phrase from
+            # the intent portion. A grown /expand ontology root can be literally named
+            # "network hierarchy", which collides with the hierarchy cue words and, being
+            # leftmost, HIJACKS the longest-match n-gram (walking that class's subclass_of
+            # ladder instead of descending the real container's tree). So when the query
+            # carries hierarchy intent, restrict the n-gram search to the tokens AFTER the
+            # last containment preposition and prefer the RIGHTMOST match — a trailing
+            # INSTANCE name ("dc-toronto") then beats a leading TYPE word ("datacenter").
+            # Grammatical (closed-class prepositions), subject-agnostic (no domain/rel
+            # literal), gated strictly on hierarchy intent so normal recall is byte-for-byte
+            # unchanged. Fail-safe: no prep / nothing after it → today's behavior.
+            _prefer_rightmost = False
+            if _query_has_hierarchy_intent(query_text):
+                _CONTAINMENT_PREPS = {"under", "beneath", "below", "within",
+                                      "inside", "in", "of", "from"}
+                _last_prep = max(
+                    (idx for idx, w in enumerate(_clean_words) if w in _CONTAINMENT_PREPS),
+                    default=-1,
+                )
+                if 0 <= _last_prep < len(_clean_words) - 1:
+                    _clean_words = _clean_words[_last_prep + 1:]
+                    _prefer_rightmost = True
+
             # Try n-grams from longest to shortest (max 5-gram)
             _max_n = min(5, len(_clean_words))
             for n in range(_max_n, 0, -1):
-                for i in range(len(_clean_words) - n + 1):
+                _i_range = (
+                    range(len(_clean_words) - n, -1, -1) if _prefer_rightmost
+                    else range(len(_clean_words) - n + 1)
+                )
+                for i in _i_range:
                     phrase = " ".join(_clean_words[i:i+n])
                     with db.cursor() as cur:
                         cur.execute(
@@ -27442,7 +28455,7 @@ def resolve_anchor(
                                 _mark("alias", term=phrase)
                                 return row[0]
                     # SYNONYM SEAM (IMPL-3 secondary): after the per-phrase alias MISS,
-                    # same helper / same gate so multi-word synonyms ("nas box")
+                    # same helper / same gate so multi-word synonyms ("truenas box")
                     # resolve identically. None continues the n-gram loop unchanged.
                     _syn_anchor = resolve_entity_synonym(phrase, user_id, db)
                     if _syn_anchor is not None:
@@ -27721,6 +28734,67 @@ def _detect_temporal_query_intent(query_text: str) -> dict:
     except Exception:  # noqa: BLE001 — fail-safe: keep the raw text
         _t_ord = t
 
+    # ── SEQUENCE / ENUMERATION REQUEST GUARD (subject-agnostic ordering grammar) ──
+    # A question asking for the ORDER / SEQUENCE of MULTIPLE items ("what is the order of
+    # the three trips …, from earliest to latest", "list these events in chronological
+    # order", "in what order did X, Y and Z happen") is a request to RETURN THE WHOLE dated
+    # set ORDERED BY event_date — NOT a single-boundary get_first/get_last, and NOT a
+    # relational pivot. Without this guard both hijacks fire and BURY the enumeration:
+    #   • a lone ordinal word ("earliest"/"first") in "from earliest to latest" makes the
+    #     PART-2 ordinal block set ordinal=first → the get_first SLICE returns ONE item and
+    #     drops the other N-1;
+    #   • a bare "on"/"after"/"before" occurring INSIDE a quoted event description
+    #     ("…coupon ON Luvs diapers…") is misread as a temporal PIVOT preposition and the
+    #     anchor becomes the rest of the sentence → a bogus pivot walk that misses.
+    # Both collapse a "return the ordered sequence" ask into a single-answer walk. When a
+    # sequence request is present we SUPPRESS the ordinal collapse and the pivot hijack and
+    # keep only ORDER=event_date/asc so the walk returns the full chronological set. Pure
+    # English ordering grammar — no domain/rel/entity/pronoun literal. Fail-safe: no cue →
+    # unset → today's behaviour byte-for-byte unchanged.
+    _is_sequence = bool(re.search(
+        r"\b(?:the\s+)?order\s+of\b"                     # "the order of the three events"
+        r"|\bin\s+(?:what|which)\s+order\b"              # "in what order did …"
+        r"|\bin\s+order\b"                               # "list them in order"
+        r"|\border\s+(?:them|these|those)\b"             # "order these events by date"
+        r"|\bsequence\s+of\b|\bin\s+sequence\b"          # "the sequence of …"
+        r"|\bchronological(?:ly)?\b"                     # "chronological order" / "chronologically"
+        r"|\bfrom\s+(?:earliest|oldest|first)\s+to\s+(?:latest|newest|last)\b"
+        r"|\bfrom\s+(?:latest|newest|last)\s+to\s+(?:earliest|oldest|first)\b",
+        t))
+    if _is_sequence:
+        intent["sequence"] = True
+        # A sequence request is inherently chronological: return the whole set ordered by
+        # event_date. Default ascending (earliest→latest); a "latest to earliest" phrasing
+        # is still enumerated ascending — the walk returns the full set either way and the
+        # ordering direction is a presentation detail over the SAME set.
+        intent.setdefault("order", "event_date")
+        intent.setdefault("dir", "asc")
+
+    # ── WH-VALUE MODIFIER GUARD (subject-agnostic English interrogative grammar) ──
+    # A question FRONTED by a single-VALUE wh-word (where/who/whom/whose) asks for ONE
+    # attribute value of an entity — a LOCATION, a PERSON. Its trailing "after/before <X>"
+    # clause is a temporal MODIFIER ("where she lives now, subsequent to that move"), NOT a
+    # second dated event to resolve nor a sequence to walk: a location/person is never a
+    # temporal neighborhood. Left ungated, the before/after boundary + the pivot
+    # sub-resolution + the Allen yes/no comparison all HIJACK such a question into a
+    # "compare two dated events" walk that then misses ("I couldn't find a dated record for
+    # the events being compared") and BURIES the plain single-pass value answer — e.g.
+    # "Where did Rachel move to after her recent relocation?" (the relocation IS the move
+    # being asked about, not a distinct pivot). EXCEPTION: an explicit ORDINAL
+    # (first/last/Nth) DOES make it a selection over a sequence ("who was the FIRST person I
+    # met after my move") — then the pivot is legitimate and the guard yields. This is pure
+    # interrogative syntax (wh-fronting vs subject-auxiliary inversion): a polar/Allen
+    # comparison has NO wh-word; a wh-fronted question asks for a value. Fully
+    # subject-agnostic — no domain/rel/entity literal. Fail-safe: no leading value-wh cue
+    # or any ordinal present → False → today's behaviour byte-for-byte unchanged.
+    _wh_value_lead = bool(re.match(r"^(?:where|who|whom|whose)\b", t.strip()))
+    _has_ordinal_cue = bool(
+        re.search(r"\b(first|earliest|oldest|initial|last|latest|most recent|newest|"
+                  r"final|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
+                  _t_ord)
+        or re.search(r"\b\d+\s*(?:st|nd|rd|th)\b", _t_ord))
+    _wh_value_modifier = _wh_value_lead and not _has_ordinal_cue
+
     # Ordering cues
     if re.search(r"\b(first|earliest|oldest)\b", _t_ord):
         intent["order"] = "event_date"
@@ -27729,8 +28803,12 @@ def _detect_temporal_query_intent(query_text: str) -> dict:
         intent["order"] = "event_date"
         intent["dir"] = "desc"
 
-    # Relational boundary cue ("issue AFTER my service")
-    if re.search(r"\bafter\b", t):
+    # Relational boundary cue ("issue AFTER my service"). Suppressed for a wh-VALUE
+    # modifier question (see guard above) — there the after/before clause is a modifier,
+    # not a boundary to compare across.
+    if _wh_value_modifier:
+        pass
+    elif re.search(r"\bafter\b", t):
         intent["boundary"] = "after"
         intent.setdefault("order", "event_date")
         intent.setdefault("dir", "asc")
@@ -27760,7 +28838,14 @@ def _detect_temporal_query_intent(query_text: str) -> dict:
     }
     # FIX #4 (PART-2 ordinal) — same window-mask: "last week/month/year" is a relative
     # WINDOW, not the chronological-ordinal "last". Match ordinals against the masked text.
-    if re.search(r"\b(first|earliest|oldest|initial)\b", _t_ord):
+    # SEQUENCE GUARD: a "return the whole ordered set" ask ("the order of the three trips,
+    # from earliest to latest") is NOT a single-boundary ordinal — the ordinal words there
+    # ("earliest"/"first") describe the ordering DIRECTION, not a slice. Suppress the
+    # single-item ordinal so the get_first/get_last collapse cannot fire (the ORDER=asc set
+    # earlier keeps the full chronological list). Fail-safe: no sequence cue → unchanged.
+    if _is_sequence:
+        pass
+    elif re.search(r"\b(first|earliest|oldest|initial)\b", _t_ord):
         intent["ordinal"] = "first"
         intent["ordinal_n"] = 1
     elif re.search(r"\b(last|latest|most recent|newest|final)\b", _t_ord):
@@ -27787,13 +28872,20 @@ def _detect_temporal_query_intent(query_text: str) -> dict:
     # punctuation/question tail. "on" is matched only as a date/event preposition
     # ("on my wedding") — guarded against the common verb-y "on" by requiring a
     # following noun-ish token; a miss simply yields no anchor (fail-safe).
-    _anchor_m = re.search(r"\b(after|before)\b\s+(.+)$", t)
+    # Suppressed for a wh-VALUE modifier question (see guard above): "her recent
+    # relocation" trailing "after" is a modifier, not a pivot event to date-resolve.
+    # ALSO suppressed for a SEQUENCE request: a bare after/before/on inside one of the
+    # enumerated event descriptions ("…coupon ON Luvs diapers…", "…redeemed cashback…")
+    # is NOT a pivot — treating it as one hijacks the whole ordered-set ask into a bogus
+    # pivot walk over the trailing sentence fragment.
+    _anchor_m = (None if (_wh_value_modifier or _is_sequence)
+                 else re.search(r"\b(after|before)\b\s+(.+)$", t))
     if _anchor_m:
         intent["direction"] = _anchor_m.group(1)
         _anchor_phrase = _anchor_m.group(2).strip(" ?.!,")
         if _anchor_phrase:
             intent["anchor"] = _anchor_phrase
-    elif re.search(r"\bon\b\s+\S", t):
+    elif not _is_sequence and re.search(r"\bon\b\s+\S", t):
         _on_m = re.search(r"\bon\b\s+(.+)$", t)
         if _on_m:
             _on_phrase = _on_m.group(1).strip(" ?.!,")
@@ -27930,12 +29022,19 @@ def _detect_temporal_query_intent(query_text: str) -> dict:
         # shape (other calc ops are untouched) so the pivot+ordinal walk owns it. Gated on
         # BOTH signals being present → a genuine "did X happen after Y?" (no ordinal) keeps
         # Allen. Deterministic, subject-agnostic, fail-safe (no ordinal/direction → no-op).
-        if (_calc.get("op") == "allen"
-                and intent.get("ordinal") in ("first", "last")
-                and (intent.get("direction") or intent.get("anchor"))):
-            log.info("query.temporal_intent.allen_suppressed_for_ordinal_pivot",
+        _suppress_allen = _calc.get("op") == "allen" and (
+            # BUG B — ordinal-after-pivot owned by the pivot+ordinal walk, not a yes/no.
+            (intent.get("ordinal") in ("first", "last")
+             and (intent.get("direction") or intent.get("anchor")))
+            # WH-value modifier — a where/who value ask is never a yes/no Allen compare;
+            # its after/before clause is a modifier (see the guard above).
+            or _wh_value_modifier
+        )
+        if _suppress_allen:
+            log.info("query.temporal_intent.allen_suppressed",
                      ordinal=intent.get("ordinal"),
-                     direction=intent.get("direction"))
+                     direction=intent.get("direction"),
+                     wh_value_modifier=_wh_value_modifier)
         else:
             intent["calc"] = _calc
 
@@ -28010,6 +29109,28 @@ def _detect_temporal_calc_intent(t: str) -> dict:
     if not t:
         return {}
     try:
+        # ── 0. AGE-AT-EVENT — "how old (was I) when <event>" ──
+        # A TWO-ANCHOR calc whose second anchor is the SUBJECT's own birth reference, not a
+        # second event: age_at_event = <event date B> − <birth/DOB>. Distinct from the
+        # duration ops (which measure event↔event) — the pivot verb is the copula "how OLD
+        # was <subject> WHEN <event>", so it is captured BEFORE the "how long"/"how many"
+        # duration shapes (none of which carry the "old" answer-type cue). A = the EVENT
+        # phrase after "when" (its date is resolved from the walk exactly like any other
+        # anchor); the birth reference is the subject's own captured age/born scalar, read
+        # downstream in _apply_temporal_calc (never a second event). Subject-agnostic: the
+        # subject and event are whatever the user named — NO domain/event word-list; the
+        # "old"→age binding is the SAME query-NLU lexical bridge _decompose_query_steps uses
+        # for "how old is X" (what is ASKED, never fact classification). The DB/in-memory
+        # anchor resolver strips the residual function words (i/we/you/the…) itself.
+        _age_m = re.search(
+            r"\bhow old\b\s+(?:was|were|am|is|are|had|have|do|did)\s+"
+            r"(.+?)\s+\bwhen\b\s+(.+)$", t)
+        if _age_m:
+            _subj = _age_m.group(1).strip(" ?.!,'\"")
+            _ev = _age_m.group(2).strip(" ?.!,'\"")
+            if _ev:
+                return {"op": "age_at_event", "anchor": _ev, "subject": _subj}
+
         # ── 1. NTH-BETWEEN — "the 2nd thing I did between X and Y" (most specific) ──
         # An ordinal + a between-pair. Captured before plain `between` so the ordinal is
         # honoured (Nth of the events that fall during [A, B]).
@@ -28086,6 +29207,31 @@ def _detect_temporal_calc_intent(t: str) -> dict:
                     return {"op": "between", "anchor": _a, "anchor_b": _b,
                             "requested_unit": _detect_requested_duration_unit(t)}
 
+        # ── 2d. WHEN-PIVOT DURATIVE DURATION — "how long had I been <A> when <B>" ──
+        # A DURATIVE-ACTIVITY duration ask: the elapsed time from the START of an ongoing
+        # activity A ("bird watching", "watching stand-up specials", "a member of 'Book
+        # Lovers Unite'") up to a punctual reference event B ("I attended the workshop /
+        # the open mic / the meetup"). The magnitude is |B − A_start|, so it maps onto the
+        # SAME proven `between` op + math: A resolves to the activity's (earliest) dated
+        # occurrence, B to the reference event's date. Without this rule the "when"-pivot
+        # phrasing matched NO calc shape at all (rules 2/2b/2c need before/after/between),
+        # so the duration was never computed even when BOTH dated anchors were captured
+        # cleanly (the c9f37c46 case: two distinct dated occurrences, no elapsed rendered).
+        # A = the phrase between "been" and "when"; B = the phrase after "when". The DB
+        # anchor resolver strips residual function words (i/attended/the…) itself.
+        # Deterministic, subject-agnostic (the anchors are whatever the user named — no
+        # event/domain word-list), gated by the "how long" duration answer-type cue.
+        if _detect_duration_answer_type(t):
+            _when_m = re.search(
+                r"\bhow long\b\s+(?:had|have|has|was|were|did|do)\s+"
+                r"(?:i|we|you)\s+(?:been\s+)?(.+?)\s+\bwhen\b\s+(.+)$", t)
+            if _when_m:
+                _a = _when_m.group(1).strip(" ?.!,'\"")
+                _b = _when_m.group(2).strip(" ?.!,'\"")
+                if _a and _b:
+                    return {"op": "between", "anchor": _a, "anchor_b": _b,
+                            "requested_unit": _detect_requested_duration_unit(t)}
+
         # ── 3. SAME-PERIOD — "was X the same week/month/year as Y" ──
         _sp_m = re.search(
             r"\bsame\s+(week|month|year|day)\b\s+as\s+(.+)$", t)
@@ -28132,15 +29278,46 @@ def _detect_temporal_calc_intent(t: str) -> dict:
                 return {"op": "allen", "anchor": _a, "anchor_b": _b,
                         "relation": _rel}
 
-        # ── 5. ELAPSED — "how long ago was/did X" / "when was X" (how-long-ago) ──
+        # ── 5. ELAPSED — "how long ago was/did X" / "how many <unit> ago did X" ──
         # Single anchor, ref = query-now. Must carry the "ago" framing to be elapsed
         # (a bare "when was X" is a boundary ask owned by the ordering rung, not calc).
+        # The "ago" cue is the elapsed signal; the lead-in that carries it is BOTH the
+        # bare "how long ago" AND the far-more-common "how many <days|weeks|months|years>
+        # ago …" phrasing — the same DURATION answer-type family (see
+        # _detect_duration_answer_type) with an explicit unit. Without the unit branch,
+        # "how many days ago did I …" never entered the calc lane at all and fell through
+        # to the raw walk (no elapsed math). Subject-agnostic: the anchor is whatever noun
+        # the user named after the pivot; the requested unit is read off the SAME question
+        # by _detect_requested_duration_unit (query-NLU, never a fact/domain word-list).
         _el_m = re.search(
-            r"\bhow long ago\b\s+(?:was|were|did|have|has|is)?\s*(.+)$", t)
+            r"\bhow (?:long|many\s+(?:days?|weeks?|months?|years?))\s+ago\b"
+            r"\s+(?:was|were|did|have|has|is)?\s*(.+)$", t)
         if _el_m:
             _a = _el_m.group(1).strip(" ?.!,'\"")
             # Strip a leading possessive/determiner ("my", "the") — keep the event noun.
             _a = re.sub(r"^\s*(?:my|the|a|an|i)\b\s*", "", _a).strip(" ?.!,'\"")
+            if _a:
+                return {"op": "elapsed", "anchor": _a,
+                        "requested_unit": _detect_requested_duration_unit(t)}
+
+        # ── 5b. DURATION-SINCE-NOW — "how long have I had/been <X>" ──
+        # A present-perfect stative possession/residence/use whose endpoint is NOW: the
+        # elapsed time from X's start/acquisition/INCEPTION up to now. = now − X_start, the
+        # SAME Allen-interval math as `elapsed` (rule 5), but the start is an entity's
+        # captured inception date (dated at ingest by the durative-inception peel — "I've had
+        # X for N months now" → start @session−N) rather than an explicit "ago" event. Gated
+        # on the present-perfect "have/has/had" pivot with NO "ago"/"when"/between/before/
+        # after (each of those owns its own shape ABOVE this rule, so this only catches the
+        # bare duration-since-now ask). Anchor = the whole possessed/stative tail; the DB
+        # anchor resolver strips the residual aux/participle/function words (been/using/had/
+        # my/the/i) itself. Subject-agnostic (NO verb/noun word-list), deterministic.
+        _since_m = re.search(
+            r"\bhow long\b\s+(?:have|has|had)\s+(?:i|we|you)\s+(.+)$", t)
+        if _since_m:
+            _a = _since_m.group(1).strip(" ?.!,'\"")
+            # Peel a leading bare "been" (present-perfect-continuous) — the content phrase
+            # follows it; the resolver handles any remaining participle/possessive.
+            _a = re.sub(r"^\s*been\b\s*", "", _a).strip(" ?.!,'\"")
             if _a:
                 return {"op": "elapsed", "anchor": _a,
                         "requested_unit": _detect_requested_duration_unit(t)}
@@ -28159,6 +29336,402 @@ def _detect_temporal_calc_intent(t: str) -> dict:
         return {}
     except Exception:
         return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COUNT-OVER-WALK — cardinality "how many <TYPE> …" as a THIN RENDER over the walk.
+#
+# Architecture (owner, non-negotiable): a count is NOT a compute operator. If L4 typing
+# is strong at INGEST, the deterministic walk ALREADY collects the distinct typed
+# instances under the anchor (that is what "tell me about my tanks" does). A "how many
+# tanks" question is just the CARDINALITY (len) of that already-collected distinct
+# instance set — a rendering choice, not a computation lane. Intelligence stays at ingest
+# (type every instance under the anchor); the query stays dumb.
+#
+# So there is deliberately NO `_apply_count` arithmetic operator that re-derives anything:
+# `_detect_count_intent` NAMES the shape + captures the user's type phrase (subject-
+# agnostic, exactly like the anchor/topic capture), `_resolve_count_type_uuids` grounds it
+# with the SAME exact-alias + subclass_of machinery ingest used, and `_apply_instance_count`
+# just COUNTS the distinct instance_of subjects the walk already collected. Dominant honest
+# failure = SILENT UNDERCOUNT when ingest missed one of the N instances (fix at ingest,
+# never by fuzzing the query). An unresolvable type FAILS LOUD (no fabricated number).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _singularize_noun(word: str) -> str:
+    """Deterministic English singularizer for a single noun token (no ML, no word-list).
+
+    Only the regular inflection rules — enough to turn a user's plural type phrase
+    ("tanks"/"stories"/"titles") into the singular the L4 TYPE node is aliased under
+    ("tank"/"story"/"title"). Irregulars are left as-is (a miss just means the plural
+    alias must also resolve, which _resolve_count_type_uuids tries anyway). Fail-safe:
+    empty/short tokens return unchanged.
+    """
+    w = (word or "").strip().lower()
+    if len(w) < 3:
+        return w
+    if w.endswith("ies"):
+        return w[:-3] + "y"          # stories → story
+    if w.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return w[:-2]                # boxes → box, glasses → glass
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]                # tanks → tank, titles → title
+    return w
+
+
+def _singularize_phrase(phrase: str) -> str:
+    """Singularize the HEAD (last token) of a possibly multi-word type phrase.
+
+    "short stories" → "short story"; "to-watch titles" → "to-watch title". Only the
+    head noun inflects; modifiers are untouched. Deterministic, subject-agnostic.
+    """
+    p = (phrase or "").strip().lower()
+    if not p:
+        return p
+    toks = p.split()
+    toks[-1] = _singularize_noun(toks[-1])
+    return " ".join(toks)
+
+
+def _detect_count_intent(t: str) -> dict:
+    """DETECT a CARDINALITY question — "how many <TYPE-PHRASE> (do|have|did) I …" — as a
+    deterministic structural regex over the lowercased query. NO LLM, NO GLiNER2, NO
+    domain word-list. Returns {"type_phrase", "scope", "since"} or {} on no match.
+
+    Subject-agnostic: the type phrase is WHATEVER the user named after "how many"; the
+    number is computed downstream as len(distinct typed instances the walk collected)
+    in _apply_instance_count. Fail-safe: any error → {}.
+
+    DELIBERATELY OUT OF SCOPE (these are NOT cardinalities of instances — do not force
+    them into the count path):
+      • TEMPORAL DURATION units ("how many days/weeks/months/years", "how long") — owned
+        by the temporal-calc layer; declined here via _detect_duration_answer_type.
+      • SUM-of-scalars ("how many hours in total …") — an aggregation cue ("in total"/
+        "altogether"/…) → a SUM, not a cardinality → declined.
+      • stated-scalar THRESHOLD ("how many stars to reach gold") — has NO first/second-
+        person possession/action verb ("do I have", "have I written") and NO "on my
+        <list>" membership, so it simply never matches the shapes below.
+    """
+    if not t:
+        return {}
+    try:
+        _t = t.strip().lower()
+        if "how many" not in _t:
+            return {}
+        # TEMPORAL duration units are the temporal-calc layer's, never a count.
+        if _detect_duration_answer_type(_t):
+            return {}
+        # Aggregation cue → SUM of a measure, not a cardinality of instances.
+        if re.search(r"\b(?:in total|altogether|combined|in all|all together)\b", _t):
+            return {}
+        _scope = ("current" if re.search(
+            r"\b(?:currently|right now|at the moment|these days)\b", _t) else None)
+        _since_m = re.search(r"\bsince\s+(.+)$", _t)
+        _since = _since_m.group(1).strip(" ?.!,'\"") if _since_m else None
+        # Shape A — possession/action: "how many <TYPE> (do|did|have|…) I/you/we …".
+        # The auxiliary + 1st/2nd-person pronoun is what makes it an instance-count of
+        # the user's own things ("how many tanks do I have", "…stories have I written").
+        _m = re.search(
+            r"\bhow many\s+(.+?)\s+"
+            r"(?:do|does|did|have|has|had|are|is|was|were)\s+(?:i|you|we)\b", _t)
+        if _m:
+            _phrase = _m.group(1).strip(" ?.!,'\"")
+            if _phrase:
+                return {"type_phrase": _phrase, "scope": _scope, "since": _since}
+        # Shape B — membership list: "how many <TYPE> on/in my/your/the <LIST>".
+        _m2 = re.search(
+            r"\bhow many\s+(.+?)\s+(?:on|in)\s+(?:my|your|the)\s+(.+)$", _t)
+        if _m2:
+            _phrase = _m2.group(1).strip(" ?.!,'\"")
+            if _phrase:
+                return {"type_phrase": _phrase, "scope": _scope, "since": _since,
+                        "list_phrase": _m2.group(2).strip(" ?.!,'\"")}
+        return {}
+    except Exception:
+        return {}
+
+
+def _resolve_count_type_uuids(db, type_phrase: str, depth_cap: int = 6) -> set:
+    """Ground the user's TYPE PHRASE to its L4 TYPE node UUID(s) with the SAME exact-alias
+    match ingest/anchor resolution uses (entity_aliases.alias = <phrase>), then EXPAND
+    DOWN the subclass_of ladder so an instance of a SUBTYPE also counts (a "sedan" counts
+    for "how many cars"). Deterministic — NO ILIKE/substring, NO cosine, NO LLM.
+
+    Tries the singular head first ("tanks" → "tank"), then the raw phrase (covers a type
+    aliased in the plural). subclass_of (P279) is the W3C transitive classification rel,
+    resolved via _get_classification_rels so a per-tenant-renamed classification rel is
+    honoured. Returns the type UUID set, or empty when the type grounds to nothing →
+    the caller FAILS LOUD (no fabricated number). Fail-safe: any error → empty set.
+    """
+    if db is None or not type_phrase:
+        return set()
+    _sing = _singularize_phrase(type_phrase)
+    _raw = type_phrase.strip().lower()
+    _cands = [c for c in (_sing, _raw) if c]
+    _cands = list(dict.fromkeys(_cands))  # de-dup, order-preserving
+    out: set = set()
+    try:
+        # subclass_of = the transitive (type→type) classification rels; instance_of stays
+        # out of the DOWN-walk (its subjects are leaf instances, not subtypes).
+        _classif = {c.lower() for c in _get_classification_rels(db)}
+        _subtype_rels = sorted(_classif - {"instance_of", "is_a"}) or ["subclass_of"]
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ANY(%s)",
+                (_cands,))
+            out.update(r[0] for r in cur.fetchall() if r and r[0])
+            if out:
+                frontier = list(out)
+                _d = max(1, int(depth_cap))
+                while frontier and _d > 0:
+                    cur.execute(
+                        "SELECT DISTINCT subject_id FROM facts"
+                        " WHERE object_id = ANY(%s) AND rel_type = ANY(%s)"
+                        "   AND superseded_at IS NULL AND archived_at IS NULL",
+                        (frontier, _subtype_rels))
+                    _new = {r[0] for r in cur.fetchall() if r and r[0]} - out
+                    out.update(_new)
+                    frontier = list(_new)
+                    _d -= 1
+    except Exception as e:  # noqa: BLE001 — fail-safe: empty → caller fails loud
+        log.warning("resolve_count_type_uuids.failed",
+                    phrase=type_phrase[:40], error=str(e)[:120])
+    return out
+
+
+def _apply_instance_count(facts: list[dict], type_uuids: set,
+                          instance_rels: frozenset | set,
+                          scope: str | None = None,
+                          since_iso: str | None = None) -> dict:
+    """THIN RENDER: count DISTINCT instances (UUID-deduped) the walk ALREADY collected that
+    are instance_of one of ``type_uuids``. The cardinality IS the answer — no arithmetic
+    operator, no re-derivation, no second walk. Reuses exactly the fact dicts the
+    deterministic walk produced (matched on ``_object_id``/``_subject_id``; falls back to
+    the display slots for test/edge shapes).
+
+    Args:
+      facts        : the walk-collected fact dicts (gated_facts snapshot).
+      type_uuids   : the resolved L4 type UUID set (+ its subclass descendants).
+      instance_rels: the P31 instance-classification rels (instance_of/is_a), per-tenant.
+      scope        : "current" → keep only live instances. The walk fetch ALREADY drops
+                     superseded/archived, so this is satisfied by construction (asserted).
+      since_iso    : lower-bound ISO date. instance_of edges are UNDATED, so we filter by
+                     each instance's DATED companion edge (event_date >= bound) among the
+                     collected facts. If the collected set carries NO dates at all, the
+                     predicate CANNOT be honoured deterministically → returned HELD (a
+                     tentative answer), never a fabricated confident number.
+
+    Returns {"miss","held","count","instance_ids","instance_names"}. miss=True (unresolved
+    type) → the caller voices an explicit no-such-instances line, not a "0".
+    """
+    if not type_uuids:
+        return {"miss": True, "held": False, "count": 0,
+                "instance_ids": [], "instance_names": []}
+    _irels = {r.lower() for r in (instance_rels or set())} or {"instance_of", "is_a"}
+    _inst: dict = {}  # instance_uuid -> best display name
+    for f in facts or []:
+        rel = str(f.get("rel_type") or "").lower()
+        if rel not in _irels:
+            continue
+        _obj = f.get("_object_id") or f.get("object")
+        if _obj not in type_uuids:
+            continue
+        _subj = f.get("_subject_id") or f.get("subject")
+        if not _subj:
+            continue
+        _inst.setdefault(_subj, f.get("subject") or _subj)
+    _held = False
+    if since_iso and _inst:
+        _dated: set = set()
+        _any_dates = False
+        for f in facts or []:
+            _ed = f.get("event_date")
+            if not _ed:
+                continue
+            _any_dates = True
+            _s = f.get("_subject_id") or f.get("subject")
+            if _s in _inst and str(_ed) >= str(since_iso):
+                _dated.add(_s)
+        if _any_dates:
+            _inst = {k: v for k, v in _inst.items() if k in _dated}
+        else:
+            # No dated companion edges reached → cannot honour "since" deterministically.
+            _held = True
+    return {"miss": False, "held": _held, "count": len(_inst),
+            "instance_ids": list(_inst.keys()),
+            "instance_names": list(_inst.values())}
+
+
+# Closed CARDINAL-WORD lexicon — a grammatical closed class (NOT a domain word list; mirrors the
+# existing ordinal ``_NUM_WORDS`` and quantity ``_WORDNUM`` lexicons already in this module). Lets a
+# count SCALAR captured as the user's SURFACE word ("I own three bikes" → scalar value_text "three")
+# be recognized as a count AND voiced back VERBATIM at recall, so "how many bikes do I own" answers
+# "You have three bikes on record" — the user's own word, not a normalized "3".
+_CARDINAL_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+
+def _count_scalar_value(vint, vtext) -> tuple:
+    """(count:int, surface:str) from a stored numeric/word scalar, else (None, None).
+
+    Recognizes a DIGIT (value_int / digit value_text "3") AND a SPELLED-OUT cardinal value_text
+    ("three" → 3), so a count STATED IN WORDS is not a false miss. ``surface`` is what recall voices
+    back to the user VERBATIM — the word "three" when that is what they said, the digit otherwise —
+    so the answer echoes the user's own surface rather than a normalized integer (``_coerce_scalar``
+    stores a spelled-out cardinal as value_text with value_int NULL). Deterministic closed-class
+    lookup, NO fuzzy/ML. Fail-safe: unrecognized value → (None, None)."""
+    if vint is not None:
+        return int(vint), (str(vtext).strip() if vtext else str(int(vint)))
+    _s = (str(vtext).strip() if vtext else "")
+    if not _s:
+        return None, None
+    if re.fullmatch(r"\d[\d,]*", _s):
+        return int(_s.replace(",", "")), _s
+    _w = _CARDINAL_WORDS.get(_s.lower())
+    if _w is not None:
+        return _w, _s
+    return None, None
+
+
+def _count_scalar_answer(db, user_id, type_phrase: str) -> dict | None:
+    """COUNT-SCALAR reconciliation (knowledge-update recency-scalar cluster).
+
+    A STATED bulk count — "I have 600 Instagram followers", "I have 3 cats" — lives as a SCALAR
+    attribute on the user ``(user, <noun>, N)`` (entity_attributes), NOT as N enumerable
+    ``instance_of`` rows. So the distinct-instance walk (``_apply_instance_count``) returns 0 and the
+    render would voice a FALSE "I don't have any <X> on record" — the live cluster Failure 2.
+
+    Resolve the count from that scalar: read the user's NUMERIC scalar attributes and match the one
+    whose HEAD noun (last ``_``-segment, singularized) EQUALS the queried type phrase's head, preferring
+    the fullest modifier-token overlap ("instagram followers" beats bare "followers" when both exist)
+    then the most-recently-updated (the recency-overwrite winner). Deterministic token comparison — NO
+    ILIKE/substring/cosine, NO domain word list. The head-match bridges a modifier mismatch between the
+    stated turn ("600 followers") and the question ("Instagram followers"). Only the caller consults this
+    when the instance walk found nothing, so it never LOWERS a legitimate instance count.
+
+    Returns {"count": int, "attribute": str} or None. Fail-safe: any error → None.
+    """
+    if db is None or not user_id or not type_phrase:
+        return None
+    try:
+        _q_tokens = [t for t in re.split(r"[\s_]+", type_phrase.strip().lower()) if t]
+        if not _q_tokens:
+            return None
+        _q_head = _singularize_noun(_q_tokens[-1])
+        _q_mods = set(_q_tokens[:-1])
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT attribute, value_int, value_text, updated_at "
+                "FROM entity_attributes WHERE entity_id = %s",
+                (str(user_id),))
+            rows = cur.fetchall()
+        best = None  # ((overlap, ts), count, attribute, surface)
+        for (attr, vint, vtext, upd) in rows or []:
+            _n, _surface = _count_scalar_value(vint, vtext)
+            if _n is None:
+                continue  # non-numeric / non-cardinal scalar → not a count
+            _a_tokens = [t for t in re.split(r"[\s_]+", str(attr).strip().lower()) if t]
+            if not _a_tokens or _singularize_noun(_a_tokens[-1]) != _q_head:
+                continue  # HEAD noun must match (deterministic, not fuzzy substring)
+            _overlap = len(_q_mods & set(_a_tokens[:-1]))
+            try:
+                _ts = upd.timestamp() if upd is not None else 0.0
+            except Exception:  # noqa: BLE001
+                _ts = 0.0
+            _key = (_overlap, _ts)
+            if best is None or _key > best[0]:
+                best = (_key, _n, str(attr), _surface)
+        if best is None:
+            return None
+        return {"count": best[1], "attribute": best[2], "surface": best[3]}
+    except Exception:  # noqa: BLE001 — fail-safe: no scalar reconciliation
+        return None
+
+
+def _enrich_count_candidates_with_instance_of(db, candidates: list, instance_rels) -> list:
+    """LEAN-QUERY read enrichment for the cardinality walk (capture proven clean).
+
+    The anchor walk collects the user's RELATIONAL edges ((user, create, <item>)) but not
+    each ITEM's own ``instance_of`` TYPE edge — that edge hangs off the item entity, one hop
+    PAST the anchor, so it is not in the walk snapshot even though it EXISTS in the store
+    (the deriver emits it at ingest; the render path already re-fetches it per fact). Without
+    it ``_apply_instance_count`` has nothing to count and a real "how many <type>" reads as
+    "none on record". This surfaces the ALREADY-STORED ``instance_of`` companion for every
+    entity UUID the walk surfaced and appends it to the candidate set — a presentation-time
+    read of an existing edge, NOT a capture change and NOT a second walk from a new anchor.
+
+    Deterministic EXACT-ID fetch (subject_id = ANY(collected uuids)) — NO ILIKE/substring,
+    NO cosine, NO LLM. Only entities the walk ALREADY collected are typed, so the count stays
+    "distinct typed instances the walk collected". Fail-safe: any error → candidates unchanged.
+    """
+    if db is None or not candidates:
+        return candidates or []
+    try:
+        _irels = sorted({r.lower() for r in (instance_rels or set())} or {"instance_of", "is_a"})
+        _ids: set = set()
+        for f in candidates:
+            for _k in ("_subject_id", "_object_id"):
+                _v = f.get(_k)
+                if _v and _UUID_PATTERN.match(str(_v)):
+                    _ids.add(str(_v))
+        if not _ids:
+            return candidates
+        # Pairs already present so we never duplicate an instance_of edge the walk did carry.
+        _have = {
+            (str(f.get("_subject_id")), str(f.get("_object_id")))
+            for f in candidates if str(f.get("rel_type") or "").lower() in _irels
+        }
+        _extra: list = []
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT subject_id, object_id, rel_type FROM facts"
+                " WHERE subject_id = ANY(%s) AND rel_type = ANY(%s)"
+                "   AND superseded_at IS NULL AND archived_at IS NULL",
+                (list(_ids), _irels))
+            for _s, _o, _rt in cur.fetchall():
+                if not _s or not _o or (str(_s), str(_o)) in _have:
+                    continue
+                _extra.append({"rel_type": str(_rt), "_subject_id": str(_s),
+                               "_object_id": str(_o), "subject": str(_s), "object": str(_o)})
+        return list(candidates) + _extra if _extra else candidates
+    except Exception as e:  # noqa: BLE001 — fail-safe: no enrichment, count unchanged
+        log.warning("count_candidate_instance_of_enrich.failed", error=str(e)[:120])
+        return candidates
+
+
+def _l4_direct_instance_count(db, type_uuids: set, instance_rels) -> dict:
+    """DIRECT L4 count(*): count DISTINCT instances that are ``instance_of`` one of ``type_uuids``,
+    read straight from the store (facts ∪ staged_facts) — NOT the walk snapshot.
+
+    The walk-snapshot count (`_apply_instance_count`) only sees instance_of edges the anchor walk
+    happened to carry; a "how many <type>" whose items sit one hop past the anchor (their type edge
+    never entered the snapshot) reads as 0 even though the edges EXIST. In a per-user schema every
+    instance_of edge is the user's, so a direct L4 cardinality IS the user's count of that type —
+    the robust, authoritative answer the owner asked for ("count(*) on L4"). Deterministic exact-UUID
+    match on L4; NO ILIKE/substring/cosine/LLM. Fail-safe: any error → miss (never a fabricated 0)."""
+    if db is None or not type_uuids:
+        return {"miss": True, "held": False, "count": 0, "instance_ids": [], "instance_names": []}
+    _irels = sorted({r.lower() for r in (instance_rels or set())} or {"instance_of", "is_a"})
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM facts"
+                " WHERE object_id = ANY(%s) AND rel_type = ANY(%s)"
+                "   AND superseded_at IS NULL AND archived_at IS NULL AND deleted_at IS NULL"
+                " UNION"
+                " SELECT DISTINCT subject_id FROM staged_facts"
+                " WHERE object_id = ANY(%s) AND rel_type = ANY(%s)"
+                "   AND promoted_at IS NULL AND deleted_at IS NULL",
+                (list(type_uuids), _irels, list(type_uuids), _irels))
+            _ids = [r[0] for r in cur.fetchall() if r and r[0]]
+        return {"miss": False, "held": False, "count": len(_ids),
+                "instance_ids": _ids, "instance_names": _ids}
+    except Exception as e:  # noqa: BLE001 — fail-safe: miss, never a fabricated count
+        log.warning("l4_direct_instance_count.failed", error=str(e)[:120])
+        return {"miss": True, "held": False, "count": 0, "instance_ids": [], "instance_names": []}
 
 
 def _extract_comparison_operands(query_text: str) -> list[str]:
@@ -28180,11 +29753,38 @@ def _extract_comparison_operands(query_text: str) -> list[str]:
     if not query_text:
         return []
     try:
+        # Strip the leading harness ``[Date: YYYY/MM/DD (dow) HH:MM]`` reference marker
+        # (single-door, same as the intent NLU) — its ``23:07`` time-colon and ``2023/…``
+        # tokens must never leak into the colon-led enumeration parse below. Fail-safe:
+        # no marker → stripped == raw → byte-for-byte unchanged.
+        try:
+            _, _stripped = _compute_ingest_reference_and_text(query_text)
+            if _stripped:
+                query_text = _stripped
+        except Exception:  # noqa: BLE001 — fail-safe: keep the raw text
+            pass
         t = query_text.strip()
         # 1) QUOTED title spans always win — '...' or "..." (multi-word titles).
         _quoted = re.findall(r"['\"‘’“”]([^'\"‘’“”]+)"
                              r"['\"‘’“”]", t)
         _quoted = [q.strip().lower() for q in _quoted if q and q.strip()]
+
+        # Leading determiners/scaffolding trimmed from each operand edge. Subject-
+        # agnostic stop set — grammar only, NOT domain words.
+        _lead = re.compile(r"^(?:the|a|an|my|your|our|their|his|her|its|"
+                           r"event|one)\s+")
+
+        def _trim_operand(_p: str) -> str:
+            _p = _p.strip().strip("?.!,").strip()
+            # strip embedded quotes (already captured above)
+            _p = _p.strip("'\"‘’“”").strip()
+            if not _p:
+                return ""
+            _prev = None
+            while _prev != _p:
+                _prev = _p
+                _p = _lead.sub("", _p).strip()
+            return _p
 
         # 2) "A or B" alternation (the comparison shape). Take the clause AFTER the
         #    interrogative lead-in (after the first comma if present, else whole query),
@@ -28196,25 +29796,38 @@ def _extract_comparison_operands(query_text: str) -> list[str]:
         _alts: list[str] = []
         _parts = re.split(r"\s+(?:or|versus|vs\.?)\s+", _clause)
         if len(_parts) >= 2:
-            # Leading determiners/scaffolding trimmed from each operand edge. Subject-
-            # agnostic stop set — grammar only, NOT domain words.
-            _lead = re.compile(r"^(?:the|a|an|my|your|our|their|his|her|its|"
-                               r"event|one)\s+")
             for _p in _parts:
-                _p = _p.strip().strip("?.!,").strip()
-                # strip embedded quotes (already captured above)
-                _p = _p.strip("'\"‘’“”").strip()
-                if not _p:
-                    continue
-                _prev = None
-                while _prev != _p:
-                    _prev = _p
-                    _p = _lead.sub("", _p).strip()
+                _p = _trim_operand(_p)
                 if _p:
                     _alts.append(_p)
 
-        # Prefer quoted spans (precise titles); fall back to the alternation phrases.
-        _operands = _quoted if _quoted else _alts
+        # 3) ENUMERATION shape ("… in order from first to last: A, B, and C" / a bare
+        #    "A, B and C" list). The "order these N events" ask names its operands as a
+        #    COLON-led and/or comma-separated LIST joined by a trailing "and"/"or" — NOT
+        #    the two-way "A or B" alternation handled above (which the first-comma split +
+        #    " or " split cannot recover, since it drops the first item). Split the list
+        #    payload on commas and the and/or coordinators into its ≥2 items. Subject-
+        #    agnostic LIST grammar (comma + coordinating conjunction), no domain words.
+        #    Consulted only when the alternation did not already yield ≥2 operands, and the
+        #    operands are ONLY ever used under an ordering/ordinal ask (the caller gates on
+        #    that), so a stray comma-list in a non-comparison query stays inert.
+        _enum: list[str] = []
+        if len(_alts) < 2:
+            _list_src = t
+            if ":" in _list_src:
+                # the enumeration payload follows the LAST colon ("… first to last: A, B, C")
+                _list_src = _list_src.rsplit(":", 1)[1]
+            _list_src = _list_src.strip().rstrip("?.!").lower()
+            for _it in re.split(r"\s*,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+", _list_src):
+                _it = _trim_operand(_it)
+                if _it and len(_it) >= 2:
+                    _enum.append(_it)
+            if len(_enum) < 2:
+                _enum = []
+
+        # Prefer quoted spans (precise titles); then the alternation phrases; then the
+        # enumerated list.
+        _operands = _quoted if _quoted else (_alts if len(_alts) >= 2 else _enum)
         # De-dup preserving order.
         _seen: set[str] = set()
         _out: list[str] = []
@@ -28226,6 +29839,43 @@ def _extract_comparison_operands(query_text: str) -> list[str]:
     except Exception as e:
         log.warning("extract_comparison_operands.failed", error=str(e)[:120])
         return []
+
+
+def _comparison_operands_undecidable(operand_phrases, resolved_phrase_count,
+                                     is_comparison_intent) -> bool:
+    """ABSTENTION GATE — a genuine multi-operand comparison ("which/who … first, A or B")
+    is UNDECIDABLE when a NAMED operand does not exist in memory at all.
+
+    THE PRECISION BUG this closes (the ``_abs`` abstention cluster): "Who became a parent
+    first, Tom or Alex?" when only *Alex* was ever mentioned; "Which project first, the
+    Ferrari model or the Porsche 991 Turbo S model?" when only the *Ferrari* exists. The
+    ordinal/first-last collapse resolves the ONE operand that IS in memory, orders its dated
+    edge, and renders it as the confident winner — FABRICATING a comparison the data cannot
+    support. Correct behaviour is to ABSTAIN (surface nothing ordered) so the reader answers
+    "not enough information" instead of a false "A was first".
+
+    Why this seam, not the dated-slice guard: the existing ``TEMPORAL_UNDECIDABLE_
+    COMPARISON_GUARD`` (in ``_apply_get_first_last``) counts DATED operand UUIDs, which
+    UNDERCOUNTS operands reached through a REIFIED occurrence (a "tomatoes"/"bike" operand's
+    date rides a ``participated_in`` sibling edge, not the operand's own UUID) — so it
+    false-abstains legitimate comparisons and stays OFF. Counting whether the operand PHRASE
+    resolved to ANY entity avoids that entirely: a reified-but-real operand DID resolve to
+    its entity; only a genuinely-never-mentioned operand resolves to nothing. So this gate
+    fires ONLY on the true "operand absent" case and never on decidable comparisons.
+
+    Deterministic, subject-agnostic (grammar-parsed operands + registered-alias resolution,
+    NO domain/location/name word-list, NO cosine/ILIKE). Requires ≥2 NAMED operands and a
+    real comparison intent, so a plain single-anchor or non-ordinal query is a no-op.
+    Fail-safe: any error → False (today's behaviour — never a spurious abstention).
+    """
+    try:
+        if not is_comparison_intent:
+            return False
+        if not operand_phrases or len(operand_phrases) < 2:
+            return False
+        return int(resolved_phrase_count) < 2
+    except Exception:  # noqa: BLE001 — fail-safe: never fabricate an abstention
+        return False
 
 
 def _resolve_phrase_to_longest_alias(db, phrase: str, limit: int = 5) -> list[str]:
@@ -29083,6 +30733,149 @@ def _resolve_calc_anchor_date_db(anchor_text: str, user_id: str):
         return None
 
 
+# Same CLOSED grammatical function-word / qualifier stop set the calc-anchor resolvers use
+# (subject-agnostic — this is GRAMMAR, not a domain word-list).
+_CALC_ANCHOR_STOP = {
+    "my", "the", "a", "an", "your", "our", "their", "his", "her", "its",
+    "first", "second", "third", "last", "latest", "most", "recent", "newest",
+    "oldest", "earliest", "initial", "final", "ever", "i", "me", "we",
+    "of", "to", "in", "on", "at", "for", "with", "that", "this", "and",
+    "was", "were", "did", "happen", "happened", "is", "are", "been", "have",
+    "collecting", "doing", "using", "playing",  # gerund shells left by "how long have I been X-ing"
+}
+
+
+def _calc_anchor_head_noun(anchor_text: str) -> str | None:
+    """Grammatically extract the HEAD content noun of a calc anchor phrase.
+
+    "collecting vintage films" → "films"; "vintage cameras" → "cameras". Uses the spaCy
+    parser (last NOUN/PROPN token) when available; fail-safe → the last content term after
+    the closed grammatical stop set. Subject-agnostic (grammar, NO domain word-list), NO
+    cosine/LLM. Returns None when no content noun survives (bare qualifier phrase).
+
+    The head noun is the SEMANTIC CORE of what the question is about: it is the token that
+    MUST ground in memory for the subject to have been mentioned at all — a modifier that
+    incidentally matches an unrelated fact ("vintage" ↔ "vintage cameras") is not enough.
+    """
+    if not anchor_text or not anchor_text.strip():
+        return None
+    _txt = anchor_text.strip()
+    # spaCy head-noun (last NOUN/PROPN in surface order) — the grammatical head.
+    try:
+        from src.extraction.linguistics import _get_nlp
+        _nlp = _get_nlp()
+        if _nlp is not None:
+            _head = None
+            for _tok in _nlp(_txt):
+                if _tok.pos_ in ("NOUN", "PROPN") and len(_tok.text) >= 3 \
+                        and _tok.text.lower() not in _CALC_ANCHOR_STOP:
+                    _head = _tok.text.lower().strip(" ?.!,'\"")
+            if _head:
+                return _head
+    except Exception:
+        pass
+    # Fail-safe: last surviving content term.
+    _terms = [
+        w.strip(" ?.!,'\"")
+        for w in re.split(r"\s+", _txt.lower())
+        if len(w.strip(" ?.!,'\"")) >= 3 and w.strip(" ?.!,'\"") not in _CALC_ANCHOR_STOP
+    ]
+    return _terms[-1] if _terms else None
+
+
+def _calc_subject_head_grounds(anchor_text: str, user_id: str) -> bool:
+    """True iff the calc anchor's HEAD content noun grounds to a real entity in the user's
+    memory (regardless of any date).
+
+    Distinguishes "the subject was never mentioned" (head noun matches NOTHING → False →
+    ABSTAIN cleanly) from "the subject IS in memory but I have no date for it" (head noun
+    matches an alias → True → the existing 'undated record' framing). Word-boundary match
+    (``~* \\m…\\M``) against ``entity_aliases`` ∪ the literal scalar object text in facts ∪
+    staged_facts — the SAME deterministic matcher the anchor-date resolver uses, NO
+    cosine/LLM/domain list. Per-tenant search_path (NO public).
+
+    FAIL-SAFE → True (assume grounded): on any error, missing DSN, or no extractable head
+    noun we NEVER falsely abstain on a real subject — the caller keeps today's behaviour.
+    """
+    _head = _calc_anchor_head_noun(anchor_text)
+    if not _head:
+        return True
+    dsn = os.environ.get("POSTGRES_DSN")
+    if not dsn:
+        return True
+    # SINGULAR/PLURAL BRIDGE (load-bearing for correct abstention): the head noun's
+    # surface number ("cameras") and the stored alias's number ("camera") routinely
+    # differ, so a bare word-boundary match on the surface form produces a FALSE
+    # abstention ("you did not mention that") on a subject the user really named. Match
+    # the head against its surface form, its deterministic singular, AND that singular
+    # re-pluralized — grounding in ANY number form counts as mentioned. Still abstains
+    # cleanly when the noun grounds in NO form ("films" ↔ a memory holding only
+    # "camera"). Deterministic inflection only, subject-agnostic, no domain word-list.
+    def _regular_plural(_w: str) -> str:
+        if _w.endswith(("s", "x", "z", "ch", "sh")):
+            return _w + "es"
+        if len(_w) > 1 and _w.endswith("y") and _w[-2] not in "aeiou":
+            return _w[:-1] + "ies"
+        return _w + "s"
+
+    _sing = _singularize_noun(_head)
+    _forms = {f for f in (_head, _sing, _regular_plural(_sing)) if f and len(f) >= 3}
+    _alt = "|".join(re.escape(f) for f in sorted(_forms))
+    _re = r"\m(?:" + _alt + r")\M"
+    try:
+        with psycopg2.connect(dsn) as conn:
+            try:
+                context = get_user_schema_context(user_id, conn)
+                schema_name = context["schema_name"]
+                with conn.cursor() as scur:
+                    scur.execute(f"SET search_path TO {schema_name}")
+                conn.commit()
+            except Exception as e:
+                log.warning("calc_subject_grounds.schema_context_failed",
+                            user_id=user_id[:8] if user_id else "unknown",
+                            error=str(e)[:120])
+                return True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM entity_aliases WHERE alias ~* %s"
+                    "  UNION ALL"
+                    "  SELECT 1 FROM facts "
+                    "    WHERE object_id ~* %s AND superseded_at IS NULL"
+                    "          AND archived_at IS NULL AND deleted_at IS NULL"
+                    "  UNION ALL"
+                    "  SELECT 1 FROM staged_facts "
+                    "    WHERE object_id ~* %s AND deleted_at IS NULL"
+                    ")",
+                    (_re, _re, _re),
+                )
+                _row = cur.fetchone()
+                _grounded = bool(_row and _row[0])
+        log.info("calc_subject_grounds.checked", head=_head, grounded=_grounded)
+        return _grounded
+    except Exception as e:
+        log.warning("calc_subject_grounds.failed", error=str(e)[:120], head=_head)
+        return True
+
+
+def _calc_miss_info_need(reason: str | None) -> str:
+    """Map a temporal-calc miss_reason to the info-need PHRASE the metacognitive return
+    voices. Pure (no DB) so the anti-confabulation wording is unit-testable.
+
+    ``absent_subject`` is the KEYSTONE-C anti-confabulation case: the subject grounds to
+    NOTHING in memory, so we voice a TRUE absence ("you did not mention that") rather than
+    the "no dated record for the events being compared" framing — which falsely presupposes
+    the event exists and merely lacks a date. Returned uppercase → the metacog uses it
+    verbatim; lowercase phrases get the "I couldn't …" prefix.
+    """
+    _r = (reason or "").lower()
+    if _r == "absent_subject":
+        return "You did not mention that, so I have no record of it in your memory."
+    if "anchor" in _r or "undated" in _r:
+        return "find a dated record for the events being compared"
+    return reason or "undated_anchor"
+
+
 def _order_facts_with_pivot(facts: list[dict], intent: dict, pivot_iso: str | None,
                             operand_ids=None) -> list[dict]:
     """PART 2 — DETERMINISTIC pivot filter + ordinal selection over already-fetched
@@ -29567,6 +31360,45 @@ def _op_duration(a):
     return (_ge - _gs).days
 
 
+def _calendar_elapsed_phrase(start_iso: str, ref, granule: str) -> str | None:
+    """Render now − start as an EXACT CALENDAR delta (relativedelta) for a MONTH/YEAR-
+    granular start — the honest coarse-duration render.
+
+    A duration stated in months/years ("for 9 months now" → a month-granular inception at
+    session − 9mo) must read back in the SAME unit ("9 months"), never a day-count's
+    spurious exact-week coarsening ("273 days" → "39 weeks", which _humanize_delta emits in
+    ambiguous mode). relativedelta between the cited start date and the reference gives the
+    exact whole-calendar-unit span (2022-06-11 → 2023-03-11 = 9 months, 0 days). Deterministic
+    calendar arithmetic (dateutil), no ML. Returns the phrase ("9 months" / "2 years" /
+    "1 year 3 months") or None when not month/year-granular / on any parse failure.
+    """
+    _g = str(granule or "").lower()
+    if _g not in ("month", "year"):
+        return None
+    try:
+        from datetime import date as _date
+        from dateutil.relativedelta import relativedelta as _rd
+        _s = _date.fromisoformat(str(start_iso)[:10])
+        _r = ref if hasattr(ref, "year") and not hasattr(ref, "hour") else (
+            ref.date() if hasattr(ref, "date") else ref)
+        if _s > _r:
+            return None
+        _delta = _rd(_r, _s)
+        _yrs, _mos = _delta.years, _delta.months
+        if _g == "year":
+            # Year-granular: round months into the year count (honest to the granule).
+            _yrs = _yrs + (1 if _mos >= 6 else 0)
+            return _plural(max(1, _yrs), "year") if _yrs >= 1 else _plural(1, "year")
+        # month-granular
+        if _yrs > 0 and _mos > 0:
+            return f"{_plural(_yrs, 'year')} {_plural(_mos, 'month')}"
+        if _yrs > 0:
+            return _plural(_yrs, "year")
+        return _plural(max(1, _yrs * 12 + _mos), "month")
+    except Exception:
+        return None
+
+
 def _op_elapsed(a, ref):
     """elapsed(A, ref) = ref − ge (days) — 'how long ago' the event ENDED. Positive when
     the event is in the past relative to ref. a = (gs, ge, gran); ref = a date."""
@@ -29701,7 +31533,62 @@ def _resolve_calc_anchor_fact(anchor_text: str, facts: list[dict],
     return _matched[-1] if _desc else _matched[0]
 
 
-def _apply_temporal_calc(facts: list[dict], intent: dict, user_id: str = None) -> dict | None:
+def _compute_age_at_event(facts: list[dict], event_date, ref_date):
+    """AGE-AT-EVENT — the subject's age at a resolved EVENT date, from their captured
+    birth reference. Deterministic, subject-agnostic, no LLM/cosine. Returns int >= 0 or
+    None (FAIL-LOUD MISS — never a fabricated age).
+
+    The subject's own scalars are already in ``facts`` (the anchor-scoped candidate set:
+    "how old was I …" anchors to the user, "how old was my mother …" to the mother), so
+    the birth reference is read from that in-memory set — no extra DB round-trip.
+
+    TWO deterministic sources, in order:
+      1. CURRENT-AGE scalar — the direct answer-type match for the "how old" ask. The
+         "old"→``age`` binding is the SAME single query-NLU lexical bridge
+         ``_decompose_query_steps`` uses for "how old is X" (what is ASKED, never fact
+         classification). Anchored to the session REFERENCE (the query's ``[Date:]`` marker,
+         else wall-clock): ``birth_year ≈ ref_year − current_age`` → age at event =
+         ``event_year − birth_year`` (whole-year difference, LME-consistent, no "now" drift).
+      2. BIRTH/CREATION DATE scalar — the earliest date-valued scalar on the subject that is
+         on/before the event (birth is normally the oldest date; the SAME value-is-a-date
+         test ``_entity_date_scalar`` / ``_derive_age_from_value`` already use, subject-
+         agnostic — no attribute-name list). age = whole completed years birth→event
+         (dateutil ``relativedelta``, leap/month-length correct). Used when no age scalar
+         exists but a real DOB was stated — the most accurate, event-relative (no "now").
+    """
+    if not event_date:
+        return None
+    _ev = event_date if hasattr(event_date, "year") \
+        else _scalar_value_as_date(event_date)
+    if _ev is None:
+        return None
+    _attrs = [f for f in (facts or [])
+              if isinstance(f, dict) and f.get("source") == "attributes"]
+    # 1. CURRENT-AGE scalar (the "how old"→age bridge) anchored to the session reference.
+    if ref_date is not None:
+        for f in _attrs:
+            if str(f.get("rel_type") or "").strip().lower() != "age":
+                continue
+            try:
+                _age_now = int(str(f.get("object")).strip())
+            except (TypeError, ValueError):
+                continue
+            if 0 <= _age_now <= 150:
+                _birth_year = ref_date.year - _age_now
+                return max(0, _ev.year - _birth_year)
+    # 2. BIRTH/CREATION DATE scalar (value-is-a-date; earliest on/before the event).
+    _birth = None
+    for f in _attrs:
+        _d = _scalar_value_as_date(f.get("object"))
+        if _d is not None and _d <= _ev and (_birth is None or _d < _birth):
+            _birth = _d
+    if _birth is not None:
+        return _whole_years_since(_birth, _ev)
+    return None
+
+
+def _apply_temporal_calc(facts: list[dict], intent: dict, user_id: str = None,
+                         query_text: str = None) -> dict | None:
     """P1 — run the DETECTED temporal-calc op over the gated facts and return a GROUNDED
     computed answer, or None (a clean no-op / MISS-LOUD).
 
@@ -29766,10 +31653,48 @@ def _apply_temporal_calc(facts: list[dict], intent: dict, user_id: str = None) -
                 return (None, None)
             return ((_rng[0], _rng[1], str(_gran).lower()), str(_iso)[:10])
 
+        # ── AGE-AT-EVENT: "how old was I when <event>" ───────────────────────────
+        # A = the EVENT (resolved to a date exactly like any anchor); the second operand
+        # is the subject's own captured birth reference (age/born scalar), NOT a second
+        # event. age = event_year − birth_year. FAIL-LOUD on an undated event OR a subject
+        # with no captured age/birth (→ miss, never a fabricated age).
+        if _op == "age_at_event":
+            _bi, _cite_b = _resolve_anchor_interval_and_cite(_calc.get("anchor"))
+            if not _bi:
+                if not _calc_subject_head_grounds(_calc.get("anchor"), user_id):
+                    return _miss("absent_subject")
+                return _miss("undated_or_unresolved_event")
+            _event_date = _bi[0]
+            # Session reference for the current-age→birth-year anchoring (the query's
+            # [Date:] marker, else wall-clock). Fail-safe: any error → wall-clock now.
+            _ref = _now
+            try:
+                if query_text:
+                    from src.temporal import derive_now as _derive_now
+                    _rn = _derive_now(query_text)[0]
+                    _ref = _rn.date() if hasattr(_rn, "date") else _rn
+            except Exception:  # noqa: BLE001 — fail-safe: keep wall-clock reference
+                pass
+            _age = _compute_age_at_event(facts, _event_date, _ref)
+            if _age is None:
+                return _miss("no_birth_or_age_anchor")
+            return {"op": _op, "answer": f"you were {_age} years old",
+                    "value": _age, "unit": "years",
+                    "granule": _bi[2], "miss": False,
+                    "cited_dates": [_cite_b] if _cite_b else []}
+
         # ── Single-anchor ops: elapsed, duration ─────────────────────────────────
         if _op in ("elapsed", "duration"):
             _ai, _cite_a = _resolve_anchor_interval_and_cite(_calc.get("anchor"))
             if not _ai:
+                # DISTINGUISH a subject that was NEVER MENTIONED (head noun grounds to
+                # nothing → clean abstention) from a present-but-undated subject (existing
+                # "no dated record" framing). Voicing "no dated record for the events being
+                # compared" on an absent subject is a false-presence confabulation — it
+                # presupposes the event exists and merely lacks a date. FAIL-SAFE inside
+                # the helper (→ True) means we never wrongly abstain on a real subject.
+                if not _calc_subject_head_grounds(_calc.get("anchor"), user_id):
+                    return _miss("absent_subject")
                 return _miss("undated_or_unresolved_anchor")
             _cite = [_cite_a]
             _gran = _ai[2]
@@ -29787,12 +31712,33 @@ def _apply_temporal_calc(facts: list[dict], intent: dict, user_id: str = None) -
                 return {"op": _op, "answer": f"it lasted {_ans}", "value": _d,
                         "unit": "days", "granule": _gran, "miss": False,
                         "cited_dates": _cite}
-            # elapsed
-            _d = _op_elapsed(_ai, _now)
+            # elapsed = SESSION-now − anchor_start. The reference is the QUERY's session
+            # date (its [Date:] marker), NOT 2026 wall-clock — otherwise a
+            # duration-since-now ("how long have I had X", start dated at session−N) would
+            # measure against today and blow the elapsed out to years. Mirrors the
+            # age_at_event branch's session anchoring; fail-safe → wall-clock _now (so the
+            # query_text=None path is byte-for-byte unchanged).
+            _el_now = _now
+            try:
+                if query_text:
+                    from src.temporal import derive_now as _derive_now
+                    _en = _derive_now(query_text)[0]
+                    _el_now = _en.date() if hasattr(_en, "date") else _en
+            except Exception:  # noqa: BLE001 — fail-safe: keep wall-clock reference
+                pass
+            _d = _op_elapsed(_ai, _el_now)
             if _d is None:
                 return _miss("elapsed_compute_failed")
             if _d >= 0:
                 _ans = _humanize_delta(_d, _gran, requested_unit=_req_unit)
+                # CALENDAR-EXACT coarse render: a month/year-granular start (a duration
+                # stated in months/years — "for 9 months now") reads back in that unit via
+                # relativedelta from the cited start, never a day-count's spurious exact-week
+                # coarsening ("39 weeks"). Only when the user named no explicit unit.
+                if _req_unit is None and _cite_a:
+                    _cal = _calendar_elapsed_phrase(_cite_a, _el_now, _gran)
+                    if _cal:
+                        _ans = _cal
                 _phrase = f"about {_ans} ago" if not _ans.startswith("about") \
                     else f"{_ans} ago"
                 return {"op": _op, "answer": _phrase, "value": _d, "unit": "days",
@@ -30162,14 +32108,16 @@ def _recursive_query_walk(query_text: str, intent: dict, gated_facts: list[dict]
                     # it was asked in.
                     "requested_unit": _hop.get("requested_unit"),
                 }}
-                _calc_result = _apply_temporal_calc(_walk_facts, _calc_intent, user_id)
+                _calc_result = _apply_temporal_calc(_walk_facts, _calc_intent, user_id,
+                                                    query_text=query_text)
                 _hops_run += 1
                 if not _calc_result or _calc_result.get("miss"):
                     # The pair MISSED a date → name the gap (which anchor) for the return.
+                    # ``absent_subject`` (subject never mentioned) voices a TRUE absence
+                    # rather than the "no dated record for the events being compared"
+                    # confabulation — see _calc_miss_info_need.
                     _reason = (_calc_result or {}).get("miss_reason") or "undated_anchor"
-                    _info_need = ("find a dated record for the events being compared"
-                                  if "anchor" in _reason or "undated" in _reason
-                                  else _reason)
+                    _info_need = _calc_miss_info_need(_reason)
                     _kind = "calc"
                     break
                 # Record the dates the calc bridged through (cycle-aware, bounded).
@@ -30316,6 +32264,239 @@ def _clean_calc_disp(s: str) -> str:
         return str(s)
 
 
+def _collapse_instance_of_to_most_specific(facts: list[dict], db) -> list[dict]:
+    """MOST-SPECIFIC-TYPE-WINS at render (breed / instance_of specificity).
+
+    When a named instance carries MULTIPLE ``instance_of`` types AND the laid-down L4
+    ladder relates them (one type is a ``subclass_of`` DESCENDANT of another — e.g.
+    ``(fraggle, instance_of, dog)`` + ``(fraggle, instance_of, poodle)`` with
+    ``poodle subclass_of dog`` grown by the ±6 backbone), the broader type is redundant
+    as a DIRECT classification: "Fraggle is a poodle" already entails "…is a dog". Drop
+    the ANCESTOR ``instance_of`` edge so the render asserts the MOST-SPECIFIC type; the
+    ancestor still surfaces as the parent CLASS via the subclass_of ladder ("poodle is a
+    subclass of dog"), so no information is lost — only the duplicate broad assertion.
+
+    LEAN QUERY, not cleanup: this uses the hierarchy INGEST already laid down (the walk
+    grounds ``poodle subclass_of dog`` — verified staged Class B); it does not build,
+    fuzz, or re-structure. It fires ONLY when the ordering is DETERMINISTIC (a real
+    subclass_of path in facts ∪ staged); unrelated sibling types (no ladder edge between
+    them yet) are LEFT ALONE — both stay, "we don't forget". Subject-agnostic + metadata
+    -driven (classification rels via _get_classification_rels; no type/breed literal).
+    Fail-safe: any error returns ``facts`` unchanged. Idempotent.
+    """
+    if not facts or db is None:
+        return facts
+    try:
+        # Split the classification rels by their Wikidata PID (metadata-driven, no rel
+        # literal): P31 (instance_of) = the DIRECT typing edge we collapse; P279
+        # (subclass_of / rdfs:subClassOf) = the TRANSITIVE ladder we climb to order the
+        # candidate types. is_a is folded into the ladder (subclass-like). The ladder MUST
+        # exclude the instance edge — otherwise a type node that is itself an instance of
+        # something would leak that target into the ancestor set and mis-order the types.
+        inst_rels: set[str] = set()
+        sub_rels: set[str] = set()
+        try:
+            with db.cursor() as _rc:
+                _rc.execute(
+                    "SELECT rel_type, wikidata_pid FROM rel_types "
+                    "WHERE is_hierarchy_rel = true AND wikidata_pid = ANY(%s)",
+                    (["P31", "P279"],),
+                )
+                for _rt, _pid in _rc.fetchall():
+                    if _pid == "P31":
+                        inst_rels.add((_rt or "").lower())
+                    elif _pid == "P279":
+                        sub_rels.add((_rt or "").lower())
+        except Exception:
+            pass
+        # Fallbacks (never disable the collapse on a metadata miss).
+        if not inst_rels:
+            inst_rels = {"instance_of"}
+        _all_class = set(_get_classification_rels(db))
+        sub_rels |= {r for r in (_all_class - inst_rels)} or {"subclass_of", "is_a"}
+        sub_rels |= {"is_a"}
+        if not sub_rels:
+            return facts
+        # Group the anchor set's instance-of edges by subject UUID → its candidate types.
+        io_by_subj: dict[str, list[tuple[str, dict]]] = {}
+        for f in facts:
+            if (f.get("rel_type") or "").lower() not in inst_rels:
+                continue
+            subj = str(f.get("_subject_id") or f.get("subject_id") or "")
+            obj = str(f.get("_object_id") or f.get("object_id") or f.get("object") or "")
+            # Object must be a UUID type node (a subclass_of ladder hangs off TYPE nodes,
+            # never off a scalar/string value). Skip anything unresolvable.
+            if len(subj) == 36 and len(obj) == 36:
+                io_by_subj.setdefault(subj, []).append((obj, f))
+        # Only a subject with COMPETING types (≥2 instance_of) needs the ladder walk;
+        # the overwhelmingly common single-type case opens no cursor and runs no query.
+        multi = {s: items for s, items in io_by_subj.items() if len(items) >= 2}
+        if not multi:
+            return facts
+        drop_ids: set[int] = set()
+        with db.cursor() as cur:
+            for subj, items in multi.items():
+                type_ids = [o for o, _ in items]
+                # Transitive subclass_of ancestors of each candidate type (facts ∪ staged),
+                # keyed start_type → its ancestor UUIDs. Cycle-safe depth bound.
+                cur.execute(
+                    """
+                    WITH RECURSIVE edges AS (
+                        SELECT subject_id, object_id FROM facts
+                        WHERE rel_type = ANY(%(rels)s) AND superseded_at IS NULL
+                          AND archived_at IS NULL AND deleted_at IS NULL
+                        UNION ALL
+                        SELECT subject_id, object_id FROM staged_facts
+                        WHERE rel_type = ANY(%(rels)s) AND promoted_at IS NULL
+                          AND deleted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > now())
+                    ),
+                    up AS (
+                        SELECT subject_id AS start_id, object_id AS ancestor, 1 AS depth
+                        FROM edges WHERE subject_id = ANY(%(ids)s)
+                        UNION
+                        SELECT u.start_id, e.object_id, u.depth + 1
+                        FROM edges e JOIN up u ON e.subject_id = u.ancestor
+                        WHERE u.depth < 12
+                    )
+                    SELECT DISTINCT start_id, ancestor FROM up WHERE ancestor IS NOT NULL
+                    """,
+                    {"ids": type_ids, "rels": sorted(sub_rels)},
+                )
+                ancestors: dict[str, set[str]] = {}
+                for start_id, anc in cur.fetchall():
+                    ancestors.setdefault(str(start_id), set()).add(str(anc))
+                in_set = set(type_ids)
+                for obj, f in items:
+                    # obj is an ANCESTOR of another in-set candidate type → the broader
+                    # one → drop its DIRECT instance_of (kept only via the ladder).
+                    if any(other != obj and obj in ancestors.get(other, set())
+                           for other in in_set):
+                        drop_ids.add(id(f))
+        if drop_ids:
+            kept = [f for f in facts if id(f) not in drop_ids]
+            log.info("query.instance_of_most_specific_collapse",
+                     dropped=len(facts) - len(kept))
+            return kept
+    except Exception as _mse:
+        log.warning("query.instance_of_most_specific_collapse_failed",
+                    error=str(_mse)[:120])
+    return facts
+
+
+def _recency_collapse_single_valued_state(facts: list[dict], rel_meta_fn, db=None) -> list[dict]:
+    """RECENCY-PICKS-CURRENT at render (DESIGN-memory-temporal-lifecycle §5 / MEMORY
+    temporal-lifecycle: 'where do I live' → latest, older coexisting value kept but marked
+    FORMER).
+
+    Among COEXISTING, same-subject, same-rel, UNDATED facts that share
+    temporal_status='now' on a SINGLE-VALUED STATE rel, keep the MOST RECENT (ingest order)
+    as the CURRENT value and re-stamp the OLDER one(s) temporal_status='past'. convert_to_prose
+    then renders those older values through its EXISTING undated-state 'past' FORMER framing
+    ("Previously, you lived in Toronto") while the latest asserts as current ("You live in
+    Vancouver") — instead of both reading as current (living in two cities at once).
+
+    CARDINALITY GUARD (the crux — do NOT get wrong): this collapse fires ONLY for a
+    SINGLE-VALUED state rel (`is_single_valued` metadata, migration 168 — e.g. residence,
+    one current home). A MULTI-VALUED state rel ("I speak English" + "I speak French";
+    likes; …) has `is_single_valued` False/absent and is LEFT UNTOUCHED — every coexisting
+    value stays current. No rel/place literal: the single-vs-multi decision reads the
+    per-tenant rel_type metadata via `rel_meta_fn`. Subject-agnostic.
+
+    DATED facts are untouched (the event_date dual-clock owns their ordering). Mutates the
+    fact dicts in place; idempotent (a group with one 'now' fact is a no-op — re-running finds
+    a single 'now' and does nothing). RECENCY key = created_at (ISO, chronological string
+    sort) then the monotonic BIGSERIAL `_ingest_id` (same-txn rows share created_at). A group
+    whose recency is wholly indeterminate is LEFT ALONE (never guess which is newer).
+    Fail-safe: any error leaves `facts` unchanged.
+    """
+    if not facts:
+        return facts
+    try:
+        groups: dict[tuple, list[dict]] = {}
+        for f in facts:
+            if f.get("event_date"):
+                continue  # dated → the dual-clock owns it, not recency
+            if (f.get("temporal_status") or "now").lower() != "now":
+                continue  # only collapse AMONG the currently-'now' coexisting values
+            rt = (f.get("rel_type") or "").lower()
+            if not rt:
+                continue
+            m = rel_meta_fn(rt) if callable(rel_meta_fn) else None
+            if not m:
+                continue
+            if (m.get("temporal_class") or "state") != "state":
+                continue  # immutable / event rels are unaffected by present-state recency
+            if not m.get("is_single_valued"):
+                continue  # MULTI-VALUED → keep ALL coexisting values current (the guard)
+            subj = str(f.get("_subject_id") or f.get("subject_id") or f.get("subject") or "")
+            if not subj:
+                continue
+            groups.setdefault((subj, rt), []).append(f)
+
+        def _rk(f):
+            return (str(f.get("created_at") or ""),
+                    f.get("_ingest_id") if f.get("_ingest_id") is not None else -1)
+
+        # NESTING GUARD (co-asserted granularities are NOT a relocation). "I live in
+        # Kitchener, Ontario" yields TWO single-valued lives_in values whose objects are
+        # in a CONTAINMENT relationship (kitchener located_in ontario) — one residence at
+        # two granularities, both currently true. Recency-collapsing them wrongly reads as
+        # "currently Ontario / used to live Kitchener". When the group's objects are nested
+        # (any pair joined by a hierarchy/containment edge), they COEXIST — skip the group.
+        # DB-checked against real containment edges only (facts ∪ staged_facts, hierarchy
+        # rels via _get_hierarchy_rels — no place/rel literal); subject-agnostic; fail-safe
+        # (no db / error → today's behaviour). See MEMORY nested-location capture.
+        def _objs_are_nested(grp) -> bool:
+            if db is None:
+                return False
+            _objs = [str(f.get("_object_id") or f.get("object_id") or f.get("object") or "")
+                     for f in grp]
+            _objs = [o for o in _objs if len(o) == 36]  # UUIDs only
+            if len(_objs) < 2:
+                return False
+            try:
+                _hier = sorted({r.lower() for r in _get_hierarchy_rels(db)})
+                if not _hier:
+                    return False
+                with db.cursor() as _nc:
+                    _nc.execute(
+                        "SELECT 1 FROM facts"
+                        " WHERE subject_id = ANY(%s) AND object_id = ANY(%s)"
+                        "   AND rel_type = ANY(%s) AND superseded_at IS NULL"
+                        "   AND archived_at IS NULL AND deleted_at IS NULL"
+                        " UNION ALL"
+                        " SELECT 1 FROM staged_facts"
+                        " WHERE subject_id = ANY(%s) AND object_id = ANY(%s)"
+                        "   AND rel_type = ANY(%s) AND deleted_at IS NULL"
+                        " LIMIT 1",
+                        (_objs, _objs, _hier, _objs, _objs, _hier),
+                    )
+                    return _nc.fetchone() is not None
+            except Exception:
+                return False
+
+        collapsed = 0
+        for grp in groups.values():
+            if len(grp) < 2:
+                continue  # a single current value — nothing to supersede
+            keys = [_rk(f) for f in grp]
+            if len(set(keys)) == 1:
+                continue  # wholly indeterminate recency → do not guess which is newer
+            if _objs_are_nested(grp):
+                continue  # co-asserted granularities (Kitchener ⊂ Ontario) → keep both current
+            ordered = sorted(grp, key=_rk)  # oldest → newest
+            for f in ordered[:-1]:          # all but the most recent → FORMER
+                f["temporal_status"] = "past"
+                collapsed += 1
+        if collapsed:
+            log.info("query.recency_collapse.single_valued_state",
+                     former_marked=collapsed, groups=len(groups))
+    except Exception as e:
+        log.warning("recency_collapse.failed", error=str(e)[:140])
+    return facts
+
+
 def _apply_clock_selection(facts: list[dict], intent: dict, rel_meta_fn,
                            user_id: str | None = None) -> list[dict]:
     """Phase 2 — dual-clock query selection + MISS-LOUD (DESIGN-memory-temporal-lifecycle
@@ -30358,6 +32539,12 @@ def _apply_clock_selection(facts: list[dict], intent: dict, rel_meta_fn,
             return sorted(facts, key=_ingest_key, reverse=True)
 
         # ── EVENT clock ──
+        # RECENCY-PICKS-CURRENT first: among coexisting UNDATED single-valued state 'now'
+        # values, re-stamp the older one(s) 'past' so BOTH the present-state phase (below,
+        # asserts the latest) AND the past-state phase ("where did I used to live" →
+        # _undated_past) see the correct current-vs-former split. Metadata-driven,
+        # cardinality-guarded (multi-valued rels untouched). No-op when nothing qualifies.
+        facts = _recency_collapse_single_valued_state(facts, rel_meta_fn)
         _dated = [f for f in facts if f.get("event_date")]
         _undated = [f for f in facts if not f.get("event_date")]
 
@@ -30430,11 +32617,34 @@ def _apply_clock_selection(facts: list[dict], intent: dict, rel_meta_fn,
                         _kept.append(f)
             _dated = _kept
 
-        # MISS-LOUD: an EVENT-clock ask whose candidates have NO event_date is a MISS.
-        # Never substitute ingest-time for "when did it happen". (The §5 substitution
-        # exception — temporal_status='now' AND state — needs no event_date and is the
-        # default non-temporal current-view path, not this event-clock branch.)
-        if not _dated:
+        # ── UNDATED STATE facts keyed on stored temporal_status (§5) ──
+        # A `state` rel fact carrying NO event_date has nothing to recompute a clock from,
+        # so its stored grammatical temporal_status is the AUTHORITY (now=current,
+        # past=former, future=upcoming). This is the design's undated fallback: the DATED
+        # path stays event_date-driven (recompute authoritative when a date exists), the
+        # UNDATED path honours the stored grammatical signal. Partition the undated STATE
+        # facts so (a) MISS-LOUD does not fire on an undated-only coexisting pair and
+        # (b) the past-state phase can return the undated former value(s). Metadata-driven
+        # (temporal_class from the overlay); subject-agnostic (any state rel); fail-safe.
+        def _tclass(f):
+            _rt = (f.get("rel_type") or "")
+            if not _rt:
+                return "state"
+            _m = rel_meta_fn(_rt.lower()) if callable(rel_meta_fn) else None
+            return (_m or {}).get("temporal_class", "state")
+
+        def _tstatus(f):
+            return (f.get("temporal_status") or "now").lower()
+
+        _undated_state = [f for f in _undated if _tclass(f) == "state"]
+        _undated_nonstate = [f for f in _undated if _tclass(f) != "state"]
+        _undated_past = [f for f in _undated_state if _tstatus(f) == "past"]
+
+        # MISS-LOUD: an EVENT-clock ask whose candidates have NO event_date AND no stored-
+        # status state fact is a MISS. Never substitute ingest-time for "when did it
+        # happen". (An UNDATED state fact IS answerable from its stored temporal_status —
+        # the §5 undated fallback — so it is NOT a miss.)
+        if not _dated and not _undated_state:
             log.info("query.clock_selection.miss_loud",
                      reason="event_clock_no_event_date",
                      candidates=len(facts), event_year=_year)
@@ -30443,50 +32653,51 @@ def _apply_clock_selection(facts: list[dict], intent: dict, rel_meta_fn,
         # PRESENT-STATE collapse, metadata-driven. If EVERY dated fact's rel_type is a
         # 'state' class (per overlay temporal_class) → the current value is the latest
         # (max event_date); collapse to it. If any 'event' class is present, this is a
-        # list-style ask → preserve (ordering already applied upstream).
-        def _tclass(f):
-            _rt = (f.get("rel_type") or "")
-            if not _rt:
-                return "state"
-            _m = rel_meta_fn(_rt.lower()) if callable(rel_meta_fn) else None
-            return (_m or {}).get("temporal_class", "state")
+        # list-style ask → preserve (ordering already applied upstream). `_all_dated_state`
+        # is vacuously True when there are no dated facts (undated-only state ask).
+        _all_dated_state = all(_tclass(f) == "state" for f in _dated)
+        _state_phase = intent.get("state_phase")
 
-        _all_state = all(_tclass(f) == "state" for f in _dated)
-        if _all_state and _dated:
-            # PRESENT vs PAST phase. Phase 3 keeps `state` changes coexisting (all dated,
-            # none superseded): the latest event_date is the CURRENT value; the older
-            # ones are the HISTORY. `state_phase=="past"` ("used to / previously / what
-            # was my…") returns the history (all but the latest), ascending by event_date;
-            # present/unset returns the single current value (existing behaviour).
-            _state_phase = intent.get("state_phase")
-            if _state_phase == "past":
-                # Order coexisting state values oldest→newest, then drop the current
-                # (max event_date) — what's left is the prior value(s) the user "used to"
-                # hold. Deterministic date-string sort (ISO event_date), no fuzzy.
+        if _state_phase == "past":
+            # PAST-STATE ("used to / previously / what was my…") → the FORMER value(s).
+            # Dated history = the coexisting dated values oldest→newest minus the current
+            # (max event_date). Undated history = the undated state facts stamped
+            # temporal_status='past' — the stored grammatical signal IS the prior-value
+            # marker when there is no date to order by. Union both; deterministic, no fuzzy.
+            _history = []
+            if _dated and _all_dated_state:
                 _ordered = sorted(
                     _dated, key=lambda f: str(f.get("event_date") or ""))
                 _history = _ordered[:-1]  # all but the latest (the current value)
-                if not _history:
-                    # MISS-LOUD: only one value ⇒ no prior state. The "used to" framing
-                    # has no answer; do NOT fabricate by returning the current value.
-                    log.info("query.clock_selection.past_state_miss",
-                             reason="single_state_value_no_history",
-                             candidates=len(_dated))
-                    return []
-                log.info("query.clock_selection.past_state",
-                         candidates=len(_dated), history=len(_history))
-                # Undated state facts are NOT prior-value history (no event_date to place
-                # them before the current); exclude them from a strict "used to" answer.
-                return _history
+            _history = _history + _undated_past
+            if not _history:
+                # MISS-LOUD: no prior value (single/only-current). The "used to" framing
+                # has no answer; do NOT fabricate by returning the current value.
+                log.info("query.clock_selection.past_state_miss",
+                         reason="no_prior_state_value",
+                         candidates=len(_dated) + len(_undated_state))
+                return []
+            log.info("query.clock_selection.past_state",
+                     dated_history=len(_history) - len(_undated_past),
+                     undated_history=len(_undated_past))
+            return _history
 
+        # PRESENT (default): coexisting states stay coexisting. Keep the current dated
+        # value (latest event_date when all dated are state) or the untouched dated/event
+        # list, PLUS all undated facts. The undated facts' stored temporal_status drives
+        # convert_to_prose framing (now=current, past=former, future=upcoming); selection
+        # KEEPS them so former/upcoming values are still surfaced (history preserved).
+        # `_undated_state + _undated_nonstate` is a permutation of `_undated` → the dated
+        # composition is byte-for-byte the prior behaviour.
+        if _dated and _all_dated_state:
             _latest = max(
                 _dated,
                 key=lambda f: str(f.get("event_date") or ""))
             log.info("query.clock_selection.present_state",
                      candidates=len(_dated))
-            return [_latest] + _undated
+            return [_latest] + _undated_state + _undated_nonstate
 
-        return _dated + _undated
+        return _dated + _undated_state + _undated_nonstate
     except Exception as e:
         log.warning("apply_clock_selection.failed", error=str(e))
         return facts
@@ -30801,6 +33012,24 @@ def determine_path(
     path = QueryPath()
     query_lower = query_text.lower()
 
+    # ── REFERENCE-DETERMINED BREADTH (resolved ONCE, up front) ─────────────────────
+    # Does the QUERY reference a hierarchy / map / grouping (→ DESCEND the tree) or a
+    # bare single entity (→ TIGHT neighbourhood)? Resolved from the query REFERENCE
+    # (surface cue OR a grouping WORD that names a per-tenant taxonomy), never from the
+    # anchor's incidental structure. Carried on the path so both determine_path (below,
+    # to gate the whole-taxonomy admission for a concrete anchor) and
+    # fetch_facts_from_anchor (to gate the descent/ladder breadth) key off ONE signal.
+    path.hierarchy_intent = _query_references_grouping(query_text, db)
+    # TIGHT reference = a concrete NON-user anchor named WITHOUT a hierarchy/grouping
+    # reference ("tell me about core-1 / backend-team"). Such a query must return the
+    # anchor's own neighbourhood, NOT the whole group/tree its rels happen to belong to.
+    # User-anchored ("my family") and hierarchy/map references are never tight.
+    _tight_reference = bool(
+        anchor_is_concrete_entity and anchor_uuid
+        and anchor_uuid != user_id
+        and not path.hierarchy_intent
+    )
+
     # ── Site 2 (SYNTHESIS §12): SCOPE-DEFERENCE for a concretely-resolved anchor ──
     # When resolve_anchor already pinned the subject to a CONCRETE entity (synonym hook
     # or alias), do NOT let GLiNER2 reclassify the bare nickname. Instead route scope off
@@ -30822,15 +33051,25 @@ def determine_path(
                 )
                 _anchor_rels = {r[0] for r in _ac.fetchall() if r[0]}
             if _anchor_rels:
-                with db.cursor() as _ac:
-                    _ac.execute(
-                        "SELECT taxonomy_name FROM entity_taxonomies "
-                        "WHERE rel_types_defining_group && %s::text[]",
-                        (list(_anchor_rels),),
-                    )
-                    for (_tax,) in _ac.fetchall():
-                        if _tax and _tax not in path.taxonomy_groups:
-                            path.taxonomy_groups.append(_tax)
+                # BREADTH GATE: admit the anchor's rels → TAXONOMY (which fans the walk
+                # out to the WHOLE group's members: every part_of / member_of entity in
+                # the tenant) ONLY when the query actually references that grouping. A
+                # bare single-entity reference ("tell me about backend-team") must NOT
+                # pull the entire `work` taxonomy just because the entity has a `part_of`
+                # edge — that is the reported over-extension. The temporal + structural
+                # tiers below still admit the anchor's OWN edges (its container/type/state),
+                # so a tight query keeps its neighbourhood. Reference-determined, not a
+                # blanket suppression: a grouping/map reference re-enables the whole path.
+                if not _tight_reference:
+                    with db.cursor() as _ac:
+                        _ac.execute(
+                            "SELECT taxonomy_name FROM entity_taxonomies "
+                            "WHERE rel_types_defining_group && %s::text[]",
+                            (list(_anchor_rels),),
+                        )
+                        for (_tax,) in _ac.fetchall():
+                            if _tax and _tax not in path.taxonomy_groups:
+                                path.taxonomy_groups.append(_tax)
 
                 # ── TEMPORAL TIER ADMISSION ("what happened to my X") ──────────────
                 # A dated EVENT/STATE edge on the anchor ("gps has_state break",
@@ -30861,6 +33100,69 @@ def determine_path(
                 except Exception as _ts_err:
                     log.warning("determine_path.temporal_tier_scope_failed",
                                 error=str(_ts_err)[:120])
+
+                # ── STRUCTURAL / HIERARCHY TIER ADMISSION (staged-only /expand anchor) ──
+                # A fresh `/expand` + statement-dump tenant grounds an entity's OWN
+                # containment + type ladder (located_in / instance_of / subclass_of /
+                # part_of / has_*) entirely in staged_facts (Class B) — the tenant has
+                # almost no `facts` rows yet. Those are the anchor's OWN hierarchy rels,
+                # but they map to NO domain taxonomy (a grown taxonomy rarely defines its
+                # group by instance_of/located_in) and are NOT event/state rels, so the
+                # two blocks above leave scope EMPTY → scope_active False → the query
+                # falls back to an UNSCOPED fetch-all that never descends the anchor's
+                # hierarchy (the fetch-all structural lane surfaces only the anchor's
+                # DIRECT edges + the is-a ladder-climb backstop, dropping the deeper
+                # containment tree, e.g. rack→datacentre).
+                #
+                # FIX (scope, not capture): when the anchor HAS structural rels of its
+                # own and NOTHING ELSE resolved scope, scope TO THE ANCHOR'S OWN
+                # HIERARCHY — admit the anchor's structural rels so scope_active flips
+                # and the scoped hierarchy walk (which already reads facts ∪ staged)
+                # descends the full containment + type ladder. This is the deterministic,
+                # subject-agnostic analogue of the temporal-tier block above, for the
+                # STRUCTURAL retrieval tier — intersected with the anchor's OWN rels (an
+                # anchor with no structural edges is unaffected → additive + safe).
+                #
+                # METADATA-DRIVEN + PER-TENANT: the structural set is the hierarchy rels
+                # read under the CALLER's bound tenant search_path (_get_hierarchy_rels(db))
+                # — so a TENANT-GROWN containment rel (an /expand-minted `mounted_in`/
+                # `contains`, is_hierarchy_rel=true, absent from the public seed) is a real
+                # scope axis, exactly as the descent lane reads it — UNION the has_* rels
+                # actually present on the anchor (structural-property assertions, a NAME
+                # pattern, tenant-agnostic). NEVER a hardcoded rel-name/domain list. Routed
+                # scalar vs relationship by tail metadata (_is_scalar_rel_type), mirroring
+                # the temporal-tier block.
+                #
+                # NO-REGRESS: GATED on scope being otherwise EMPTY (no taxonomy, no
+                # scalar/relationship rels admitted). A concrete anchor that DID resolve a
+                # taxonomy or an event/state scope — every Class-A scoped path, whose rels
+                # already come from `facts` — never enters this branch and is byte-for-byte
+                # unchanged. Only the would-be fetch-all case (no scope) is rescued.
+                if not (path.taxonomy_groups or path.scalar_rels
+                        or path.relationship_rels):
+                    try:
+                        _structural = set(_get_hierarchy_rels(db))
+                        _structural |= {
+                            r for r in _anchor_rels
+                            if isinstance(r, str) and r.lower().startswith("has_")
+                        }
+                        _admitted_struct: list[str] = []
+                        for _sr in sorted(_anchor_rels & _structural):
+                            if _is_scalar_rel_type(_sr):
+                                if _sr not in path.scalar_rels:
+                                    path.scalar_rels.append(_sr)
+                                    _admitted_struct.append(_sr)
+                            elif _sr not in path.relationship_rels:
+                                path.relationship_rels.append(_sr)
+                                _admitted_struct.append(_sr)
+                        if _admitted_struct:
+                            log.info("determine_path.structural_tier_scope",
+                                     anchor=str(anchor_uuid)[:8],
+                                     structural_rels=_admitted_struct[:8],
+                                     query=query_text[:50])
+                    except Exception as _st_err:
+                        log.warning("determine_path.structural_tier_scope_failed",
+                                    error=str(_st_err)[:120])
             log.info("determine_path.scope_deference",
                      anchor=str(anchor_uuid)[:8],
                      anchor_rels=sorted(_anchor_rels)[:5],
@@ -31177,6 +33479,39 @@ def determine_path(
                             continue
                         _attr_lc = str(_attr).strip().lower()
                         _hit = _attr_lc in _aspect_words
+                        # (a2) HEAD TOKEN of a COMPOUND attribute name — the scalar twin of
+                        # RELSCOPE's rel-name tokenisation, grounded on the compound's HEAD.
+                        # A grown scalar carries either a verb+particle attribute ("take_on"/
+                        # "wake_on" for "I take a class ON Fridays" / "I wake up ON Tuesdays")
+                        # OR a PURE-NP attribute ("daily_commute"/"new_internet_plan" for "my
+                        # daily commute takes 45 minutes" / "I upgraded to 500 Mbps"); the WHOLE
+                        # name is never a query word, so the equality above misses it and the
+                        # value never surfaces. Tokenise on word boundaries, drop functor halves
+                        # ("on" is in _tmpl_stop), and match the query aspect words against the
+                        # attribute's HEAD token — its RIGHTMOST content constituent
+                        # ("daily_commute"→commute, "new_internet_plan"→plan, "take_on"→take).
+                        # This is the Right-hand Head Rule for English compounds (Williams 1981):
+                        # the head of a noun/verb-particle compound is its rightmost element.
+                        #   • ADMITS the pure-NP scalar — the query NP head ("commute"/"plan")
+                        #     matches the attribute head, so it surfaces (fixes the systemic
+                        #     captured-not-surfaced gap: commute/internet/schedule/…).
+                        #   • HOLDS the OVERSCOPE boundary — an unrelated query that merely
+                        #     shares a generic MODIFIER token ("what is my NEW job title" vs
+                        #     new_internet_plan; "my DAILY mood" vs daily_commute) no longer
+                        #     firehoses the wrong scalar into scope, because a modifier is never
+                        #     the head. Matching ANY shared token (the prior greedy set-∩) let a
+                        #     lone generic modifier collide → wrong-scalar overscope.
+                        # Scalar-only + anchor-grounded (reads the anchor's OWN entity_attributes),
+                        # so it opens no relationship edge and cannot leak across groups.
+                        # Deterministic word-boundary tokenisation, no cosine/LLM/word-zoo;
+                        # subject-agnostic (head comes from the query + the stored attribute only).
+                        if not _hit:
+                            _attr_name_seq = [
+                                _t for _t in re.findall(r'[a-z]+', _attr_lc)
+                                if len(_t) >= 3 and _t not in _tmpl_stop
+                            ]
+                            if _attr_name_seq:
+                                _hit = _attr_name_seq[-1] in _aspect_words
                         if not _hit and _nl:
                             _nl_tokens = {
                                 _t for _t in re.findall(r'[a-z]+', str(_nl).lower())
@@ -31462,7 +33797,39 @@ def determine_path(
             # exactly the "Frizz"→bash@0.74 hijack — anchor (WHO) right, scope (WHAT) wrong.
             # Deferring to the anchor's real edges (block above) is authoritative; do not let a
             # fuzzy zero-shot taxonomy guess override a deterministically-resolved entity.
-            if not path.taxonomy_groups and not anchor_is_concrete_entity:
+            # PRECEDENCE: an EXPLICIT aspect beats a FUZZY group guess. Do not widen a scope the
+            # user already named.
+            #
+            # "Hey, where do I live?" deterministically resolved `lives_in` (rel_type_aliases:
+            # live → lives_in) — the aspect was RIGHT THERE and correctly matched. GLiNER2 then
+            # zero-shot-classified the same sentence into the `household` TAXONOMY at 0.538 (a
+            # hair over the 0.5 floor) and Component 1 unioned that group's ENTIRE
+            # rel_types_defining_group on top: has_pet, belongs_to, part_of, member_of,
+            # represents, resides_in, located_at.
+            #
+            # So a location question walked into the household group and returned the dog, the
+            # club memberships, a third party's gender — and a medical appointment. An INVALID
+            # L4 walk: right anchor, WRONG NODE. The aspect the user actually named was drowned
+            # in a group they did not ask about.
+            #
+            # This is the SAME principle already stated two lines below for the anchor ("do not
+            # let a fuzzy zero-shot taxonomy guess override a deterministically-resolved entity")
+            # — it was simply never applied to RELS. A taxonomy guess is the FALLBACK for a query
+            # that names no aspect ("tell me about my family"); it is not a licence to widen one
+            # that does. Bounded aspect-precise walk: ground the anchor, walk the ASPECT.
+            #
+            # Subject-agnostic: keys only on "did the query deterministically resolve any rel",
+            # never on which rel or which domain.
+            _explicit_aspect = bool(path.relationship_rels or path.scalar_rels)
+            if _explicit_aspect:
+                log.info("determine_path.explicit_aspect_wins",
+                         rels=sorted(set(path.relationship_rels) | set(path.scalar_rels)),
+                         query=query_text[:50],
+                         note="query named its aspect deterministically — skipping the fuzzy "
+                              "taxonomy guess so it cannot widen the scope")
+
+            if (not path.taxonomy_groups and not anchor_is_concrete_entity
+                    and not _explicit_aspect):
                 _gliner = get_gliner_model()
                 if _gliner:
                     try:
@@ -31602,6 +33969,58 @@ def determine_path(
             except Exception as _mte:
                 log.warning("determine_path.member_types_failed", error=str(_mte)[:120])
 
+        # ── SCALAR MEMBER-ATTRIBUTE ADMISSION (occupation recall-scope fix) ──────────
+        # A resolved taxonomy declares two rel families on its own row: the MEMBERSHIP
+        # rels (`rel_types_defining_group`, Component-1-expanded above) and the member
+        # ATTRIBUTE rels (`transitive_rel_types` — the slots a member of the group
+        # carries). Component 1 admits ONLY the membership rels, so a taxonomy-anchored
+        # question surfaces the group's edges but PROJECTS OUT the members' own attribute
+        # values. That is the reported "what do I do for work" miss: keyword "work"
+        # resolves the `work` taxonomy, whose defining group is {works_for, …} but whose
+        # `occupation` slot (the actual answer, "systems analyst") lives in
+        # transitive_rel_types → allowed_rels never carries it → the SCALAR attribute is
+        # dropped at the anchor projection (WHERE attribute = ANY(scalar_rels)).
+        #
+        # FIX (projection, not capture): admit the SCALAR subset of each resolved
+        # taxonomy's transitive_rel_types into path.scalar_rels. SCALAR-ONLY is the safety
+        # boundary — a scalar is a member's OWN attribute VALUE (entity_attributes), so
+        # admitting it cannot introduce a cross-group RELATIONSHIP leak (this is exactly
+        # why the NESTING-REL block below refuses to fold the taxonomy's BROAD transitive
+        # set: its relationship rels — lives_in/works_for — would leak address/employer
+        # edges; the scalar rels — occupation/age/born_on — cannot). Bounded to the
+        # resolved taxonomy(ies); metadata-driven (transitive_rel_types + tail_types via
+        # _is_scalar_rel_type); subject-agnostic (no rel/domain literal). A taxonomy with
+        # no scalar transitive rels is a no-op. Fail-safe: any error leaves scope unchanged.
+        if path.taxonomy_groups:
+            try:
+                _scalar_transitive: set[str] = set()
+                with db.cursor() as _sttcur:
+                    for _tax in path.taxonomy_groups:
+                        _sttcur.execute(
+                            "SELECT transitive_rel_types FROM entity_taxonomies "
+                            "WHERE taxonomy_name = %s",
+                            (_tax,),
+                        )
+                        _strow = _sttcur.fetchone()
+                        if _strow and _strow[0]:
+                            for _tr in _strow[0]:
+                                _tr_lc = (_tr or "").strip().lower()
+                                if _tr_lc and _is_scalar_rel_type(_tr_lc):
+                                    _scalar_transitive.add(_tr_lc)
+                _admitted_scalar = []
+                for _sr in sorted(_scalar_transitive):
+                    if _sr not in path.scalar_rels:
+                        path.scalar_rels.append(_sr)
+                        _admitted_scalar.append(_sr)
+                if _admitted_scalar:
+                    log.info("determine_path.scalar_member_attribute_scope",
+                             query=query_text[:50],
+                             taxonomies=list(path.taxonomy_groups),
+                             admitted_scalars=_admitted_scalar[:8])
+            except Exception as _stte:
+                log.warning("determine_path.scalar_member_attribute_failed",
+                            error=str(_stte)[:120])
+
         # ── NESTING-REL RESOLUTION (Fix A — make the walk DESCEND the nesting) ───────
         # A resolved taxonomy can NEST a sub-group (family ⊃ pets) via two metadata
         # signals on its own row: `transitive_rel_types` (the classification/composition
@@ -31723,6 +34142,21 @@ def determine_path(
         if AXIS_SCOPED_QUERY:
             path.axis = _resolve_query_axis(path, query_text, db)
 
+        # ── REFERENCE-DETERMINED BREADTH (already set up front; augment here) ──────
+        # path.hierarchy_intent was resolved up front from (a) a hierarchy/map SURFACE cue
+        # and (b) a grouping WORD naming a per-tenant taxonomy. AUGMENT it here (OR-in)
+        # when a taxonomy resolved via Phase-1 keyword matching whose NAME the query does
+        # utter — so a grouping keyword the up-front literal-name scan didn't catch still
+        # descends. Gated on the taxonomy_name (or its spaced form) appearing as a query
+        # token, so a taxonomy INFERRED from the anchor's incidental rels (never uttered)
+        # cannot flip a tight bare-entity query. Never turns a grouping reference tight.
+        _ql_ref = (query_text or "").lower()
+        _grouping_word_in_query = any(
+            t and (t.lower() in _ql_ref or t.lower().replace("_", " ") in _ql_ref)
+            for t in path.taxonomy_groups
+        )
+        path.hierarchy_intent = bool(path.hierarchy_intent or _grouping_word_in_query)
+
         log.info(
             "determine_path",
             query=query_text[:50],
@@ -31733,6 +34167,7 @@ def determine_path(
             member_types=path.member_types,
             scope_active=path.scope_active,
             axis=path.axis,
+            hierarchy_intent=path.hierarchy_intent,
         )
 
         return path
@@ -32103,6 +34538,105 @@ def fetch_facts_from_anchor(
                 # Continue with default schema (conn will use public)
 
             with conn.cursor() as cur:
+                # ── CLASSIFICATION-AXIS RE-ADMISSION (Fix B — the "what IS X" lane) ──────
+                # GAP 2 (/expand walk): on the CLASSIFICATION axis ("what is router-1 / what
+                # kind of device") the answer is the instance's is-a/subclass_of LADDER, which
+                # is anchored at the TYPE node and climbs class→class. Those classification rels
+                # are is_hierarchy_rel=true and therefore DELIBERATELY excluded from allowed_rels
+                # (concept scope is scalar+relationship only) — so under an active scope the
+                # ladder is projected OUT and the query returns only the instance's own leaf
+                # facts. Re-admit the CLASSIFICATION rels (instance_of/subclass_of, P31/P279 —
+                # metadata-driven via _get_classification_rels, read per-tenant so a grown
+                # classification rel is seen) into the direct + staged projection ONLY on the
+                # classification axis, and climb the ladder (facts ∪ staged) in a dedicated lane
+                # below. Empty on every non-classification query → those projections are
+                # byte-for-byte unchanged. Subject-agnostic, no rel-name literals.
+                # OVER-WIDEN FIX (user-anchored TOPIC classification): a classification
+                # question about a grown TOPIC ("what is espresso a type of?") whose topic
+                # word is a TAXONOMY makes resolve_anchor DECLINE to anchor on it (taxonomy
+                # words anchor the user, so "what is my family" works) → anchor falls back to
+                # the USER. With the classification axis then re-admitting the ANCHOR's own
+                # is-a chain, `(user, instance_of, person)` is pulled in and Step 3c
+                # downward-expands `person` into the user's WHOLE family (anchor==user ⇒
+                # `_tight_downward` False ⇒ no suppression) — the reported personal dump. But
+                # the classification SUBJECT here is the TOPIC (in `taxonomy_groups`), NOT the
+                # user: the named-group branch already returns the topic's own is-a ladder
+                # ("espresso subclass_of coffee"). So when the anchor is the user AND a topic
+                # grouping owns the classification, DO NOT re-admit the user's is-a chain.
+                # Subject-agnostic (anchor==user + a resolved taxonomy scope, NO rel/domain
+                # literal). NON-user classification ("what is router-1") and scopeless
+                # classification are byte-for-byte unchanged; "tell me about espresso/family"
+                # are axis!=classification so `_classif_axis_rels` is empty there regardless.
+                _user_anchored_topic_classification = (
+                    _is_user_anchored_topic_classification(anchor_uuid, user_id, path)
+                )
+                _classification_axis = bool(
+                    AXIS_SCOPED_QUERY and getattr(path, "axis", None) == "classification"
+                    and not _user_anchored_topic_classification
+                )
+                _classif_axis_rels: list[str] = (
+                    sorted(_get_classification_rels(conn)) if _classification_axis else []
+                )
+                # ── REFERENCE-DETERMINED BREADTH: tight single-entity vs descend ────────
+                # A bare single-entity reference ("tell me about core-1") returns the
+                # anchor's TIGHT neighbourhood — its own edges + scalars + immediate
+                # container + its direct type — and must NOT climb the full type ladder
+                # or fan the containment tree out to SIBLINGS. A hierarchy/map/grouping
+                # reference ("the hierarchy under dc-toronto", "my family") DESCENDS.
+                # path.hierarchy_intent (set in determine_path from query-reference cues +
+                # a grouping word) carries that distinction. This gates the two lanes that
+                # otherwise over-extend for ANY concrete anchor regardless of the ask:
+                #   • the container-SEEDED descent (seed = the anchor's own container →
+                #     descending from it reaches SIBLINGS), and
+                #   • the multi-rung classification LADDER CLIMB (anchor → type → …root).
+                # When tight, the descent runs seedless at depth 1 (immediate members only,
+                # no sibling fan-out) and the ladder climb is capped to 1 rung (the anchor's
+                # OWN type, not the whole class lineage). User-anchored recall (anchor ==
+                # user: "my family/pets/car") is NEVER tight — the founding possessive
+                # grouping descends as designed. An explicit "what is / what kind"
+                # CLASSIFICATION reference is also NOT tight — it genuinely asks for the
+                # instance's full is-a lineage (climb the ladder to the root); only the
+                # AUTO-resolved classification axis (a bare entity whose only edges happen
+                # to be structural) is tightened. Subject-agnostic (keys on anchor identity
+                # + the reference signal, no domain/rel literal). Fail-safe: default False
+                # (hierarchy_intent absent) only tightens a concrete NON-user anchor.
+                _classification_cue_present = any(
+                    _c in (query_text or "").lower() for _c in _CLASSIFICATION_QUERY_CUES
+                )
+                _tight_neighbourhood = bool(
+                    AXIS_SCOPED_QUERY
+                    and anchor_uuid and anchor_uuid != user_id
+                    and not getattr(path, "hierarchy_intent", False)
+                    and not _classification_cue_present
+                )
+                # ── LADDER CLIMB FOR A CONCRETE ANCHOR WITH NO ACTIVE SCOPE (walk gap) ──
+                # The classification-ladder CLIMB below is gated on the classification axis,
+                # which only resolves when determine_path built an ACTIVE scope. But when the
+                # anchor is a CONCRETE non-user entity (resolve_anchor pinned it via alias /
+                # synonym — the query is literally ABOUT that entity: "what is toronto", "tell
+                # me about core-1") and determine_path resolved NO scope (no taxonomy match, no
+                # scalar/relationship rel extracted — the COMMON /expand-grown case whose entire
+                # is-a/subclass lineage lives in staged_facts), path.axis is None and the climb
+                # never fires. Only the anchor's OWN single is-a rung then surfaces (via the
+                # structural lane) instead of the full lineage — the correctly-built staged
+                # hierarchy is not traversed. Climb the anchor's OWN ladder in that case too.
+                # UP-only + depth-bounded (a node has few parents) so it can never dump a type's
+                # instances; the direct/staged/anchor-OR PROJECTIONS are left untouched (only
+                # _classif_axis_rels feeds those, and it stays empty here), so this ONLY adds the
+                # missing upper rungs and adds ZERO projection noise. Metadata-driven
+                # (classification rels resolved per-tenant), no rel/domain literals. Fires ONLY
+                # for a concrete non-user anchor with scope inactive → user-anchored and scoped
+                # queries (incl. the whole Class-A scoped path) are byte-for-byte unchanged.
+                _concrete_anchor_no_scope = bool(
+                    AXIS_SCOPED_QUERY
+                    and anchor_uuid and anchor_uuid != user_id
+                    and not getattr(path, "scope_active", False)
+                )
+                _ladder_climb_rels: list[str] = (
+                    _classif_axis_rels if _classif_axis_rels
+                    else (sorted(_get_classification_rels(conn))
+                          if _concrete_anchor_no_scope else [])
+                )
                 # ─── Fetch DIRECT facts: (anchor, rel_type, object) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 # Issue #5: Include temporal columns (valid_from, valid_until) for time-aware queries
@@ -32128,6 +34662,11 @@ def fetch_facts_from_anchor(
                     # edge (has_pet → pets, etc.) so the walk descends the sub-group.
                     if _nesting_axis_rels:
                         _direct |= set(_nesting_axis_rels)
+                    # Fix B: on the classification axis, re-admit the classification rels so
+                    # the instance's own is-a edge surfaces (the ladder climb below reaches
+                    # the rest). No-op off the classification axis.
+                    if _classif_axis_rels:
+                        _direct |= set(_classif_axis_rels)
                     _direct_scope_rels = sorted(_direct)
                 # FIX-1: SAFETY FALLBACK — if path determination returned NO scopes.
                 #
@@ -32265,7 +34804,7 @@ def fetch_facts_from_anchor(
                             if _cmp_lane else ""
                         )
                         direct_query = f"""
-                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, temporal_status, event_date, event_date_granularity, polarity
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, temporal_status, event_date, event_date_granularity, polarity, created_at, id, fact_provenance
                             FROM facts
                             WHERE (subject_id = %(anchor)s
                                    AND (rel_type = ANY(%(rels)s){_event_lane_sql})
@@ -32289,7 +34828,7 @@ def fetch_facts_from_anchor(
                             if _cmp_lane else ""
                         )
                         direct_query = f"""
-                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, temporal_status, event_date, event_date_granularity, polarity
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, temporal_status, event_date, event_date_granularity, polarity, created_at, id, fact_provenance
                             FROM facts
                             WHERE (subject_id = %(anchor)s{_cmp_lane_sql})
                               AND superseded_at IS NULL
@@ -32323,6 +34862,16 @@ def fetch_facts_from_anchor(
                             # ASSERTION POLARITY (Q1): carry the column so prose renders a negated
                             # state negated. Read-only — the query does NO reasoning over it.
                             "polarity": (row[10] if len(row) > 10 else None) or "affirmed",
+                            # RECENCY (migration 168 render): ingest-order signal for the
+                            # single-valued recency-supersede at render — created_at + the
+                            # monotonic BIGSERIAL id tiebreak (same-txn rows share created_at).
+                            "created_at": (row[11].isoformat() if len(row) > 11 and row[11]
+                                           and hasattr(row[11], "isoformat")
+                                           else (str(row[11]) if len(row) > 11 and row[11] else None)),
+                            "_ingest_id": (row[12] if len(row) > 12 else None),
+                            # PROVENANCE (confidence-as-voice): the recall render decides
+                            # assert-vs-hold from truth-confidence (provenance), not fact_class.
+                            "provenance": (row[13] if len(row) > 13 else None),
                         })
 
                 # ─── Fetch STAGED direct facts (Class B/C not yet promoted) ───
@@ -32357,7 +34906,7 @@ def fetch_facts_from_anchor(
                             _sparams["cmpcomp"] = _companion_lane_rels
                         cur.execute(
                             f"""
-                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class, temporal_status, event_date, event_date_granularity, polarity
+                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class, temporal_status, event_date, event_date_granularity, polarity, first_seen_at, fact_provenance
                             FROM staged_facts
                             WHERE (subject_id = %(anchor)s
                                    AND (rel_type = ANY(%(rels)s) OR rel_type IS NULL{_event_lane_sql})
@@ -32382,7 +34931,7 @@ def fetch_facts_from_anchor(
                             _sparams["cmpcomp"] = _companion_lane_rels
                         cur.execute(
                             f"""
-                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class, temporal_status, event_date, event_date_granularity, polarity
+                            SELECT id, subject_id, object_id, rel_type, confidence, fact_class, temporal_status, event_date, event_date_granularity, polarity, first_seen_at, fact_provenance
                             FROM staged_facts
                             WHERE (subject_id = %(anchor)s{_cmp_lane_sql})
                               AND (expires_at IS NULL OR expires_at > now())
@@ -32412,6 +34961,15 @@ def fetch_facts_from_anchor(
                             "event_date_granularity": (row[8] if len(row) > 8 else None),
                             # ASSERTION POLARITY (Q1): staged mirror carries polarity too.
                             "polarity": (row[9] if len(row) > 9 else None) or "affirmed",
+                            # RECENCY (migration 168 render): first_seen_at + the monotonic
+                            # BIGSERIAL id (row[0]) tiebreak for single-valued recency-supersede.
+                            "created_at": (row[10].isoformat() if len(row) > 10 and row[10]
+                                           and hasattr(row[10], "isoformat")
+                                           else (str(row[10]) if len(row) > 10 and row[10] else None)),
+                            "_ingest_id": row[0],
+                            # PROVENANCE (confidence-as-voice): assert-vs-hold keys on this, not
+                            # fact_class — a user_stated staged Class-C fact reads as a plain fact.
+                            "provenance": (row[11] if len(row) > 11 else None),
                         })
                     # Query hit = confirmation signal → increment toward promotion.
                     #
@@ -32495,12 +35053,12 @@ def fetch_facts_from_anchor(
                         inverse_rel_type = rel_type_meta.get("inverse_rel_type")
 
                         # For asymmetric relationships, fully invert: swap subject/object
-                        # AND use the inverse rel_type. This transforms (leo, child_of, user)
-                        # → (user, parent_of, leo), matching the anchor's perspective.
+                        # AND use the inverse rel_type. This transforms (cyrus, child_of, user)
+                        # → (user, parent_of, cyrus), matching the anchor's perspective.
                         # The dedup step will merge this with any lower-confidence direct
                         # counterpart and keep the higher-confidence version.
                         # Half-inversion (flip rel_type only, no subject/object swap) produces
-                        # semantically wrong facts like "leo is the parent of user".
+                        # semantically wrong facts like "cyrus is the parent of user".
                         rel_type_final = rel_type_orig
                         if not is_symmetric and inverse_rel_type:
                             facts.append({
@@ -32558,7 +35116,12 @@ def fetch_facts_from_anchor(
                 # the SAME descent. Subject-agnostic, metadata-driven, deterministic (real
                 # edges only — no cosine/LLM). Fail-safe: helper returns the partial set.
                 try:
-                    _hier_rels = {r.lower() for r in _get_hierarchy_rels()}
+                    # PER-TENANT: read hierarchy rels under the bound tenant search_path so a
+                    # GROWN composition rel (an /expand-minted networking `mounted_in`/`contains`,
+                    # is_hierarchy_rel=true, absent from the public seed) is a real DESCENT axis —
+                    # otherwise the public-only read leaves the grown containment tree invisible to
+                    # the walk (the confirmed /expand gap). Subject-agnostic: keyed on is_hierarchy_rel.
+                    _hier_rels = {r.lower() for r in _get_hierarchy_rels(conn)}
                     _classif_rels = _get_classification_rels(conn)
                     # DESCENT rels = composition/membership hierarchy rels (drop the
                     # classification axis: descending a type would dump every instance).
@@ -32573,7 +35136,12 @@ def fetch_facts_from_anchor(
                             _desc_scope = set(path.allowed_rels)
                             if _nesting_axis_rels:
                                 _desc_scope |= set(_nesting_axis_rels)
-                        _desc_depth = max(1, int(QUERY_MULTIHOP_CLIMB_DEPTH))
+                        # TIGHT breadth: a bare single-entity reference descends only ONE
+                        # immediate hop (its direct members), never the full tree.
+                        _desc_depth = (
+                            1 if _tight_neighbourhood
+                            else max(1, int(QUERY_MULTIHOP_CLIMB_DEPTH))
+                        )
                         # SEED the descent with the anchor's directly-related entities so the
                         # composition subtree is reachable when the anchor is the OWNER, not
                         # the composed whole (user→owns→car→part_of→gps→has_state). The seeds
@@ -32586,8 +35154,15 @@ def fetch_facts_from_anchor(
                             sorted(_desc_scope) if _desc_scope is not None
                             else sorted({r.lower() for r in (path.relationship_rels or [])})
                         )
+                        # TIGHT breadth: do NOT seed the descent with the anchor's OWN
+                        # container/owner (the objects of its outbound edges). Seeding the
+                        # container makes the descent fan OUT to the anchor's SIBLINGS
+                        # (core-1's rack → every device in the rack) — the exact
+                        # over-extension a bare single-entity query must avoid. On a
+                        # hierarchy/map or user-anchored query the seed is kept (the
+                        # founding "my car → gps issue" reach depends on it).
                         _seed_entities: set = set()
-                        if _seed_rels:
+                        if _seed_rels and not _tight_neighbourhood:
                             cur.execute(
                                 "SELECT DISTINCT object_id FROM facts"
                                 " WHERE subject_id = %s AND rel_type = ANY(%s)"
@@ -32619,6 +35194,79 @@ def fetch_facts_from_anchor(
                                 anchor=anchor_uuid[:8] if anchor_uuid else "?",
                                 error=str(_desc_e))
 
+                # ─── CLASSIFICATION LADDER CLIMB (Fix B — the "what IS X" walk) ───
+                # On the CLASSIFICATION axis, CLIMB the instance's is-a/subclass_of ladder from
+                # the anchor UP through class→class (the ladder /learn builds is anchored at the
+                # TYPE node, so reaching it needs an instance→type→climb hop no scoped fact-lane
+                # does). Collect the actual ladder EDGES from BOTH facts and staged_facts (the
+                # grown/learned rungs land Class-B in staged), bounded by QUERY_MULTIHOP_CLIMB_DEPTH
+                # with a cycle guard. Real edges only (no cosine/LLM), metadata-driven
+                # (classification rels resolved per-tenant), subject-agnostic. Gated strictly on
+                # the classification axis → non-classification queries never reach this lane.
+                if _ladder_climb_rels:
+                    try:
+                        _ladder_rels = sorted({r.lower() for r in _ladder_climb_rels})
+                        _seen_nodes: set = {anchor_uuid}
+                        _frontier: list = [anchor_uuid]
+                        # TIGHT breadth: a bare single-entity reference surfaces only the
+                        # anchor's OWN type (1 rung), NOT the whole class lineage climbed to
+                        # the root. A "what is X / what kind" or hierarchy reference keeps the
+                        # full climb.
+                        _climb = (
+                            1 if _tight_neighbourhood
+                            else max(1, int(QUERY_MULTIHOP_CLIMB_DEPTH))
+                        )
+                        _added = 0
+                        while _frontier and _climb > 0:
+                            cur.execute(
+                                "SELECT subject_id, object_id, rel_type, confidence, fact_class, provenance"
+                                "  FROM facts"
+                                " WHERE subject_id = ANY(%s) AND rel_type = ANY(%s)"
+                                "   AND superseded_at IS NULL"
+                                "   AND archived_at IS NULL AND deleted_at IS NULL"
+                                " UNION ALL"
+                                " SELECT subject_id, object_id, rel_type, confidence, fact_class, provenance"
+                                "  FROM staged_facts"
+                                " WHERE subject_id = ANY(%s) AND rel_type = ANY(%s)"
+                                "   AND promoted_at IS NULL AND deleted_at IS NULL",
+                                (_frontier, _ladder_rels, _frontier, _ladder_rels),
+                            )
+                            _next: set = set()
+                            for _lr in cur.fetchall():
+                                _lsub, _lobj, _lrel, _lconf, _lclass, _lprov = _lr
+                                _lrel_l = (_lrel or "").lower()
+                                # THE HARD LINE: still WALK the grown ladder (frontier advances
+                                # below so a grounded leaf ABOVE this rung is still reached), but
+                                # do NOT RETURN an engine-grown type-ladder rung as the user's
+                                # memory — the grown places are the shelf, not the memory.
+                                if not _is_grown_ontology_row(_lrel_l, _lprov):
+                                    facts.append({
+                                        "subject": _lsub,
+                                        "object": _lobj,
+                                        "rel_type": _lrel_l,
+                                        "confidence": float(_lconf) if _lconf else 0.8,
+                                        "fact_class": _lclass or "B",
+                                        "source": "db",
+                                        "category": _get_rel_type_category(_lrel_l),
+                                        # proven via the deterministic classification climb — exempt
+                                        # from the membership/taxonomy projection (this IS the answer).
+                                        "_hierarchy_admitted": True,
+                                    })
+                                    _added += 1
+                                if _lobj and _lobj not in _seen_nodes:
+                                    _next.add(_lobj)
+                            _seen_nodes |= _next
+                            _frontier = list(_next)
+                            _climb -= 1
+                        if _added:
+                            log.info("fetch_facts_from_anchor.classification_ladder_climbed",
+                                     anchor=anchor_uuid[:8] if anchor_uuid else "?",
+                                     rungs=_added, ladder_rels=_ladder_rels)
+                    except Exception as _cl_e:
+                        log.warning("fetch_facts_from_anchor.classification_climb_failed",
+                                    anchor=anchor_uuid[:8] if anchor_uuid else "?",
+                                    error=str(_cl_e))
+
                 # ─── Fetch SCALAR ATTRIBUTES: (anchor, attribute, value) ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
                 #
@@ -32639,6 +35287,7 @@ def fetch_facts_from_anchor(
                 # widens the gate for a non-user anchor). Metadata-free, no attribute
                 # literals — the mechanism is "return the anchored entity's scalars".
                 _nonuser_concrete_anchor = bool(anchor_uuid) and anchor_uuid != user_id
+                _anchor_own_scalars = 0  # counts the anchor's OWN scalar rows (sibling lane gate)
                 if path.fetch_all_details or path.scalar_rels or _nonuser_concrete_anchor:
                     if not path.fetch_all_details and path.scalar_rels and anchor_uuid == user_id:
                         # D1: WHERE attribute IN (...) — strict scalar scoping for user anchor.
@@ -32681,6 +35330,124 @@ def fetch_facts_from_anchor(
                             "valid_from": None,  # scalar attributes have no temporal validity
                             "valid_until": None,
                         })
+                        _anchor_own_scalars += 1
+
+                # ── SCALAR SIBLING-FRAGMENT LANE (fragmented-entity attribute reach) ─────────
+                # A single real-world thing ingested in one breath ("my new Samsung 55-inch
+                # 4K smart TV") can land as SEVERAL user-linked FRAGMENT entities — "samsung
+                # tv", "smart tv", "55-inch smart tv" — because the deriver split the long NP.
+                # The MEASUREMENT/VALUE scalar (height=55-inch) attaches to only ONE fragment
+                # ("55-inch smart tv"), while an attribute question ("what size is my Samsung
+                # TV") anchors (longest-n-gram) on a DIFFERENT fragment ("samsung tv") that
+                # carries NO scalar — so the value the user asked for is present in memory but
+                # unreachable from the resolved anchor (its shared token "tv" is too short for
+                # the query-word entity-centric expansion, and no alias bridges the two names).
+                # This lane is the LEAN query-side REACH for that capture residue (the
+                # fragmentation itself is an ingest/over-capture artefact — cluster-C — not
+                # cleaned up here; we only SURFACE the already-captured scalar). It fires ONLY
+                # as a FALLBACK and under a tight bound:
+                #   • the anchor is a CONCRETE non-user entity that carries NO scalar of its
+                #     own (_anchor_own_scalars == 0) — so it genuinely cannot answer any
+                #     attribute question from itself;
+                #   • the query is a value-seeking INTERROGATIVE (a closed-class WH word) — we
+                #     only reach out when the user is asking for a value, never on "tell me
+                #     about X";
+                #   • siblings are the anchor's OWN FRAGMENTS: entities DIRECTLY linked to the
+                #     user (1-hop on facts∪staged, either side) whose PREFERRED alias shares a
+                #     whole CONTENT TOKEN with the ANCHOR's OWN preferred alias (not the query
+                #     text — so the reach never wanders past the named thing's own fragments).
+                # SCALAR-ONLY: we surface only entity_attributes (the entity's OWN values), so
+                # NO relationship edge to another group is opened — the same leak boundary the
+                # anchored-scalar lane above relies on. Deterministic (whole-word token
+                # overlap, no cosine/substring/LLM), metadata-driven (entity_aliases +
+                # entity_attributes), subject-agnostic (no attribute/rel/domain literal — it
+                # resolves whatever fragments the tenant actually stored). Fail-safe: any error
+                # leaves facts unchanged.
+                _WH_VALUE_TOKENS = {"what", "whats", "which", "how"}
+                if (_nonuser_concrete_anchor and _anchor_own_scalars == 0
+                        and query_text):
+                    try:
+                        _q_toks = set(re.findall(r"[a-z']+", query_text.lower()))
+                        _is_value_q = bool(_q_toks & _WH_VALUE_TOKENS) or (
+                            "what's" in query_text.lower())
+                        if _is_value_q:
+                            # Anchor's OWN preferred-alias content tokens (len>=2, minus a
+                            # tiny functor stop set) — the bridge is a token of the name the
+                            # user's query actually resolved to.
+                            cur.execute(
+                                "SELECT alias FROM entity_aliases"
+                                " WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                                (anchor_uuid,),
+                            )
+                            _arow = cur.fetchone()
+                            _anchor_alias = (_arow[0] if _arow else "") or ""
+                            _fn_stop = {"of", "the", "my", "an", "is", "to", "in",
+                                        "on", "at", "or", "a"}
+                            _anchor_toks = {
+                                t for t in re.findall(r"[a-z]+", _anchor_alias.lower())
+                                if len(t) >= 2 and t not in _fn_stop
+                            }
+                            if _anchor_toks:
+                                # User-linked entities (1-hop, either side) that HOLD a scalar,
+                                # with their preferred alias + attribute value.
+                                cur.execute(
+                                    "SELECT ea.entity_id, al.alias, ea.attribute,"
+                                    "       ea.value_text, ea.value_int, ea.value_float, ea.value_date "
+                                    "  FROM entity_attributes ea "
+                                    "  JOIN entity_aliases al ON al.entity_id = ea.entity_id"
+                                    "   AND al.is_preferred = true "
+                                    " WHERE ea.entity_id <> %(anchor)s "
+                                    "   AND ea.entity_id IN ("
+                                    "        SELECT object_id FROM facts"
+                                    "         WHERE subject_id = %(user)s AND object_id IS NOT NULL"
+                                    "        UNION SELECT subject_id FROM facts WHERE object_id = %(user)s"
+                                    "        UNION SELECT object_id FROM staged_facts"
+                                    "         WHERE subject_id = %(user)s AND object_id IS NOT NULL"
+                                    "        UNION SELECT subject_id FROM staged_facts WHERE object_id = %(user)s"
+                                    "   )",
+                                    {"anchor": anchor_uuid, "user": user_id},
+                                )
+                                _sib_surfaced = 0
+                                for _srow in cur.fetchall():
+                                    _sib_alias = (_srow[1] or "")
+                                    _sib_toks = {
+                                        t for t in re.findall(r"[a-z]+", _sib_alias.lower())
+                                        if len(t) >= 2 and t not in _fn_stop
+                                    }
+                                    if not (_anchor_toks & _sib_toks):
+                                        continue
+                                    _val = _srow[3]
+                                    if _val is None and _srow[4] is not None:
+                                        _val = str(_srow[4])
+                                    if _val is None and _srow[5] is not None:
+                                        _val = str(_srow[5])
+                                    if _val is None and _srow[6] is not None:
+                                        _val = str(_srow[6])
+                                    if _val is None:
+                                        continue
+                                    facts.append({
+                                        "subject": _srow[0],
+                                        "rel_type": _srow[2],
+                                        "object": _val,
+                                        "confidence": 1.0,
+                                        "fact_class": "A",
+                                        "source": "attributes",
+                                        "category": _get_rel_type_category(_srow[2]),
+                                        "valid_from": None,
+                                        "valid_until": None,
+                                    })
+                                    _sib_surfaced += 1
+                                if _sib_surfaced:
+                                    log.info(
+                                        "fetch_facts.scalar_sibling_fragment_surfaced",
+                                        anchor=str(anchor_uuid)[:8],
+                                        anchor_alias=_anchor_alias[:40],
+                                        surfaced=_sib_surfaced,
+                                        query=(query_text or "")[:50],
+                                    )
+                    except Exception as _sib_err:
+                        log.warning("fetch_facts.scalar_sibling_fragment_failed",
+                                    error=str(_sib_err)[:120])
 
                 # ─── Fetch STAGED FACTS: Class B + C awaiting promotion ───
                 # PHASE 2: user_id filter removed — schema isolation handles per-user scoping
@@ -32702,6 +35469,11 @@ def fetch_facts_from_anchor(
                 # the taxonomy-declared nesting rels; empty (no-op) off the membership axis.
                 if _scope_rels is not None and _nesting_axis_rels:
                     _scope_rels = sorted(set(_scope_rels) | set(_nesting_axis_rels))
+                # Fix B: on the classification axis, admit the classification rels into the
+                # anchor-OR staged projection so a STAGED is-a/subclass_of edge on the instance
+                # (or its class) surfaces. Bounded to the classification rels; no-op otherwise.
+                if _scope_rels is not None and _classif_axis_rels:
+                    _scope_rels = sorted(set(_scope_rels) | set(_classif_axis_rels))
                 if _scope_rels:
                     staged_query = """
                         SELECT subject_id, object_id, rel_type, confidence, fact_class, expires_at
@@ -32760,20 +35532,39 @@ def fetch_facts_from_anchor(
                     for taxonomy in path.taxonomy_groups:
                         try:
                             category_rels = _get_rels_by_taxonomy(conn, taxonomy)
-                            if not category_rels:
-                                log.warning("taxonomy_rels.empty", taxonomy=taxonomy)
-                                continue
 
-                            # ── NAMED-GROUP SCOPING (anti cross-group leak) ──────────────
-                            # A GROWN grouping is named after a CONCRETE group ENTITY (the
-                            # "band"/"team" node). Two such groupings share the same defining
-                            # rel (member_of), so the broad domain-scoped lane below (fetch
-                            # ALL member_of facts) would leak team members into a band answer.
-                            # When the taxonomy_name resolves to a real entity, scope STRICTLY
-                            # to THAT group node's members and skip the broad lanes. Seeded
-                            # ABSTRACT taxonomies (family/work/pets) do NOT resolve to an
-                            # entity → this is a no-op for them (byte-for-byte unchanged).
-                            # Subject-agnostic, metadata-driven (defining rels only).
+                            # ── NAMED-GROUP SCOPING (anti cross-group leak) + GROWN-GROUPING
+                            # MEMBER ADMISSION (over-projection fix, audit site #1) ──────────
+                            # A GROWN grouping is named after a CONCRETE group ENTITY — the
+                            # "band"/"team" node, or an /expand topic root ("espresso"). The
+                            # group NODE itself IS the tight scope: EVERY edge that touches
+                            # that node is, by construction, a member of the grouping and was
+                            # grown *by* this grouping's ingest.
+                            #
+                            # BUG (validated live — /expand espresso → "No relevant facts
+                            # found", log `named_group_scoped members=0`): the old lane ALSO
+                            # projected `rel_type IN (rel_types_defining_group)`. But
+                            # `_strip_hierarchy_rels` deliberately KEEPS subclass_of/
+                            # instance_of/part_of OUT of the defining group, and an /expand
+                            # grouping's structural SPINE (`espresso subclass_of coffee`) plus
+                            # its grown domain facts land STAGED (Class B, provenance
+                            # llm_learned). So the rel projection dropped the grouping's OWN
+                            # members and the walk returned members=0. OWNER DIRECTIVE: "the
+                            # recall shouldn't be scoped like that, whether on /expand topics
+                            # or otherwise."
+                            #
+                            # FIX: the group-node anchor IS the scope (deterministic
+                            # reachability — the same admission source `_hierarchy_admitted`
+                            # already grants descent leaves). Fetch ALL non-tombstoned edges
+                            # touching the node (facts ∪ staged-B / live-C), with NO rel-name
+                            # projection. Cross-group leak stays impossible: a FOREIGN group's
+                            # member_of edges never touch THIS node, and the broad tenant-wide
+                            # lanes are still skipped (`continue`). Seeded ABSTRACT taxonomies
+                            # (family/work/pets) do NOT resolve to an entity → no-op for them
+                            # (byte-for-byte unchanged), so the anchor is still the user and
+                            # aspect-precise personal recall (milestone 398a4fb0 / audit #5)
+                            # is untouched. Subject-agnostic (keys on the group-node identity,
+                            # NO rel/domain literal).
                             _grp_id = None
                             try:
                                 cur.execute(
@@ -32786,27 +35577,52 @@ def fetch_facts_from_anchor(
                             except Exception:
                                 _grp_id = None
                             if _grp_id is not None:
-                                _ng_ph = ",".join(["%s"] * len(category_rels))
                                 cur.execute(
-                                    f"""
+                                    """
                                     SELECT subject_id, object_id, rel_type, confidence, fact_class
                                       FROM facts
                                      WHERE (subject_id = %s OR object_id = %s)
-                                       AND rel_type IN ({_ng_ph})
                                        AND superseded_at IS NULL
                                        AND archived_at IS NULL AND deleted_at IS NULL
                                     UNION ALL
                                     SELECT subject_id, object_id, rel_type, confidence, fact_class
                                       FROM staged_facts
                                      WHERE (subject_id = %s OR object_id = %s)
-                                       AND rel_type IN ({_ng_ph})
                                        AND promoted_at IS NULL
+                                       AND deleted_at IS NULL
+                                       AND (fact_class = 'B'
+                                            OR (fact_class = 'C' AND expires_at > NOW()))
                                     """,
-                                    (_grp_id, _grp_id) + tuple(category_rels)
-                                    + (_grp_id, _grp_id) + tuple(category_rels),
+                                    (_grp_id, _grp_id, _grp_id, _grp_id),
                                 )
                                 _ng_members: set = set()
                                 for _row in cur.fetchall():
+                                    # ── DO NOT TRAVERSE OUTWARD INTO THE QUERYING USER ──────
+                                    # The user is the SUBJECT asking, never a STRUCTURAL member
+                                    # of a TOPIC grouping. An /expand topic is commonly anchored
+                                    # to the user via an interest/ownership edge
+                                    # (`chris has_interest_in espresso`). Surfacing that edge
+                                    # injects the USER node into db_facts + `_ng_members`, and
+                                    # the downstream /query expansions then cascade into the
+                                    # user's UNRELATED personal profile: Step 3c seeds
+                                    # `_anchor_connected` from any edge touching the anchor
+                                    # (main.py ~36181) and fans the user's class nodes downward;
+                                    # this member-scalar read below pulls the user's own scalars
+                                    # (occupation/commute/address) — the reported over-widen
+                                    # ("tell me about espresso" dumping the user's family/job).
+                                    # Cut the OUTWARD link to the user HERE: drop a group-node
+                                    # edge whose non-group endpoint is the user, and never admit
+                                    # the user as a member. The user's interest in the topic is a
+                                    # PERSONAL fact (retrievable via a SELF-anchored query), not
+                                    # part of the topic's structure. Subject-agnostic (keys on
+                                    # user identity, NO rel literal); the grouping's OWN domain
+                                    # members (coffee, beverage, brewed_by X) + the node's own
+                                    # scalars are untouched. No-op when anchor IS the user (a
+                                    # self-anchored grouping never enters this entity branch).
+                                    if _group_edge_is_outward_to_user(
+                                        _row[0], _row[1], _grp_id, user_id
+                                    ):
+                                        continue
                                     facts.append({
                                         "subject": _row[0],
                                         "object": _row[1],
@@ -32815,10 +35631,40 @@ def fetch_facts_from_anchor(
                                         "fact_class": _row[4] or "B",
                                         "source": "db",
                                         "category": _get_rel_type_category(_row[2]),
+                                        # REACHABILITY ADMISSION: this fact is admitted because
+                                        # the deterministic walk reached the group NODE, not
+                                        # because its rel is in a seed scope — exempt it from
+                                        # the downstream /query node-gate + axis projection
+                                        # (audit sites #1/#4) the same way descent leaves are.
+                                        "_hierarchy_admitted": True,
                                     })
                                     _ng_members.add(_row[0])
                                     _ng_members.add(_row[1])
+                                # Group node's OWN scalar attributes (a grown scalar fact —
+                                # e.g. an /expand `requires_pressure` — lands in
+                                # entity_attributes, NOT `facts`; the old lane fetched only
+                                # MEMBERS' scalars and dropped the node's own).
+                                cur.execute(
+                                    "SELECT entity_id, attribute, value_text "
+                                    "FROM entity_attributes WHERE entity_id = %s",
+                                    (_grp_id,),
+                                )
+                                for _row in cur.fetchall():
+                                    if _row[2]:
+                                        facts.append({
+                                            "subject": _row[0],
+                                            "rel_type": _row[1],
+                                            "object": _row[2],
+                                            "confidence": 1.0,
+                                            "fact_class": "A",
+                                            "source": "attributes",
+                                            "category": _get_rel_type_category(_row[1]),
+                                            "valid_from": None,
+                                            "valid_until": None,
+                                            "_hierarchy_admitted": True,
+                                        })
                                 _ng_members.discard(_grp_id)
+                                _ng_members.discard(user_id)  # never read the querying user's scalars
                                 # Members' scalar attributes (ages, etc.) — the descend.
                                 if _ng_members:
                                     cur.execute(
@@ -32838,11 +35684,18 @@ def fetch_facts_from_anchor(
                                                 "category": _get_rel_type_category(_row[1]),
                                                 "valid_from": None,
                                                 "valid_until": None,
+                                                "_hierarchy_admitted": True,
                                             })
                                 log.info("fetch_facts_from_anchor.named_group_scoped",
                                          taxonomy=taxonomy, group=str(_grp_id)[:8],
                                          members=len(_ng_members))
                                 continue  # named-group fully scoped; skip broad lanes
+
+                            # No group-node entity → fall back to the broad domain lanes,
+                            # which REQUIRE a defining-rel set to scope on.
+                            if not category_rels:
+                                log.warning("taxonomy_rels.empty", taxonomy=taxonomy)
+                                continue
 
                             # Query facts with these rel_types
                             placeholders = ",".join(["%s"] * len(category_rels))
@@ -32883,10 +35736,10 @@ def fetch_facts_from_anchor(
                             # a BROAD self/group recall ("tell me about my family" → anchor is
                             # the user; every family fact + member scalar is wanted), but it is
                             # the LEAK for a NARROW question anchored on a CONCRETE non-user
-                            # entity: "how old is Leo" resolves the anchor to Leo, scope-
-                            # deference maps Leo's child_of → the family taxonomy, and this
+                            # entity: "how old is Cyrus" resolves the anchor to Cyrus, scope-
+                            # deference maps Cyrus's child_of → the family taxonomy, and this
                             # lane then floods the WHOLE family domain + everyone's scalars
-                            # (Carol, the user's address/heart-rate). For a concrete non-user
+                            # (Diane, the user's address/heart-rate). For a concrete non-user
                             # anchor the anchor-BOUNDED taxonomy_query above + the descent +
                             # the non-user scalar lane already surface the right subtree, so
                             # gate the tenant-wide flood to the broad case only. Subject-
@@ -32988,7 +35841,23 @@ def fetch_facts_from_anchor(
                                                 "confidence": float(row[3]) if row[3] else 0.8,
                                                 "fact_class": row[4] or "B",
                                                 "source": "db",
-                                                "category": _get_rel_type_category(row[2])
+                                                "category": _get_rel_type_category(row[2]),
+                                                # REACHABILITY MARKER (over-projection fix, audit
+                                                # site #1): this entity was reached from the anchor
+                                                # via the taxonomy's OWN defining rels — it is a
+                                                # grouping member by construction. A GROWN member
+                                                # is staged-B / llm_learned / entity_type='unknown'
+                                                # with its instance_of ladder still unpromoted, so
+                                                # the downstream node-gate resolves NO type signal
+                                                # and DROPS it (only Class-A/user_stated survive the
+                                                # `not _signals` branch) → the reported user-anchored
+                                                # grouping `members=0`. This marker admits it there
+                                                # by REACHABILITY. It is DELIBERATELY DISTINCT from
+                                                # `_hierarchy_admitted`: it exempts ONLY the
+                                                # no-type-signal branch, NOT the typed-MISMATCH drop
+                                                # (audit site #5 / RC2 `fatty member_of you`), which
+                                                # keeps the fuzzy-taxonomy firewall (398a4fb0) intact.
+                                                "_grouping_reachable": True,
                                             })
                                         cur.execute("""
                                             SELECT entity_id, attribute, value_text
@@ -33656,8 +36525,9 @@ def qdrant_semantic_search(
 
         context = ". ".join(context_parts)
 
-        # Determine collection name: faultline-{user_id}
-        collection = derive_collection(user_id)
+        # Determine collection + tenant scope (partition choke-point).
+        collection, _tflt = qp_resolve_partition(user_id, "memory")
+        qp_require_tenant(_tflt, op="search", collection=collection)
 
         # ── MULTI-QUERY EXPANSION (mnemory borrow) ─────────────────────────────
         # The Class-C lane is associative short-term memory; a single phrasing of the
@@ -33684,7 +36554,7 @@ def qdrant_semantic_search(
             # dominating recall results.
             resp = httpx.post(
                 f"{qdrant_url}/collections/{collection}/points/query",
-                json={
+                json=qp_apply_tenant_filter({
                     "query": {
                         "nearest": embedding,
                         "mmr": {
@@ -33696,7 +36566,8 @@ def qdrant_semantic_search(
                     "limit": limit,
                     "with_payload": True,
                     "with_vectors": False,
-                },
+                }, _tflt),
+                headers=qp_qdrant_headers(),
                 timeout=10.0,
             )
             if resp.status_code != 200:
@@ -33779,112 +36650,6 @@ def qdrant_semantic_search(
 # PHASE 4: Natural Language Conversion - Convert Facts to Prose
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _entity_is_l4_place(db, entity_id: str) -> bool:
-    """THE HARD LINE: is ``entity_id`` a PLACE (an L4 type/class node) rather than a MEMORY
-    (a grounded instance the user actually told us about)?
-
-    L4 is the *place to put a memory* — the type ladder (``dog → canine → mammal``). A place
-    is the INDEX; it is never itself user content. An entity is a PLACE when it lives on the
-    class ladder as a CLASS:
-
-      • something else is filed AT it — it is the OBJECT of a classification rel
-        (``X instance_of E`` / ``X subclass_of E``), or
-      • it declares its own superclass — it is the SUBJECT of a P279 (``subclass_of``) rel.
-
-    It is NOT a place when it is itself filed at one — SUBJECT of a P31 (``instance_of``):
-    a named instance is a MEMORY and wins the tie (``Fraggle instance_of dog`` → Fraggle is
-    the memory, dog is the place). This is the W3C RDFS split: ``rdf:type`` is instance-level,
-    ``rdfs:subClassOf`` is class-level.
-
-    METADATA-DRIVEN: the classification rels come from ``rel_types.wikidata_pid`` ∈
-    {P31, P279} via ``_get_classification_rels(db)`` (per-tenant, seed ∪ grown) — never a
-    hardcoded rel-name list, never a domain word. Reads ``facts`` ∪ ``staged_facts`` under
-    the caller's already-bound tenant search_path.
-
-    FAIL-SAFE: no db / no entity / any error → False (not a place → today's behaviour)."""
-    if not db or not entity_id:
-        return False
-    try:
-        _cls = sorted(_get_classification_rels(db))
-        if not _cls:
-            return False
-        # P31 = instance_of (filed AT a place). Resolved from metadata, not by name.
-        _p31: set[str] = set()
-        try:
-            with db.cursor() as _pc:
-                _pc.execute(
-                    "SELECT rel_type FROM rel_types WHERE wikidata_pid = %s", ("P31",)
-                )
-                _p31 = {r[0].lower() for r in _pc.fetchall() if r and r[0]}
-        except Exception:  # noqa: BLE001 — no P31 metadata → fall through on the ladder test
-            _p31 = set()
-        _subclass = [r for r in _cls if r not in _p31]
-
-        with db.cursor() as _c:
-            # (a) A named INSTANCE wins the tie — it is a MEMORY, never a place.
-            if _p31:
-                _c.execute(
-                    "SELECT 1 FROM facts WHERE subject_id = %s AND rel_type = ANY(%s) "
-                    "AND superseded_at IS NULL AND archived_at IS NULL "
-                    "UNION ALL "
-                    "SELECT 1 FROM staged_facts WHERE subject_id = %s AND rel_type = ANY(%s) "
-                    "LIMIT 1",
-                    (entity_id, sorted(_p31), entity_id, sorted(_p31)),
-                )
-                if _c.fetchone():
-                    return False
-            # (b) Something is filed AT it, or it declares its own superclass → PLACE.
-            _c.execute(
-                "SELECT 1 FROM facts WHERE object_id = %s AND rel_type = ANY(%s) "
-                "AND superseded_at IS NULL AND archived_at IS NULL "
-                "UNION ALL "
-                "SELECT 1 FROM staged_facts WHERE object_id = %s AND rel_type = ANY(%s) "
-                "UNION ALL "
-                "SELECT 1 FROM facts WHERE subject_id = %s AND rel_type = ANY(%s) "
-                "AND superseded_at IS NULL AND archived_at IS NULL "
-                "UNION ALL "
-                "SELECT 1 FROM staged_facts WHERE subject_id = %s AND rel_type = ANY(%s) "
-                "LIMIT 1",
-                (entity_id, _cls, entity_id, _cls,
-                 entity_id, _subclass, entity_id, _subclass),
-            )
-            return bool(_c.fetchone())
-    except Exception as _pe:  # noqa: BLE001
-        log.warning("entity_is_l4_place.failed", entity=str(entity_id)[:8],
-                    error=str(_pe)[:120])
-        return False
-
-
-def _display_cased(db, entity_id: str, alias: str, display_form: str | None) -> str:
-    """Render ``alias`` with the casing RETAINED at ingest, unless the entity is an L4 PLACE.
-
-    ``display_form`` (migration 214) is a pure casing overlay of ``alias`` stored from the
-    user's verbatim turn — nothing is reconstructed here, and NULL yields ``alias`` unchanged
-    (today's lowercase output). See ``src/extraction/display_case.py``.
-
-    THE HARD LINE: a PLACE (an L4 type node — ``dog``, ``corporation``) must never render as a
-    proper name, so a display form is WITHHELD from any entity the P31/P279 ladder classifies
-    as a place. Reuses ``_entity_is_l4_place`` (metadata-driven; a named INSTANCE, subject of
-    P31, wins the tie and keeps its casing). The probe is paid for ONLY when casing actually
-    exists, so an entity with no display form costs nothing. Fail-safe → ``alias``.
-
-    This is the same rule the batched /query preferred_names lane applies; both live at the ONE
-    sanctioned read-time presentation seam so a UUID can never render cased in one lane and
-    lowercase in another.
-    """
-    if not display_form or display_form == alias:
-        return alias
-    try:
-        if _entity_is_l4_place(db, entity_id):
-            log.info("query.display_case_withheld_from_l4_place",
-                     entity=str(entity_id)[:8],
-                     reason="a PLACE is never rendered as a proper name")
-            return alias
-    except Exception:  # noqa: BLE001 — presentation only; never fail a recall over casing
-        return alias
-    return display_form
-
-
 def resolve_display_name(entity_id: str, db) -> str:
     """
     Resolve a UUID or user_id to a human-readable display name.
@@ -33915,31 +36680,22 @@ def resolve_display_name(entity_id: str, db) -> str:
         # Primary lookup: preferred alias from entity_aliases
         with db.cursor() as cur:
             cur.execute(
-                "SELECT alias, display_form FROM entity_aliases "
-                "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                "SELECT alias FROM entity_aliases WHERE entity_id = %s AND is_preferred = true LIMIT 1",
                 (entity_id,)
             )
             row = cur.fetchone()
             if row:
-                # Defensive arity: a UUID must NEVER leak to the user (CLAUDE.md), and this
-                # function's except-arm returns the raw UUID. A short row would raise
-                # IndexError inside the try and silently produce exactly that leak, so the
-                # display column is read tolerantly — no display_form simply means "no casing
-                # observed", which is the documented NULL behaviour anyway.
-                return _display_cased(db, entity_id, row[0],
-                                      row[1] if len(row) > 1 else None)
+                return row[0]
 
         # Fallback: any alias (non-preferred)
         with db.cursor() as cur:
             cur.execute(
-                "SELECT alias, display_form FROM entity_aliases WHERE entity_id = %s LIMIT 1",
+                "SELECT alias FROM entity_aliases WHERE entity_id = %s LIMIT 1",
                 (entity_id,)
             )
             row = cur.fetchone()
             if row:
-                # Defensive arity — see the preferred-alias lookup above.
-                return _display_cased(db, entity_id, row[0],
-                                      row[1] if len(row) > 1 else None)
+                return row[0]
 
         # Fallback: return UUID itself
         return str(entity_id)
@@ -34028,7 +36784,7 @@ def resolve_entity_display(
 
     Every subject/object slot in every recall lane (DB lane, Qdrant lane, and the
     MCP `_emit` prose) must render through THIS function so the same UUID can never
-    diverge — e.g. resolve to "you" in one lane and "alex" in another (the
+    diverge — e.g. resolve to "you" in one lane and "chris" in another (the
     duplication source this fix kills).
 
     Resolution order (preferred-name = exposed identity):
@@ -34110,128 +36866,6 @@ _NEGATE_AUX = ("is", "are", "was", "were", "am", "has", "have", "had",
                "will", "would", "can", "could", "does", "do", "did", "should", "must")
 
 
-# ── DO-SUPPORT ON NEGATED PROSE (default ON) ──────────────────────────────────────────────────────
-# MEASURED DEFECT: the negated-possession render read "You HAVE NOT a pet that is Dog". ``_negate_prose``
-# treats its whole ``_NEGATE_AUX`` list as auxiliaries and inserts "not" straight after the match — which
-# is correct for a genuine auxiliary ("is not functioning", "have not eaten") but ungrammatical when the
-# SAME surface form is the clause's MAIN LEXICAL verb. English negates a lexical verb with DO-SUPPORT:
-# the negator attaches to a dummy ``do`` carrying the tense/agreement, and the lexical verb reverts to
-# its bare form — "You DO NOT HAVE a pet". Only ``be`` (and true auxiliaries/modals) take ``not``
-# directly. Huddleston & Pullum, "The Cambridge Grammar of the English Language" (2002) ch.3 §1.3
-# (do-support / the auxiliary–lexical verb distinction); Quirk et al., CGEL §3.21ff, §10.54ff.
-#
-# The auxiliary-vs-lexical distinction is READ FROM THE PARSE, not from a verb list: spaCy tags the
-# perfect auxiliary "have" as ``AUX`` and possessive "have" as ``VERB`` (verified on the live model),
-# which is exactly the grammatical contrast that governs do-support. The ``do`` form is chosen from the
-# token's own morphology (``Tense=Past`` → did; ``Person=3|Number=Sing`` → does; else do) and the BARE
-# form is the token's own LEMMA off the same parse, so no lexicon of any kind is introduced.
-#
-# This also repairs a pre-existing gap: a lexical-verb clause with no ``_NEGATE_AUX`` match at all
-# ("Diane lives in Toronto") previously fell through to the blunt "It is not the case that …" wrapper
-# and now reads "Diane does not live in Toronto".
-#
-# Presentation-only — it renders the ``polarity`` column the walk already carried and performs NO
-# reasoning, so it stays inside the one read-time exception (prose rendering) to lean-query.
-# FAIL-SAFE: flag OFF, spaCy unavailable, no finite verb, no resolvable lemma, or ANY error →
-# the existing regex insertion, byte-identical.
-RENDER_NEGATION_DO_SUPPORT: bool = os.environ.get(
-    "RENDER_NEGATION_DO_SUPPORT", "true").strip().lower() not in ("0", "false", "no")
-
-
-def _negate_prose_do_support(s: str) -> str | None:
-    """Negate a clause whose FINITE verb is LEXICAL, using English do-support.
-
-    Returns the negated clause, or None when the clause is not a lexical-verb clause (a genuine
-    auxiliary/copula → the caller's direct "not" insertion is already correct) or when anything at
-    all prevents a clean transform. Grammar-driven (parse POS + morphology + lemma), no verb list."""
-    if not RENDER_NEGATION_DO_SUPPORT:
-        return None
-    try:
-        from src.extraction.linguistics import (
-            _parse as _ling_parse,
-            linguistics_available as _ling_ok,
-        )
-        if not _ling_ok():
-            return None
-        def _first_finite(_doc):
-            """FIRST FINITE verbal token = the clause's tense-carrying verb, the one negation
-            attaches to."""
-            for _t in _doc:
-                if _t.pos_ in ("AUX", "VERB") and "Fin" in _t.morph.get("VerbForm"):
-                    return _t
-            return None
-
-        doc = _ling_parse(s)
-        if doc is None:
-            return None
-        fin = _first_finite(doc)
-        if fin is None:
-            # ── SENTENCE-CASE RETRY (measured; strictly additive) ─────────────────────────────
-            # MEASURED DEFECT: composed prose renders entity names from ``entity_aliases.alias``,
-            # which is LOWERCASED at registration (entity_registry/registry.py), and nothing
-            # re-capitalizes it for display. So the clause handed to the parser is
-            # sentence-initial-lowercase — "diane lives in toronto" — which is ORTHOGRAPHICALLY
-            # ill-formed English and therefore out-of-distribution for a model trained on
-            # conventionally-cased text. en_core_web_sm then loses the finite verb entirely and
-            # tags the whole clause as a compound NOUN chain, so do-support declined and recall
-            # read "It is not the case that diane lives in toronto". VERIFIED: the SAME clause
-            # cased ("Diane lives in toronto") parses ``lives`` as VERB/Fin. The failure needs
-            # BOTH an out-of-vocabulary lowercase subject AND a verb whose ``-s`` form is a
-            # frequent plural noun (lives/works/studies/dislikes); "diane visits toronto" was
-            # never affected. Case restoration as a preprocessing step for degraded input is
-            # standard practice — Lita et al., "tRuEcasIng", ACL 2003 (§4: restoring case yields
-            # a 26% F-measure improvement on a downstream task).
-            #
-            # RETRY-ON-MISS, deliberately — NOT unconditional normalisation. A clause that already
-            # yields a finite verb never reaches this branch, so every currently-correct render is
-            # byte-identical BY CONSTRUCTION rather than by measurement. Measured on the dev line
-            # over the full 1504-render matrix (every seeded rel_types.natural_language template x
-            # realistic lowercase fillers, both perspectives): 15 clauses gained a verb, 0 lost
-            # one, 0 picked a DIFFERENT verb.
-            #
-            # It cannot FABRICATE a verb: re-measured against the label-fallback lane's genuine
-            # NOUN-PHRASE renders ("X {label} Y" -> "apollo ip address 10.0.0.4", "you favorite
-            # color teal"), casing produced no finite verb in any case — those correctly keep the
-            # "It is not the case that …" wrapper, which for a verbless clause is the RIGHT render.
-            # Offsets are safe: the splice below indexes the ORIGINAL ``s`` and capitalising one
-            # ASCII letter is length-preserving; the ``len`` guard declines the pathological
-            # length-changing uppercase (e.g. "ß" -> "SS") rather than mis-splicing.
-            #
-            # ⚠️ A PRO-FORM SUBSTITUTION PROBE WAS TRIED AND REJECTED — do not re-add it without
-            # re-measuring. Substituting a PRONOUN subject recovered 23/23 of the real cases but
-            # scored 8/8 FALSE POSITIVES on the label-fallback lane's genuine noun-phrase renders
-            # ("apollo does not ip address 10.0.0.4"): a pronoun subject COERCES a verb reading,
-            # so it cannot distinguish "a verb the tagger lost" from "no verb exists". Sentence-
-            # casing fabricates nothing, which is why the honest wrapper stays reachable.
-            #
-            # NOT a lexicon: zero word lists, zero rel/domain literals — a pure orthographic
-            # normalisation of the PARSE INPUT. The rendered string is still spliced from ``s``,
-            # so no casing change ever leaks into the user-visible prose.
-            _cased = s[:1].upper() + s[1:]
-            if _cased != s and len(_cased) == len(s):
-                _doc_cased = _ling_parse(_cased)
-                if _doc_cased is not None:
-                    fin = _first_finite(_doc_cased)
-        if fin is None:
-            return None
-        # A genuine AUXILIARY/copula takes "not" directly — leave it to the caller (unchanged path).
-        if fin.pos_ != "VERB":
-            return None
-        base = (fin.lemma_ or "").strip().lower()
-        if not base:
-            return None
-        morph = fin.morph
-        if morph.get("Tense") == ["Past"]:
-            do_form = "did"
-        elif morph.get("Person") == ["3"] and morph.get("Number") == ["Sing"]:
-            do_form = "does"
-        else:
-            do_form = "do"
-        return s[:fin.idx] + f"{do_form} not {base}" + s[fin.idx + len(fin.text):]
-    except Exception:  # noqa: BLE001 — presentation fail-safe: never break prose
-        return None
-
-
 def _negate_prose(prose: str) -> str:
     """Insert "not" after the first copula/auxiliary in a rendered state clause so a NEGATED fact
     reads back negated ("X is in state Y" → "X is not in state Y"). Presentation-only, deterministic,
@@ -34246,13 +36880,6 @@ def _negate_prose(prose: str) -> str:
         # Idempotency / already-negated guard: never double-negate.
         if _re2.search(r"\bnot\b|n't\b", s, flags=_re2.IGNORECASE):
             return prose
-        # DO-SUPPORT FIRST: when the clause's finite verb is LEXICAL ("You have a pet"), English
-        # negates it with do/does/did + not + BASE, not by suffixing "not" to the verb. A genuine
-        # auxiliary/copula returns None here and falls through to the direct insertion below,
-        # byte-identical to before. See _negate_prose_do_support.
-        _ds = _negate_prose_do_support(s)
-        if _ds:
-            return _ds
         # Insert "not" after the EARLIEST-positioned copula/aux (a single alternation over the whole
         # closed-class set, so we negate the main clause's verb, not a later one).
         _alt = r"\b(" + "|".join(_re2.escape(a) for a in _NEGATE_AUX) + r")\b"
@@ -34262,6 +36889,118 @@ def _negate_prose(prose: str) -> str:
         # No copula/aux found → clause-level negation so we never read the positive.
         return "It is not the case that " + s[0:1].lower() + s[1:]
     except Exception:  # noqa: BLE001 — presentation fail-safe: never break prose
+        return prose
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FORMER-STATE REFRAME (recall prose): a state fact that WAS true (superseded, or an
+# undated stored 'past') must read as GRAMMATICAL past — "You used to live in London",
+# NOT the broken "Previously, You live in London" (present-tense verb + a mid-sentence
+# capital grafted onto a present clause). "used to <BASE-VERB>" is correct for EVERY
+# grammatical person (I/you/she/they used to live), so the ONLY work is de-conjugating
+# the surface verb — which the upstream prose has already conjugated to the subject
+# ("You live" = base; "Diane lives" = +s; "is/are" → "be") — back to its BASE form.
+#
+# SUBJECT-AGNOSTIC / REL-AGNOSTIC: keyed purely on the rendered sentence shape
+# "<subject> <verb> <rest>" + a closed-class English de-conjugation. NO rel-name,
+# subject-name, or object literal anywhere. Deterministic (matches the _negate_prose /
+# _you_agreement_fixup house style; cheaper and MORE predictable than a bare-token spaCy
+# lemma, which is POS-ambiguous out of context — "lives" lemmatizes to the noun "life"
+# with no surrounding sentence). Fail-safe: any shape it cannot cleanly transform returns
+# None so the caller keeps today's "Previously," output — never emits garbage.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 3rd-person-singular present → BASE. The copula/auxiliary + high-frequency irregulars
+# are an explicit closed set; everything else de-conjugates by the regular -s/-es/-ies
+# spelling rules. This is the English present-tense inflection system (a grammar
+# primitive), NOT a domain word-list.
+_PRESENT_TO_BASE_IRREGULAR = {
+    "is": "be", "are": "be", "am": "be", "was": "be", "were": "be",
+    "has": "have", "had": "have",
+    "does": "do", "did": "do", "goes": "go",
+}
+# Modals/aux that must NOT take a "used to" reframe → fail-safe (caller keeps old form).
+_USED_TO_DECLINE_VERBS = frozenset({
+    "will", "would", "can", "could", "shall", "should", "may", "might", "must",
+    "used",  # already a "used to" surface — never double-wrap
+})
+
+
+def _verb_present_to_base(verb: str) -> str | None:
+    """De-conjugate a present-tense finite verb to its BASE (bare-infinitive) form.
+
+    Returns None for a verb the reframe must decline (modals). Grammar-primitive rules +
+    a closed-class irregular map — subject/domain-agnostic, no lexicon."""
+    if not verb:
+        return None
+    w = verb.lower()
+    if w in _USED_TO_DECLINE_VERBS:
+        return None
+    if w in _PRESENT_TO_BASE_IRREGULAR:
+        return _PRESENT_TO_BASE_IRREGULAR[w]
+    # Already base (1st/2nd person present, e.g. "live"/"work"/"go"): no trailing -s.
+    if not w.endswith("s"):
+        return w
+    # Regular 3rd-person-singular spelling rules, most specific first.
+    if w.endswith("ies") and len(w) >= 5:                       # carries→carry, flies→fly
+        return w[:-3] + "y"
+    for _suf in ("sses", "shes", "ches", "xes", "zes", "oes"):  # passes→pass, watches→watch, fixes→fix
+        if w.endswith(_suf):
+            return w[:-2]
+    if w.endswith("ss"):                                        # base already ends -ss: leave
+        return w
+    return w[:-1]                                               # lives→live, works→work, stays→stay
+
+
+def _reframe_former_state(prose: str, subject_name: str | None) -> str | None:
+    """Rewrite a present-tense state clause "<subject> <verb> <rest>" as the FORMER
+    "<subject> used to <BASE-VERB> <rest>". Subject/rel-agnostic; fail-safe → None on any
+    shape (possessive scalar, negated clause, modal verb) it cannot cleanly transform."""
+    try:
+        if not prose or not subject_name:
+            return None
+        s = prose.strip()
+        subj = subject_name.strip()
+        # The clause must LEAD with the subject (case-insensitive), exactly as rendered.
+        if len(s) <= len(subj) or s[:len(subj)].lower() != subj.lower():
+            return None
+        subj_surface = s[:len(subj)]        # preserve original case ("You"/"Diane")
+        remainder = s[len(subj):]           # e.g. " live in London"
+        if not remainder[:1].isspace():
+            return None                     # subject not a whole leading token
+        rest = remainder.lstrip()
+        # Negation guard: a negated clause ("… is not …") needs "used not to" logic we do
+        # not attempt — fail-safe to the caller's "Previously," form.
+        if re.search(r"\bnot\b|n't\b", rest, flags=re.IGNORECASE):
+            return None
+        parts = rest.split(None, 1)
+        if not parts:
+            return None
+        base = _verb_present_to_base(parts[0])
+        if not base:
+            return None
+        tail = (" " + parts[1]) if len(parts) > 1 else ""
+        return "%s used to %s%s" % (subj_surface, base, tail)
+    except Exception:  # noqa: BLE001 — presentation fail-safe
+        return None
+
+
+def _prefix_current_state(prose: str, subject_name: str | None) -> str:
+    """Insert "currently" between subject and verb to sharpen a current-vs-former contrast
+    ("You currently live in Vancouver"). Fail-safe → prose unchanged; idempotent."""
+    try:
+        if not prose or not subject_name:
+            return prose
+        subj = subject_name.strip()
+        if len(prose) <= len(subj) or prose[:len(subj)].lower() != subj.lower():
+            return prose
+        remainder = prose[len(subj):]
+        if not remainder[:1].isspace():
+            return prose
+        if re.match(r"\s+currently\b", remainder, flags=re.IGNORECASE):
+            return prose  # already marked — no double-insert
+        return "%s currently%s" % (prose[:len(subj)], remainder)
+    except Exception:  # noqa: BLE001 — presentation fail-safe
         return prose
 
 
@@ -34478,14 +37217,41 @@ def _compose_object_clause(
                 # POSSESSIVE-VERB normalization: the named-instance shape ("a <Type>
                 # named <Name>") is a POSSESSIVE construction. A rel whose template verb
                 # is a copula (parent_of → "You ARE the parent of Y") would render the
-                # WRONG perspective here — "you are a son named Leo" makes the USER the
+                # WRONG perspective here — "you are a son named Cyrus" makes the USER the
                 # son. When the named instance is on the OBJECT side and the parsed verb
                 # is a copula, substitute the closed-class possessive primitive (have/has)
-                # so it reads "you have a son named Leo". Grammar primitive, NOT a domain
+                # so it reads "you have a son named Cyrus". Grammar primitive, NOT a domain
                 # token (same justification as Shape 4's predicate inventory). Non-copula
                 # rel verbs (has_pet→have, owns→own) are kept verbatim.
                 if verb in ("is", "are", "was", "were", "be", "am"):
                     verb = "have" if subject_is_you else "has"
+                # ── THE HARD LINE (render guard): "a <Type> named <Name>" is a PROPER-NAME
+                # construction (Rex, Apollo). When the object's DISPLAY form is itself a
+                # COMMON-NOUN instance descriptor — the head TYPE word premodified by an
+                # article/ordinal/cardinal/adjective ("third birdhouse", "navy blue blazer",
+                # "revell f-15 eagle kit") — the alias is NOT a name (a common noun is a TYPE,
+                # never a name; classifying it AS a name is the hard-line violation that emits
+                # "a birdhouse named third birdhouse" junk and confuses the cardinality read).
+                # Detect it STRUCTURALLY: the instance_of type HEAD appears as a whole-word
+                # token inside the object's display form. Then render the plain descriptive NP
+                # with an article ("you built a third birdhouse"), NEVER "…named…". A genuine
+                # proper name never contains its own type word ("rex" ∌ "dog"), so this leaves
+                # real named instances untouched. Subject-agnostic, deterministic whole-word
+                # test — NO domain list, NO cosine. Presentation only; the stored edges are
+                # unchanged (instance_of stays intact so the item remains countable).
+                import re as _re
+                _obj_is_common_noun_inst = False
+                try:
+                    _type_head = named_type_name.lower().split()[-1]
+                    if _type_head:
+                        _obj_is_common_noun_inst = _re.search(
+                            r"\b" + _re.escape(_type_head) + r"\b",
+                            object_name.lower()) is not None
+                except Exception:  # noqa: BLE001 — fail-safe: fall through to the named render
+                    _obj_is_common_noun_inst = False
+                if _obj_is_common_noun_inst:
+                    _art_obj = _indefinite_article(object_name)
+                    return "%s %s %s %s" % (subject_name, verb, _art_obj, object_name)
                 _art = _indefinite_article(named_type_name)
                 return "%s %s %s %s named %s" % (subject_name, verb, _art, named_type_name, object_name)
 
@@ -34509,14 +37275,14 @@ def _compose_inverse_anchor_clause(
     The structure-driven NAMED-INSTANCE composer was built for POSSESSION — the named
     instance on the OBJECT side ((user, has_pet, rex) → "you have a dog named
     Rex"). When the SAME shape appears MIRRORED — the named instance on the SUBJECT
-    side and the query anchor ("you") on the OBJECT side ((leo, child_of, you)) — the
+    side and the query anchor ("you") on the OBJECT side ((cyrus, child_of, you)) — the
     object-side composer's gate (object≠"you") rightly declines, and the bare template
-    path renders it from the WRONG perspective ("you are a son named Leo": it makes the
+    path renders it from the WRONG perspective ("you are a son named Cyrus": it makes the
     USER the son). This composer re-frames such a fact FROM THE ANCHOR'S perspective by
     FLIPPING along the rel's ``inverse_rel_type`` (overlay metadata):
 
-      (leo, child_of, you)  --inverse-->  (you, parent_of, leo)
-        → "you have a son named Leo"   (Type=son from leo's instance_of, Name=Leo)
+      (cyrus, child_of, you)  --inverse-->  (you, parent_of, cyrus)
+        → "you have a son named Cyrus"   (Type=son from cyrus's instance_of, Name=Cyrus)
 
     Detection is purely STRUCTURAL (caller guarantees: named instance on subject side,
     anchor on object side) + the rel having an ``inverse_rel_type`` in metadata. ZERO
@@ -34529,7 +37295,7 @@ def _compose_inverse_anchor_clause(
       • ASYMMETRIC inverse (parent_of ≠ child_of): the anchor POSSESSES a typed-and-named
         instance → "<anchor> have/has a <Type> named <Name>" (Shape-1 possessive reading,
         mirrored). Falls through (None) when no instance_of TYPE is known, so we never
-        fabricate "you have a named Leo".
+        fabricate "you have a named Cyrus".
       • SYMMETRIC rel (spouse: inverse == self): no possession reading — render the
         relationship naturally, anchor-first → "<Name> is your <role>" using the rel's
         own label as the role noun. (e.g. spouse → "Ada is your spouse"; if a cleaner
@@ -34559,6 +37325,23 @@ def _compose_inverse_anchor_clause(
         if not (instance_type_name and instance_type_name.lower() != instance_name.lower()):
             return None
         have = "have" if anchor_is_you else "has"
+        # THE HARD LINE (render guard, mirror of Shape 1): a common-noun instance descriptor
+        # (the type head word premodified — "third birdhouse") is NOT a proper name. Detect it
+        # STRUCTURALLY (type head is a whole-word token of the display form) and render the
+        # plain NP, never "…named…". Subject-agnostic, deterministic; a real proper name never
+        # contains its own type word so named instances (Rex/Cyrus) are untouched.
+        import re as _re
+        _inst_is_common_noun = False
+        try:
+            _th = instance_type_name.lower().split()[-1]
+            if _th:
+                _inst_is_common_noun = _re.search(
+                    r"\b" + _re.escape(_th) + r"\b", instance_name.lower()) is not None
+        except Exception:  # noqa: BLE001 — fail-safe: fall through to the named render
+            _inst_is_common_noun = False
+        if _inst_is_common_noun:
+            art = _indefinite_article(instance_name)
+            return "%s %s %s %s" % (anchor_name, have, art, instance_name)
         art = _indefinite_article(instance_type_name)
         return "%s %s %s %s named %s" % (anchor_name, have, art, instance_type_name, instance_name)
     except Exception:  # noqa: BLE001 — presentation fail-safe
@@ -34571,19 +37354,7 @@ def _titlecase_display_slots(prose: str, name_slots: list[str]) -> str:
     Only the supplied resolved alias slots (e.g. "rex" → "Rex") are titled,
     matched as WHOLE words, case-insensitively. "you" and scalar VALUES are never in
     name_slots, so they stay verbatim. The det-scorer is case-insensitive, so this is
-    safe (no gold token is dropped — the token text is identical modulo case).
-
-    ⚠️ THIS POST-PASS IS TRUECASING, and it is only correct while the resolved slot carries
-    NO casing of its own. It is a first-letter rule, so it renders `ebay` → `Ebay`, `iphone` →
-    `Iphone`, `mcdonald` → `Mcdonald` — wrong, and unrecoverable from a folded string (Lita et
-    al., "tRuEcasIng", ACL 2003; Unicode Standard §4.2, case mappings are non-invertible).
-    Since migration 214 a slot can instead arrive with the casing the user actually typed,
-    RETAINED at ingest (`entity_aliases.display_form`, src/extraction/display_case.py) — and
-    this pass would then DESTROY it: measured, `eBay` → `EBay` and `iPhone` → `IPhone`.
-    Observed casing therefore OUTRANKS the guess: a slot that already carries any uppercase is
-    left exactly as resolved. A fully-lowercase slot is one for which no casing was ever
-    observed, so it keeps today's title-case fallback and this function is byte-identical for
-    every entity that has no display_form."""
+    safe (no gold token is dropped — the token text is identical modulo case)."""
     if not prose or not name_slots:
         return prose
     import re as _re
@@ -34591,9 +37362,6 @@ def _titlecase_display_slots(prose: str, name_slots: list[str]) -> str:
     for raw in sorted({s for s in name_slots if s and s.strip()}, key=len, reverse=True):
         slot = raw.strip()
         if not slot or slot.lower() == "you":
-            continue
-        if slot != slot.lower():
-            # RETAINED casing (user truth) beats a titlecase GUESS — never re-case it.
             continue
         titled = " ".join(w[:1].upper() + w[1:] if w else w for w in slot.split())
         if titled == slot:
@@ -34744,6 +37512,22 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         except Exception as _ome:
             log.warning("convert_to_prose.overlay_resolve_failed", error=str(_ome)[:160])
             _overlay_meta = {}
+
+        # RECENCY-PICKS-CURRENT at render (DESIGN-memory-temporal-lifecycle §5). A plain
+        # present recall ("where do I live?") carries NO clock, so it never reaches
+        # _apply_clock_selection — yet two coexisting UNDATED single-valued state 'now'
+        # values (relocate: Toronto then Vancouver) would BOTH render as current here. Re-stamp
+        # the older one(s) 'past' so the undated-state FORMER framing below marks them
+        # ("Previously, you lived in Toronto") and the latest asserts as current. Cardinality-
+        # guarded off the per-tenant `is_single_valued` metadata: MULTI-VALUED state rels
+        # (speaks/likes) keep ALL values current. Subject-agnostic (no rel/place literal);
+        # idempotent (facts already collapsed upstream are a no-op); fail-safe.
+        try:
+            _recency_collapse_single_valued_state(
+                facts, lambda _rt2: _overlay_meta.get(_rt2), db=db)
+        except Exception as _rce:
+            log.warning("convert_to_prose.recency_collapse_failed", error=str(_rce)[:140])
+
         for _rt in set(f.get("rel_type", "").lower() for f in facts if f.get("rel_type")):
             _m = _overlay_meta.get(_rt)
             if _m:
@@ -34753,6 +37537,33 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 rel_type_templates_2p[_rt] = _strip_template_hint(_m.get("natural_language_2p"))
                 rel_type_labels[_rt] = _m.get("label")
                 rel_type_tail[_rt] = _m.get("tail_types")
+
+        # FORMER-STATE KEY INDEX (current-vs-former contrast): collect the (subject, rel)
+        # keys that carry a FORMER member — a superseded `historical` row, or an undated
+        # stored 'past' state (the same phase the FORMER framing below reads). When such a
+        # key ALSO has a surviving current member, the current line is sharpened with
+        # "currently" ("You currently live in Vancouver") to contrast the former ("You used
+        # to live in Toronto"). Subject/rel-agnostic (temporal_class from the overlay + the
+        # stored temporal_status/historical flag; no rel/place literal). The recency-collapse
+        # pass above already re-stamped the older single-valued 'now' as 'past', so a plain
+        # "Toronto then Vancouver" relocate lands here. Fail-safe → empty set (no "currently").
+        _former_state_keys: set = set()
+        try:
+            for _ff in facts:
+                _frt = (_ff.get("rel_type") or "").lower()
+                if not _frt:
+                    continue
+                _fsid = _ff.get("_subject_id") or _ff.get("subject_id") or _ff.get("subject")
+                _is_former = bool(_ff.get("historical"))
+                if not _is_former and not _ff.get("event_date"):
+                    _ftc = (_overlay_meta.get(_frt) or {}).get("temporal_class", "state")
+                    if _ftc == "state" and (_ff.get("temporal_status") or "now").lower() == "past":
+                        _is_former = True
+                if _is_former:
+                    _former_state_keys.add((str(_fsid), _frt))
+        except Exception as _fsk:
+            log.debug("convert_to_prose.former_state_key_index_failed", error=str(_fsk)[:120])
+            _former_state_keys = set()
 
         # OCCURRENCE-TYPE INDEX (lean-query rendering): a reified dated occurrence is filed at its
         # bare type via an (<occurrence>, instance_of, <type>) edge that the walk already carried into
@@ -34842,6 +37653,45 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         # never compose for instance_of/subclass_of themselves). Fail-safe: no type → unchanged.
         named_instance_type_id: dict = occurrence_type_id
 
+        # ROLE-SCAFFOLD SUPPRESSION indices (consumed by the per-fact block below). Ingest
+        # sometimes mints a BARE TYPE-WORD entity for a kin/role noun ("son"/"mother") and
+        # hangs the SAME anchor-relationship off it that the real NAMED instance already
+        # carries — e.g. "I have a son David" yields BOTH (david chen, child_of, user) [named]
+        # and (son, child_of, user) [role-scaffold], with (david chen, instance_of, son). Build:
+        #  • _type_member_ids: type-entity id -> {named member ids} from the in-set instance_of
+        #    edges (so we can find the NAMED instance a bare type-word stands in for).
+        #  • _anchor_partner_by_rel: rel_type -> {non-anchor endpoint ids} for every edge touching
+        #    the querying anchor, so we can tell whether that named member stands in the SAME
+        #    anchor-relationship the scaffold does. UUID-keyed, metadata-driven, subject-agnostic
+        #    (ZERO kin/role literals). Fail-safe → empty indices → renders as today.
+        _anchor_id_set: set = set()
+        if anchor:
+            _anchor_id_set.add(str(anchor))
+        try:
+            for _aid in (identity_set or set()):
+                _anchor_id_set.add(str(_aid))
+        except Exception:
+            pass
+        _type_member_ids: dict = {}
+        _anchor_partner_by_rel: dict = {}
+        try:
+            for _f in facts:
+                _frt = (_f.get("rel_type") or "").lower()
+                _fs = _f.get("_subject_id") or _f.get("subject_id") or _f.get("subject")
+                _fo = _f.get("_object_id") or _f.get("object_id") or _f.get("object")
+                if _frt == "instance_of" and _fs and _fo:
+                    _type_member_ids.setdefault(str(_fo), set()).add(str(_fs))
+                if _frt and _fs and _fo and _anchor_id_set:
+                    if str(_fs) in _anchor_id_set:
+                        _anchor_partner_by_rel.setdefault(_frt, set()).add(str(_fo))
+                    elif str(_fo) in _anchor_id_set:
+                        _anchor_partner_by_rel.setdefault(_frt, set()).add(str(_fs))
+        except Exception as _rsx:
+            log.debug("convert_to_prose.role_scaffold_index_failed", error=str(_rsx)[:120])
+            _type_member_ids = {}
+            _anchor_partner_by_rel = {}
+        _type_ids: set = set(_type_member_ids.keys())
+
         # GROUP-SCAFFOLD OBJECT SUPPRESSION (prose cleanup — "You own Team/Family",
         # "You have a pet that is Pets"). Ingest sometimes mints a COLLECTIVE-NOUN entity for a
         # grouping word ("pets"/"team"/"family") and hangs a non-membership edge off it
@@ -34884,6 +37734,43 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                     log.debug("convert_to_prose.group_scaffold_suppressed",
                               rel_type=rel_type, object=str(object_id)[:8])
                     continue
+
+                # ROLE-SCAFFOLD SUPPRESSION (presentation dedup — the allowed read-time exception):
+                # drop a redundant relational edge whose NON-ANCHOR endpoint is a BARE TYPE-WORD
+                # (used as an instance_of object in this set) WHEN a NAMED instance of that type
+                # already stands in the SAME anchor-relationship (this rel or its metadata inverse).
+                # Kills the ungrammatical "Son is the child of you" noise line AND the titlecase
+                # contamination it caused ("you have a Son named david chen": the single-token
+                # scaffold alias "son" was polluting the titlecase pass so the TYPE word "son" got
+                # cased like a name). Gated to rels that HAVE an inverse_rel_type (relational
+                # kin/role rels) so a legitimate type-word OBJECT on a possessive/preference rel
+                # without an inverse (likes/owns/has_pet — "you like coffee") is NEVER suppressed.
+                # UUID-keyed, metadata-driven (instance_of edges + inverse_rel_type), subject-
+                # agnostic (ZERO kin/role literals). Fail-safe: any miss keeps the line.
+                try:
+                    _rs_meta = _overlay_meta.get(rel_type) or {}
+                    _rs_inv = (_rs_meta.get("inverse_rel_type") or "").lower()
+                    if (_anchor_id_set and _rs_inv
+                            and not _rs_meta.get("is_hierarchy_rel")):
+                        _s_is_anchor = str(subject_id) in _anchor_id_set
+                        _o_is_anchor = bool(object_id) and str(object_id) in _anchor_id_set
+                        _partner = None
+                        if _s_is_anchor and not _o_is_anchor:
+                            _partner = object_id
+                        elif _o_is_anchor and not _s_is_anchor:
+                            _partner = subject_id
+                        if _partner is not None and str(_partner) in _type_ids:
+                            _members = _type_member_ids.get(str(_partner), set())
+                            _same_rel_partners = (
+                                _anchor_partner_by_rel.get(rel_type, set())
+                                | _anchor_partner_by_rel.get(_rs_inv, set()))
+                            if _members & _same_rel_partners:
+                                log.debug("convert_to_prose.role_scaffold_suppressed",
+                                          rel_type=rel_type, scaffold=str(_partner)[:8])
+                                continue
+                except Exception as _rse:
+                    log.debug("convert_to_prose.role_scaffold_suppress_failed",
+                              error=str(_rse)[:120])
 
                 # SUBJECT-MATTER REDUNDANCY SUPPRESSION (presentation dedup): this edge is an
                 # occurrence's subject-matter that the participated_in render already FOLDS into the
@@ -35056,8 +37943,17 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 _scalar_prose = None
                 if fact.get("source") == "attributes" and object_name:
                     _tt = rel_type_tail.get(rel_type) or []
-                    _tt_scalar = any((str(_t).strip().upper() == "SCALAR") for _t in _tt)
-                    if not _tt_scalar:
+                    # The possessive fallback exists to override the STIFF relational template
+                    # the re_embedder backfills onto an ENGINE-GROWN attribute rel — which is
+                    # minted tail_types={ANY} ("X is the ram of Y" → "Your ram is 64 gigabytes").
+                    # Gate on that grown signature ({ANY} in tail), NOT on "any non-SCALAR tail":
+                    # a CURATED relational rel with a specific non-scalar tail (born_in {Location},
+                    # located_in {Location}) carries a hand-written natural_language_2p ("You were
+                    # born in Y") that must win — the broad "not SCALAR" test hijacked those and
+                    # rendered the label-leak garbage "Your was born in is 1990-03-03". Metadata-
+                    # driven, subject-agnostic; curated {SCALAR}-tailed seeds were already skipped.
+                    _tt_any = any((str(_t).strip().upper() == "ANY") for _t in _tt)
+                    if _tt_any:
                         # attribute noun reads naturally lowercased ("ram", not "Ram").
                         _sa_label = (rel_type_labels.get(rel_type)
                                      or rel_type.replace("_", " ")).strip().lower()
@@ -35078,7 +37974,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         # 2p template has the subject baked in (no X slot). Substitute
                         # only the object into the Y placeholder. The baked subject
                         # "You"/"Your" CONTAINS a literal 'Y', so a naive str.replace
-                        # would corrupt it ("You go by Y" → "Chrisou go by Alex").
+                        # would corrupt it ("You go by Y" → "Chrisou go by Chris").
                         # Replace the Y placeholder as a WHOLE WORD only.
                         if object_name:
                             prose = re.sub(r'\bY\b', lambda _m: object_name, template_2p)
@@ -35108,13 +38004,13 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 if not is_unbound:
                     # SUBJECT-SIDE NAMED-INSTANCE flip (perspective fix): when the named
                     # instance is on the SUBJECT side and the query anchor ("you") is the
-                    # OBJECT — (leo, child_of, you) — the object-side composer declines
+                    # OBJECT — (cyrus, child_of, you) — the object-side composer declines
                     # (object=="you") and the bare template renders the WRONG perspective
-                    # ("you are a son named Leo"). Re-frame anchor-first by FLIPPING along
-                    # the rel's inverse_rel_type (overlay metadata): (leo, child_of, you)
-                    # → you-parent_of-leo → "you have a son named Leo". The Type ("son")
-                    # is leo's instance_of (resolved here, mirroring the object-side block),
-                    # the Name is leo's alias — ZERO kin literals. Detection is STRUCTURAL:
+                    # ("you are a son named Cyrus"). Re-frame anchor-first by FLIPPING along
+                    # the rel's inverse_rel_type (overlay metadata): (cyrus, child_of, you)
+                    # → you-parent_of-cyrus → "you have a son named Cyrus". The Type ("son")
+                    # is cyrus's instance_of (resolved here, mirroring the object-side block),
+                    # the Name is cyrus's alias — ZERO kin literals. Detection is STRUCTURAL:
                     # object is the anchor (UUID), subject is a UUID named instance, rel has a
                     # metadata inverse. Symmetric rels (spouse) render naturally. Runs BEFORE
                     # the object-side composer; takes priority for this mirrored shape.
@@ -35193,13 +38089,40 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 if (fact.get("polarity") or "affirmed") == "negated":
                     prose = _negate_prose(prose)
 
+                # UNDATED-STATE TEMPORAL FRAMING (DESIGN-memory-temporal-lifecycle §5):
+                # a `state` rel fact carrying NO event_date has nothing to recompute a
+                # clock from, so its STORED grammatical temporal_status is the authority
+                # for current-vs-former-vs-upcoming. Frame a stored 'past' as a FORMER
+                # value (via the same "Previously," marker the supersession lane uses) and
+                # a stored 'future' as an UPCOMING one, so a coexisting UNDATED state pair
+                # ("used to live in London" + "moved to Tokyo") reads with the current
+                # value asserted and the former/upcoming ones marked — instead of both as
+                # current. DATED facts are UNTOUCHED here: their status is recomputed from
+                # event_date and they render "(on …)" below. Metadata-driven (temporal_class
+                # from the overlay); subject-agnostic (any state rel); fail-safe → None.
+                _undated_state_phase = None
+                try:
+                    if (not fact.get("historical")) and (not fact.get("event_date")):
+                        _tc = (_overlay_meta.get(rel_type) or {}).get(
+                            "temporal_class", "state")
+                        if _tc == "state":
+                            _ts = (fact.get("temporal_status") or "now").lower()
+                            if _ts in ("past", "future"):
+                                _undated_state_phase = _ts
+                except Exception:
+                    _undated_state_phase = None
+
                 # HISTORICAL (supersession lane): a fact that WAS true and was
                 # corrected. Render it as a FORMER value, never as a current
-                # assertion ("Previously, you lived in Toronto" — not "you live in
-                # Toronto"). The validity boundary (when it stopped being true) is
-                # appended when known. This is a presentation-only marker keyed on
-                # the lane's `historical` flag — no time reasoning in the query.
-                if fact.get("historical"):
+                # assertion. PROPER GRAMMAR: "You used to live in London" — de-conjugate
+                # the surface verb to its base and prepend "used to" (correct for every
+                # person; subject/rel-agnostic). This replaces the old broken "Previously,
+                # You live in London" (present-tense verb + mid-sentence capital graft).
+                # The validity boundary (when it stopped being true) is appended when known.
+                # The undated-state 'past' phase (above) joins this same FORMER framing.
+                # Fail-safe: any shape _reframe_former_state cannot cleanly transform (a
+                # possessive scalar, a negated clause) keeps today's "Previously," marker.
+                if fact.get("historical") or _undated_state_phase == "past":
                     _until = fact.get("valid_until") or fact.get("superseded_at")
                     _when = ""
                     if _until:
@@ -35207,8 +38130,27 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                             _when = " (until %s)" % str(_until)[:10]
                         except Exception:
                             _when = ""
-                    prose = "Previously, %s%s" % (prose, _when)
+                    _reframed = _reframe_former_state(prose, subject_name)
+                    if _reframed:
+                        prose = "%s%s" % (_reframed, _when)
+                    else:
+                        prose = "Previously, %s%s" % (prose, _when)
+                elif _undated_state_phase == "future":
+                    # UPCOMING (undated-state 'future'): a state the user has stated they
+                    # WILL be in ("moving to Paris next year") with no resolved event_date.
+                    # Mark it as planned/upcoming so it never reads as the CURRENT value.
+                    # Mirrors the "Previously," former marker; deterministic, no time reasoning.
+                    prose = "In the future, %s" % prose
                 else:
+                    # CURRENT-VS-FORMER CONTRAST: this is a surviving CURRENT value (not
+                    # historical, not an undated past/future phase). When a FORMER value
+                    # coexists for the SAME (subject, rel) key, sharpen it with "currently"
+                    # ("You currently live in Vancouver") so it contrasts the former ("You
+                    # used to live in Toronto"). No former present (plain single state, or a
+                    # multi-valued state where all values are current) → left plain present.
+                    # Subject/rel-agnostic (UUID+rel key, no literal); fail-safe.
+                    if (str(subject_id), rel_type) in _former_state_keys:
+                        prose = _prefix_current_state(prose, subject_name)
                     # OCCURRENCE TYPE (lean-query rendering): a dated participated_in occurrence is
                     # rendered as only its NAME/title ("You participated in 'Advanced Python'"), but the
                     # type word the question keys on ("webinar"/"workshop") lives on the occurrence's
@@ -35315,10 +38257,11 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 # phrase like "your dog" — that is rendered verbatim, not a name).
                 if (subject_name and subject_name != "you"
                         and not _subj_override
+                        and str(subject_id) not in _type_ids
                         and len(subject_name.split()) == 1):
                     _name_slots.append(subject_name)
                 # Object alias → titlecase ONLY a clean SINGLE-TOKEN entity NAME on a
-                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Mittens). A
+                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Goose). A
                 # hierarchy object is a TYPE word ("dog"/"animal"), a participated_in object
                 # is an occurrence TITLE/handle, and a STATE object is a state word ("down")
                 # — none are proper names, all read naturally lowercase and must NOT be titled
@@ -35334,6 +38277,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 if (object_is_uuid and object_name and object_name != "you"
                         and rel_type != "participated_in"
                         and not _obj_is_hier_slot and not _obj_is_state_slot
+                        and str(object_id) not in _type_ids
                         and len(object_name.split()) == 1):
                     _name_slots.append(object_name)
 
@@ -35424,7 +38368,9 @@ def _fetch_location_grounding(db, user_id: str, schema_name: str | None) -> dict
             with db.cursor() as cur:
                 # Relational location (facts table): object is an entity UUID (e.g. lives_in Toronto).
                 cur.execute(
-                    "SELECT rel_type, object_id, COALESCE(confidence, 0.5) FROM facts "
+                    "SELECT rel_type, object_id, COALESCE(confidence, 0.5), "
+                    "       COALESCE(fact_class, 'B'), COALESCE(fact_provenance, '') "
+                    "FROM facts "
                     "WHERE subject_id = %s AND rel_type = ANY(%s) "
                     "AND superseded_at IS NULL AND archived_at IS NULL "
                     "ORDER BY COALESCE(last_seen_at, created_at) DESC NULLS LAST LIMIT 1",
@@ -35432,31 +38378,68 @@ def _fetch_location_grounding(db, user_id: str, schema_name: str | None) -> dict
                 )
                 _row = cur.fetchone()
                 if _row:
-                    _found = (_row[0], _row[1], float(_row[2]))
+                    # Carry the fact's REAL class AND its PROVENANCE. The provenance is the
+                    # load-bearing one: the CONSUMER (_fact_is_asserted, src/mcp/server.py) keys
+                    # the assert/hold voice on PROVENANCE, not on fact_class — "user_stated →
+                    # ASSERT always; user is truth, never hedge, regardless of class/confidence".
+                    # We were dropping provenance on the floor, so the reader fell back to the
+                    # capture tier + a LOW-CONFIDENCE FLOOR, and these rows carry confidence 0 —
+                    # so a Class-A user_stated address was still rendered as a maybe.
+                    _found = (_row[0], _row[1], float(_row[2]), (_row[3] or "B"), (_row[4] or ""))
                     break
                 # Scalar location (entity_attributes): value is a string (e.g. lives_at address).
                 cur.execute(
-                    "SELECT attribute, value_text FROM entity_attributes "
+                    "SELECT attribute, value_text, COALESCE(provenance, '') "
+                    "FROM entity_attributes "
                     "WHERE entity_id = %s AND attribute = ANY(%s) "
                     "AND value_text IS NOT NULL AND value_text <> '' LIMIT 1",
                     (user_id, _rels),
                 )
                 _arow = cur.fetchone()
                 if _arow:
-                    _found = (_arow[0], _arow[1], 0.6)
+                    # A user-STATED scalar (their address) is not a maybe. Do NOT decide the class
+                    # here: hand PROVENANCE + rel_type to the ONE canonical, metadata-driven seam
+                    # (assign_class_and_confidence) that every other write already goes through.
+                    # An inline `"B" if stated else "C"` would be a hardcoded validation constant
+                    # and a second, drifting copy of the class rules.
+                    _aprov = (_arow[2] or "llm_inferred")
+                    _acls, _aconf = assign_class_and_confidence(
+                        {}, fact_provenance=_aprov, rel_type=_arow[0],
+                    )
+                    _found = (_arow[0], _arow[1], _aconf, _acls, _aprov)
                     break
         if not _found:
             return None
 
-        _rel_type, _obj, _conf = _found
+        _rel_type, _obj, _conf, _fclass, _prov = _found
         # Render via the SAME prose path (perspective "you" + per-tenant template overlay);
         # convert_to_prose resolves the object display from the UUID / uses the scalar value
-        # verbatim. fact_class 'C' → the MCP _emit HELD lane presents it tentatively — never
-        # as the literal answer to the asked question.
+        # verbatim.
+        #
+        # THE CLASS IS THE FACT'S OWN — it used to be HARDCODED to 'C'.
+        #
+        # That forced a user-STATED address into the HELD band, whose contract tells the model
+        # "you are less certain about the following — mention tentatively". A live model then
+        # dutifully hedged: "I see that you might be here ... if that's wrong". It hedged because
+        # WE TOLD IT TO. The user told us where they live; that is Class A/B truth.
+        #
+        # The conflation: the RELEVANCE inference is uncertain (we are guessing they wanted their
+        # location surfaced) — the FACT is not (we are not guessing where they live). Those are
+        # two different uncertainties and hardcoding 'C' hedged the wrong one. Soften the FRAMING
+        # if needed; never the fact. Same rule as feelings: NEVER force a user_stated thing to C
+        # (see CLAUDE.md "FEELINGS TIERING — by PROVENANCE, not a fixed C").
+        # PROVENANCE IS THE LOAD-BEARING FIELD, not fact_class. The consumer of this dict
+        # (_fact_is_asserted, src/mcp/server.py) keys the assert/hold voice on PROVENANCE:
+        # "user_stated → ASSERT always; user is truth, never hedge, regardless of class or
+        # confidence". With `provenance` ABSENT it falls back to the capture tier PLUS a
+        # low-confidence floor — and these rows carry confidence 0, so even a corrected Class-A
+        # address still rendered as "you might be here". Fixing fact_class alone was fixing the
+        # WRITE and assuming the READ.
         _syn = {
             "subject": "you", "object": _obj,
             "_subject_id": user_id, "_object_id": _obj,
-            "rel_type": _rel_type, "fact_class": "C", "confidence": _conf,
+            "rel_type": _rel_type, "fact_class": _fclass, "confidence": _conf,
+            "provenance": _prov, "fact_provenance": _prov,
             "source": "location_grounding", "event_date": None,
         }
         _tok = rel_type_overlay.set_current_schema(schema_name) if schema_name else None
@@ -35477,6 +38460,208 @@ def _fetch_location_grounding(db, user_id: str, schema_name: str | None) -> dict
         return _out
     except Exception as _e:  # noqa: BLE001 — fail-safe: any error → no grounding → honest empty
         log.warning("query.location_grounding_failed", error=str(_e)[:160])
+        return None
+
+
+def _gliner_canonical_type(term: str, gmodel) -> str | None:
+    """Top GLiNER2 canonical CLASS (lowercased) for a bare term, or None.
+
+    This is the SAME zero-shot entity typing ingest uses (concise personal-memory labels —
+    Person/Animal/Organization/Location/Object/Concept; Pitfall 11 purity: no descriptions,
+    no examples, ≤6 labels). It lands an arbitrary noun in the ontology's TOP-LEVEL class so
+    two nouns can be compared BY TYPE ("hamster" → animal, "cat" → animal) — NOT by string /
+    embedding similarity. Fail-safe → None (no type → caller cannot match → honest bare
+    abstention stands). NO cosine, NO fuzz."""
+    if not term or not gmodel:
+        return None
+    try:
+        _labels = _gliner2_entity_labels(source="user")
+        _res = gmodel.extract_entities(term, _labels, max_len=2048)
+        _ents = (_res or {}).get("entities", {}) or {}
+        _term_l = term.strip().lower()
+        # Prefer the class whose detected span IS the term; else the first non-unknown class.
+        _first: str | None = None
+        for _t, _names in _ents.items():
+            if not _t or _t.lower() == "unknown" or not _names:
+                continue
+            if _first is None:
+                _first = _t.lower()
+            for _n in _names:
+                if isinstance(_n, str) and _n.strip().lower() == _term_l:
+                    return _t.lower()
+        return _first
+    except Exception as _e:  # noqa: BLE001 — fail-safe: no type on any error
+        log.debug("gliner_canonical_type.failed", term=str(term)[:40], error=str(_e)[:120])
+        return None
+
+
+def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_id: str,
+                                  schema_name: str | None) -> dict | None:
+    """INFORMATIVE ABSTENTION (read-time presentation, lean-query exception — same class as
+    ``_fetch_location_grounding`` / ``_populate_preferred_names``: it does NOT re-ingest,
+    re-validate or re-structure; it only PRESENTS what the deterministic walk already grounds).
+
+    On a specific-entity MISS (``_query_scoped_to_absent_concept`` fired — the query names a
+    concrete concept absent from memory), do NOT stop at a bare "No relevant facts found".
+    Instead:
+      1. GROUND the queried noun's TYPE via GLiNER2 (the SAME typing ingest uses) — "hamster"
+         → the ``animal`` class.
+      2. CLIMB to that type's L4 PLACE scoped to the ANCHOR (the user) and WALK it — the user's
+         relational neighbours whose OWN L4 type-signals (``_resolve_type_signals`` — the
+         hierarchy IS the type authority) land in the SAME class → the real pets (cat Luna).
+      3. State the SPECIFIC ABSENCE deterministically — "you have not mentioned a hamster".
+
+    Net: "You have a cat named Luna. You have not mentioned a hamster." Every token grounded —
+    Luna is a real row, the hamster-absence is a real gap.
+
+    THE MOAT (why this is NOT fuzzy RAG): the type match is INDEPENDENT GLiNER2 classification
+    of each side into the SAME ontology class (hamster→animal, cat→animal), never a cosine
+    hamster↔cat SIMILARITY. So Luna surfaces as CONTEXT while we REFUSE to call her the hamster.
+    The queried entity is voiced ONLY as an ABSENCE, never echoed as a stored row — the archived
+    failure "your hamster's preferred name is hamster" is structurally impossible here.
+
+    BOUNDED (intent over islands): only neighbours whose type-family matches the queried type
+    are surfaced (the user's pets for a pet ask), NEVER the whole graph. No grounded neighbour of
+    that type → None → the caller's honest bare abstention stands (never invent context).
+
+    Subject-agnostic + metadata/hierarchy-driven end to end: GLiNER2 typing + the
+    ``_resolve_type_signals`` L4 walk + the per-tenant prose overlay. NO domain / rel / word
+    literal, NO ILIKE / substring / cosine. FAIL-SAFE → None on any error/uncertainty.
+
+    Returns a render-ready fact dict (``definition`` set, ``fact_class`` from the surfaced
+    neighbours, ``fact_provenance='user_stated'`` so the grounded context ASSERTS) or None.
+    """
+    if db is None or not user_id or not absent_terms:
+        return None
+    gmodel = get_gliner_model()
+    if not gmodel:
+        return None  # cannot type the queried noun → no informative walk → honest bare abstention
+    try:
+        _class_rels = _get_classification_rels(db)  # instance_of/subclass_of — NOT neighbour edges
+        # The user's RELATIONAL neighbours (an entity object, NOT a scalar value, NOT a type-cast).
+        # search_path is already bound by the caller; per-tenant, NO public.
+        _neighbours: list[tuple] = []
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT rel_type, object_id, COALESCE(fact_class, 'B'), "
+                "       COALESCE(confidence, 0.5), COALESCE(fact_provenance, '') "
+                "FROM facts "
+                "WHERE subject_id = %s AND superseded_at IS NULL "
+                "  AND archived_at IS NULL AND deleted_at IS NULL "
+                "  AND object_id IS NOT NULL",
+                (user_id,),
+            )
+            for _r in cur.fetchall() or []:
+                _rel, _oid = _r[0], _r[1]
+                if not _oid or _rel in _class_rels:
+                    continue
+                # Object must be an ENTITY (UUID with an alias), not a scalar/value string.
+                if not (isinstance(_oid, str) and len(_oid) == 36):
+                    continue
+                _neighbours.append(_r)
+        if not _neighbours:
+            return None
+
+        # Cache GLiNER2 canonical class per distinct type-signal word (bounded: the miss path
+        # is rare, the signal vocabulary per tenant is small).
+        _class_cache: dict[str, str | None] = {}
+
+        def _canon(_w: str) -> str | None:
+            _wl = (_w or "").strip().lower()
+            if not _wl:
+                return None
+            if _wl not in _class_cache:
+                _class_cache[_wl] = _gliner_canonical_type(_wl, gmodel)
+            return _class_cache[_wl]
+
+        def _neighbour_matches(_obj_id: str, _target_class: str) -> bool:
+            """True iff the neighbour's L4 type-family == the queried noun's class.
+            Hierarchy is the type authority (_resolve_type_signals): a signal word may already
+            BE the class ("animal") or classify INTO it ("cat" → animal). Fail-safe → False."""
+            try:
+                _sig, _auth = _resolve_type_signals(db, _obj_id)
+            except Exception:  # noqa: BLE001
+                _sig, _auth = set(), False
+            if not _sig:
+                # No classification ladder → fall back to the denormalized entity_type HINT.
+                try:
+                    with db.cursor() as _tc:
+                        _tc.execute(
+                            "SELECT entity_type FROM entities WHERE id = %s "
+                            "  AND entity_type IS NOT NULL AND entity_type != 'unknown'",
+                            (_obj_id,),
+                        )
+                        _row = _tc.fetchone()
+                        if _row and _row[0]:
+                            _sig = {_row[0].lower()}
+                except Exception:  # noqa: BLE001
+                    _sig = set()
+            if _target_class in _sig:
+                return True
+            return any(_canon(_w) == _target_class for _w in _sig)
+
+        # Try each absent term (singularized) — the FIRST that grounds a matching neighbourhood
+        # wins. A term that types to nothing, or whose L4 place has no grounded neighbour, is
+        # skipped (no fabrication).
+        for _term in sorted({(_singularize_noun(t) or t).strip().lower() for t in absent_terms if t}):
+            if not _term:
+                continue
+            _tq = _gliner_canonical_type(_term, gmodel)
+            if not _tq:
+                continue
+            _matched: list[dict] = []
+            for _rel, _oid, _fc, _conf, _prov in _neighbours:
+                if _neighbour_matches(_oid, _tq):
+                    _matched.append({
+                        "subject_id": user_id, "_subject_id": user_id,
+                        "rel_type": _rel, "object_id": _oid, "_object_id": _oid,
+                        "fact_class": _fc, "confidence": _conf,
+                        "provenance": _prov, "fact_provenance": _prov,
+                    })
+            if not _matched:
+                continue  # queried type has NO grounded neighbour under the user → try next term
+
+            # Render the grounded neighbours via the SAME per-tenant prose path (perspective
+            # "you" + template overlay). This is the only content voiced as STORED fact.
+            _tok = rel_type_overlay.set_current_schema(schema_name) if schema_name else None
+            try:
+                _neighbour_prose = convert_to_prose(
+                    [dict(f) for f in _matched], db, anchor=user_id, user_id=user_id)
+            finally:
+                if _tok is not None:
+                    rel_type_overlay.reset_current_schema(_tok)
+            _neighbour_prose = [p for p in (_neighbour_prose or []) if p and p.strip()]
+            if not _neighbour_prose:
+                continue  # nothing rendered → do not fabricate a bare absence with no context
+
+            # Compose: grounded context (asserted) + the SPECIFIC, deterministic absence. The
+            # absent term appears ONLY inside an explicit "you have not mentioned …" clause —
+            # never as a stored row (anti-fabrication guard).
+            _ctx = ". ".join(p.rstrip(". ") for p in _neighbour_prose)
+            _article = "an" if _term[:1] in "aeiou" else "a"
+            _definition = f"{_ctx}. You have not mentioned {_article} {_term}."
+
+            # The surfaced context is grounded user truth → assert (user_stated). fact_class is
+            # the strongest surfaced neighbour's class (A wins over B); presentation only.
+            _fclass = "A" if any(f.get("fact_class") == "A" for f in _matched) else "B"
+            log.info("query.phase5.informative_abstention",
+                     term=_term, queried_class=_tq, neighbours=len(_matched),
+                     user=str(user_id)[:8])
+            # rel_type is deliberately NON-"context": the MCP reader renders a "context" fact
+            # from its `object` slot but a normal fact from its `definition` slot — we carry the
+            # composed prose in `definition` (like _fetch_location_grounding), so it must take the
+            # definition branch. `fact_provenance='user_stated'` drives the ASSERT voice.
+            return {
+                "subject": "you", "object": None,
+                "rel_type": "informative_abstention", "fact_class": _fclass,
+                "confidence": 1.0, "provenance": "user_stated",
+                "fact_provenance": "user_stated",
+                "source": "informative_abstention", "event_date": None,
+                "definition": _definition, "category": "abstention",
+            }
+        return None
+    except Exception as _e:  # noqa: BLE001 — fail-safe: any error → honest bare abstention
+        log.warning("query.informative_abstention_failed", error=str(_e)[:160])
         return None
 
 
@@ -35707,9 +38892,26 @@ async def query(request: QueryRequest) -> QueryResponse:
         # non-default method (exempt). FAIL-SAFE: the reference detector returns True (don't blank) when
         # the layer is unavailable, so an uncertain case prefers returning facts. Deterministic, no
         # phrase list (anchor method + scope flag + Person-morphology + parsed temporal intent).
+        # A BARE ambient-FUTURE flag ("what's the weather TOMORROW", "anything NEXT week")
+        # is NOT a memory recall — there are no future stored facts to filter — yet
+        # _detect_temporal_query_intent returns {filter_status:'future'}, which as a plain
+        # truthy dict wrongly EXEMPTED the query from this gate → it fetch-all'd and dumped
+        # the whole profile (the reported "blood pressure with the weather" leak). Exempt
+        # ONLY for a genuine temporal RECALL directive over stored facts (order/boundary/
+        # ordinal comparison, historical-supersession, past-state, or a PAST filter) — an
+        # ambient future/relative mention alone does not keep the fetch-all open. Structural
+        # (keys on the parsed directive, no phrase list); subject-agnostic; fail-safe.
+        _temporal_is_recall = bool(
+            _anchor_temporal_intent.get("order")
+            or _anchor_temporal_intent.get("boundary")
+            or _anchor_temporal_intent.get("ordinal")
+            or _anchor_temporal_intent.get("history")
+            or _anchor_temporal_intent.get("state_phase")
+            or _anchor_temporal_intent.get("filter_status") == "past"
+        )
         if (_anchor_meta.get("method") == "default"
                 and not getattr(path, "scope_active", False)
-                and not _anchor_temporal_intent
+                and not _temporal_is_recall
                 and not _has_first_or_second_person_reference(query_text)):
             log.info("query.phase5.broad_recall_gated",
                      query=query_text[:60], anchor_method=_anchor_meta.get("method"),
@@ -35728,6 +38930,45 @@ async def query(request: QueryRequest) -> QueryResponse:
             return QueryResponse(
                 anchor=anchor or "",
                 facts=_gate_facts,
+                preferred_names={},
+                canonical_identity=anchor or "",
+                confidence_applied=True,
+                staged_facts_count=0,
+                error=None,
+                alerts=_get_active_alerts(locals().get("schema_name")) or [],
+            )
+        # ── SCOPED-ABSENT-CONCEPT ABSTENTION GATE (anti-fabrication) ────────────────────────────
+        # The broad-recall gate above EXEMPTS any query carrying a 1st/2nd-person reference OR a
+        # temporal recall intent — so a scoped ask for a concrete concept the user NEVER mentioned
+        # ("how long was I in Korea for", "what is the name of my hamster") slips past it into the
+        # UNSCOPED fetch-all lane (method=="default", scope_active False) and DUMPS the user's
+        # unrelated facts as if they answered — a fabrication. When NO concept scope resolved AND
+        # the anchor fell back to default, but the query NAMES a concrete entity concept absent from
+        # this tenant's memory+ontology, ABSTAIN (return empty) instead. Deterministic + subject-
+        # agnostic (spaCy NOUN/PROPN grounded against the tenant's own registry/ontology; no domain/
+        # rel/pronoun literal). FAIL-SAFE: the helper returns False on any parse/DB uncertainty, so
+        # an uncertain case keeps today's fetch-all. Runs ONLY on the unscoped path, so a real
+        # scoped answer (scope_active True / a concretely-resolved anchor) is never blanked.
+        _absent_probe: set = set()
+        if (_anchor_meta.get("method") == "default"
+                and not getattr(path, "scope_active", False)
+                and _query_scoped_to_absent_concept(query_text, db, user_id,
+                                                     probe_out=_absent_probe)):
+            # INFORMATIVE ABSTENTION: rather than a bare "no record", climb the absent noun's
+            # TYPE to its L4 place scoped to the user and surface the real grounded neighbours of
+            # that type (cat Luna) alongside the SPECIFIC absence ("you have not mentioned a
+            # hamster"). Deterministic L4 walk, never fuzzy — no matching neighbour → None → the
+            # honest bare abstention below stands. See _fetch_informative_abstention.
+            _info_abstain = _fetch_informative_abstention(
+                query_text, _absent_probe, db, user_id, locals().get("schema_name"))
+            log.info("query.phase5.scoped_absent_concept_abstain",
+                     query=query_text[:80], anchor_method=_anchor_meta.get("method"),
+                     informative=bool(_info_abstain),
+                     note="query scoped to a concrete concept absent from memory → abstain "
+                          "instead of unscoped fetch-all dump")
+            return QueryResponse(
+                anchor=anchor or "",
+                facts=[_info_abstain] if _info_abstain else [],
                 preferred_names={},
                 canonical_identity=anchor or "",
                 confidence_applied=True,
@@ -35755,6 +38996,7 @@ async def query(request: QueryRequest) -> QueryResponse:
         # the anchor/user). This is the load-bearing narrow set: the min/max ordinal
         # operator scopes to {these events}, immune to unrelated/garbled dated edges.
         _comparison_operand_ids: list[str] = []
+        _comparison_undecidable = False  # abstention gate: a named operand absent from memory
         try:
             _is_comparison_intent = (
                 _anchor_temporal_intent.get("order") == "event_date"
@@ -35791,6 +39033,10 @@ async def query(request: QueryRequest) -> QueryResponse:
                 # (Type→instance expansion of a bare TYPE-WORD operand — "which workshop was first"
                 # → all workshop occurrences — is handled downstream by
                 # _expand_type_operands_to_instances; it is NOT appended here.)
+                # Count NAMED operand phrases that resolve to ANY entity — the abstention
+                # gate keys on this: a genuine 2-operand comparison where a named operand
+                # resolves to NOTHING (it was never mentioned) is undecidable → abstain.
+                _resolved_operand_phrases = 0
                 with db.cursor() as _cc:
                     for _phrase in _operand_phrases:
                         _matched_phrase = False
@@ -35812,9 +39058,14 @@ async def query(request: QueryRequest) -> QueryResponse:
                         # python") wins over a contained shorter alias ("python"). Deterministic, no
                         # fuzz; only consulted on an exact-match miss so it never weakens an exact hit.
                         if not _matched_phrase:
-                            for _eid in _resolve_phrase_to_longest_alias(db, _phrase):
+                            _long_hits = _resolve_phrase_to_longest_alias(db, _phrase)
+                            for _eid in _long_hits:
                                 _cmp_set.add(_eid)
                                 _operand_set.add(_eid)
+                            if _long_hits:
+                                _matched_phrase = True
+                        if _matched_phrase:
+                            _resolved_operand_phrases += 1
 
                 # ── (b) DB-ORDERED LONG-TO-SHORT fallback — replaces the legacy single-
                 # token loop + its brittle hardcoded stop-word zoo. Only consulted when
@@ -35872,6 +39123,17 @@ async def query(request: QueryRequest) -> QueryResponse:
                 # The narrow set is the named events ONLY (anchor excluded — the user is
                 # subject of EVERY dated edge, so scoping by it would not narrow).
                 _comparison_operand_ids = list(_operand_set)
+                # ── ABSTENTION GATE: a genuine 2-operand comparison where a NAMED operand
+                # never resolved to any entity (it was never mentioned) cannot be ordered —
+                # suppress the confident first-last/pivot render downstream so recall abstains
+                # instead of fabricating a winner from the one operand that DOES exist.
+                _comparison_undecidable = _comparison_operands_undecidable(
+                    _operand_phrases, _resolved_operand_phrases, _is_comparison_intent)
+                if _comparison_undecidable:
+                    log.info("query.phase5.comparison_undecidable_abstain",
+                             phrases=len(_operand_phrases),
+                             resolved=_resolved_operand_phrases,
+                             query=query_text[:60])
                 if _comparison_entity_ids or _comparison_operand_ids:
                     log.info("query.phase5.temporal_comparison_set",
                              fetch_operands=len(_comparison_entity_ids or []),
@@ -36011,6 +39273,18 @@ async def query(request: QueryRequest) -> QueryResponse:
         # If buddy is stored as (buddy, instance_of, dog) and dog is in the result set as a class
         # node, traverse downward from dog to find all its instances (e.g., buddy).
         # Uses _REL_TYPE_HIERARCHY (DB-driven at startup) — no hardcoded rel_type names.
+        #
+        # BREADTH GATE (reference-determined): for a TIGHT single-entity reference ("tell
+        # me about core-1") this downward expansion is exactly what fans the anchor's OWN
+        # container down to its SIBLINGS (core-1's rack → every device in the rack) — the
+        # reported over-extension. Skip it when the query is a bare concrete-entity
+        # reference with no hierarchy/grouping intent; a hierarchy/map or user-anchored
+        # query keeps the full expansion. Subject-agnostic (keys on anchor identity +
+        # path.hierarchy_intent), fail-safe (default False only tightens a non-user anchor).
+        _tight_downward = bool(
+            AXIS_SCOPED_QUERY and anchor and anchor != user_id
+            and not getattr(path, "hierarchy_intent", False)
+        )
         try:
             # Build the anchor's connected entity set (anchor + its 1-hop neighbours).
             # Only hierarchy facts whose subject is in this set seed downward expansion —
@@ -36037,6 +39311,12 @@ async def query(request: QueryRequest) -> QueryResponse:
                     _obj_id = _hf.get("_object_id") or _hf.get("object")
                     if _obj_id and _obj_id != anchor:
                         _class_entity_uuids.add(_obj_id)
+            # TIGHT reference: suppress the downward fan-out (container → siblings).
+            if _tight_downward and _class_entity_uuids:
+                log.info("query.phase5.downward_expansion_tight_suppressed",
+                         anchor=str(anchor)[:8], class_nodes=len(_class_entity_uuids),
+                         query=query_text[:50])
+                _class_entity_uuids = set()
             if _class_entity_uuids and db:
                 _down_member_uuids: set[str] = set()
                 for _class_uuid in _class_entity_uuids:
@@ -36052,11 +39332,28 @@ async def query(request: QueryRequest) -> QueryResponse:
                 if _down_member_uuids:
                     _down_hier_facts = _fetch_hierarchy_facts(db, user_id, _down_member_uuids)
                     _down_entity_facts = _fetch_entity_facts(db, user_id, _down_member_uuids, anchor_uuid=anchor)
+                    # THE HARD LINE: the descent already WALKED the grown ladder (the member
+                    # UUID set above), so grounded LEAF facts on those members are collected —
+                    # but the grown type-ladder rungs themselves (subclass_of dog→canine, the
+                    # engine-minted is-a rows) must NOT be RETURNED as the user's memory. Hold
+                    # them out of the rendered set; the leaf instance rows (has_pet/part_of/
+                    # instance_of user-grounded) are kept, so a leaf reached THROUGH the ladder
+                    # (family → pets → Fraggle) still surfaces.
+                    _before = len(_down_hier_facts) + len(_down_entity_facts)
+                    _down_hier_facts = [
+                        _f for _f in _down_hier_facts
+                        if not _is_grown_ontology_row(_f.get("rel_type"), _f.get("provenance"))
+                    ]
+                    _down_entity_facts = [
+                        _f for _f in _down_entity_facts
+                        if not _is_grown_ontology_row(_f.get("rel_type"), _f.get("provenance"))
+                    ]
                     db_facts = db_facts + _down_hier_facts + _down_entity_facts
                     log.info("query.phase5.downward_hierarchy_expanded",
                              class_nodes=len(_class_entity_uuids),
                              member_uuids=len(_down_member_uuids),
-                             added_facts=len(_down_hier_facts) + len(_down_entity_facts))
+                             added_facts=len(_down_hier_facts) + len(_down_entity_facts),
+                             grown_ontology_held=_before - (len(_down_hier_facts) + len(_down_entity_facts)))
         except Exception as _down_e:
             log.warning("query.phase5.downward_hierarchy_expansion_failed", error=str(_down_e))
 
@@ -36167,26 +39464,23 @@ async def query(request: QueryRequest) -> QueryResponse:
         # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
         # D3: ALWAYS runs (no skip) so Class C is always part of full scope.
         qdrant_facts = []
-        if USER_MEMORY_VECTOR_LANE:
-            try:
-                llm_url = _get_llm_url()
-                if llm_url:
-                    qdrant_facts = qdrant_semantic_search(
-                        query_text,
-                        conversation_history,
-                        user_id,
-                        qdrant_url,
-                        llm_url,
-                        score_threshold=0.3,
-                        limit=10,
-                        schema_name=schema_name,
-                    )
-                    if qdrant_facts:
-                        log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
-            except Exception as e:
-                log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
-        # When USER_MEMORY_VECTOR_LANE is off (default), qdrant_facts stays [] — Class C surfaces
-        # from staged_facts (Postgres) via fetch_facts_from_anchor.
+        try:
+            llm_url = _get_llm_url()
+            if llm_url:
+                qdrant_facts = qdrant_semantic_search(
+                    query_text,
+                    conversation_history,
+                    user_id,
+                    qdrant_url,
+                    llm_url,
+                    score_threshold=0.3,
+                    limit=10,
+                    schema_name=schema_name,
+                )
+                if qdrant_facts:
+                    log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
+        except Exception as e:
+            log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
 
         # D3 rank-down (was: hard floor/exclusion). Low-relevance / low-confidence Qdrant
         # facts are DEMOTED in rank, NEVER removed. The DB-confident case stacks an extra
@@ -36215,8 +39509,8 @@ async def query(request: QueryRequest) -> QueryResponse:
         # Qdrant payloads store subject/object as DISPLAY NAMES (re_embedder writes
         # subject_display/object_display), not UUIDs. A DB copy of the same fact keys
         # on its UUID; the Qdrant copy keyed on a display name — so dedup never
-        # collapsed them and the SAME fact rendered twice (e.g. "you works for riverton"
-        # AND "alex works for riverton"). Resolve each Qdrant point's backing row
+        # collapsed them and the SAME fact rendered twice (e.g. "you works for guelph"
+        # AND "chris works for guelph"). Resolve each Qdrant point's backing row
         # (fact_id + source_table) to its real subject_id/object_id UUIDs and stamp
         # them onto the fact, so the UUID-keyed dedup below collapses DB+Qdrant copies
         # and the central resolver renders the survivor ONE way. Runs AFTER the
@@ -36349,6 +39643,38 @@ async def query(request: QueryRequest) -> QueryResponse:
             except Exception as _spe:
                 log.warning("query.qdrant_scope_projection_failed non-blocking", error=str(_spe)[:120])
 
+        # ─── TIGHT single-entity: the Qdrant Class-C ASSOCIATIVE lane must involve the ANCHOR ───
+        # The deterministic PostgreSQL walk is tightened for a bare concrete-entity reference
+        # ("tell me about core-1" → the anchor's own edges/scalars/container, NOT its rack-mates).
+        # The Qdrant short-term lane is ASSOCIATIVE (cosine), so it pulls vector-NEIGHBOURS: a
+        # sibling's ip (sw-1 10.0.0.2) is vector-near the anchor's ip (core-1 10.0.0.1 — both
+        # IPs), leaking sw-1 onto a core-1 question. The fuzzy lane must match the tight walk:
+        # on a tight reference (non-user anchor, NO hierarchy/classification intent) keep a
+        # Class-C fact ONLY if it actually INVOLVES the anchor (subject/object == anchor). A
+        # broad / self-anchored / hierarchy / "what is X" query keeps the full C lane (the
+        # intentional short-term backstop). Subject-agnostic (keys on anchor identity, no
+        # domain/rel literal); deterministic (identity, not fuzz); fail-safe (never raises).
+        if qdrant_facts and anchor and anchor != user_id:
+            try:
+                _q_tight = (
+                    not getattr(path, "hierarchy_intent", False)
+                    and not any(_c in (query_text or "").lower()
+                                for _c in _CLASSIFICATION_QUERY_CUES)
+                )
+                if _q_tight:
+                    _before_t = len(qdrant_facts)
+                    qdrant_facts = [
+                        f for f in qdrant_facts
+                        if anchor in (f.get("subject"), f.get("object"),
+                                      f.get("_subject_id"), f.get("_object_id"))
+                    ]
+                    if len(qdrant_facts) < _before_t:
+                        log.info("query.qdrant_tight_anchor_filtered",
+                                 before=_before_t, after=len(qdrant_facts),
+                                 anchor=str(anchor)[:8])
+            except Exception as _qte:
+                log.warning("query.qdrant_tight_anchor_failed non-blocking", error=str(_qte)[:120])
+
         # ─── D4 (query half): genuine scoped HIT increments hit_count on Class C ───
         # A Class C Qdrant fact is a HIT (not a mere bulk return) when:
         #   • its cosine score >= QUERY_CLASSC_HIT_THRESHOLD (stricter than the 0.3 inclusion
@@ -36454,6 +39780,15 @@ async def query(request: QueryRequest) -> QueryResponse:
                     before=len(gated_facts), after=len(temporal_filtered_facts))
         gated_facts = temporal_filtered_facts
 
+        # Step 5b-1: COUNT-OVER-WALK — snapshot the walk-collected set for a cardinality
+        # ask BEFORE the temporal rungs narrow/slice it. A "how many <TYPE> …" question is
+        # answered by len(distinct typed instances the walk already collected) — a thin
+        # render, not a compute lane (see _detect_count_intent). Detected here, applied
+        # after the temporal block (below) over this untouched snapshot. Only taken when a
+        # count intent is present (else None → zero overhead on the common path).
+        _count_intent = _detect_count_intent(query_text or "")
+        _count_candidates = list(gated_facts) if _count_intent else None
+
         # Step 5b-2: TEMPORAL MODEL query intent (deterministic, structural).
         # DESIGN-hierarchy-ladder §"Temporal model" → "Query payoff": temporal
         # reasoning is structural filter/order over (temporal_status, event_date) —
@@ -36486,7 +39821,7 @@ async def query(request: QueryRequest) -> QueryResponse:
                 # math) and project the dated facts to the asked side/position. Lean +
                 # read-only; non-temporal & undated facts are preserved. Kill-switch +
                 # fail-safe: any error leaves gated_facts as the plain-ordered set above.
-                if TEMPORAL_RECALL_ORDERING and (
+                if TEMPORAL_RECALL_ORDERING and not _comparison_undecidable and (
                     _temporal_intent.get("direction") or _temporal_intent.get("ordinal")
                 ):
                     _pivot_iso = None
@@ -36585,7 +39920,9 @@ async def query(request: QueryRequest) -> QueryResponse:
                                  topic=_qt.get("topic_word"),
                                  relation=_qt.get("relation_word"),
                                  boundary=_qt.get("boundary"), query=query_text[:50])
-                        if _qt.get("template") == _QT_TEMPORAL_FIRST_LAST and _qt.get("boundary"):
+                        if (_qt.get("template") == _QT_TEMPORAL_FIRST_LAST
+                                and _qt.get("boundary")
+                                and not _comparison_undecidable):
                             _before_fl = len(gated_facts)
                             gated_facts = _apply_get_first_last(
                                 gated_facts, _qt["boundary"],
@@ -36636,7 +39973,7 @@ async def query(request: QueryRequest) -> QueryResponse:
                     _calc_src = _calc_candidates if _calc_candidates is not None \
                         else gated_facts
                     _temporal_calc_result = _apply_temporal_calc(
-                        _calc_src, _temporal_intent, user_id)
+                        _calc_src, _temporal_intent, user_id, query_text=query_text)
                     log.info("query.phase5.temporal_calc",
                              op=(_temporal_calc_result or {}).get("op"),
                              miss=(_temporal_calc_result or {}).get("miss"),
@@ -36661,7 +39998,11 @@ async def query(request: QueryRequest) -> QueryResponse:
                 # A/B deterministic deep pass that supersedes/strengthens it. Flag-gated;
                 # any error leaves the single-pass result untouched (fail-safe).
                 _recursive_meta = None
-                if QUERY_RECURSIVE_WALK:
+                # ABSTENTION: an undecidable comparison (a named operand absent from memory)
+                # must not be resolved by the deep recursive walk either — it could only
+                # voice the ONE operand that exists as the confident answer. Skip so recall
+                # abstains (fail-safe: non-comparison queries are unaffected).
+                if QUERY_RECURSIVE_WALK and not _comparison_undecidable:
                     try:
                         _walk = _recursive_query_walk(
                             query_text, _temporal_intent, gated_facts, user_id, db)
@@ -36691,6 +40032,79 @@ async def query(request: QueryRequest) -> QueryResponse:
                                     error=str(_rwe)[:140])
         except Exception as _tie:
             log.warning("query.phase5.temporal_intent_failed", error=str(_tie))
+
+        # Step 5b-3: COUNT-OVER-WALK — apply the cardinality render over the pre-narrowing
+        # snapshot. Ground the user's type phrase to its L4 type UUID(s) with the SAME
+        # exact-alias + subclass_of machinery ingest used, then COUNT the distinct
+        # instance_of instances the walk already collected under that type (dedup on UUID).
+        # NOT a compute operator — the number IS len(distinct collected instances). An
+        # unresolvable type → miss (voiced as an explicit no-such-instances line, never a
+        # fabricated 0). Result surfaced as an asserted synthetic fact below. Fail-safe:
+        # any error leaves recall byte-for-byte unchanged (no count fact injected).
+        _count_result = None
+        if _count_intent and _count_candidates is not None:
+            try:
+                _ctype_uuids = _resolve_count_type_uuids(
+                    db, _count_intent.get("type_phrase") or "")
+                # Surface each collected item's ALREADY-STORED instance_of TYPE edge (one hop
+                # past the anchor, so the anchor walk didn't carry it) — capture is clean; this
+                # is a presentation-time read so the cardinality has typed instances to count.
+                _count_candidates = _enrich_count_candidates_with_instance_of(
+                    db, _count_candidates, _get_classification_rels(db))
+                _cres = _apply_instance_count(
+                    _count_candidates, _ctype_uuids,
+                    _get_classification_rels(db),
+                    scope=_count_intent.get("scope"),
+                    since_iso=None)  # deterministic "since" bound: resolved below
+                # Resolve a "since <phrase>" lower bound deterministically (dateparser,
+                # no ML) and re-apply the dated-companion filter when present.
+                _since_phrase = _count_intent.get("since")
+                if _since_phrase and not _cres.get("miss"):
+                    _since_iso = _resolve_temporal_pivot(_since_phrase, user_id, db)
+                    if _since_iso:
+                        _cres = _apply_instance_count(
+                            _count_candidates, _ctype_uuids,
+                            _get_classification_rels(db),
+                            scope=_count_intent.get("scope"),
+                            since_iso=_since_iso)
+                    else:
+                        # cannot ground the "since" bound → hold rather than assert
+                        _cres["held"] = True
+                # DIRECT L4 count(*) (owner-directed): the walk-snapshot count under-counts when the
+                # item→type edges sit one hop past the anchor and never entered the snapshot (a real
+                # "how many <type>" then reads as 0/too-low even though the L4 instance_of edges EXIST).
+                # With NO date bound, take the authoritative direct L4 cardinality when it EXCEEDS the
+                # walk count — never lower a legitimately relation-scoped walk count.
+                if (not _since_phrase and not _cres.get("miss")
+                        and not _cres.get("held") and _ctype_uuids):
+                    _direct = _l4_direct_instance_count(
+                        db, _ctype_uuids, _get_classification_rels(db))
+                    if not _direct.get("miss") and _direct.get("count", 0) > _cres.get("count", 0):
+                        _cres = _direct
+                # COUNT-SCALAR reconciliation (knowledge-update recency-scalar cluster, Failure 2): a
+                # STATED bulk count ("I have 600 followers", "I have 3 cats") lives as a SCALAR attribute
+                # on the user, not as enumerable instance_of rows → the instance walk finds 0/miss and
+                # would voice a FALSE "I don't have any <X> on record". When such a count scalar EXISTS for
+                # the queried type phrase, it is the AUTHORITATIVE answer (asserted). ``from_scalar_attr``
+                # is carried so the render also DROPS the raw scalar fact (no double "Your cats is 3").
+                # Only consulted when the instance walk found nothing — never LOWERS a real instance count.
+                if _cres.get("miss") or int(_cres.get("count") or 0) == 0:
+                    _sc = _count_scalar_answer(db, user_id, _count_intent.get("type_phrase") or "")
+                    if _sc is not None:
+                        _cres = {"miss": False, "held": False, "count": int(_sc["count"]),
+                                 "instance_ids": [], "instance_names": [],
+                                 "from_scalar_attr": _sc["attribute"],
+                                 "count_surface": _sc.get("surface")}
+                _count_result = {**_count_intent, **_cres}
+                log.info("query.phase5.count_over_walk",
+                         type_phrase=_count_intent.get("type_phrase"),
+                         resolved_types=len(_ctype_uuids),
+                         count=_cres.get("count"), miss=_cres.get("miss"),
+                         held=_cres.get("held"), query=query_text[:50])
+            except Exception as _cerr:  # noqa: BLE001 — fail-safe: no count fact injected
+                log.warning("query.phase5.count_over_walk_failed",
+                            error=str(_cerr)[:140])
+                _count_result = None
 
         # Step 5c: Taxonomy gate — filter merged facts when a taxonomy scope is active.
         # Prevents Qdrant Phase 4 facts from bypassing the rel_type + entity_type constraints
@@ -36897,9 +40311,15 @@ async def query(request: QueryRequest) -> QueryResponse:
                     elif not _signals:
                         # No type signal at all — EXCLUDE from taxonomy-scoped queries to
                         # prevent cross-domain bleed. User corrections (Class A) always pass.
-                        _f_class = (_f.get("fact_class") or "").upper()
-                        _f_prov = (_f.get("fact_provenance") or (_f.get("provenance") or "")).lower()
-                        if _f_class == "A" or _f_prov == "user_stated":
+                        # OVER-PROJECTION FIX (audit site #1): a GROWN grouping member reached
+                        # from the anchor via the taxonomy's OWN defining rels
+                        # (`_grouping_reachable`) is a member BY CONSTRUCTION — it just hasn't
+                        # grown a type signal yet (staged-B, entity_type='unknown', unpromoted
+                        # instance_of ladder). Admit it by REACHABILITY, same spirit as
+                        # `_hierarchy_admitted`. This is the `not _signals` branch ONLY, so the
+                        # typed-MISMATCH firewall below (site #5 / RC2, 398a4fb0) is untouched:
+                        # an entity that HAS a signal never reaches here.
+                        if _untyped_grouping_member_admitted(_f):
                             _gated.append(_f)
                         else:
                             log.debug(
@@ -36947,49 +40367,23 @@ async def query(request: QueryRequest) -> QueryResponse:
                 with db.cursor() as cur:
                     placeholders = ",".join(["%s"] * len(entity_uuids))
                     # REMOVED: WHERE user_id = %s filter (schema isolation handles this)
-                    # DISPLAY CASE (migration 214): `display_form` is the casing RETAINED at
-                    # ingest from the user's verbatim turn — a pure overlay of `alias`
-                    # (lower(display_form) = alias, enforced at the write seam). NULL means no
-                    # casing was ever observed for this name, and COALESCE then yields exactly
-                    # today's lowercase `alias`. Nothing is reconstructed here: this reads a
-                    # stored value, it does not capitalise. `alias` itself is still what the
-                    # walk matched on; only the rendered label changes.
+                    # NAME-FALLBACK (deterministic): do NOT require is_preferred=true — a
+                    # component/nested entity (e.g. "gps system", a NIC, a pet) often has only a
+                    # single alias row with is_preferred=false, and filtering it out left the entity
+                    # unresolved so its walked fact was dropped downstream as
+                    # `skipped_unresolved_subject`. Order preferred-first per entity and take the
+                    # first row (preferred wins if present, else the best stable alias). Mirrors the
+                    # owner-identity `ORDER BY is_preferred DESC, alias` fallback just below. This is
+                    # the sanctioned read-time name-rendering exception to lean-query; no rel/type/
+                    # domain literal, no fuzzy match — UUID + is_preferred metadata only.
                     cur.execute(
-                        f"SELECT entity_id, COALESCE(display_form, alias), alias "
-                        f"FROM entity_aliases WHERE entity_id IN ({placeholders}) AND is_preferred = true",
+                        f"SELECT entity_id, alias FROM entity_aliases WHERE entity_id IN ({placeholders}) "
+                        f"ORDER BY entity_id, is_preferred DESC, alias",
                         list(entity_uuids)
                     )
-                    _cased_entities: set = set()
-                    for entity_id, _label, _raw_alias in cur.fetchall():
-                        preferred_names[entity_id] = _label
-                        if _label != _raw_alias:
-                            _cased_entities.add(entity_id)
-                    # ── THE HARD LINE, display side ────────────────────────────────────────
-                    # A MEMORY is user truth (the name `Diane`); a PLACE is an L4 type node
-                    # (`dog`, `corporation`) the engine builds and files memories AT. A place
-                    # must never acquire a proper-name display form, or the type starts
-                    # rendering like a name.
-                    #
-                    # Ingest already discards sentence-initial capitals and admits only PROPN
-                    # runs, so a bare common noun never gets a display form. What ingest CANNOT
-                    # see is a token inside a multi-word name whose lowercase form is ALSO a
-                    # type in THIS tenant ("McDonald Corporation" → `corporation`). The
-                    # evidence that settles it — the P31/P279 classification ladder — does not
-                    # exist yet while the turn is being written, but it does here. So the
-                    # place test is applied at the ONE sanctioned read-time presentation seam,
-                    # reusing the `_entity_is_l4_place` predicate (metadata-driven from
-                    # `rel_types.wikidata_pid`; a named INSTANCE, subject of P31, wins the tie
-                    # and stays a memory).
-                    #
-                    # Cost-bounded: probed ONLY for entities that actually carry casing (a
-                    # small named subset), never for the whole result set. Fail-safe: the
-                    # predicate returns False on any error → today's behaviour.
-                    for entity_id in _cased_entities:
-                        if _entity_is_l4_place(db, entity_id):
-                            preferred_names[entity_id] = preferred_names[entity_id].lower()
-                            log.info("query.display_case_withheld_from_l4_place",
-                                     entity=str(entity_id)[:8],
-                                     reason="a PLACE is never rendered as a proper name")
+                    for entity_id, alias in cur.fetchall():
+                        if entity_id not in preferred_names:
+                            preferred_names[entity_id] = alias
             except Exception as e:
                 log.warning("query.preferred_names_lookup.failed", error=str(e))
 
@@ -37005,21 +40399,14 @@ async def query(request: QueryRequest) -> QueryResponse:
                     # slug) and fall back to the best real alias. The UUID-slug regex is
                     # kept as a belt-and-suspenders fallback for rows written before
                     # migration 076 (preference_source='unspecified').
-                    # DISPLAY CASE (migration 214): the two TIGHT-ON-RETURN filters below
-                    # (`_UUID_SLUG_PATTERN`, `_is_surfaceable_user_name`) are lowercase
-                    # predicates and MUST keep judging the raw `alias`; only the value that
-                    # gets rendered carries the retained casing. Selected side by side so the
-                    # gate and the label can never diverge.
                     cur.execute(
-                        "SELECT alias, preference_source, COALESCE(display_form, alias) "
-                        "FROM entity_aliases "
+                        "SELECT alias, preference_source FROM entity_aliases "
                         "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
                         (user_id,)
                     )
                     row = cur.fetchone()
                     _alias_val = row[0] if row else None
                     _alias_src = row[1] if row and len(row) > 1 else None
-                    _alias_label = row[2] if row and len(row) > 2 else _alias_val
                     # TIGHT-ON-RETURN: refuse to surface a placeholder/slug preferred
                     # name OR a junk common-word alias ("worried"/"thinking" — a loose
                     # alias the dumb registry accepted at ingest). The smart-query
@@ -37028,9 +40415,8 @@ async def query(request: QueryRequest) -> QueryResponse:
                             and not _UUID_SLUG_PATTERN.match(_alias_val)
                             and _is_surfaceable_user_name(_alias_val)):
                         # Clean, non-placeholder, non-junk preferred name — use it directly
-                        # (rendered with its retained casing; the gate above judged `alias`).
-                        preferred_names["user"] = _alias_label
-                        preferred_names[user_id] = _alias_label
+                        preferred_names["user"] = _alias_val
+                        preferred_names[user_id] = _alias_val
                     else:
                         # Preferred name is a placeholder/slug, a junk common word, or
                         # missing — fetch the best real human alias instead. Exclude
@@ -37038,19 +40424,16 @@ async def query(request: QueryRequest) -> QueryResponse:
                         # junk-word filter is applied per-row below (it is a language
                         # primitive, not expressible cheaply in SQL).
                         cur.execute(
-                            "SELECT alias, COALESCE(display_form, alias) FROM entity_aliases "
-                            "WHERE entity_id = %s "
+                            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
                             "AND preference_source != 'provisioned' "
                             "AND NOT (alias ~ '^[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$') "
                             "ORDER BY is_preferred DESC, alias",
                             (user_id,)
                         )
                         _surfaced = None
-                        for (_cand_alias, _cand_label) in cur.fetchall():
-                            # Junk-word gate judges the lowercase alias; the retained casing is
-                            # what gets rendered (migration 214).
+                        for (_cand_alias,) in cur.fetchall():
                             if _is_surfaceable_user_name(_cand_alias):
-                                _surfaced = _cand_label
+                                _surfaced = _cand_alias
                                 break
                         if _surfaced:
                             preferred_names["user"] = _surfaced
@@ -37116,7 +40499,7 @@ async def query(request: QueryRequest) -> QueryResponse:
         # NAME-INTENT gate (presentation only): non-preferred / legal / also-known-as
         # names stay GROUNDED on the entity UUID but are held in reserve — excluded
         # from normal recall and surfaced ONLY when the query is explicitly about an
-        # entity's name(s). pref_name (the PREFERRED-name memory, "you go by Alex")
+        # entity's name(s). pref_name (the PREFERRED-name memory, "you go by Chris")
         # is always kept; only the also_known_as reserve is gated. Metadata-driven:
         # we gate by the rel_type semantics, not by any hardcoded entity name.
         _name_intent = _query_has_name_intent(query_text)
@@ -37232,6 +40615,12 @@ async def query(request: QueryRequest) -> QueryResponse:
         # resolves render templates from THIS tenant's rel_types (seed ∪ tenant), not
         # seed-only — without it, tenant-grown rels (favorite_*, coworker_of) miss their
         # natural_language_2p template and fall to the copula label fallback. (FIX 1a.)
+        # MOST-SPECIFIC-TYPE-WINS: when the anchor carries multiple instance_of types the
+        # L4 ladder relates (poodle subclass_of dog), assert only the specific type; the
+        # broad one still renders as the parent class via its own subclass_of edge. Lean
+        # (uses the laid-down hierarchy), deterministic, subject-agnostic. No-op otherwise.
+        resolved_facts = _collapse_instance_of_to_most_specific(resolved_facts, db)
+
         _prose_schema_token = rel_type_overlay.set_current_schema(schema_name)
         try:
             prose_facts = convert_to_prose(resolved_facts, db, anchor=anchor, user_id=user_id,
@@ -37290,6 +40679,60 @@ async def query(request: QueryRequest) -> QueryResponse:
                 "confidence": 1.0,
                 "definition": _calc_def,
                 "event_date": None,   # the computed answer is not itself a dated event
+            })
+
+        # COUNT-OVER-WALK — surface the CARDINALITY answer. The number is len(distinct
+        # typed instances the deterministic walk already collected), so a grounded count
+        # is ASSERTED (Class A) — it flows through recall's assert lane like any A/B fact.
+        # A MISS (the type grounded to nothing) is HELD (Class C) and worded as an explicit
+        # "none on record" so the model never fabricates a number. A HELD result (a "since"
+        # bound that could not be dated) is voiced tentatively. None → no count intent →
+        # nothing injected (regression boundary).
+        _cnt_res = locals().get("_count_result")
+        if _cnt_res:
+            _tp = _cnt_res.get("type_phrase") or "items"
+            # When the count came from a SCALAR attribute (bulk count reconciliation), DROP the raw
+            # scalar fact from the render so it does not ALSO surface as "Your <noun> is N" (double /
+            # awkward) alongside the coherent "You have N <noun>". Exact rel_type match on the resolved
+            # attribute; anchor-agnostic (the scalar sits on the queried anchor). Fail-safe: no-op.
+            _from_scalar = _cnt_res.get("from_scalar_attr")
+            if _from_scalar:
+                try:
+                    facts_with_definition[:] = [
+                        _f for _f in facts_with_definition
+                        if str(_f.get("rel_type") or "").lower() != str(_from_scalar).lower()]
+                except Exception:  # noqa: BLE001 — fail-safe: never sink the render
+                    pass
+            if _cnt_res.get("miss"):
+                _cnt_def = (f"I don't have any {_tp} on record, "
+                            f"so I can't give a count.")
+                _cnt_class = "C"
+            else:
+                _n = int(_cnt_res.get("count") or 0)
+                # Voice the user's OWN surface for a count captured in WORDS ("three") — value_text
+                # preserves the spelled-out cardinal; echoing it verbatim keeps recall faithful to
+                # what the user said. Digit / instance-count paths carry no surface → the int stands.
+                _surface = _cnt_res.get("count_surface")
+                _voiced = str(_surface).strip() if _surface else str(_n)
+                if _n == 0 and not _surface:
+                    _cnt_def = f"I don't have any {_tp} on record."
+                else:
+                    _cnt_def = f"You have {_voiced} {_tp} on record."
+                if _cnt_res.get("held"):
+                    _cnt_def = ("Based on the dated records I can find, " + _cnt_def)
+                    _cnt_class = "C"
+                else:
+                    _cnt_class = "A"
+            facts_with_definition.insert(0, {
+                "subject": anchor,
+                "object": (locals().get("_voiced") or str(_cnt_res.get("count") or 0)),
+                "rel_type": "instance_count",
+                "fact_class": _cnt_class,
+                "source": "count_over_walk",
+                "category": "cardinality",
+                "confidence": 1.0 if _cnt_class == "A" else 0.5,
+                "definition": _cnt_def,
+                "event_date": None,   # the count is not itself a dated event
             })
 
         # KEYSTONE C — surface the METACOGNITIVE RETURN. The recursive walk's verdict
@@ -37843,7 +41286,7 @@ def correct_fact(req: FactCorrectionRequest):
         # The correction LLM flattens a 1st-person POSSESSIVE role phrase ("Actually my mother
         # is 63") to subject_name="user" (the "my" → first-person rule above). But when Fix B
         # has registered the ROLE noun ("mother") as a non-preferred alias of a NAMED person
-        # (Carol), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
+        # (Diane), "my mother" must bind the scalar to THAT named entity — NOT mint a spurious
         # (user, age, N). We do NOT special-case the word: we ground the correction text with
         # the SAME shared anchor resolver ingest/query use (resolve_anchor), whose Rule 2 reads
         # the DB ALIAS CACHE for "my <role>" and returns the named entity's UUID iff the role is
@@ -38892,35 +42335,28 @@ def correct_fact(req: FactCorrectionRequest):
                                                 _orphan_qdrant_url = os.environ.get(
                                                     "QDRANT_URL", "http://qdrant:6333"
                                                 )
-                                                _orphan_collection = derive_collection(req.user_id)
+                                                _orphan_collection, _orphan_tflt = qp_resolve_partition(req.user_id, "memory")
+                                                qp_require_tenant(_orphan_tflt, op="delete", collection=_orphan_collection)
                                                 for _oid in _orphan_ids:
                                                     _http_client_sync.post(
                                                         f"{_orphan_qdrant_url}/collections/"
                                                         f"{_orphan_collection}/points/delete",
-                                                        json={
-                                                            "filter": {
-                                                                "must": [
-                                                                    {
-                                                                        "key": "source_table",
-                                                                        "match": {"value": "staged_facts"},
-                                                                    },
-                                                                    {
-                                                                        "key": "fact_id",
-                                                                        "match": {"value": _oid},
-                                                                    },
-                                                                ]
-                                                            }
-                                                        },
+                                                        json=qp_build_delete_body(_orphan_tflt, must=[
+                                                            {"key": "source_table", "match": {"value": "staged_facts"}},
+                                                            {"key": "fact_id", "match": {"value": _oid}},
+                                                        ]),
+                                                        headers=qp_qdrant_headers(),
                                                         timeout=5.0,
                                                     )
                                                 # POST /points/delete — httpx .delete() takes no body kwarg.
                                                 _http_client_sync.post(
                                                     f"{_orphan_qdrant_url}/collections/"
                                                     f"{_orphan_collection}/points/delete",
-                                                    json={"points": [
-                                                        derive_qdrant_point_id("staged_facts", _oid)
+                                                    json=qp_build_delete_body(_orphan_tflt, point_ids=[
+                                                        qp_resolve_point_id(req.user_id, "staged_facts", _oid, "memory")
                                                         for _oid in _orphan_ids
-                                                    ]},
+                                                    ]),
+                                                    headers=qp_qdrant_headers(),
                                                     timeout=5.0,
                                                 )
                                             except Exception as _orphan_qdrant_err:
@@ -39521,19 +42957,17 @@ def correct_fact(req: FactCorrectionRequest):
         if affected_ids:
             try:
                 _qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-                _collection = derive_collection(req.user_id)
+                _collection, _tflt = qp_resolve_partition(req.user_id, "memory")
+                qp_require_tenant(_tflt, op="delete", collection=_collection)
                 _src_table = "staged_facts" if (found_via is not None and "_staged" in found_via) else "facts"
                 for _fid in affected_ids:
                     _http_client_sync.post(
                         f"{_qdrant_url}/collections/{_collection}/points/delete",
-                        json={
-                            "filter": {
-                                "must": [
-                                    {"key": "source_table", "match": {"value": _src_table}},
-                                    {"key": "fact_id", "match": {"value": _fid}},
-                                ]
-                            }
-                        },
+                        json=qp_build_delete_body(_tflt, must=[
+                            {"key": "source_table", "match": {"value": _src_table}},
+                            {"key": "fact_id", "match": {"value": _fid}},
+                        ]),
+                        headers=qp_qdrant_headers(),
                         timeout=5.0,
                     )
                 log.info("correct_fact.qdrant_sync_deleted",
@@ -39556,7 +42990,10 @@ def correct_fact(req: FactCorrectionRequest):
                     # filtered delete above is primary).
                     _http_client_sync.post(
                         f"{_qdrant_url}/collections/{_collection}/points/delete",
-                        json={"points": [derive_qdrant_point_id(_src_table, _fid) for _fid in affected_ids]},
+                        json=qp_build_delete_body(_tflt, point_ids=[
+                            qp_resolve_point_id(req.user_id, _src_table, _fid, "memory") for _fid in affected_ids
+                        ]),
+                        headers=qp_qdrant_headers(),
                         timeout=5.0,
                     )
                     log.info("correct_fact.qdrant_fallback_id_delete",
@@ -39686,20 +43123,18 @@ def correct_fact(req: FactCorrectionRequest):
                             # Two-pass: filtered delete (new points with source_table payload)
                             # then fallback point-ID delete (old points without source_table).
                             _sf_qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-                            _sf_collection = derive_collection(req.user_id)
+                            _sf_collection, _sf_tflt = qp_resolve_partition(req.user_id, "memory")
+                            qp_require_tenant(_sf_tflt, op="delete", collection=_sf_collection)
                             try:
                                 # Pass 1: filtered delete by source_table + fact_id (new points)
                                 for _sf_id in _deleted_sf_ids:
                                     _http_client_sync.post(
                                         f"{_sf_qdrant_url}/collections/{_sf_collection}/points/delete",
-                                        json={
-                                            "filter": {
-                                                "must": [
-                                                    {"key": "source_table", "match": {"value": "staged_facts"}},
-                                                    {"key": "fact_id", "match": {"value": _sf_id}},
-                                                ]
-                                            }
-                                        },
+                                        json=qp_build_delete_body(_sf_tflt, must=[
+                                            {"key": "source_table", "match": {"value": "staged_facts"}},
+                                            {"key": "fact_id", "match": {"value": _sf_id}},
+                                        ]),
+                                        headers=qp_qdrant_headers(),
                                         timeout=5.0,
                                     )
                                 # Pass 2: fallback derived point-ID delete (new (source_table,
@@ -39707,10 +43142,11 @@ def correct_fact(req: FactCorrectionRequest):
                                 # POST /points/delete — httpx .delete() takes no body kwarg.
                                 _http_client_sync.post(
                                     f"{_sf_qdrant_url}/collections/{_sf_collection}/points/delete",
-                                    json={"points": [
-                                        derive_qdrant_point_id("staged_facts", _sf_id)
+                                    json=qp_build_delete_body(_sf_tflt, point_ids=[
+                                        qp_resolve_point_id(req.user_id, "staged_facts", _sf_id, "memory")
                                         for _sf_id in _deleted_sf_ids
-                                    ]},
+                                    ]),
+                                    headers=qp_qdrant_headers(),
                                     timeout=5.0,
                                 )
                                 log.info("correct_fact.staged_facts_qdrant_cleanup",
@@ -39885,11 +43321,11 @@ def retract_fact(req: RetractRequest):
             db.commit()
 
         if affected_ids:
-            collection = derive_collection(req.user_id)
+            collection, _ = qp_resolve_partition(req.user_id, "memory")
             qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
             # Collision-safe: pass the source_table so Qdrant cleanup filters by
             # (source_table, fact_id), not bare point ids (facts/staged_facts share ids).
-            _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table)
+            _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table, user_id=req.user_id)
 
         # Clean up entity_aliases for scalar rel_type hard-delete (per-user schema, no user_id filter)
         # Metadata-driven: use tail_types to detect scalar rels (pref_name, also_known_as, etc.)
@@ -40165,10 +43601,10 @@ def forget_fact(req: RetractRequest):
             db.commit()
 
         if affected_ids:
-            collection = derive_collection(req.user_id)
+            collection, _ = qp_resolve_partition(req.user_id, "memory")
             qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
             # Collision-safe Qdrant cleanup: filter by (source_table, fact_id).
-            _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table)
+            _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table, user_id=req.user_id)
 
         log.info("forget.done", user_id=req.user_id, forgotten=len(affected_ids),
                  source_table=affected_source_table)
@@ -40283,6 +43719,259 @@ def episodic_append(req: EpisodicAppendRequest):
                 pass
 
 
+# ── Async document-ingestion registry (documents table, migration 183) ───────
+# ETA honesty (under-promise / over-deliver). The async doc lane is drained by the
+# re_embedder poll loop's fast doc-drain pre-pass, so a freshly-enqueued document
+# waits at most ~ONE poll interval before it is claimed on the next tick, THEN pays
+# the per-chunk LLM extraction cost. The ETA is DERIVED from that real cadence — the
+# poll interval + per-chunk extraction time × chunks — never a hardcoded lie, and is
+# floored at one full poll interval so it can never under-shoot the pickup delay.
+#
+# Poll interval mirrors the re_embedder's REEMBED_INTERVAL (default 60s; the two
+# processes read the same env var). A busy rig whose full heavy cycle exceeds one
+# interval can raise DOC_ETA_POLL_INTERVAL to stay conservative.
+_DOC_ETA_PER_CHUNK_SECONDS = int(os.environ.get("DOC_ETA_PER_CHUNK_SECONDS", "6") or 6)
+# Worst-case pickup delay before the fast pre-pass claims a pending doc = ~one poll
+# interval. Defaults to the re_embedder's own REEMBED_INTERVAL so the two stay in sync.
+_DOC_ETA_POLL_INTERVAL = int(
+    os.environ.get("DOC_ETA_POLL_INTERVAL")
+    or os.environ.get("REEMBED_INTERVAL", "60")
+    or 60
+)
+# Small fixed startup/probe margin on top of the interval (pre-pass probe + claim +
+# first /ingest round-trip) so we still over-estimate for a 0/1-chunk doc.
+_DOC_ETA_STARTUP_MARGIN = int(os.environ.get("DOC_ETA_STARTUP_MARGIN", "10") or 10)
+
+
+def _doc_eta_seconds(total_chunks: int) -> int:
+    """Conservative ETA (seconds) for `total_chunks` still-to-process chunks.
+
+    Derived from the real drain cadence — ONE poll interval of pickup delay (the
+    fast pre-pass claims the doc on the next tick) + a small startup margin + the
+    per-chunk LLM extraction cost — rounded UP to the nearest 5s and floored at one
+    full poll interval. Always over-estimates so the ingest_document promise holds
+    (under-promise / over-deliver): eta >= poll interval, and grows with chunk count."""
+    n = max(0, int(total_chunks))
+    raw = _DOC_ETA_POLL_INTERVAL + _DOC_ETA_STARTUP_MARGIN + n * _DOC_ETA_PER_CHUNK_SECONDS
+    raw = max(raw, _DOC_ETA_POLL_INTERVAL)  # never under-shoot the pickup delay
+    return int(((raw + 4) // 5) * 5)  # round up to nearest 5
+
+
+def _derive_tenant_schema(user_id: str) -> Optional[str]:
+    """Immutable slug from UUID → tenant schema (mirrors /episodic/append)."""
+    try:
+        from src.provisioning.schema_manager import derive_schema_name, derive_user_slug_from_uuid
+        return derive_schema_name(derive_user_slug_from_uuid(user_id))
+    except Exception as e:
+        log.error("doc_registry.schema_derive_failed", error=str(e), user_id=(user_id or "")[:8])
+        return None
+
+
+@app.post("/documents/enqueue")
+def documents_enqueue(req: DocumentEnqueueRequest):
+    """Enqueue a chunked document for ASYNC hybrid extraction (documents registry).
+
+    Writes ONE per-tenant `documents` row status='pending' (chunks retained verbatim
+    in JSONB) and returns FAST with the document id + a modest ETA. The re_embedder
+    poll loop drains it. Purely additive — no WGM gate / class assignment / query
+    scope here. Resilient: an unprovisioned schema / missing table soft-fails (never
+    500s the caller's ingest, mirroring /episodic/append)."""
+    # Freeze switch (knowledge-store mode): enqueue is a write surface — refuse coherently.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/documents/enqueue")
+        return {"status": "ingest_disabled", "document_id": None,
+                "message": "Ingest is disabled (knowledge-store mode)."}
+
+    user_id = req.user_id or "anonymous"
+    if user_id == "anonymous":
+        return {"status": "soft_error", "document_id": None}
+
+    schema_name = _derive_tenant_schema(user_id)
+    if schema_name is None:
+        return {"status": "soft_error", "document_id": None}
+
+    chunks = [c for c in (req.chunks or []) if isinstance(c, str) and c.strip()]
+    if not chunks:
+        return {"status": "no_content", "document_id": None, "chunk_count": 0}
+    chunk_count = req.chunk_count or len(chunks)
+
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            cur.execute(
+                """
+                INSERT INTO documents
+                    (user_id, source_ref, title, chunks, chunk_count, status, truncated)
+                VALUES (%s, %s, %s, %s::jsonb, %s, 'pending', %s)
+                RETURNING id
+                """,
+                (user_id, req.source_ref, req.title, json.dumps(chunks),
+                 chunk_count, bool(req.truncated)),
+            )
+            new_id = cur.fetchone()[0]
+        _db.commit()
+        eta = _doc_eta_seconds(chunk_count)
+        log.info("doc_registry.enqueued", user_id=user_id[:8], schema=schema_name,
+                 document_id=new_id, chunk_count=chunk_count, eta_seconds=eta)
+        return {"status": "pending", "document_id": new_id,
+                "chunk_count": chunk_count, "eta_seconds": eta, "truncated": bool(req.truncated)}
+    except Exception as e:
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.error("doc_registry.enqueue_failed", error=str(e),
+                  user_id=user_id[:8], schema=schema_name)
+        return {"status": "soft_error", "document_id": None}
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+
+
+@app.get("/documents/pending")
+def documents_pending(user_id: str):
+    """Recall not-ready probe: is any document still processing for this tenant?
+
+    Returns {pending: bool, count, chunks_remaining, eta_seconds}. Best-effort and
+    fail-SAFE — an unprovisioned schema / missing table / any error returns
+    pending=False so recall never breaks and simply omits the not-ready line."""
+    _quiet = {"pending": False, "count": 0, "chunks_remaining": 0, "eta_seconds": 0}
+    uid = (user_id or "").strip()
+    if not uid or uid == "anonymous":
+        return _quiet
+    schema_name = _derive_tenant_schema(uid)
+    if schema_name is None:
+        return _quiet
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            cur.execute(
+                """
+                SELECT count(*), COALESCE(sum(chunk_count), 0)
+                FROM documents
+                WHERE status IN ('pending', 'processing')
+                """
+            )
+            row = cur.fetchone()
+        count = int(row[0] or 0)
+        chunks_remaining = int(row[1] or 0)
+        if count <= 0:
+            return _quiet
+        return {"pending": True, "count": count, "chunks_remaining": chunks_remaining,
+                "eta_seconds": _doc_eta_seconds(chunks_remaining)}
+    except Exception as e:
+        # Missing table (pre-migration-183 schema) or any DB error → fail-safe quiet.
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.debug("doc_registry.pending_probe_soft_fail user_id=%s err=%s", uid[:8], str(e)[:120])
+        return _quiet
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+
+
+@app.post("/cortex/note")
+def cortex_note(req: CortexNoteRequest):
+    """Write an AGENT-CORTEX operational note (the /iremember backend).
+
+    The cortex is the operating-agent's OWN persistent operational memory — gotchas,
+    failed commands, pitfalls, corrections, how-tos, overruns — so it stops repeating its
+    own mistakes. This is NEVER a user fact; it lands in the FIREWALLED ``flagent_<uuid>``
+    schema (source ``agent_manual``, durable), which the user-fact walk can never read.
+    MANUAL capture only. Fail-safe: any failure returns a soft status, never a 500.
+    """
+    user_id = req.user_id or "anonymous"
+    if user_id == "anonymous" or not (req.note or "").strip():
+        return {"status": "soft_error", "written": False}
+    try:
+        ok = _cortex.note(
+            user_id=user_id,
+            note=req.note.strip(),
+            category=req.category,
+            tags=req.tags,
+            context=req.context,
+            evidence=getattr(req, "evidence", None),
+        )
+        return {"status": "stored" if ok else "soft_error", "written": bool(ok)}
+    except Exception as e:  # defense-in-depth; _cortex.note already swallows
+        log.warning("cortex_note.failed", error=str(e)[:160])
+        return {"status": "soft_error", "written": False}
+
+
+@app.post("/cortex/recall")
+def cortex_recall(req: CortexRecallRequest):
+    """Read AGENT-CORTEX operational notes (the /irecall backend).
+
+    Deterministic keyword + tag recall (top-K), rendered held/soft (never user facts).
+    Fail-safe: an absent/unprovisioned cortex schema returns an empty list, never a 500.
+    """
+    user_id = req.user_id or "anonymous"
+    if user_id == "anonymous":
+        return {"status": "ok", "notes": []}
+    try:
+        notes = _cortex.recall_notes(
+            user_id=user_id,
+            query=((req.query or "").strip() or None),
+            limit=req.limit,
+        )
+        return {"status": "ok", "notes": notes}
+    except Exception as e:
+        log.warning("cortex_recall.failed", error=str(e)[:160])
+        return {"status": "soft_error", "notes": []}
+
+
+@app.post("/cortex/usage-patterns")
+def cortex_usage_patterns(req: CortexRecallRequest):
+    """The HOW-YOU-OPERATE surface (memory-teaches-the-model, Phase 1).
+
+    Returns the few SEEDED operating rules relevant to the turn — read ONLY from the FIREWALLED
+    cortex ``usage_pattern`` slice (``flagent_<uuid>``). These are the agent's operating manual,
+    NEVER a user fact and NEVER served as one; a usage pattern can never appear in the user-fact
+    walk. Fail-safe: absent/unprovisioned cortex or any error → empty list, never a 500.
+    """
+    user_id = req.user_id or "anonymous"
+    if user_id == "anonymous":
+        return {"status": "ok", "lines": []}
+    try:
+        pats = _cortex.recall_usage_patterns(
+            user_id=user_id,
+            query=((req.query or "").strip() or None),
+            limit=(req.limit or 4),
+        )
+        lines = [p["note"] for p in pats if p.get("note")]
+        # REFLECTION NUDGE — the model-agnostic third capture lane. A client-side hook can force
+        # an agent to reflect (Claude Code), but FaultLine serves ANY model over MCP and cannot
+        # reach into their turn loops. It CAN see what no client can: a seat that is accruing
+        # auto-captured failures while its DELIBERATE lane sits at zero — working, but learning
+        # nothing. One line, on the operating-brief channel that already exists. Self-limiting:
+        # it stops permanently the moment the seat records one lesson of its own. Fail-safe:
+        # a nudge that breaks recall is a bug, so it can only ever ADD a line.
+        try:
+            _nudge = _cortex.reflection_nudge(user_id)
+            if _nudge:
+                lines.append(_nudge)
+        except Exception as _ne:  # noqa: BLE001
+            log.debug("cortex_usage_patterns.nudge_failed", error=str(_ne)[:120])
+        return {"status": "ok", "lines": lines}
+    except Exception as e:
+        log.warning("cortex_usage_patterns.failed", error=str(e)[:160])
+        return {"status": "soft_error", "lines": []}
+
+
 def _defer_context_to_episodic(req: StoreContextRequest, reason: str) -> StoreContextResponse:
     """Degrade /store_context to the durable episodic_log instead of losing the text.
 
@@ -40329,18 +44018,11 @@ def store_context(req: StoreContextRequest):
             log.info("store_context.disabled", user_id=req.user_id)
             return StoreContextResponse(status="disabled", point_id="")
 
-        # User-memory vector lane RETIRED: /store_context has no Postgres fact backing by design
-        # (it is a verbatim prose blob), so when the lane is OFF we defer the text to episodic_log
-        # (the verbatim re-mineable substrate) instead of writing to a Qdrant collection that is no
-        # longer read. The text is retained; it is re-mined by reextract_episodic as the ontology grows.
-        if not USER_MEMORY_VECTOR_LANE:
-            log.info("store_context.deferred_to_episodic_vector_lane_retired", user_id=req.user_id)
-            return _defer_context_to_episodic(req, "vector_lane_retired")
-
         qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
         qwen_api_url = _LLM_URL
 
-        collection = derive_collection(req.user_id)
+        collection, _tflt = qp_resolve_partition(req.user_id, "memory")
+        qp_require_tenant(_tflt, op="upsert", collection=collection)
 
         # Ensure collection exists
         if not ensure_collection(collection, qdrant_url):
@@ -40364,7 +44046,7 @@ def store_context(req: StoreContextRequest):
                     {
                         "id": point_id,
                         "vector": vector,
-                        "payload": {
+                        "payload": qp_stamp_tenant({
                             "text": req.text,
                             "source": req.source,
                             "context_type": req.context_type,
@@ -40374,10 +44056,11 @@ def store_context(req: StoreContextRequest):
                             "object": req.text[:120],
                             "fact_class": "C",
                             "confidence": 0.4,
-                        },
+                        }, req.user_id),
                     }
                 ]
             },
+            headers=qp_qdrant_headers(),
             timeout=10.0,
         )
 
@@ -40588,25 +44271,43 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
     _MAX_OPERATIONAL = 12
 
     # ── One LLM call returns operational rel_types WITH complete metadata ──────────
+    # It ALSO returns the domain's ONE primary CONTAINMENT/composition relation — the
+    # walkable TREE axis (a rack CONTAINS devices, a directory CONTAINS files, a body
+    # CONTAINS organs). This is DISTINCT from pure classification (instance_of/subclass_of,
+    # "what a thing IS" — /learn already builds that ladder) and from the flat operational
+    # rels: containment is the part_of/composition axis the deterministic walk DESCENDS to
+    # return a scoped hierarchy. Without it every /expand-grown domain rel is flat and the
+    # scoped walk returns only a 1-hop neighborhood (the confirmed gap). Subject-agnostic:
+    # we ask the model to NAME the domain's containment rel, never hardcode one.
     prompt = (
         f"You are defining the OPERATIONAL ontology for the domain: {topic}.\n"
-        f"List the core operational relationship types used to describe entities in "
-        f"this domain (NOT taxonomy/hierarchy like instance_of or subclass_of — those "
-        f"are handled separately). Examples of operational relations across domains: a "
-        f"server `runs` software, a device `connects_to` a network, a person "
-        f"`works_for` an organization.\n\n"
+        f"(A) List the core OPERATIONAL relationship types used to describe entities in "
+        f"this domain. Examples across domains: a server `runs` software, a device "
+        f"`connects_to` a network, a person `works_for` an organization.\n"
+        f"(B) Identify the domain's ONE primary CONTAINMENT / composition relation — the "
+        f"'is physically part of / is contained in / is located within' relation that forms "
+        f"the domain's structural TREE, oriented from the SMALLER/contained thing to the "
+        f"LARGER/containing thing. Examples: a device `mounted_in` a rack, a rack `part_of` "
+        f"a row, a file `contained_in` a directory, an organ `part_of` a body. This is "
+        f"COMPOSITION, NOT classification: do NOT return instance_of / subclass_of / is_a "
+        f"(what a thing IS) — only the whole/part containment relation.\n\n"
         f"Return STRICT JSON only, no prose, in this exact shape:\n"
         f'{{"rel_types": [\n'
         f'  {{"rel_type": "snake_case_name", "natural_language": "X verbs Y",\n'
         f'    "head_types": ["Object"], "tail_types": ["Object"],\n'
         f'    "category": "system", "is_symmetric": false, "inverse_rel_type": null}}\n'
-        f"]}}\n\n"
+        f'  ],\n'
+        f'  "containment": {{"rel_type": "snake_case_name",\n'
+        f'    "natural_language": "X is contained in Y",\n'
+        f'    "head_types": ["Object"], "tail_types": ["Object"]}}\n'
+        f"}}\n\n"
         f"Rules: rel_type is lowercase snake_case. head_types/tail_types are drawn from "
         f"[Person, Animal, Organization, Location, Object, Concept] (or [\"SCALAR\"] when "
         f"the object is a literal value like a version or port). natural_language uses the "
-        f"literal placeholders X and Y. inverse_rel_type is null unless a clear inverse "
-        f"exists. Provide at most {_MAX_OPERATIONAL} of the MOST important operational "
-        f"relations for {topic}."
+        f"literal placeholders X and Y (the containment natural_language is oriented "
+        f"contained→container, e.g. 'X is mounted in Y'). inverse_rel_type is null unless a "
+        f"clear inverse exists. Provide at most {_MAX_OPERATIONAL} of the MOST important "
+        f"operational relations for {topic}, plus the SINGLE best containment relation."
     )
     if llm_text_excerpt:
         prompt = (
@@ -40662,21 +44363,29 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
     import json as _json
     import re as _re_json
     rel_defs = []
+    containment_def: dict | None = None
     try:
         _m = _re_json.search(r'\{.*\}', llm_text, _re_json.DOTALL)
         _raw = _m.group(0) if _m else llm_text
         _parsed = _json.loads(_raw)
         rel_defs = _parsed.get("rel_types", []) if isinstance(_parsed, dict) else []
+        # Fix A: the domain's CONTAINMENT/composition relation — the walkable tree axis
+        # (distinct from the flat operational rels and from classification). Optional:
+        # a model that omits it degrades to today's flat-only behaviour.
+        _cd = _parsed.get("containment") if isinstance(_parsed, dict) else None
+        if isinstance(_cd, dict) and (_cd.get("rel_type") or "").strip():
+            containment_def = _cd
     except Exception as _pe:
         log.error("learn_topic.operational_seed_parse_failed",
                   topic=topic, error=str(_pe), text_preview=llm_text[:200])
         return result
 
-    if not rel_defs:
+    if not rel_defs and not containment_def:
         log.warning("learn_topic.operational_seed_empty", topic=topic)
         return result
 
     seeded_rel_types: list[str] = []
+    containment_rel: str | None = None
     member_types: set[str] = set()
     # FIX (RC-expand-taxonomy-pollution §3): the operational seed is GROWN ontology and
     # MUST land in the request's TENANT schema, never the public seed template. Resolve
@@ -40726,18 +44435,54 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
                         if _canon:
                             member_types.add(_canon)
 
+            # ── Fix A: mint the domain's CONTAINMENT relation as a COMPOSITION HIERARCHY
+            #    rel (is_hierarchy_rel=true, NO P31/P279 classification PID) — the walkable
+            #    tree axis the deterministic walk DESCENDS. Distinct from the flat operational
+            #    rels above and from /learn's classification ladder. Oriented contained→container
+            #    (child→parent) so the descent (object_id = parent) walks it. Subject-agnostic:
+            #    the model NAMED the rel; we only pin its structural class. ───────────────────
+            if containment_def:
+                _cr = (containment_def.get("rel_type") or "").strip().lower()
+                if _cr:
+                    _cnorm = _normalize_novel_rel_metadata(containment_def, _cr) or {}
+                    if not _cnorm.get("natural_language"):
+                        _cnorm["natural_language"] = (containment_def.get("natural_language")
+                                                      or f"X {_cr.replace('_', ' ')} Y")
+                    # EXPLICIT structural pin: this IS a composition hierarchy edge. Never
+                    # symmetric (a part is not its whole); no inverse minted (keep it one-axis).
+                    _cnorm["is_hierarchy_rel"] = True
+                    _cnorm["is_symmetric"] = False
+                    _cnorm["inverse_rel_type"] = None
+                    if _create_rel_type_in_flow(_db, _cr, _cnorm, confidence=0.6, source="expand"):
+                        containment_rel = _cr
+                        log.info("learn_topic.containment_rel_seeded",
+                                 topic=topic, containment_rel=_cr)
+                    else:
+                        log.warning("learn_topic.containment_rel_seed_failed", topic=topic, rel=_cr)
+
             # ── Seed entity_taxonomies for the domain (member_entity_types +
-            #    rel_types_defining_group). ON CONFLICT extends existing rows. ─────────
+            #    rel_types_defining_group + the CONTAINMENT hierarchy axis). ON CONFLICT
+            #    extends existing rows. ─────────
             taxonomy_name = topic.strip().lower().replace(" ", "_")[:64]
-            if seeded_rel_types and taxonomy_name:
+            if (seeded_rel_types or containment_rel) and taxonomy_name:
                 _members = sorted(member_types) if member_types else ["Object", "Concept"]
+                # Fix A: when a containment rel exists, mark the taxonomy HIERARCHICAL and
+                # declare the containment rel as its parent/transitive axis so query-side axis
+                # resolution + membership-nesting have a tree to descend. NULLs (no containment)
+                # → today's flat taxonomy, byte-for-byte. Hierarchy rels are NOT added to
+                # rel_types_defining_group (that stays behavioral-only; _safe_taxonomy_rel_types
+                # enforces it) — the composition axis lives in transitive_rel_types/parent_rel_type.
+                _is_hier = bool(containment_rel)
+                _parent_rt = containment_rel
+                _trans = [containment_rel] if containment_rel else []
                 with _db.cursor() as _tc:
                     _tc.execute(
                         """
                         INSERT INTO entity_taxonomies
                             (taxonomy_name, description, member_entity_types,
-                             rel_types_defining_group, source)
-                        VALUES (%s, %s, %s, %s, 'expand')
+                             rel_types_defining_group, is_hierarchical, parent_rel_type,
+                             transitive_rel_types, has_transitivity, source)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'expand')
                         ON CONFLICT (taxonomy_name) DO UPDATE SET
                             member_entity_types = (
                                 SELECT ARRAY(SELECT DISTINCT unnest(
@@ -40746,10 +44491,19 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
                             rel_types_defining_group = (
                                 SELECT ARRAY(SELECT DISTINCT unnest(
                                     entity_taxonomies.rel_types_defining_group
-                                    || EXCLUDED.rel_types_defining_group)))
+                                    || EXCLUDED.rel_types_defining_group))),
+                            -- Additive: only PROMOTE a taxonomy to hierarchical / attach the
+                            -- containment axis; never demote an existing hierarchical taxonomy.
+                            is_hierarchical = entity_taxonomies.is_hierarchical OR EXCLUDED.is_hierarchical,
+                            parent_rel_type = COALESCE(entity_taxonomies.parent_rel_type, EXCLUDED.parent_rel_type),
+                            has_transitivity = entity_taxonomies.has_transitivity OR EXCLUDED.has_transitivity,
+                            transitive_rel_types = (
+                                SELECT ARRAY(SELECT DISTINCT unnest(
+                                    COALESCE(entity_taxonomies.transitive_rel_types, ARRAY[]::text[])
+                                    || EXCLUDED.transitive_rel_types)))
                         """,
                         (taxonomy_name, f"Operational ontology for {topic}",
-                         _members, seeded_rel_types),
+                         _members, seeded_rel_types, _is_hier, _parent_rt, _trans, _is_hier),
                     )
 
                     # Also merge into overlapping existing taxonomies whose
@@ -40796,6 +44550,7 @@ def _seed_domain_operational_ontology(topic: str, user_id: str = "anonymous",
 
     result["rel_types_seeded"] = len(seeded_rel_types)
     result["rel_types"] = seeded_rel_types
+    result["containment_rel"] = containment_rel
 
     # Refresh _REL_TYPE_META in-process so the new clean labels are visible to GLiNER2
     # on the next message (Phase 3 mechanism). _create_rel_type_in_flow already refreshes
@@ -40837,7 +44592,7 @@ _LEARN_MAX_DEPTH = int(os.environ.get("LEARN_MAX_DEPTH", "2"))
 # Directive C — DELIBERATE /learn growth is durable Class B (NOT Class C, never ages out).
 # When a /learn (/extend) batch emits a NOVEL rel_type, the novel-rel routing would stage the
 # fact as Class C on its low llm_learned confidence and the Class-C expire/decay jobs would age
-# it out. Alexander: deliberate growth is trusted — floor it to Class B (on the promotion
+# it out. Christopher: deliberate growth is trusted — floor it to Class B (on the promotion
 # track, exempt from C expiry). Consistency/durability fix; default ON, reversible.
 _LEARN_DURABLE_CLASS_B = os.environ.get(
     "LEARN_DURABLE_CLASS_B", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -40918,7 +44673,7 @@ async def _backstop_topic_up_parent(topic: str, user_id: str) -> str | None:
                 "answer null — do NOT invent one.\n"
                 "Examples (topic -> parent): ansible -> configuration_management_tool; "
                 "kubernetes -> container_orchestrator; bash -> shell; tcp -> network_protocol; "
-                "alexander -> null.\n"
+                "christopher -> null.\n"
                 'Respond with STRICT JSON only: '
                 '{"parent":"<single lowercase snake_case category, or null>"}.'
             )},
@@ -41182,7 +44937,7 @@ async def learn_topic(req: LearnTopicRequest):
     # The LLM frequently generates abstract upper-ontology edges such as:
     #   "faultline subclass_of object", "organization subclass_of person"
     # These are meaningless as personal facts and surface as garbled query results
-    # (e.g. "alex is a subclass of theo") when abstract UUIDs collide with known entities.
+    # (e.g. "chris is a subclass of des") when abstract UUIDs collide with known entities.
     #
     # Two complementary checks — belt-and-suspenders:
     #   1. Name check (primary): subject or object in _SYSTEM_ENTITY_NAMES
@@ -41254,7 +45009,7 @@ async def learn_topic(req: LearnTopicRequest):
     # The prompt ASKS the LLM to type the topic itself and the filter keeps that edge, but the
     # LLM frequently emits only component (part_of) edges and NOTHING guarantees a topic up-edge
     # survived — so the topic floats as a top-of-tree island and upward traversal dead-ends.
-    # Alexander: "if you're learning about ansible, it should know WHAT ansible is, and class
+    # Christopher: "if you're learning about ansible, it should know WHAT ansible is, and class
     # upward." If NO subclass_of/instance_of edge whose subject IS the topic survived, run a
     # bounded secondary "what is <topic>?" call and inject `topic subclass_of <parent>` (real
     # is-a rung, validated, bounded, fail-safe). Flag-gated (LEARN_TOPIC_UP_BACKSTOP, default ON);
@@ -41460,40 +45215,3 @@ async def learn_topic(req: LearnTopicRequest):
     except Exception as e:
         log.error("learn_topic.ingest_failed", topic=topic, error=str(e))
         return {"status": "error", "topic": topic, "detail": str(e), "committed": 0, "staged": 0, "total": 0}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FOSS control plane — dashboard API + webui static mount
-#
-# The dashboard router (/api/dashboard/*) is operator-bearer-authed and drives
-# the running stack: seats+tokens, the LLM Brain, MCP key rotation, health. The
-# webui/ static assets are mounted at "/" LAST so explicit routes (/health,
-# /api/dashboard/*, /openapi.json, …) are matched before the catch-all static
-# serve. No extra service/container is needed — the backend on :8000 serves both
-# the console and the API on one origin.
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    from src.api.dashboard import router as _dashboard_router
-    app.include_router(_dashboard_router)
-except Exception as _dashboard_err:  # noqa: BLE001 — never block the app from starting
-    log.error("startup.dashboard_router_failed", error=str(_dashboard_err)[:200])
-
-try:
-    from fastapi.staticfiles import StaticFiles  # type: ignore
-    import glob as _glob
-    # Resolve the webui/ dir: repo root (local + /app in the image, which COPYs
-    # webui/ next to src/). Falls through to /app/webui explicitly for the image.
-    _webui_candidates = [
-        os.path.join(os.getcwd(), "webui"),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "webui"),
-        "/app/webui",
-    ]
-    _webui_dir = next((p for p in _webui_candidates
-                       if os.path.isdir(p) and os.path.isfile(os.path.join(p, "index.html"))), None)
-    if _webui_dir:
-        app.mount("/", StaticFiles(directory=_webui_dir, html=True), name="foss-webui")
-        log.info("startup.webui_served", path=_webui_dir)
-    else:
-        log.warning("startup.webui_dir_not_found", searched=_webui_candidates)
-except Exception as _webui_err:  # noqa: BLE001
-    log.error("startup.webui_mount_failed", error=str(_webui_err)[:200])
