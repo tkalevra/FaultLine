@@ -2074,6 +2074,28 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                         "deleted_at": row[7],
                     }
 
+            # END THE READ TRANSACTION NOW — do not hold it across Step 4.
+            #
+            # Closing the cursor (the `with` above) does NOT end the transaction: under
+            # psycopg2's default non-autocommit mode a bare SELECT opens one that lives until
+            # an explicit commit/rollback. Everything below this point is pure Qdrant HTTP
+            # (no further DB access in this function), so the transaction was being held open
+            # for the ENTIRE reconcile loop — leaving the connection `idle in transaction` for
+            # minutes at a time.
+            #
+            # That is not merely untidy: an open transaction blocks ACCESS EXCLUSIVE lock
+            # acquisition, so it stalls every `TRUNCATE` on the tenant schema, and holds back
+            # the xmin horizon so autovacuum cannot reclaim dead tuples database-wide.
+            # Observed 2026-07-30: one such connection, idle-in-transaction for 16 minutes,
+            # blocked a chain of ~13 backends waiting on `SET search_path`.
+            #
+            # rollback() rather than commit(): this is a read-only snapshot, so rollback ends
+            # the transaction without any possibility of persisting something unintended.
+            try:
+                db_conn.rollback()
+            except Exception as _e:      # never let hygiene break reconciliation
+                log.warning(f"re_embedder.reconcile_txn_release_failed error={_e}")
+
             # Step 4: Reconcile each point
             for point in all_points:
                 try:
