@@ -103,6 +103,222 @@ def _thinking_kwarg_backends() -> set[str]:
     return {b.strip().lower() for b in raw.split(",") if b.strip()}
 
 
+# ── Reasoning / "thinking" suppression, keyed by ENDPOINT HOST ────────────────────────
+# WHY HOST-KEYED AND NOT backend_type: ``backend_type="openai"`` is what a tenant picks for
+# EVERY OpenAI-compatible provider — DeepSeek, Cerebras, Groq, OpenRouter, xAI, LM Studio —
+# and each has a DIFFERENT (or absent) reasoning switch. "OpenAI-compatible" describes the
+# transport, not the parameter vocabulary. Keying on backend_type is therefore structurally
+# unable to get this right; we key on the host, exactly as ``resolve_provider_limits`` does.
+#
+# WHY THIS MATTERS AT ALL: FaultLine uses the LLM only for STRUCTURED extraction, where a
+# chain of thought is pure waste — and worse than waste. Measured 2026-07-30 against DeepSeek
+# v4-flash with a control:
+#     thinking disabled → 1291ms, 236 output tokens, 0 reasoning, 5/5 parsed
+#     thinking default  → 5844ms, 4472 output tokens, ~15.8k reasoning chars, 4/5 parsed
+# The reasoning run produced an UNPARSEABLE response — so leaving reasoning on is a
+# CORRECTNESS defect in an extraction pipeline, not merely a cost one.
+#
+# WHY NOT "optimistically send and retry on 400": because the dangerous failure is SILENT.
+# We sent Qwen/vLLM's ``enable_thinking`` to DeepSeek and got HTTP 200 with full reasoning —
+# no error to retry on. A 400-retry strategy catches the strict providers and misses exactly
+# the ones that quietly ignore you. So: an explicit per-host allowlist, and NO field at all
+# for an unrecognized host (guessing there risks a hard 400 on every call — the Cerebras
+# ``chat_template_kwargs`` incident).
+#
+# ``can_disable=False`` is recorded HONESTLY: several providers cannot turn reasoning off at
+# all (xAI Grok, Gemini 3, Gemini 2.5 Pro, Claude Fable/Mythos). For those we send the lowest
+# available effort and the caller can surface a warning — we never pretend suppression worked.
+#
+# Sources (fetched 2026-07-30): DeepSeek https://api-docs.deepseek.com/guides/thinking_mode/ ·
+# OpenAI https://developers.openai.com/api/docs/guides/reasoning · Anthropic
+# https://platform.claude.com/docs/en/build-with-claude/thinking · Gemini
+# https://ai.google.dev/gemini-api/docs/generate-content/thinking · Groq
+# https://console.groq.com/docs/reasoning · DashScope
+# https://www.alibabacloud.com/help/en/model-studio/deep-thinking · Mistral
+# https://docs.mistral.ai/capabilities/reasoning/ · xAI https://docs.x.ai/docs/guides/reasoning ·
+# OpenRouter https://openrouter.ai/docs/use-cases/reasoning-tokens · Cerebras
+# https://inference-docs.cerebras.ai/capabilities/reasoning
+#
+# Each entry: ``models`` = ordered (substring, spec) pairs, first match wins; ``default`` =
+# fallback for that host. A spec is {"fields": {...merged into payload...},
+# "can_disable": bool}. An EMPTY fields dict means "nothing to send" (already off by default).
+_REASONING_CONTROLS: dict[str, dict] = {
+    # DeepSeek — LIVE-VERIFIED here with a control run (see numbers above). The toggle
+    # defaults to "enabled" on v4, which is why v4 reasoned unprompted. `deepseek-chat`
+    # (legacy alias) is already non-thinking; sending the field is harmless and explicit.
+    "api.deepseek.com": {
+        "models": [],
+        "default": {"fields": {"thinking": {"type": "disabled"}}, "can_disable": True},
+    },
+    # OpenAI — `reasoning_effort` is REJECTED (400 unsupported_parameter) on non-reasoning
+    # models like gpt-4o, so it is scoped to the reasoning families only. "none" is documented
+    # for latency-critical work; the older o-series predates it, so use its lowest ("low").
+    "api.openai.com": {
+        "models": [
+            ("gpt-5", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+            ("o1", {"fields": {"reasoning_effort": "low"}, "can_disable": False}),
+            ("o3", {"fields": {"reasoning_effort": "low"}, "can_disable": False}),
+            ("o4", {"fields": {"reasoning_effort": "low"}, "can_disable": False}),
+        ],
+        # gpt-4o / gpt-4-turbo / gpt-3.5: no reasoning, and the field would 400. Send nothing.
+        "default": {"fields": {}, "can_disable": True},
+    },
+    # Anthropic — thinking is OPT-IN on 4.x and earlier (omit = off). On the adaptive-thinking
+    # models it defaults ON and needs an explicit disable. Fable/Mythos REJECT the disable.
+    "api.anthropic.com": {
+        "models": [
+            ("claude-fable", {"fields": {}, "can_disable": False}),
+            ("claude-mythos", {"fields": {}, "can_disable": False}),
+            ("claude-opus-5", {"fields": {"thinking": {"type": "disabled"}}, "can_disable": True}),
+            ("claude-sonnet-5", {"fields": {"thinking": {"type": "disabled"}}, "can_disable": True}),
+            ("claude-opus-4-7", {"fields": {"thinking": {"type": "disabled"}}, "can_disable": True}),
+            ("claude-opus-4-8", {"fields": {"thinking": {"type": "disabled"}}, "can_disable": True}),
+        ],
+        "default": {"fields": {}, "can_disable": True},   # 4.5 and earlier: off unless asked
+    },
+    # Google Gemini — TWO different fields by generation, and several models cannot disable.
+    # 2.5 Flash/Flash-Lite accept budget 0; 2.5 Pro has a 128-token FLOOR; Gemini 3 replaced
+    # the budget with thinkingLevel ("low"|"high" only — no off value exists).
+    "generativelanguage.googleapis.com": {
+        "models": [
+            ("gemini-2.5-flash",
+             {"fields": {"thinkingConfig": {"thinkingBudget": 0}}, "can_disable": True}),
+            ("gemini-2.5-pro",
+             {"fields": {"thinkingConfig": {"thinkingBudget": 128}}, "can_disable": False}),
+            ("gemini-3",
+             {"fields": {"thinkingConfig": {"thinkingLevel": "low"}}, "can_disable": False}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+    # Groq — per-model: Qwen3 supports "none"; GPT-OSS only has low/medium/high (no off).
+    "api.groq.com": {
+        "models": [
+            ("qwen", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+            ("gpt-oss", {"fields": {"reasoning_effort": "low"}, "can_disable": False}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+    # Alibaba DashScope / Qwen — `enable_thinking` (top-level on raw REST, which is what we
+    # send). Thinking-ONLY model ids cannot be turned off.
+    "dashscope-intl.aliyuncs.com": {
+        "models": [
+            ("thinking", {"fields": {}, "can_disable": False}),
+            ("qwq", {"fields": {}, "can_disable": False}),
+            ("qwen", {"fields": {"enable_thinking": False}, "can_disable": True}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+    "dashscope.aliyuncs.com": {
+        "models": [
+            ("thinking", {"fields": {}, "can_disable": False}),
+            ("qwq", {"fields": {}, "can_disable": False}),
+            ("qwen", {"fields": {"enable_thinking": False}, "can_disable": True}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+    # Mistral — reasoning moved into the general models via `reasoning_effort`; "none" = off.
+    "api.mistral.ai": {
+        "models": [
+            ("mistral-small", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+            ("mistral-medium", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+    # xAI Grok — docs are explicit: "Reasoning cannot be disabled." Depth only. NOTE the
+    # footgun: on grok-4.20-multi-agent the SAME field name means agent count, not depth —
+    # so we deliberately send NOTHING here rather than guess a semantic.
+    "api.x.ai": {
+        "models": [],
+        "default": {"fields": {}, "can_disable": False},
+    },
+    # OpenRouter — unified object; it translates/degrades downstream per provider.
+    "openrouter.ai": {
+        "models": [],
+        "default": {"fields": {"reasoning": {"effort": "none"}}, "can_disable": True},
+    },
+    # Cerebras — zai-glm accepts "none"; gpt-oss/gemma have no off value. The boolean
+    # `disable_reasoning` is deprecated (2026-07-21) — do NOT build on it.
+    "api.cerebras.ai": {
+        "models": [
+            ("zai-glm", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+            ("gpt-oss", {"fields": {"reasoning_effort": "low"}, "can_disable": False}),
+            ("gemma", {"fields": {"reasoning_effort": "none"}, "can_disable": True}),
+        ],
+        "default": {"fields": {}, "can_disable": True},
+    },
+}
+
+# Where each provider reports a reasoning-token COUNT, so suppression can be VERIFIED rather
+# than assumed. Paths are dotted, relative to the parsed response. Providers absent from this
+# map do not expose a count (verify via content instead). DeepSeek IS here — measured live at
+# completion_tokens_details.reasoning_tokens = 440/503/791 on the un-suppressed control.
+_REASONING_USAGE_PATHS: tuple[str, ...] = (
+    "usage.completion_tokens_details.reasoning_tokens",   # OpenAI-compat, DeepSeek, Groq
+    "usage.output_tokens_details.reasoning_tokens",       # OpenAI Responses
+    "usage.output_tokens_details.thinking_tokens",        # Anthropic
+    "usage.reasoning_tokens",                             # xAI (NOT folded into completion)
+    "usageMetadata.thoughtsTokenCount",                   # Gemini
+)
+
+
+def _reasoning_suppression_enabled() -> bool:
+    """Kill switch for reasoning suppression. Default ON — it is a correctness fix.
+
+    Set ``LLM_REASONING_SUPPRESSION=false`` to send no suppression field anywhere (e.g. to
+    isolate a provider that has started rejecting a field we inject).
+    """
+    return os.environ.get("LLM_REASONING_SUPPRESSION", "true").strip().lower() \
+        not in ("false", "0", "no", "off")
+
+
+def resolve_reasoning_controls(base_url: Optional[str], model: Optional[str]) -> dict:
+    """Resolve how to disable reasoning for an endpoint host + model.
+
+    Returns ``{"fields": dict, "can_disable": bool, "known": bool, "source": str}``.
+      * ``known=True``  → recognized provider; ``fields`` are safe to merge into the payload.
+      * ``known=False`` → unrecognized host (self-hosted / LAN / new provider). ``fields`` is
+        EMPTY: we do not guess, because an unsupported top-level field HTTP-400s on strict
+        providers and would break every call on that endpoint.
+      * ``can_disable=False`` → this model cannot have reasoning fully disabled (documented);
+        ``fields`` may still carry the lowest available effort.
+    Fail-safe: any parse problem → unknown, no fields.
+    """
+    host = ""
+    try:
+        from urllib.parse import urlparse
+        if base_url:
+            host = (urlparse(str(base_url)).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    entry = None
+    for known_host, e in _REASONING_CONTROLS.items():
+        if host == known_host or host.endswith("." + known_host):
+            entry = e
+            break
+    if entry is None:
+        return {"fields": {}, "can_disable": True, "known": False,
+                "source": host or "unknown"}
+
+    m = (model or "").lower()
+    for model_key, spec in entry.get("models", []):
+        if model_key in m:
+            return {"fields": dict(spec["fields"]), "can_disable": spec["can_disable"],
+                    "known": True, "source": host}
+    spec = entry.get("default", {"fields": {}, "can_disable": True})
+    return {"fields": dict(spec["fields"]), "can_disable": spec["can_disable"],
+            "known": True, "source": host}
+
+
+def _reasoning_base_url() -> Optional[str]:
+    """The base_url this call will hit, used to resolve the provider's reasoning switch.
+
+    Open-core reads the configured global endpoint. (The hosted build resolves a per-tenant
+    BYO endpoint first; that indirection has no meaning here, where there is exactly one
+    configured brain.)
+    """
+    return os.environ.get("LLM_BASE_URL") or None
+
 def get_llm_headers() -> dict:
     """
     Return HTTP headers for LLM authentication.
@@ -233,6 +449,38 @@ def build_llm_payload(
     # anthropic-specific block below (disabled == field absent).
     if backend in _thinking_kwarg_backends():
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    # ── Reasoning suppression, HOST-resolved (the hosted-provider half) ──────────
+    # The block above only covers SELF-HOSTED vLLM/OpenWebUI, whose LAN host we cannot
+    # recognize. Hosted providers each need their OWN documented field — and the
+    # fallback above ("strict providers rely on the post-hoc _strip_think_tags net")
+    # is not suppression at all: stripping tags is COSMETIC, since the tokens and the
+    # latency are already spent, and if the model burned its budget reasoning the JSON
+    # may be truncated with nothing left to salvage.
+    #
+    # Measured against DeepSeek v4-flash with a control (2026-07-30):
+    #     thinking disabled -> 1291ms,  236 output tokens, 0 reasoning,      5/5 parsed
+    #     thinking default  -> 5844ms, 4472 output tokens, ~15.8k reasoning, 4/5 parsed
+    # The un-suppressed run produced an UNPARSEABLE response, so leaving reasoning on is
+    # a CORRECTNESS defect for structured extraction, not merely a cost one.
+    #
+    # Merged, never overwritten: an explicit caller-supplied `thinking` (handled above)
+    # wins, so a deliberate opt-in is not clobbered by the blanket suppression.
+    if _reasoning_suppression_enabled():
+        try:
+            controls = resolve_reasoning_controls(_reasoning_base_url(), model)
+            for key, value in (controls.get("fields") or {}).items():
+                payload.setdefault(key, value)
+            if controls.get("known") and not controls.get("can_disable"):
+                # Honest signal: this model CANNOT have reasoning fully disabled. We sent the
+                # lowest effort available and must not pretend it is off.
+                log.warning("llm_reasoning.cannot_disable", host=controls.get("source"),
+                            model=model,
+                            note="provider does not support disabling reasoning; lowest "
+                                 "available effort sent — expect reasoning tokens")
+        except Exception as exc:
+            # Never let suppression resolution break a call — worst case we reason.
+            log.warning("llm_reasoning.resolve_failed", error=repr(exc)[:160])
 
     # Anthropic-specific request shape adjustments
     if backend == "anthropic":
