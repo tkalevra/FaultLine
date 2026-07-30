@@ -60,8 +60,66 @@ _THINK_RE = _re.compile(r'<think>.*?</think>', _re.DOTALL)
 
 
 def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks from LLM output."""
+    """Remove <think>...</think> reasoning blocks from LLM output.
+
+    ⚠️ THIS IS COSMETIC. It cleans the TEXT; it does NOT prevent reasoning. By the time a
+    ``<think>`` block reaches us the tokens were generated, billed, and the latency paid —
+    and if the model spent its budget reasoning, the JSON may be truncated so there is
+    nothing left to salvage. Actual suppression happens at REQUEST time
+    (``llm_client.resolve_reasoning_controls``); this remains only as the last-resort net
+    for a self-hosted model whose off-switch we could not resolve.
+    """
     return _THINK_RE.sub('', text).strip()
+
+
+def _dig(obj, dotted: str):
+    """Fetch a dotted path out of nested dicts, or None. Never raises."""
+    cur = obj
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _audit_reasoning_leak(result: dict, operation: str, user_id: Optional[str] = None) -> None:
+    """VERIFY that reasoning suppression actually took effect, from the response.
+
+    We cannot trust a 200. Measured 2026-07-30: DeepSeek accepted a suppression field it did
+    not recognize (``enable_thinking``, a Qwen/vLLM convention that is not DeepSeek's) and
+    reasoned anyway — no error to catch. So the only honest check is to read a reasoning-token
+    count back out of the response and complain when it is non-zero.
+
+    Providers report this under different paths (and some not at all) — see
+    ``llm_client._REASONING_USAGE_PATHS``. A miss is not evidence of success, merely absence
+    of evidence, so this NEVER asserts "suppression worked"; it only fires when it provably
+    did NOT. Also surfaces token usage, which was previously discarded entirely — which is why
+    wasted reasoning tokens were invisible.
+
+    Fail-safe: never raises, never alters the result.
+    """
+    try:
+        from src.api.llm_client import _REASONING_USAGE_PATHS
+        reasoning = None
+        for path in _REASONING_USAGE_PATHS:
+            v = _dig(result, path)
+            if isinstance(v, (int, float)) and v > 0:
+                reasoning, found_path = int(v), path
+                break
+        if not reasoning:
+            return
+        from src.api.logging_config import log_crit
+        log_crit(log, "llm_reasoning.suppression_ineffective",
+                 operation=operation, user_id=user_id,
+                 reasoning_tokens=reasoning, usage_path=found_path,
+                 note="the model REASONED despite suppression — the field we send for this "
+                      "host/model is wrong, ignored, or unsupported. Tokens and latency were "
+                      "spent, and extraction JSON may be truncated. Fix the entry in "
+                      "llm_client._REASONING_CONTROLS; do NOT rely on _strip_think_tags.")
+    except Exception:
+        return  # observability must never break a call
 
 # Module-level sync HTTP client — initialized at import time so it is available
 # in both the FastAPI process and the re_embedder subprocess without depending
@@ -780,6 +838,9 @@ def call_llm_with_retry_sync(
                     continue
 
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                # VERIFY suppression before stripping: once the tags are gone the evidence
+                # that the model reasoned is gone too. A 200 is not proof of suppression.
+                _audit_reasoning_leak(result, operation, user_id)
                 # Strip <think>...</think> reasoning blocks (Qwen3 models)
                 content = _strip_think_tags(content)
 
@@ -963,6 +1024,9 @@ async def call_llm_with_retry_async(
                     continue
 
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                # VERIFY suppression before stripping: once the tags are gone the evidence
+                # that the model reasoned is gone too. A 200 is not proof of suppression.
+                _audit_reasoning_leak(result, operation, user_id)
                 # Strip <think>...</think> reasoning blocks (Qwen3 models)
                 content = _strip_think_tags(content)
 
@@ -1127,6 +1191,8 @@ def call_llm_no_retry_sync(
             return None
 
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        # VERIFY suppression before stripping (see the retry paths — same reasoning).
+        _audit_reasoning_leak(result, operation, user_id)
         # Strip <think>...</think> reasoning blocks (Qwen3 models)
         content = _strip_think_tags(content)
 
