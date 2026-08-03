@@ -1792,7 +1792,13 @@ def _validate_tool_input(tool_name: str, arguments: dict) -> dict | None:
     # only as a single-user fallback (matches _call_tool / bind_tenant precedence).
     # With no identity at all this becomes the front-line empty-user_id rejection so
     # a tool never proceeds with no resolvable identity.
-    effective_user_id = user_id or FAULTLINE_USER_ID
+    # STRIP BEFORE the pin fallback, matching bind_tenant (server.py:154). Without the strip a
+    # whitespace-only user_id ("   ") is TRUTHY, so it never reaches the pin and this validator
+    # REJECTS an identity that bind_tenant would happily resolve — the two identity seams
+    # disagreed. Unreachable over HTTP (both transports run bind_tenant first, so the argument is
+    # already normalized), but live on the direct/stdio path. A defense-in-depth validator that
+    # contradicts the seam it backstops is worse than no validator: it makes the guarantee a lie.
+    effective_user_id = (user_id or "").strip() or FAULTLINE_USER_ID
     err = validate_user_id(effective_user_id)
     if err:
         return {"error": f"Invalid user_id: {err}"}

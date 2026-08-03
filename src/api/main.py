@@ -4392,7 +4392,7 @@ def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
 
     natural_language = meta.get("natural_language")
     if isinstance(natural_language, str):
-        natural_language = natural_language.strip() or None
+        natural_language = _strip_template_hint(natural_language.strip()) or None
     else:
         natural_language = None
 
@@ -4400,7 +4400,7 @@ def _normalize_novel_rel_metadata(meta: dict, rel_type: str) -> dict | None:
     # must not reintroduce X — _create_rel_type_in_flow re-validates as a backstop.
     natural_language_2p = meta.get("natural_language_2p")
     if isinstance(natural_language_2p, str):
-        natural_language_2p = natural_language_2p.strip() or None
+        natural_language_2p = _strip_template_hint(natural_language_2p.strip()) or None
         if natural_language_2p and ("Y" not in natural_language_2p or "X" in natural_language_2p):
             natural_language_2p = None
     else:
@@ -10050,6 +10050,20 @@ def _pin_rel_type_to_known(cur, subject_id: str, corrected_rel: str,
             "  AND archived_at IS NULL",
             (subject_id, subject_id))
         known = [r[0] for r in cur.fetchall() if r[0]]
+        # Staged-aware: grown Class-B/C rels (e.g. `favorite_color`) live in staged_facts
+        # until promoted. Union the subject's ACTIVE staged rels so a correction can pin to
+        # a rel the subject holds even before it's committed to `facts`.
+        try:
+            cur.execute(
+                "SELECT DISTINCT rel_type FROM staged_facts "
+                "WHERE (subject_id = %s OR object_id = %s) AND promoted_at IS NULL "
+                "  AND (expires_at IS NULL OR expires_at > now())",
+                (subject_id, subject_id))
+            for _sr in cur.fetchall():
+                if _sr[0] and _sr[0] not in known:
+                    known.append(_sr[0])
+        except Exception:
+            pass
     except Exception:
         return cr
     if not known or cr in known:
@@ -11257,12 +11271,20 @@ If extraction is impossible or ambiguous, return {{}}."""
     # Load rel_types with natural_language from database
     try:
         with db.cursor() as cur:
+            # No LIMIT: a truncated menu hid grown rels (e.g. `favorite_color`, category
+            # pending_placement) from the extractor so it mislabelled them onto a shown rel
+            # (has_interest_in) → the rel-keyed correction lookups all missed. Present the
+            # full active ontology; usage-ordered so the most-relevant rels lead.
             cur.execute("""
-                SELECT rel_type, natural_language, category
-                FROM rel_types
-                WHERE natural_language IS NOT NULL
-                ORDER BY category, rel_type
-                LIMIT 20
+                SELECT r.rel_type, r.natural_language, r.category
+                FROM rel_types r
+                LEFT JOIN (
+                    SELECT rel_type, count(*) AS n FROM facts
+                    WHERE superseded_at IS NULL AND archived_at IS NULL
+                    GROUP BY rel_type
+                ) u ON u.rel_type = r.rel_type
+                WHERE r.natural_language IS NOT NULL
+                ORDER BY COALESCE(u.n, 0) DESC, r.category, r.rel_type
             """)
             rel_types_list = cur.fetchall()
             rel_types_str = "\n".join(
@@ -11448,12 +11470,19 @@ If extraction is impossible or confidence < 0.70, return {{}}."""
 
     try:
         with db.cursor() as cur:
+            # No LIMIT: same defect as the correction extractor — a truncated menu hides grown
+            # rels so the extractor mislabels them, breaking the rel-keyed lookups. Present the
+            # full active ontology, usage-ordered.
             cur.execute("""
-                SELECT rel_type, natural_language, category
-                FROM rel_types
-                WHERE natural_language IS NOT NULL
-                ORDER BY category, rel_type
-                LIMIT 20
+                SELECT r.rel_type, r.natural_language, r.category
+                FROM rel_types r
+                LEFT JOIN (
+                    SELECT rel_type, count(*) AS n FROM facts
+                    WHERE superseded_at IS NULL AND archived_at IS NULL
+                    GROUP BY rel_type
+                ) u ON u.rel_type = r.rel_type
+                WHERE r.natural_language IS NOT NULL
+                ORDER BY COALESCE(u.n, 0) DESC, r.category, r.rel_type
             """)
             rel_types_list = cur.fetchall()
             rel_types_str = "\n".join(
@@ -13859,6 +13888,38 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
     return all_matches
 
 
+def _suppress_atomic_claimed_twins(edges: list[dict], atomic: list[dict]) -> tuple[list[dict], int]:
+    """Drop deriver edges whose OBJECT is EXACTLY a claimed atomic-scalar value (the spine's
+    own-the-construction / suppress-twin rule for the scalar_atomic format-grammar).
+
+    ``atomic`` is ``_detect_atomic_values`` output (dates already filtered by the caller — the
+    temporal lane owns dates). An edge is suppressed iff its object equals a claimed VALUE by
+    EXACT normalized (strip+lower) comparison — NO substring/ILIKE heuristics — UNLESS the edge
+    already carries the detector's own rel_type for that value (a correct has_ip/has_mac/… capture
+    is never dropped). This is what frees the value so the atomic lane (the residue binder here,
+    /ingest's atomic supplementation as the backstop) can host it on the seeded has_* rel instead
+    of a deriver twin eating it first (the live ``age="172.16.5.9"`` corruption). Pure/deterministic;
+    returns (kept_edges, dropped_count)."""
+    if not edges or not atomic:
+        return edges, 0
+    claimed = {
+        (_av.get("value") or "").strip().lower(): (_av.get("rel_type") or "").strip().lower()
+        for _av in atomic if (_av.get("value") or "").strip()
+    }
+    if not claimed:
+        return edges, 0
+    kept: list[dict] = []
+    dropped = 0
+    for _e in edges:
+        _eo = (_e.get("object") or "").strip().lower()
+        _er = (_e.get("rel_type") or "").strip().lower()
+        if _eo in claimed and _er != claimed[_eo]:
+            dropped += 1
+            continue
+        kept.append(_e)
+    return kept, dropped
+
+
 def _parse_relative_date(text: str, reference):
     """Deterministic relative-time → absolute date parser (NO LLM, NO heavy dep).
 
@@ -14422,7 +14483,7 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
     * X MUST be a literal, named entity (a real name). If X is only a pronoun ("I call HER my Y"),
       DO NOT emit synonym_of — fall back to normal handling (omit).
     * Example: "call Robert my ace" → (robert, synonym_of, "ace", is_preferred_label=false)
-    * Example: "my box is the truenas server" → (truenas server, synonym_of, "box", is_preferred_label=false)
+    * Example: "my box is the nas server" → (nas server, synonym_of, "box", is_preferred_label=false)
     * Distinguish from pref_name/also_known_as: synonym_of is how the SPEAKER talks ABOUT X
       (a nickname/slang/referential word), NOT an alternate proper name X is publicly known by.
 
@@ -15423,6 +15484,43 @@ def _head_token_index_for_surface(doc, surface: str):
     return None
 
 
+def _reconcile_residue_against_seam(
+    residue_sentences: list[str],
+    captured_objects: set,
+) -> tuple[list[str], int]:
+    """Drop a residue sentence the post-loop affect/preference/relational-predicate seams ALREADY
+    captured as a structured edge, so the SAME statement is never stored BOTH as that edge AND as a
+    verbatim Class-C store_context blob (the negation/absence double-capture leak).
+
+    A residue sentence is COVERED (dropped) iff a seam-captured OBJECT (lowercased) appears in it as a
+    WORD-BOUNDARY token — deterministic regex, case-insensitive; a multi-word object is matched whole.
+    Precise by construction: it drops ONLY a sentence a seam owns, never a genuine untypeable residue
+    (whose content no seam captured). Subject-agnostic, no cosine, no domain list. Pure function
+    (no I/O) so it is directly unit-testable. Returns (kept_sentences, dropped_count)."""
+    if not residue_sentences or not captured_objects:
+        return list(residue_sentences), 0
+    kept: list[str] = []
+    dropped = 0
+    for _rs in residue_sentences:
+        _rs_l = (_rs or "").lower()
+        _covered = False
+        for _obj in captured_objects:
+            _o = (_obj or "").strip().lower()
+            if not _o:
+                continue
+            try:
+                if re.search(r"\b" + re.escape(_o) + r"\b", _rs_l):
+                    _covered = True
+                    break
+            except Exception:  # noqa: BLE001 — bad pattern → treat as not-covered (keep the residue)
+                continue
+        if _covered:
+            dropped += 1
+        else:
+            kept.append(_rs)
+    return kept, dropped
+
+
 async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     """SENTENCE-PIPELINE harvest ("feed it the clean sentence"). Returns the standard
     ``{"edges": [...], "spans": N}`` dict, or ``None`` to signal the caller to fall through to today's
@@ -15705,6 +15803,15 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # (Class C via the EXISTING store_context). We collect those sentences here and route them once,
     # after the loop. Success = how LITTLE lands here; this is never aimed-at, only a non-drop floor.
     _residue_sentences: list[str] = []
+    # RESIDUE↔SEAM RECONCILE (negation/absence fix, Part 1): the post-loop affect/preference/
+    # relational-predicate seams capture a sentence the per-sentence deriver loop already booked as
+    # zero-edge residue ("I am allergic to penicillin" → the deriver emits nothing, so the sentence
+    # is marked residue; the relpred seam THEN mints (user, allergic_to, penicillin)). Without
+    # reconciliation the SAME sentence lands BOTH as a structured edge AND a verbatim Class-C
+    # store_context blob — the contradictory-recall leak. We record every seam-captured edge OBJECT
+    # here (lowercased) and, before the store_context floor, drop any residue sentence whose text
+    # carries a captured object as a WORD-BOUNDARY token. Deterministic, no cosine, subject-agnostic.
+    _seam_captured_objects: set = set()
     # Fix B, Part 1 (flag-gated): accumulate the NAMED-INSTANCE / NAMING-VERB seam edges per
     # declarative sentence. The spine deriver never invokes analyze_naming / analyze_named_instance,
     # so "I have a dog named Rex" / "My dog Rex is a poodle" lose the named instance on this
@@ -16247,6 +16354,41 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                         _add_feeling(_comp)
                 except Exception:  # noqa: BLE001 — fail-safe: copula miss never breaks the harvest
                     pass
+                # (2b) RELATIONAL-PREDICATE capture (DATA-LOSS fix): "I am allergic to penicillin" is a
+                #     predicate adjective carrying a PREPOSITIONAL OBJECT — a RELATION with an object,
+                #     NOT a bare feeling. The affect seams above now DECLINE it (analyze_copula /
+                #     analyze_copula_affect_complements prep-object guards), so WITHOUT this the object
+                #     (penicillin) would drop entirely and the "feels allergic" junk would vanish with
+                #     nothing in its place. Emit (user, <adj>_<prep>, <object>) — e.g. (user,
+                #     allergic_to, penicillin) — a NOVEL rel_type the ontology growth engine grounds
+                #     (miss→grow). Subject-agnostic, deterministic (grammar: prep→pobj), NO medical /
+                #     adjective word list. user_stated so /ingest lands it durably (Class A/B).
+                _relpred_edges_sp: list[dict] = []
+                try:
+                    from src.extraction.linguistics import (
+                        analyze_copula_relational_predicate as _rel_pred)
+                    for _rp in (_rel_pred(_affect_text) or []):
+                        _rp_rel = (_rp.get("rel_type") or "").strip().lower()
+                        _rp_obj = (_rp.get("object") or "").strip().lower()
+                        if not _rp_rel or not _rp_obj:
+                            continue
+                        # NEGATION-AS-ABSENCE (design-negation-and-absence-facts, polarity option):
+                        # "I'm not allergic to penicillin" is NOT dropped — it is CAPTURED as the SAME
+                        # structured relation carrying polarity='negated'. Ingest's ON CONFLICT
+                        # (subject_id, object_id, rel_type) DO UPDATE polarity=EXCLUDED.polarity then
+                        # flips the prior affirmed row to negated (supersede-in-place, latest assertion
+                        # wins); a later re-affirmation flips it back — the identical mechanism the
+                        # has_state negated-state lane (Q1 GPS) already ships. convert_to_prose reads
+                        # the polarity column back and renders the negation (_negate_prose). NEVER a
+                        # Class-C blob; the state is one authoritative, traceable row. Subject-agnostic
+                        # (grammar-driven negation cue on ANY relational predicate, no domain list).
+                        _rp_edge = {"subject": "user", "rel_type": _rp_rel, "object": _rp_obj,
+                                    "fact_provenance": "user_stated"}
+                        if _rp.get("negated"):
+                            _rp_edge["polarity"] = "negated"
+                        _relpred_edges_sp.append(_rp_edge)
+                except Exception:  # noqa: BLE001 — fail-safe: relpred miss never breaks the harvest
+                    _relpred_edges_sp = []
                 # TEMPORAL STAMP + PROVENANCE: a USER-STATED feeling is DURABLE — fact_provenance=
                 # "user_stated" so /ingest's provenance router + assign_class land it at Class B (the
                 # feels rel's defined class is C, so user_stated → B, NOT A; NEVER force C — see
@@ -16343,8 +16485,12 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                                 _dropped_junk += 1
                                 continue
                         # (b) (<X-head>, has_state, <value>) where the value matches a captured
-                        #     preference value ("color" has_state "blue").
-                        if _er == "has_state" and _eo in _pref_values and _es != "user":
+                        #     preference value ("color" has_state "blue"). Token-aware so a WIDENED
+                        #     multi-token preference value ("o negative") still drops the deriver's
+                        #     has_state twin whose object is the bare ADJ head ("negative") — the twin
+                        #     carries only the copula-complement LEMMA, not the full value phrase.
+                        if _er == "has_state" and _es != "user" and _eo and any(
+                                _eo == _pv or _eo in _pv.split() for _pv in _pref_values):
                             _dropped_junk += 1
                             continue
                         _kept_pref.append(_e)
@@ -16359,16 +16505,22 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
 
                 # UNION the seam edges (deduped on `seen`). Feelings carry the seeded `feels` rel;
                 # preferences carry the snake-cased favorite_<x>/<x> rel. NO object resolution here.
-                for _se in (_feeling_edges_sp + _preference_edges_sp):
-                    _key = (_se.get("subject"), _se.get("rel_type"),
-                            (_se.get("object") or "").strip().lower())
+                for _se in (_feeling_edges_sp + _preference_edges_sp + _relpred_edges_sp):
+                    _se_obj = (_se.get("object") or "").strip().lower()
+                    _key = (_se.get("subject"), _se.get("rel_type"), _se_obj)
+                    # RESIDUE↔SEAM RECONCILE (Part 1): remember this seam's OBJECT so the store_context
+                    # floor below drops the residue sentence that ALSO produced this edge (no double
+                    # capture: a structured edge AND a verbatim C blob for the same statement).
+                    if _se_obj:
+                        _seam_captured_objects.add(_se_obj)
                     if all(_key) and _key not in seen:
                         seen.add(_key)
                         edges.append(dict(_se))
-                if _feeling_edges_sp or _preference_edges_sp:
+                if _feeling_edges_sp or _preference_edges_sp or _relpred_edges_sp:
                     log.info("sentence_pipeline.affect_preference_captured",
                              user_id=user_id[:8],
-                             feelings=len(_feeling_edges_sp), preferences=len(_preference_edges_sp))
+                             feelings=len(_feeling_edges_sp), preferences=len(_preference_edges_sp),
+                             relational_predicates=len(_relpred_edges_sp))
         except Exception as _ape:  # noqa: BLE001 — fail-safe: seam miss never breaks the spine harvest
             log.debug("sentence_pipeline.affect_preference_failed",
                       user_id=user_id[:8], error=str(_ape)[:120])
@@ -16470,6 +16622,67 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
         edges = _drop_temporal_object_edges(edges)
     except Exception as _te:  # noqa: BLE001
         log.debug("sentence_pipeline.drop_temporal_failed", error=str(_te)[:120])
+
+    # ── ATOMIC-SCALAR CLAIM (spine parity with the rewrite/ingest lane) ──────────────────────────
+    # The spine returned early and NEVER ran the atomic pre-flight, so a structured literal (an
+    # IP / MAC / email / FQDN / URL) was eaten by a deriver copula/attr twin FIRST (the live
+    # ``age="172.16.5.9"`` corruption) — and /ingest's post-hoc atomic supplementation (~20349)
+    # then SKIPPED ``has_ip`` because the value was already an edge object (its ``_existing_objects``
+    # dedup). Claim the atomics here, REUSING the existing machinery (never a re-implementation):
+    #   1. ``_detect_atomic_values`` on the marker-stripped statement text — the SAME seeded
+    #      scalar_atomic format-grammar the rewrite/ingest lane runs (per-tenant
+    #      extraction_patterns, deterministic regex, <1ms). DATES are exempt (temporal lane).
+    #   2. SUPPRESS deriver twins via ``_suppress_atomic_claimed_twins`` — EXACT normalized-value
+    #      comparison only, correct has_* captures kept (own-the-construction / suppress-twin).
+    #   3. UNION the typed atomic edges via the EXISTING ``_classify_value_subject_residue`` (the
+    #      SAME residue binder the /harvest-spans lane uses: identical edge shape with
+    #      object_datatype + llm_inferred provenance; ONE bounded LLM call binds only the missing
+    #      SUBJECT slot; self-gated by MISSING_SLOT_CAPTURE; the WGM gate still validates).
+    # FAIL-SAFE: detector/DB/LLM miss → edges unchanged and /ingest's atomic supplementation
+    # remains the backstop (the value is no longer masked by a twin, so it fires there).
+    try:
+        _sp_atomic_db = None
+        try:
+            _sp_atomic_db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        except Exception:  # noqa: BLE001 — detector falls back to bootstrap patterns
+            _sp_atomic_db = None
+        try:
+            _sp_atomic = _detect_atomic_values(text, _sp_atomic_db) or []
+        finally:
+            if _sp_atomic_db is not None:
+                try:
+                    _sp_atomic_db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Dates ride the temporal lane (event_date), never the scalar claim.
+        _sp_atomic = [_av for _av in _sp_atomic if (_av.get("type") or "").lower() != "date"]
+        if _sp_atomic:
+            edges, _at_dropped = _suppress_atomic_claimed_twins(edges, _sp_atomic)
+            if _at_dropped:
+                seen = {(_e.get("subject"), _e.get("rel_type"),
+                         (_e.get("object") or "").strip().lower()) for _e in edges}
+                log.info("sentence_pipeline.atomic_twin_suppressed",
+                         user_id=user_id[:8], dropped=_at_dropped,
+                         note="deriver edge object was a claimed atomic-scalar value (IP/MAC/…); "
+                              "the scalar_atomic format-grammar owns the value — the typed has_* "
+                              "edge is unioned via the residue binder")
+            try:
+                _sp_atomic_edges = await _classify_value_subject_residue(text, edges, user_id)
+            except Exception as _are:  # noqa: BLE001 — fail-safe: /ingest supplementation backstops
+                log.debug("sentence_pipeline.atomic_residue_failed", error=str(_are)[:120])
+                _sp_atomic_edges = []
+            for _ae in (_sp_atomic_edges or []):
+                _key = (_ae.get("subject"), _ae.get("rel_type"),
+                        (_ae.get("object") or "").strip().lower())
+                if all(_key) and _key not in seen:
+                    seen.add(_key)
+                    edges.append(_ae)
+            if _sp_atomic_edges:
+                log.info("sentence_pipeline.atomic_values_claimed",
+                         user_id=user_id[:8], added=len(_sp_atomic_edges))
+    except Exception as _spae:  # noqa: BLE001 — fail-safe: the atomic claim never breaks the harvest
+        log.debug("sentence_pipeline.atomic_claim_failed", error=str(_spae)[:160])
+
     # RELATION-FIT GUARDRAIL — every candidate must ground to a classifiable rel_type (parity with
     # the legacy path's relation_fit). Malformed fragments are dropped BY CONSTRUCTION.
     try:
@@ -16784,6 +16997,23 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # carries the verbatim sentence (no rewrite), and the count is log_crit-surfaced so a growing C is
     # visible. The loop's real job is to grow the ontology so this trends toward empty. Fail-safe:
     # any store_context error is swallowed — a C miss never breaks the harvest's structured edges.
+    # RESIDUE↔SEAM RECONCILE (negation/absence fix, Part 1): drop any residue sentence the post-loop
+    # affect/preference/relational-predicate seams ALREADY captured as a structured edge — otherwise
+    # the SAME statement lands BOTH as that edge AND as a verbatim Class-C store_context blob (the
+    # contradictory-recall leak this fix closes). A residue sentence is covered iff a seam-captured
+    # OBJECT appears in it as a WORD-BOUNDARY token (deterministic regex, case-insensitive; multi-word
+    # objects matched whole). This is precise: it drops ONLY the sentence a seam owns, never a genuine
+    # untypeable residue (regression-guarded). Subject-agnostic, no cosine.
+    if _residue_sentences and _seam_captured_objects:
+        _kept_residue, _reconciled = _reconcile_residue_against_seam(
+            _residue_sentences, _seam_captured_objects)
+        if _reconciled:
+            log.info("sentence_pipeline.residue_seam_reconciled",
+                     user_id=user_id[:8], dropped=_reconciled, kept=len(_kept_residue),
+                     note="residue sentence(s) already captured as an affect/preference/relational "
+                          "seam edge → NOT re-stored as a Class-C blob (no double capture)")
+        _residue_sentences = _kept_residue
+
     if _residue_sentences and _SHORT_TERM_MEMORY:
         _c_held = 0
         for _rs in _residue_sentences:
@@ -25325,7 +25555,7 @@ def resolve_entity_synonym(term: str, anchor: str, db) -> str | None:
 
     try:
         # ---- 1/2. EXACT-TERM LOOKUP (approved-only, live-only). Qualifier-first is
-        # structural: a qualified phrase ("truenas box") is its OWN normalized key and
+        # structural: a qualified phrase ("nas box") is its OWN normalized key and
         # never collides into the bare term. No substring/fuzzy (the ex-wife trap). ----
         with db.cursor() as cur:
             cur.execute(
@@ -26853,7 +27083,7 @@ def resolve_anchor(
                                 _mark("alias", term=phrase)
                                 return row[0]
                     # SYNONYM SEAM (IMPL-3 secondary): after the per-phrase alias MISS,
-                    # same helper / same gate so multi-word synonyms ("truenas box")
+                    # same helper / same gate so multi-word synonyms ("nas box")
                     # resolve identically. None continues the n-gram loop unchanged.
                     _syn_anchor = resolve_entity_synonym(phrase, user_id, db)
                     if _syn_anchor is not None:
@@ -29372,6 +29602,9 @@ def _decompose_cross_hinge_steps(query_text: str, intent: dict) -> list[dict] | 
                         "op": _op,
                         "anchor": _calc.get("anchor"),
                         "anchor_b": None,
+                        # Same class of bug as the pair branch above: without the asked-in unit
+                        # the elapsed/duration render drifts to weeks on a 7-multiple.
+                        "requested_unit": _calc.get("requested_unit"),
                     })
 
         # Hinge 3 — temporal PIVOT (before/after <pivot> + ordinal). "first issue after
@@ -29563,6 +29796,12 @@ def _recursive_query_walk(query_text: str, intent: dict, gated_facts: list[dict]
                     "relation": _hop.get("relation"),
                     "granule": _hop.get("granule"),
                     "ordinal_n": _hop.get("ordinal_n"),
+                    # The unit the USER asked in. Dropping it here sent _humanize_delta into
+                    # AMBIGUOUS mode, which re-expresses week-multiples ("21 days" → "3 weeks")
+                    # — so the walk's render diverged from the single pass's, the [:24] dedup
+                    # missed it, and BOTH shipped as Class-A. Answer the question in the unit
+                    # it was asked in.
+                    "requested_unit": _hop.get("requested_unit"),
                 }}
                 _calc_result = _apply_temporal_calc(_walk_facts, _calc_intent, user_id)
                 _hops_run += 1
@@ -32980,6 +33219,31 @@ def _compose_object_clause(
         # domain word-list (same justification as _NEGATE_AUX). Value kept verbatim.
         if tail_types == ["SCALAR"] and object_name is not None:
             import re as _re
+            # A CURATED 2p TEMPLATE WINS — never clobber a hand-written second-person rendering.
+            # This shape exists to RESCUE scalar rels whose template is NULL or whose label bakes
+            # the predicate in ("Has IP Address"). A `natural_language_2p` row is, by contract, a
+            # COMPLETE 2p sentence, so the composer has nothing to add — fall through to the
+            # template path. Without this guard Shape 4 fired unconditionally and overwrote the
+            # correct prose the template had already produced:
+            #     "You go by Sam"            -> "your preferred name is Sam"
+            #     "You were born on 1980-04-02" -> "your born on is 1980-04-02"
+            # and for `also_known_as` it rendered the rel's LABEL DOC-COMMENT verbatim to the user
+            # ("your also known as (skos:altLabel; use pref_name for preferred display name) is …"),
+            # an ontology-metadata leak straight through the "NO rel_type tokens leak" contract.
+            # SYMMETRIC: a curated template wins in EITHER person. The 2p guard alone fixed only
+            # the user's OWN facts and left every fact about ANYONE ELSE still clobbered:
+            #     "Diane was born on 1980-04-02" -> "Diane's born on is 1980-04-02"
+            #     "Diane is also known as Di"    -> "Diane's also known as is Di"
+            #     "Diane is 62 years old"        -> "Diane's age is 62"
+            # CLAUDE.md's own worked example ("my mother's birthday?") lands on exactly this path.
+            # Shape 4 exists to RESCUE a scalar rel with NO curated template (has_ip:
+            # natural_language IS NULL, label "Has IP Address" -> "apollo's ip address is …").
+            # When a template IS curated, there is nothing to rescue — fall through to it.
+            if (subject_is_you and template_2p) or (not subject_is_you and template):
+                return None
+            # Drop any parenthetical from the label before it can reach the reader. `rel_types.label`
+            # carries doc-comments for US, not for the user; the 3p path leaked them the same way.
+            label = _re.sub(r'\s*\([^)]*\)', '', label).strip() or label
             attr = _re.sub(r'^(?:has|have|had|is|are|was|were)\b\s*', '',
                            label.lower(), flags=_re.IGNORECASE).strip() or label.lower()
             poss = "your" if subject_is_you else "%s's" % subject_name
@@ -33187,6 +33451,26 @@ def _dedup_inverse_pairs(rendered: list[dict], overlay_meta: dict) -> list[str]:
         return [r.get("prose", "") for r in rendered]
 
 
+def _strip_template_hint(t):
+    """Strip a maintainer DOC-HINT parenthetical from a user-facing rendering template.
+
+    Several SEED templates carry a hint written for US, and it rendered VERBATIM to the reader:
+        "X lives in Y (residence)"       -> "Diane lives in Toronto (residence)"
+        "X was born on Y (date)"         -> "Diane was born on 1980-04-02 (date)"
+        "X lives at Y (address)" · "X is an instance of Y (type)"
+    Same class of leak as the rel_type LABEL doc-comment ("…(skos:altLabel; use pref_name…)"):
+    metadata written for maintainers escaping into what a USER reads, straight through the
+    convert_to_prose contract ("NO rel_type tokens leak").
+
+    Applied where the template is LOADED FOR RENDER — i.e. BEFORE X/Y substitution — so a VALUE
+    containing parentheses is never touched. Fail-safe: if stripping would empty the template,
+    keep the original (a hinted sentence beats no sentence).
+    """
+    if not isinstance(t, str):
+        return t
+    return re.sub(r"\s*\([^)]*\)", "", t).strip() or t
+
+
 def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = None,
                      preferred_alias_map: dict = None,
                      anchor_matched_term: str = None) -> list[str]:
@@ -33270,8 +33554,10 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         for _rt in set(f.get("rel_type", "").lower() for f in facts if f.get("rel_type")):
             _m = _overlay_meta.get(_rt)
             if _m:
-                rel_type_templates[_rt] = _m.get("natural_language")
-                rel_type_templates_2p[_rt] = _m.get("natural_language_2p")
+                # Strip maintainer doc-hints BEFORE render — "(residence)"/"(date)"/"(type)"
+                # were reaching the reader verbatim. See _strip_template_hint.
+                rel_type_templates[_rt] = _strip_template_hint(_m.get("natural_language"))
+                rel_type_templates_2p[_rt] = _strip_template_hint(_m.get("natural_language_2p"))
                 rel_type_labels[_rt] = _m.get("label")
                 rel_type_tail[_rt] = _m.get("tail_types")
 
@@ -35776,10 +36062,26 @@ async def query(request: QueryRequest) -> QueryResponse:
         _meta = locals().get("_recursive_meta")
         if _meta and _meta.get("definition"):
             _meta_def = _meta["definition"]
-            _already = any(
+            # STRUCTURAL guard (was: a [:24] prefix compare). The prefix compare deduped by how
+            # the answer HAPPENED TO RENDER, so two renders of the SAME computation that differ
+            # in wording ("3 weeks…" vs "21 days…") both survived and shipped as contradictory
+            # Class-A lines. Authority is not a string prefix: if the single pass already
+            # ANSWERED this computation, the walk does not get to answer it a second time — in
+            # any wording. The walk still injects for PARTIAL/MISSING, which is the gap-naming
+            # only it can produce.
+            _calc_answered = any(
                 (f.get("source") == "temporal_calc"
-                 and str(f.get("definition") or "")[:24] == str(_meta_def)[:24])
+                 and f.get("rel_type") == "temporal_computation")
                 for f in facts_with_definition)
+            _meta_is_answer = (_meta.get("status") == "answered")
+            if _calc_answered and _meta_is_answer:
+                log.info("query.recursive_walk.metacog_suppressed reason=calc_already_answered")
+                _already = True
+            else:
+                _already = any(
+                    (f.get("source") == "temporal_calc"
+                     and str(f.get("definition") or "")[:24] == str(_meta_def)[:24])
+                    for f in facts_with_definition)
             if not _already:
                 facts_with_definition.insert(0, {
                     "subject": anchor,
@@ -37148,6 +37450,64 @@ def correct_fact(req: FactCorrectionRequest):
                     old_fact_row = cur.fetchone()
                     if old_fact_row:
                         found_via = f"subject_staged({old_rel_type})"
+
+                # 7. OLD-VALUE-ANCHORED, REL-AGNOSTIC supersession (user-is-truth).
+                # Every rel-keyed step above trusts the LLM's `old_rel_type`. When the
+                # correction-extractor mislabels the rel (e.g. emits `has_interest_in` for a
+                # stored, grown `favorite_color` because its prompt menu was truncated), all
+                # rel-keyed lookups miss and a real, correctable memory is lost. But the user
+                # named the OLD VALUE ("...red, NOT blue") and it resolved to a concrete UUID —
+                # that is the deterministic anchor. Match by (subject, object) IGNORING rel_type
+                # across BOTH the authoritative `facts` table and `staged_facts`; the stored rel
+                # is whatever the row actually holds. Correction-only (a retraction removes broadly
+                # and has its own semantic fallback); guarded to exactly ONE candidate so we can
+                # NEVER corrupt the wrong memory (>1 → clarify).
+                if (not old_fact_row and object_uuid and not is_retraction
+                        and not is_temporal_correction):
+                    _ov_candidates = []  # (fact_id, stored_rel, is_staged)
+                    cur.execute("""
+                        SELECT id, rel_type FROM facts
+                        WHERE subject_id = %s AND object_id = %s
+                          AND superseded_at IS NULL AND archived_at IS NULL
+                    """, (subject_uuid, object_uuid))
+                    for _r in cur.fetchall():
+                        _ov_candidates.append((_r[0], _r[1], False))
+                    cur.execute("""
+                        SELECT id, rel_type FROM staged_facts
+                        WHERE subject_id = %s AND object_id = %s
+                          AND promoted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > now())
+                    """, (subject_uuid, object_uuid))
+                    for _r in cur.fetchall():
+                        _ov_candidates.append((_r[0], _r[1], True))
+
+                    if len(_ov_candidates) == 1:
+                        _ov_id, _ov_rel, _ov_staged = _ov_candidates[0]
+                        # Pure value correction = only the VALUE changed (the extractor kept the
+                        # rel the same on both sides). Adopt the STORED rel for BOTH the old-match
+                        # and the new re-ingest, else blue is archived but red re-lands under the
+                        # mislabelled rel and the fact re-splits. If the user genuinely changed the
+                        # rel (old_rel_type != new_rel_type), leave new_rel_type as intended.
+                        _was_pure_value = (new_rel_type == old_rel_type)
+                        old_fact_row = (_ov_id, object_uuid)
+                        old_rel_type = _ov_rel
+                        if _was_pure_value:
+                            new_rel_type = _ov_rel
+                        found_via = (f"old_value_object({_ov_rel})"
+                                     + ("_staged" if _ov_staged else ""))
+                        log.info("correct_fact.old_value_anchored_match",
+                                 subject=subject_uuid, object=object_uuid,
+                                 stored_rel=_ov_rel, staged=_ov_staged,
+                                 pure_value=_was_pure_value)
+                    elif len(_ov_candidates) > 1:
+                        log.warning("correct_fact.ambiguous_old_value_object",
+                                    subject=subject_uuid, object=object_uuid,
+                                    candidates=len(_ov_candidates))
+                        return FactCorrectionResponse(
+                            status="clarification_needed",
+                            message=(f"You have several facts with that value and I "
+                                     f"couldn't tell which one to correct. Could you name "
+                                     f"the specific relationship you mean?"))
 
                 if not old_fact_row:
                     # Semantic fallback for retractions — when all 6 pattern-match steps

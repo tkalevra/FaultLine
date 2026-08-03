@@ -50,3 +50,11 @@ tests/
 # Test result artifacts
 *.pyc
 __pycache__/
+
+# Local API-key / credential drop files. NEVER commit — this is a PUBLIC repo.
+# A key file was found untracked in this working tree on 2026-07-30; these patterns
+# make an accidental `git add -A` a no-op rather than a credential disclosure.
+*.api
+*.key
+*credentials*
+*secret*
