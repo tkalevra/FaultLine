@@ -18,12 +18,14 @@ Auth:
 """
 
 import hmac
+import hashlib
 import os
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
+import psycopg2
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -155,20 +157,116 @@ async def health() -> JSONResponse:
 _bearer = HTTPBearer(auto_error=False, description="MCP_API_KEY bearer token")
 
 
+# ── Dashboard-backed credential resolution (seats + rotated MCP keys) ─────────
+# When the operator has minted seats or rotated the MCP key from the control-
+# plane webui, the authoritative credentials live in the shared postgres DB
+# (both containers talk to the same instance). The MCP server consults them
+# here so that:
+#   • a per-seat token authenticates AND identifies (the token's hash resolves
+#     to a seat's user_id → returned as the principal → bind_tenant's dormant
+#     "Option A" activates with NO call-site change; the token IS the identity,
+#     the X-OpenWebUI-User-Id header becomes a cross-check, not the source).
+#   • a rotated-then-revoked MCP key stops working IMMEDIATELY (no cache; a
+#     single indexed lookup on every auth).
+# When the DB is unreachable OR the operator has minted nothing yet, behaviour
+# falls back to the original env-MCP_API_KEY / anonymous-dev path (back-compat).
+
+def _dashboard_dsn() -> str:
+    return os.environ.get("POSTGRES_DSN", "").strip()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _dashboard_lookup(query: str, params: tuple) -> Optional[tuple]:
+    """Run a single SELECT against the shared DB; return the first row or None.
+
+    Opens a short-lived connection per call — local postgres, one indexed probe,
+    negligible cost. Any error → None (auth falls back to env); the MCP path
+    never hard-fails on a DB hiccup. Blocking, but ~ms and not on the chat path.
+    """
+    dsn = _dashboard_dsn()
+    if not dsn:
+        return None
+    try:
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception:  # noqa: BLE001 — DB optional; degrade to env auth
+        return None
+
+
+def _resolve_seat_token_db(credentials: Optional[str]) -> Optional[str]:
+    """Return the seat's user_id if credentials is a valid active seat token."""
+    if not credentials:
+        return None
+    row = _dashboard_lookup(
+        "SELECT user_id FROM public.dashboard_seats "
+        "WHERE token_hash = %s AND active = TRUE",
+        (_sha256_hex(credentials),),
+    )
+    if not row:
+        return None
+    return str(row[0])
+
+
+def _mcp_key_active_db(credentials: Optional[str]) -> bool:
+    """True if credentials matches an active rotated MCP key in the DB."""
+    if not credentials:
+        return False
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys "
+        "WHERE key_hash = %s AND is_active = TRUE LIMIT 1",
+        (_sha256_hex(credentials),),
+    ) is not None
+
+
+def _any_dashboard_credential_configured() -> bool:
+    """True if the operator has minted ANY seat or rotated key (DB-gated).
+
+    Gates the anonymous-dev fallback: once seats/keys exist in the DB, the open
+    anonymous mode is suppressed even if MCP_API_KEY env is unset, so minting the
+    first seat closes the open posture."""
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1"
+    ) is not None or _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1"
+    ) is not None
+
+
 def _resolve_principal(credentials: str | None) -> str | None:
     """Map a presented bearer credential to a principal.
 
-    Today: single shared key → returns 'shared' on match, None on miss.
-    Forward-compat (DEV/SECURITY-multiuser-tenant-isolation.md remediation #1):
-    swap this body for a token→user_id lookup and return the user_id, without
-    touching require_auth's call sites.
+    Resolution order:
+      1. Per-seat token (DB) → returns the seat's user_id UUID. bind_tenant's
+         Option A then treats the token as the authoritative identity.
+      2. Rotated MCP key (DB) → 'shared'.
+      3. Env MCP_API_KEY (back-compat / bootstrap) → 'shared'.
+      4. Anonymous dev mode → only when NO credentials are configured anywhere
+         (no env key AND no DB seats/keys) AND no credential was presented.
+
+    Returns None on every miss → caller raises 401. Constant-time on the env
+    secret path (hmac.compare_digest); the DB paths compare sha256 digests via
+    indexed equality (the preimage is the secret, so there is no partial-secret
+    timing to leak).
     """
-    if not MCP_API_KEY:
-        return "anonymous"  # unauthenticated mode (dev/localhost only)
-    if credentials is None:
-        return None
-    if hmac.compare_digest(credentials, MCP_API_KEY):
+    # 1. Per-seat token (highest precedence — strongest auth).
+    seat_uid = _resolve_seat_token_db(credentials)
+    if seat_uid:
+        return seat_uid
+    # 2. Rotated MCP key in the DB.
+    if _mcp_key_active_db(credentials):
         return "shared"
+    # 3. Env MCP_API_KEY.
+    if MCP_API_KEY:
+        if credentials is not None and hmac.compare_digest(credentials, MCP_API_KEY):
+            return "shared"
+        return None
+    # 4. Anonymous dev mode — only when nothing is configured AND nothing was
+    # presented. Once a seat/key exists, the open posture is suppressed.
+    if credentials is None and not _any_dashboard_credential_configured():
+        return "anonymous"
     return None
 
 
@@ -178,12 +276,15 @@ def require_auth(
 ) -> str:
     """FastAPI dependency enforcing the bearer scheme; returns the principal.
 
-    Returns a principal id (threaded so the tenant-isolation follow-up can bind
-    principal→user_id here). Raises 401 on failure. Logs only length + reason —
-    never any prefix of the secret.
+    Returns a principal id — either "shared"/"anonymous" (transport auth) or a
+    seat's user_id UUID (per-seat token: the token IS the identity). Raises 401
+    on failure. Logs only length + reason — never any prefix of the secret.
+
+    NB: do NOT short-circuit on ``not MCP_API_KEY`` — _resolve_principal now
+    consults the dashboard DB (seats + rotated keys) and only falls back to the
+    anonymous-dev posture when NOTHING is configured anywhere. Short-circuiting
+    here would let a minted seat be bypassed whenever the env key is unset.
     """
-    if not MCP_API_KEY:
-        return "anonymous"
     presented = creds.credentials if creds is not None else None
     principal = _resolve_principal(presented)
     if principal is None:
@@ -193,7 +294,7 @@ def require_auth(
         elif creds.scheme.lower() != "bearer":
             _log(f"REST 401 from {client} — non-bearer scheme {creds.scheme!r}")
         else:
-            _log(f"REST 401 from {client} — key mismatch ({len(presented)} chars)")
+            _log(f"REST 401 from {client} — credential rejected ({len(presented)} chars)")
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -210,7 +311,16 @@ def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | 
     body.user_id, then runs it through bind_tenant() (spoof-guard + UUID validation +
     FAULTLINE_USER_ID single-user fallback). Translates a spoof/malformed rejection into
     the matching HTTP status — fail loud, never silently route to a wrong/shared tenant.
+
+    Per-seat token override: when the principal is itself a UUID (a minted seat token
+    authenticated), the token IS the identity — the seat's user_id is authoritative and
+    any client-claimed header is ignored. This is what makes a seat token actually scope
+    a connection in real OpenWebUI wiring (OpenWebUI forwards its OWN logged-in user's
+    UUID as X-OpenWebUI-User-Id, which would otherwise mismatch the seat and 403). The
+    token proves identity; the header is transport plumbing.
     """
+    if principal and _mcp._TENANT_UUID_RE.match(principal.strip().lower()):
+        return principal.strip().lower()
     claimed = request.headers.get("X-OpenWebUI-User-Id", "") or body_user_id
     try:
         return _mcp.bind_tenant(principal, claimed)
@@ -436,15 +546,22 @@ async def mcp_endpoint(
         # X-OpenWebUI-User-Id; an explicit arguments.user_id takes precedence over it.
         # bind_tenant validates the claimed id (well-formed UUID, spoof-guard against
         # _principal) and applies FAULTLINE_USER_ID only as a single-user fallback.
-        claimed = request.headers.get("X-OpenWebUI-User-Id", "") or arguments.get("user_id", "")
-        try:
-            resolved_user_id = _mcp.bind_tenant(_principal, claimed)
-        except _mcp.TenantSpoofError as exc:
-            _log(f"tools/call name={tool_name!r} REJECT: {exc.message}")
-            return JSONResponse(
-                _jsonrpc_error(req_id, -32602, exc.message),
-                status_code=exc.status_code,
-            )
+        #
+        # Per-seat token override: when _principal is itself a UUID (a minted seat
+        # token authenticated), the token IS the identity — authoritative; the
+        # client-claimed header is ignored (see _resolve_rest_user_id for the why).
+        if _principal and _mcp._TENANT_UUID_RE.match(_principal.strip().lower()):
+            resolved_user_id = _principal.strip().lower()
+        else:
+            claimed = request.headers.get("X-OpenWebUI-User-Id", "") or arguments.get("user_id", "")
+            try:
+                resolved_user_id = _mcp.bind_tenant(_principal, claimed)
+            except _mcp.TenantSpoofError as exc:
+                _log(f"tools/call name={tool_name!r} REJECT: {exc.message}")
+                return JSONResponse(
+                    _jsonrpc_error(req_id, -32602, exc.message),
+                    status_code=exc.status_code,
+                )
         arguments = {**arguments, "user_id": resolved_user_id}
         _log(f"tools/call name={tool_name!r} user_id={resolved_user_id[:8]}...")
         result = await _mcp._call_tool(tool_name, arguments)

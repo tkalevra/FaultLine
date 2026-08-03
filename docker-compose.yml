@@ -58,6 +58,14 @@ services:
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-100}
       FAULTLINE_LOG_LEVEL: ${FAULTLINE_LOG_LEVEL:-INFO}
+
+      # ── FOSS control plane (operator webui on :8000/) ────────────────────────
+      # Operator bearer for /api/dashboard/* (seats, tokens, LLM Brain, MCP key).
+      # Unset → the backend auto-mints a random one and prints it once to the logs
+      # (look for the FAULTLINE_ADMIN_TOKEN line). Set it here to pin a known value.
+      FAULTLINE_ADMIN_TOKEN: ${FAULTLINE_ADMIN_TOKEN:-}
+      # Optional friendly MCP URL shown in the OpenWebUI tab (defaults derived).
+      MCP_EXTERNAL_URL: ${MCP_EXTERNAL_URL:-}
     extra_hosts:
       # Lets the container reach an LLM running on the Docker host.
       - "host.docker.internal:host-gateway"
@@ -90,6 +98,11 @@ services:
       FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
+      # Shared postgres — lets the MCP server validate per-seat tokens minted
+      # from the control-plane webui AND honour rotated MCP keys immediately
+      # (dashboard_seats / dashboard_mcp_keys tables, public schema). Falls back
+      # to MCP_API_KEY env when the tables are empty or the DB is unreachable.
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
     depends_on:
       - faultline
     networks:
