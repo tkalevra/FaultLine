@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>FaultLine · Control Plane</title>
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body data-console="foss">
+
+<!-- ── top status bar ─────────────────────────────────────── -->
+<div class="statusbar" id="statusbar">
+  <span id="sb-scope" class="muted" data-i18n="sb.scope.signedout">not signed in</span>
+  <span class="sep">·</span>
+  <span><span data-i18n="sb.instance">instance</span> <span class="val" id="sb-version">—</span></span>
+  <span class="right">
+    <span class="status-dot" id="sb-dot">●</span>
+    <span id="sb-mode" data-i18n="sb.mode.offline">offline</span>
+  </span>
+</div>
+
+<!-- ── header ─────────────────────────────────────────────── -->
+<header class="app-head">
+  <svg class="logo" viewBox="0 0 200 200" role="img" aria-label="FaultLine">
+    <rect width="200" height="200" fill="var(--bg)"/>
+    <rect x="2" y="2" width="196" height="196" fill="none" stroke="var(--border)" stroke-width="1"/>
+    <text x="100" y="124" text-anchor="middle" font-family="Georgia, serif" font-size="120" font-weight="700" fill="var(--fg)">⊢</text>
+    <line x1="40" y1="158" x2="160" y2="158" stroke="var(--accent)" stroke-width="1.5"/>
+  </svg>
+  <div class="title-block">
+    <h1 data-i18n="head.title">FaultLine Control Plane <span class="console-tag">foss</span></h1>
+    <span class="subtitle" data-i18n="head.subtitle">self-hosted · AGPL v3 · single-instance</span>
+  </div>
+  <div class="head-actions">
+    <div class="accent-picker" id="accent-picker" title="highlight color">
+      <button type="button" class="swatch active" data-accent="" style="--sw:#3FB950" title="green (default)"></button>
+      <button type="button" class="swatch" data-accent="orange" style="--sw:#F0883E" title="orange"></button>
+      <button type="button" class="swatch" data-accent="red" style="--sw:#F85149" title="red"></button>
+      <button type="button" class="swatch" data-accent="blue" style="--sw:#58A6FF" title="blue"></button>
+      <button type="button" class="swatch" data-accent="purple" style="--sw:#A371F7" title="purple"></button>
+    </div>
+    <button class="theme-toggle" id="btn-theme" title="toggle light / dark"><span id="theme-ico">☾</span> <span id="theme-lbl">dark</span></button>
+    <button class="help-launch hidden" id="btn-help" data-i18n="head.help">? Help</button>
+    <button class="btn sm hidden" id="btn-logout" data-i18n="head.logout">sign out</button>
+  </div>
+</header>
+
+<!-- ── LOGIN GATE ─────────────────────────────────────────── -->
+<section id="view-login" class="login-wrap">
+<main>
+  <div class="section-label" data-i18n="login.title">Operator sign-in</div>
+  <div class="panel">
+    <p class="hint" style="margin-top:0" data-i18n="login.intro">
+      Paste your admin token once. It is the operator bearer for this instance's control API,
+      stored only in this browser and sent as <code>Authorization: Bearer</code> on every call.
+    </p>
+    <div class="field">
+      <span class="lbl"><span data-i18n="login.token">Admin token</span> <span class="pill-note">operator bearer</span></span>
+      <input type="password" id="in-token" autocomplete="off" placeholder="paste your admin token">
+    </div>
+    <button class="btn accent" id="btn-connect" style="width:100%" data-i18n="login.connect">▸ connect</button>
+    <div class="msg" id="login-msg"></div>
+    <details class="help-strip">
+      <summary data-i18n="login.where">Where do I get the token?</summary>
+      <div class="help-body">
+        <p>The admin token is the operator credential for the FaultLine control API on this instance.
+          On a fresh FOSS install it is printed by the backend on first boot (look for the
+          <code>FAULTLINE_ADMIN_TOKEN</code> line in the container logs). Set it as an env var on the
+          backend; paste the same value here.</p>
+        <p>This console is the <strong>business + access control plane</strong> — health, seats, the
+          LLM Brain and OpenWebUI wiring. It is separate from your chat client (OpenWebUI / Claude
+          Desktop), which talks to the MCP server on <code>:8002</code> with a per-seat token.</p>
+      </div>
+    </details>
+  </div>
+</main>
+</section>
+
+<!-- ── APP (hidden until authenticated) ───────────────────── -->
+<section id="view-app" class="hidden">
+<main>
+  <div class="pending-banner hidden" id="pending-banner"></div>
+
+  <nav class="tabs" id="tabs">
+    <button type="button" class="active" data-tab="dashboard" data-i18n="tab.dashboard">Dashboard</button>
+    <button type="button" data-tab="seats" data-i18n="tab.seats">Seats &amp; Tokens</button>
+    <button type="button" data-tab="brain" data-i18n="tab.brain">LLM Brain</button>
+    <button type="button" data-tab="openwebui" data-i18n="tab.openwebui">OpenWebUI</button>
+    <button type="button" data-tab="help" data-i18n="tab.help">Help</button>
+    <button type="button" data-tab="compare" data-i18n="tab.compare">FOSS vs SaaS</button>
+  </nav>
+
+  <!-- ══ TAB 1 — DASHBOARD ══ -->
+  <div class="view" data-view="dashboard">
+    <div class="section-label" data-i18n="dash.health">Stack health</div>
+    <div id="dash-health" class="health-grid"></div>
+    <div class="msg" id="dash-health-msg"></div>
+
+    <div class="section-label" data-i18n="dash.summary">Instance summary</div>
+    <div class="grid2">
+      <div class="panel" id="dash-config-panel"></div>
+      <div class="panel">
+        <div class="kv"><span class="k" data-i18n="dash.seats">Seats</span><span class="v" id="dash-seats">—</span></div>
+        <div class="usage"><div class="bar" id="dash-seats-bar"><span style="width:0%"></span></div><div class="cap" id="dash-seats-cap">—</div></div>
+        <div class="kv" style="margin-top:14px"><span class="k" data-i18n="dash.brain">Brain</span><span class="v" id="dash-brain">—</span></div>
+        <div class="kv"><span class="k" data-i18n="dash.llmkey">LLM API key</span><span class="v" id="dash-llmkey">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ TAB 2 — SEATS & TOKENS ══ -->
+  <div class="view hidden" data-view="seats">
+    <div class="section-label" data-i18n="seats.title">Seats <span class="pill-note">up to 5 · FOSS</span></div>
+    <div class="panel">
+      <p class="hint" style="margin-top:0" data-i18n="seats.help">
+        A seat is one end-user memory store, scoped to its own database schema. Minting a seat
+        returns a connection token <strong>once</strong> — store it immediately. Wire it into your
+        chat client as a Bearer token. Each seat is identified by its <code>user_id</code>.
+      </p>
+      <div class="form-row" style="margin-bottom:10px">
+        <input type="text" id="seat-label" class="fl-in" placeholder="optional label (e.g. jane-laptop)" autocomplete="off" style="max-width:320px">
+        <button class="btn accent" id="btn-seat-mint" data-i18n="seats.mint">＋ mint seat</button>
+        <span class="pill-note" id="seat-cap-note">0 / 5</span>
+      </div>
+      <div class="msg" id="seat-mint-msg"></div>
+      <div id="seat-cap-touchpoint" class="touchpoint hidden"></div>
+    </div>
+
+    <div class="section-label" data-i18n="seats.list">Seat roster</div>
+    <div class="panel tight">
+      <table>
+        <thead><tr>
+          <th data-i18n="seats.col.label">Label</th>
+          <th>user_id</th>
+          <th data-i18n="seats.col.created">Created</th>
+          <th data-i18n="seats.col.status">Status</th>
+          <th style="text-align:right" data-i18n="seats.col.actions">Actions</th>
+        </tr></thead>
+        <tbody id="seats-body"></tbody>
+      </table>
+      <div class="empty hidden" id="seats-empty" data-i18n="seats.empty">no seats yet — mint one above</div>
+      <div class="msg" id="seats-msg"></div>
+    </div>
+    <div class="panel tight hidden" id="seat-detail"></div>
+  </div>
+
+  <!-- ══ TAB 3 — LLM BRAIN ══ -->
+  <div class="view hidden" data-view="brain">
+    <div class="section-label" data-i18n="brain.title">LLM Brain <span class="pill-note">connect your model</span></div>
+    <div class="panel">
+      <details class="help-strip">
+        <summary data-i18n="brain.what">What is the Brain?</summary>
+        <div class="help-body">
+          <p>The Brain is the LLM backend FaultLine talks to for extraction and recall. It is a model
+            <em>you</em> already run — Ollama, LM Studio, OpenWebUI, or a hosted API. FaultLine does
+            not host one. Point it at host + port (no path); the correct API path is appended from
+            the backend type.</p>
+        </div>
+      </details>
+      <div class="form-grid">
+        <div class="field">
+          <span class="lbl" data-i18n="brain.type">Backend type</span>
+          <select id="llm-type"></select>
+        </div>
+        <div class="field">
+          <span class="lbl" data-i18n="brain.baseurl">Base URL <span class="pill-note">host + port, no path</span></span>
+          <input type="text" id="llm-baseurl" autocomplete="off" placeholder="http://host.docker.internal:11434">
+        </div>
+        <div class="field">
+          <span class="lbl" data-i18n="brain.model">Model <span class="pill-note">optional</span></span>
+          <input type="text" id="llm-model" autocomplete="off" placeholder="leave blank for backend default">
+        </div>
+        <div class="field">
+          <span class="lbl"><span data-i18n="brain.apikey">API key</span> <span class="pill-note" id="llm-key-note">not set</span></span>
+          <input type="password" id="llm-apikey" autocomplete="off" placeholder="write-only — leave blank to keep">
+        </div>
+      </div>
+      <div class="form-row">
+        <button class="btn accent" id="btn-llm-save" data-i18n="brain.save">▸ save Brain config</button>
+        <button class="btn" id="btn-llm-test" data-i18n="brain.test">⚡ test connection</button>
+      </div>
+      <div class="msg" id="llm-msg"></div>
+    </div>
+  </div>
+
+  <!-- ══ TAB 4 — OPENWEBUI ══ -->
+  <div class="view hidden" data-view="openwebui">
+    <div class="section-label" data-i18n="owui.title">OpenWebUI integration</div>
+    <div class="panel">
+      <div class="kv"><span class="k" data-i18n="owui.mcp">MCP tool URL</span><span class="v mono-id" id="owui-url">—</span></div>
+      <div class="kv"><span class="k" data-i18n="owui.keyset">MCP key set</span><span class="v" id="owui-keyset">—</span></div>
+      <div class="form-row" style="margin-top:10px">
+        <button class="btn" id="btn-owui-rotate" data-i18n="owui.rotate">↻ rotate MCP key</button>
+      </div>
+      <div class="msg" id="owui-msg"></div>
+    </div>
+
+    <div class="section-label" data-i18n="owui.steps.title">Connect OpenWebUI (recommended path)</div>
+    <div class="panel">
+      <p class="hint" style="margin-top:0" data-i18n="owui.steps.intro">
+        The supported path is the <strong>OpenAPI tool server</strong> — it reliably forwards the
+        per-user identity header FaultLine scopes on. Verified against OpenWebUI v0.10.x; paths
+        apply from v0.6.31+.
+      </p>
+      <ol class="steps">
+        <li><strong>Settings → Tools → <code>+</code></strong> (Manage Tool Servers). For an instance-wide server, use <strong>Admin Settings → Tools</strong>.</li>
+        <li><strong>URL:</strong> <code id="owui-step-url">http://faultline-mcp:8002</code> (same Docker network) or <code>http://&lt;host&gt;:8002</code>. If the modal pre-fills <code>https://</code>, change it to <code>http://</code> for a local server, then hit refresh.</li>
+        <li><strong>Auth:</strong> <code>Bearer</code> → your MCP key (or a per-seat token).</li>
+        <li>Set <code>ENABLE_FORWARD_USER_INFO_HEADERS=true</code> in OpenWebUI's environment so each user's memory is scoped to them via the <code>X-OpenWebUI-User-Id</code> header. Without it, per-user memory will not work.</li>
+        <li>OpenWebUI reads <code>/openapi.json</code> and surfaces <code>recall_memory</code>, <code>remember_facts</code>, <code>retract_fact</code> as tools in every conversation.</li>
+      </ol>
+      <div class="pre-head"><span class="lbl" data-i18n="owui.filter">Filter script (legacy inlet/outlet)</span>
+        <button class="btn sm" id="btn-owui-copy-filter" data-i18n="owui.copy">⎘ copy</button></div>
+      <pre id="owui-filter"><code data-i18n="owui.filter.placeholder">-- backend wiring pending -- the live filter script is served by GET /api/dashboard/openwebui</code></pre>
+      <div class="touchpoint" data-i18n="owui.weak">
+        Weak model won't call the tools? Switch <strong>Chat Controls → Advanced Params → Function
+        Calling → Legacy</strong>. The legacy inlet/outlet Filter lives in
+        <code>openwebui/faultline_function.py</code> (Workspace → Functions) for automatic injection.
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ TAB 5 — HELP ══ -->
+  <div class="view hidden" data-view="help">
+    <div class="section-label" data-i18n="help.tour">Guided tour</div>
+    <div class="panel">
+      <p class="hint" style="margin-top:0" data-i18n="help.tour.intro">
+        A 5-stop walkthrough of this console. Runs once on first visit; replay anytime.
+      </p>
+      <button class="btn accent" id="btn-tour" data-i18n="help.tour.start">▸ start the tour</button>
+    </div>
+
+    <div class="section-label" data-i18n="help.memory">How memory works</div>
+    <div class="panel">
+      <p>FaultLine stores facts as <strong>typed relationships</strong> in a structured graph — not
+        summarised text blobs, not document chunks. Every message is scanned for facts worth keeping;
+        facts pass a validation gate before storage, so hallucinated details are rejected at the gate.</p>
+      <p>Memories strengthen with confirmation; corrections archive the old value cleanly.</p>
+      <pre>You:  "I'm a sysadmin. My main workstation is DevBox, IP 10.0.1.5."
+
+Later:
+You:  "What do you know about DevBox?"
+AI:   "DevBox is your workstation, IP address 10.0.1.5."</pre>
+      <pre>You:  "Actually DevBox moved to 10.0.1.10 after the network change."
+
+Later:
+You:  "What's DevBox's IP?"
+AI:   "DevBox has IP address 10.0.1.10."</pre>
+    </div>
+
+    <div class="section-label" data-i18n="help.expand">/expand — domain intelligence</div>
+    <div class="panel">
+      <p>Most memory systems store flat facts. <code>/expand</code> teaches FaultLine how a
+        <em>domain</em> works — the structure, the relationships, the vocabulary — so facts about it
+        land correctly and mean something.</p>
+      <pre>/expand networking
+/expand kubernetes online https://kubernetes.io/docs/concepts/
+/expand tls online https://www.rfc-editor.org/rfc/rfc8446</pre>
+      <p class="hint">Without a URL it reasons from training knowledge. With one, it reads the source
+        and builds the ontology from it. Everything <code>/expand</code> builds is still correctable
+        by you — your correction wins.</p>
+    </div>
+
+    <div class="section-label" data-i18n="help.correct">Corrections &amp; retractions</div>
+    <div class="panel">
+      <p>Corrections update the record cleanly; the old value is archived, not lost. Say
+        <em>"actually, …"</em> or <em>"no, …"</em> and the corrected fact replaces the stale one.</p>
+      <p>To remove a fact, say <em>"forget X"</em> (naming one subject). The
+        <code>retract_fact</code> tool backs both. Retraction is narrow by design — it targets the
+        one fact you named, never a broad wipe.</p>
+    </div>
+
+    <div class="section-label" data-i18n="help.connect">Connect a model</div>
+    <div class="panel">
+      <p>FaultLine hooks into an LLM you already run — it does not host one. Point the
+        <strong>LLM Brain</strong> tab at host + port and pick a backend type. Local servers
+        (Ollama, LM Studio) need no key; hosted APIs (OpenAI, Anthropic, Groq) do.</p>
+      <p>Your chat client is separate: it talks to the MCP server on <code>:8002</code> with a
+        per-seat token. See the <strong>OpenWebUI</strong> tab for the supported wiring.</p>
+    </div>
+  </div>
+
+  <!-- ══ TAB 6 — FOSS vs SaaS ══ -->
+  <div class="view hidden" data-view="compare">
+    <div class="section-label" data-i18n="cmp.title">FOSS vs SaaS <span class="pill-note">honest · side by side</span></div>
+    <div class="panel">
+      <p class="hint" style="margin-top:0" data-i18n="cmp.intro">
+        The same engine, two ways to run it. This is factual, not salesy — pick what fits.
+      </p>
+      <table class="compare">
+        <thead><tr>
+          <th></th>
+          <th data-i18n="cmp.foss">Self-hosted (FOSS)</th>
+          <th data-i18n="cmp.saas">FaultLine SaaS</th>
+        </tr></thead>
+        <tbody>
+          <tr><td class="row-label" data-i18n="cmp.row.license">License</td>
+            <td class="col-foss">AGPL v3 — self-host</td>
+            <td class="col-saas">Managed SaaS at faultline.ca</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.seats">Seats</td>
+            <td class="col-foss">Up to 5</td>
+            <td class="col-saas">Unlimited</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.hosting">Hosting</td>
+            <td class="col-foss">Your machine / your network</td>
+            <td class="col-saas">Managed at faultline.ca</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.brain">LLM Brain</td>
+            <td class="col-foss">Bring your own model</td>
+            <td class="col-saas">Bring your own (per seat)</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.data">Data location</td>
+            <td class="col-foss">Stays on your machine</td>
+            <td class="col-saas">Managed tenant on the platform</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.updates">Updates</td>
+            <td class="col-foss">You pull &amp; redeploy</td>
+            <td class="col-saas">Automatic</td></tr>
+          <tr class="divider"><td class="row-label" data-i18n="cmp.row.audit">Audit log / event history</td>
+            <td class="col-foss">Not in FOSS</td>
+            <td class="col-saas">Included</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.multi">Multi-tenant isolation</td>
+            <td class="col-foss">Single-instance, schema-per-user</td>
+            <td class="col-saas">Per-account, managed</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.serve">Serve / Train (read-only agent) mode</td>
+            <td class="col-foss">Not in FOSS</td>
+            <td class="col-saas">Included</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.support">Support</td>
+            <td class="col-foss">Community (issues)</td>
+            <td class="col-saas">Professional</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.auth">Control-plane auth</td>
+            <td class="col-foss">Single operator token</td>
+            <td class="col-saas">Operator logins + MFA</td></tr>
+          <tr><td class="row-label" data-i18n="cmp.row.price">Price</td>
+            <td class="col-foss">Free</td>
+            <td class="col-saas">Subscription</td></tr>
+        </tbody>
+      </table>
+      <a class="link-button" href="https://faultline.ca" target="_blank" rel="noopener" data-i18n="cmp.cta">Explore FaultLine SaaS → https://faultline.ca</a>
+    </div>
+  </div>
+
+</main>
+</section>
+
+<footer data-i18n="footer">FAULTLINE · WRITE-VALIDATED MEMORY · FOSS · AGPL V3</footer>
+
+<!-- ── generic confirm modal ── -->
+<div class="modal-back hidden" id="modal">
+  <div class="modal">
+    <h3 id="modal-title">Confirm</h3>
+    <p id="modal-body" class="muted"></p>
+    <div id="modal-extra"></div>
+    <div class="row">
+      <button class="btn sm" id="modal-cancel" data-i18n="modal.cancel">cancel</button>
+      <button class="btn sm danger" id="modal-ok" data-i18n="modal.confirm">confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── secret reveal modal ── -->
+<div class="modal-back hidden" id="reveal">
+  <div class="modal">
+    <h3 id="reveal-title">Token</h3>
+    <p class="hint" id="reveal-warn"></p>
+    <div class="reveal-secret">
+      <div class="secret" id="reveal-secret"></div>
+      <div class="form-row">
+        <button class="btn accent sm" id="reveal-copy" data-i18n="reveal.copy">⎘ copy to clipboard</button>
+      </div>
+      <div class="msg" id="reveal-msg"></div>
+    </div>
+    <div class="row">
+      <button class="btn sm" id="reveal-close" data-i18n="reveal.close">I've stored it — close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── first-run tour prompt ── -->
+<div class="firstrun-prompt hidden" id="firstrun">
+  <h4 data-i18n="tour.welcome">Welcome</h4>
+  <p data-i18n="tour.firstrun">New here? Take a 30-second tour of the control plane.</p>
+  <div class="actions">
+    <button class="btn sm" id="firstrun-dismiss" data-i18n="tour.dismiss">later</button>
+    <button class="btn sm accent" id="firstrun-go" data-i18n="tour.go">▸ start tour</button>
+  </div>
+</div>
+
+<script src="./strings.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
