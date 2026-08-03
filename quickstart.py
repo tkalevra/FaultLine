@@ -243,7 +243,7 @@ _DEFAULT_MODEL = {
 
 def configure_backend():
     backend = choose(
-        "Quale LLM stai già usando? (FaultLine si collega ad esso — non ne ospita uno)",
+        "¿Qué LLM estás usando ya? (FaultLine se conecta a él — no aloja ninguno)",
         _BACKENDS,
     )
     cfg = {"LLM_BACKEND_TYPE": backend, "LLM_API_KEY": "", "WGM_LLM_MODEL": "", "LLM_BASE_URL": ""}
@@ -325,7 +325,7 @@ def configure_embeddings(llm_cfg):
     embed model might be on another box), then we do an ACTUAL model pull against
     it (probe → pick from the served list, no blind typing).
     """
-    print(bold("Embedding") + dim("  (vettorizza i fatti per la corsia di richiamo a breve termine, Classe C)"))
+    print(bold("Embeddings") + dim("  (vectoriza los hechos para la vía de recuperación a corto plazo, Clase C)"))
     print(dim("  FaultLine has a built-in LOCAL CPU embedder (nomic) — works out of the box,"))
     print(dim("  offline, no setup."))
     if not ask_yes("Choose your own embedding model, or use the standard built-in one?", default_yes=False):
@@ -402,7 +402,7 @@ def configure_identity():
         opts.insert(0, ("reuse", f"Keep the id already in .env  ({existing})"))
 
     while True:
-        mode = choose("Imposta il tuo FAULTLINE_USER_ID (il proprietario del tenant di memoria):", opts)
+        mode = choose("Configura tu FAULTLINE_USER_ID (el propietario del tenant de memoria):", opts)
 
         if mode == "reuse":
             return existing
@@ -483,7 +483,7 @@ def configure_naming():
     Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
     DB that isn't up yet (the stack may not be built).
     """
-    print(bold("Nomi delle risorse") + dim("  (DB Postgres, prefisso schema per-tenant, collezione Qdrant)"))
+    print(bold("Nombres de los recursos") + dim("  (BD Postgres, prefijo de esquema por tenant, colección Qdrant)"))
     print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
     base_dsn = _default_dsn()
 
@@ -567,7 +567,7 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
 # ── next steps ────────────────────────────────────────────────────────────────
 def print_next_steps(mcp_key):
     hr()
-    print(bold("Tutto pronto. Prossimi passi:\n"))
+    print(bold("Todo listo. Siguientes pasos:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
     print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
     print(f"       expect: {dim(chr(34) + 'database:ok, qdrant:ok, llm:ok' + chr(34))}")
@@ -801,7 +801,7 @@ def _switch_branch_and_reexec(targets, note):
     → print a note and return so setup continues in the current branch's language."""
     if _current_branch() is None:
         print(yellow("  ! Not a git checkout — cannot switch language automatically."
-                     "  (Non e un checkout git — impossibile cambiare lingua automaticamente.)"))
+                     "  (No es un checkout de git — no se puede cambiar de idioma automaticamente.)"))
         return
     print(dim(f"  {note}"))
     for t in targets:
@@ -817,7 +817,7 @@ def _switch_branch_and_reexec(targets, note):
             # checkout replaced quickstart.py on disk → re-exec runs the NEW branch's version.
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
     print(red("  ✗ Could not switch branch (uncommitted changes? offline?). Continuing as-is."
-              "  (Impossibile cambiare ramo — continuo cosi com'e.)"))
+              "  (No se pudo cambiar de rama — se continua tal cual.)"))
 
 
 def language_gate():
@@ -871,10 +871,10 @@ def main():
     # LANGUAGE FIRST — before prereqs / .env. Italian switches to the `it` branch and re-execs.
     language_gate()
 
-    print(bold(cyan("\n  FaultLine — installazione rapida  (ramo IT — sperimentale)\n")))
-    print("  Una memoria a grafo della conoscenza, per tenant e validata in scrittura, per il tuo LLM.")
-    print(dim("  Si collega al tuo LLM, lo verifica e scrive un file .env pronto all'uso."))
-    print(yellow("  ⚠ Versione sperimentale e non ufficiale — vedi LEGGIMI-it.md. Usare a proprio rischio.\n"))
+    print(bold(cyan("\n  FaultLine — instalación rápida  (rama ES — experimental)\n")))
+    print("  Una memoria de grafo de conocimiento, por tenant y validada en escritura, para tu LLM.")
+    print(dim("  Se conecta a tu LLM, lo verifica y escribe un archivo .env listo para usar."))
+    print(yellow("  ⚠ Versión experimental y no oficial — consulta LEEME-es.md. Úsala bajo tu propia responsabilidad.\n"))
     hr()
     check_prereqs()
     hr()
@@ -885,12 +885,12 @@ def main():
     embed_overrides = configure_embeddings(cfg)
 
     hr()
-    print(bold("Chiave API MCP") + dim("  (protegge il server MCP su :8002 — consigliata)"))
-    if ask_yes("Genero subito una MCP_API_KEY robusta?", default_yes=True):
+    print(bold("Clave API MCP") + dim("  (protege el servidor MCP en :8002 — recomendada)"))
+    if ask_yes("¿Genero ahora una MCP_API_KEY robusta?", default_yes=True):
         mcp_key = secrets.token_urlsafe(32)
-        print(green(f"  ✓ generata: {mcp_key}"))
+        print(green(f"  ✓ generada: {mcp_key}"))
     else:
-        mcp_key = ask("Inserisci una MCP_API_KEY (vuoto = aperta, solo sviluppo)", "")
+        mcp_key = ask("Introduce una MCP_API_KEY (vacío = abierta, solo desarrollo)", "")
 
     hr()
     faultline_user_id = configure_identity()
@@ -903,12 +903,12 @@ def main():
     print_next_steps(mcp_key)
 
     print()
-    if ask_yes("Compilo e avvio lo stack ora (docker compose up -d --build)?", default_yes=False):
+    if ask_yes("¿Construyo e inicio el stack ahora (docker compose up -d --build)?", default_yes=False):
         try:
             subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=HERE, check=False)
             _poll_health()
         except Exception as e:
-            print(red(f"  impossibile avviare docker compose: {e}"))
+            print(red(f"  no se pudo iniciar docker compose: {e}"))
 
     print_integration_guide(mcp_key, faultline_user_id)
 
