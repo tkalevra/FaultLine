@@ -28,6 +28,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # MUST be a BUILD ARG, not just runtime env: the model wheel is BAKED into the image
+        # (Dockerfile `ARG SPACY_MODEL`). Setting SPACY_MODEL only in .env would leave the
+        # image carrying the English model while the runtime asked for another one — and the
+        # linguistic layer NO-OPs silently when the requested model isn't baked. That would
+        # make a non-English language choice quietly half-inert.
+        #
+        # ⚠️ NOT A PARITY CLAIM. The spine's dependency chains are built and validated against
+        # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
+        # text; it does not make the chains correct for that language. Portable in principle
+        # (the UD features they key on exist in these models), UNMEASURED in practice.
+        SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
     image: faultline:latest
     container_name: faultline-api
     ports:
