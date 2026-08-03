@@ -59,6 +59,8 @@ COPY --from=builder /root/.cache /root/.cache
 COPY src/       ./src/
 COPY migrations/ ./migrations/
 COPY tools/     ./tools/
+COPY webui/     ./webui/
+COPY openwebui/ ./openwebui/
 COPY docker-entrypoint.sh ./
 
 RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh

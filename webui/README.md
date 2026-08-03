@@ -13,10 +13,27 @@ honest FOSS-vs-SaaS comparison.
 
 ## Serve it
 
-This UI is static and is intended to be served by the FaultLine backend at **`/`** (or
-**`/dashboard`**), behind operator auth, on the same origin as the control API. The backend
-wiring (mount point + the `/api/dashboard/*` handlers) is owned by a separate change; this tree
-is the front-end only.
+This UI is static and is served by the **FaultLine backend itself** at **`/`** on
+port `8000` — the same origin as the control API, so the relative `/api/dashboard/*`
+calls work with no CORS config. The backend serves `webui/` as a catch-all static
+mount *after* all explicit routes (`/health`, `/api/dashboard/*`, `/openapi.json`),
+so the API is never shadowed. No extra service/container is needed.
+
+The static assets themselves are not auth-gated (the login page must render); only
+the `/api/dashboard/*` handlers require the operator bearer. Every dashboard call
+sends `Authorization: Bearer <FAULTLINE_ADMIN_TOKEN>`; 401 on missing/mismatch
+(constant-time compare).
+
+**Operator token (`FAULTLINE_ADMIN_TOKEN`):**
+- **Unset** → the backend auto-mints a random one on first boot and prints it to the
+  container logs (search for `FAULTLINE_ADMIN_TOKEN`). Paste that into the sign-in.
+- **Set** (in `.env` / the compose `environment:` block) → that exact value is the login.
+
+The seat cap (`FOSS_MAX_SEATS = 5`) is enforced **server-side** — it is a source
+constant in `src/api/dashboard.py`, **not** an env var. The webui's 5-seat disable is
+UX only; the `POST /api/dashboard/seats` handler counts active seats from the DB under
+a transaction advisory lock and returns **409** at the cap (race-free). Bumping the cap
+requires editing the source and redeploying.
 
 To preview standalone during development, any static file server works:
 
@@ -25,9 +42,6 @@ To preview standalone during development, any static file server works:
 python -m http.server 8090 --directory webui
 # then open http://localhost:8090/  (the API calls will be "pending" until a backend is wired)
 ```
-
-The operator pastes their **admin token** once; it is stored in `localStorage` and sent as
-`Authorization: Bearer <token>` on every call. Sign out clears it.
 
 ---
 
@@ -64,6 +78,20 @@ served same-origin. Endpoints not yet implemented on the backend are rendered as
 | POST   | `/api/dashboard/llm/test`                    | `{ok:true, latency_ms}` or `{ok:false, error}`                                |
 | GET    | `/api/dashboard/openwebui`                   | `{mcp_url, api_key_set, filter_script}`                                       |
 | POST   | `/api/dashboard/openwebui/rotate-key`        | `{api_key}` (new key, shown once)                                             |
+
+**Additive** (not called by this version of the webui, but backed for curl / future UI):
+
+| Method | Path                                         | Result                                                                        |
+|--------|----------------------------------------------|-------------------------------------------------------------------------------|
+| GET    | `/api/dashboard/actions`                     | `{actions:[{ts, action, target_user_id?, detail?}]}` last 25 operator actions |
+
+**Seat tokens are real credentials, not cosmetic.** When a client presents a minted seat
+token as `Authorization: Bearer <seat-token>` to the MCP server (`:8002`), the MCP server
+hashes it and resolves it to the seat's `user_id` from `dashboard_seats` — that UUID becomes
+the authenticated principal, and `bind_tenant`'s per-token identity path activates
+automatically (the token IS the identity; the `X-OpenWebUI-User-Id` header becomes a
+cross-check, not the source of truth). So minting a seat and pasting the token into OpenWebUI
+genuinely scopes that connection's memory to that seat.
 
 **Backend types** (`GET/PUT /api/dashboard/llm`) — the exact list from `.env.example` /
 `docker-compose.yml`:

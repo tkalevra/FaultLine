@@ -10162,6 +10162,35 @@ async def lifespan(app: FastAPI):
 
     # dprompt-41: validate startup config (fail fast)
     _validate_startup_config()
+
+    # FOSS control plane: apply the persisted LLM Brain override (written by the
+    # webui) BEFORE the chat URL is resolved, so a config saved from the console
+    # is authoritative across restarts. Idempotent + fail-safe.
+    try:
+        from src.api.dashboard import apply_persisted_llm_override
+        apply_persisted_llm_override()
+    except Exception as e:  # noqa: BLE001 — must never block startup
+        log.warning("startup.llm_override_apply_failed", error=str(e)[:160])
+
+    # FOSS control plane: ensure an operator bearer exists. If FAULTLINE_ADMIN_TOKEN
+    # is unset, mint a random one for this process and log it ONCE (the webui's login
+    # help documents this first-boot behaviour). Operators who want a known token set
+    # it in .env / the compose environment block.
+    if not (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip():
+        import secrets as _secrets
+        os.environ["FAULTLINE_ADMIN_TOKEN"] = _secrets.token_urlsafe(32)
+        log.info("startup.admin_token_auto_minted",
+                 token=os.environ["FAULTLINE_ADMIN_TOKEN"])
+        print(
+            "====================================================================\n"
+            "FAULTLINE_ADMIN_TOKEN (auto-generated for this instance):\n"
+            f"  {os.environ['FAULTLINE_ADMIN_TOKEN']}\n"
+            "Paste this into the control-plane webui sign-in. To pin a known\n"
+            "token, set FAULTLINE_ADMIN_TOKEN in the environment and restart.\n"
+            "====================================================================",
+            flush=True,
+        )
+
     _LLM_URL = _get_llm_url()
 
     # Initialize persistent HTTP clients for pooled connections
@@ -40208,3 +40237,40 @@ async def learn_topic(req: LearnTopicRequest):
     except Exception as e:
         log.error("learn_topic.ingest_failed", topic=topic, error=str(e))
         return {"status": "error", "topic": topic, "detail": str(e), "committed": 0, "staged": 0, "total": 0}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FOSS control plane — dashboard API + webui static mount
+#
+# The dashboard router (/api/dashboard/*) is operator-bearer-authed and drives
+# the running stack: seats+tokens, the LLM Brain, MCP key rotation, health. The
+# webui/ static assets are mounted at "/" LAST so explicit routes (/health,
+# /api/dashboard/*, /openapi.json, …) are matched before the catch-all static
+# serve. No extra service/container is needed — the backend on :8000 serves both
+# the console and the API on one origin.
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from src.api.dashboard import router as _dashboard_router
+    app.include_router(_dashboard_router)
+except Exception as _dashboard_err:  # noqa: BLE001 — never block the app from starting
+    log.error("startup.dashboard_router_failed", error=str(_dashboard_err)[:200])
+
+try:
+    from fastapi.staticfiles import StaticFiles  # type: ignore
+    import glob as _glob
+    # Resolve the webui/ dir: repo root (local + /app in the image, which COPYs
+    # webui/ next to src/). Falls through to /app/webui explicitly for the image.
+    _webui_candidates = [
+        os.path.join(os.getcwd(), "webui"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "webui"),
+        "/app/webui",
+    ]
+    _webui_dir = next((p for p in _webui_candidates
+                       if os.path.isdir(p) and os.path.isfile(os.path.join(p, "index.html"))), None)
+    if _webui_dir:
+        app.mount("/", StaticFiles(directory=_webui_dir, html=True), name="foss-webui")
+        log.info("startup.webui_served", path=_webui_dir)
+    else:
+        log.warning("startup.webui_dir_not_found", searched=_webui_candidates)
+except Exception as _webui_err:  # noqa: BLE001
+    log.error("startup.webui_mount_failed", error=str(_webui_err)[:200])
