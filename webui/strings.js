@@ -22,6 +22,9 @@
   'use strict';
 
   var STRINGS = {
+    "lic.line": "Distribuito con licenza GNU Affero General Public License v3 \u2014 libero di essere eseguito, studiato, modificato e condiviso.",
+    "lic.contact": "Per autorizzazioni o collaborazioni,",
+    "lic.full": "leggi la licenza completa",
     "sb.scope.signedout": "non autenticato",
     "sb.scope.signedin":  "operatore",
     "sb.instance": "istanza",
@@ -129,13 +132,6 @@
     "reveal.token.warn": "Conservalo ora — non verrà mostrato di nuovo. Questo è un token di POSTAZIONE: usalo come token Bearer in un client a utente singolo come Claude Desktop o opencode. OpenWebUI non usa i token di postazione — configuralo invece una sola volta con la chiave MCP di questa istanza.",
     "reveal.mcpkey.title": "Nuova chiave MCP — mostrata una sola volta",
     "reveal.mcpkey.warn": "Conservala ora. Non verrà mostrata di nuovo. La chiave precedente smette di funzionare immediatamente.",
-
-    "lic.badge": "AGPL v3",
-    "lic.sub": "software libero — con obblighi",
-    "lic.body": "FaultLine FOSS è concesso in licenza secondo la GNU Affero General Public License v3. Puoi eseguirlo, studiarlo, modificarlo e condividerlo liberamente. A questo si accompagnano due condizioni: se lo modifichi e ne consenti l'uso ad altri attraverso una rete, devi offrire loro il codice sorgente modificato; e tutto ciò che ridistribuisci resta sotto la stessa licenza.",
-    "lic.scope": "Questa è l'edizione self-hosted. La tua memoria, il tuo database, il tuo endpoint del modello — a noi non viene inviato nulla. Effettuando l'accesso, gestisci la tua istanza secondo questi termini.",
-    "lic.full": "leggi la licenza completa",
-    "lic.gnu": "AGPL v3 su gnu.org",
 
     "tour.welcome": "Benvenuto",
     "tour.firstrun": "È la prima volta? Fai un tour di 30 secondi del pannello di controllo.",
