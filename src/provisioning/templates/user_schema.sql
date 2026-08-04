@@ -210,6 +210,15 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
     id SERIAL PRIMARY KEY,
     entity_id TEXT NOT NULL,
     alias TEXT NOT NULL,
+    -- OBSERVED CASING OVERLAY of `alias` (migration 214). NULL = no casing was observed for
+    -- this name, and the renderer falls back to `alias` — i.e. today's lowercase output.
+    -- INVARIANT, enforced in Python at the write seam (src/extraction/display_case.py), NOT
+    -- as a SQL CHECK: lower(display_form) = alias. It is a CASING overlay and can never be a
+    -- second, divergent name. `alias` stays the matching/dedup/UUID-v5/ON CONFLICT key and is
+    -- read by everything except the ONE sanctioned read-time presentation seam in /query.
+    -- (No CHECK because PostgreSQL's collation-dependent lower() can disagree with Python's
+    -- str.lower() on non-ASCII, and a violation there would cost the user's whole sentence.)
+    display_form TEXT DEFAULT NULL,
     is_preferred BOOLEAN NOT NULL DEFAULT false,
     preference_source TEXT NOT NULL DEFAULT 'unspecified',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
