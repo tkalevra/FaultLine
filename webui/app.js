@@ -241,15 +241,42 @@ function startHealthPolling() {
   S.healthTimer = setInterval(loadHealth, 10000);
 }
 
-function healthPill(name, state) {
+/* A health value is EITHER a scalar state ("ok") or a DETAIL OBJECT — the backend
+   returns an object for re_embedder and llm_config. String()-ing an object yields
+   the literal "[object Object]", which is exactly what this card used to print.
+   Objects are reduced to a derived state plus a compact detail line; the state
+   comes from any error signal present, so a failing re-embedder still moves the
+   status dot instead of being silently swallowed as "unknown". */
+function healthSummary(v) {
+  if (v == null || v === '') return { state: '', detail: '', full: '' };
+  if (typeof v !== 'object') return { state: String(v).toLowerCase(), detail: '', full: '' };
+
+  var failed = v.error != null || v.last_error != null ||
+               (typeof v.error_count === 'number' && v.error_count > 0);
+  var parts = [], full = [];
+  Object.keys(v).forEach(function (k) {
+    var val = v[k];
+    if (val == null || val === '' || typeof val === 'object') return;
+    var label = k.replace(/_/g, ' ');
+    var s = String(val);
+    full.push(label + ' ' + s);
+    parts.push(label + ' ' + (s.length > 32 ? s.slice(0, 31) + '…' : s));
+  });
+  return { state: failed ? 'degraded' : 'ok', detail: parts.join(' · '), full: full.join('\n') };
+}
+
+function healthPill(name, sum) {
   var cls = 'status-pill ' + ({
     ok: 'ok', up: 'ok', healthy: 'ok', true: 'ok',
     down: 'down', false: 'down', unhealthy: 'down', error: 'down',
     warn: 'warn', degraded: 'warn'
-  }[String(state).toLowerCase()] || 'unknown');
-  var label = (state == null || state === '') ? '—' : String(state).toLowerCase();
-  return '<div class="health-card"><div class="hc-label">' + esc(name) + '</div>' +
-    '<div class="hc-state"><span class="' + cls + '">' + esc(label) + '</span></div></div>';
+  }[sum.state] || 'unknown');
+  var label = sum.state === '' ? '—' : sum.state;
+  return '<div class="health-card"' + (sum.full ? ' title="' + esc(sum.full) + '"' : '') + '>' +
+    '<div class="hc-label">' + esc(name) + '</div>' +
+    '<div class="hc-state"><span class="' + cls + '">' + esc(label) + '</span></div>' +
+    (sum.detail ? '<div class="hc-detail">' + esc(sum.detail) + '</div>' : '') +
+    '</div>';
 }
 
 function loadHealth() {
@@ -269,14 +296,15 @@ function loadHealth() {
     setMsg('dash-health-msg', '', '');
     var d = r.data || {};
     var anyDown = false, anyWarn = false;
-    function mark(v) { var s = String(v).toLowerCase(); if (['down','false','unhealthy','error'].indexOf(s) >= 0) anyDown = true; else if (s === 'warn' || s === 'degraded') anyWarn = true; }
-    ['database','qdrant','llm','re_embedder','llm_config'].forEach(function (k) { mark(d[k]); });
-    box.innerHTML =
-      healthPill('database', d.database) +
-      healthPill('qdrant', d.qdrant) +
-      healthPill('llm', d.llm) +
-      healthPill('re-embedder', d.re_embedder) +
-      healthPill('llm config', d.llm_config);
+    function mark(s) { if (['down','false','unhealthy','error'].indexOf(s) >= 0) anyDown = true; else if (s === 'warn' || s === 'degraded') anyWarn = true; }
+    var html = '';
+    [['database','database'], ['qdrant','qdrant'], ['llm','llm'],
+     ['re_embedder','re-embedder'], ['llm_config','llm config']].forEach(function (pair) {
+      var sum = healthSummary(d[pair[0]]);
+      mark(sum.state);
+      html += healthPill(pair[1], sum);
+    });
+    box.innerHTML = html;
     dotState(anyDown ? 'down' : (anyWarn ? 'warn' : 'online'));
     $('sb-mode').textContent = anyDown ? 'degraded' : (anyWarn ? 'degraded' : t('sb.mode.online'));
   });
@@ -561,12 +589,15 @@ function fmtDate(v) {
 }
 
 /* ── guided tour (localStorage-only, no server sync) ───────────────────────── */
+/* Step COPY lives in strings.js like every other user-visible string — these are
+   i18n keys, resolved at render time so a translated build translates the tour
+   too. Only the selector is structural. */
 var TOUR_STEPS = [
-  { sel: '#statusbar',     title: 'Status bar',     body: 'Instance health, version, and the live status dot. Health polls every 10s.' },
-  { sel: '#tabs',          title: 'Six tabs',       body: 'Dashboard, Seats & Tokens, LLM Brain, OpenWebUI, Help, and the FOSS vs SaaS comparison.' },
-  { sel: '[data-tab="seats"]', title: 'Seats',      body: 'Mint up to 5 seats — one per person. Each token is shown ONCE, so store it immediately. A seat token is for a single-user client (Claude Desktop, opencode). OpenWebUI is different: wire it once on the OpenWebUI tab with the instance MCP key, and each signed-in user is scoped automatically.' },
-  { sel: '[data-tab="brain"]', title: 'LLM Brain',  body: 'Point FaultLine at a model you already run (Ollama, LM Studio, OpenWebUI, or a hosted API). Restart the backend after saving.' },
-  { sel: '[data-tab="openwebui"]', title: 'OpenWebUI', body: 'The supported wiring path and your MCP tool URL. Rotate the MCP key anytime.' }
+  { sel: '#statusbar',            title: 'tour.s1.title', body: 'tour.s1.body' },
+  { sel: '#tabs',                 title: 'tour.s2.title', body: 'tour.s2.body' },
+  { sel: '[data-tab="seats"]',    title: 'tour.s3.title', body: 'tour.s3.body' },
+  { sel: '[data-tab="brain"]',    title: 'tour.s4.title', body: 'tour.s4.body' },
+  { sel: '[data-tab="openwebui"]',title: 'tour.s5.title', body: 'tour.s5.body' }
 ];
 
 function maybeOfferTour() {
@@ -600,11 +631,11 @@ function runTourStep(i) {
   document.body.appendChild(overlay);
 
   var card = document.createElement('div'); card.className = 'tour-card';
-  card.innerHTML = '<h4>' + esc((i + 1) + '. ' + step.title) + '</h4><p>' + esc(step.body) + '</p>' +
+  card.innerHTML = '<h4>' + esc((i + 1) + '. ' + t(step.title)) + '</h4><p>' + esc(t(step.body)) + '</p>' +
     '<div class="tour-actions">' +
-      (i > 0 ? '<button class="btn sm" data-act="prev">‹ back</button>' : '') +
-      '<button class="btn sm" data-act="skip">skip</button>' +
-      '<button class="btn sm accent" data-act="next">' + (i === TOUR_STEPS.length - 1 ? 'done' : 'next ›') + '</button>' +
+      (i > 0 ? '<button class="btn sm" data-act="prev">' + esc(t('tour.back')) + '</button>' : '') +
+      '<button class="btn sm" data-act="skip">' + esc(t('tour.skip')) + '</button>' +
+      '<button class="btn sm accent" data-act="next">' + esc(t(i === TOUR_STEPS.length - 1 ? 'tour.done' : 'tour.next')) + '</button>' +
     '</div>';
   document.body.appendChild(card);
   card.querySelector('[data-act="next"]').addEventListener('click', function (e) { e.stopPropagation(); runTourStep(i + 1); });
