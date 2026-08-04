@@ -116,10 +116,32 @@
     "reveal.mcpkey.title": "New MCP key — shown once",
     "reveal.mcpkey.warn": "Store this now. It will not be shown again. The old key stops working immediately.",
 
+    "lic.badge": "AGPL v3",
+    "lic.sub": "free software — with obligations",
+    "lic.body": "FaultLine FOSS is licensed under the GNU Affero General Public License v3. You may run, study, modify and share it freely. Two conditions come with that: if you modify it and let others use it over a network, you must offer them the modified source; and anything you redistribute stays under the same licence.",
+    "lic.scope": "This is the self-hosted edition. Your memory, your database, your model endpoint — nothing is sent to us. By signing in you are operating your own instance under these terms.",
+    "lic.full": "read the full licence",
+    "lic.gnu": "AGPL v3 at gnu.org",
+
     "tour.welcome": "Welcome",
     "tour.firstrun": "New here? Take a 30-second tour of the control plane.",
     "tour.dismiss": "later",
     "tour.go": "▸ start tour",
+    "tour.back": "‹ back",
+    "tour.skip": "skip",
+    "tour.next": "next ›",
+    "tour.done": "done",
+
+    "tour.s1.title": "Status bar",
+    "tour.s1.body": "Instance health, version, and the live status dot. Health polls every 10s.",
+    "tour.s2.title": "Six tabs",
+    "tour.s2.body": "Dashboard, Seats & Tokens, LLM Brain, OpenWebUI, Help, and the FOSS vs SaaS comparison.",
+    "tour.s3.title": "Seats",
+    "tour.s3.body": "Mint up to 5 seats — one per person. Each token is shown ONCE, so store it immediately. A seat token is for a single-user client (Claude Desktop, opencode). OpenWebUI is different: wire it once on the OpenWebUI tab with the instance MCP key, and each signed-in user is scoped automatically.",
+    "tour.s4.title": "LLM Brain",
+    "tour.s4.body": "Point FaultLine at a model you already run (Ollama, LM Studio, OpenWebUI, or a hosted API). Restart the backend after saving.",
+    "tour.s5.title": "OpenWebUI",
+    "tour.s5.body": "The supported wiring path and your MCP tool URL. Rotate the MCP key anytime.",
 
     "footer": "FAULTLINE · WRITE-VALIDATED MEMORY · FOSS · AGPL V3",
 

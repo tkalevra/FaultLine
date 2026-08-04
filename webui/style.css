@@ -232,6 +232,10 @@ input.fl-in:focus { outline: none; border-color: var(--accent); }
 }
 .health-card .hc-label { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
 .health-card .hc-state { display: flex; align-items: center; gap: 8px; }
+.health-card .hc-detail {
+  color: var(--muted); font-size: 10px; line-height: 1.6;
+  overflow-wrap: anywhere; word-break: break-word;
+}
 
 /* ── empty / messaging ──────────────────────────────────────── */
 .empty { color: var(--muted); font-size: 12px; padding: 10px 0; }
