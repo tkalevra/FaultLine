@@ -46,7 +46,7 @@
     "dash.llmkey": "LLM API key",
 
     "seats.title": "Seats",
-    "seats.help": "A seat is one end-user memory store, scoped to its own database schema. Minting a seat returns a connection token once — store it immediately. Wire it into your chat client as a Bearer token. Each seat is identified by its user_id.",
+    "seats.help": "A seat is one end-user memory store, scoped to its own database schema. Minting a seat returns a connection token once — store it immediately. Use it as the Bearer token in a single-user client (Claude Desktop, opencode); OpenWebUI is wired separately with the MCP key. Each seat is identified by its user_id.",
     "seats.mint":  "＋ mint seat",
     "seats.list":  "Seat roster",
     "seats.col.label": "Label",
@@ -54,7 +54,7 @@
     "seats.col.status": "Status",
     "seats.col.actions":"Actions",
     "seats.empty": "no seats yet — mint one above",
-    "seats.cap.reached": "FOSS edition supports up to 5 seats. Unlimited seats are available in the SaaS offering at https://faultline.ca",
+    "seats.cap.reached": "The FOSS edition supports up to 5 seats. Larger seat counts are available on the hosted plans \u2014 see https://faultline.ca/pricing",
     "seats.revoke.confirm": "Revoke this seat? Its memory store is preserved, but its connection token stops working immediately.",
 
     "brain.title": "LLM Brain",
@@ -112,7 +112,7 @@
     "reveal.copy": "⎘ copy to clipboard",
     "reveal.close": "I've stored it — close",
     "reveal.token.title": "Seat token — shown once",
-    "reveal.token.warn": "Store this now. It will not be shown again. Use it as the Bearer token in your chat client (OpenWebUI / Claude Desktop) for this seat.",
+    "reveal.token.warn": "Store this now \u2014 it will not be shown again. This is a SEAT token: use it as the Bearer token in a single-user client such as Claude Desktop or opencode. OpenWebUI does not use seat tokens \u2014 wire it once with this instance\u2019s MCP key instead.",
     "reveal.mcpkey.title": "New MCP key — shown once",
     "reveal.mcpkey.warn": "Store this now. It will not be shown again. The old key stops working immediately.",
 

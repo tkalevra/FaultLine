@@ -33,7 +33,11 @@ function esc(s) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
   });
 }
-function t(key) { return window.t ? window.t(key) : key; }
+/* NO local `t` here. A global `function t` (or `var t`) IS window.t, so ANY shim in this
+   file clobbers the one strings.js exports and ends up calling itself — RangeError on
+   load, before a single listener is wired. Function declarations HOIST, so capturing
+   `var _t = window.t` first does not help: the declaration wins. strings.js loads first
+   and its t() already falls back to the key when a string is missing. Just use it. */
 
 function applyI18n(root) {
   qsa('[data-i18n]', root || document).forEach(function (n) {
@@ -560,7 +564,7 @@ function fmtDate(v) {
 var TOUR_STEPS = [
   { sel: '#statusbar',     title: 'Status bar',     body: 'Instance health, version, and the live status dot. Health polls every 10s.' },
   { sel: '#tabs',          title: 'Six tabs',       body: 'Dashboard, Seats & Tokens, LLM Brain, OpenWebUI, Help, and the FOSS vs SaaS comparison.' },
-  { sel: '[data-tab="seats"]', title: 'Seats',      body: 'Mint up to 5 seats. Each token is shown ONCE — store it immediately. Wire it into OpenWebUI as a Bearer token.' },
+  { sel: '[data-tab="seats"]', title: 'Seats',      body: 'Mint up to 5 seats — one per person. Each token is shown ONCE, so store it immediately. A seat token is for a single-user client (Claude Desktop, opencode). OpenWebUI is different: wire it once on the OpenWebUI tab with the instance MCP key, and each signed-in user is scoped automatically.' },
   { sel: '[data-tab="brain"]', title: 'LLM Brain',  body: 'Point FaultLine at a model you already run (Ollama, LM Studio, OpenWebUI, or a hosted API). Restart the backend after saving.' },
   { sel: '[data-tab="openwebui"]', title: 'OpenWebUI', body: 'The supported wiring path and your MCP tool URL. Rotate the MCP key anytime.' }
 ];
