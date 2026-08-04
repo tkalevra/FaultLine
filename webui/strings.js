@@ -37,6 +37,7 @@
     "login.title": "Acceso de operador",
     "login.intro": "Pega tu token de administración una sola vez. Es el bearer del operador para la API de control de esta instancia, se guarda solo en este navegador y se envía como Authorization: Bearer en cada llamada.",
     "login.token": "Token de administración",
+    "login.token.note": "bearer del operador",
     "login.connect": "▸ conectar",
     "login.where": "¿Dónde consigo el token?",
 
@@ -54,6 +55,7 @@
     "dash.llmkey": "Clave API del LLM",
 
     "seats.title": "Puestos",
+    "seats.title.note": "hasta 5 · FOSS",
     "seats.help": "Un puesto es el almacén de memoria de un único usuario final, aislado en su propio esquema de base de datos. Al crear un puesto, el token de conexión se muestra una sola vez: guárdalo de inmediato. Úsalo como token Bearer en un cliente de usuario único (Claude Desktop, opencode); OpenWebUI se configura por separado con la clave MCP. Cada puesto se identifica por su user_id.",
     "seats.mint":  "＋ crear puesto",
     "seats.list":  "Lista de puestos",
@@ -66,10 +68,13 @@
     "seats.revoke.confirm": "¿Revocar este puesto? Su almacén de memoria se conserva, pero su token de conexión deja de funcionar de inmediato.",
 
     "brain.title": "Cerebro LLM",
+    "brain.title.note": "conecta tu modelo",
     "brain.what": "¿Qué es el Cerebro?",
     "brain.type": "Tipo de backend",
     "brain.baseurl": "Base URL",
+    "brain.baseurl.note": "host + puerto, sin ruta",
     "brain.model": "Modelo",
+    "brain.model.note": "opcional",
     "brain.apikey": "Clave API",
     "brain.save": "▸ guardar la configuración del Cerebro",
     "brain.test": "⚡ probar la conexión",
@@ -98,6 +103,7 @@
     "help.connect": "Conectar un modelo",
 
     "cmp.title": "FOSS vs SaaS",
+    "cmp.title.note": "objetivo · en paralelo",
     "cmp.intro": "El mismo motor, dos formas de ejecutarlo. Esta comparación es objetiva, no comercial: elige la que te convenga.",
     "cmp.foss": "Self-hosted (FOSS)",
     "cmp.saas": "FaultLine SaaS",
