@@ -997,7 +997,19 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
             + "\n".join(hold_lines)
         )
 
-    return {"memory": f"{preamble}\n\n" + "\n\n".join(sections)}
+    # Re-query hint — NON-EMPTY recall ONLY. This is GUIDANCE to the model, not a
+    # backend-state claim: there is no `more_available` boolean (that would have to be
+    # computed where the scope/walk cap lives, i.e. backend-side). The model decides
+    # whether the user's message had other distinct topics; no keyword detection here
+    # (brain-not-transport).
+    #
+    # ⚠️ BENCHMARK CONTRACT: the EMPTY sentinel {"memory": "No relevant facts found."}
+    # above must stay BYTE-IDENTICAL — the abstention scorer keys off that exact string.
+    # Appending this hint to an empty recall would silently corrupt every abstention score.
+    _more_hint = (
+        "\n\nIf their message touched on other distinct topics, recall each before responding."
+    )
+    return {"memory": f"{preamble}\n\n" + "\n\n".join(sections) + _more_hint}
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -1207,7 +1219,12 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         # No held-blob fallback here (ingest-spine "no-islands" spec, guarded by
         # test_store_context_residue_fallback_removed). The episodic capture above
         # already retains the fragment verbatim for re-mining by the backfill.
-        return {"status": "no_ingest", "message": "Text too short for fact extraction"}
+        # DIRECTIVE, not a status report. Models parrot tool output verbatim, so a
+        # descriptive message ("Text too short for fact extraction") made weak models
+        # announce "I couldn't store that" to the user — breaking the silence-is-the-feature
+        # design. The CAUSE is logged for us; the model is told what to DO.
+        _log(f"no_ingest: too short ({len(text.split())} words): {text[:60]!r}")
+        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage."}
 
     # ── D1: STATEMENT extractor route (brain-not-transport) ──────────────────
     # WHICH extractor a STATEMENT goes through is a BRAIN decision (gated backend-side by
@@ -1276,7 +1293,8 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         # that used to live here is removed per the ingest-spine spec; SHORT_TERM_MEMORY no longer
         # gates this path.)
         _log(f"residue_dropped: no valid triple from {text[:60]!r}")
-        return {"status": "no_ingest", "message": "No memorable fact detected — nothing stored."}
+        # DIRECTIVE, not a status report — see the too-short branch above.
+        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage."}
     ingest_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/ingest",
         json={"text": text, "user_id": user_id, "edges": edges, "source": "mcp"},
@@ -1660,50 +1678,57 @@ async def retract_fact_tool(
     """Call FaultLine /retract/correct endpoint with GLiNER2 intent classification.
 
     When called directly by the LLM (classified_intent is None), runs the same
-    /classify-intent + /confidence-gate pipeline used by remember_facts_tool().
-    When called from remember_facts_tool() (classified_intent provided), skips
-    classification to avoid double-classifying.
+    _classify_and_gate pipeline used by remember_facts_tool()/recall_memory_tool()
+    (single source of truth), with a RETRACT-SPECIFIC fail-safe: on classify failure
+    the default is RETRACTION (the model explicitly chose this tool), not the STATEMENT
+    default _classify_and_gate uses for remember/recall. STATEMENT/QUERY redirect to
+    remember_facts (data preservation); RETRACTION/CORRECTION proceed to /retract/correct
+    (CORRECTION is a non-destructive supersede and is never downgraded to RETRACTION).
+    When called from remember_facts_tool()/recall_memory_tool() (classified_intent
+    provided), skips classification to avoid double-classifying.
     """
     intent = classified_intent
 
     if intent is None:
-        # ── Intent classification (Layer 1) ─────────────────────────────────
-        # Non-fatal: default to RETRACTION since the LLM chose retract_fact.
-        intent = "RETRACTION"
-        confidence = 0.0
+        # ── Intent classification (shared brain, retract-specific fail-safe) ──────
+        # Uses the SAME _classify_and_gate helper as remember_facts_tool and
+        # recall_memory_tool (single source of truth for the route decision — eliminates
+        # the prior inline /classify-intent + /confidence-gate drift).
+        # RETRACT-SPECIFIC FAIL-SAFE: _classify_and_gate RAISES on classify failure (its
+        # own default is STATEMENT — the safe ingest path for remember/recall). The model
+        # EXPLICITLY chose retract_fact here, so on classify failure we default to
+        # RETRACTION (the user's tool choice is the strongest signal a delete was intended),
+        # NOT STATEMENT. This is the one reason this block catches and overrides instead of
+        # just deferring to the helper's default.
         try:
-            classify_resp = await _http_client.post(
-                f"{FAULTLINE_API_URL}/classify-intent",
-                params={"user_id": user_id},
-                json={"text": text},
-                timeout=10.0,
-            )
-            classify_resp.raise_for_status()
-            classify_data = classify_resp.json()
-            intent = classify_data.get("intent", "RETRACTION")
-            confidence = float(classify_data.get("confidence", 0.0))
+            intent, confidence, gate = await _classify_and_gate(text, user_id)
         except Exception as exc:
             _log(f"retract_fact intent_classify_fallback: {exc!r} — defaulting to RETRACTION")
-
-        # ── Per-user confidence gate (Layer 3) ──────────────────────────────
-        # Non-fatal: default to 0.70 (same default as Filter).
-        gate = 0.70
-        try:
-            gate_resp = await _http_client.get(
-                f"{FAULTLINE_API_URL}/confidence-gate/{user_id}",
-                timeout=5.0,
-            )
-            gate_resp.raise_for_status()
-            gate = float(gate_resp.json().get("threshold", 0.70))
-        except Exception as exc:
-            _log(f"retract_fact confidence_gate_fallback: {exc!r} — defaulting to 0.70")
+            intent, confidence, gate = "RETRACTION", 0.0, 0.70
 
         _log(f"retract_fact intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}")
 
-        # STATEMENT or low confidence → fall back to RETRACTION (LLM chose this tool for a reason).
-        # Only CORRECTION should override the tool choice.
-        if intent == "STATEMENT" or confidence < gate:
-            intent = "RETRACTION"
+        # STATEMENT/QUERY → redirect to ingest (fail toward DATA PRESERVATION, not deletion).
+        # A model that calls retract_fact with a STATEMENT or QUERY made a tool-selection
+        # error; the old behavior forced RETRACTION here, which destroyed data the user
+        # meant to store (measured: "my name is alice and I am 42" archived real facts).
+        # Hand off to remember_facts instead. No redirect loop: when remember_facts_tool
+        # re-routes to retract_fact_tool it passes classified_intent=..., which skips this
+        # whole block (the `if intent is None` guard above). Only the direct, model-invoked
+        # path (classified_intent=None) can reach this redirect.
+        if intent in ("STATEMENT", "QUERY"):
+            _log(f"retract_fact: model mis-pick ({intent}) — redirecting to remember_facts to preserve data")
+            return await remember_facts_tool(text, user_id)
+        # RETRACTION and CORRECTION proceed to /retract/correct.
+        # NOTE (data preservation wins): a low-confidence CORRECTION is NOT downgraded to
+        # RETRACTION. RETRACTION deletes data; CORRECTION is a NON-DESTRUCTIVE supersede
+        # (the brain said "supersede, don't delete"). The old
+        # `if confidence < gate: intent = "RETRACTION"` line forced a low-confidence
+        # CORRECTION into a destructive delete — the same data-loss class the STATEMENT
+        # redirect above fixes. It has been removed. A low-confidence RETRACTION stays
+        # RETRACTION (the model explicitly asked to forget). `confidence`/`gate` are now
+        # diagnostic-only here (consistent with remember_facts_tool/recall_memory_tool —
+        # the gate does not drive routing; the brain's intent does).
 
     # Use a dedicated 90s timeout: /retract/correct invokes LLM extraction which takes 14–55s
     # under load. The shared _http_client is 30s which is insufficient.

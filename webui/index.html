@@ -218,7 +218,7 @@
         <li><strong>URL:</strong> <code id="owui-step-url">http://faultline-mcp:8002</code> (same Docker network) or <code>http://&lt;host&gt;:8002</code>. If the modal pre-fills <code>https://</code>, change it to <code>http://</code> for a local server, then hit refresh.</li>
         <li><strong>Auth:</strong> <code>Bearer</code> → your MCP key (or a per-seat token).</li>
         <li>Set <code>ENABLE_FORWARD_USER_INFO_HEADERS=true</code> in OpenWebUI's environment so each user's memory is scoped to them via the <code>X-OpenWebUI-User-Id</code> header. Without it, per-user memory will not work.</li>
-        <li>OpenWebUI reads <code>/openapi.json</code> and surfaces <code>recall_memory</code>, <code>remember_facts</code>, <code>retract_fact</code> as tools in every conversation.</li>
+        <li>OpenWebUI reads <code>/openapi.json</code> and surfaces all six tools — <code>recall_memory</code>, <code>remember_facts</code>, <code>ingest_document</code>, <code>learn_facts</code>, <code>retract_fact</code>, <code>forget_fact</code> — in every conversation.</li>
       </ol>
       <div class="pre-head"><span class="lbl" data-i18n="owui.filter">Filter script (legacy inlet/outlet)</span>
         <button class="btn sm" id="btn-owui-copy-filter" data-i18n="owui.copy">⎘ copy</button></div>

@@ -240,7 +240,7 @@ FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWeb
 3. **Auth:** `Bearer` → your `MCP_API_KEY`.
 4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them. It forwards the `X-OpenWebUI-User-Id` header FaultLine keys on (also `-User-Name`/`-Email`/`-Role`) — without it, per-user memory won't work.
 
-OpenWebUI reads `/openapi.json` and surfaces `recall_memory`, `remember_facts`, `retract_fact` as tools in every conversation.
+OpenWebUI reads `/openapi.json` and surfaces all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — in every conversation.
 
 **Option B — native MCP (OpenWebUI 0.6.31+):**
 
@@ -310,10 +310,12 @@ MCP clients that support HTTP transport directly (no stdio needed) can connect w
 |---|---|
 | `recall_memory` | Query the knowledge graph — retrieves facts relevant to the conversation |
 | `remember_facts` | Extract and store facts from conversation text |
-| `learn_facts` | Ingest structured fact triples directly |
-| `retract_fact` | Remove a fact from the knowledge graph |
+| `ingest_document` | Store a document/article/long-form text; chunked and mined for facts |
+| `learn_facts` | Ingest structured ontological statements directly (`X is a subclass of Y`, …) |
+| `retract_fact` | Remove a fact from the knowledge graph (natural-language retraction) |
+| `forget_fact` | Tombstone ONE specific named fact (`subject` + optional `rel_type`/`old_value`) |
 
-All four tools are backed by the same store your OpenWebUI conversations write to.
+All six tools are backed by the same store your OpenWebUI conversations write to.
 
 ### System prompt (important)
 
