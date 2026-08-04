@@ -28,11 +28,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # MUST be a BUILD ARG, not just runtime env: the model wheel is BAKED into the image
+        # (Dockerfile `ARG SPACY_MODEL`). Setting SPACY_MODEL only in .env would leave the
+        # image carrying the English model while the runtime asked for another one — and the
+        # linguistic layer NO-OPs silently when the requested model isn't baked. That would
+        # make a non-English language choice quietly half-inert.
+        #
+        # ⚠️ NOT A PARITY CLAIM. The spine's dependency chains are built and validated against
+        # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
+        # text; it does not make the chains correct for that language. Portable in principle
+        # (the UD features they key on exist in these models), UNMEASURED in practice.
+        SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
     image: faultline:latest
     container_name: faultline-api
     ports:
       - "8000:8000"
     environment:
+      # INSTALL LANGUAGE — set by quickstart.py's language gate; both EMPTY for English, which
+      # makes the entrypoint's collation guard a total no-op (not one query issued).
+      # FAULTLINE_DB_ICU_LOCALE is what that guard compares the live database against; it must
+      # stay in lockstep with the --icu-locale in POSTGRES_INITDB_ARGS on the postgres service.
+      FAULTLINE_LANGUAGE: ${FAULTLINE_LANGUAGE:-}
+      FAULTLINE_DB_ICU_LOCALE: ${FAULTLINE_DB_ICU_LOCALE:-}
+      # Escape hatch for the guard — run anyway on a mismatched database. Wrong text ordering,
+      # but storage and case-folding are unaffected. Deliberately opt-in.
+      FAULTLINE_ALLOW_DB_LOCALE_MISMATCH: ${FAULTLINE_ALLOW_DB_LOCALE_MISMATCH:-}
       # Storage (local services below)
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
@@ -119,6 +140,22 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-faultline}
       POSTGRES_MAX_CONNECTIONS: "200"
       POSTGRES_SHARED_BUFFERS: "256MB"
+      # DATABASE COLLATION — set ONCE, at initdb, and then IMMUTABLE. A collation cannot be
+      # changed after the database is created without a dump/restore, which is why a non-English
+      # install has to get this right on first boot or carry the wrong sort order forever.
+      #
+      # EMPTY for English = today's behaviour byte-for-byte (the postgres image default). A
+      # non-English install sets it from the language chosen in quickstart.py, e.g.
+      #   POSTGRES_INITDB_ARGS=--locale-provider=icu --icu-locale=es-ES --encoding=UTF8
+      #
+      # ICU, not libc, DELIBERATELY: this image ships NO es_*/it_* OS locales (`locale -a` finds
+      # none), so `--locale=es_ES.utf8` FAILS outright. ICU carries its own locale data and needs
+      # nothing installed. Requires PG15+; this image is 16.
+      #
+      # ⚠️ Only applies when the data volume is EMPTY. Against an existing volume initdb never
+      # runs and this is silently ignored — which is exactly the case docker-entrypoint.sh's
+      # locale guard catches and refuses to start on.
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
