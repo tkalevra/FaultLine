@@ -1,0 +1,125 @@
+---
+# FaultLine Agent Brief Skill
+# A reusable constraint preamble to prepend to ANY build/investigate agent spawned
+# against this repo. This session re-derived these same guardrails by hand for every
+# agent — codified here so the next spawn ships them in one block.
+
+name: faultline-agent-brief
+description: "Constraint preamble for spawning a FaultLine build/investigate agent. Prepend the constraints block to the agent prompt so it ships compliant work (GLiNER2 purity, per-tenant search_path, strong-ingest/lean-query, deterministic-not-fuzzy, uncommitted-for-review)."
+version: 1.0.0
+author: Christopher
+tags:
+  - faultline
+  - agents
+  - constraints
+  - guardrails
+
+references:
+  - CLAUDE.md (Key Principles)
+  - DEV/PITFALLS.md (Pitfall 11)
+  - memory: feedback_gliner2_purity.md, feedback-strong-ingest-lean-query.md, feedback-transport-parity-mcp-filter.md
+
+# How to use: paste `constraints_block` verbatim into the spawned agent's prompt,
+# then add the task. Add `self_check` as the agent's pre-return gate.
+
+constraints_block: |
+  You are working in the FaultLine repo. These are HARD constraints — violating any
+  one is a failed deliverable, regardless of whether the feature works:
+
+  1. GLiNER2 PURITY (Pitfall 11). GLiNER2 labels are CONCISE zero-shot type/intent
+     names only. NEVER inject taxonomy descriptions, string_agg blobs, examples, or
+     patterns into GLiNER2 labels — it collapses detection (~70%→<50%). Never call
+     GLiNER2 "the LLM" or "RLM" — it is GLiNER2. Label changes are benchmark-gated
+     whole-label replacements, never frequency-gated accretion.
+  2. DETERMINISTIC, NOT FUZZY. No new fuzzy string matching, substring/ILIKE matching,
+     embeddings, or scoring engines where the design calls for exact + graph signals.
+     Matching is exact-normalized-token + hierarchy/type + graph-density. If you can't
+     resolve something deterministically, NO-OP honestly — never fabricate a signal.
+  3. PER-TENANT search_path has NO public. All runtime metadata lives in the tenant
+     schema (seeded from public at provisioning). Queries run unqualified on the bound
+     db; public.* is template/seed-source only. Do not read public at runtime.
+  4. STRONG INGEST, LEAN QUERY. Ingest carries extraction/validation/classification/
+     conflict-resolution. Query traverses + presents — it does NOT clean up, re-validate,
+     or re-structure. If recall is wrong, fix it AT INGEST, never bolt cleanup onto query.
+  5. METADATA-DRIVEN. Validation/ontology comes from rel_types/entity_taxonomies via the
+     overlays. ZERO hardcoded validation constants or rel_type name checks
+     (`if rel_type == "has_pet"` is forbidden).
+  6. NEVER hardcode LLM timeouts/max_tokens — use LLMTimeouts/LLMMaxTokens.
+  7. BRAIN NOT TRANSPORT. Route/gate/intent decisions live ONCE backend-side; MCP and
+     the Filter both consume them. Don't re-derive a weaker decision in a transport.
+  8. FAIL LOUD / FAIL SAFE. log_crit + safe defaults over silent bad-data continuation.
+     For write paths, fail safe toward NOT losing data.
+  9. main.py is a large shared file — make edits SEQUENTIALLY, not in parallel.
+  10. Leave work UNCOMMITTED for review unless explicitly told to commit. Do NOT push.
+  11. EVIDENCE-GROUND THE MECHANISM. When your fix relies on parser/library behavior or a
+      linguistic/NLP mechanism (spaCy dependency labels / tokenizer, dateparser, NegEx,
+      coreference/anaphora, Postgres/Qdrant/RDFS semantics, KG-memory practice), CORROBORATE
+      it against the authoritative primary source (library docs / the linguistics-NLP
+      literature) with WebSearch/WebFetch and CITE it. Live validation proves it WORKS;
+      the source proves the APPROACH is legitimate and correctly named — you need BOTH, and
+      a plausible-but-wrong parse assumption is exactly what the source catches. Name the
+      mechanism by its established term. Record the citation in the code docstring and/or the
+      relevant DEV/DESIGN note (see DEV/DESIGN-ingest-hardening-grounding.md for the pattern).
+  12. AUTHORITY ORDER: user-stated > seed/public template > engine growth (LOWEST). Engine
+      growth (±6 climb / re-embedder ontology eval / synonym convergence / gate type-constraint
+      expansion) may PROPOSE + ADD (mint novel rels, widen head/tail types by UNION, strengthen
+      confidence, add aliases) but must NEVER OVERRIDE a higher authority — never re-classify a
+      SEEDED rel's structural flags (is_hierarchy_rel / category / fact_class / storage_target /
+      inverse_rel_type / is_symmetric), never overwrite a user-stated fact/classification. Detect
+      "seeded" STRUCTURALLY (present in public.rel_types), never by a rel-name literal. A
+      source='user' write is not growth and may still change flags. This extends user.is.truth to
+      the ontology STRUCTURE — same truth-firewall as THE HARD LINE (grow PLACES, never corrupt
+      grounded truth).
+  13. AUDIT EVERY WRITE PATH TO A SHARED RESOURCE. When you fix ONE write to a shared table
+      (rel_types, entities, facts, entity_aliases), grep ALL writes to it across src/ (every
+      INSERT / UPDATE / ON CONFLICT DO UPDATE) and confirm each is consistent with your fix.
+      A guard applied to 4 of 5 write paths leaves the bug live (this session: a seed-mutation
+      guard passed on 4 sites but the rel re-drifted through an un-audited 5th path in the WGM
+      gate). List every write path and its status in your report.
+  14. USE THE CORTEX — IT IS NOT OPTIONAL. The agent cortex is YOUR OWN operational memory
+      (gotchas / failed commands / pitfalls / corrections / how-tos), separate from the user's
+      facts. It already holds 1,400+ notes earned by agents before you, and the single most
+      expensive failure mode in this repo is re-learning something already written down.
+      - BEFORE you act on anything with a known-hard edge — deploying, benching, touching
+        Portainer/Docker/psql, editing main.py, running the test harness, resetting a tenant,
+        pushing to a foss branch — call `irecall` FIRST with the topic. Before you GUESS at a
+        command, a path, a port, or an env var name: that is the trigger. It is checkable.
+      - THE MOMENT YOU LEARN, call `iremember` with the lesson in one sentence + tags. Being
+        corrected by the user IS the write trigger — you will not get a clearer one. Also
+        record: a command that failed and the version that worked, a trap you hit, an order of
+        steps that worked. A lesson you reasoned out and did not write down is one this repo
+        pays for twice.
+      - Hold recalled notes TENTATIVELY — they are working notes, not user truth, and some are
+        marked [unverified]. Verify before betting a destructive action on one.
+      - The cortex is SaaS-only by owner decision: never let `irecall`/`iremember`/cortex
+        symbols reach a `foss*` branch (`tools/foss_gate.sh` enforces this).
+
+self_check: |
+  Before returning, the agent MUST:
+  - Have called `irecall` at least once before the first risky/irreversible action, and
+    `iremember` for every lesson learned (constraint 14). If it learned nothing worth
+    recording, say so explicitly — "no cortex write" is a claim that must be defended,
+    not a default.
+  - python -c "import ast; ast.parse(open('<file>').read())"  → AST OK on every edited file.
+  - git --no-pager diff --stat  → confirm ONLY the intended files changed.
+  - grep the new code for: classify_text / get_gliner_model (no fuzzy on bare terms),
+    ILIKE / LIKE '%' (no substring matching), hardcoded rel_type == "..." checks,
+    new UNIQUE indexes (don't add write-uniqueness where homonyms/duplicates are intended).
+  - Report what it VERIFIED vs what it COULDN'T (no live LLM/DB), and the exact
+    deterministic signal it used for any disambiguation.
+  - RE-RUN THE ORIGINAL FAILING REPRO END-TO-END on a FRESH tenant after the fix (not a
+    unit test, not the response-summary counter — the actual live repro + the DB rows).
+    Verify the DB ground truth, NOT the API response fields: `scalar_committed=0` in a
+    remember_facts response was a FALSE NEGATIVE this session (the value committed via the
+    harvest→ingest path); trust the tenant tables, not the summary. Paste the DB rows.
+  - For any parser/library/linguistic mechanism relied on: CITE the authoritative source
+    (docs/literature) that corroborates the approach, and name the mechanism by its
+    established term (constraint 11). Empirical validation alone is not sufficient grounding.
+
+# Spawn note for the orchestrator (you):
+orchestrator_notes:
+  - "Pick the right subagent_type: Explore/general-purpose for fan-out search; general-purpose for build."
+  - "After the agent returns, independently verify the load-bearing claims (compile, diff scope, the determinism/no-fuzzy grep, the regression boundary) before committing — do not commit on the agent's word alone."
+  - "INDEPENDENTLY RE-RUN THE LIVE REPRO YOURSELF before shipping — an agent's 'validated' report is not proof. A fix can pass all its own checks (guard present, migration idempotent, drifted row reset) and STILL leave the bug live: this session a seed-mutation guard looked complete but `owns` re-drifted on my own fresh-tenant re-run because a 5th write path was missed. Rebuild, re-run the exact failing input on a fresh tenant, read the DB rows. If it re-breaks, send the agent back with the pinned root cause (SendMessage to its agentId) rather than shipping or re-deriving yourself."
+  - "Baseline suspicious test failures by stash+run (with vs without the change) to separate pre-existing fixture breakage from real regressions before trusting a red suite."
+  - "Tell the agent if the design must be SUBJECT-AGNOSTIC (most of this codebase is). Examples in docs/tests must be subject-agnostic or grounded in a public reference — never personal."

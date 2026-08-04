@@ -1,0 +1,209 @@
+---
+name: investigate-faultline-constraints
+description: HARD constraint validation against CLAUDE.md - identify architectural violations across any FaultLine issue
+version: 1.0.0
+author: Christopher
+environment: pre-production
+
+tags:
+  - faultline
+  - investigation
+  - constraints
+  - validation
+  - architecture
+  - generic
+
+prerequisites: |
+  Run /skill troubleshoot-faultline-pipeline first to collect diagnostic data from the reported issue.
+  This skill validates findings against CLAUDE.md hard constraints to identify root causes.
+
+scope: |
+  Works for ANY FaultLine pipeline issue:
+  - Facts not being extracted
+  - Facts not being stored
+  - Facts not being retrieved
+  - Facts not being injected into LLM
+  - Entity types wrong
+  - Validation gates failing
+  - Staging/promotion not working
+  - Deduplication errors
+  - Type constraints violations
+
+hard_constraints: |
+  These are non-negotiable architectural rules from CLAUDE.md. Any violation indicates
+  a deeper system issue requiring metadata-driven solutions, not catch gates.
+
+  1. **NO UUIDs in user-facing output (Filter hard guard)**
+     - If LLM response contains UUIDs → Filter hard guard failure or missing preferred_names
+     - If /query returns UUID→UUID fallback mappings → Name resolution incomplete
+     - Acceptable: UUIDs in database keys only, never in LLM context
+     - Applies to: Filter injection, /query response formatting, LLM input preprocessing
+
+  2. **preferred_names must include all entities referenced in facts**
+     - If fact exists but entity not in preferred_names → Cannot inject to LLM
+     - If preferred_names empty or incomplete → /query or _populate_preferred_names broken
+     - Failure mode: Facts with unresolved UUIDs filtered by UUID guard
+     - Applies to: All entity resolution, all fact injection scenarios
+
+  3. **Entity type must not stay 'unknown' if type-defining facts exist**
+     - If "X instance_of Y" fact exists → X should inherit/infer Y's type
+     - If "X has_pet Y" fact fails validation due to Y.type='unknown' → Type inference broken
+     - Pattern: Hierarchy facts (is_hierarchy_rel=true) should propagate types
+     - Applies to: Classification chains, prerequisite extraction, validation gates
+
+  4. **Validation is metadata-driven via rel_types table**
+     - No hardcoded rel_type names in code (like `if rel_type == "has_pet"`)
+     - All validation rules come from rel_types columns (head_types, tail_types, is_hierarchy_rel, etc.)
+     - New rel_types must self-describe their constraints without code changes
+     - Applies to: All validation gates, fact routing, type checking, extraction rules
+
+  5. **Scalar rel_types have STRING objects, relational rel_types have UUID objects**
+     - Scalar: pref_name, age, height, born_on → objects are STRINGS (entity_attributes table)
+     - Relational: has_pet, parent_of, spouse → objects are UUIDs (facts table)
+     - Routing determined by rel_types.tail_types = {SCALAR} vs relationship
+     - Failure mode: Type mismatches cause conflict detection to fail, facts stored wrong location
+     - Applies to: Storage routing, fact creation, query retrieval
+
+  6. **Deduplication uses UUIDs, not display names**
+     - pg_keys built from _subject_id/_object_id (UUIDs preserved throughout)
+     - NOT from subject/object display names
+     - Same entity with alias variations must deduplicate to same UUID
+     - Applies to: Query deduplication, fact merging, duplicate detection
+
+  7. **Nested function definitions must precede call sites**
+     - Helper functions must be defined before their first use
+     - _fetch_user_facts(), _populate_preferred_names(), etc. defined at module level before try block
+     - Failure mode: NameError or undefined function at runtime
+     - Applies to: All helper functions, callback definitions, internal utilities
+
+  8. **Class A facts (user-stated, confidence >= 0.9) always override conflicting data**
+     - User corrections always Class A → bypass all validation gates
+     - Class A facts committed immediately → no staging
+     - Class A facts supersede Class B/C conflicts → archive conflicting facts
+     - Failure mode: Corrections not taking effect, extraction overriding user input
+     - Applies to: Fact classification, staging logic, correction handling, user authority
+
+  9. **Graph and hierarchy traversal are orthogonal systems**
+     - _REL_TYPE_GRAPH: connectivity (spouse, parent_of, works_for) → who am I connected to
+     - _REL_TYPE_HIERARCHY: composition (instance_of, subclass_of, member_of) → what am I, what do I belong to
+     - Do not conflate them in queries or validation
+     - Applies to: Query traversal, fact filtering, scope detection
+
+  10. **Identity relationships always pass validation gates**
+      - pref_name, also_known_as, same_as, parent_of, child_of, sibling_of, spouse
+      - These facts are foundational and never staged or rejected
+      - Applies to: Filter injection (identity rels always pass), ingest gates (no validation of identity facts)
+
+investigation_framework: |
+  **For ANY reported issue, follow this path:**
+
+  STEP 1: Characterize the failure layer
+  - Is extraction returning data? (check backend /extract or /extract/rewrite)
+  - Is ingest storing data? (check facts + staged_facts tables)
+  - Is query retrieving data? (check /query response)
+  - Is filter injecting data? (check OpenWebUI logs)
+  Which layer is broken? → Tells you which constraints to check
+
+  STEP 2: Check constraint violations based on failure layer
+  - Extraction broken → Check constraints #4 (metadata-driven), #3 (type info available?)
+  - Ingest broken → Check constraints #3, #4, #5, #8, #9
+  - Query broken → Check constraints #2, #6, #7
+  - Injection broken → Check constraints #1, #2, #10
+
+  STEP 3: Validate entity integrity
+  - Are entities created in entities table?
+  - Do entities have types assigned or reason why type='unknown'?
+  - Are entity_aliases registered with preferred names?
+  - Do entities appear in all required tables for their facts?
+
+  STEP 4: Check rel_types metadata
+  - Does rel_type exist in rel_types table?
+  - Are head_types and tail_types constraints properly defined?
+  - Is is_hierarchy_rel flag correct?
+  - Is storage_target (facts vs entity_attributes) correct?
+
+  STEP 5: Validate class assignment
+  - Are facts correctly classified as A/B/C?
+  - Are user-stated facts (Class A) bypassing all gates?
+  - Are staged facts (Class B/C) following promotion/expiry rules?
+
+validation_checklist: |
+  General checklist for any FaultLine investigation:
+
+  [ ] Characterize which pipeline layer failed (extract → ingest → query → inject)
+  [ ] No UUIDs in LLM output or user-visible responses (constraint #1)
+  [ ] preferred_names dict complete for all entities with facts (constraint #2)
+  [ ] Entity types assigned appropriately (not 'unknown' without reason) (constraint #3)
+  [ ] All validation rules come from rel_types metadata, zero hardcoded checks (constraint #4)
+  [ ] Scalar vs relational rel_types routed to correct storage paths (constraint #5)
+  [ ] Deduplication uses UUIDs consistently throughout (constraint #6)
+  [ ] All function definitions precede their call sites (constraint #7)
+  [ ] User-stated facts (Class A) bypass gates and override conflicts (constraint #8)
+  [ ] Graph and hierarchy traversal queries don't conflate systems (constraint #9)
+  [ ] Identity relationships always pass validation (constraint #10)
+
+metadata_investigation: |
+  For constraint violations, inspect rel_types table:
+
+  **Constraint #3 (Type inference):**
+  ```
+  SELECT rel_type, is_hierarchy_rel, head_types, tail_types
+  FROM rel_types WHERE rel_type IN (extracted rel_types)
+  ```
+  Look for: is_hierarchy_rel=true facts not propagating types
+
+  **Constraint #4 (Metadata-driven):**
+  ```
+  SELECT COUNT(*) FROM rel_types WHERE rel_type IN (extracted rel_types)
+  ```
+  Look for: Extracted rel_types missing from table → no metadata to self-describe
+
+  **Constraint #5 (Scalar/Relational):**
+  ```
+  SELECT rel_type, tail_types, storage_target FROM rel_types
+  WHERE tail_types LIKE '%SCALAR%' OR rel_type LIKE '%age%|%height%'
+  ```
+  Look for: Inconsistent scalar rel_type definitions
+
+  **Constraint #9 (Graph vs Hierarchy):**
+  ```
+  SELECT rel_type, is_hierarchy_rel FROM rel_types
+  ORDER BY is_hierarchy_rel
+  ```
+  Look for: Facts incorrectly classified as hierarchy when they're relational, or vice versa
+
+generic_root_causes: |
+  **Pattern 1: Entities not in preferred_names**
+  - Symptom: Entities have facts but UUID guard skips them
+  - Root cause: _populate_preferred_names() incomplete or broken
+  - Check: Is entity in entity_aliases? In facts table? In query result?
+
+  **Pattern 2: Entity type stays 'unknown'**
+  - Symptom: Type-defining facts exist but entity not typed
+  - Root cause: Type inference logic missing for that rel_type
+  - Check: Does rel_type have is_hierarchy_rel=true? Does ingest check it?
+
+  **Pattern 3: Hardcoded rel_type special-casing**
+  - Symptom: One rel_type works differently than others
+  - Root cause: Hardcoded conditional logic for that rel_type
+  - Check: Grep for `if rel_type == "specific_type"` → Not metadata-driven
+
+  **Pattern 4: Validation gates rejecting facts incorrectly**
+  - Symptom: Valid facts staged but not promoted, or rejected entirely
+  - Root cause: Validation logic too strict, or type constraints incorrect
+  - Check: Are head_types and tail_types correct? Should this rel_type allow unknown types?
+
+  **Pattern 5: Deduplication creating duplicates**
+  - Symptom: Same logical fact appears multiple times
+  - Root cause: Dedup key using display names instead of UUIDs
+  - Check: Are subject_id/object_id UUIDs being used? Or display names?
+
+output: |
+  After investigation, document:
+  1. Which constraint(s) violated (list numbers from hard_constraints section)
+  2. Root cause pattern identified (from generic_root_causes or custom analysis)
+  3. Evidence from database/logs/code
+  4. Whether fix is metadata-driven (preferred) or code change required
+  5. Scope: Is this issue singular or systemic? (affects one rel_type or all facts?)
+
+  Then invoke /skill propose-faultline-fix to design metadata-driven solution

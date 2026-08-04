@@ -1,0 +1,182 @@
+---
+# FaultLine Transparent Pipeline Test Skill
+# Simple, visible, constraint-respecting test flow
+# Use: /skill test-pipeline-transparent
+# Shows actual curl commands, SQL queries, real responses
+# Stops on first error with clear evidence
+
+name: test-pipeline-transparent
+description: "Transparent pipeline test: ingest family → validate DB → show what failed"
+version: 1.0.0
+author: Christopher
+
+tags:
+  - faultline
+  - test
+  - transparent
+  - debug
+
+config:
+  openwebui_url: "https://hairbrush.helpdeskpro.ca"
+  bearer_token: "sk-a2d41543706140fbae32088110d9f0cf"
+  model_name: "faultline-test"
+
+  truenas_ssh: "ssh truenas -x"
+  database_user: "faultline"
+  database_name: "faultline_test"
+  postgres_container: "faultline-postgres"
+
+steps:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # STEP 0: CLEAR DATABASE (fresh state)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - name: "Clear database"
+    id: "step-clear-db"
+    description: "Truncate all tables for fresh test"
+    commands:
+      - |
+        ssh truenas -x "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -c \
+          \"TRUNCATE entities, entity_aliases, facts, staged_facts, entity_attributes, entity_name_conflicts CASCADE;\""
+    expected_output: "TRUNCATE TABLE"
+    on_failure: "STOP: Database truncation failed. Check Docker/Postgres connectivity."
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # STEP 1: INGEST FAMILY (curl request, transparent)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - name: "Ingest family statement"
+    id: "step-ingest-family"
+    description: "Send family data via OpenWebUI API"
+    payload: |
+      {
+        "model": "faultline-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "My name is Christopher, I prefer to be called Chris. My spouses name is Marla, she prefers Mars. We have 3 children, Desmonde(M,12) who goes by Des, Gabriella(F,10) prefers Gabby, and Cyrus 19. Mars has a pet dog named Fraggle."
+          }
+        ],
+        "stream": false
+      }
+    curl_command: |
+      curl -s -X POST "https://hairbrush.helpdeskpro.ca/api/chat/completions" \
+        -H "Authorization: Bearer sk-a2d41543706140fbae32088110d9f0cf" \
+        -H "Content-Type: application/json" \
+        -d '{PAYLOAD}' | jq '.'
+    validations:
+      - type: "http_status"
+        expected: 200
+        on_failure: "STOP: OpenWebUI returned non-200. Check bearer token and endpoint."
+      - type: "response_field"
+        field: "choices[0].message.content"
+        should_exist: true
+        on_failure: "STOP: No response content from model. Check model availability."
+      - type: "response_field"
+        field: "choices[0].message.content"
+        should_not_contain: "I don't have the ability to"
+        on_failure: "STOP: Model returned inability message. This is the 'creepy' response issue."
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # STEP 2: VALIDATE DB STATE (SQL queries, transparent)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - name: "Validate entities created"
+    id: "step-validate-entities"
+    description: "Check that all 6 entities (Chris, Marla, Des, Gabby, Cyrus, Fraggle) exist in DB"
+    sql_query: |
+      SELECT
+        COUNT(*) as total_entities,
+        array_agg(DISTINCT entity_type) as entity_types
+      FROM entities;
+    expected:
+      total_entities: 6
+      entity_types: "should include Person and Animal"
+    on_failure: "STOP: Expected 6 entities (5 Person + 1 Animal). Check extraction and ingest."
+
+  - name: "Validate preferred names registered"
+    id: "step-validate-preferred-names"
+    description: "Check that display names are in entity_aliases as is_preferred=true"
+    sql_query: |
+      SELECT
+        alias,
+        is_preferred,
+        COUNT(*) as count
+      FROM entity_aliases
+      WHERE is_preferred = true
+      GROUP BY alias, is_preferred
+      ORDER BY alias;
+    expected:
+      aliases: ["christopher", "chris", "marla", "mars", "des", "gabby", "cyrus", "fraggle"]
+    on_failure: "STOP: Preferred names not registered. Check entity_aliases table."
+
+  - name: "Validate relationships stored"
+    id: "step-validate-relationships"
+    description: "Check that spouse, parent_of, child_of, has_pet facts were created"
+    sql_query: |
+      SELECT
+        rel_type,
+        COUNT(*) as fact_count,
+        MIN(confidence) as min_confidence,
+        MAX(confidence) as max_confidence
+      FROM facts
+      GROUP BY rel_type
+      ORDER BY rel_type;
+    expected:
+      rel_types:
+        - rel_type: "spouse"
+          min_count: 1
+        - rel_type: "parent_of"
+          min_count: 3
+        - rel_type: "child_of"
+          min_count: 3
+        - rel_type: "has_pet"
+          min_count: 1
+    on_failure: "STOP: Expected relationships not found. Check ingest validation pipeline."
+
+  - name: "Validate scalar attributes"
+    id: "step-validate-attributes"
+    description: "Check that ages are stored as entity_attributes (scalars, not UUIDs)"
+    sql_query: |
+      SELECT
+        attribute,
+        COUNT(*) as count,
+        array_agg(value_text) as values
+      FROM entity_attributes
+      GROUP BY attribute
+      ORDER BY attribute;
+    expected:
+      attribute_age_values: ["12", "10", "19"]
+    on_failure: "STOP: Age attributes not stored. Check scalar routing."
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # STEP 3: CHECK PLAIN ENGLISH RESPONSE (not weird)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - name: "Validate response quality"
+    id: "step-validate-response"
+    description: "Check that LLM response is plain English, no creepy/unable messages"
+    validations:
+      - type: "response_field"
+        field: "choices[0].message.content"
+        should_contain_one_of: ["Christopher", "Chris", "family", "children"]
+        on_failure: "STOP: Response doesn't mention family members. Check injection."
+      - type: "response_field"
+        field: "choices[0].message.content"
+        should_not_contain: ["unable to", "don't have the ability", "not able to", "cannot help"]
+        on_failure: "STOP: Response contains refusal messages. Filter/backend issue."
+
+summary:
+  success: |
+    ✅ PIPELINE TEST PASSED
+    - Database cleared and populated correctly
+    - 6 entities created (5 Person + 1 Animal)
+    - Relationships stored: spouse (1), parent_of (3), child_of (3), has_pet (1)
+    - Scalar attributes (ages) in entity_attributes table
+    - LLM response is plain English, no creepy messages
+  failure: |
+    ❌ PIPELINE TEST FAILED
+    See STOP messages above for exact failure point.
+    Next step: Run /skill investigate-faultline-failure with the failure ID
+
+chainable_next_steps:
+  - "/skill test-faultline-corrections"
+  - "/skill test-faultline-retractions"
+  - "/skill test-faultline-name-changes"
+  - "/skill investigate-faultline-failure"

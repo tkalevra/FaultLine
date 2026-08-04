@@ -1,0 +1,259 @@
+---
+# FaultLine Propose Fix Skill v2.0
+# Chain: investigate identifies failure → propose suggests fix → implement
+# ALL fixes are METADATA-DRIVEN and GENERIC — no hardcoded rel_types, entity types, or domain logic
+
+name: propose-faultline-fix
+description: "Suggest metadata-driven fixes for identified constraint violations"
+version: 2.0.0
+author: Christopher
+environment: pre-production
+
+tags:
+  - faultline
+  - fix
+  - constraint
+  - proposal
+  - metadata-driven
+  - chain
+
+config:
+  claude_md_path: "/home/chris/Documents/013-GIT/FaultLine-dev/CLAUDE.md"
+  test_user_id: "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+
+# ═══════════════════════════════════════════════════════════════════
+# FIX PATTERNS — matched by failure_pattern id from investigate skill
+# ═══════════════════════════════════════════════════════════════════
+fix_patterns:
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PATTERN 1: Zero Relationship Facts (extraction gap)
+  # Matches: investigate → pattern-no-facts
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - id: "fix-extraction-relational-gap"
+    matches_failure: "pattern-no-facts"
+    symptom: "entity_attributes has scalars (age, pref_name) but facts table has 0 rows"
+    violated_constraint: "Three-dimensional classification: relational facts not extracted"
+    root_cause: "LLM extraction prompt may not produce relational edges for certain input patterns (list-form family descriptions), or WGM gate rejects all relational edges due to type constraints"
+    fix: |
+      **Layer: Extract (prompt or preprocessing)**
+
+      1. Verify LLM extraction output: check /extract/rewrite response for triples
+         - If zero triples returned: prompt is the issue (dBug-040 pattern)
+         - If triples returned but zero facts in DB: validation gate is the issue
+
+      2. If prompt issue: add extraction examples for the failing input pattern
+         - List-form: "X (M, 12) who goes by Y" → extract age + pref_name + parent_of
+         - Entity-type hints from GLiNER2 preflight should guide extraction
+
+      3. If validation gate issue: check rel_types.head_types/tail_types
+         - Are type constraints too strict? (e.g., requires 'Animal' for has_pet but object_type='unknown')
+         - Should unknown types be allowed through with warning instead of rejection?
+
+      GENERIC: Fix works for ANY domain, not just family. Same pattern fixes work relationships, health data, etc.
+      METADATA-DRIVEN: Type constraints come from rel_types table, not code.
+    test: |
+      # After fix, re-run ingest and check:
+      ssh truenas "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -t -c \"SELECT COUNT(*) FROM facts WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' AND superseded_at IS NULL;\""
+      # Expected: > 0
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PATTERN 2: Entity Split (aliases create separate entities)
+  # Matches: investigate → pattern-entity-split
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - id: "fix-entity-dedup"
+    matches_failure: "pattern-entity-split"
+    symptom: "Two aliases that should merge (e.g., 'chris' and 'christopher') point to different entity_ids"
+    violated_constraint: "EntityRegistry UUID v5 surrogates must be stable across aliases"
+    root_cause: |
+      EntityRegistry.resolve() generates UUID v5 from (user_id, name). If name differs 
+      ('christopher' vs 'chris'), different UUIDs are generated. The system should 
+      recognize that 'chris' is an also_known_as of 'christopher' and reuse the same entity.
+    fix: |
+      **Layer: Entity Registry (src/entity_registry/registry.py)**
+
+      1. When registering an alias that is an also_known_as or pref_name for an 
+         entity that already exists (resolved via different alias), REUSE the entity_id.
+      
+      2. Flow: 
+         a. Resolve subject → gets UUID for 'christopher'
+         b. Ingest processes also_known_as edge: (christopher, also_known_as, chris)
+         c. Object 'chris' should resolve to the SAME entity_id as 'christopher'
+         d. Currently: creates NEW entity for 'chris' → ENTITY SPLIT
+
+      3. Fix: In EntityRegistry.resolve(), check entity_aliases FIRST
+         - If alias exists in entity_aliases → return existing entity_id
+         - If not, check if this is an also_known_as targeting an existing entity → reuse
+
+      GENERIC: Works for ANY entity with multiple names/aliases. 
+      METADATA-DRIVEN: Uses entity_aliases table as authoritative source.
+    test: |
+      ssh truenas "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -t -c \"
+      SELECT COUNT(DISTINCT entity_id) FROM entity_aliases 
+      WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' 
+      AND alias IN ('christopher', 'chris');
+      \""
+      # Expected: 1 (both aliases point to same entity)
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PATTERN 3: Missing Scalar Attributes (extraction coverage)
+  # Matches: investigate → pattern-missing-scalars
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - id: "fix-extraction-coverage"
+    matches_failure: "pattern-missing-scalars"
+    symptom: "Some ages/names from input are missing from entity_attributes"
+    violated_constraint: "Strong Ingest — all user-stated facts should be captured"
+    root_cause: |
+      LLM extraction prompt may miss scalars in list-form descriptions.
+      Example: "Desmonde (M, 12) who goes by Des, Gabriella (F, 10) prefers Gabby"
+      → should extract: (desmonde, age, 12), (desmonde, also_known_as, des),
+                        (gabriella, age, 10), (gabriella, also_known_as, gabby)
+      → may only extract names, missing ages.
+    fix: |
+      **Layer: Extract (prompt enhancement)**
+
+      1. Add explicit extraction patterns for list-form input:
+         - "X (M, 12)" → subject=X, rel_type=age, object=12
+         - "X who goes by Y" → subject=X, rel_type=also_known_as, object=Y
+         - "X prefers Y" → subject=X, rel_type=pref_name, object=Y
+
+      2. Entity-type hints from GLiNER2 preflight should include age/number detection
+         - Person entities with numeric annotations → likely age
+
+      GENERIC: Works for any scalar annotation pattern, any domain.
+      METADATA-DRIVEN: Age is SCALAR per rel_types.tail_types — routing is automatic.
+    test: |
+      ssh truenas "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -t -c \"
+      SELECT COUNT(*) FROM entity_attributes 
+      WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' AND attribute='age';
+      \""
+      # Expected: 3 (Des=12, Gabby=10, Cyrus=19)
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PATTERN 4: Entity Types Unknown
+  # Matches: investigate → pattern-unknown-types
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - id: "fix-type-inference"
+    matches_failure: "pattern-unknown-types"
+    symptom: "Most entities have entity_type='unknown'"
+    violated_constraint: "Three-layer type inference: GLiNER2 → relationship semantics → descriptor context"
+    root_cause: |
+      GLiNER2 preflight may not be running, or type inference from relationship 
+      semantics (e.g., subject of parent_of → likely Person) isn't executing.
+    fix: |
+      **Layer: Ingest (type inference)**
+
+      1. GLiNER2 preflight: verify model is loaded and producing typed_entities
+         - Check logs for 'gliner2' or 'typed_entities'
+         - If model unavailable: use regex/heuristic fallback (already implemented for prerequisites)
+
+      2. Relationship-based inference: if GLiNER2 returns no types, infer from rel_type
+         - subject of parent_of/child_of/spouse/sibling_of → likely Person
+         - object of has_pet → likely Animal
+         - subject of works_for → likely Person, object → likely Organization
+         - These are HEURISTICS, not hardcoded — fall back to 'unknown' if no match
+
+      3. Persist inferred type: UPDATE entities SET entity_type = inferred WHERE entity_type = 'unknown'
+
+      GENERIC: Heuristics based on rel_type semantics, not domain-specific names.
+      METADATA-DRIVEN: rel_types define head_types/tail_types — use those for inference.
+    test: |
+      ssh truenas "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -t -c \"
+      SELECT COUNT(*) FROM entities 
+      WHERE user_id='10d7d879-63cd-4f31-92ce-f2c9edb760ab' AND entity_type = 'unknown';
+      \""
+      # Expected: low count (most entities should have inferred types)
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # PATTERN 5: Correction Matching Not Working
+  # Matches: investigate → (custom — the user's "translation matching" concern)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - id: "fix-correction-matching"
+    matches_failure: "custom — correction not matching DB facts"
+    symptom: "User says 'Desmonde is 14 not 12' but age doesn't update, or correction creates duplicate entity"
+    violated_constraint: "Class A corrections must override conflicting data immediately"
+    root_cause: |
+      The matching step between user input text and DB-stored facts may be broken:
+      1. LLM extracts correction → returns subject='desmonde', rel_type='age', object='14'
+      2. System must match 'desmonde' → Des UUID in entity_aliases
+      3. System must match 'age' → entity_attributes(entity_id=Des_UUID, attribute='age')
+      4. If matching fails at step 2 or 3, correction is lost or creates duplicate
+
+      The matching is supposed to be: DB lookup first, LLM fallback second.
+      If DB lookup returns entity UUID and attribute, no LLM needed.
+      If not found, LLM creates new rel_type/entity on the fly.
+    fix: |
+      **Layer: Ingest / Correction Pipeline**
+
+      1. Trace the matching path for a correction:
+         a. Input: "Desmonde is 14 not 12"
+         b. LLM extract → {subject:'desmonde', rel_type:'age', object:'14', is_correction:true}
+         c. Entity resolution: 'desmonde' → lookup entity_aliases WHERE alias='desmonde' → UUID
+         d. Fact matching: UUID + 'age' → lookup entity_attributes WHERE entity_id=UUID AND attribute='age'
+         e. If found: UPDATE entity_attributes SET value_int=14 WHERE entity_id=UUID AND attribute='age'
+         f. If not found: treat as new fact (INSERT)
+
+      2. If step (c) returns wrong UUID or null → entity resolution broken
+      3. If step (d) returns null but attribute exists → attribute matching broken
+      4. Fix: ensure entity_aliases lookup is case-insensitive and includes also_known_as
+      5. Fix: ensure attribute matching checks both entity_attributes AND facts tables
+
+      GENERIC: Works for ANY entity, ANY scalar/relational correction.
+      METADATA-DRIVEN: Entity lookup uses entity_aliases; attribute lookup uses rel_types metadata.
+    test: |
+      # After sending "Desmonde is 14 not 12":
+      ssh truenas "sudo docker exec faultline-postgres psql -U faultline -d faultline_test -t -c \"
+      SELECT value_int FROM entity_attributes ea
+      JOIN entity_aliases eal ON ea.entity_id = eal.entity_id
+      WHERE eal.alias = 'desmonde' AND ea.attribute = 'age'
+      AND ea.user_id = '10d7d879-63cd-4f31-92ce-f2c9edb760ab';
+      \""
+      # Expected: 14
+
+# ═══════════════════════════════════════════════════════════════════
+# CHAIN
+# ═══════════════════════════════════════════════════════════════════
+chain:
+  triggered_by: "skill-investigate-faultline-failure"
+  workflow:
+    - "1. Identify failure pattern from investigation (e.g., pattern-no-facts)"
+    - "2. Match to fix pattern above (e.g., fix-extraction-relational-gap)"
+    - "3. Read the fix description — it specifies the layer and file to modify"
+    - "4. Implement the fix in /home/chris/Documents/013-GIT/FaultLine-dev/"
+    - "5. Run the test query to verify"
+    - "6. Re-run skill-faultline-full-pipeline-test from step 1"
+  next: "Re-run skill-faultline-full-pipeline-test"
+
+# ═══════════════════════════════════════════════════════════════════
+# PHILOSOPHY
+# ═══════════════════════════════════════════════════════════════════
+philosophy: |
+  EVERY fix is:
+  - METADATA-DRIVEN: rules come from rel_types, entity_aliases, entity_taxonomies tables
+  - GENERIC: works for family, work, health, hobbies — any domain
+  - NON-BRITTLE: new rel_types/entities self-describe; no code changes needed
+
+  ANTI-PATTERNS (never do these):
+  - ❌ "if rel_type == 'has_pet': require Animal type"
+  - ❌ "family entities are Person type"
+  - ❌ "add 'has_pet' to _PET_RELS list"
+  - ❌ "expected aliases: ['christopher', 'chris', 'marla', ...]"
+
+  CORRECT PATTERNS (always do these):
+  - ✅ "Query rel_types.tail_types for this rel_type"
+  - ✅ "Infer type from relationship semantics + entity_taxonomies"
+  - ✅ "New rel_types added to rel_types table → code picks them up automatically"
+  - ✅ "Query entity_aliases WHERE user_id = ? for entity resolution"
+
+summary: |
+  Fix patterns are matched by failure_pattern id from investigate skill.
+  Each pattern specifies: layer, file, root cause, fix, and test query.
+  All fixes are metadata-driven and generic.
+
+documentation:
+  usage: |
+    /skill propose-faultline-fix
+
+    Requires: investigation findings from /skill investigate-faultline-failure
+    Output: matching fix pattern with implementation instructions
+    Chain: implement fix → re-run /skill faultline-full-pipeline-test

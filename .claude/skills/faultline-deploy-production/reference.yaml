@@ -1,0 +1,334 @@
+---
+# FaultLine Production Deployment Skill
+# Sanitizes development code for production: removes personal data, test config, prompts
+# Requires explicit confirmation before push to main
+
+name: faultline-deploy-production
+description: "Safe production deployment: sanitize code → validate → present for approval → push to main"
+version: 1.0.0
+author: Christopher
+environment: production
+critical: true  # Requires approval before execution
+
+tags:
+  - faultline
+  - deployment
+  - production
+  - sanitization
+  - approval-required
+
+# Configuration
+config:
+  dev_folder: "/home/chris/Documents/013-GIT/FaultLine-dev"
+  prod_folder: "/home/chris/Documents/013-GIT/FaultLine"
+  dev_repo: "https://github.com/tkalevra/FaultLine-dev.git"
+  prod_repo: "https://github.com/tkalevra/FaultLine.git"
+  dev_branch: "master"
+  prod_branch: "main"
+
+# Production-safe files (whitelist)
+production_safe_paths:
+  - "src/**/*.py"
+  - "migrations/**/*.sql"
+  - "config/docker-compose.yml"  # WITHOUT credentials in env vars
+  - "docker-entrypoint.sh"
+  - "BUGS/**/*.md"
+  - "README.md"
+  - ".gitignore"
+  - "pyproject.toml"
+  - "requirements.txt"
+  - "tests/**/*.py"
+  - "openwebui/*.py"
+  - ".github/**/*"
+  - "LICENSE"
+
+# Files to EXCLUDE (always)
+exclude_paths:
+  - "CLAUDE.md"  # CRITICAL: Never deploy
+  - "**/test-*.sh"  # Test scripts
+  - "**/skill-*.yaml"  # Skill definitions
+  - "**/.claude/**"  # Local Claude settings
+  - "**/*.local"  # Local config
+  - "docs/prompts/**"  # Prompt library
+  - "dprompt-*.md"  # Development prompts
+  - "SESSION-*.md"  # Session notes
+  - "PROMPT-*.md"  # Prompt documentation
+  - "**/.env"  # Environment files
+  - "**/.env.*"  # Any env variant
+  - "**/*credentials*"  # Credential files
+  - "**/*secret*"  # Secret files
+  - "**/*password*"  # Password files
+  - "MEMORY.md"  # Local memory
+
+# Personal data to sanitize from all files
+personal_data_patterns:
+  - pattern: "christopher|chris"
+    context: "user name"
+    replacement: "${USER}"
+
+  - pattern: "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    context: "test user UUID"
+    replacement: "${TEST_USER_ID}"
+
+  - pattern: "Des|Desmonde"
+    context: "child name"
+    replacement: "${CHILD1}"
+
+  - pattern: "Cyrus|Cy"
+    context: "child name"
+    replacement: "${CHILD2}"
+
+  - pattern: "Gabby|Gabriella"
+    context: "child name"
+    replacement: "${CHILD3}"
+
+  - pattern: "Mars"
+    context: "spouse name"
+    replacement: "${SPOUSE}"
+
+  - pattern: "Aurora|Art"
+    context: "entity name"
+    replacement: "${ENTITY}"
+
+  - pattern: "hairbrush\\.helpdeskpro\\.ca"
+    context: "personal server domain"
+    replacement: "${OPENWEBUI_DOMAIN}"
+
+  - pattern: "192\\.168\\.40\\.10"
+    context: "personal network IP"
+    replacement: "${BACKEND_IP}"
+
+  - pattern: "sk-[a-z0-9]{40,}"
+    context: "API bearer token"
+    replacement: "${BEARER_TOKEN}"
+
+  - pattern: "Kitchener|Waterloo|KW|Lenovo|ThinkPad"
+    context: "location/device identifiers"
+    replacement: "${LOCATION}"
+
+  - pattern: "University of Guelph|Optimus|lmia\\.helpdeskpro"
+    context: "employer/project identifiers"
+    replacement: "${EMPLOYER}"
+
+  - pattern: "sk-[a-f0-9]{32,}"
+    context: "any OpenWebUI/API bearer token (literal redacted — rotate the exposed key)"
+    replacement: "${BEARER_TOKEN}"
+
+# Deployment workflow steps
+workflow:
+  - step: 1
+    name: "Validate environment"
+    description: "Check folders exist, git config valid"
+    actions:
+      - validate_folder_exists: "${prod_folder}"
+      - validate_git_repo: "${prod_folder}"
+      - validate_url: "${prod_repo}"
+      - validate_branch: "${prod_branch}"
+
+  - step: 2
+    name: "Sync from development"
+    description: "Pull latest from dev/master"
+    actions:
+      - chdir: "${dev_folder}"
+      - git_status: "Check for uncommitted changes"
+      - git_pull:
+          remote: "origin"
+          branch: "${dev_branch}"
+      - log: "Development branch synchronized"
+
+  - step: 3
+    name: "Identify production files"
+    description: "List files that belong in production"
+    actions:
+      - find_files:
+          path: "${dev_folder}"
+          include: "${production_safe_paths}"
+          exclude: "${exclude_paths}"
+      - validate_no_excluded: "Ensure CLAUDE.md not included"
+      - validate_no_test_files: "Ensure test scripts excluded"
+      - validate_no_prompts: "Ensure prompts excluded"
+      - output: "production_files_list"
+
+  - step: 4
+    name: "Sanitize personal data"
+    description: "Remove personal identifiers from all files"
+    actions:
+      - for_each_file: "${production_files_list}"
+        actions:
+          - read_file: "${file}"
+          - sanitize_patterns: "${personal_data_patterns}"
+          - validate_no_personal_data: "Scan for remaining names/IPs/tokens"
+          - validate_no_claude_content: "Ensure no CLAUDE.md content leaked"
+          - save_sanitized: "${file}"
+          - log_sanitization: "file=${file}, patterns_replaced=${count}"
+
+  - step: 5
+    name: "Validate sanitization"
+    description: "Comprehensive check for data leaks"
+    actions:
+      - grep_check:
+          pattern: "christopher|chris"
+          exclude_pattern: "# christopher is a common name"
+          error: "Personal name found in production code"
+      - grep_check:
+          pattern: "Des|Cyrus|Gabby"
+          error: "Child names found in production code"
+      - grep_check:
+          pattern: "Mars"
+          error: "Spouse name found in production code"
+      - grep_check:
+          pattern: "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+          error: "Test user UUID found in production code"
+      - grep_check:
+          pattern: "sk-[a-f0-9]{32,}"
+          error: "Bearer token found in production code"
+      - grep_check:
+          pattern: "192\\.168\\.40"
+          error: "Personal network IP found in production code"
+      - grep_check:
+          pattern: "hairbrush\\.helpdeskpro"
+          error: "Personal domain found in production code"
+      - grep_check:
+          pattern: "CLAUDE\\.md|dprompt-|PROMPT-"
+          error: "Development artifacts found in production code"
+
+  - step: 6
+    name: "Present file list"
+    description: "Show user what will be deployed"
+    actions:
+      - format_file_list: "${production_files_list}"
+      - include_file_status: "new/modified/deleted"
+      - include_sanitization_summary: "files modified, patterns replaced"
+      - include_validation_results: "all checks passed"
+      - present_for_approval: true
+
+  - step: 7
+    name: "WAIT FOR CONFIRMATION"
+    description: "User must explicitly approve deployment"
+    actions:
+      - pause: "Waiting for user confirmation"
+      - require_approval: true
+      - timeout_seconds: 3600  # 1 hour timeout
+      - on_approval: "proceed_to_step_8"
+      - on_rejection: "abort_deployment"
+      - on_timeout: "abort_deployment"
+
+  - step: 8
+    name: "Prepare production folder"
+    description: "Copy sanitized files to production repo"
+    actions:
+      - chdir: "${prod_folder}"
+      - git_status: "Verify clean working tree"
+      - copy_files:
+          from: "${dev_folder}"
+          files: "${production_files_list}"
+          sanitized: true
+      - git_add: "${production_files_list}"
+      - git_status: "Show staged changes"
+
+  - step: 9
+    name: "Push to main"
+    description: "Push changes to production main branch"
+    actions:
+      - validate_branch: "${prod_branch}"
+      - git_commit:
+          message: "chore: deploy sanitized production code"
+          author: "christopher"
+      - git_push:
+          remote: "origin"
+          branch: "${prod_branch}"
+          force: false  # NEVER force push
+      - log: "Successfully pushed to production/main"
+
+# Approval gates
+approval_gates:
+  - gate: "file_list_approval"
+    description: "User must confirm file list"
+    required: true
+    prompt: "Approve files for deployment?"
+
+  - gate: "sanitization_review"
+    description: "User must verify no personal data leaked"
+    required: true
+    prompt: "All personal data sanitized. Proceed?"
+
+  - gate: "final_confirmation"
+    description: "Final confirmation before push to production"
+    required: true
+    prompt: "Push to production/main?"
+
+# Safety checks (abort conditions)
+abort_conditions:
+  - uncommitted_changes_in_dev: "Development folder has uncommitted changes"
+  - uncommitted_changes_in_prod: "Production folder has uncommitted changes"
+  - wrong_branch: "Not on correct branch"
+  - personal_data_detected: "Personal data found in code (Des, Cyrus, Gabby, christopher, etc)"
+  - bearer_token_detected: "Bearer token found in code"
+  - claude_content_detected: "CLAUDE.md content detected"
+  - prompt_files_detected: "Prompt files included"
+  - test_scripts_detected: "Test scripts included"
+  - network_unreachable: "Cannot reach GitHub"
+  - user_rejection: "User rejected deployment"
+  - timeout: "Approval timeout exceeded"
+
+# Rollback plan
+rollback:
+  trigger: "deployment_failure"
+  actions:
+    - git_reset: "Revert uncommitted changes"
+    - git_checkout: "Return to previous commit"
+    - notify_user: "Deployment failed, rolled back"
+
+# Reporting
+reporting:
+  format: "markdown"
+  include_file_list: true
+  include_sanitization_log: true
+  include_git_log: true
+  include_validation_report: true
+  filename: "deployment-report-${timestamp}.md"
+
+# Documentation
+documentation:
+  purpose: |
+    Safe production deployment with mandatory sanitization.
+
+    Workflow:
+    1. Validate environment and repositories
+    2. Sync latest from development/master
+    3. Identify production-safe files (whitelist approach)
+    4. Sanitize all personal data from code
+    5. Validate no data leaks (personal names, IPs, tokens, CLAUDE.md content)
+    6. Present file list for explicit user approval
+    7. **WAIT FOR CONFIRMATION** (approval gates)
+    8. Copy sanitized files to production folder
+    9. Push to production/main
+
+    CRITICAL CONSTRAINTS:
+    - CLAUDE.md NEVER deployed
+    - ALL personal details removed (names, IPs, domains, tokens)
+    - NO prompts included (dprompt-*.md, PROMPT-*.md)
+    - NO test files
+    - Approval required before push
+    - Force push NEVER used
+    - Rollback available if deployment fails
+
+  usage: |
+    /skill faultline-deploy-production
+
+    Workflow:
+    1. Shows files to be deployed
+    2. Waits for your approval (3 gates)
+    3. Sanitizes code
+    4. Validates no leaks
+    5. Pushes to production/main only on approval
+
+  safety: |
+    Multiple safeguards prevent accidents:
+    - Whitelist approach (only safe files included)
+    - Personal data scan with 20+ patterns
+    - Approval gates before each major step
+    - Abort on any safety violation
+    - Rollback capability
+    - Git branch protection (never force push)
+    - Timestamped deployment report

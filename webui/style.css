@@ -377,3 +377,27 @@ footer {
   nav.tabs button { padding: 10px 12px; }
   header.app-head .head-actions { margin-left: 0; }
 }
+
+/* ── AGPL notice on the connect screen ─────────────────────────────────────────
+   Deliberately ABOVE the token field and NOT inside a <details>: the operator
+   should see the terms before signing in, not after hunting for them. */
+.lic-box { border:1px solid var(--border); border-left:3px solid var(--accent);
+           border-radius:4px; padding:12px 14px; margin:0 0 16px; background:var(--panel-2,transparent); }
+.lic-head { display:flex; align-items:baseline; gap:10px; margin-bottom:6px; }
+.lic-head > span:first-child { font-weight:700; letter-spacing:.5px; color:var(--accent); font-size:12px; }
+.lic-sub { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+.lic-body { margin:0 0 8px; font-size:12px; line-height:1.55; color:var(--fg); }
+.lic-links { margin:0; font-size:11.5px; }
+.lic-links a { color:var(--accent); }
+
+/* ── AGPL notice on the connect screen ─────────────────────────────────────────
+   Deliberately ABOVE the token field and NOT inside a <details>: the operator
+   should see the terms before signing in, not after hunting for them. */
+.lic-box { border:1px solid var(--border); border-left:3px solid var(--accent);
+           border-radius:4px; padding:12px 14px; margin:0 0 16px; background:var(--panel-2,transparent); }
+.lic-head { display:flex; align-items:baseline; gap:10px; margin-bottom:6px; }
+.lic-head > span:first-child { font-weight:700; letter-spacing:.5px; color:var(--accent); font-size:12px; }
+.lic-sub { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+.lic-body { margin:0 0 8px; font-size:12px; line-height:1.55; color:var(--fg); }
+.lic-links { margin:0; font-size:11.5px; }
+.lic-links a { color:var(--accent); }
