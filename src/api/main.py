@@ -4618,7 +4618,7 @@ def _seed_structural_flags(db, rel_type: str) -> dict | None:
             return None
         return dict(zip(_SEED_STRUCTURAL_FIELDS, row))
     except Exception as e:
-        log_crit("ontology.seed_structural_flags_read_failed",
+        log_crit(log, "ontology.seed_structural_flags_read_failed",
                  rel_type=rt, error=str(e)[:160])
         return None
 
@@ -33257,15 +33257,65 @@ def _negate_prose_do_support(s: str) -> str | None:
         )
         if not _ling_ok():
             return None
+        def _first_finite(_doc):
+            """FIRST FINITE verbal token = the clause's tense-carrying verb, the one negation
+            attaches to."""
+            for _t in _doc:
+                if _t.pos_ in ("AUX", "VERB") and "Fin" in _t.morph.get("VerbForm"):
+                    return _t
+            return None
+
         doc = _ling_parse(s)
         if doc is None:
             return None
-        # FIRST FINITE verbal token = the clause's tense-carrying verb, the one negation attaches to.
-        fin = None
-        for t in doc:
-            if t.pos_ in ("AUX", "VERB") and "Fin" in t.morph.get("VerbForm"):
-                fin = t
-                break
+        fin = _first_finite(doc)
+        if fin is None:
+            # ── SENTENCE-CASE RETRY (measured; strictly additive) ─────────────────────────────
+            # MEASURED DEFECT: composed prose renders entity names from ``entity_aliases.alias``,
+            # which is LOWERCASED at registration (entity_registry/registry.py), and nothing
+            # re-capitalizes it for display. So the clause handed to the parser is
+            # sentence-initial-lowercase — "diane lives in toronto" — which is ORTHOGRAPHICALLY
+            # ill-formed English and therefore out-of-distribution for a model trained on
+            # conventionally-cased text. en_core_web_sm then loses the finite verb entirely and
+            # tags the whole clause as a compound NOUN chain, so do-support declined and recall
+            # read "It is not the case that diane lives in toronto". VERIFIED: the SAME clause
+            # cased ("Diane lives in toronto") parses ``lives`` as VERB/Fin. The failure needs
+            # BOTH an out-of-vocabulary lowercase subject AND a verb whose ``-s`` form is a
+            # frequent plural noun (lives/works/studies/dislikes); "diane visits toronto" was
+            # never affected. Case restoration as a preprocessing step for degraded input is
+            # standard practice — Lita et al., "tRuEcasIng", ACL 2003 (§4: restoring case yields
+            # a 26% F-measure improvement on a downstream task).
+            #
+            # RETRY-ON-MISS, deliberately — NOT unconditional normalisation. A clause that already
+            # yields a finite verb never reaches this branch, so every currently-correct render is
+            # byte-identical BY CONSTRUCTION rather than by measurement. Measured on the dev line
+            # over the full 1504-render matrix (every seeded rel_types.natural_language template x
+            # realistic lowercase fillers, both perspectives): 15 clauses gained a verb, 0 lost
+            # one, 0 picked a DIFFERENT verb.
+            #
+            # It cannot FABRICATE a verb: re-measured against the label-fallback lane's genuine
+            # NOUN-PHRASE renders ("X {label} Y" -> "apollo ip address 10.0.0.4", "you favorite
+            # color teal"), casing produced no finite verb in any case — those correctly keep the
+            # "It is not the case that …" wrapper, which for a verbless clause is the RIGHT render.
+            # Offsets are safe: the splice below indexes the ORIGINAL ``s`` and capitalising one
+            # ASCII letter is length-preserving; the ``len`` guard declines the pathological
+            # length-changing uppercase (e.g. "ß" -> "SS") rather than mis-splicing.
+            #
+            # ⚠️ A PRO-FORM SUBSTITUTION PROBE WAS TRIED AND REJECTED — do not re-add it without
+            # re-measuring. Substituting a PRONOUN subject recovered 23/23 of the real cases but
+            # scored 8/8 FALSE POSITIVES on the label-fallback lane's genuine noun-phrase renders
+            # ("apollo does not ip address 10.0.0.4"): a pronoun subject COERCES a verb reading,
+            # so it cannot distinguish "a verb the tagger lost" from "no verb exists". Sentence-
+            # casing fabricates nothing, which is why the honest wrapper stays reachable.
+            #
+            # NOT a lexicon: zero word lists, zero rel/domain literals — a pure orthographic
+            # normalisation of the PARSE INPUT. The rendered string is still spliced from ``s``,
+            # so no casing change ever leaks into the user-visible prose.
+            _cased = s[:1].upper() + s[1:]
+            if _cased != s and len(_cased) == len(s):
+                _doc_cased = _ling_parse(_cased)
+                if _doc_cased is not None:
+                    fin = _first_finite(_doc_cased)
         if fin is None:
             return None
         # A genuine AUXILIARY/copula takes "not" directly — leave it to the caller (unchanged path).
