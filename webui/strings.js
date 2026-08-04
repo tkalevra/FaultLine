@@ -14,6 +14,9 @@
   'use strict';
 
   var STRINGS = {
+    "lic.line": "Licensed under the GNU Affero General Public License v3 \u2014 free to run, study, modify and share.",
+    "lic.contact": "For permissions or collaboration,",
+    "lic.full": "read the full licence",
     "sb.scope.signedout": "not signed in",
     "sb.scope.signedin":  "operator",
     "sb.instance": "instance",
@@ -121,13 +124,6 @@
     "reveal.token.warn": "Store this now \u2014 it will not be shown again. This is a SEAT token: use it as the Bearer token in a single-user client such as Claude Desktop or opencode. OpenWebUI does not use seat tokens \u2014 wire it once with this instance\u2019s MCP key instead.",
     "reveal.mcpkey.title": "New MCP key — shown once",
     "reveal.mcpkey.warn": "Store this now. It will not be shown again. The old key stops working immediately.",
-
-    "lic.badge": "AGPL v3",
-    "lic.sub": "free software — with obligations",
-    "lic.body": "FaultLine FOSS is licensed under the GNU Affero General Public License v3. You may run, study, modify and share it freely. Two conditions come with that: if you modify it and let others use it over a network, you must offer them the modified source; and anything you redistribute stays under the same licence.",
-    "lic.scope": "This is the self-hosted edition. Your memory, your database, your model endpoint — nothing is sent to us. By signing in you are operating your own instance under these terms.",
-    "lic.full": "read the full licence",
-    "lic.gnu": "AGPL v3 at gnu.org",
 
     "tour.welcome": "Welcome",
     "tour.firstrun": "New here? Take a 30-second tour of the control plane.",
