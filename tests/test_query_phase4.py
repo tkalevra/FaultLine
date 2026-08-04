@@ -60,8 +60,11 @@ class TestResolveDisplayName:
         mock_cursor = MagicMock()
         mock_db.cursor.return_value.__enter__.return_value = mock_cursor
 
-        # Mock preferred name lookup
-        mock_cursor.fetchone.return_value = ("Aurora",)
+        # Mock preferred name lookup. The row shape is (alias, display_form) since
+        # migration 214 — display_form NULL means "no casing observed", so the alias
+        # renders unchanged. Kept in the REAL shape the query actually selects: a mock
+        # that does not match the SELECT is a dead mock asserting nothing.
+        mock_cursor.fetchone.return_value = ("Aurora", None)
 
         result = resolve_display_name(entity_id, mock_db)
 
@@ -77,7 +80,8 @@ class TestResolveDisplayName:
 
         # First call (preferred): no result
         # Second call (any alias): returns "aurora"
-        mock_cursor.fetchone.side_effect = [None, ("aurora",)]
+        # (alias, display_form) — the real row shape since migration 214.
+        mock_cursor.fetchone.side_effect = [None, ("aurora", None)]
 
         result = resolve_display_name(entity_id, mock_db)
 
