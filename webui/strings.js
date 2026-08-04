@@ -29,6 +29,7 @@
     "login.title": "Operator sign-in",
     "login.intro": "Paste your admin token once. It is the operator bearer for this instance's control API, stored only in this browser and sent as Authorization: Bearer on every call.",
     "login.token": "Admin token",
+    "login.token.note": "operator bearer",
     "login.connect": "▸ connect",
     "login.where": "Where do I get the token?",
 
@@ -46,6 +47,7 @@
     "dash.llmkey": "LLM API key",
 
     "seats.title": "Seats",
+    "seats.title.note": "up to 5 · FOSS",
     "seats.help": "A seat is one end-user memory store, scoped to its own database schema. Minting a seat returns a connection token once — store it immediately. Use it as the Bearer token in a single-user client (Claude Desktop, opencode); OpenWebUI is wired separately with the MCP key. Each seat is identified by its user_id.",
     "seats.mint":  "＋ mint seat",
     "seats.list":  "Seat roster",
@@ -58,10 +60,13 @@
     "seats.revoke.confirm": "Revoke this seat? Its memory store is preserved, but its connection token stops working immediately.",
 
     "brain.title": "LLM Brain",
+    "brain.title.note": "connect your model",
     "brain.what": "What is the Brain?",
     "brain.type": "Backend type",
     "brain.baseurl": "Base URL",
+    "brain.baseurl.note": "host + port, no path",
     "brain.model": "Model",
+    "brain.model.note": "optional",
     "brain.apikey": "API key",
     "brain.save": "▸ save Brain config",
     "brain.test": "⚡ test connection",
@@ -90,6 +95,7 @@
     "help.connect": "Connect a model",
 
     "cmp.title": "FOSS vs SaaS",
+    "cmp.title.note": "honest · side by side",
     "cmp.intro": "The same engine, two ways to run it. This is factual, not salesy — pick what fits.",
     "cmp.foss": "Self-hosted (FOSS)",
     "cmp.saas": "FaultLine SaaS",
