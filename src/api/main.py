@@ -19,6 +19,10 @@ from src.api.logging_config import set_log_level, get_log_level, LogLevel, log_c
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry
 from src.entity_registry.entity_type_cache import initialize_entity_type_cache, get_entity_type_cache
+# OBSERVED DISPLAY CASE (migration 214): resolves the casing this request's verbatim turn showed
+# for a lowercase alias, or None. Used by the two /ingest alias writers that bypass
+# EntityRegistry.register_alias. See src/extraction/display_case.py.
+from src.extraction.display_case import display_form_for as _display_form_for
 from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.schema_oracle import resolve_entities
@@ -19700,6 +19704,31 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
     # "anonymous" shared-pool collapse (which also skipped SET search_path).
     user_id = _require_resolvable_user_id(req.user_id, "/ingest")
 
+    # ── OBSERVED DISPLAY CASE (migration 214) ──────────────────────────────────────────
+    # `req.text` is the VERBATIM user turn and is the LAST place the original casing of a
+    # name still exists: by the time an edge reaches the registry the surface has been
+    # `.strip().lower()`-ed at several hundred independent sites, because "all string compares
+    # on pre-lowercased values" is a load-bearing invariant of this pipeline (measured on the
+    # dev line: `entity_registry.resolve_start` logs `original_name=diane`, never `Diane`). So
+    # the casing is RETAINED here, at ingest, from the raw turn — not reconstructed at render
+    # time, which would be truecasing and cannot recover `eBay`/`IBM`/`iPhone`. See
+    # src/extraction/display_case.py for the two HARD-LINE guards (sentence-initial evidence is
+    # discarded; only PROPN runs are observed) and the rejected alternative.
+    #
+    # Bound as a ContextVar rather than threaded as a parameter because `EntityRegistry` is
+    # constructed at dozens of points inside this handler and one missed site silently reverts
+    # that entity to lowercase — the same reasoning as `rel_type_overlay._current_schema`.
+    # NOT reset in a `finally`: contextvars are copied per asyncio Task, so a value set inside
+    # this handler cannot escape to another request, and EVERY /ingest binds its own map before
+    # any alias write, so no request can inherit a previous one's. Fail-safe: no spaCy / parse
+    # error → `{}` → every display_form is NULL → the renderer falls back to `alias`, i.e.
+    # byte-identical to today.
+    try:
+        from src.extraction.display_case import observe_display_forms, set_display_forms
+        set_display_forms(observe_display_forms(req.text or ""))
+    except Exception as _dce:  # noqa: BLE001 — casing is presentation; never fail an ingest
+        log.warning("ingest.display_case_observe_failed", error=str(_dce)[:160])
+
     # Derive immutable slug from UUID (never from mutable user attributes)
     if user_id != "anonymous":
         from src.provisioning.schema_manager import derive_user_slug_from_uuid
@@ -24646,13 +24675,21 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                             # Resolve display name from canonical UUID (Bug #3 fix)
                             _display_name = _canonical_to_display.get(_obj, _obj)
 
-                            # Upsert alias into entity_aliases
+                            # Upsert alias into entity_aliases.
+                            # display_form (migration 214): this writer bypasses
+                            # EntityRegistry.register_alias, so it must carry the observed
+                            # casing itself or a name arriving through the also_known_as /
+                            # pref_name lane would render lowercase while the same name
+                            # arriving through the registry rendered correctly. COALESCE on
+                            # conflict so a turn that observes nothing never ERASES casing
+                            # already captured.
                             cur.execute(
-                                "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
-                                "VALUES (%s, %s, %s) "
+                                "INSERT INTO entity_aliases (entity_id, alias, is_preferred, display_form) "
+                                "VALUES (%s, %s, %s, %s) "
                                 "ON CONFLICT (entity_id, alias) "
-                                "DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
-                                (_subj, _display_name, _is_pref),
+                                "DO UPDATE SET is_preferred = EXCLUDED.is_preferred, "
+                                "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
+                                (_subj, _display_name, _is_pref, _display_form_for(_display_name)),
                             )
 
                             # If this is a hard preference, demote all other aliases for this entity
@@ -24777,12 +24814,17 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 # Set the corrected object as preferred
                                 _corrected_obj_display = _canonical_to_display.get(
                                     correction_object, correction_object)
+                                # display_form (migration 214) — see the also_known_as upsert
+                                # above; this identity-correction writer likewise bypasses
+                                # register_alias and must carry the observed casing itself.
                                 cur.execute(
-                                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
-                                    "VALUES (%s, %s, true) "
+                                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, display_form) "
+                                    "VALUES (%s, %s, true, %s) "
                                     "ON CONFLICT (entity_id, alias) DO UPDATE SET "
-                                    "is_preferred = true",
-                                    (correction_subject, _corrected_obj_display),
+                                    "is_preferred = true, "
+                                    "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
+                                    (correction_subject, _corrected_obj_display,
+                                     _display_form_for(_corrected_obj_display)),
                                 )
                                 log.info("ingest.pref_name_correction_aliases_updated",
                                          entity=correction_subject,
@@ -32998,6 +33040,112 @@ def qdrant_semantic_search(
 # PHASE 4: Natural Language Conversion - Convert Facts to Prose
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _entity_is_l4_place(db, entity_id: str) -> bool:
+    """THE HARD LINE: is ``entity_id`` a PLACE (an L4 type/class node) rather than a MEMORY
+    (a grounded instance the user actually told us about)?
+
+    L4 is the *place to put a memory* — the type ladder (``dog → canine → mammal``). A place
+    is the INDEX; it is never itself user content. An entity is a PLACE when it lives on the
+    class ladder as a CLASS:
+
+      • something else is filed AT it — it is the OBJECT of a classification rel
+        (``X instance_of E`` / ``X subclass_of E``), or
+      • it declares its own superclass — it is the SUBJECT of a P279 (``subclass_of``) rel.
+
+    It is NOT a place when it is itself filed at one — SUBJECT of a P31 (``instance_of``):
+    a named instance is a MEMORY and wins the tie (``Fraggle instance_of dog`` → Fraggle is
+    the memory, dog is the place). This is the W3C RDFS split: ``rdf:type`` is instance-level,
+    ``rdfs:subClassOf`` is class-level.
+
+    METADATA-DRIVEN: the classification rels come from ``rel_types.wikidata_pid`` ∈
+    {P31, P279} via ``_get_classification_rels(db)`` (per-tenant, seed ∪ grown) — never a
+    hardcoded rel-name list, never a domain word. Reads ``facts`` ∪ ``staged_facts`` under
+    the caller's already-bound tenant search_path.
+
+    FAIL-SAFE: no db / no entity / any error → False (not a place → today's behaviour)."""
+    if not db or not entity_id:
+        return False
+    try:
+        _cls = sorted(_get_classification_rels(db))
+        if not _cls:
+            return False
+        # P31 = instance_of (filed AT a place). Resolved from metadata, not by name.
+        _p31: set[str] = set()
+        try:
+            with db.cursor() as _pc:
+                _pc.execute(
+                    "SELECT rel_type FROM rel_types WHERE wikidata_pid = %s", ("P31",)
+                )
+                _p31 = {r[0].lower() for r in _pc.fetchall() if r and r[0]}
+        except Exception:  # noqa: BLE001 — no P31 metadata → fall through on the ladder test
+            _p31 = set()
+        _subclass = [r for r in _cls if r not in _p31]
+
+        with db.cursor() as _c:
+            # (a) A named INSTANCE wins the tie — it is a MEMORY, never a place.
+            if _p31:
+                _c.execute(
+                    "SELECT 1 FROM facts WHERE subject_id = %s AND rel_type = ANY(%s) "
+                    "AND superseded_at IS NULL AND archived_at IS NULL "
+                    "UNION ALL "
+                    "SELECT 1 FROM staged_facts WHERE subject_id = %s AND rel_type = ANY(%s) "
+                    "LIMIT 1",
+                    (entity_id, sorted(_p31), entity_id, sorted(_p31)),
+                )
+                if _c.fetchone():
+                    return False
+            # (b) Something is filed AT it, or it declares its own superclass → PLACE.
+            _c.execute(
+                "SELECT 1 FROM facts WHERE object_id = %s AND rel_type = ANY(%s) "
+                "AND superseded_at IS NULL AND archived_at IS NULL "
+                "UNION ALL "
+                "SELECT 1 FROM staged_facts WHERE object_id = %s AND rel_type = ANY(%s) "
+                "UNION ALL "
+                "SELECT 1 FROM facts WHERE subject_id = %s AND rel_type = ANY(%s) "
+                "AND superseded_at IS NULL AND archived_at IS NULL "
+                "UNION ALL "
+                "SELECT 1 FROM staged_facts WHERE subject_id = %s AND rel_type = ANY(%s) "
+                "LIMIT 1",
+                (entity_id, _cls, entity_id, _cls,
+                 entity_id, _subclass, entity_id, _subclass),
+            )
+            return bool(_c.fetchone())
+    except Exception as _pe:  # noqa: BLE001
+        log.warning("entity_is_l4_place.failed", entity=str(entity_id)[:8],
+                    error=str(_pe)[:120])
+        return False
+
+
+def _display_cased(db, entity_id: str, alias: str, display_form: str | None) -> str:
+    """Render ``alias`` with the casing RETAINED at ingest, unless the entity is an L4 PLACE.
+
+    ``display_form`` (migration 214) is a pure casing overlay of ``alias`` stored from the
+    user's verbatim turn — nothing is reconstructed here, and NULL yields ``alias`` unchanged
+    (today's lowercase output). See ``src/extraction/display_case.py``.
+
+    THE HARD LINE: a PLACE (an L4 type node — ``dog``, ``corporation``) must never render as a
+    proper name, so a display form is WITHHELD from any entity the P31/P279 ladder classifies
+    as a place. Reuses ``_entity_is_l4_place`` (metadata-driven; a named INSTANCE, subject of
+    P31, wins the tie and keeps its casing). The probe is paid for ONLY when casing actually
+    exists, so an entity with no display form costs nothing. Fail-safe → ``alias``.
+
+    This is the same rule the batched /query preferred_names lane applies; both live at the ONE
+    sanctioned read-time presentation seam so a UUID can never render cased in one lane and
+    lowercase in another.
+    """
+    if not display_form or display_form == alias:
+        return alias
+    try:
+        if _entity_is_l4_place(db, entity_id):
+            log.info("query.display_case_withheld_from_l4_place",
+                     entity=str(entity_id)[:8],
+                     reason="a PLACE is never rendered as a proper name")
+            return alias
+    except Exception:  # noqa: BLE001 — presentation only; never fail a recall over casing
+        return alias
+    return display_form
+
+
 def resolve_display_name(entity_id: str, db) -> str:
     """
     Resolve a UUID or user_id to a human-readable display name.
@@ -33028,22 +33176,31 @@ def resolve_display_name(entity_id: str, db) -> str:
         # Primary lookup: preferred alias from entity_aliases
         with db.cursor() as cur:
             cur.execute(
-                "SELECT alias FROM entity_aliases WHERE entity_id = %s AND is_preferred = true LIMIT 1",
+                "SELECT alias, display_form FROM entity_aliases "
+                "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
                 (entity_id,)
             )
             row = cur.fetchone()
             if row:
-                return row[0]
+                # Defensive arity: a UUID must NEVER leak to the user (CLAUDE.md), and this
+                # function's except-arm returns the raw UUID. A short row would raise
+                # IndexError inside the try and silently produce exactly that leak, so the
+                # display column is read tolerantly — no display_form simply means "no casing
+                # observed", which is the documented NULL behaviour anyway.
+                return _display_cased(db, entity_id, row[0],
+                                      row[1] if len(row) > 1 else None)
 
         # Fallback: any alias (non-preferred)
         with db.cursor() as cur:
             cur.execute(
-                "SELECT alias FROM entity_aliases WHERE entity_id = %s LIMIT 1",
+                "SELECT alias, display_form FROM entity_aliases WHERE entity_id = %s LIMIT 1",
                 (entity_id,)
             )
             row = cur.fetchone()
             if row:
-                return row[0]
+                # Defensive arity — see the preferred-alias lookup above.
+                return _display_cased(db, entity_id, row[0],
+                                      row[1] if len(row) > 1 else None)
 
         # Fallback: return UUID itself
         return str(entity_id)
@@ -33675,7 +33832,19 @@ def _titlecase_display_slots(prose: str, name_slots: list[str]) -> str:
     Only the supplied resolved alias slots (e.g. "rex" → "Rex") are titled,
     matched as WHOLE words, case-insensitively. "you" and scalar VALUES are never in
     name_slots, so they stay verbatim. The det-scorer is case-insensitive, so this is
-    safe (no gold token is dropped — the token text is identical modulo case)."""
+    safe (no gold token is dropped — the token text is identical modulo case).
+
+    ⚠️ THIS POST-PASS IS TRUECASING, and it is only correct while the resolved slot carries
+    NO casing of its own. It is a first-letter rule, so it renders `ebay` → `Ebay`, `iphone` →
+    `Iphone`, `mcdonald` → `Mcdonald` — wrong, and unrecoverable from a folded string (Lita et
+    al., "tRuEcasIng", ACL 2003; Unicode Standard §4.2, case mappings are non-invertible).
+    Since migration 214 a slot can instead arrive with the casing the user actually typed,
+    RETAINED at ingest (`entity_aliases.display_form`, src/extraction/display_case.py) — and
+    this pass would then DESTROY it: measured, `eBay` → `EBay` and `iPhone` → `IPhone`.
+    Observed casing therefore OUTRANKS the guess: a slot that already carries any uppercase is
+    left exactly as resolved. A fully-lowercase slot is one for which no casing was ever
+    observed, so it keeps today's title-case fallback and this function is byte-identical for
+    every entity that has no display_form."""
     if not prose or not name_slots:
         return prose
     import re as _re
@@ -33683,6 +33852,9 @@ def _titlecase_display_slots(prose: str, name_slots: list[str]) -> str:
     for raw in sorted({s for s in name_slots if s and s.strip()}, key=len, reverse=True):
         slot = raw.strip()
         if not slot or slot.lower() == "you":
+            continue
+        if slot != slot.lower():
+            # RETAINED casing (user truth) beats a titlecase GUESS — never re-case it.
             continue
         titled = " ".join(w[:1].upper() + w[1:] if w else w for w in slot.split())
         if titled == slot:
@@ -36033,12 +36205,49 @@ async def query(request: QueryRequest) -> QueryResponse:
                 with db.cursor() as cur:
                     placeholders = ",".join(["%s"] * len(entity_uuids))
                     # REMOVED: WHERE user_id = %s filter (schema isolation handles this)
+                    # DISPLAY CASE (migration 214): `display_form` is the casing RETAINED at
+                    # ingest from the user's verbatim turn — a pure overlay of `alias`
+                    # (lower(display_form) = alias, enforced at the write seam). NULL means no
+                    # casing was ever observed for this name, and COALESCE then yields exactly
+                    # today's lowercase `alias`. Nothing is reconstructed here: this reads a
+                    # stored value, it does not capitalise. `alias` itself is still what the
+                    # walk matched on; only the rendered label changes.
                     cur.execute(
-                        f"SELECT entity_id, alias FROM entity_aliases WHERE entity_id IN ({placeholders}) AND is_preferred = true",
+                        f"SELECT entity_id, COALESCE(display_form, alias), alias "
+                        f"FROM entity_aliases WHERE entity_id IN ({placeholders}) AND is_preferred = true",
                         list(entity_uuids)
                     )
-                    for entity_id, alias in cur.fetchall():
-                        preferred_names[entity_id] = alias
+                    _cased_entities: set = set()
+                    for entity_id, _label, _raw_alias in cur.fetchall():
+                        preferred_names[entity_id] = _label
+                        if _label != _raw_alias:
+                            _cased_entities.add(entity_id)
+                    # ── THE HARD LINE, display side ────────────────────────────────────────
+                    # A MEMORY is user truth (the name `Diane`); a PLACE is an L4 type node
+                    # (`dog`, `corporation`) the engine builds and files memories AT. A place
+                    # must never acquire a proper-name display form, or the type starts
+                    # rendering like a name.
+                    #
+                    # Ingest already discards sentence-initial capitals and admits only PROPN
+                    # runs, so a bare common noun never gets a display form. What ingest CANNOT
+                    # see is a token inside a multi-word name whose lowercase form is ALSO a
+                    # type in THIS tenant ("McDonald Corporation" → `corporation`). The
+                    # evidence that settles it — the P31/P279 classification ladder — does not
+                    # exist yet while the turn is being written, but it does here. So the
+                    # place test is applied at the ONE sanctioned read-time presentation seam,
+                    # reusing the `_entity_is_l4_place` predicate (metadata-driven from
+                    # `rel_types.wikidata_pid`; a named INSTANCE, subject of P31, wins the tie
+                    # and stays a memory).
+                    #
+                    # Cost-bounded: probed ONLY for entities that actually carry casing (a
+                    # small named subset), never for the whole result set. Fail-safe: the
+                    # predicate returns False on any error → today's behaviour.
+                    for entity_id in _cased_entities:
+                        if _entity_is_l4_place(db, entity_id):
+                            preferred_names[entity_id] = preferred_names[entity_id].lower()
+                            log.info("query.display_case_withheld_from_l4_place",
+                                     entity=str(entity_id)[:8],
+                                     reason="a PLACE is never rendered as a proper name")
             except Exception as e:
                 log.warning("query.preferred_names_lookup.failed", error=str(e))
 
@@ -36054,14 +36263,21 @@ async def query(request: QueryRequest) -> QueryResponse:
                     # slug) and fall back to the best real alias. The UUID-slug regex is
                     # kept as a belt-and-suspenders fallback for rows written before
                     # migration 076 (preference_source='unspecified').
+                    # DISPLAY CASE (migration 214): the two TIGHT-ON-RETURN filters below
+                    # (`_UUID_SLUG_PATTERN`, `_is_surfaceable_user_name`) are lowercase
+                    # predicates and MUST keep judging the raw `alias`; only the value that
+                    # gets rendered carries the retained casing. Selected side by side so the
+                    # gate and the label can never diverge.
                     cur.execute(
-                        "SELECT alias, preference_source FROM entity_aliases "
+                        "SELECT alias, preference_source, COALESCE(display_form, alias) "
+                        "FROM entity_aliases "
                         "WHERE entity_id = %s AND is_preferred = true LIMIT 1",
                         (user_id,)
                     )
                     row = cur.fetchone()
                     _alias_val = row[0] if row else None
                     _alias_src = row[1] if row and len(row) > 1 else None
+                    _alias_label = row[2] if row and len(row) > 2 else _alias_val
                     # TIGHT-ON-RETURN: refuse to surface a placeholder/slug preferred
                     # name OR a junk common-word alias ("worried"/"thinking" — a loose
                     # alias the dumb registry accepted at ingest). The smart-query
@@ -36070,8 +36286,9 @@ async def query(request: QueryRequest) -> QueryResponse:
                             and not _UUID_SLUG_PATTERN.match(_alias_val)
                             and _is_surfaceable_user_name(_alias_val)):
                         # Clean, non-placeholder, non-junk preferred name — use it directly
-                        preferred_names["user"] = _alias_val
-                        preferred_names[user_id] = _alias_val
+                        # (rendered with its retained casing; the gate above judged `alias`).
+                        preferred_names["user"] = _alias_label
+                        preferred_names[user_id] = _alias_label
                     else:
                         # Preferred name is a placeholder/slug, a junk common word, or
                         # missing — fetch the best real human alias instead. Exclude
@@ -36079,16 +36296,19 @@ async def query(request: QueryRequest) -> QueryResponse:
                         # junk-word filter is applied per-row below (it is a language
                         # primitive, not expressible cheaply in SQL).
                         cur.execute(
-                            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+                            "SELECT alias, COALESCE(display_form, alias) FROM entity_aliases "
+                            "WHERE entity_id = %s "
                             "AND preference_source != 'provisioned' "
                             "AND NOT (alias ~ '^[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12}$') "
                             "ORDER BY is_preferred DESC, alias",
                             (user_id,)
                         )
                         _surfaced = None
-                        for (_cand_alias,) in cur.fetchall():
+                        for (_cand_alias, _cand_label) in cur.fetchall():
+                            # Junk-word gate judges the lowercase alias; the retained casing is
+                            # what gets rendered (migration 214).
                             if _is_surfaceable_user_name(_cand_alias):
-                                _surfaced = _cand_alias
+                                _surfaced = _cand_label
                                 break
                         if _surfaced:
                             preferred_names["user"] = _surfaced

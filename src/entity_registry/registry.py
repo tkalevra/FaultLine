@@ -4,6 +4,8 @@ import psycopg2.errorcodes
 import structlog
 from fastapi import HTTPException
 
+from src.extraction.display_case import display_form_for
+
 log = structlog.get_logger()
 
 # Maximum length for entity names and aliases stored in entity_aliases.alias.
@@ -138,7 +140,7 @@ class EntityRegistry:
         with self.db_conn.cursor() as cur:
             # Check if it's a known alias (but only if it points to a valid UUID)
             cur.execute(
-                "SELECT entity_id FROM entity_aliases "
+                "SELECT entity_id, display_form FROM entity_aliases "
                 "WHERE alias = %s "
                 "ORDER BY CASE WHEN entity_id = %s THEN 0 ELSE 1 END, is_preferred DESC",
                 (name, user_id),
@@ -147,6 +149,33 @@ class EntityRegistry:
             log.info("entity_registry.alias_query_executed", name=name, user_id=user_id, found=row is not None)
             if row:
                 entity_id = row[0]
+                # ── DISPLAY-CASE SELF-HEAL (migration 214) ──────────────────────────────
+                # This is the path a KNOWN name takes, and it is the COMMON one: an alias row
+                # is usually already present (minted by an earlier turn, or by the
+                # /harvest-spans ±6 backbone attach before /ingest runs), so the INSERT below
+                # never executes and casing captured at the INSERT alone would be recorded for
+                # almost nothing. Measured on the dev line: a full spine ingest of "…Diane
+                # lives in Toronto…" wrote every alias through this early return, leaving
+                # display_form NULL for all of them.
+                #
+                # So the casing observed for THIS turn is written here, and ONLY when the
+                # stored value is still NULL — never overwriting a form already captured
+                # (observation is monotone; a name does not change case because one later turn
+                # saw it differently). No extra round trip: display_form rides the SELECT
+                # above. Fires at most once per name per tenant.
+                _observed = display_form_for(name)
+                if _observed and row[1] is None:
+                    try:
+                        cur.execute(
+                            "UPDATE entity_aliases SET display_form = %s "
+                            "WHERE alias = %s AND entity_id = %s AND display_form IS NULL",
+                            (_observed, name, entity_id),
+                        )
+                    except Exception as _dfe:  # noqa: BLE001
+                        # Casing is presentation; the resolution it rides on is not. Never let
+                        # a cosmetic write break entity resolution — degrade to lowercase.
+                        log.warning("entity_registry.display_form_heal_failed",
+                                    alias=name, error=str(_dfe)[:160])
                 log.info("entity_registry.alias_query_result", name=name, user_id=user_id, entity_id=entity_id, uuid_count=entity_id.count('-') if entity_id else 0)
                 # Validate that entity_id is a UUID (not a corrupted string)
                 # Corrupted entries should be skipped and treated as unknown
@@ -211,11 +240,18 @@ class EntityRegistry:
                     "ON CONFLICT (id) DO NOTHING",
                     (surrogate,),
                 )
+                # display_form: the OBSERVED casing of this name in the user's verbatim turn
+                # (src/extraction/display_case.py). NULL when nothing was observed → the
+                # renderer falls back to `alias`, i.e. today's lowercase output. COALESCE on
+                # conflict so a later turn that happens not to observe the name never ERASES
+                # casing already captured — observation is monotone.
                 cur.execute(
-                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred) "
-                    "VALUES (%s, %s, true) "
-                    "ON CONFLICT (entity_id, alias) DO UPDATE SET is_preferred = EXCLUDED.is_preferred",
-                    (surrogate, name),
+                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, display_form) "
+                    "VALUES (%s, %s, true, %s) "
+                    "ON CONFLICT (entity_id, alias) DO UPDATE SET "
+                    "is_preferred = EXCLUDED.is_preferred, "
+                    "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
+                    (surrogate, name, display_form_for(name)),
                 )
                 self.db_conn.commit()
                 log.info("entity_registry.registered", surrogate=surrogate, alias=name, user_id=user_id)
@@ -415,6 +451,13 @@ class EntityRegistry:
                         (canonical, alias),
                     )
 
+                # OBSERVED CASING (migration 214). `alias` is lowercase and STAYS the matching /
+                # dedup / UUID-v5 / ON CONFLICT key; `display_form` is a pure casing overlay of
+                # it, taken from the user's verbatim turn (src/extraction/display_case.py). NULL
+                # when this turn observed no casing for the name — the renderer then falls back
+                # to `alias`, byte-identical to today.
+                _display = display_form_for(alias)
+
                 # Ratchet preference_source UP only — never downgrade an alias's own
                 # provenance (ALIAS-PROVENANCE-DESIGN). Re-registering the SAME alias via
                 # a weaker path (e.g. a later rel_default re-extraction of a name the user
@@ -436,12 +479,13 @@ class EntityRegistry:
                 # Persist preference_source so downstream consumers (merge, re-embedder,
                 # query) can read WHY this alias is preferred instead of guessing.
                 cur.execute(
-                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, preference_source) "
-                    "VALUES (%s, %s, %s, %s) "
+                    "INSERT INTO entity_aliases (entity_id, alias, is_preferred, preference_source, display_form) "
+                    "VALUES (%s, %s, %s, %s, %s) "
                     "ON CONFLICT (entity_id, alias) DO UPDATE SET "
                     "is_preferred = EXCLUDED.is_preferred, "
-                    "preference_source = EXCLUDED.preference_source",
-                    (canonical, alias, is_pref, effective_source),
+                    "preference_source = EXCLUDED.preference_source, "
+                    "display_form = COALESCE(EXCLUDED.display_form, entity_aliases.display_form)",
+                    (canonical, alias, is_pref, effective_source, _display),
                 )
                 log.info("entity_registry.alias_registered",
                          canonical=canonical, alias=alias, preferred=is_pref)
