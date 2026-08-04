@@ -65,7 +65,7 @@ In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server**
 | URL | `http://faultline-mcp:8002/mcp` (Docker-internal) |
 | Bearer Token | `<your MCP_API_KEY value>` |
 
-OpenWebUI will call `tools/list`, discover `recall_memory`, `remember_facts`, `retract_fact`, and surface them as native tools in every conversation. The MCP tools are the live integration path; the legacy OpenWebUI Filter in `openwebui/` is intentionally disabled.
+OpenWebUI will call `tools/list`, discover all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — and surface them as native tools in every conversation. The MCP tools are the live integration path; the legacy OpenWebUI Filter in `openwebui/` is intentionally disabled.
 
 #### Step 2b — Claude Desktop over HTTP (remote MCP server)
 
@@ -119,7 +119,7 @@ Prefer specificity: query recall_memory with "family", "pets", "where I live", e
 ## Verification
 
 1. Restart Claude Desktop after updating the config file.
-2. Open a new conversation. The MCP tools indicator (hammer icon) should appear in the input bar. Click it to confirm `recall_memory`, `remember_facts`, and `retract_fact` are listed.
+2. Open a new conversation. The MCP tools indicator (hammer icon) should appear in the input bar. Click it to confirm all six tools are listed — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact`.
 3. Test recall: type `what do you know about me?` — Claude should call `recall_memory` and either return known facts or a clean empty response (not an error).
 4. Test ingest: type `my name is [your name]` — Claude should call `remember_facts`. Verify with:
    ```bash

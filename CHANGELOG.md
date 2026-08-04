@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased (2026-08-03) — MCP Safety + UX Pass
+
+**MCP layer (`src/mcp/server.py`):**
+- **Safety — a `retract_fact` mis-pick no longer destroys data.** A model that called
+  `retract_fact` with text the brain classifies as STATEMENT (or QUERY) was force-routed to
+  RETRACTION — a destructive delete of data the user meant to *store*. Measured: `"my name is
+  alice and I am 42"` archived real facts. It now redirects to `remember_facts`, failing toward
+  data preservation. Genuine RETRACTION still deletes; CORRECTION still reaches the
+  non-destructive supersede. No redirect loop — the `remember_facts` → `retract_fact` re-entry
+  carries `classified_intent`, which skips the classify block entirely.
+- **Safety — a low-confidence CORRECTION is no longer downgraded to RETRACTION.** The old
+  `if confidence < gate: intent = "RETRACTION"` line turned "supersede, don't delete" into a
+  delete. Removed. A low-confidence RETRACTION still deletes (the model explicitly asked to
+  forget); `confidence`/`gate` are diagnostic-only here — the brain's intent drives the route.
+- `retract_fact` now classifies through the shared `_classify_and_gate` helper (single source of
+  truth), keeping its retract-specific fail-safe: on classify failure the default is RETRACTION,
+  not the helper's STATEMENT default, because the model explicitly chose this tool.
+- **UX — `no_ingest` returns are DIRECTIVES, not status reports.** Models parrot tool output, so
+  a descriptive message made weak models announce "I couldn't store that", breaking the
+  silence-is-the-feature design. The cause is logged for operators; the model is told what to do.
+- **UX — `recall_memory` appends a re-query hint on a NON-EMPTY recall only**, so a compound
+  message gets a second lookup. It is model-facing guidance, not a backend-state claim. The
+  EMPTY sentinel `"No relevant facts found."` is byte-identical and must stay that way —
+  abstention scoring keys off that exact string.
+
+**Tests:** `tests/mcp/test_server.py` — 12 tests covering both arms of the redirect (a genuine
+retraction still deletes; a mis-picked statement/query does not), the CORRECTION arm at high and
+low confidence, the classify-failure fail-safe, the no-redirect-loop guard, the directive
+`no_ingest` return, and both halves of the empty/non-empty recall contract. `pytest-asyncio` +
+`asyncio_mode = "auto"` added so async tests actually run in a fresh checkout instead of
+silently skipping.
+
+**Docs:** README, `docs/MCP-SETUP.md`, `docs/MCP-SYSTEM-PROMPT.md` and `webui/index.html`
+corrected from three/four tools to the six actually advertised; `docs/FLOW-BRIEF.md` class
+tiering reconciled to the code (B materializes into `facts` still as B; C→B is the only tier
+change); `docs/ARCHITECTURE.md` `entity_aliases` constraint corrected to `UNIQUE (entity_id,
+alias)` — the per-tenant table has no `user_id` column, and querying one aborts the caller's
+transaction.
+
 ## v1.1.0 (2026-06-01) — MCP Native Server + Security Hardening
 
 **MCP Support:**

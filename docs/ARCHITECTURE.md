@@ -267,7 +267,11 @@ There are two distinct growth pathways — do not conflate them:
 - **Display names** live in `entity_aliases.alias` (lowercased) and
   `entity_attributes.value_*`.
 - `entity_aliases` is the authoritative alias registry, unique on
-  `(user_id, alias)`.
+  `(entity_id, alias)`. The per-tenant table has **no `user_id` column at all** —
+  scoping comes from the bound `search_path`. `(user_id, alias)` is the shape of the
+  LEGACY `public` table only; a per-tenant query that filters on `user_id` raises
+  `UndefinedColumn`, which ABORTS the caller's transaction — so every later read in
+  that request fails and the symptom surfaces somewhere else entirely.
 - **Registry is dumb, query layer is smart** — name filtering/rendering happens
   only at read time in the query path, never at registration.
 

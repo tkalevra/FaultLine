@@ -154,20 +154,23 @@ Not all facts are equal.
 **Class A — You said it directly**
 - "My name is Sam"
 - Confidence: 100% (1.0)
-- Storage: Permanent
+- Storage: Permanent (lands in `facts` immediately; never reclassified)
 
-**Class B — AI inferred it and you confirmed**
-- AI saw: "I work at Acme Corp"
-- You didn't deny it after 3 similar contexts
-- Confidence: 80% (0.8)
-- Storage: Permanent after confirmation
+**Class B — AI inferred it following the established ontology**
+- AI saw: "I work at Acme Corp" (Acme's ontology already exists)
+- Confidence: 80% (0.8), or 60% (0.6) if the ontology had to be created in-flow
+- Storage: Lives in `staged_facts` first; **materializes** into `facts` once it has been
+  confirmed 3 times — still Class B, NOT promoted to A
 
-**Class C — AI guessed something new**
+**Class C — AI guessed something new (no ontology yet)**
 - AI inferred: "You might be interested in gardening" (based on one mention)
 - Confidence: 40% (0.4)
-- Storage: Temporary (expires in 30 days unless confirmed)
+- Storage: Temporary (30-day expiry). If it keeps showing up — or keeps being recalled —
+  it **graduates to Class B** at the 3-confirmation threshold. That is the only tier
+  change in the system.
 
-**Why?** Because corrections from you matter most. AI guesses come second. Random patterns expire.
+**Why?** Because corrections from you matter most. AI guesses come second. Random patterns
+expire. A and B never change class; only C ever promotes, and only to B.
 
 ---
 
