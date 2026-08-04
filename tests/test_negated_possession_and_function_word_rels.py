@@ -220,3 +220,126 @@ def test_auxiliary_negation_is_unchanged():
 def test_already_negated_prose_is_not_double_negated():
     import src.api.main as m
     assert m._negate_prose("You are not sick") == "You are not sick"
+
+
+def test_past_tense_lexical_verb_takes_the_bare_form_not_the_past_form():
+    """MEASURED USER-VISIBLE DEFECT (dev line): recall rendered "Diane did not LIVED in Toronto".
+
+    The past branch correctly selected ``did``, then took the bare form from a de-conjugator
+    for PRESENT-tense finite verbs that strips a trailing ``-s``. Handed a past form it
+    returns it unchanged ("lived"→"lived", "went"→"went"), so the clause carried tense TWICE.
+    English do-support puts the tense on the ``do`` operator and leaves the lexical verb in
+    its BARE form (Huddleston & Pullum, CGEL 2002 ch.3 §1.3; Quirk et al. §3.21ff) — "did not
+    live", never "did not lived".
+
+    This line was written with the lemma from the start (the de-conjugator never existed
+    here), so this test PINS that, it does not change it. The bare form is the finite token's
+    own lemma off the same parse, so it is correct for regular AND irregular pasts, which a
+    spelling rule can never be."""
+    import src.api.main as m
+    assert m._negate_prose("Diane lived in Toronto") == "Diane did not live in Toronto"
+    assert m._negate_prose("You carried the box") == "You did not carry the box"
+    # Irregular past — no suffix rule could ever recover the bare form from the surface.
+    assert m._negate_prose("Diane went to Toronto") == "Diane did not go to Toronto"
+
+
+def test_present_tense_do_support_is_unchanged_by_the_lemma_switch():
+    """The lemma must agree with a surface de-conjugator on every PRESENT form it handled."""
+    import src.api.main as m
+    assert m._negate_prose("Diane lives in Toronto") == "Diane does not live in Toronto"
+    assert m._negate_prose("Diane goes to school") == "Diane does not go to school"
+    assert m._negate_prose("You have a pet that is Dog") == "You do not have a pet that is Dog"
+
+
+def test_lowercase_clause_still_gets_do_support():
+    """A LOWERCASE clause must negate as well as its capitalised twin.
+
+    Composed prose renders entity names from ``entity_aliases.alias``, which is LOWERCASED at
+    registration (entity_registry/registry.py) and never re-capitalised for display — so the
+    clause the parser actually sees is sentence-initial-lowercase. That is orthographically
+    ill-formed English and therefore out-of-distribution for a model trained on
+    conventionally-cased text: ``en_core_web_sm`` loses the finite verb entirely and tags
+    "diane lives in toronto" as one compound NOUN chain, so do-support declined and recall read
+    "It is not the case that diane lives in toronto" for a fact whose capitalised twin rendered
+    correctly.
+
+    Case restoration as a preprocessing step for degraded input is standard practice — Lita et
+    al., "tRuEcasIng", ACL 2003. The retry runs ONLY when the raw parse found no finite verb,
+    so every already-working clause is byte-identical by construction.
+
+    NOTE the asserted output keeps the ORIGINAL lowercase: the casing is applied to the PARSE
+    INPUT only and the returned string is spliced from the caller's own text. If this goes red
+    with a capitalised subject, the normalisation has leaked into the render."""
+    import src.api.main as m
+    assert m._negate_prose("diane lives in toronto") == "diane does not live in toronto"
+    assert m._negate_prose("marcus works for acme") == "marcus does not work for acme"
+    assert m._negate_prose("sarah dislikes cilantro") == "sarah does not dislike cilantro"
+    # The capitalised twin is unchanged.
+    assert m._negate_prose("Diane lives in Toronto") == "Diane does not live in Toronto"
+
+
+def test_verbless_clause_still_gets_the_honest_wrapper():
+    """THE FAIL-SAFE MUST STAY REACHABLE. The label-fallback lane renders a rel with no learned
+    template as the HONEST NEUTRAL "X {label} Y", which for a NOUN-PHRASE label is a genuinely
+    VERBLESS clause — there is no verb to apply do-support to, and the clause-level wrapper is
+    the CORRECT render.
+
+    This is the guard on the sentence-case retry: a PRO-FORM SUBSTITUTION probe was measured
+    and REJECTED for this exact reason (substituting a pronoun subject COERCES a verb reading,
+    giving 8/8 false positives on these clauses — "apollo does not ip address 10.0.0.4").
+    Sentence-casing fabricates nothing, and this test is what proves it. A wrong polarity is a
+    TRUTH error; clunky prose is only a style error — never trade the second for the first."""
+    import src.api.main as m
+    assert m._negate_prose("apollo ip address 10.0.0.4") == (
+        "It is not the case that apollo ip address 10.0.0.4"
+    )
+    assert m._negate_prose("you favorite color teal") == (
+        "It is not the case that you favorite color teal"
+    )
+    # Negation is never LOST, whatever branch runs.
+    for clause in ("diane lives in toronto", "apollo ip address 10.0.0.4"):
+        assert " not " in m._negate_prose(clause)
+
+
+def test_do_support_flag_off_restores_the_legacy_insertion():
+    """FAIL-SAFE lever: flag OFF → the blunt regex path, byte-identical to pre-feature."""
+    import src.api.main as m
+    original = m.RENDER_NEGATION_DO_SUPPORT
+    try:
+        m.RENDER_NEGATION_DO_SUPPORT = False
+        assert m._negate_prose("The gps system is functioning") == (
+            "The gps system is not functioning"
+        )
+        # No _NEGATE_AUX match in a bare lexical past clause → clause-level wrapper.
+        assert m._negate_prose("Diane lived in Toronto") == (
+            "It is not the case that diane lived in Toronto"
+        )
+    finally:
+        m.RENDER_NEGATION_DO_SUPPORT = original
+
+
+def test_log_crit_call_sites_have_the_logger_argument():
+    """FAIL-LOUD PATHS MUST NOT CRASH. ``log_crit(logger, msg, **args)`` — a call site in
+    main.py omitted the logger, so the reporter raised at the exact moment it was meant to
+    report a failure (TypeError: missing required positional argument 'msg').
+
+    Pinned by AST across the whole log_* family so a future site cannot regress silently."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id not in ("log_crit", "log_warn", "log_info", "log_debug"):
+                continue
+            # First positional arg is the LOGGER; a bare string literal there is the bug.
+            if len(node.args) < 2 or isinstance(node.args[0], ast.Constant):
+                offenders.append(f"{path}:{node.lineno} {node.func.id}")
+    assert not offenders, "log_* called without a logger argument: " + ", ".join(offenders)
