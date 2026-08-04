@@ -228,10 +228,15 @@ def _any_dashboard_credential_configured() -> bool:
     Gates the anonymous-dev fallback: once seats/keys exist in the DB, the open
     anonymous mode is suppressed even if MCP_API_KEY env is unset, so minting the
     first seat closes the open posture."""
+    # NOTE the empty params tuple on BOTH probes. `_dashboard_lookup(query, params)` takes
+    # params as a REQUIRED positional; omitting it raises TypeError at the CALL SITE, i.e.
+    # before the callee's `try`, so its documented "any error -> None, never hard-fails"
+    # fail-safe never gets the chance to run. Every credential-less request then 500s inside
+    # require_auth — which is the DEFAULT posture for a fresh self-hosted install.
     return _dashboard_lookup(
-        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1"
+        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1", ()
     ) is not None or _dashboard_lookup(
-        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1"
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
     ) is not None
 
 
