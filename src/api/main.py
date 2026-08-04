@@ -7,7 +7,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from functools import wraps
+from functools import lru_cache, wraps
 from time import time as time_now
 from typing import Optional, Union
 import httpx
@@ -4623,6 +4623,103 @@ def _seed_structural_flags(db, rel_type: str) -> dict | None:
         return None
 
 
+# ── FUNCTION-WORD REL_TYPE GUARD (growth refuses a closed-class relation name) ────────────────────
+# MEASURED DEFECT: an edge carrying ``rel_type="not"`` was accepted by /ingest, MINTED into the
+# tenant's ``rel_types`` (``source='engine'``, ``engine_generated=true``) and committed as a Class-A
+# fact ``(aurora, not, dog)`` stored with ``polarity='affirmed'``. A NEGATION PARTICLE had become a
+# permanent ontology entry, and the assertion it encoded was stored as its own opposite. Any tenant
+# whose extractor emits a stray function word accretes that junk rel_type forever.
+#
+# THE RULE, and why it is grammar rather than a word list: a RELATION NAME must be predicative — it
+# has to denote something. Universal Dependencies splits the POS inventory into an OPEN (content /
+# lexical) class — ADJ, ADV, NOUN, PROPN, VERB — and a CLOSED (function / grammatical) class — ADP,
+# AUX, CCONJ, DET, NUM, PART, PRON, SCONJ (UD v2, "POS tags"; the open/closed distinction is the
+# inventory's own top-level organising principle). A candidate whose tokens are ALL closed-class
+# carries no predicate at all: ``not``, ``is``, ``of``, ``and``, ``that`` name nothing that could be
+# a relation. INTJ is excluded from the admitted set for the same reason: UD defines an interjection
+# as an element that "does not have grammatical relations to other words", which is precisely what a
+# rel_type must have. NUM/X stay admitted (fail toward capture on anything unanalysable).
+#
+# SAFETY — this can only ever refuse a rel_type the system does not already know. The caller applies
+# it ONLY where ``_rel_meta()`` fails to resolve, so a seeded or already-grown rel is NEVER
+# evaluated, let alone dropped. On the dev line this was verified by measurement across every
+# ``rel_types`` row in every tenant schema on the box (216 distinct rel_types): exactly two are
+# all-closed-class — ``not`` (the junk this guard exists to stop) and ``is_a``, which is
+# ``source='builtin'`` in the public seed and is therefore resolved by ``_rel_meta`` and never
+# reaches the guard.
+#
+# HONEST RESIDUAL: ``never`` tags ADV and ``none`` tags NOUN, so a rel_type by either name would
+# still be admitted. Both are genuinely open-class under UD, and tightening past the grammar would
+# mean the negation word-list this repo forbids. Stated, not papered over.
+#
+# FAIL-SAFE: flag OFF, spaCy unavailable, an empty parse, or ANY error → False (admit), i.e.
+# byte-identical to today's behaviour.
+REL_TYPE_FUNCTION_WORD_GUARD: bool = os.environ.get(
+    "REL_TYPE_FUNCTION_WORD_GUARD", "true").strip().lower() not in ("0", "false", "no")
+
+# UD open/content classes admitted as a relation name (INTJ deliberately absent — see above).
+_REL_TYPE_CONTENT_POS = frozenset({"ADJ", "ADV", "NOUN", "PROPN", "VERB", "NUM", "X"})
+
+
+@lru_cache(maxsize=2048)
+def _rel_type_is_function_word_only(rel_type: str) -> bool:
+    """True iff EVERY token of ``rel_type`` is a closed-class (function) word — i.e. the candidate
+    names no predicate and must not become an ontology entry. Grammar-driven (UD open/closed POS),
+    subject-agnostic, NO word list. Fail-safe: any failure → False (admit)."""
+    if not REL_TYPE_FUNCTION_WORD_GUARD:
+        return False
+    rt = (rel_type or "").strip().lower()
+    if not rt:
+        return False
+    try:
+        from src.extraction.linguistics import (
+            _parse as _ling_parse,
+            linguistics_available as _ling_ok,
+        )
+        if not _ling_ok():
+            return False
+        doc = _ling_parse(rt.replace("_", " "))
+        if doc is None:
+            return False
+        toks = [t for t in doc if not t.is_punct and not t.is_space]
+        if not toks:
+            return False
+        return not any(t.pos_ in _REL_TYPE_CONTENT_POS for t in toks)
+    except Exception:  # noqa: BLE001 — fail-safe: never let a parse failure sink a capture
+        return False
+
+
+def _drop_function_word_rel_edges(edges: list) -> list:
+    """Drop edges whose rel_type is an UNKNOWN, all-closed-class candidate.
+
+    Applied at the single point where the turn's edge set is finalised, so it covers BOTH ingest
+    lanes (the ``/extract/rewrite`` LLM relations and the caller-supplied ``req.edges`` the spine
+    posts). An edge whose rel_type the overlay ALREADY resolves is never examined — the guard
+    constrains ONLY ontology GROWTH, never established metadata. Logs every drop (fail loud);
+    returns the kept edges."""
+    if not REL_TYPE_FUNCTION_WORD_GUARD or not edges:
+        return edges
+    kept = []
+    for _e in edges:
+        _rt = (getattr(_e, "rel_type", "") or "").strip().lower()
+        # An ALREADY-KNOWN rel_type is authoritative metadata — never second-guess it here.
+        if not _rt or _rel_meta(_rt):
+            kept.append(_e)
+            continue
+        if _rel_type_is_function_word_only(_rt):
+            log_crit(log,
+                     "ingest.function_word_rel_type_rejected",
+                     rel_type=_rt[:40],
+                     subject=str(getattr(_e, "subject", ""))[:40],
+                     object=str(getattr(_e, "object", ""))[:40],
+                     reason=("candidate rel_type is entirely closed-class (function) words — it "
+                             "names no predicate; refusing to mint it into the ontology or store a "
+                             "fact under it. See _rel_type_is_function_word_only (UD open/closed POS)."))
+            continue
+        kept.append(_e)
+    return kept
+
+
 def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: float,
                              source: str = "engine") -> bool:
     """
@@ -4638,6 +4735,18 @@ def _create_rel_type_in_flow(db, rel_type: str, metadata: dict, confidence: floa
         rt_lower = (rel_type or "").lower().strip()
         if not rt_lower:
             log.warning("ingest.create_rel_type_in_flow.empty_rel_type")
+            return False
+        # FUNCTION-WORD REL_TYPE GUARD, at the MINT itself. The /ingest edge filter already refuses
+        # these before they reach here, but this function is ALSO called by the /expand (learn) lane,
+        # which never passes through that filter. Guarding the mint makes the invariant hold for
+        # EVERY growth path: a closed-class candidate never becomes an ontology row. Returning False
+        # is the existing "mint failed" contract every caller already handles non-fatally.
+        if _rel_type_is_function_word_only(rt_lower):
+            log_crit(log,
+                     "ontology.function_word_rel_type_mint_refused",
+                     rel_type=rt_lower[:40], source=source,
+                     reason=("candidate rel_type is entirely closed-class (function) words — it "
+                             "names no predicate. See _rel_type_is_function_word_only."))
             return False
 
         norm = metadata or {}
@@ -4843,6 +4952,15 @@ def _insert_novel_rel_type(db, rel_type: str, confidence: float,
         rt_lower = rel_type.lower().strip()
         if not rt_lower:
             log.warning("insert_novel_rel_type: empty rel_type provided")
+            return False
+        # FUNCTION-WORD REL_TYPE GUARD — the heuristic sibling of _create_rel_type_in_flow's mint.
+        # Both mint seams are covered so no growth path can register a closed-class relation name.
+        if _rel_type_is_function_word_only(rt_lower):
+            log_crit(log,
+                     "ontology.function_word_rel_type_mint_refused",
+                     rel_type=rt_lower[:40], source=source,
+                     reason=("candidate rel_type is entirely closed-class (function) words — it "
+                             "names no predicate. See _rel_type_is_function_word_only."))
             return False
 
         # Layer placement: taxonomy-driven (subject-agnostic, hierarchy-aware), not the
@@ -20786,6 +20904,12 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     edges = list(edges_dict.values())
 
+    # FUNCTION-WORD REL_TYPE GUARD. Both lanes (LLM /extract/rewrite relations and caller-supplied
+    # req.edges) converge here, BEFORE the novel-rel mint below — so an unknown, all-closed-class
+    # candidate ("not") is refused once, in one place, and can neither become a rel_types row nor
+    # carry a stored fact. Known rel_types are untouched. See _drop_function_word_rel_edges.
+    edges = _drop_function_word_rel_edges(edges)
+
     # DATE HOST-SELECTION (the Feb-27 mis-host fix): when an OCCURRENCE edge (temporal_class='event'
     # — e.g. participated_in) exists in THIS request, the parsed request-level event_date BELONGS to
     # that in-clause occurrence ("I washed my Corolla on Feb 27"), NOT smeared across unrelated
@@ -33090,6 +33214,78 @@ _NEGATE_AUX = ("is", "are", "was", "were", "am", "has", "have", "had",
                "will", "would", "can", "could", "does", "do", "did", "should", "must")
 
 
+# ── DO-SUPPORT ON NEGATED PROSE (default ON) ──────────────────────────────────────────────────────
+# MEASURED DEFECT: the negated-possession render read "You HAVE NOT a pet that is Dog". ``_negate_prose``
+# treats its whole ``_NEGATE_AUX`` list as auxiliaries and inserts "not" straight after the match — which
+# is correct for a genuine auxiliary ("is not functioning", "have not eaten") but ungrammatical when the
+# SAME surface form is the clause's MAIN LEXICAL verb. English negates a lexical verb with DO-SUPPORT:
+# the negator attaches to a dummy ``do`` carrying the tense/agreement, and the lexical verb reverts to
+# its bare form — "You DO NOT HAVE a pet". Only ``be`` (and true auxiliaries/modals) take ``not``
+# directly. Huddleston & Pullum, "The Cambridge Grammar of the English Language" (2002) ch.3 §1.3
+# (do-support / the auxiliary–lexical verb distinction); Quirk et al., CGEL §3.21ff, §10.54ff.
+#
+# The auxiliary-vs-lexical distinction is READ FROM THE PARSE, not from a verb list: spaCy tags the
+# perfect auxiliary "have" as ``AUX`` and possessive "have" as ``VERB`` (verified on the live model),
+# which is exactly the grammatical contrast that governs do-support. The ``do`` form is chosen from the
+# token's own morphology (``Tense=Past`` → did; ``Person=3|Number=Sing`` → does; else do) and the BARE
+# form is the token's own LEMMA off the same parse, so no lexicon of any kind is introduced.
+#
+# This also repairs a pre-existing gap: a lexical-verb clause with no ``_NEGATE_AUX`` match at all
+# ("Diane lives in Toronto") previously fell through to the blunt "It is not the case that …" wrapper
+# and now reads "Diane does not live in Toronto".
+#
+# Presentation-only — it renders the ``polarity`` column the walk already carried and performs NO
+# reasoning, so it stays inside the one read-time exception (prose rendering) to lean-query.
+# FAIL-SAFE: flag OFF, spaCy unavailable, no finite verb, no resolvable lemma, or ANY error →
+# the existing regex insertion, byte-identical.
+RENDER_NEGATION_DO_SUPPORT: bool = os.environ.get(
+    "RENDER_NEGATION_DO_SUPPORT", "true").strip().lower() not in ("0", "false", "no")
+
+
+def _negate_prose_do_support(s: str) -> str | None:
+    """Negate a clause whose FINITE verb is LEXICAL, using English do-support.
+
+    Returns the negated clause, or None when the clause is not a lexical-verb clause (a genuine
+    auxiliary/copula → the caller's direct "not" insertion is already correct) or when anything at
+    all prevents a clean transform. Grammar-driven (parse POS + morphology + lemma), no verb list."""
+    if not RENDER_NEGATION_DO_SUPPORT:
+        return None
+    try:
+        from src.extraction.linguistics import (
+            _parse as _ling_parse,
+            linguistics_available as _ling_ok,
+        )
+        if not _ling_ok():
+            return None
+        doc = _ling_parse(s)
+        if doc is None:
+            return None
+        # FIRST FINITE verbal token = the clause's tense-carrying verb, the one negation attaches to.
+        fin = None
+        for t in doc:
+            if t.pos_ in ("AUX", "VERB") and "Fin" in t.morph.get("VerbForm"):
+                fin = t
+                break
+        if fin is None:
+            return None
+        # A genuine AUXILIARY/copula takes "not" directly — leave it to the caller (unchanged path).
+        if fin.pos_ != "VERB":
+            return None
+        base = (fin.lemma_ or "").strip().lower()
+        if not base:
+            return None
+        morph = fin.morph
+        if morph.get("Tense") == ["Past"]:
+            do_form = "did"
+        elif morph.get("Person") == ["3"] and morph.get("Number") == ["Sing"]:
+            do_form = "does"
+        else:
+            do_form = "do"
+        return s[:fin.idx] + f"{do_form} not {base}" + s[fin.idx + len(fin.text):]
+    except Exception:  # noqa: BLE001 — presentation fail-safe: never break prose
+        return None
+
+
 def _negate_prose(prose: str) -> str:
     """Insert "not" after the first copula/auxiliary in a rendered state clause so a NEGATED fact
     reads back negated ("X is in state Y" → "X is not in state Y"). Presentation-only, deterministic,
@@ -33104,6 +33300,13 @@ def _negate_prose(prose: str) -> str:
         # Idempotency / already-negated guard: never double-negate.
         if _re2.search(r"\bnot\b|n't\b", s, flags=_re2.IGNORECASE):
             return prose
+        # DO-SUPPORT FIRST: when the clause's finite verb is LEXICAL ("You have a pet"), English
+        # negates it with do/does/did + not + BASE, not by suffixing "not" to the verb. A genuine
+        # auxiliary/copula returns None here and falls through to the direct insertion below,
+        # byte-identical to before. See _negate_prose_do_support.
+        _ds = _negate_prose_do_support(s)
+        if _ds:
+            return _ds
         # Insert "not" after the EARLIEST-positioned copula/aux (a single alternation over the whole
         # closed-class set, so we negate the main clause's verb, not a later one).
         _alt = r"\b(" + "|".join(_re2.escape(a) for a in _NEGATE_AUX) + r")\b"
