@@ -139,6 +139,42 @@ ENUM_PRESPLIT: bool = os.environ.get(
     "ENUM_PRESPLIT", "true"
 ).strip().lower() in ("1", "true", "yes")
 
+# ── NEGATED PREDICATIVE POSSESSIVE (default ON) ───────────────────────────────────────────────────
+# MEASURED DEFECT: "Aurora is not my dog." derived the SAME edge as "Aurora is my dog." —
+# ``(user, owns, dog) negated=False``. ``_chain_possessive`` reads the ``my X`` NP in isolation and
+# never consults the clause it sits in, so a user DENYING a possession re-committed the affirmative
+# fact (``committed:1`` on the identical triple) and recall kept asserting it. The user's correction
+# had ZERO effect — worse than being dropped, it was counted as a re-confirmation.
+#
+# The negated copula/state chains ALREADY handle this correctly ("The car is not blue" →
+# ``negated=True``) and the SVO chain correctly emits nothing under negation. Only the PRESUPPOSED
+# possessive/kinship leg was blind to it. The polarity plumbing downstream is already generic:
+# ``SentenceFact.negated`` → ``_edge["polarity"]="negated"`` → the ingest ``ON CONFLICT ... polarity =
+# EXCLUDED.polarity`` supersede-in-place → ``convert_to_prose`` renders the negation. Nothing new is
+# built here; the flag that was already flowing simply reaches this chain.
+#
+# SCOPE — a GRAMMATICAL rule, not a word list. The possessive is marked negated ONLY when the
+# possessed noun is the DIRECT PREDICATIVE COMPLEMENT of a predicate carrying a ``neg`` dependency.
+# That is precisely the configuration in which sentential negation scopes over the possession itself:
+#   "Aurora is not my DOG."           dog  = attr of negated ROOT  → the possession IS denied.
+#   "Sarah is not my SISTER."         sister = attr of negated ROOT → the kin tie IS denied.
+# It does NOT fire when the possessive sits anywhere else, because there the possession is a
+# PRESUPPOSITION that PROJECTS THROUGH the negation and remains asserted (Karttunen 1973,
+# "Presuppositions of Compound Sentences", Linguistic Inquiry 4(2) — presupposition survives under
+# negation; the classic diagnostic for presupposition vs. entailment):
+#   "MY DOG is not sick."             dog = nsubj  → I still have a dog; only "sick" is denied.
+#   "My pets are not part of my FAMILY."  family = pobj under "part of" → I still have a family;
+#                                     what is denied is the part_of relation, not the possession.
+# Clause negation scoping over the predication (and only the predication) is Quirk et al.,
+# "A Comprehensive Grammar of the English Language" §10.54ff; the ``neg`` dependency itself is the
+# spaCy/ClearNLP label for UD's negation ``advmod`` (UD v2 ``polarity=Neg`` feature).
+#
+# FAIL-SAFE: flag OFF, no ``neg`` child, an unexpected dependency shape, or ANY error → today's
+# affirmed emit, byte-identical.
+SPINE_NEGATED_POSSESSIVE: bool = os.environ.get(
+    "SPINE_NEGATED_POSSESSIVE", "true"
+).strip().lower() not in ("0", "false", "no")
+
 # Universal POS tags that mark a token as a FUNCTION word (grammar, not a relation). This is the
 # spaCy/Universal-Dependencies POS scheme — a closed LANGUAGE PRIMITIVE set, NOT a domain list.
 #   ADP   adposition / preposition (in, at, with)      PART  particle (to, 's, not)
@@ -7400,6 +7436,39 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             for _m in _mods:
                 _occ_suppress.add(_m.i)
 
+    def _possessum_predication_negated(head) -> bool:
+        """True iff the possessed noun ``head`` is the DIRECT PREDICATIVE COMPLEMENT of a
+        predicate carrying a ``neg`` dependency — i.e. the possession itself is what the
+        clause DENIES ("Aurora is not my dog", "Sarah is not my sister").
+
+        Returns False for every other position, because there the possession is a
+        PRESUPPOSITION that PROJECTS THROUGH the negation and is still asserted
+        (Karttunen 1973, Linguistic Inquiry 4(2)): in "My dog is not sick" the possessum is
+        the ``nsubj`` and I still have a dog; in "my pets are not part of my family" the
+        possessum is a ``pobj`` nested under the "part of" complement and I still have a
+        family. Clause negation scopes over the predication only — Quirk et al., CGEL
+        §10.54ff. ``neg`` is the spaCy/ClearNLP label for UD's negation ``advmod``.
+
+        Grammar only: dependency label + the presence of a ``neg`` child on the governing
+        predicate. NO token/word list of any kind. Fail-safe: any error → False (today's
+        affirmed reading).
+        """
+        if not SPINE_NEGATED_POSSESSIVE:
+            return False
+        try:
+            # PREDICATIVE COMPLEMENT positions. ``attr``/``acomp``/``oprd`` are the copular
+            # complement slots; ``dobj``/``obj`` cover the transitive predicative ("I do not
+            # own my car"). A ``nsubj``/``pobj``/``poss`` possessum is deliberately excluded —
+            # that is the presupposition-projection carve-out above.
+            if head is None or head.dep_ not in ("attr", "acomp", "oprd", "dobj", "obj"):
+                return False
+            pred = head.head
+            if pred is None or pred is head:
+                return False
+            return any(c.dep_ == "neg" for c in pred.children)
+        except Exception:  # noqa: BLE001 — fail-safe: never let a parse quirk flip polarity
+            return False
+
     def _chain_possessive(doc):
         # POSSESSIVE (relational-vs-sortal split). ``my X`` (1st-person poss pronoun) → (user, owns, X).
         # ``X's Y`` genitive → relational/sortal split via the relational_noun cue class (overlay):
@@ -7518,9 +7587,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _hl = (head.lemma_ or head.text or "").strip().lower()
                 if _hl in _kinship_nouns():
                     _kin = _inherent_relation_for_noun(_hl)
-                    _emit(head_phrase, _kin, "user", obj_tok=head)
+                    # NEGATED PREDICATIVE KIN TIE ("Sarah is not my sister"): the clause DENIES
+                    # the tie, so the edge must carry polarity='negated' and supersede the prior
+                    # affirmed row in place — never re-confirm it. See _possessum_predication_negated.
+                    _emit(head_phrase, _kin, "user", obj_tok=head,
+                          negated=_possessum_predication_negated(head))
                 else:
-                    _emit("user", "owns", head_phrase, obj_tok=head)
+                    # NEGATED PREDICATIVE POSSESSION ("Aurora is not my dog"): the clause DENIES
+                    # the possession, so the edge carries polarity='negated' and supersedes the
+                    # prior affirmed row in place. See _possessum_predication_negated for the
+                    # presupposition-projection carve-out that keeps "My dog is not sick" affirmed.
+                    _emit("user", "owns", head_phrase, obj_tok=head,
+                          negated=_possessum_predication_negated(head))
                 continue
             if tok.pos_ in ("NOUN", "PROPN"):
                 possessor = (tok.text or tok.lemma_ or "").strip().lower()
