@@ -39,13 +39,28 @@ function esc(s) {
    `var _t = window.t` first does not help: the declaration wins. strings.js loads first
    and its t() already falls back to the key when a string is missing. Just use it. */
 
+/* Decorative badges are not part of the translated sentence, so they survive; the rest
+   of the element is sentence BODY and is replaced wholesale.
+
+   The old version rewrote only the element's FIRST TEXT NODE. For a sentence carrying
+   inline markup (`<code>`, `<strong>`) that left every node after it in place, so the
+   tail of the ORIGINAL English sentence rendered after the applied string — visibly
+   duplicated in login.intro, seats.help, owui.steps.intro and owui.weak. In seats.help
+   the stranded tail was the superseded "Wire it into your chat client as a Bearer
+   token" copy, still on screen after the string that was written to replace it. It also
+   made those four strings untranslatable: a translated build would swap the string and
+   still print the English tail. */
+var I18N_KEEP = '.pill-note, .console-tag';
+
 function applyI18n(root) {
   qsa('[data-i18n]', root || document).forEach(function (n) {
     var val = t(n.getAttribute('data-i18n'));
-    if (n.children.length === 0) { n.textContent = val; return; }
-    var first = n.firstChild;
-    if (first && first.nodeType === 3) first.nodeValue = val + ' ';
-    else n.insertBefore(document.createTextNode(val + ' '), n.firstChild);
+    var kept = qsa(I18N_KEEP, n);
+    n.textContent = val;
+    kept.forEach(function (el) {
+      n.appendChild(document.createTextNode(' '));
+      n.appendChild(el);
+    });
   });
 }
 
