@@ -533,6 +533,9 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
         "WGM_LLM_MODEL": cfg["WGM_LLM_MODEL"],
         "FAULTLINE_USER_ID": faultline_user_id,
     }
+    # ONE language choice → the database collation, the parser, and the language marker the
+    # startup guard checks. All empty strings for English, so an English .env is unchanged.
+    to_set.update(language_env())
     # embedding overrides are already container-final (host rewrite applied) — merge verbatim
     for k, v in (embed_overrides or {}).items():
         to_set[k] = v
@@ -708,8 +711,75 @@ def _load_env(path):
     return cfg
 
 
-# ── language gate (runs FIRST — Italian pulls the experimental `it` branch) ────
+# ── language gate (runs FIRST — a non-English choice pulls that language's branch) ────
 _EN_BRANCHES = ("main", "master")
+
+# THE LANGUAGE TABLE — adding a language is an ENTRY HERE, not a code change.
+#
+# Each entry carries everything one choice has to drive:
+#   label        what the picker shows
+#   branches     branch(es) that hold this language's code + prompts (the branch IS the language)
+#   icu_locale   PostgreSQL ICU locale. ⚠️ SET ONCE AT initdb AND THEN IMMUTABLE — a collation
+#                cannot be changed afterwards without a dump/restore, which is the whole reason
+#                this has to be decided at install time. ICU rather than a libc locale because
+#                the postgres image ships NO es_*/it_* OS locales, so `--locale=it_IT.utf8`
+#                fails outright while ICU carries its own data.
+#   spacy_model  the parser the deterministic spine runs on.
+#   ts_config    default_text_search_config. Nothing reads it today (we use no full-text
+#                search anywhere) — set for future-proofing so a later tsvector cannot silently
+#                inherit English stemming.
+#
+# ⚠️ ENGLISH DELIBERATELY CARRIES EMPTY icu_locale. Empty = "do not touch initdb, do not run the
+# collation guard" = today's behaviour byte-for-byte. Do NOT fill it in to look tidy; that would
+# change how every existing English database is judged at startup.
+#
+# ⚠️ THE spaCy MODEL IS NOT A PARITY CLAIM. The spine's chains are built and validated against
+# English. Switching the model makes the parser match the text; it does not make the chains
+# correct for that language. They are portable in principle (the UD features they key on exist
+# in these models) and UNMEASURED in practice.
+_LANGUAGES = {
+    "en": {"label": "English",
+           "branches": _EN_BRANCHES,
+           "icu_locale": "",                      # empty ⇒ image default, guard disabled
+           "spacy_model": "en_core_web_sm",
+           "ts_config": "english"},
+    "it": {"label": "Italiano  (sperimentale — experimental)",
+           "branches": ("it",),
+           "icu_locale": "it-IT",
+           "spacy_model": "it_core_news_sm",
+           "ts_config": "italian"},
+    "es": {"label": "Español  (experimental)",
+           "branches": ("es",),
+           "icu_locale": "es-ES",
+           "spacy_model": "es_core_news_sm",
+           "ts_config": "spanish"},
+}
+_DEFAULT_LANG = "en"
+
+
+def chosen_language():
+    """The language picked at the gate. Survives the branch-switch re-exec via the environment,
+    because after a re-exec ``language_gate`` returns early and never re-prompts. Fail-safe to
+    English so a missing/garbled value can never produce a non-English database."""
+    lang = (os.environ.get("_FL_LANG") or "").strip().lower()
+    return lang if lang in _LANGUAGES else _DEFAULT_LANG
+
+
+def language_env(lang=None):
+    """The .env keys ONE language choice drives. English yields empty strings for the
+    locale-bearing keys, which is what makes the whole feature a no-op for English."""
+    spec = _LANGUAGES.get(lang or chosen_language(), _LANGUAGES[_DEFAULT_LANG])
+    icu = spec["icu_locale"]
+    return {
+        "FAULTLINE_LANGUAGE": (lang or chosen_language()),
+        "FAULTLINE_DB_ICU_LOCALE": icu,
+        # Consumed by the postgres service ONLY when the data volume is empty (initdb runs once).
+        # Against an existing volume this is ignored — docker-entrypoint.sh's guard is what
+        # catches that case and refuses to start on a mismatch.
+        "POSTGRES_INITDB_ARGS": (
+            f"--locale-provider=icu --icu-locale={icu} --encoding=UTF8" if icu else ""),
+        "SPACY_MODEL": spec["spacy_model"],
+    }
 
 
 def _git(*args, timeout=60):
@@ -751,22 +821,23 @@ def _switch_branch_and_reexec(targets, note):
 
 
 def language_gate():
-    """FIRST prompt, before anything else. English → the `main`/`master` (en) code; Italian → the
-    EXPERIMENTAL `it` branch (multilingual code + Italian prompts) via checkout + re-exec. The branch
-    IS the language, so there is no bilingual-string refactor. Bilingual prompt, fail-safe."""
+    """FIRST prompt, before anything else. English → the `main`/`master` (en) code; any other
+    language → that language's branch (its own code + prompts) via checkout + re-exec. The branch
+    IS the language, so there is no bilingual-string refactor. Fail-safe: an unresolvable switch
+    prints a note and continues in the current branch's language, never crashes."""
     if os.environ.get("_FL_LANG_SWITCHED"):
         return  # re-exec after a branch switch — language already chosen, don't re-prompt.
-    lang = choose("Language / Lingua",
-                  [("en", "English"), ("it", "Italiano  (sperimentale — experimental)")])
-    on_it = (_current_branch() == "it")
-    if lang == "it" and not on_it:
+    lang = choose("Language / Lingua / Idioma",
+                  [(k, v["label"]) for k, v in _LANGUAGES.items()])
+    # Record BEFORE any switch: _switch_branch_and_reexec replaces this process, and on the far
+    # side the early-return above fires, so the environment is the only carrier of the choice.
+    os.environ["_FL_LANG"] = lang
+    branch = _current_branch()
+    want = _LANGUAGES[lang]["branches"]
+    if branch not in want:
         _switch_branch_and_reexec(
-            ["it"],
-            "Passo al ramo italiano (sperimentale) e riavvio l'installazione…  "
-            "(Switching to the experimental Italian branch and restarting…)")
-    elif lang == "en" and on_it:
-        _switch_branch_and_reexec(list(_EN_BRANCHES),
-                                  "Switching to the English branch and restarting setup…")
+            list(want),
+            f"Switching to the {_LANGUAGES[lang]['label']} branch and restarting setup…")
     # else: already on the branch for the chosen language → continue.
 
 
