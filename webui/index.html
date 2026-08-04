@@ -77,7 +77,7 @@
       </p>
     </div>
     <div class="field">
-      <span class="lbl"><span data-i18n="login.token">Admin token</span> <span class="pill-note">operator bearer</span></span>
+      <span class="lbl"><span data-i18n="login.token">Admin token</span> <span class="pill-note" data-i18n="login.token.note">operator bearer</span></span>
       <input type="password" id="in-token" autocomplete="off" placeholder="paste your admin token">
     </div>
     <button class="btn accent" id="btn-connect" style="width:100%" data-i18n="login.connect">▸ connect</button>
@@ -132,7 +132,7 @@
 
   <!-- ══ TAB 2 — SEATS & TOKENS ══ -->
   <div class="view hidden" data-view="seats">
-    <div class="section-label" data-i18n="seats.title">Seats <span class="pill-note">up to 5 · FOSS</span></div>
+    <div class="section-label" data-i18n="seats.title">Seats <span class="pill-note" data-i18n="seats.title.note">up to 5 · FOSS</span></div>
     <div class="panel">
       <p class="hint" style="margin-top:0" data-i18n="seats.help">
         A seat is one end-user memory store, scoped to its own database schema. Minting a seat
@@ -168,7 +168,7 @@
 
   <!-- ══ TAB 3 — LLM BRAIN ══ -->
   <div class="view hidden" data-view="brain">
-    <div class="section-label" data-i18n="brain.title">LLM Brain <span class="pill-note">connect your model</span></div>
+    <div class="section-label" data-i18n="brain.title">LLM Brain <span class="pill-note" data-i18n="brain.title.note">connect your model</span></div>
     <div class="panel">
       <details class="help-strip">
         <summary data-i18n="brain.what">What is the Brain?</summary>
@@ -185,11 +185,11 @@
           <select id="llm-type"></select>
         </div>
         <div class="field">
-          <span class="lbl" data-i18n="brain.baseurl">Base URL <span class="pill-note">host + port, no path</span></span>
+          <span class="lbl" data-i18n="brain.baseurl">Base URL <span class="pill-note" data-i18n="brain.baseurl.note">host + port, no path</span></span>
           <input type="text" id="llm-baseurl" autocomplete="off" placeholder="http://host.docker.internal:11434">
         </div>
         <div class="field">
-          <span class="lbl" data-i18n="brain.model">Model <span class="pill-note">optional</span></span>
+          <span class="lbl" data-i18n="brain.model">Model <span class="pill-note" data-i18n="brain.model.note">optional</span></span>
           <input type="text" id="llm-model" autocomplete="off" placeholder="leave blank for backend default">
         </div>
         <div class="field">
@@ -303,7 +303,7 @@ AI:   "DevBox has IP address 10.0.1.10."</pre>
 
   <!-- ══ TAB 6 — FOSS vs SaaS ══ -->
   <div class="view hidden" data-view="compare">
-    <div class="section-label" data-i18n="cmp.title">FOSS vs SaaS <span class="pill-note">honest · side by side</span></div>
+    <div class="section-label" data-i18n="cmp.title">FOSS vs SaaS <span class="pill-note" data-i18n="cmp.title.note">honest · side by side</span></div>
     <div class="panel">
       <p class="hint" style="margin-top:0" data-i18n="cmp.intro">
         The same engine, two ways to run it. This is factual, not salesy — pick what fits.

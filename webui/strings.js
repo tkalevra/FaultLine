@@ -37,6 +37,7 @@
     "login.title": "Accesso operatore",
     "login.intro": "Incolla una sola volta il tuo token di amministrazione. È il bearer dell'operatore per l'API di controllo di questa istanza, memorizzato solo in questo browser e inviato come Authorization: Bearer a ogni chiamata.",
     "login.token": "Token di amministrazione",
+    "login.token.note": "bearer dell'operatore",
     "login.connect": "▸ connetti",
     "login.where": "Dove trovo il token?",
 
@@ -54,6 +55,7 @@
     "dash.llmkey": "Chiave API LLM",
 
     "seats.title": "Postazioni",
+    "seats.title.note": "fino a 5 · FOSS",
     "seats.help": "Una postazione è l'archivio di memoria di un singolo utente finale, isolato nel proprio schema di database. Creando una postazione, il token di connessione viene restituito una sola volta: conservalo subito. Usalo come token Bearer in un client a utente singolo (Claude Desktop, opencode); OpenWebUI si configura separatamente con la chiave MCP. Ogni postazione è identificata dal proprio user_id.",
     "seats.mint":  "＋ crea postazione",
     "seats.list":  "Elenco delle postazioni",
@@ -66,10 +68,13 @@
     "seats.revoke.confirm": "Revocare questa postazione? Il suo archivio di memoria viene conservato, ma il token di connessione smette di funzionare immediatamente.",
 
     "brain.title": "Cervello LLM",
+    "brain.title.note": "collega il tuo modello",
     "brain.what": "Che cos'è il Cervello?",
     "brain.type": "Tipo di backend",
     "brain.baseurl": "Base URL",
+    "brain.baseurl.note": "host + porta, senza percorso",
     "brain.model": "Modello",
+    "brain.model.note": "facoltativo",
     "brain.apikey": "Chiave API",
     "brain.save": "▸ salva la configurazione del Cervello",
     "brain.test": "⚡ verifica la connessione",
@@ -98,6 +103,7 @@
     "help.connect": "Collegare un modello",
 
     "cmp.title": "FOSS vs SaaS",
+    "cmp.title.note": "onesto · a confronto",
     "cmp.intro": "Lo stesso motore, due modi di eseguirlo. Questo confronto è fattuale, non promozionale: scegli ciò che fa al caso tuo.",
     "cmp.foss": "Self-hosted (FOSS)",
     "cmp.saas": "FaultLine SaaS",
