@@ -36,9 +36,12 @@ services:
         # make a non-English language choice quietly half-inert.
         #
         # ⚠️ NOT A PARITY CLAIM. The spine's dependency chains are built and validated against
-        # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
-        # text; it does not make the chains correct for that language. Portable in principle
-        # (the UD features they key on exist in these models), UNMEASURED in practice.
+        # ENGLISH. Pointing the parser at fr_core_news_sm / es_core_news_sm / it_core_news_sm
+        # makes it match the text; it does not make the chains correct for that language.
+        # Portable in principle (the UD features they key on exist in these models),
+        # UNMEASURED in practice. On THIS branch that means: French text is PARSED as French,
+        # but the deterministic extraction chains remain English-shaped. Do not read a
+        # French spaCy model as 'French extraction works'.
         SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
     image: faultline:latest
     container_name: faultline-api

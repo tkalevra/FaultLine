@@ -243,7 +243,7 @@ _DEFAULT_MODEL = {
 
 def configure_backend():
     backend = choose(
-        "Which LLM are you already running? (FaultLine connects to it — it doesn't host one)",
+        "Quel LLM utilisez-vous déjà? (FaultLine s'y raccorde — il n'en héberge aucun)",
         _BACKENDS,
     )
     cfg = {"LLM_BACKEND_TYPE": backend, "LLM_API_KEY": "", "WGM_LLM_MODEL": "", "LLM_BASE_URL": ""}
@@ -325,7 +325,7 @@ def configure_embeddings(llm_cfg):
     embed model might be on another box), then we do an ACTUAL model pull against
     it (probe → pick from the served list, no blind typing).
     """
-    print(bold("Embeddings") + dim("  (vectorize facts for the Class-C short-term recall lane)"))
+    print(bold("Embeddings") + dim("  (vectorise les faits pour la voie de rappel à court terme, classe C)"))
     print(dim("  FaultLine has a built-in LOCAL CPU embedder (nomic) — works out of the box,"))
     print(dim("  offline, no setup."))
     if not ask_yes("Choose your own embedding model, or use the standard built-in one?", default_yes=False):
@@ -402,7 +402,7 @@ def configure_identity():
         opts.insert(0, ("reuse", f"Keep the id already in .env  ({existing})"))
 
     while True:
-        mode = choose("Set your FAULTLINE_USER_ID (the memory tenant owner):", opts)
+        mode = choose("Définissez votre FAULTLINE_USER_ID (le propriétaire du locataire de mémoire) :", opts)
 
         if mode == "reuse":
             return existing
@@ -483,7 +483,7 @@ def configure_naming():
     Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
     DB that isn't up yet (the stack may not be built).
     """
-    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix, Qdrant collection)"))
+    print(bold("Noms des ressources") + dim("  (BD Postgres, préfixe de schéma par locataire, collection Qdrant)"))
     print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
     base_dsn = _default_dsn()
 
@@ -567,7 +567,7 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
 # ── next steps ────────────────────────────────────────────────────────────────
 def print_next_steps(mcp_key):
     hr()
-    print(bold("You're set. Next steps:\n"))
+    print(bold("Tout est prêt. Prochaines étapes :\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
     print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
     print(f"       expect: {dim(chr(34) + 'database:ok, qdrant:ok, llm:ok' + chr(34))}")
@@ -753,6 +753,25 @@ _LANGUAGES = {
            "icu_locale": "es-ES",
            "spacy_model": "es_core_news_sm",
            "ts_config": "spanish"},
+    # CANADIAN French, not France French. The key is "ca-fr" so that KEY == BRANCH NAME, which
+    # is the convention every other entry follows (en is the only exception, because its branch
+    # is main/master). The ICU locale below is "fr-CA" and NOT "ca-fr": ICU/BCP 47 is strictly
+    # language-REGION, so the two strings are deliberately not the same and must not be
+    # "harmonised". fr-CA is a real CLDR locale, so PG16's ICU provider accepts it directly —
+    # which matters because, exactly as with es/it, the postgres image carries no fr_* OS locale.
+    #
+    # ⚠️ fr-CA IS NOT INTERCHANGEABLE WITH fr-FR, and this is MEASURED, not assumed. Run against
+    # postgres:16-alpine, ordering ('cote','coté','côte','côté'):
+    #     ICU fr-CA -> cote < côte < coté < côté      (forward accent ordering)
+    #     ICU fr-FR -> cote < coté < côte < côté      (French BACKWARD accent ordering)
+    # CLDR keeps the traditional right-to-left accent comparison for France French and not for
+    # Canadian French. Since collation is fixed at initdb and immutable afterwards, putting
+    # "fr-FR" here would silently give every Canadian install the wrong sort order for good.
+    "ca-fr": {"label": "Français canadien  (expérimental — experimental)",
+              "branches": ("ca-fr",),
+              "icu_locale": "fr-CA",
+              "spacy_model": "fr_core_news_sm",
+              "ts_config": "french"},
 }
 _DEFAULT_LANG = "en"
 
@@ -801,7 +820,7 @@ def _switch_branch_and_reexec(targets, note):
     → print a note and return so setup continues in the current branch's language."""
     if _current_branch() is None:
         print(yellow("  ! Not a git checkout — cannot switch language automatically."
-                     "  (Non e un checkout git — impossibile cambiare lingua automaticamente.)"))
+                     "  (Ce n'est pas un dépôt git — impossible de changer de langue automatiquement.)"))
         return
     print(dim(f"  {note}"))
     for t in targets:
@@ -817,7 +836,7 @@ def _switch_branch_and_reexec(targets, note):
             # checkout replaced quickstart.py on disk → re-exec runs the NEW branch's version.
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
     print(red("  ✗ Could not switch branch (uncommitted changes? offline?). Continuing as-is."
-              "  (Impossibile cambiare ramo — continuo cosi com'e.)"))
+              "  (Impossible de changer de branche — on continue tel quel.)"))
 
 
 def language_gate():
@@ -827,7 +846,7 @@ def language_gate():
     prints a note and continues in the current branch's language, never crashes."""
     if os.environ.get("_FL_LANG_SWITCHED"):
         return  # re-exec after a branch switch — language already chosen, don't re-prompt.
-    lang = choose("Language / Lingua / Idioma",
+    lang = choose("Language / Lingua / Idioma / Langue",
                   [(k, v["label"]) for k, v in _LANGUAGES.items()])
     # Record BEFORE any switch: _switch_branch_and_reexec replaces this process, and on the far
     # side the early-return above fires, so the environment is the only carrier of the choice.
@@ -868,12 +887,13 @@ def main():
             print(red(f"  ✗ {detail}"))
         sys.exit(0 if ok else 2)
 
-    # LANGUAGE FIRST — before prereqs / .env. Italian switches to the `it` branch and re-execs.
+    # LANGUAGE FIRST — before prereqs / .env. A non-English pick switches branch and re-execs.
     language_gate()
 
-    print(bold(cyan("\n  FaultLine — quickstart setup\n")))
-    print("  A per-tenant, write-validated knowledge-graph memory for your LLM.")
-    print(dim("  Connects to your LLM, confirms it, and writes a ready-to-use .env.\n"))
+    print(bold(cyan("\n  FaultLine — installation rapide  (branche CA-FR — expérimentale)\n")))
+    print("  Une mémoire en graphe de connaissances, par locataire et validée à l'écriture, pour votre LLM.")
+    print(dim("  Se raccorde à votre LLM, le vérifie et écrit un fichier .env prêt à l'emploi."))
+    print(yellow("  ⚠ Version expérimentale et non officielle — voir LISEZMOI-ca-fr.md. À utiliser à vos risques.\n"))
     hr()
     check_prereqs()
     hr()
@@ -884,12 +904,12 @@ def main():
     embed_overrides = configure_embeddings(cfg)
 
     hr()
-    print(bold("MCP API key") + dim("  (secures the MCP server on :8002 — recommended)"))
-    if ask_yes("Generate a strong MCP_API_KEY for you now?", default_yes=True):
+    print(bold("Clé API MCP") + dim("  (protège le serveur MCP sur :8002 — recommandée)"))
+    if ask_yes("Générer maintenant une MCP_API_KEY robuste?", default_yes=True):
         mcp_key = secrets.token_urlsafe(32)
-        print(green(f"  ✓ generated: {mcp_key}"))
+        print(green(f"  ✓ générée : {mcp_key}"))
     else:
-        mcp_key = ask("Enter an MCP_API_KEY (blank = leave open, dev only)", "")
+        mcp_key = ask("Entrez une MCP_API_KEY (vide = ouverte, développement seulement)", "")
 
     hr()
     faultline_user_id = configure_identity()
@@ -902,12 +922,12 @@ def main():
     print_next_steps(mcp_key)
 
     print()
-    if ask_yes("Build + start the stack now (docker compose up -d --build)?", default_yes=False):
+    if ask_yes("Construire et démarrer le stack maintenant (docker compose up -d --build)?", default_yes=False):
         try:
             subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=HERE, check=False)
             _poll_health()
         except Exception as e:
-            print(red(f"  could not launch docker compose: {e}"))
+            print(red(f"  impossible de lancer docker compose : {e}"))
 
     print_integration_guide(mcp_key, faultline_user_id)
 

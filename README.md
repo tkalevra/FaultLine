@@ -179,7 +179,7 @@ git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
 ```
 
-**Guided setup (recommended).** An interactive wizard first asks **Language / Lingua**, then picks your LLM backend, **tests the connection and lists your available models to choose from**, generates a secret `MCP_API_KEY`, sorts out your tenant id, and writes a ready-to-use `.env` — then prints exactly what to paste into your client:
+**Guided setup (recommended).** An interactive wizard first asks **Language / Lingua / Idioma / Langue**, then picks your LLM backend, **tests the connection and lists your available models to choose from**, generates a secret `MCP_API_KEY`, sorts out your tenant id, and writes a ready-to-use `.env` — then prints exactly what to paste into your client:
 
 ```bash
 ./setup.sh            # Linux / macOS
@@ -187,7 +187,9 @@ setup.bat             # Windows
 #  or, on any platform:  python3 quickstart.py
 ```
 
-> **🌍 Language.** The wizard opens with a language choice. **English** continues on `main`. **Italiano** (experimental) switches to the `it` branch — an unofficial, work-in-progress Italian instance (Italian setup + `LEGGIMI-it.md`); extraction there rides the LLM path. Not production-ready — use at your own risk; for the stable version stay on English/`main`.
+> **🌍 Language.** The wizard opens with a language choice, and **the branch IS the language**. **English** continues on `main`. **Italiano** (experimental) switches to the `it` branch (`LEGGIMI-it.md`); **Español** (experimental) switches to the `es` branch (`LEEME-es.md`); **Français canadien** (experimental) switches to the `ca-fr` branch (`LISEZMOI-ca-fr.md`). These are unofficial, work-in-progress instances whose extraction rides the LLM path — the deterministic spine is English-only. Not production-ready; for the stable version stay on English/`main`.
+>
+> ⚠️ **The choice also fixes the PostgreSQL collation (ICU) and it is IMMUTABLE after `initdb`** — it cannot be changed later without a dump/restore, which is why it is asked first. The Canadian French branch uses ICU `fr-CA`, which is **not** the same collation as `fr-FR` (CLDR keeps France French's backward accent ordering and Canadian French's forward ordering: `cote < côte < coté` under `fr-CA`, `cote < coté < côte` under `fr-FR`). If you reuse a Postgres volume whose collation does not match, startup **stops on purpose** and prints the real options; nothing is changed or deleted. English is a complete no-op here (empty locale, guard skipped).
 
 **Or configure manually:**
 
