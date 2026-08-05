@@ -107,7 +107,8 @@ Example:
 - We KNOW Toronto is in Canada from data
 - We NEVER confuse one for the other
 
-Vectors help us find related memories, but **facts decide what's true**.
+FaultLine does not use vector search for user memory at all — the vector tier is
+retired. Every fact lives in PostgreSQL, and **facts decide what's true**.
 
 ---
 

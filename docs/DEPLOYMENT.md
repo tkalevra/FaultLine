@@ -7,8 +7,9 @@ This is the full deployment walkthrough. For a 30-second start see the root
 ## Architecture in one paragraph
 
 FaultLine is a **per-tenant, write-validated, deterministic knowledge-graph
-memory**. PostgreSQL is the authoritative store; a Qdrant vector index holds only
-the short-term Class-C tier. The **live integration path is the MCP server**
+memory**. PostgreSQL is the authoritative store for **all** user memory, including
+the short-term Class-C tier (the vector tier is retired for user memory). The
+**live integration path is the MCP server**
 (`recall_memory`, `remember_facts`, `learn_facts`, `retract_fact`) on port `:8002`.
 The legacy OpenWebUI Filter in `openwebui/` is intentionally disabled and is **not**
 the production path — do not treat its being off as a fault.
@@ -16,8 +17,8 @@ the production path — do not treat its being off as a fault.
 ```
 client (Claude Desktop / OpenWebUI MCP) ──MCP──▶ faultline-mcp :8002 ──▶ backend :8000
                                                                             │
-                                          PostgreSQL :5432 (authoritative, per-tenant)
-                                                  + Qdrant :6333 (Class-C short-term)
+                                          PostgreSQL :5432 (authoritative, per-tenant — ALL user memory)
+                                                  + Qdrant :6333 (present in the stack; holds no user memory)
 ```
 
 The backend orchestrates the complete ingest pipeline — extraction, the WGM
@@ -31,7 +32,7 @@ scattered into the client.
 
 ### Prerequisites
 - Docker & Docker Compose v2+
-- PostgreSQL 16+ and Qdrant (both come up via the compose file)
+- PostgreSQL 16+ (Qdrant also comes up via the compose file, but the vector tier is retired for user memory and holds no user facts)
 - An LLM backend you already run
 
 ### Steps
@@ -76,7 +77,7 @@ in [`ENV-REFERENCE.md`](ENV-REFERENCE.md). The essentials:
 | `WGM_LLM_MODEL` | Model name as it appears on your backend. |
 | `MCP_API_KEY` | Bearer token enforced on the MCP transport (`:8002`). **Set this for any networked deploy.** |
 | `FAULTLINE_USER_ID` | Single-user fallback for MCP; omit in multi-user. |
-| `QDRANT_URL` | Vector index endpoint (Class-C short-term tier only). |
+| `QDRANT_URL` | Vector index endpoint (retired for user memory; the service may remain in the stack but holds no user facts). |
 | `REEMBED_INTERVAL` | Re-embedder poll interval (seconds). |
 
 Set LLM configuration through environment variables (compose `environment:` or
@@ -201,5 +202,7 @@ FaultLine extracts and stores, per tenant:
 - **Attributes (scalars):** age, location, occupation, IPs, MACs, hostnames.
 - **Classifications:** entity types and hierarchy membership.
 
-Authoritative facts (Class A/B) live in PostgreSQL. Class C short-term material is
-mirrored to Qdrant until it is promoted or expires.
+All user memory (Class A/B/C) lives in PostgreSQL (`facts` / `staged_facts` /
+`episodic_log`). The vector tier is retired for user memory — nothing is mirrored
+to Qdrant. Class-C short-term material stays in PostgreSQL until it is promoted or
+expires.
