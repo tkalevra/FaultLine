@@ -377,10 +377,10 @@ def _guardrail_check(atom_text: str, source_span: str, full_message: str) -> str
     # IMPORTANT (enumeration fix): we test ONLY ``atom_text`` here, NOT the ``source`` span. A
     # correctly-split ENUMERATION item carries the shared subject in the ATOM TEXT but cites a bare
     # subjectless NP as its ``source`` — e.g. "We have a cat …, a dog named Rex, … a snake named
-    # Sophia" splits to atom_text="We have a dog named Rex." (subject "We" intact) with
+    # Slinky" splits to atom_text="We have a dog named Rex." (subject "We" intact) with
     # source="a dog named Rex" (no nsubj). The atom is GOOD; the source is just the verbatim
     # provenance fragment. The OLD code also tested the ``source`` span and rejected these correct
-    # atoms, replacing them with the entire run-on sentence — the live "Rex/Sophia merge" bug.
+    # atoms, replacing them with the entire run-on sentence — the live "Rex/Slinky merge" bug.
     # The ``source``-subjectlessness only matters when the source is USED as the downstream text
     # (the CONTENT/NUMERIC verbatim fallback), so that case is handled in ``_apply_guardrail`` by
     # anchoring a subjectless source to its true containing sentence — without falsely rejecting the
