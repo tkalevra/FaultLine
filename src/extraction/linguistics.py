@@ -237,14 +237,23 @@ def _install_bracket_infix(nlp) -> None:
     a UNIVERSAL orthographic boundary, not a domain fact, so it belongs in the tokenizer: with the run
     split, the SPACED and UNSPACED forms parse IDENTICALLY and the alias chain sees the same shape.
 
-    The identifier ``token_match`` installed above OVERRIDES infixes (spaCy applies ``token_match``
-    first), so a genuine identifier that legitimately carries brackets is unaffected. Idempotent
-    (re-running recompiles the same rule set); fail-safe: any error leaves the tokenizer untouched."""
+    ORDERING (spaCy's documented tokenizer loop): a ``token_match`` is consulted BEFORE the infix
+    split (infixes are step 9, after the prefix/suffix/URL/special-case steps), so the identifier
+    ``token_match`` installed above still wins and an identifier that legitimately carries brackets is
+    untouched — verified by the identifier regression suites. The one documented way a new infix can
+    silently no-op is a conflicting tokenizer SPECIAL CASE (``nlp.tokenizer.rules``, e.g. the
+    contraction table), which takes precedence over every pattern; no special case spans a bracket,
+    and ``_reconcile_cue_tokenizer_exceptions`` below already owns that table.
+
+    Built with ``spacy.util.compile_infix_regex`` (the documented helper) rather than a hand-joined
+    alternation. Installed BEFORE the first parse, so no tokenization cache needs invalidating.
+    Idempotent (re-running recompiles the same rule set); fail-safe: any error leaves the tokenizer
+    untouched — the unspaced form then degrades to today's single-token reading, never to a crash."""
     try:
-        import re as _re
+        from spacy.util import compile_infix_regex  # deferred: spaCy is an optional dependency
 
         _infixes = list(nlp.Defaults.infixes) + [r"(?<=[A-Za-z0-9])[\(\)\[\]\{\}](?=[A-Za-z0-9])"]
-        nlp.tokenizer.infix_finditer = _re.compile("|".join(_infixes)).finditer
+        nlp.tokenizer.infix_finditer = compile_infix_regex(_infixes).finditer
     except Exception as e:  # noqa: BLE001 — never break the parse over a tokenizer tweak
         log.warning("linguistics.bracket_infix_install_failed", error=str(e)[:120])
 
