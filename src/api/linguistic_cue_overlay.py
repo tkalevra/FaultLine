@@ -427,6 +427,34 @@ _BOOTSTRAP_UNIT_SCALAR_MAP: dict[str, str] = {
 # non-circular signal exists.
 _BOOTSTRAP_THIN_TYPE_MAP: dict[str, str] = {}
 
+# ── IDENTIFIER-NOUN class — DB-HELD + per-tenant + GROWABLE (category='identifier_noun') ──────────
+# The CONTEXT-SIGNAL class for a stated reference/identifier code ("my ticket number is 1234567",
+# "the docket number is 2024-CV-00931"): the HEAD/compound noun of the copula subject NP signals that
+# the post-copula value is an IDENTIFIER, so it is captured (has_reference_id) REGARDLESS of value
+# shape — including a BARE NUMBER that the value-shape atomic pattern (migration 147) intentionally
+# excludes to avoid eating counts. The context noun is what disambiguates: "1234567" after "ticket
+# number is" is an ID, not a count.
+#
+# ROLE ('description' column, resolved by resolve_identifier_noun_roles → {noun: role}):
+#   • 'strong' — INHERENTLY identifier-signalling; establishes the context ALONE ("my case is X",
+#     "my id is X", "my reference is X") or as a COMPOUND of a generic head ("ticket number").
+#   • 'suffix' — the AMBIGUOUS generic tail ("number"): identifier-SHAPED but NOT sufficient alone
+#     (a bare "number" is "favorite number"/"phone number"/a count). It only rides ALONGSIDE a
+#     'strong' cue; the deriver gate requires a 'strong' cue present, so "my favorite number is 7"
+#     (no strong cue) NEVER fires. Note "id"/"code" are 'strong' (they mean identifier
+#     unambiguously); only "number" is a 'suffix'.
+# Grown per-tenant on the SAME rail; this in-code set is the DB-DOWN code-fallback seed only (mirrors
+# migration 148's public seed).
+_BOOTSTRAP_IDENTIFIER_NOUN_ROLE_MAP: dict[str, str] = {
+    # strong — establish identifier context alone or as a compound
+    "ticket": "strong", "case": "strong", "docket": "strong", "order": "strong",
+    "account": "strong", "policy": "strong", "claim": "strong", "reference": "strong",
+    "confirmation": "strong", "invoice": "strong", "id": "strong", "code": "strong",
+    # suffix — generic tail; rides alongside a strong cue, never triggers alone
+    "number": "suffix",
+}
+_BOOTSTRAP_IDENTIFIER_NOUNS: frozenset[str] = frozenset(_BOOTSTRAP_IDENTIFIER_NOUN_ROLE_MAP)
+
 # Cue CATEGORIES this module resolves. The table is general by category so every verb/particle cue
 # class rides the SAME rail (one table, one overlay) without a new module.
 NAMING_VERB_CATEGORY = "naming_verb"
@@ -453,6 +481,10 @@ THIN_TYPE_CATEGORY = "thin_type"
 # SET — the SET is resolve_kinship_nouns, the MAP is resolve_kinship_rel_map). No separate category.
 # unit_scalar is its OWN keyed class (unit-lemma → scalar rel_type) for the copula measurement chain.
 UNIT_SCALAR_CATEGORY = "unit_scalar"
+# identifier_noun is BOTH a SET (resolve_identifier_nouns — is this head an identifier-context noun)
+# AND a KEYED value (resolve_identifier_noun_roles — {noun: 'strong'|'suffix'} in `description`) on
+# the SAME rail/rows, exactly like kinship_noun. Drives the context-signalled has_reference_id capture.
+IDENTIFIER_NOUN_CATEGORY = "identifier_noun"
 # kinship_gender is a KEYED class (kinship-noun → gender) on the SAME rail (cue=noun, description=
 # gender), resolved by resolve_kinship_gender_map() into a {noun: gender} dict. Distinct category from
 # kinship_noun so the rel-map and the gender-map ride separate rows for the same noun.
@@ -485,6 +517,7 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     RELATIONAL_NOUN_CATEGORY: _BOOTSTRAP_RELATIONAL_NOUNS,
     DISCOURSE_MARKER_CATEGORY: _BOOTSTRAP_DISCOURSE_MARKERS,
     KINSHIP_NOUN_CATEGORY: _BOOTSTRAP_KINSHIP_NOUNS,
+    IDENTIFIER_NOUN_CATEGORY: _BOOTSTRAP_IDENTIFIER_NOUNS,
     SHELL_NOUN_CATEGORY: _BOOTSTRAP_SHELL_NOUNS,
     # THIN_TYPE_CATEGORY is intentionally NOT here: it is a keyed-value (surface→type) class resolved
     # by resolve_thin_type() into a dict, not a flat cue set. Its DB-DOWN fallback is
@@ -879,6 +912,24 @@ def resolve_kinship_rel_map(dsn: str) -> dict[str, str]:
     return _resolve_keyed_map(dsn, KINSHIP_NOUN_CATEGORY, _BOOTSTRAP_KINSHIP_REL_MAP)
 
 
+def resolve_identifier_nouns(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE IDENTIFIER-CONTEXT noun SET for the ContextVar-bound current
+    request schema (tenant-only), via the SAME binding as the kinship/naming/temporal resolvers. Used
+    by the deriver's context-signalled scalar chain to recognise "my <ticket/case/…> [number] is
+    <value>". Fail-safe: never empty (the identifier_noun bootstrap floor)."""
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), IDENTIFIER_NOUN_CATEGORY)
+
+
+def resolve_identifier_noun_roles(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE identifier-noun → ROLE MAP for the ContextVar-bound current
+    request schema. Reads the `description` column of the identifier_noun rows ({noun: 'strong'|
+    'suffix'}). 'strong' = establishes identifier context alone or as a compound; 'suffix' = the
+    ambiguous generic tail ("number") that only rides alongside a strong cue. Metadata-driven, NOT an
+    in-code literal. Same contract as resolve_kinship_rel_map. Fail-safe: bootstrap floor
+    (`_BOOTSTRAP_IDENTIFIER_NOUN_ROLE_MAP`)."""
+    return _resolve_keyed_map(dsn, IDENTIFIER_NOUN_CATEGORY, _BOOTSTRAP_IDENTIFIER_NOUN_ROLE_MAP)
+
+
 def resolve_unit_scalar_map(dsn: str) -> dict[str, str]:
     """Resolve the per-tenant ACTIVE measurement-unit → scalar rel_type MAP for the ContextVar-bound
     current request schema. Reads the unit_scalar rows ({unit: rel_type}). Used by the copula
@@ -928,6 +979,56 @@ def resolve_role_noun_map(dsn: str) -> dict[str, str]:
     Same contract as resolve_social_role_map. Fail-safe: bootstrap floor
     (`_BOOTSTRAP_ROLE_NOUN_MAP`)."""
     return _resolve_keyed_map(dsn, ROLE_NOUN_CATEGORY, _BOOTSTRAP_ROLE_NOUN_MAP)
+
+
+# ── ALL-CATEGORY CUE SURFACES (the TOKENIZER-RECONCILIATION reader) ─────────────────
+# Every resolver above is category-scoped because every CONSUMER is. This one is not: its consumer
+# asks a question about the cue vocabulary AS A WHOLE — "is any cue surface destroyed before a
+# consumer can ever see it?" (src/extraction/linguistics.py::_reconcile_cue_tokenizer_exceptions).
+# A cue is matched by spaCy LEMMA/TEXT, so a surface the tokenizer SPLITS can never match anything
+# and the row is silently DEAD (measured: seeded `id` → tokens ['i','d'], dead since migration 148).
+# Same tenant/seed/TTL/fail-safe contract as ``resolve_cues``; category-agnostic by design.
+_ALL_SURFACES_KEY = "__all_cue_surfaces__"
+
+
+def _fetch_all_cue_surfaces(dsn: str, schema_qualifier: str) -> frozenset[str]:
+    """Read every ACTIVE cue surface (all categories) from one explicit, already-validated schema."""
+    surfaces: set[str] = set()
+    with psycopg2.connect(dsn, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT cue FROM {schema_qualifier}.linguistic_cues "
+                f"WHERE is_active = true"
+            )
+            for (cue,) in cur.fetchall():
+                if cue and cue.strip():
+                    surfaces.add(cue.strip().lower())
+    return frozenset(surfaces)
+
+
+def resolve_all_cue_surfaces(dsn: str) -> frozenset[str]:
+    """Every ACTIVE cue surface across ALL categories for the ContextVar-bound schema (tenant-only;
+    unbound → the public template). Fail-safe → EMPTY (unlike the category resolvers there is no
+    bootstrap floor: the consumer's safe default is "reconcile nothing", i.e. today's tokenizer)."""
+    if not dsn:
+        return frozenset()
+    schema_name = rel_type_overlay.get_current_schema()
+    qualifier = schema_name.strip() if _is_real_tenant_schema(schema_name) else "public"
+    cache_key = f"{qualifier}::{_ALL_SURFACES_KEY}"
+    now = time.time()
+    with _lock:
+        entry = _overlay_cache.get(cache_key)
+        if entry and (now - entry["loaded_at"]) <= _TTL_SECONDS:
+            return entry["cues"]
+    try:
+        fresh = _fetch_all_cue_surfaces(dsn, qualifier)
+    except Exception as e:  # noqa: BLE001 — fail-safe: reconcile nothing
+        log.warning("linguistic_cue_overlay.all_cue_surfaces_fetch_failed",
+                    schema=qualifier, error=str(e)[:160])
+        return frozenset()
+    with _lock:
+        _overlay_cache[cache_key] = {"cues": fresh, "loaded_at": time.time()}
+    return fresh
 
 
 # ── CARVED-CLASS GROWTH ACCUMULATOR (request-scoped cue-candidate side-channel) ──────

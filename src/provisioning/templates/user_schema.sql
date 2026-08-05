@@ -26,7 +26,7 @@
 --   3. NEVER set status='ready'
 --   4. Fail loud per CLAUDE.md constraint #3
 
--- USER SCHEMA TEMPLATE: Replace {schema_name} with actual schema name (e.g., faultline_christopher)
+-- USER SCHEMA TEMPLATE: Replace {schema_name} with actual schema name (e.g., faultline_alice)
 -- This template is applied when provisioning a new user schema
 
 -- Create schema

@@ -2659,6 +2659,7 @@ async def _classify_value_subject_residue(text: str, edges: list[dict], user_id:
     _unresolved = [
         _av for _av in _atomic
         if _av["value"].strip().lower() not in _existing_objects
+        and not _atomic_claim_is_run_fragment(_av["value"], _existing_objects)
     ]
     if not _unresolved:
         return []
@@ -3375,7 +3376,7 @@ def get_user_schema_context(user_id: str, db) -> dict:
     Returns:
         {
             "user_id": user_id,
-            "schema_name": "faultline_christopher",  # from users.slug
+            "schema_name": "faultline_example",  # from users.slug
             "status": "ready"
         }
 
@@ -11301,6 +11302,75 @@ async def refresh_intent_pattern_caches(request: Request):
 
 
 # ── Surgical Fact Correction Helper ──────────────────────────────────────────
+def _recover_alnum_identifier_in_text(source: str, fragment: str) -> str:
+    """Recover the FULL alphanumeric identifier when an LLM extraction returned only a
+    FRAGMENT of it. The correction/rewrite LLM routinely truncates out-of-distribution
+    identifiers ("X9K 8Z7" → "x9", "AB-1234" → "ab"); this finds ``fragment`` in the
+    source statement and expands to the maximal whitespace-separated alphanumeric run
+    containing it, when that run carries a digit (the identifier signal).
+
+    Subject-agnostic and structural — a digit-bearing token run, never a domain pattern.
+    Conservative: returns ``fragment`` UNCHANGED unless a strictly longer digit-bearing
+    run is recovered, so a correct extraction is never altered and word values
+    ("dark blue", "negative" — no digit) are never touched.
+    """
+    if not source or not fragment:
+        return fragment
+    frag = fragment.strip()
+    # the fragment must be a purely-alphanumeric token (a shard of an identifier)
+    if not frag or not re.fullmatch(r'[A-Za-z0-9]+', frag):
+        return fragment
+    m = re.search(re.escape(frag), source, re.IGNORECASE)
+    if not m:
+        return fragment
+    # alnum words with positions
+    words = [(wm.start(), wm.end(), wm.group()) for wm in re.finditer(r'[A-Za-z0-9]+', source)]
+    # locate the word containing the fragment match
+    idx = next((i for i, (s, e, _w) in enumerate(words) if s <= m.start() < e), None)
+    if idx is None:
+        return fragment
+    # only recover when the fragment anchors at the word's LEFT edge or is the whole word
+    # (LLM truncation is left-anchored; a mid-word substring match is almost certainly spurious)
+    containing = words[idx][2]
+    if not (containing.lower() == frag.lower() or containing.lower().startswith(frag.lower())):
+        return fragment
+
+    def _is_ident_word(w: str) -> bool:
+        # a token that can be part of an identifier: digit-bearing, OR a short non-lowercase
+        # fragment of the kind identifiers are made of (mirrors _is_ident_fragment)
+        return any(c.isdigit() for c in w) or (len(w) <= 3 and w != w.lower())
+
+    # gate: the fragment must sit in an identifier-shaped word (digit-bearing or a short
+    # non-lowercase code token in the SOURCE), or itself carry a digit — otherwise a plain
+    # word like "is"/"a" matching inside prose would spuriously extend into a nearby number
+    if not (_is_ident_word(containing) or any(c.isdigit() for c in frag)):
+        return fragment
+
+    lo = hi = idx
+    # extend right through whitespace-only gaps to adjacent identifier words
+    j = idx
+    while j + 1 < len(words):
+        gap = source[words[j][1]:words[j + 1][0]]
+        if gap.strip() == '' and _is_ident_word(words[j + 1][2]):
+            hi = j + 1
+            j += 1
+        else:
+            break
+    # extend left
+    j = idx
+    while j - 1 >= 0:
+        gap = source[words[j - 1][1]:words[j][0]]
+        if gap.strip() == '' and _is_ident_word(words[j - 1][2]):
+            lo = j - 1
+            j -= 1
+        else:
+            break
+    run = source[words[lo][0]:words[hi][1]]
+    if len(run) > len(frag) and any(c.isdigit() for c in run):
+        return run.strip().lower()
+    return fragment
+
+
 def _unified_correction_extraction_llm(
     text: str,
     user_id: str,
@@ -11480,6 +11550,18 @@ If extraction is impossible or ambiguous, return {{}}."""
                     subject=extraction.get("subject_uuid"),
                     old_rel_type=extraction.get("old_rel_type"),
                     confidence=extraction.get("confidence"))
+            # VALUE RECOVERY: the correction LLM truncates out-of-distribution alphanumeric
+            # identifiers ("X9K 8Z7" → "x9"). If new_value is a fragment of a longer digit-
+            # bearing identifier in the source statement, recover the full span so the
+            # corrected scalar lands whole (mirrors the spine's identifier-context rebuild,
+            # applied here on the LLM string output). Conservative — no-op on a clean value.
+            _nv = extraction.get("new_value")
+            if isinstance(_nv, str) and _nv:
+                _recovered = _recover_alnum_identifier_in_text(text, _nv)
+                if _recovered != _nv:
+                    log.info("correction_extraction.identifier_recovered",
+                             user_id=user_id, fragment=_nv, recovered=_recovered)
+                    extraction["new_value"] = _recovered
             return extraction
         else:
             log.warning("correction_extraction.llm_no_json", user_id=user_id)
@@ -13975,6 +14057,16 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
         (r'\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b',                'date',       'born_on'),
         (r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', 'uuid', 'has_uuid'),
         (r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b', 'fqdn', 'has_fqdn'),
+        # Generic reference/identifier CODE — an alphanumeric (letters+digits+[#/-]separators)
+        # letters+digits+separators token — the SHAPE the LLM/deriver would mangle on its
+        # separators exactly like an IP. DB-mirror of the migration-147 seeded scalar_atomic
+        # row (public.extraction_patterns → per-tenant); the seeded per-tenant pattern OVERRIDES
+        # this fallback (used only when db_conn is unavailable). Deterministic gate (NO IGNORECASE
+        # here — parity with _detect_atomic_values' case-sensitive finditer): require >=1 UPPERCASE
+        # letter AND >=2 digits so it NEVER eats a plain number (no letter), a plain/lowercase word
+        # (no uppercase — "utf8"/"win10" excluded), or an IP/MAC/email/FQDN span (boundary guards
+        # reject .:/@ adjacency + a MAC-shape negative lookahead yields that span to has_mac).
+        (r'(?<![\w.:@#/-])(?!(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-]))(?=[0-9A-Z#/-]*[A-Z])(?=(?:[0-9A-Z#/-]*[0-9]){2})[0-9A-Z]+(?:[#/-][0-9A-Z]+)*(?![\w])(?![.:@]\w)', 'identifier', 'has_reference_id'),
     ]
 
     patterns = []
@@ -14037,6 +14129,54 @@ def _detect_atomic_values(text: str, db_conn=None) -> list[dict]:
 
     all_matches.sort(key=lambda x: x["start"])
     return all_matches
+
+
+# An identifier RUN part: alphanumerics optionally joined by the separators the scalar_atomic
+# format-grammar itself admits. Structural, case-folded — no format list, no country/postal literal.
+_IDENT_RUN_PART_RE = re.compile(r"^[0-9a-z]+(?:[#/-][0-9a-z]+)*$")
+
+
+def _is_identifier_run(value: str) -> bool:
+    """True iff ``value`` is a whitespace-separated IDENTIFIER RUN: every part is identifier-shaped
+    AND every part carries a digit.
+
+    The digit-on-EVERY-part requirement is the whole safety of ``_atomic_claim_is_run_fragment``: it
+    is what separates a shattered single identifier ("X9K 8Z7", "K1A 0B1") from ordinary prose that
+    merely happens to contain a code ("ab123 thing" — "thing" has no digit, so the run test fails and
+    the atomic claim is left alone to rescue the value). Subject-agnostic: shape only."""
+    parts = (value or "").strip().lower().split()
+    if not parts:
+        return False
+    return all(_IDENT_RUN_PART_RE.match(p) and any(ch.isdigit() for ch in p) for p in parts)
+
+
+def _atomic_claim_is_run_fragment(value: str, hosted_objects) -> bool:
+    """True iff a claimed atomic value is a PROPER FRAGMENT of an identifier RUN already captured as
+    an edge object — i.e. the format-grammar claimed HALF of a value a cue-gated lane captured WHOLE.
+
+    THE DEFECT THIS CLOSES: the generic identifier pattern (migration 147) requires >= 2 digits, so on
+    "My postal code is X9K 8Z7." it rejects "X9K" (one digit) and matches "8Z7" ALONE. Every guard
+    downstream compared values by EQUALITY — the twin-suppressor,
+    ``_classify_value_subject_residue``'s ``_existing_objects``, /ingest's supplementation — so
+    "8z7" was never seen as already-hosted by "x9k 8z7" and a SECOND, WRONG has_reference_id was
+    minted beside the correct one. The user ends up holding two reference identifiers, one of which
+    is half of the other. A fragment of a captured value is not a different value; equality was the
+    wrong test and containment is the right one, for every format, not just this one.
+
+    Deliberately ONE-DIRECTIONAL: it only ever drops the SHORTER CLAIM, never the longer capture, so
+    the failure mode is "the whole value survives", never "the value is lost"."""
+    v = (value or "").strip().lower()
+    if not v:
+        return False
+    for _o in (hosted_objects or ()):
+        o = (_o or "").strip().lower()
+        if not o or len(o) <= len(v):
+            continue
+        if not _is_identifier_run(o):
+            continue
+        if v in o.split() or v in o:
+            return True
+    return False
 
 
 def _suppress_atomic_claimed_twins(edges: list[dict], atomic: list[dict]) -> tuple[list[dict], int]:
@@ -16807,6 +16947,24 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                     pass
         # Dates ride the temporal lane (event_date), never the scalar claim.
         _sp_atomic = [_av for _av in _sp_atomic if (_av.get("type") or "").lower() != "date"]
+        # OVERCLAIM GUARD — drop a claim that is only a FRAGMENT of an identifier run the cue-gated
+        # deriver already captured WHOLE (see _atomic_claim_is_run_fragment). This must run BEFORE the
+        # possessive-attribute connect below, because that connect mints an edge straight off this
+        # list — by the time _suppress_atomic_claimed_twins sees it, the wrong edge already exists and
+        # carries the detector's own rel_type, which that function deliberately never drops.
+        try:
+            _sp_hosted = [(_e.get("object") or "") for _e in edges]
+            _sp_kept = [_av for _av in _sp_atomic
+                        if not _atomic_claim_is_run_fragment(_av.get("value"), _sp_hosted)]
+            if len(_sp_kept) != len(_sp_atomic):
+                log.info("sentence_pipeline.atomic_fragment_claim_dropped",
+                         user_id=user_id[:8], dropped=len(_sp_atomic) - len(_sp_kept),
+                         note="scalar_atomic matched only PART of an identifier run already captured "
+                              "whole by a cue-gated chain — the half-value claim is discarded so it "
+                              "cannot mint a second, wrong identifier beside the correct one")
+                _sp_atomic = _sp_kept
+        except Exception as _fre:  # noqa: BLE001 — fail-safe: keep today's claims
+            pass
         if _sp_atomic:
             edges, _at_dropped = _suppress_atomic_claimed_twins(edges, _sp_atomic)
             if _at_dropped:
@@ -20771,6 +20929,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                 _unresolved = [
                     _av for _av in _atomic
                     if _av["value"].lower() not in _existing_objects
+                    and not _atomic_claim_is_run_fragment(_av["value"], _existing_objects)
                 ]
                 if _unresolved:
                     try:
@@ -23110,7 +23269,7 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
                             if match:
                                 relation_type = match.group(1)  # son, daughter, wife, dog, etc.
-                                entity_name = match.group(2).lower()  # alice, Sophia, Spot, etc.
+                                entity_name = match.group(2).lower()  # alice, Slinky, Spot, etc.
 
                                 # Resolve the mentioned entity to its canonical ID
                                 resolved_entity = registry.resolve(req.user_id, entity_name)
@@ -34579,7 +34738,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         and len(subject_name.split()) == 1):
                     _name_slots.append(subject_name)
                 # Object alias → titlecase ONLY a clean SINGLE-TOKEN entity NAME on a
-                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Goose). A
+                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Mittens). A
                 # hierarchy object is a TYPE word ("dog"/"animal"), a participated_in object
                 # is an occurrence TITLE/handle, and a STATE object is a state word ("down")
                 # — none are proper names, all read naturally lowercase and must NOT be titled

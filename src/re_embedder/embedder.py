@@ -1087,7 +1087,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         db_conn: PostgreSQL connection (per-user schema context via search_path)
         qdrant_url: Qdrant service URL for staged collection cleanup
         user_id: User UUID for collection naming (optional, derived from schema context)
-        schema_name: User schema name (e.g., "faultline_christopher"). If provided, sets search_path.
+        schema_name: User schema name (e.g., "faultline_alice"). If provided, sets search_path.
         promotion_threshold: Confirmed count threshold for promotion (default 3, configurable)
 
     Returns:
