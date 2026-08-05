@@ -8,8 +8,12 @@ Rendered with [Manim](https://www.manim.community/) (real motion graphics, not
 slide transitions), narrated with [Piper](https://github.com/OHF-Voice/piper1-gpl),
 assembled with ffmpeg.
 
-Output: `out/faultline-promo.mp4` (1920×1080, 60 fps, H.264 + AAC) and
-`out/faultline-promo-silent.mp4` for anyone who would rather record their own read.
+Outputs, all written next to `--out`:
+
+- `faultline-promo.mp4` — 1920×1080, 60 fps, H.264 + AAC, ~2:46
+- `faultline-promo-silent.mp4` — no audio, for recording your own read
+- `faultline-promo.srt` — subtitles, generated from the same cue timings as the
+  voiceover (worth having: most social platforms autoplay muted)
 
 ---
 
