@@ -1,0 +1,5 @@
+# render intermediates and encoded output — rebuildable via build.py
+build/
+out/
+voices/
+__pycache__/
