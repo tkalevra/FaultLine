@@ -5,7 +5,7 @@ RAG pipeline actually is, the three places it breaks, and what FaultLine does
 instead.
 
 Rendered with [Manim](https://www.manim.community/) (real motion graphics, not
-slide transitions), narrated with [Piper](https://github.com/OHF-Voice/piper1-gpl),
+slide transitions), narrated with [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M),
 assembled with ffmpeg.
 
 Outputs, all written next to `--out`:
@@ -22,10 +22,10 @@ Outputs, all written next to `--out`:
 | file | what it covers |
 |---|---|
 | `theme.py` | palette, typography, lower-third system, shared parts, `FilmScene` base |
-| `s1_pipeline.py` | **01** documents → chunks → vectors → top-k → LLM |
-| `s2_failure.py` | **02** nearest ≠ correct; nothing can be removed; so you raise k |
-| `s3_context.py` | **03** bloated context, lost-in-the-middle, the model writes anyway |
-| `s4_poison.py` | **04** no gate on the write path — RAG poisoning |
+| `s1_pipeline.py` | **01** what a RAG pipeline is: documents → chunks → vectors → top-k → LLM |
+| `s2_failure.py` | **02** where RAG breaks by accident: nearest ≠ correct; nothing can be removed |
+| `s3_context.py` | **03** why *more* context makes the answer worse |
+| `s4_poison.py` | **04** RAG poisoning — the same failure, on purpose |
 | `s5_gate.py` | **05** the logo's turnstile becomes the validation gate; graph; correction |
 | `s6_walk.py` | **06** anchor + deterministic walk, the Class-C note, end card |
 | `narration.py` | the spoken script, keyed to on-screen cue points |
@@ -48,16 +48,23 @@ sudo dnf install cairo-devel pango-devel python3.13-devel gcc
 sudo dnf swap ffmpeg-free ffmpeg --allowerasing     # ffmpeg-free has no libx264
 
 python3.13 -m venv .venv && . .venv/bin/activate
-pip install manim piper-tts
+pip install manim
 
-# a Piper voice
-mkdir -p voices && cd voices
-curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx
-curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx.json
-cd ..
-
-python build.py --all --quality h --voice voices/en_US-ryan-high.onnx
+# narration comes from a kokoro-fastapi service (one already runs on the NAS)
+python build.py --all --quality h --kokoro-url http://192.168.40.10:8880
 ```
+
+To run the voice service yourself:
+
+```bash
+docker run -d --name kokoro-fastapi -p 8880:8880 \
+  ghcr.io/remsky/kokoro-fastapi-cpu:latest
+```
+
+Pick a different narrator with `--kokoro-voice` (`GET /v1/audio/voices` lists
+all 67; `am_michael` is the default, `bm_george` and `am_onyx` are the strongest
+alternates). `--speed` defaults to 1.15 because Kokoro reads slower than the
+scene timings were originally cut for.
 
 `--quality l` renders a 480p15 draft in a couple of minutes — use it while
 iterating. Individual stages: `--cues`, `--vo`, `--render`, `--mux`.
@@ -84,11 +91,29 @@ so overlaps are caught rather than shipped.
 
 ### Changing the voice or the words
 
-Edit `narration.py` — keys must match the `say()` strings exactly. Any Piper
-voice works via `--voice`; `--length-scale` above 1.0 slows the read down.
+Edit `narration.py` — keys must match the `say()` strings exactly.
 
 There is **no music bed** — nothing suitably licensed was available offline. The
 mix leaves plenty of headroom (peaks at ~0.89) if you want to lay one under it.
+
+### Why Kokoro, and a licensing warning
+
+This film is an advertisement, so the narration has to be **commercially
+licensable**. That rules out more of the field than you would expect:
+
+| voice | verdict |
+|---|---|
+| **Kokoro-82M** | ✅ MIT code, **Apache-2.0 weights**. Runs on CPU. What this uses. |
+| Chatterbox (Resemble AI) | ✅ MIT, richer output — but GPU-oriented, slow on CPU |
+| Piper voice `en_US-ryan-high` | ❌ trained on RyanSpeech, **CC BY-NC-SA 4.0 — non-commercial** |
+| XTTS-v2 | ❌ CPML, non-commercial (and Coqui folded, so no licence is purchasable) |
+| F5-TTS | ❌ MIT code but the released checkpoints are CC-BY-NC |
+| Fish Speech / OpenAudio, Higgs Audio | ❌ commercial use requires a paid licence |
+
+The first cut of this film was narrated with the Piper `ryan` voice before that
+dataset licence was checked. It is non-commercial, so it was replaced. **Piper
+voices carry per-voice licences** — the engine being permissive tells you
+nothing about the voice. Always read the voice's `MODEL_CARD`.
 
 ---
 

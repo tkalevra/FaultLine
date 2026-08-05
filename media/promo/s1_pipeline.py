@@ -18,7 +18,7 @@ LEFT_X = -3.6
 
 class RagPipeline(FilmScene):
     def construct(self):
-        ch = chapter("01", "HOW RETRIEVAL WORKS TODAY")
+        ch = chapter("01", "WHAT A RAG PIPELINE IS")
         wm = watermark()
         self.play(FadeIn(ch, shift=RIGHT * 0.2), FadeIn(wm), run_time=0.7)
 
@@ -110,7 +110,19 @@ class RagPipeline(FilmScene):
 
         self.play(FadeOut(embedder), FadeOut(a2), FadeIn(count), run_time=0.6)
         self.say("Text becomes coordinates. Meaning becomes distance.", run_time=0.6,
-                 hold=1.0)
+                 hold=0.7)
+
+        # name the thing, plainly — the rest of the film argues about it
+        named = VGroup(
+            title("RAG", size=0.72, color=ACCENT),
+            body("retrieval-augmented generation", size=0.36, color=DIM),
+        ).arrange(DOWN, buff=0.24)
+        named.move_to([-3.6, 0.75, 0])
+        self.play(FadeIn(named[0], shift=UP * 0.15), run_time=0.5)
+        self.play(FadeIn(named[1]), run_time=0.4)
+        self.say("This is RAG — retrieval-augmented generation.", run_time=0.55,
+                 hold=1.5)
+        self.play(FadeOut(named), run_time=0.5)
 
         # ------------------------------------------------------ query path
         q_prompt = mono('"What is DevBox\'s IP?"', size=0.36, color=INK)

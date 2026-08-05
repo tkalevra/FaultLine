@@ -20,10 +20,12 @@ the dry-run duration, so the voiceover cannot drift over the length of a scene.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -101,14 +103,41 @@ def stage_vo(cfg, rows):
         text = entry[0] if isinstance(entry, tuple) else entry
         txt = vo_dir / f"{i:03d}.txt"
         txt.write_text(text, encoding="utf-8")
-        sh(
-            [cfg.piper, "-m", str(cfg.voice), "-i", str(txt),
-             "-f", str(vo_dir / f"{i:03d}.wav"),
-             "--length-scale", str(cfg.length_scale),
-             "--sentence-silence", "0.22"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    print(f"[vo]     {len(cues)} lines synthesised")
+        wav = vo_dir / f"{i:03d}.wav"
+        if cfg.tts == "kokoro":
+            kokoro_say(cfg, text, wav)
+        else:
+            sh(
+                [cfg.piper, "-m", str(cfg.voice), "-i", str(txt),
+                 "-f", str(wav),
+                 "--length-scale", str(cfg.length_scale),
+                 "--sentence-silence", "0.22"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    print(f"[vo]     {len(cues)} lines synthesised via {cfg.tts}")
+
+
+def kokoro_say(cfg, text, out: Path):
+    """Synthesise one line through a kokoro-fastapi service.
+
+    Kokoro (MIT code, Apache-2.0 weights) is the default because it is
+    commercially licensable — several popular alternatives, including the
+    Piper `ryan` voice this film originally used, are trained on
+    non-commercial datasets and cannot be used in an advertisement.
+    """
+    req = urllib.request.Request(
+        cfg.kokoro_url.rstrip("/") + "/v1/audio/speech",
+        data=json.dumps({
+            "model": "kokoro",
+            "input": text,
+            "voice": cfg.kokoro_voice,
+            "response_format": "wav",
+            "speed": cfg.speed,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        out.write_bytes(r.read())
 
 
 # ------------------------------------------------------------------- render
@@ -258,6 +287,17 @@ def main():
     ap.add_argument("--piper", default=shutil.which("piper") or "piper")
     ap.add_argument("--voice", required=False, default=os.environ.get("FL_VOICE", ""))
     ap.add_argument("--length-scale", type=float, default=1.0)
+    ap.add_argument("--tts", default="kokoro", choices=("kokoro", "piper"),
+                    help="kokoro is the default: Apache-2.0 weights, so the "
+                         "audio is commercially usable")
+    ap.add_argument("--kokoro-url",
+                    default=os.environ.get("FL_KOKORO_URL",
+                                           "http://192.168.40.10:8880"))
+    ap.add_argument("--kokoro-voice",
+                    default=os.environ.get("FL_KOKORO_VOICE", "am_michael"))
+    ap.add_argument("--speed", type=float, default=1.15,
+                    help="Kokoro reads slower than Piper; ~1.15 restores the "
+                         "pacing the scene timings were cut for")
     for st in ("cues", "vo", "render", "mux"):
         ap.add_argument(f"--{st}", action="store_true")
     ap.add_argument("--all", action="store_true")
@@ -289,7 +329,7 @@ def main():
             )
         ]
     if do["vo"]:
-        if not cfg.voice or not cfg.voice.exists():
+        if cfg.tts == "piper" and (not cfg.voice or not cfg.voice.exists()):
             raise SystemExit("--voice must point at a Piper .onnx voice model")
         stage_vo(cfg, rows)
     if do["render"]:
