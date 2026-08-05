@@ -9638,6 +9638,11 @@ QUERY_MIN_CONFIDENCE = float(os.environ.get("QUERY_MIN_CONFIDENCE", "0.35"))
 # never breaks.
 VECTOR_CLASS_C_ONLY = os.environ.get("VECTOR_CLASS_C_ONLY", "true").strip().lower() not in ("false", "0", "no")
 
+# User-memory vector lane retirement (ratified 2026-07-31). When OFF (default), /query stops
+# reading Class-C user memory from Qdrant (C surfaces from staged_facts in Postgres instead) and
+# the re-embedder stops writing it. Default OFF = retirement active (the ratified direction).
+USER_MEMORY_VECTOR_LANE = os.environ.get("USER_MEMORY_VECTOR_LANE", "false").strip().lower() not in ("false", "0", "no")
+
 # When the deterministic typed multi-hop walk DEFERS (no authoritative A/B answer for a
 # decomposable chain), fall through to the legacy scope path so the Class-C / Qdrant
 # short-term backstop still runs, instead of returning empty immediately. A/B authority
@@ -35587,23 +35592,26 @@ async def query(request: QueryRequest) -> QueryResponse:
         # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
         # D3: ALWAYS runs (no skip) so Class C is always part of full scope.
         qdrant_facts = []
-        try:
-            llm_url = _get_llm_url()
-            if llm_url:
-                qdrant_facts = qdrant_semantic_search(
-                    query_text,
-                    conversation_history,
-                    user_id,
-                    qdrant_url,
-                    llm_url,
-                    score_threshold=0.3,
-                    limit=10,
-                    schema_name=schema_name,
-                )
-                if qdrant_facts:
-                    log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
-        except Exception as e:
-            log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
+        if USER_MEMORY_VECTOR_LANE:
+            try:
+                llm_url = _get_llm_url()
+                if llm_url:
+                    qdrant_facts = qdrant_semantic_search(
+                        query_text,
+                        conversation_history,
+                        user_id,
+                        qdrant_url,
+                        llm_url,
+                        score_threshold=0.3,
+                        limit=10,
+                        schema_name=schema_name,
+                    )
+                    if qdrant_facts:
+                        log.info("query.phase5.qdrant_facts_fetched", count=len(qdrant_facts))
+            except Exception as e:
+                log.warning("query.phase5.qdrant_search_failed non-blocking", error=str(e))
+        # When USER_MEMORY_VECTOR_LANE is off (default), qdrant_facts stays [] — Class C surfaces
+        # from staged_facts (Postgres) via fetch_facts_from_anchor.
 
         # D3 rank-down (was: hard floor/exclusion). Low-relevance / low-confidence Qdrant
         # facts are DEMOTED in rank, NEVER removed. The DB-confident case stacks an extra
@@ -39745,6 +39753,14 @@ def store_context(req: StoreContextRequest):
         if not _SHORT_TERM_MEMORY:
             log.info("store_context.disabled", user_id=req.user_id)
             return StoreContextResponse(status="disabled", point_id="")
+
+        # User-memory vector lane RETIRED: /store_context has no Postgres fact backing by design
+        # (it is a verbatim prose blob), so when the lane is OFF we defer the text to episodic_log
+        # (the verbatim re-mineable substrate) instead of writing to a Qdrant collection that is no
+        # longer read. The text is retained; it is re-mined by reextract_episodic as the ontology grows.
+        if not USER_MEMORY_VECTOR_LANE:
+            log.info("store_context.deferred_to_episodic_vector_lane_retired", user_id=req.user_id)
+            return _defer_context_to_episodic(req, "vector_lane_retired")
 
         qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
         qwen_api_url = _LLM_URL
