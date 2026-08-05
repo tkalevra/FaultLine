@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Friends in the Space — The LLM Memory Ecosystem · FaultLine</title>
+<meta name="description" content="We're glad this space is crowded — it means the problem matters. A celebration of the talented teams building durable, useful memory for AI agents: mem0, Zep, Graphiti, LangMem, Letta, Cognee, LlamaIndex, Supermemory, and Kernel Memory.">
+<!-- AI crawlers are welcome: FaultLine wants to be cited by AI answer engines. -->
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="googlebot" content="index, follow">
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="stylesheet" href="./style.css">
+<!--
+  FaultLine FOSS — LLM memory-layer ecosystem page
+  SPDX-License-Identifier: AGPL-3.0-only
+  License: GNU AGPL v3 — see ./LICENSE in the repo root.
+  Style conventions mirror webui/style.css (CSS-var themed, JetBrains Mono,
+  single restrained accent). The page-specific layout lives in the inline block
+  below; everything else (theme vars, font, header, footer, theme-toggle button)
+  is inherited from the shared stylesheet.
+-->
+
+<!-- ── Structured data (AEO): ItemList of the memory-layer ecosystem ────────── -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "ItemList",
+  "name": "LLM agent memory-layer ecosystem",
+  "description": "Teams building durable, useful memory for AI agents, celebrated by FaultLine.",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "mem0", "url": "https://mem0.ai" },
+    { "@type": "ListItem", "position": 2, "name": "Zep", "url": "https://www.getzep.com" },
+    { "@type": "ListItem", "position": 3, "name": "Graphiti", "url": "https://github.com/getzep/graphiti" },
+    { "@type": "ListItem", "position": 4, "name": "LangMem", "url": "https://www.langchain.com/blog/langmem-sdk-launch" },
+    { "@type": "ListItem", "position": 5, "name": "Letta", "url": "https://www.letta.com" },
+    { "@type": "ListItem", "position": 6, "name": "Cognee", "url": "https://www.cognee.ai" },
+    { "@type": "ListItem", "position": 7, "name": "LlamaIndex", "url": "https://www.llamaindex.ai" },
+    { "@type": "ListItem", "position": 8, "name": "Supermemory", "url": "https://supermemory.ai" },
+    { "@type": "ListItem", "position": 9, "name": "Kernel Memory", "url": "https://microsoft.github.io/kernel-memory/" }
+  ]
+}
+</script>
+
+<style>
+  /* ── page-specific layout for the ecosystem page ─────────────────────────── */
+  main.eco { max-width: 980px; }
+
+  .eco-head {
+    display: flex; align-items: center; gap: 12px;
+    margin: 4px 0 6px;
+  }
+  .eco-mark {
+    font-family: Georgia, serif; font-size: 30px; font-weight: 700;
+    color: var(--accent); text-decoration: none; line-height: 1;
+  }
+  .eco-mark:hover { text-decoration: none; }
+  .eco-label { font-size: 11px; letter-spacing: 3px; color: var(--muted); text-transform: uppercase; }
+
+  .eyebrow {
+    text-transform: uppercase; letter-spacing: 3px; font-size: 11px;
+    color: var(--muted); margin: 26px 0 6px;
+  }
+  main.eco h1 {
+    font-size: 30px; font-weight: 500; margin: 0 0 14px; letter-spacing: 0.5px;
+    color: var(--fg);
+  }
+  main.eco h1 .glow { color: var(--accent); }
+
+  .eco-lead {
+    font-size: 14px; line-height: 1.7; color: var(--fg); max-width: 760px;
+    margin: 0 0 26px;
+  }
+  .eco-lead strong { color: var(--fg); }
+
+  /* ── card grid ───────────────────────────────────────────────────────────── */
+  .eco-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    margin: 10px 0 30px;
+  }
+  @media (max-width: 860px) { .eco-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 620px) { .eco-grid { grid-template-columns: 1fr; } }
+
+  a.eco-card {
+    display: flex; flex-direction: column; gap: 8px;
+    border: 1px solid var(--border); background: var(--bg-soft);
+    padding: 16px 16px 14px; text-decoration: none !important; color: var(--fg);
+    transition: border-color .12s ease, box-shadow .12s ease;
+  }
+  a.eco-card:hover { border-color: var(--accent); box-shadow: 0 6px 20px rgba(0,0,0,0.35); }
+
+  .eco-mono {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
+    color: var(--accent); border: 1px solid var(--accent-dim);
+    width: 34px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+  }
+  .eco-name { font-size: 15px; font-weight: 500; margin: 2px 0 0; color: var(--fg); letter-spacing: 0.3px; }
+  .eco-tag { font-size: 12.5px; color: var(--fg); line-height: 1.55; margin: 0; }
+  ul.eco-strengths {
+    list-style: none; padding: 0; margin: 4px 0 0; display: flex; flex-direction: column; gap: 4px;
+  }
+  ul.eco-strengths li {
+    font-size: 11.5px; color: var(--muted); line-height: 1.5;
+    padding-left: 12px; position: relative;
+  }
+  ul.eco-strengths li::before { content: "▸"; position: absolute; left: 0; color: var(--accent); }
+  .eco-go {
+    margin-top: auto; padding-top: 10px;
+    font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--accent);
+  }
+
+  /* ── the FaultLine note ──────────────────────────────────────────────────── */
+  aside.eco-us {
+    display: flex; gap: 16px; align-items: flex-start;
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    background: var(--bg-soft); padding: 18px 20px; margin: 6px 0 22px;
+  }
+  .eco-us-mark { font-family: Georgia, serif; font-size: 34px; color: var(--accent); line-height: 1; }
+  aside.eco-us h3 { margin: 0 0 6px; font-size: 14px; letter-spacing: 1px; text-transform: uppercase; color: var(--fg); }
+  aside.eco-us p { margin: 0 0 10px; font-size: 13px; line-height: 1.65; color: var(--fg); }
+  aside.eco-us strong { color: var(--fg); }
+  .eco-us-go { font-size: 12px; letter-spacing: 1px; text-transform: uppercase; color: var(--accent); }
+
+  .eco-disclaim {
+    font-size: 11px; color: var(--muted); line-height: 1.7; text-align: center;
+    border-top: 1px solid var(--border); margin: 26px 0 0; padding-top: 16px;
+  }
+
+  .eco-foot {
+    text-align: center; padding: 18px 0 4px; color: var(--muted); font-size: 10px;
+    letter-spacing: 3px; text-transform: uppercase;
+  }
+  .eco-foot a { color: var(--muted); }
+  .eco-foot a:hover { color: var(--accent); }
+</style>
+</head>
+<body data-console="foss">
+
+<!-- ── header (reuses the shared terminal aesthetic) ─────────────────────── -->
+<header class="app-head">
+  <a href="./index.html" aria-label="Back to the FaultLine control plane" style="display:flex;align-items:center;gap:10px;text-decoration:none">
+    <svg class="logo" viewBox="0 0 200 200" role="img" aria-label="FaultLine">
+      <rect width="200" height="200" fill="var(--bg)"/>
+      <rect x="2" y="2" width="196" height="196" fill="none" stroke="var(--border)" stroke-width="1"/>
+      <text x="100" y="124" text-anchor="middle" font-family="Georgia, serif" font-size="120" font-weight="700" fill="var(--fg)">⊢</text>
+      <line x1="40" y1="158" x2="160" y2="158" stroke="var(--accent)" stroke-width="1.5"/>
+    </svg>
+    <span class="title-block">
+      <span style="font-size:12px;font-weight:500;letter-spacing:2px;text-transform:uppercase;color:var(--fg)">FaultLine</span>
+      <span class="subtitle">self-hosted · AGPL v3</span>
+    </span>
+  </a>
+  <div class="head-actions">
+    <button class="theme-toggle" id="btn-theme" title="Toggle light / dark" aria-label="Toggle light or dark theme"><span id="theme-ico">☾</span> <span id="theme-lbl">dark</span></button>
+  </div>
+</header>
+
+<main class="eco">
+
+  <p class="eyebrow">The neighbourhood</p>
+  <h1>Friends in the <span class="glow">Space</span></h1>
+
+  <p class="eco-lead">
+    We're glad this space is crowded — it means the problem matters. Giving AI agents durable, useful
+    memory is one of the hard, important problems of this generation, and a lot of talented teams are
+    building toward it from different angles. The tools below are colleagues we genuinely admire —
+    each has shaped how the whole field thinks about memory. We're listing them here <strong>not to
+    compare, but to celebrate.</strong>
+  </p>
+
+  <!-- ── card grid: nine teams, each a real crawlable external link ─────────── -->
+  <div class="eco-grid">
+
+    <a class="eco-card" href="https://mem0.ai" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">m0</span>
+      <h3 class="eco-name">mem0</h3>
+      <p class="eco-tag">AI memory that persists across sessions and agents.</p>
+      <ul class="eco-strengths">
+        <li>Best-in-class dev ergonomics (pip install, 60k+ stars)</li>
+        <li>Production / enterprise maturity (SOC2, HIPAA)</li>
+        <li>Serious benchmarking discipline</li>
+      </ul>
+      <span class="eco-go">Visit mem0.ai ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://www.getzep.com" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">ze</span>
+      <h3 class="eco-name">Zep</h3>
+      <p class="eco-tag">Agent memory at enterprise scale.</p>
+      <ul class="eco-strengths">
+        <li>Pioneered temporal knowledge graphs</li>
+        <li>Sub-200ms p95 at 100M entities</li>
+        <li>Provenance-first</li>
+      </ul>
+      <span class="eco-go">Visit getzep.com ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://github.com/getzep/graphiti" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">gr</span>
+      <h3 class="eco-name">Graphiti</h3>
+      <p class="eco-tag">Build Temporal Context Graphs for AI Agents.</p>
+      <ul class="eco-strengths">
+        <li>Reference implementation for time-aware graphs (Apache-2.0, 29k stars)</li>
+        <li>Backend-flexible (Neo4j / FalkorDB / Neptune)</li>
+        <li>First-class MCP server</li>
+      </ul>
+      <span class="eco-go">Visit GitHub ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://www.langchain.com/blog/langmem-sdk-launch" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">lm</span>
+      <h3 class="eco-name">LangMem</h3>
+      <p class="eco-tag">The SDK that helps your agents learn.</p>
+      <ul class="eco-strengths">
+        <li>Principled cognitive-science taxonomy (semantic / episodic / procedural)</li>
+        <li>Novel procedural memory &amp; prompt self-optimization</li>
+        <li>Deep LangGraph integration</li>
+      </ul>
+      <span class="eco-go">Read the launch ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://www.letta.com" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">lt</span>
+      <h3 class="eco-name">Letta</h3>
+      <p class="eco-tag">Machines that learn.</p>
+      <ul class="eco-strengths">
+        <li>Originated the field (MemGPT paper)</li>
+        <li>Deepest research bench on continual learning</li>
+        <li>Ships as real product</li>
+      </ul>
+      <span class="eco-go">Visit letta.com ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://www.cognee.ai" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">cg</span>
+      <h3 class="eco-name">Cognee</h3>
+      <p class="eco-tag">Open-Source Memory Platform for Agents.</p>
+      <ul class="eco-strengths">
+        <li>Cognitive-science-grounded graph memory</li>
+        <li>Pragmatic single-Postgres stack</li>
+        <li>Broadest integrations</li>
+      </ul>
+      <span class="eco-go">Visit cognee.ai ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://www.llamaindex.ai" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">li</span>
+      <h3 class="eco-name">LlamaIndex</h3>
+      <p class="eco-tag">Memory built into the dominant RAG framework.</p>
+      <ul class="eco-strengths">
+        <li>Structured memory in the most-used framework</li>
+        <li>Composable memory blocks</li>
+        <li>Memory + document understanding</li>
+      </ul>
+      <span class="eco-go">Visit llamaindex.ai ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://supermemory.ai" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">sm</span>
+      <h3 class="eco-name">Supermemory</h3>
+      <p class="eco-tag">The memory layer for AI agents.</p>
+      <ul class="eco-strengths">
+        <li>Rare dual dev + consumer focus</li>
+        <li>Rich extractors &amp; connectors</li>
+        <li>Clean modern API</li>
+      </ul>
+      <span class="eco-go">Visit supermemory.ai ▸</span>
+    </a>
+
+    <a class="eco-card" href="https://microsoft.github.io/kernel-memory/" target="_blank" rel="noopener">
+      <span class="eco-mono" aria-hidden="true">km</span>
+      <h3 class="eco-name">Kernel Memory <span style="color:var(--muted);font-weight:400;font-size:12px">(Microsoft)</span></h3>
+      <p class="eco-tag">Memory as a Service.</p>
+      <ul class="eco-strengths">
+        <li>Opinionated .NET memory architecture</li>
+        <li>Runs four ways</li>
+        <li>Genuine upstream influence</li>
+      </ul>
+      <span class="eco-go">Visit the docs ▸</span>
+    </a>
+
+  </div>
+
+  <!-- ── the FaultLine note: a gentle, non-comparative close ────────────────── -->
+  <aside class="eco-us">
+    <div class="eco-us-mark" aria-hidden="true">⊢</div>
+    <div>
+      <h3>And FaultLine?</h3>
+      <p>
+        We simply do things a bit differently. FaultLine is <strong>write-validated, walk-read
+        memory</strong> — every fact is grounded and traceable at write time, then recalled by a
+        deterministic walk of a per-tenant knowledge graph in PostgreSQL rather than fuzzy vector
+        similarity. Same destination many of us are walking toward; a different path there.
+      </p>
+      <a class="eco-us-go" href="./index.html">Back to FaultLine →</a>
+    </div>
+  </aside>
+
+  <!-- trademark disclaimer -->
+  <p class="eco-disclaim">
+    All names, logos, and marks are the property of their respective owners.<br>
+    Listed here with respect, not affiliation.
+  </p>
+
+  <div class="eco-foot">
+    <span>⊢ FAULTLINE · WRITE-VALIDATED MEMORY · FOSS · AGPL V3</span>
+  </div>
+
+</main>
+
+<script>
+  /* Minimal theme + accent bootstrap — reads the same localStorage keys as the
+     control plane (app.js: fl_foss_theme / fl_foss_accent) so a visitor who
+     toggled either there sees the same choice here. Default: dark, green. */
+  (function () {
+    var root = document.documentElement;
+    var theme = 'dark';
+    try { theme = localStorage.getItem('fl_foss_theme') || 'dark'; } catch (e) {}
+    function paint(t) {
+      root.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+      var ico = document.getElementById('theme-ico');
+      var lbl = document.getElementById('theme-lbl');
+      if (ico) ico.textContent = t === 'light' ? '☀' : '☾';
+      if (lbl) lbl.textContent = t === 'light' ? 'light' : 'dark';
+    }
+    paint(theme);
+    try {
+      var a = localStorage.getItem('fl_foss_accent') || '';
+      if (a) root.setAttribute('data-accent', a); else root.removeAttribute('data-accent');
+    } catch (e) {}
+    var btn = document.getElementById('btn-theme');
+    if (btn) btn.addEventListener('click', function () {
+      var cur = root.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+      var next = cur === 'light' ? 'dark' : 'light';
+      try { localStorage.setItem('fl_foss_theme', next); } catch (e) {}
+      paint(next);
+    });
+  })();
+</script>
+
+</body>
+</html>
