@@ -24,14 +24,14 @@ it to `.env` and edit. Every value here has a plain-English description there.
 | `LLM_TIMEOUT_<OP>` | per-op defaults | Override per-operation timeouts (e.g. `LLM_TIMEOUT_EXTRACTION`). Never hardcoded. |
 | `LLM_MAX_TOKENS_<OP>` | per-op defaults | Override per-operation token budgets (e.g. `LLM_MAX_TOKENS_EXTRACT`). |
 
-## Storage & vector index
+## Storage
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QDRANT_URL` | `http://qdrant:6333` | Qdrant endpoint. Qdrant holds the **Class C short-term tier only** (see [ARCHITECTURE.md](ARCHITECTURE.md)). |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant endpoint. The vector tier is **retired for user memory** — all user facts (A/B/C) live in PostgreSQL. The service may remain in the stack but holds no user facts (see [ARCHITECTURE.md](ARCHITECTURE.md)). |
 | `QDRANT_COLLECTION` | `faultline-test` | Base collection name. Per-user collections are derived automatically (`faultline-{user_id}`). |
 | `SHORT_TERM_MEMORY` | `true` | When extraction yields no structured triples, stash the text as a Class C context fact. |
-| `REEMBED_INTERVAL` | `60` | Re-embedder poll interval (seconds) — promotion, expiry, Class-C sync. |
+| `REEMBED_INTERVAL` | `60` | Re-embedder poll interval (seconds) — promotion, expiry. |
 
 ## Provisioning (per-tenant isolation)
 

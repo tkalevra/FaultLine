@@ -3,8 +3,9 @@
 FaultLine is a **per-tenant, write-validated, deterministic knowledge-graph memory**
 for LLM conversations. It extracts entities and relationships from what a user
 says, validates them against a metadata-driven ontology, and persists them to
-**PostgreSQL** — the authoritative store. A Qdrant vector index is a *derived,
-short-term scratchpad* for one tier of facts only; it is never the source of truth.
+**PostgreSQL** — the authoritative store for *all* user memory. The vector tier
+(Qdrant) is **retired for user memory**; every fact, including the short-term
+Class-C tier, lives in PostgreSQL. It is never the source of truth.
 
 The live integration path is **MCP tools** (`recall_memory`, `remember_facts`,
 `learn_facts`, `retract_fact`). The legacy OpenWebUI Filter exists in the tree but
@@ -21,13 +22,12 @@ is intentionally disabled — it is not the production path.
                  │ Class A/B/C assignment → commit to per-tenant PostgreSQL schema         │
                  └────────────────────────────────────────────────────────────────────────┘
                                                   │
-                       PostgreSQL (per-tenant schema) = AUTHORITATIVE long-term memory
-                                                  │
-                          re-embedder syncs Class C ──▶ Qdrant (short-term only)
+                       PostgreSQL (per-tenant schema) = AUTHORITATIVE — ALL user memory
+                       (A/B in facts; Class-C short-term in staged_facts + episodic_log)
                                                   │
                  ┌──────────────────────────── QUERY (lean) ──────────────────────────────┐
   recall call  → │ resolve anchor → build scope → DETERMINISTIC PostgreSQL walk (PRIMARY)  │
-   (via MCP)     │ + Qdrant Class-C lane (backstop / promotion gate) → dedup → prose       │
+   (via MCP)     │ + Class-C short-term lane (staged_facts) → dedup → prose                │
                  └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,15 +49,17 @@ PostgreSQL holds the structured knowledge graph and **is** long-term memory. Eve
 served fact resolves to a real row you can point at. There is no step where an LLM
 re-interprets retrieved text to answer — the walk returns grounded rows.
 
-Qdrant is a **derived, Class-C-only short-term scratchpad** (see *Class tiering*
-below). It is a backstop, not the library. The deterministic PostgreSQL walk runs
-first and is authoritative; the vector lane only surfaces short-term "couldn't
-classify yet" material and acts as a promotion gate. **The vector never overrides
-PostgreSQL.**
+**All user memory lives in PostgreSQL** — including the short-term Class-C tier
+(`staged_facts` for staged facts and the verbatim `episodic_log` for raw turns).
+The vector tier (Qdrant) is **retired for user memory**: it is no longer part of
+the ingest or query path for user facts. The deterministic PostgreSQL walk is
+authoritative and is the only retrieval mechanism. Nothing is embedded or served
+from a vector store.
 
 This inverts the usual memory-system layout, where a vector store is the
 long-term RAG library and a small context window is the short-term scratch.
-FaultLine flips it: **the graph is long-term; the vector is short-term.**
+FaultLine flips it: **the graph is long-term** — and the short-term tier lives in
+PostgreSQL too, so there is no vector store in the user-memory path at all.
 
 ---
 
@@ -75,7 +77,7 @@ not a marketing line.
 | **Hallucination handling** | Stored alongside real text; surfaces at recall | Rejected at the gate; never written as authoritative |
 | **Corrections** | New chunk competes with the old by similarity | Deterministic supersede/archive — the corrected row wins, old soft-deleted |
 | **Determinism** | Similarity scores drift with phrasing/model | Same anchor → same walk → same rows, repeatably |
-| **Vector role** | The library | A short-term (Class C) scratchpad backstop only |
+| **Vector role** | The library | Retired for user memory (none) |
 
 Mechanically, the difference is this: **RAG answers by ranking text by similarity
 and trusting the LLM to read it. FaultLine answers by walking a validated graph and
@@ -85,9 +87,8 @@ does not find the most *similar* sentence — it resolves the `DevBox` entity an
 reads its `has_ip` attribute. If that row does not exist, it says so (fail loud)
 rather than returning the nearest-looking chunk.
 
-The vector index still earns its keep — for the short-term tier of facts the engine
-could not yet classify — but it is a backstop behind the deterministic walk, never
-the primary retrieval mechanism.
+There is no vector retrieval step for user memory. The walk is the whole retrieval
+mechanism.
 
 ---
 
@@ -101,8 +102,9 @@ binds it with `SET search_path TO {schema}` **without `public`**. Consequences:
   cue classes) lives *inside* each tenant schema, seeded from a `public` template
   at provisioning. `public.*` is a **seed source / template only** — never read at
   runtime by ingest or query.
-- A per-user Qdrant collection (`faultline-{user_id}`) keeps the short-term tier
-  isolated too.
+- PostgreSQL schema isolation is the sole user-memory boundary: the schema a
+  request binds to *is* the tenant scope, with no shared `user_id` column to
+  filter on and forget.
 
 Schemas are created by a background provisioning worker (~1 minute), auto-enqueued
 on a user's first request.
@@ -148,23 +150,24 @@ this, what does it belong to?*). Do not conflate them.
 
 ---
 
-## Class tiering (durability — A/B in PostgreSQL, C in Qdrant)
+## Class tiering (durability — all classes in PostgreSQL)
 
-Every fact is assigned a class that decides its durability and which store backs it:
+Every fact is assigned a class that decides its durability. All three classes are
+backed by PostgreSQL; the vector tier is retired for user memory.
 
 | Class | Meaning | Confidence | Backed by | Lifecycle |
 |---|---|---|---|---|
 | **A** | User-stated / structural | 1.0 | PostgreSQL `facts` | Written through immediately. Authoritative. |
 | **B** | Inferred but following established ontology | 0.8 | PostgreSQL `staged_facts` | Promoted into `facts` at `confirmed_count >= 3`. |
-| **C** | Couldn't-classify-yet / short-term | ~0.4 | PostgreSQL `staged_facts` **and** Qdrant | Expires after 30 days unless promoted (C→B at occurrence ≥ 3). |
+| **C** | Couldn't-classify-yet / short-term | ~0.4 | PostgreSQL `staged_facts` (+ `episodic_log`) | Expires after 30 days unless promoted (C→B at occurrence ≥ 3). |
 
 Key invariants:
 
-- **Class A/B live in PostgreSQL only.** They are *never* vector-indexed and
-  *never* served from the vector lane.
-- **Qdrant holds Class C only** — the short-term scratchpad. The re-embedder skips
-  the A/B sync; the query lane drops any Qdrant result whose authoritative class is
-  A/B.
+- **All classes live in PostgreSQL only.** Nothing is vector-indexed and nothing
+  is served from a vector store.
+- **The short-term Class-C tier is PostgreSQL** (`staged_facts`, plus the verbatim
+  `episodic_log`). The re-embedder runs promotion/expiry over these rows; no
+  user-memory embedding is written.
 - **User corrections are always Class A**, regardless of rel_type. User authority
   overrides everything.
 - **We don't forget.** A classification *failure* is not a dropped fact — it is
@@ -205,7 +208,7 @@ LLM," not "RLM."
 ## The query pipeline (lean)
 
 ```
-resolve anchor → build scope → PostgreSQL walk (PRIMARY) → Qdrant Class-C lane → dedup → prose
+resolve anchor → build scope → PostgreSQL walk (PRIMARY) → Class-C short-term lane (staged_facts) → dedup → prose
 ```
 
 1. **Resolve the anchor** — pronouns/possessives/names → a user or entity UUID,
@@ -216,11 +219,11 @@ resolve anchor → build scope → PostgreSQL walk (PRIMARY) → Qdrant Class-C 
    per-tenant taxonomy overlay.
 3. **Walk PostgreSQL** — baseline facts + 1-hop graph + hierarchy expansion,
    projected by scope. This is authoritative and primary.
-4. **Qdrant Class-C lane** — surfaces short-term memory and gates promotion (a
-   recall hit bumps a C fact toward C→B). A/B Qdrant results are dropped. It never
+4. **Class-C short-term lane (PostgreSQL `staged_facts`)** — surfaces short-term
+   memory and gates promotion (a recall hit bumps a C fact toward C→B). It never
    overrides the PostgreSQL walk.
 5. **Dedup** on `(subject_uuid, rel_type, object_uuid)` using UUIDs (never display
-   names); highest confidence wins; PostgreSQL beats Qdrant.
+   names); highest confidence wins.
 6. **Render to prose** — perspective resolved at build time (the querying user's own
    facts read as "you", others by preferred alias). No UUIDs or rel_type tokens
    leak into output.
@@ -300,18 +303,14 @@ tense-guessing and GLiNER2 never touches dates.
 
 Polls the database (default every 60s) and:
 
-- Embeds unsynced **Class C** staged rows and upserts them to the per-user Qdrant
-  collection (the A/B sync is skipped under the C-only model).
+- Marks unsynced **Class-C** staged rows synced without embedding them — **no
+  user-memory write to the vector tier** (it is retired). Promotion and expiry
+  still run over these rows.
 - Promotes Class B (`confirmed_count >= 3`) into `facts`; expires Class C past its
   TTL.
 - Evaluates ontology candidates (frequency ≥ 3 → approve; synonyms collapse
   deterministically; else reject).
-- Resolves name conflicts; reconciles Qdrant against PostgreSQL ground truth
-  (deletes orphaned/superseded points).
-
-Qdrant deletes filter by `(source_table, fact_id)` payload — `facts` and
-`staged_facts` share a per-user collection with independent id sequences, so a bare
-point-id delete is unsafe.
+- Resolves name conflicts over `entity_aliases` / `entity_name_conflicts`.
 
 ---
 
@@ -326,8 +325,8 @@ not at query time. `archived_at` is a non-destructive soft-delete; `/query` filt
 
 ## Key design principles
 
-- **PostgreSQL is authoritative (long-term A/B); Qdrant is a derived Class-C-only
-  short-term scratchpad.** The vector never overrides PostgreSQL. This is not RAG.
+- **PostgreSQL is authoritative for all user memory (A/B/C); the vector tier is
+  retired for user memory.** This is not RAG.
 - **Strong ingest, lean query.** Extraction is part of strong ingest; the lean half
   is the query walk. Fix bad recall at ingest, never by bolting cleanup onto query.
 - **The LLM has no unsupervised write access** — all writes pass the WGM gate.
