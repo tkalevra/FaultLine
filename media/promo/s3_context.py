@@ -106,8 +106,13 @@ class ContextCollapse(FilmScene):
             ).move_to([row_x(), BAR_Y, 0])
         )
         self.add(marker)
-        tmark = label("the row you needed", size=0.22, color=GOOD)
-        tmark.next_to(frame, UP, buff=0.62).shift(LEFT * 3.1)
+        # rides with the marker — it slides right as the context grows, and a
+        # label parked at a fixed spot would stop pointing at anything
+        # offset right of the drop line so the two never sit on top of each other
+        tmark = always_redraw(
+            lambda: label("the row you needed", size=0.22, color=GOOD)
+            .move_to([row_x() + 1.4, BAR_Y - 0.72, 0])
+        )
         self.play(FadeIn(tmark), run_time=0.5)
 
         # -------------------------------------------------- the accuracy curve

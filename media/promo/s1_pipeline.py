@@ -110,7 +110,7 @@ class RagPipeline(FilmScene):
 
         self.play(FadeOut(embedder), FadeOut(a2), FadeIn(count), run_time=0.6)
         self.say("Text becomes coordinates. Meaning becomes distance.", run_time=0.6,
-                 hold=0.7)
+                 hold=1.4)
 
         # name the thing, plainly — the rest of the film argues about it
         named = VGroup(
