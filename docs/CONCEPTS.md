@@ -32,7 +32,7 @@ actually true* (memories).
 
 → Mechanically: the entity model and naming layer in
 [ARCHITECTURE.md → Entity model](ARCHITECTURE.md#entity-model); class assignment in
-[Class tiering](ARCHITECTURE.md#class-tiering-durability--ab-in-postgresql-c-in-qdrant).
+[Class tiering](ARCHITECTURE.md#class-tiering-durability--all-classes-in-postgresql).
 
 ---
 
@@ -99,15 +99,16 @@ commits. Validation is entirely metadata-driven — adding a relationship type i
 - **Class A** — user-stated / structural. PostgreSQL, written through immediately.
 - **Class B** — inferred but following established ontology. PostgreSQL staged,
   promoted at three confirmations.
-- **Class C** — couldn't-classify-yet / short-term. PostgreSQL staged **and**
-  mirrored to the Qdrant vector index; expires unless promoted (C→B).
+- **Class C** — couldn't-classify-yet / short-term. PostgreSQL staged
+  (`staged_facts` + the verbatim `episodic_log`); expires unless promoted (C→B).
+  The vector tier is retired for user memory — all classes live in PostgreSQL.
 
 The growth engine hinges on **B**: on an ingest miss we *grow* the ontology so the
 fact has somewhere walkable to live — we do not drop it. **We don't forget**: a
 classification failure lands in C and can be promoted later. A/B never promote;
 promotion is a C-tier mechanism.
 
-→ Mechanically: [ARCHITECTURE.md → Class tiering](ARCHITECTURE.md#class-tiering-durability--ab-in-postgresql-c-in-qdrant).
+→ Mechanically: [ARCHITECTURE.md → Class tiering](ARCHITECTURE.md#class-tiering-durability--all-classes-in-postgresql).
 
 ---
 
@@ -156,7 +157,7 @@ The lesson here is "tier by where it came from, not by a blanket rule" — a sta
 feeling should never be forced into a 30-day expiry just because feelings *can* be
 ephemeral.
 
-→ Related: [Class tiering](ARCHITECTURE.md#class-tiering-durability--ab-in-postgresql-c-in-qdrant).
+→ Related: [Class tiering](ARCHITECTURE.md#class-tiering-durability--all-classes-in-postgresql).
 
 ---
 
@@ -204,7 +205,7 @@ bound *without* `public`, so one user's world can never leak into another's.
                     │                                │        │
             WGM gate (no unsupervised writes)        │        └── fail loud if absent
                     │                                │
-        A/B (Postgres, authoritative)  ◀── promote ──┴── C (Qdrant, short-term)
+        A/B (Postgres, authoritative)  ◀── promote ──┴── C (Postgres, short-term)
                     │
    temporal hinge · feelings tiering · ±6 growth · /expand · per-tenant
         (all hinge on L4 being built right at ingest)

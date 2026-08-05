@@ -52,8 +52,8 @@ aspirational. Then:
 - **No UUIDs, rel_type tokens, or internal identifiers in anything a user sees.**
 - **Strong ingest, lean query.** If recall is wrong, fix it at ingest. Do not bolt cleanup onto the
   query path.
-- **PostgreSQL is authoritative.** The vector index is a derived, Class-C-only scratchpad. It never
-  overrides Postgres.
+- **PostgreSQL is authoritative for all user memory (A/B/C).** The vector tier is retired for user
+  memory — nothing overrides Postgres.
 - **Fail loud, never silent.** A safe default plus a `log_crit` beats silently continuing on bad
   data.
 

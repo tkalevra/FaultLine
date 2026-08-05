@@ -33,7 +33,7 @@ curl http://localhost:8000/health
 | `faultline` | **8000** | Backend API — `/ingest`, `/query`, `/health` |
 | `faultline-mcp` | **8002** | MCP server — `recall_memory`, `remember_facts`, `learn_facts`, `retract_fact` (the live integration path) |
 | `postgres` | 5432 | PostgreSQL — authoritative fact storage (per-tenant schemas) |
-| `qdrant` | 6333 | Qdrant — Class-C short-term vector index |
+| `qdrant` | 6333 | Qdrant — present in the stack; retired for user memory (holds no user facts) |
 
 The **MCP server on `:8002`** is the production integration path. The OpenWebUI
 Filter in `openwebui/` is intentionally disabled and is not the live path.

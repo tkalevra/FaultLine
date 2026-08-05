@@ -150,7 +150,7 @@ Expand once and every future conversation in that domain benefits automatically.
 
 ## Multi-tenant isolation
 
-Every user gets a **physically separate PostgreSQL schema** (`faultline_<user_id>`) and their own Qdrant collection. Each request binds to the caller's schema via `SET search_path` **without `public`**, so one tenant's queries cannot even *name* another tenant's tables. There is no shared `user_id` column to filter on and forget — the boundary **is** the schema, enforced by the database.
+Every user gets a **physically separate PostgreSQL schema** (`faultline_<user_id>`) — the sole user-memory boundary. Each request binds to the caller's schema via `SET search_path` **without `public`**, so one tenant's queries cannot even *name* another tenant's tables. There is no shared `user_id` column to filter on and forget — the boundary **is** the schema, enforced by the database. (User memory is PostgreSQL-only; the vector tier is retired, so there are no per-user vector collections in the memory path.)
 
 **Verified on a live instance.** Three fresh tenants, each told one distinct thing, then inspected:
 
