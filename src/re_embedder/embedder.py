@@ -107,6 +107,11 @@ _CATEGORY_PENDING_RE = "pending_placement"
 # their PG row lives) and are simply never SERVED to the query lane.
 _VECTOR_CLASS_C_ONLY = _flag("VECTOR_CLASS_C_ONLY", "true")
 
+# User-memory vector lane retirement (ratified 2026-07-31). When OFF (default), the re-embedder
+# stops embedding Class-C user-memory rows to Qdrant. C stays queryable from staged_facts
+# (Postgres) via fetch_facts_from_anchor. Default OFF = retirement active (the ratified direction).
+_USER_MEMORY_VECTOR_LANE = _flag("USER_MEMORY_VECTOR_LANE", "false")
+
 # Hierarchy rel_types (rung-4 closed set, DESIGN §"The deterministic resolution ladder"). Used by
 # convergence + bridging validation. Mechanism, not ontology CONTENT — these are the structural
 # classification rels, identical to the closed set the canonical ladder enforces.
@@ -8277,6 +8282,20 @@ def main():
 
                         # Fetch and embed unsynced staged facts for this user
                         staged_rows = fetch_unsynced_staged(db_per_user, user_id)
+                        if staged_rows and not _USER_MEMORY_VECTOR_LANE:
+                            # User-memory vector lane RETIRED: mark these Class-C rows synced WITHOUT
+                            # embedding so the idle-probe stops firing and no Qdrant write happens. C
+                            # remains queryable from staged_facts (Postgres).
+                            try:
+                                with db_per_user.cursor() as _mc:
+                                    _mc.executemany(
+                                        "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
+                                        [(_r["id"],) for _r in staged_rows],
+                                    )
+                                db_per_user.commit()
+                            except Exception as _e:  # noqa: BLE001
+                                log.warning("re_embedder.staged_mark_synced_failed", error=str(_e)[:120])
+                            staged_rows = []
                         if staged_rows:
                             log.info(f"re_embedder.staged_batch user_id={user_id[:8]} count={len(staged_rows)}")
                             collection = derive_collection(user_id)
