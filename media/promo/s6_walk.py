@@ -167,10 +167,10 @@ class TheWalk(FilmScene):
         self.unsay(run_time=0.4)
 
         claims = VGroup(
-            body("Runs entirely on your machine.", size=0.42, color=INK),
             body("One memory, shared across every model — over MCP.",
                  size=0.42, color=INK),
-            body("Open source. AGPLv3.", size=0.42, color=INK),
+            body("Self-host it: open source, AGPLv3.", size=0.42, color=INK),
+            body("Or let us host it — in Canada.", size=0.42, color=INK),
         ).arrange(DOWN, buff=0.42, aligned_edge=LEFT)
         claims.move_to([0, 0.35, 0])
 
@@ -179,16 +179,21 @@ class TheWalk(FilmScene):
             LaggedStart(*[FadeIn(c, shift=UP * 0.2) for c in claims], lag_ratio=0.35),
             run_time=2.0,
         )
-        self.wait(1.4)
+        self.wait(2.1)
         self.play(FadeOut(claims, shift=UP * 0.2), run_time=0.7)
 
-        mark = turnstile(h=1.4, stroke=6.5, color=INK).move_to([0, 0.95, 0])
+        mark = turnstile(h=1.3, stroke=6.5, color=INK).move_to([0, 1.55, 0])
         word = Text("FAULTLINE", font=FONT, weight="LIGHT", color=INK).scale(0.95)
-        word.set_stroke(width=0).move_to([0, -0.35, 0])
+        word.set_stroke(width=0).move_to([0, 0.35, 0])
         sub = Text("WRITE-VALIDATED MEMORY", font=FONT, color=DIM).scale(0.28)
-        sub.move_to([0, -1.05, 0])
-        url = Text("github.com/tkalevra/FaultLine", font=MONO, color=ACCENT).scale(0.3)
-        url.move_to([0, -2.05, 0])
+        sub.move_to([0, -0.3, 0])
+
+        saas = Text("faultline.ca", font=MONO, color=ACCENT).scale(0.4)
+        saas.move_to([0, -1.35, 0])
+        foss = Text("github.com/tkalevra/FaultLine", font=MONO, color=DIM).scale(0.27)
+        foss.move_to([0, -1.95, 0])
+        by = Text("by Volenti  ·  volenti.ca", font=FONT, color=DIM).scale(0.24)
+        by.move_to([0, -2.75, 0])
 
         self.cue("@endcard")
         self.play(Create(mark[0]), run_time=0.5)
@@ -198,10 +203,12 @@ class TheWalk(FilmScene):
             run_time=0.9,
         )
         self.play(FadeIn(sub), run_time=0.5)
-        self.play(FadeIn(url, shift=UP * 0.15), run_time=0.6)
-        self.wait(2.2)
+        self.play(FadeIn(saas, shift=UP * 0.15), run_time=0.6)
+        self.play(FadeIn(foss), run_time=0.45)
+        self.play(FadeIn(by), run_time=0.5)
+        self.wait(2.3)
         self.play(
-            FadeOut(VGroup(mark, word, sub, url)),
+            FadeOut(VGroup(mark, word, sub, saas, foss, by)),
             run_time=1.1,
         )
         self.wait(0.4)
