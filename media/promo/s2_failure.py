@@ -48,7 +48,7 @@ class RagFailure(FilmScene):
         wm = watermark()
         self.add(cloud, store_frame, store_lbl, wm)
 
-        ch = chapter("02", "WHERE IT BREAKS")
+        ch = chapter("02", "WHERE RAG BREAKS BY ACCIDENT")
         self.play(FadeIn(ch, shift=RIGHT * 0.2), run_time=0.6)
 
         # =============================================== A. nearest ≠ correct

@@ -21,8 +21,23 @@ QUERY_POINT = np.array([3.05, 0.25, 0.0])
 class Poisoning(FilmScene):
     def construct(self):
         wm = watermark()
-        ch = chapter("04", "AND THERE IS NO GATE")
+        ch = chapter("04", "RAG POISONING")
         self.play(FadeIn(ch, shift=RIGHT * 0.2), FadeIn(wm), run_time=0.6)
+
+        # bridge: everything up to here was RAG failing on its own. This is
+        # someone making it fail on purpose — a different claim, so say so.
+        bridge = VGroup(
+            body("Everything so far was an accident.", size=0.44, color=DIM),
+            body("This part is on purpose.", size=0.5, color=BAD),
+        ).arrange(DOWN, buff=0.4)
+        bridge.move_to([0, 0.6, 0])
+        self.play(FadeIn(bridge[0], shift=UP * 0.15), run_time=0.7)
+        self.play(FadeIn(bridge[1], shift=UP * 0.15), run_time=0.7)
+        self.say("Everything so far was RAG failing on its own.", run_time=0.55,
+                 hold=2.2)
+        self.say("This is someone making it fail — an attack called RAG poisoning.",
+                 color=BAD, accent=BAD, size=0.4, run_time=0.6, hold=1.6)
+        self.play(FadeOut(bridge), run_time=0.6)
 
         # ------------------------------------------------------- the index
         pts = cloud_points(n=320, seed=11, rx=2.6, ry=1.78, center=CLOUD_CENTER)

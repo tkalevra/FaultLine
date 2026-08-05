@@ -22,6 +22,8 @@ SCRIPT = {
         "Each chunk is turned into a vector. A point in space.",
     ("RagPipeline", "Text becomes coordinates. Meaning becomes distance."):
         "Text becomes coordinates. Meaning becomes distance.",
+    ("RagPipeline", "This is RAG — retrieval-augmented generation."):
+        "This is RAG. Retrieval-augmented generation.",
     ("RagPipeline", "Your question is embedded the same way."):
         "Your question is embedded the same way,",
     ("RagPipeline", "It returns whatever sits closest."):
@@ -45,24 +47,30 @@ SCRIPT = {
     ("RagFailure", "Forty chunks. To answer one question."):
         "Forty chunks, to answer one question.",
 
-    # -------------------------------------- 03  what the model actually sees
-    ("ContextCollapse", "Everything retrieved gets pasted in front of your question."):
-        "All of it gets pasted in front of your question.",
-    ("ContextCollapse", "One of them is the answer. The model has to find it."):
-        "One of them is the answer. It has to find it.",
-    ("ContextCollapse", "Long context does not mean evenly read."):
-        "But a long context is not read evenly.",
-    ("ContextCollapse", "Accuracy is highest at the edges — and sags in the middle."):
-        "Accuracy peaks at the edges, and sags through the middle.",
-    ("ContextCollapse", "So it does the thing it always does."):
+    # ------------------------------ 03  why more context makes the answer worse
+    ("ContextCollapse", "You retrieve a handful of chunks. That is your context."):
+        "What you retrieve becomes the model's context.",
+    ("ContextCollapse", "Short context: the model reads all of it. Your row lands well."):
+        "A short context is read well.",
+    ("ContextCollapse", "But precision was bad, so you retrieved more."):
+        "But precision was bad, so you retrieved more. And more.",
+    ("ContextCollapse", "The context grew — and the middle of it collapsed."):
+        "The context grew, and the middle collapsed.",
+    ("ContextCollapse", "Your row is now buried exactly where accuracy is worst."):
+        "Buried exactly where accuracy is worst.",
+    ("ContextCollapse", "So it does what it always does."):
         "So it does what it always does. It answers anyway.",
     ("ContextCollapse", "It will not say “I don’t know.” It fills the gap."):
         "It will not tell you it doesn't know. It fills the gap.",
 
-    # ------------------------------------------------- 04  and there's no gate
+    # ---------------------------------------------------- 04  RAG poisoning
+    ("Poisoning", "Everything so far was RAG failing on its own."):
+        "Everything so far was an accident.",
+    ("Poisoning", "This is someone making it fail — an attack called RAG poisoning."):
+        "This is deliberate. It's called RAG poisoning.",
     ("Poisoning", "Anything that reaches the index becomes knowledge."):
-        "And nothing checks what goes in. Anything that reaches the index "
-        "becomes knowledge.",
+        "Nothing checks what goes in. Anything reaching the index becomes "
+        "knowledge.",
     ("Poisoning", "The same pipeline. No validation. No gate."):
         "The same pipeline. No validation. No gate.",
     ("Poisoning", "Ask the question they targeted."):
@@ -97,9 +105,9 @@ SCRIPT = {
     ("TheWalk", "Yes — there is still a vector index here."):
         "There is still a vector index.",
     ("TheWalk", "It holds what can't be classified yet — never the source of truth."):
-        "It holds what can't be classified yet. It is never the source of truth.",
+        "It holds what can't be classified yet — never the source of truth.",
     ("TheWalk", "@claims"):
-        "Private, self-hosted, and shared across every model you use.",
+        "One memory, across every model. Self-hosted, or hosted for you.",
     ("TheWalk", "@endcard"):
-        ("FaultLine. Write-validated memory.", 1.0),
+        ("FaultLine. Write-validated memory. By Volenti.", 1.0),
 }
