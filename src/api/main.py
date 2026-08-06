@@ -5202,7 +5202,80 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
                     "object_type": object_type,
                 })
 
+    edges = _resolve_gliner_scalar_slot_collisions(edges)
+
     return edges if edges else None
+
+
+def _resolve_gliner_scalar_slot_collisions(edges: list[dict]) -> list[dict]:
+    """Drop the LOSING edges when GLiNER2 files ONE span into SEVERAL scalar slots.
+
+    THE DEFECT (measured on the live line). GLiNER2 scores each candidate rel_type
+    INDEPENDENTLY, so nothing stops it returning the same (subject, object) pair under two
+    different scalar labels. Raw output for "My son Rowan is 12." is literally::
+
+        {'age': [('Rowan', '12')], 'has_gender': [('Rowan', '12')], ...}
+
+    Both edges were converted, both committed, and the store gained ``has_gender = 12`` — a
+    person whose gender is a number — beside the correct age. The same collision is what put
+    "10 F" / "12 m" style values into gender and quantity slots in a real memory.
+
+    THE DISCRIMINATOR IS METADATA ALREADY IN THE SCHEMA, not a rel_type list: migration 101
+    gives every SCALAR rel a ``scalar_datatype`` ("integer" / "quantity" / "string") precisely
+    to drive per-datatype validation. A bare cardinal SATISFIES ``integer``; it is not a
+    ``quantity`` (that needs a unit) and it is only vacuously a ``string``. So when several
+    rels claim one span we keep the rel whose declared datatype the value satisfies MOST
+    SPECIFICALLY (integer > quantity > string) and drop the rest.
+
+    SCOPE — deliberately narrow, so this can only ever remove noise:
+      • Only groups where 2+ DISTINCT rel_types claim the SAME (subject, object) are touched.
+      • Only when the value is a bare cardinal. A NON-numeric span is left completely alone,
+        because co-claiming is legitimate there ("ro" is genuinely both ``pref_name`` and
+        ``also_known_as``) and nothing would justify picking a winner.
+      • A group with no strictly-typed winner is left alone (never guess).
+    Fail-safe: metadata unresolvable / any error → the edges are returned untouched.
+    """
+    if not edges or len(edges) < 2:
+        return edges
+    try:
+        meta = _rel_meta() or {}
+    except Exception:  # noqa: BLE001 — fail-safe: no metadata → never drop anything
+        return edges
+    if not meta:
+        return edges
+
+    # Specificity ladder: a value that satisfies a STRICTER datatype belongs in that slot.
+    # "string" accepts anything, so it must never beat a datatype the value genuinely fits.
+    _RANK = {"integer": 3, "quantity": 2, "string": 1}
+
+    groups: dict[tuple, list[dict]] = {}
+    for e in edges:
+        groups.setdefault((e.get("subject"), e.get("object")), []).append(e)
+
+    drop: set[int] = set()
+    for (_subj, obj), group in groups.items():
+        if len({e.get("rel_type") for e in group}) < 2:
+            continue
+        # Only a BARE CARDINAL is unambiguous enough to adjudicate (see SCOPE above).
+        if not (isinstance(obj, str) and obj.strip().isdigit()):
+            continue
+        ranked = []
+        for e in group:
+            dt = (meta.get(e.get("rel_type"), {}) or {}).get("scalar_datatype")
+            ranked.append((_RANK.get((dt or "").strip().lower(), 0), e))
+        best = max(r for r, _ in ranked)
+        # A winner must be STRICTLY better than the rest — otherwise we would be guessing.
+        if best <= _RANK["string"] or sum(1 for r, _ in ranked if r == best) != 1:
+            continue
+        for r, e in ranked:
+            if r != best:
+                drop.add(id(e))
+                log.info("gliner2.scalar_slot_collision_dropped",
+                         rel_type=e.get("rel_type"), subject=e.get("subject"),
+                         object=e.get("object"),
+                         kept=[x.get("rel_type") for rr, x in ranked if rr == best][0])
+
+    return [e for e in edges if id(e) not in drop] if drop else edges
 
 
 def _build_relational_candidate_labels(rel_meta: dict, cap: int = _GLINER2_RELATIONAL_LABEL_CAP) -> dict:
