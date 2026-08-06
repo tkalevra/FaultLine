@@ -8846,6 +8846,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     break
                 if _t.dep_ == "case":
                     continue
+                # AN ALIAS IS NOT A NEW REFERENT. A nickname inside a parenthetical or relative-clause
+                # alias run ("a son named Rowan (goes by Ro), he is 12") is a SECOND NAME for the
+                # person already introduced, not a fresh discourse referent — but it is also the
+                # NEAREST preceding PROPN, so recency handed the pronoun to the nickname and the age
+                # landed on "ro" instead of "rowan". (Only visible once the bracket infix split the
+                # run into real tokens.) The alias run is already marked in ``_ni_suppress`` by the
+                # named-instance pre-pass, which is exactly the span the binding consumed as a
+                # nickname, so skipping it here keeps ONE notion of "the alias run" in the module.
+                if _t.i in _ni_suppress:
+                    continue
                 if _t.pos_ == "PROPN":
                     best = (_t.text or "").strip().lower()
                     continue
