@@ -4438,6 +4438,74 @@ _GLINER2_RELATION_LABEL_CAP = 25  # legacy — kept for backward compat; new spl
 _GLINER2_SCALAR_LABEL_CAP = int(os.environ.get("GLINER2_SCALAR_LABEL_CAP", "15"))
 _GLINER2_RELATIONAL_LABEL_CAP = int(os.environ.get("GLINER2_RELATIONAL_LABEL_CAP", "20"))
 
+# ── THE PER-INSTANCE CEILING (the invariant the split caps above silently broke) ─────────────
+# The two budgets above are PER-POOL, but they are MERGED into ONE dict and handed to a SINGLE
+# extract_relations() call — so the number of labels that actually reaches the model was
+# scalar + relational = 15 + 20 = 35. The cap the comment above describes is PER INSTANCE, and
+# GLiREL states it outright: "We limit the number of relation type labels prepended to each
+# training instance to 25." (arxiv:2501.03172). 35 labels is not "near the limit"; it is 40%
+# BEYOND the training maximum — a sequence shape the model never saw. Measured on the live line:
+# one /ingest call carried 33 labels and GLiNER2 fired TWO conflicting scalar labels on ONE span
+# ({'age': [('Rowan','12')], 'has_gender': [('Rowan','12')]}).
+#
+# The paper also measures the cost of merely APPROACHING the cap — F1 by candidate-label count m:
+#     m=5 → 94.20 (FewRel) / 83.28 (Wiki-ZSL)
+#     m=10 → 87.60          / 83.67
+#     m=15 → 84.48          / 73.91
+# i.e. 5→15 labels costs ~10 F1 on FewRel and ~9 on Wiki-ZSL. Fewer labels is not merely safer,
+# it is measurably more accurate — so this ceiling is a floor on quality, not a formality.
+#
+# RELATIONAL FLOOR: the split budgets exist because a large scalar pool once crowded relational
+# candidates out entirely. Trimming to the ceiling must not re-create that, so the relational
+# pool keeps a reserved minimum whenever relational candidates exist at all.
+_GLINER2_TOTAL_LABEL_CAP = int(os.environ.get("GLINER2_TOTAL_LABEL_CAP", "25"))
+_GLINER2_RELATIONAL_FLOOR = int(os.environ.get("GLINER2_RELATIONAL_FLOOR", "8"))
+
+
+def _enforce_gliner2_total_label_budget(scalars: dict, relational: dict) -> tuple[dict, dict]:
+    """Trim the two candidate pools so their MERGED size never exceeds the per-instance ceiling.
+
+    Returns ``(scalars, relational)`` trimmed. Both inputs are assumed ALREADY RANKED by their
+    own selection logic (seeded backbone reserved first, then priority), so trimming is a
+    deterministic tail-drop — the highest-value labels survive.
+
+    Order of sacrifice: RELATIONAL first, down to ``_GLINER2_RELATIONAL_FLOOR``, because a scalar
+    rel is the more specific storage path (the merge already resolves scalar-vs-relational ties in
+    the scalar's favour). Only if the scalar pool alone still breaches the ceiling are scalars
+    trimmed too. The floor guarantees relational candidates are never crowded out entirely — the
+    exact failure the split budgets were introduced to fix.
+
+    NEVER SILENT: every drop is logged with counts and the dropped label names, because a silent
+    truncation reads as "we considered everything" when we did not.
+    """
+    cap = max(1, _GLINER2_TOTAL_LABEL_CAP)
+    scalars = dict(scalars or {})
+    relational = dict(relational or {})
+    total = len(scalars) + len(relational)
+    if total <= cap:
+        return scalars, relational
+
+    floor = max(0, min(_GLINER2_RELATIONAL_FLOOR, len(relational)))
+    scalar_slots = max(0, cap - floor)
+    kept_scalars = dict(list(scalars.items())[:scalar_slots])
+    rel_slots = max(0, cap - len(kept_scalars))
+    kept_relational = dict(list(relational.items())[:rel_slots])
+
+    log.warning(
+        "gliner2.total_label_cap_enforced",
+        cap=cap,
+        before_total=total,
+        after_total=len(kept_scalars) + len(kept_relational),
+        scalar_before=len(scalars), scalar_after=len(kept_scalars),
+        relational_before=len(relational), relational_after=len(kept_relational),
+        relational_floor=floor,
+        dropped_scalar=sorted(set(scalars) - set(kept_scalars)),
+        dropped_relational=sorted(set(relational) - set(kept_relational)),
+        note="GLiREL trains with <=25 relation labels per instance (arxiv:2501.03172); "
+             "the merged scalar+relational set exceeded it and was trimmed",
+    )
+    return kept_scalars, kept_relational
+
 # GLiNER2 closed-set RELATION scorer confidence floor (extract_relations threshold).
 # The closed-set scorer will FORCE an existing label onto a weak entity pair when the floor is
 # low (the live "resides_in | east side" noise). Raising the floor drops those low-confidence
@@ -5202,7 +5270,80 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
                     "object_type": object_type,
                 })
 
+    edges = _resolve_gliner_scalar_slot_collisions(edges)
+
     return edges if edges else None
+
+
+def _resolve_gliner_scalar_slot_collisions(edges: list[dict]) -> list[dict]:
+    """Drop the LOSING edges when GLiNER2 files ONE span into SEVERAL scalar slots.
+
+    THE DEFECT (measured on the live line). GLiNER2 scores each candidate rel_type
+    INDEPENDENTLY, so nothing stops it returning the same (subject, object) pair under two
+    different scalar labels. Raw output for "My son Rowan is 12." is literally::
+
+        {'age': [('Rowan', '12')], 'has_gender': [('Rowan', '12')], ...}
+
+    Both edges were converted, both committed, and the store gained ``has_gender = 12`` — a
+    person whose gender is a number — beside the correct age. The same collision is what put
+    "10 F" / "12 m" style values into gender and quantity slots in a real memory.
+
+    THE DISCRIMINATOR IS METADATA ALREADY IN THE SCHEMA, not a rel_type list: migration 101
+    gives every SCALAR rel a ``scalar_datatype`` ("integer" / "quantity" / "string") precisely
+    to drive per-datatype validation. A bare cardinal SATISFIES ``integer``; it is not a
+    ``quantity`` (that needs a unit) and it is only vacuously a ``string``. So when several
+    rels claim one span we keep the rel whose declared datatype the value satisfies MOST
+    SPECIFICALLY (integer > quantity > string) and drop the rest.
+
+    SCOPE — deliberately narrow, so this can only ever remove noise:
+      • Only groups where 2+ DISTINCT rel_types claim the SAME (subject, object) are touched.
+      • Only when the value is a bare cardinal. A NON-numeric span is left completely alone,
+        because co-claiming is legitimate there ("ro" is genuinely both ``pref_name`` and
+        ``also_known_as``) and nothing would justify picking a winner.
+      • A group with no strictly-typed winner is left alone (never guess).
+    Fail-safe: metadata unresolvable / any error → the edges are returned untouched.
+    """
+    if not edges or len(edges) < 2:
+        return edges
+    try:
+        meta = _rel_meta() or {}
+    except Exception:  # noqa: BLE001 — fail-safe: no metadata → never drop anything
+        return edges
+    if not meta:
+        return edges
+
+    # Specificity ladder: a value that satisfies a STRICTER datatype belongs in that slot.
+    # "string" accepts anything, so it must never beat a datatype the value genuinely fits.
+    _RANK = {"integer": 3, "quantity": 2, "string": 1}
+
+    groups: dict[tuple, list[dict]] = {}
+    for e in edges:
+        groups.setdefault((e.get("subject"), e.get("object")), []).append(e)
+
+    drop: set[int] = set()
+    for (_subj, obj), group in groups.items():
+        if len({e.get("rel_type") for e in group}) < 2:
+            continue
+        # Only a BARE CARDINAL is unambiguous enough to adjudicate (see SCOPE above).
+        if not (isinstance(obj, str) and obj.strip().isdigit()):
+            continue
+        ranked = []
+        for e in group:
+            dt = (meta.get(e.get("rel_type"), {}) or {}).get("scalar_datatype")
+            ranked.append((_RANK.get((dt or "").strip().lower(), 0), e))
+        best = max(r for r, _ in ranked)
+        # A winner must be STRICTLY better than the rest — otherwise we would be guessing.
+        if best <= _RANK["string"] or sum(1 for r, _ in ranked if r == best) != 1:
+            continue
+        for r, e in ranked:
+            if r != best:
+                drop.add(id(e))
+                log.info("gliner2.scalar_slot_collision_dropped",
+                         rel_type=e.get("rel_type"), subject=e.get("subject"),
+                         object=e.get("object"),
+                         kept=[x.get("rel_type") for rr, x in ranked if rr == best][0])
+
+    return [e for e in edges if id(e) not in drop] if drop else edges
 
 
 def _build_relational_candidate_labels(rel_meta: dict, cap: int = _GLINER2_RELATIONAL_LABEL_CAP) -> dict:
@@ -20232,6 +20373,16 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                     detected_types=sorted(
                                         {t.lower() for t in _detected_entity_types}),
                                     note="relational candidate set exceeded relational budget cap")
+
+                    # PER-INSTANCE CEILING — the two budgets above are PER-POOL, but everything
+                    # below is merged into ONE call, so the label count the MODEL sees is their
+                    # SUM (15 + 20 = 35) against a training maximum of 25 (arxiv:2501.03172).
+                    # Enforce the real invariant here, at the one place both pools are still
+                    # distinguishable, before they lose their identity in the merge.
+                    _scalar_relation_types, _relational_candidates = (
+                        _enforce_gliner2_total_label_budget(
+                            _scalar_relation_types, _relational_candidates))
+                    _scalar_count = len(_scalar_relation_types)
 
                     # Merge: scalars + selected relational, stripping the internal
                     # prioritization keys so GLiNER2 receives ONLY {description, threshold}.

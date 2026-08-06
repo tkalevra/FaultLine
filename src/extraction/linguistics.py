@@ -222,6 +222,42 @@ def _install_identifier_tokenizer(nlp) -> None:
         log.warning("linguistics.identifier_tokenizer_install_failed", error=str(e)[:120])
 
 
+def _install_bracket_infix(nlp) -> None:
+    r"""SPLIT a bracket GLUED between two word characters — "Desmonde(goes" → ``Desmonde`` ``(`` ``goes``.
+
+    GROUNDING: spaCy Tokenizer ``infix_finditer`` — "a function to find internal segment separators,
+    e.g. hyphens" (spaCy Tokenizer API). Brackets live in spaCy's PREFIX/SUFFIX rules, which only fire
+    at a token's EDGE; a bracket in the MIDDLE of an alphanumeric run matches no infix rule, so the run
+    survives as ONE token.
+
+    THE CAPTURE BUG THIS CLOSES (measured on the live spine): a user writing a parenthetical alias with
+    no space — "I have a son named Desmonde(goes by Dez)" — tokenized as the single PROPN
+    ``Desmonde(goes``, which the naming chain then bound as THE NAME. The stored memory read "a son
+    named Desmonde(goes", with a gender/kin edge hung off that malformed surface. The parenthetical is
+    a UNIVERSAL orthographic boundary, not a domain fact, so it belongs in the tokenizer: with the run
+    split, the SPACED and UNSPACED forms parse IDENTICALLY and the alias chain sees the same shape.
+
+    ORDERING (spaCy's documented tokenizer loop): a ``token_match`` is consulted BEFORE the infix
+    split (infixes are step 9, after the prefix/suffix/URL/special-case steps), so the identifier
+    ``token_match`` installed above still wins and an identifier that legitimately carries brackets is
+    untouched — verified by the identifier regression suites. The one documented way a new infix can
+    silently no-op is a conflicting tokenizer SPECIAL CASE (``nlp.tokenizer.rules``, e.g. the
+    contraction table), which takes precedence over every pattern; no special case spans a bracket,
+    and ``_reconcile_cue_tokenizer_exceptions`` below already owns that table.
+
+    Built with ``spacy.util.compile_infix_regex`` (the documented helper) rather than a hand-joined
+    alternation. Installed BEFORE the first parse, so no tokenization cache needs invalidating.
+    Idempotent (re-running recompiles the same rule set); fail-safe: any error leaves the tokenizer
+    untouched — the unspaced form then degrades to today's single-token reading, never to a crash."""
+    try:
+        from spacy.util import compile_infix_regex  # deferred: spaCy is an optional dependency
+
+        _infixes = list(nlp.Defaults.infixes) + [r"(?<=[A-Za-z0-9])[\(\)\[\]\{\}](?=[A-Za-z0-9])"]
+        nlp.tokenizer.infix_finditer = compile_infix_regex(_infixes).finditer
+    except Exception as e:  # noqa: BLE001 — never break the parse over a tokenizer tweak
+        log.warning("linguistics.bracket_infix_install_failed", error=str(e)[:120])
+
+
 # HEAD-POS inventory for the identifier-context chain. NOUN was too narrow: spaCy's tagger routinely
 # calls an ALL-CAPS / capitalised / out-of-vocabulary common noun a PROPN ("my order ID is AB123" →
 # ID/PROPN/nsubj), so the cue-class gate below was unreachable for exactly the surfaces users
@@ -321,6 +357,9 @@ def _get_nlp():
             # footprint). We only need tagger + parser for POS + dependency labels.
             _nlp = spacy.load(_SPACY_MODEL, disable=["ner"])
             _install_identifier_tokenizer(_nlp)  # keep CVE ids / version strings / x86-64 whole
+            # …split a BRACKET glued between word characters ("Desmonde(goes" → "Desmonde ( goes"),
+            # which spaCy's default rules leave WHOLE (a bracket is a prefix/suffix, never an infix).
+            _install_bracket_infix(_nlp)
             # …and stop spaCy's own exception table from shattering a cue surface the engine holds
             # (the seeded `id` was dead from the day it was seeded). Fail-safe: no DB → no change.
             _reconcile_cue_tokenizer_exceptions(_nlp)
@@ -2139,14 +2178,52 @@ def _binding_age_string(name_tok, type_tok):
 
 
 def _binding_nickname(name_tok, type_tok):
-    r"""A "<who> goes by <Nick>" nickname bound to THIS named instance ("Jamie who goes by Jay"), or
-    None. SCOPED to the binding's OWN relcl (head=type_tok — see ``_binding_own_relcl``) so a sibling's
-    nickname never bleeds onto this name. spaCy parses the relative clause's ``go`` verb with head =
+    r"""A "<who> goes by <Nick>" nickname bound to THIS named instance, or None. TWO constructions:
+    the PARENTHETICAL run ("Desmonde (goes by Dez)" — linearly anchored to this name) and the
+    RELATIVE CLAUSE ("Jamie who goes by Jay"). Both are SCOPED to THIS binding so a sibling's nickname
+    never bleeds onto this name — the parenthetical by the bracket sitting on the token immediately
+    after the NAME, the relcl by ``_binding_own_relcl`` (head=type_tok). spaCy parses the relative
+    clause's ``go`` verb with head =
     the TYPE noun the NAME is the appositive of; the nickname is the ``pobj`` of the ``by`` prep. We
     accept it when THIS binding's own relcl is a ``go``-lemma verb governing a ``by`` prep with a
     PROPN/NOUN pobj that is NOT the bound name. Structural (dependency + the surface preposition "by"),
     NO nickname word-list. Fail-safe → None."""
     try:
+        # (a) PARENTHETICAL alias run — "Desmonde (goes by Dez)" / "Gabriella (goes by Gabby)".
+        #     Checked FIRST because it is LINEARLY anchored to THIS name (the bracket opens on the
+        #     token immediately after it), which is a stricter scope than the relcl walk below.
+        #
+        #     THE CAPTURE BUG THIS CLOSES (measured on the live spine): spaCy gives a parenthetical
+        #     alias run NO subject of its own, so it re-attaches the bare alias VERB as the nsubj of
+        #     the following copula ("… (goes by Dez) is 12" → nsubj(is) = "goes"). The nickname was
+        #     therefore DROPPED (the relcl branch below never matches — there is no ``relcl``), and a
+        #     junk ("goes", age, "12") scalar was minted off the verb. Reading the run LINEARLY — the
+        #     bracket immediately after the NAME, then an alias-predicate verb — recovers the alias
+        #     without depending on how the parser re-attached the subject-less clause.
+        #
+        #     The alias VOCABULARY is the growable ``alias_predicate`` cue MAP ({verb_lemma: particle}
+        #     — go→by, know→as, refer→as), the SAME metadata ``_chain_alias_predicate`` reads, NOT a
+        #     "goes by" literal. Only the BRACKET and the dependency shape stay in code (orthography +
+        #     grammar, a language primitive).
+        _alias_pp = _alias_predicate_map() or {}
+        _doc = name_tok.doc
+        _open = name_tok.i + 1
+        if _alias_pp and _open + 1 < len(_doc) and (_doc[_open].text or "").strip() in ("(", "["):
+            _v = _doc[_open + 1]
+            _vl = (_v.lemma_ or _v.text or "").strip().lower()
+            _particle = _alias_pp.get(_vl) if _v.pos_ in ("VERB", "AUX") else None
+            if _particle:
+                for c in _v.children:
+                    if c.dep_ != "prep" or (c.text or "").strip().lower() != _particle:
+                        continue
+                    pobj = next((g for g in c.children
+                                 if g.dep_ == "pobj" and g.pos_ in ("PROPN", "NOUN")), None)
+                    if pobj is not None:
+                        nick = (pobj.text or "").strip()
+                        if nick and nick.lower() != (name_tok.text or "").strip().lower():
+                            return nick
+        # (b) RELATIVE-CLAUSE alias run — "Jamie who goes by Jay" (the original construction), scoped
+        #     to THIS binding's OWN relcl so a sibling's nickname never bleeds onto this name.
         relcl = _binding_own_relcl(name_tok, type_tok)
         if relcl is None or (relcl.lemma_ or "").strip().lower() != "go":
             return None
@@ -2175,9 +2252,16 @@ def _bound_name_for_type(type_tok, _naming):
                          ``oprd``/``attr``/``dobj`` is a PROPN ("Rex").
       (3) COPULA       — the type is the ``nsubj`` of a copula ``be`` whose ``attr``/``oprd`` is a
                          PROPN with no determiner ("my friend is Sam").
+      (4) INVERSE COPULA — the mirror of (3): the type is the POSSESSED ``attr``/``oprd`` and the NAME
+                         is the ``nsubj`` ("Marla is my wife"). Gated on 1st-person possession.
+      (5) COPULA TYPE-PREDICATE — a DETERMINER-introduced predicate nominal is a second, narrower TYPE
+                         for the instance the possessed subject NP already names ("My dog Fraggle is a
+                         morkie" → morkie binds to Fraggle).
 
-    A determiner-introduced common-noun complement is never a name (it's a type); the wh-interrogative
-    is excluded. Structural + the naming-verb cue class only; subject-agnostic, no name word-list."""
+    A determiner-introduced common-noun complement is never a name (it's a type) in branches (1)–(4);
+    branch (5) inverts that reading deliberately — there the determiner is what identifies the TYPE,
+    and the name is taken from the subject NP's appositive. The wh-interrogative is excluded
+    throughout. Structural + the naming-verb cue class only; subject-agnostic, no name word-list."""
     # (1) apposition
     for c in type_tok.children:
         if c.dep_ != "appos" or c.pos_ not in ("PROPN", "NOUN"):
@@ -2224,7 +2308,15 @@ def _bound_name_for_type(type_tok, _naming):
     #     the complement is NOT determiner-introduced (a det → "is a poodle" is a TYPE, owned
     #     elsewhere). A bare PROPN complement is always accepted. This never over-captures "the printer
     #     is Apollo"-style non-possessed subjects (no 1st-person poss → NOUN complement rejected).
-    if type_tok.dep_ in ("nsubj", "nsubjpass"):
+    #     NAMING-NOUN EXCLUSION: "my mother's name is Priya" (and the apostrophe-stripped "my mothers
+    #     name is Priya" the atomizer produces) is the NAMING construction owned by
+    #     ``_chain_genitive_name`` — it binds Priya as the PERSON and hangs the kin relation there.
+    #     Read as a type↔name binding instead, the naming noun became the TYPE and the store gained a
+    #     phantom classification (priya, instance_of, "mothers name"). The head noun "name" is the
+    #     same grammatical marker ``_chain_possessive``'s ``_is_name_copula_nsubj`` guard already keys
+    #     on, so this exclusion matches the ownership boundary the rest of the module observes.
+    if type_tok.dep_ in ("nsubj", "nsubjpass") and (
+            type_tok.lemma_ or type_tok.text or "").strip().lower() != "name":
         head = type_tok.head
         if head is not None and head.lemma_ == "be" and head.pos_ == "AUX":
             _self_poss = any(
@@ -2248,6 +2340,70 @@ def _bound_name_for_type(type_tok, _naming):
                 except Exception:  # noqa: BLE001
                     pass
                 return c, "copula"
+    # (4) INVERSE COPULA — "Marla is my wife": the NAME is the ``nsubj`` and the POSSESSED ROLE is the
+    #     ``attr``. Branch (3) reads only the forward order ("my wife is Marla"), so this everyday
+    #     order bound NOTHING and the role noun leaked as its own entity: the possessive chain minted
+    #     (wife, spouse, user) — a PHANTOM "Wife" person that then collected an instance_of, an owns,
+    #     and a retraction's negative fact, all conflicting with the real (marla, spouse, user).
+    #     GATED on the role being 1st-person POSSESSED ("my"/"our" — Person=1 ∧ Poss=Yes), the same
+    #     user-anchored gate branch (3) and ``_chain_copula_name`` use, so an unpossessed predicate
+    #     nominal ("Marla is a doctor" — a ROLE reading owned by the appositive/role chains) is never
+    #     swept in here. The complement NAME must be a bare PROPN (no determiner) and not a wh-word.
+    if type_tok.dep_ in ("attr", "oprd"):
+        head = type_tok.head
+        if head is not None and head.lemma_ == "be" and head.pos_ == "AUX":
+            _role_self_poss = False
+            for c in type_tok.children:
+                try:
+                    if (c.dep_ == "poss" and c.morph.get("Person") == ["1"]
+                            and "Yes" in c.morph.get("Poss")):
+                        _role_self_poss = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if _role_self_poss:
+                for c in head.children:
+                    if c.dep_ not in ("nsubj", "nsubjpass"):
+                        continue
+                    # CASING-ROBUST, mirroring branch (3): en_core_web_sm tags an out-of-vocabulary
+                    # personal name as NOUN, not PROPN, so a PROPN-only match dropped the binding for
+                    # exactly the names the model has never seen — the drop is name-dependent, which
+                    # is the worst kind. The 1st-person possessed role above is already the gate; a
+                    # DETERMINER on the subject is what marks a type reading ("the dog is my problem")
+                    # and is rejected here, the same discriminator branches (1)–(3) use.
+                    if c.pos_ not in ("PROPN", "NOUN"):
+                        continue
+                    if any(g.dep_ == "det" for g in c.children):
+                        continue
+                    try:
+                        if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return c, "copula_inverse"
+    # (5) COPULA TYPE-PREDICATE ON AN ALREADY-NAMED SUBJECT — "My dog Fraggle is a morkie": the
+    #     predicate nominal is a SECOND, more specific type for the instance the subject NP already
+    #     names. Without this the breed bound to NOTHING and the attribute-scalar chain read the whole
+    #     clause as a possessed-attribute literal, minting the noun-as-relation junk (user, dog,
+    #     morkie) while the real (fraggle, instance_of, morkie) was never captured — the "a Cat named
+    #     <breed>" shape in the live store. The subject role must be 1st-person POSSESSED and carry the
+    #     appositive PROPN NAME; the predicate nominal must be DETERMINER-INTRODUCED (that determiner
+    #     is exactly what makes it a TYPE rather than a name — the inverse of branches (1)–(3)).
+    if type_tok.dep_ in ("attr", "oprd") and any(g.dep_ == "det" for g in type_tok.children):
+        head = type_tok.head
+        if head is not None and head.lemma_ == "be" and head.pos_ == "AUX":
+            for _sj in head.children:
+                if _sj.dep_ not in ("nsubj", "nsubjpass") or _sj.pos_ != "NOUN":
+                    continue
+                if not any(c.dep_ == "poss" and c.morph.get("Person") == ["1"]
+                           and "Yes" in c.morph.get("Poss") for c in _sj.children):
+                    continue
+                for g in _sj.children:
+                    if g.dep_ != "appos" or g.pos_ != "PROPN":
+                        continue
+                    if any(d.dep_ == "det" for d in g.children):
+                        continue
+                    return g, "copula_type"
     return None, None
 
 
@@ -2345,6 +2501,25 @@ def analyze_name_type_bindings(text):
             except Exception:  # noqa: BLE001 — fail-safe
                 name = (name_tok.text or "").strip()
             if not type_noun or not name or name.lower() == type_noun:
+                continue
+            # ATTRIBUTE-VALUE APPOSITION IS NOT A TYPE↔NAME BINDING. "Gabriella, age 10, F." is a
+            # <attribute> <value> pair followed by a code — spaCy hangs the trailing "F." on "age" as
+            # an ``appos``, which read as "a "type" (age) named F". The live store took that literally:
+            # a gender-code entity F, filed as an instance of "age", carrying a "10 F" quantity. The
+            # discriminator is STRUCTURAL, not a word list: a type noun that carries its own cardinal
+            # ``nummod`` ("age 10") is an attribute already SATURATED by a value, so a further
+            # appositive on it is a sibling field, never that attribute's name. (A real binding's
+            # cardinal hangs off the NAME — "a son Alex 19" — which is why ``_binding_age_string``
+            # reads it there; a cardinal on the TYPE head is a count/value and is excluded there too.)
+            if connector == "appos" and any(
+                    d.pos_ == "NUM" and d.dep_ == "nummod" for d in type_tok.children):
+                continue
+            # A BARE INITIAL IS NOT A NAME. A single alphabetic character (with an optional trailing
+            # period — "F", "F.", "M") is an initial or a coded field value, not the proper name of an
+            # instance. Orthographic and subject-agnostic (no gender/letter vocabulary): a name that
+            # carries no more than one letter identifies nothing, so binding one only ever mints a
+            # phantom entity. The residue guard still logs the span, so it reaches the growth path.
+            if len(name.strip().rstrip(".")) <= 1:
                 continue
             _key = (name.lower(), type_noun)
             if _key in _seen:
@@ -6157,6 +6332,22 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                for _c in _t.children):
                             for _d in _t.subtree:
                                 _ni_suppress.add(_d.i)
+                    # the PARENTHETICAL nickname run "(goes by Dez)" — the binding consumed it as the
+                    # nickname, but spaCy leaves the subject-less alias verb re-attached as the nsubj
+                    # of the FOLLOWING clause, where the sibling chains read it as an entity. Suppress
+                    # the verb and its prep/pobj by LINEAR position (the bracket), because the
+                    # dependency shape here is precisely the thing the parser got wrong. Alias
+                    # vocabulary from the growable ``alias_predicate`` cue map, never a verb literal.
+                    if _t.pos_ in ("VERB", "AUX") and _t.i > 0 and (
+                            (doc[_t.i - 1].text or "").strip() in ("(", "[")):
+                        _pp = (_alias_predicate_map() or {}).get(
+                            (_t.lemma_ or _t.text or "").strip().lower())
+                        if _pp:
+                            _ni_suppress.add(_t.i)
+                            for _c in _t.children:
+                                if _c.dep_ == "prep" and (_c.text or "").strip().lower() == _pp:
+                                    for _d in _c.subtree:
+                                        _ni_suppress.add(_d.i)
         except Exception:  # noqa: BLE001 — fail-safe: suppression is best-effort, never blocks capture
             _ni_suppress = set()
 
@@ -7103,6 +7294,27 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # per-noun rel like ticket_number). Step aside so only ONE has_reference_id edge is minted.
             if _identifier_context_binding(tok) is not None:
                 continue
+            # NAMED-INSTANCE TYPE-PREDICATE GUARD: "My dog Fraggle is a morkie" — "dog" is a bound
+            # TYPE (Fraggle is its appositive name), so the clause CLASSIFIES the named instance; it
+            # is not a possessed-attribute literal keyed by the role noun. Without this the chain
+            # minted the noun-as-relation (user, dog, "morkie") — the breed filed as a value of a
+            # "dog" attribute on the USER, while the named instance never received its type. The
+            # named-instance chain owns it (``_bound_name_for_type`` branch (5) binds the predicate
+            # nominal), so step aside — the established own-the-construction / suppress-twin pattern.
+            #
+            # NARROW BY THE COMPLEMENT, not by the bound type alone: the complement must be a
+            # DETERMINER-introduced common noun carrying NO DIGIT — i.e. a TYPE. A possessed role can
+            # legitimately head a real attribute scalar ("my address is 123 Main Street, Riverton,
+            # Ontario" binds "Main Street" as a name of type "address"), and suppressing on the
+            # binding alone silently DROPPED that scalar. The determiner + digit-free test separates
+            # "is a <type>" from "is <literal value>" structurally, with no attribute word-list.
+            if tok.i in _ni_suppress and tok.head is not None:
+                _tp = next((c for c in tok.head.children
+                            if c.dep_ in ("attr", "oprd", "dobj", "obj") and c.pos_ == "NOUN"
+                            and any(g.dep_ == "det" for g in c.children)), None)
+                if _tp is not None and not any(
+                        ch.isdigit() for ch in " ".join(t.text or "" for t in _tp.subtree)):
+                    continue
             b = _attr_scalar_binding(tok)
             if not b:
                 continue
@@ -8245,6 +8457,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if tok.pos_ != "NOUN":
                 continue  # the ROLE is a common noun (sister/mother/colleague); a PROPN nsubj is a name
+            # NAMING-NOUN EXCLUSION: in "my sisters name is Dana" the apostrophe-stripped genitive
+            # leaves "name" itself as the possessed nsubj, so this chain read the NAMING noun as the
+            # person's ROLE — (dana, has_role, "name") + (dana, also_known_as, "name"). The naming
+            # construction belongs to ``_chain_genitive_name``, which binds Dana as the person and
+            # hangs the kin relation there; the same marker gates ``_chain_possessive``'s
+            # ``_is_name_copula_nsubj`` guard and the naming-noun exclusion in ``_bound_name_for_type``.
+            if (tok.lemma_ or tok.text or "").strip().lower() == "name":
+                continue
             head = tok.head
             if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
                 continue
@@ -8626,6 +8846,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     break
                 if _t.dep_ == "case":
                     continue
+                # AN ALIAS IS NOT A NEW REFERENT. A nickname inside a parenthetical or relative-clause
+                # alias run ("a son named Rowan (goes by Ro), he is 12") is a SECOND NAME for the
+                # person already introduced, not a fresh discourse referent — but it is also the
+                # NEAREST preceding PROPN, so recency handed the pronoun to the nickname and the age
+                # landed on "ro" instead of "rowan". (Only visible once the bracket infix split the
+                # run into real tokens.) The alias run is already marked in ``_ni_suppress`` by the
+                # named-instance pre-pass, which is exactly the span the binding consumed as a
+                # nickname, so skipping it here keeps ONE notion of "the alias run" in the module.
+                if _t.i in _ni_suppress:
+                    continue
                 if _t.pos_ == "PROPN":
                     best = (_t.text or "").strip().lower()
                     continue
@@ -8697,10 +8927,30 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _first_person_self:
                 subject = "user"
             else:
-                subject = (tok.text or tok.lemma_ or "").strip().lower()
-                _cr = _person_coref(tok)
-                if _cr:
-                    subject = _cr
+                # NOMINAL-SUBJECT GATE + PARENTHETICAL RECOVERY. A measured entity is a NOMINAL; a
+                # VERB can never carry an age. spaCy nonetheless hands this chain a VERB nsubj for a
+                # parenthetical alias run, which has no subject of its own and gets re-attached to the
+                # following copula: "My son Desmonde (goes by Dez) is 12" → nsubj(is) = "goes", which
+                # this chain stored as ("goes", age, "12"). Reject the non-nominal, then RECOVER the
+                # real subject — the nearest PROPER NAME to the LEFT of the bracket that opens the
+                # run — so the age still lands on Desmonde instead of being dropped with the junk.
+                if tok.pos_ not in ("NOUN", "PROPN", "PRON"):
+                    _rec = None
+                    if tok.i > 0 and (doc[tok.i - 1].text or "").strip() in ("(", "["):
+                        for _p in range(tok.i - 2, -1, -1):
+                            if doc[_p].pos_ == "PROPN":
+                                _rec = (doc[_p].text or "").strip().lower()
+                                break
+                            if doc[_p].pos_ in ("VERB", "AUX") or doc[_p].is_punct:
+                                break
+                    if not _rec:
+                        continue
+                    subject = _rec
+                else:
+                    subject = (tok.text or tok.lemma_ or "").strip().lower()
+                    _cr = _person_coref(tok)
+                    if _cr:
+                        subject = _cr
             if not subject:
                 continue
             # Find a measurement: a NUM with a governing UNIT noun (year/foot/pound) anywhere under the
@@ -9368,6 +9618,23 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the named-instance chain owns "a son Alex" (Alex is the appos PROPN of son); here we
             # only reach a NOUN appos. If the HEAD is a bound proper name, the role is its type — skip.
             if named in _owned_name_keys:
+                continue
+            # ATTRIBUTE-VALUE APPOSITIVE → a SCALAR, not a role. "Gabriella, age 10" states a VALUE
+            # for an attribute; it does not give Gabriella the role "age". The discriminator is the
+            # cardinal the appositive noun carries on itself (a ``nummod``) — an attribute SATURATED
+            # by its value — which a genuine role appositive ("Rachel, a real estate agent") never
+            # has. Emit the attribute keyed by its own head noun with the cardinal as a STRING scalar
+            # (``scalar_datatype="string"`` routes it to entity_attributes, exactly as the other
+            # scalar chains do), so the pair is stored as what it is instead of as a phantom role.
+            _numv = next((d for d in tok.children if d.pos_ == "NUM" and d.dep_ == "nummod"), None)
+            if _numv is not None:
+                _attr = (tok.lemma_ or tok.text or "").strip().lower().replace(" ", "_")
+                _val = (_numv.text or "").strip()
+                if _attr and _val:
+                    _emit(named, _attr, _val, obj_tok=None, subj_tok=head,
+                          scalar_datatype="string")
+                    _claim(tok)
+                    _claim(_numv)
                 continue
             _emit(named, "has_role", role, obj_tok=tok, subj_tok=head)
 
