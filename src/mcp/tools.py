@@ -183,6 +183,49 @@ TOOLS = [
 ]
 
 
+# MCP SPEC COMPLIANCE: annotations (P1), titles (P9), outputSchema (P4).
+# Non-breaking: clients that understand these fields use them; others ignore them.
+# Evidence: https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+_ANNOTATIONS = {
+    "recall_memory": {"readOnlyHint": True},
+    "retract_fact": {"destructiveHint": True},
+    "forget_fact": {"destructiveHint": True},
+}
+_TITLES = {
+    "recall_memory": "Recall Memory",
+    "remember_facts": "Remember Facts",
+    "ingest_document": "Ingest Document",
+    "learn_facts": "Learn / Expand",
+    "retract_fact": "Retract Fact",
+    "forget_fact": "Forget Fact",
+}
+_OUTPUT_SCHEMAS = {
+    "recall_memory": {
+        "type": "object",
+        "properties": {
+            "memory": {"type": "string", "description": "The recalled memory as natural-language prose."},
+            "status": {"type": "string", "enum": ["ok", "no_ingest", "error"]},
+        },
+    },
+    "remember_facts": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["stored", "valid", "no_ingest", "corrected", "failed"]},
+            "committed": {"type": "integer", "description": "Number of facts committed to long-term storage."},
+            "message": {"type": "string"},
+        },
+    },
+}
+for _t in TOOLS:
+    _name = _t.get("name", "")
+    if _name in _ANNOTATIONS:
+        _t["annotations"] = _ANNOTATIONS[_name]
+    if _name in _TITLES:
+        _t["title"] = _TITLES[_name]
+    if _name in _OUTPUT_SCHEMAS:
+        _t["outputSchema"] = _OUTPUT_SCHEMAS[_name]
+
+
 def validate_text(text: str) -> str | None:
     """Return error message if text is invalid, None if valid."""
     if not isinstance(text, str):
