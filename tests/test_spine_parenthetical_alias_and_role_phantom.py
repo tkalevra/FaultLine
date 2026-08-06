@@ -94,6 +94,18 @@ def test_parenthetical_alias_is_captured_as_an_alias():
            ("rowan", "also_known_as", "ro") in triples, triples
 
 
+def test_a_nickname_is_not_a_pronoun_antecedent():
+    """An alias is a second name, not a new referent — recency must not hand it the pronoun.
+
+    Only observable once the bracket infix splits the run into real tokens: the nickname then
+    becomes the NEAREST preceding PROPN, and the age landed on "ro" instead of "rowan".
+    """
+    triples = _triples(m.derive_sentence_facts(
+        "I have a son named Rowan(goes by Ro), he is 12.", _REF))
+    assert ("rowan", "age", "12") in triples, triples
+    assert not [t for t in triples if t[0] == "ro" and t[1] == "age"], triples
+
+
 def test_parenthetical_run_never_becomes_the_scalar_subject():
     """("goes", age, "12") — a fact ABOUT A VERB — was the live noise; the age must land on the son."""
     triples = _triples(m.derive_sentence_facts("My son Rowan (goes by Ro) is 12.", _REF))
