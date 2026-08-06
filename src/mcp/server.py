@@ -1224,7 +1224,8 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         # announce "I couldn't store that" to the user — breaking the silence-is-the-feature
         # design. The CAUSE is logged for us; the model is told what to DO.
         _log(f"no_ingest: too short ({len(text.split())} words): {text[:60]!r}")
-        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage."}
+        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage.",
+                "isError": True}
 
     # ── D1: STATEMENT extractor route (brain-not-transport) ──────────────────
     # WHICH extractor a STATEMENT goes through is a BRAIN decision (gated backend-side by
@@ -1294,7 +1295,8 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         # gates this path.)
         _log(f"residue_dropped: no valid triple from {text[:60]!r}")
         # DIRECTIVE, not a status report — see the too-short branch above.
-        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage."}
+        return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage.",
+                "isError": True}
     ingest_resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/ingest",
         json={"text": text, "user_id": user_id, "edges": edges, "source": "mcp"},
@@ -1942,7 +1944,18 @@ async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int 
         result = await handler(**arguments)
         # Step 3: work complete, send before assembling the final response
         _send_progress(progress_token, 3, 3, _rotate(_MCP_PROGRESS_DONE, _rot))
-        return {"content": [{"type": "text", "text": json.dumps(result)}]}
+        # MCP spec: a tool error the MODEL can self-correct from returns ``isError: true`` at the
+        # top level of CallToolResult (alongside ``content``), NOT a JSON-RPC error. The handler
+        # signals it by returning a dict containing ``"isError": True`` (e.g. ``no_ingest``); this
+        # seam lifts that flag out of the content payload and onto the envelope so a spec-aware
+        # client can act on it. The content text is unchanged — models that read the result as
+        # text are unaffected.
+        envelope: dict[str, Any] = {
+            "content": [{"type": "text", "text": json.dumps(result)}],
+        }
+        if isinstance(result, dict) and result.get("isError") is True:
+            envelope["isError"] = True
+        return envelope
     except httpx.TimeoutException:
         return {"content": [{"type": "text", "text": json.dumps({"error": "FaultLine API timeout"})}]}
     except httpx.HTTPStatusError as e:
