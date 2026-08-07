@@ -92,6 +92,7 @@ def _check_injection_signals(text: str) -> str | None:
 
 from .tools import (
     TOOLS,
+    _OUTPUT_SCHEMAS,
     validate_query,
     validate_text,
     validate_user_id,
@@ -1953,6 +1954,13 @@ async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int 
         envelope: dict[str, Any] = {
             "content": [{"type": "text", "text": json.dumps(result)}],
         }
+        # MCP spec (2025-06-18): a tool that declares ``outputSchema`` is OBLIGATED to
+        # return ``structuredContent`` — spec-strict clients (opencode/Claude Desktop/Cline)
+        # reject a text-only result with -32600 "did not return structured content". Emit the
+        # handler's dict as structuredContent whenever this tool declared an output schema; the
+        # text ``content`` above stays for back-compat with text-only clients.
+        if tool_name in _OUTPUT_SCHEMAS:
+            envelope["structuredContent"] = result
         if isinstance(result, dict) and result.get("isError") is True:
             envelope["isError"] = True
         return envelope

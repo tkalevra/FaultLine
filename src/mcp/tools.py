@@ -210,7 +210,7 @@ _OUTPUT_SCHEMAS = {
     "remember_facts": {
         "type": "object",
         "properties": {
-            "status": {"type": "string", "enum": ["stored", "valid", "no_ingest", "corrected", "failed"]},
+            "status": {"type": "string", "description": "Write outcome (stored, no_ingest, query_detected, rejected, ingest_disabled, corrected, …). Open set: routed CORRECTION/RETRACTION returns the retract_fact status."},
             "committed": {"type": "integer", "description": "Number of facts committed to long-term storage."},
             "message": {"type": "string"},
         },
