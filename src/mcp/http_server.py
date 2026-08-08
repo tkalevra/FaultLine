@@ -441,7 +441,9 @@ async def rest_ingest_document(
         "FaultLine knowledge graph with source=llm_learn. Use when the user asks to learn "
         "a topic. Generate statements in the forms: 'X is a subclass of Y', "
         "'X is an instance of Y', 'X is a part of Y' — one per line — then call this. "
-        "Facts are staged as Class B (llm_learn provenance) and confirmed over time."
+        "Spanish forms are accepted too ('X es una subclase de Y', 'X es una instancia de Y', "
+        "'X es parte de Y'). Facts are staged as Class B (llm_learn provenance) and confirmed "
+        "over time. A no_facts response is a FORMAT error to retry, not a missing capability."
     ),
 )
 async def rest_learn_facts(

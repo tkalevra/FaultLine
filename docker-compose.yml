@@ -39,7 +39,7 @@ services:
         # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
         # text; it does not make the chains correct for that language. Portable in principle
         # (the UD features they key on exist in these models), UNMEASURED in practice.
-        SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
+        SPACY_MODEL: ${SPACY_MODEL:-es_core_news_sm}
     image: faultline:latest
     container_name: faultline-api
     ports:
@@ -49,7 +49,7 @@ services:
       # makes the entrypoint's collation guard a total no-op (not one query issued).
       # FAULTLINE_DB_ICU_LOCALE is what that guard compares the live database against; it must
       # stay in lockstep with the --icu-locale in POSTGRES_INITDB_ARGS on the postgres service.
-      FAULTLINE_LANGUAGE: ${FAULTLINE_LANGUAGE:-}
+      FAULTLINE_LANGUAGE: ${FAULTLINE_LANGUAGE:-es}
       FAULTLINE_DB_ICU_LOCALE: ${FAULTLINE_DB_ICU_LOCALE:-}
       # Escape hatch for the guard — run anyway on a mismatched database. Wrong text ordering,
       # but storage and case-folding are unaffected. Deliberately opt-in.
