@@ -288,6 +288,43 @@ def _reconcile_cue_tokenizer_exceptions(nlp) -> int:
         return 0
 
 
+# ── Negation detection, portable across dependency label schemes ──────────────────────────────
+# The English models spaCy ships use the ClearNLP/Penn scheme, which has a dedicated ``neg`` arc.
+# The Spanish (and every other ``*_core_news_*``) model emits **Universal Dependencies**, which
+# DELETED that label in UD v2: negation is an ordinary ``advmod`` (or ``det`` for "ningún"). So the
+# 43 hand-rolled ``_is_neg(c)`` checks in this file all silently returned False on Spanish,
+# and "No uso el puerto 9004" was ingested as "uso el puerto 9004" — the negation dropped, the
+# fact stored AFFIRMED. A dropped fact is a gap; an INVERTED fact is corruption, so this is the
+# single most damaging Spanish defect. Route every site through here instead of the raw label.
+#
+# English is unchanged in practice: ``neg`` still matches first, and the ``advmod``/``det`` arm only
+# fires on tokens that ARE negations in either language, so it is a semantic superset, not a
+# behavior change.
+_NEG_LEMMAS = frozenset({
+    # Spanish (UD: advmod / det)
+    "no", "nunca", "jamás", "jamas", "tampoco",
+    "ningún", "ninguno", "ninguna", "ningunos", "ningunas",
+    "nada", "nadie",
+    # English (already ``neg`` in the en models; harmless, and covers UD-scheme en models)
+    "not", "never", "neither", "nor",
+})
+_NEG_DEPS = frozenset({"advmod", "det"})
+
+
+def _is_neg(tok) -> bool:
+    """True iff ``tok`` is a negation marker, under EITHER the Penn ``neg`` scheme or UD.
+
+    Fail-safe: any attribute error (a mock token in a unit test, a stripped doc) returns False,
+    which is the pre-existing behavior for a non-``neg`` token — never raises into a parse.
+    """
+    try:
+        if tok.dep_ == "neg":
+            return True
+        return tok.dep_ in _NEG_DEPS and (tok.lemma_ or tok.text or "").lower() in _NEG_LEMMAS
+    except Exception:  # noqa: BLE001 — a negation probe must never break an extraction
+        return False
+
+
 def _get_nlp():
     """Return the loaded spaCy pipeline, or ``None`` if unavailable (flag off / no spaCy / no model).
 
@@ -320,11 +357,35 @@ def _get_nlp():
             # NER is GLiNER2's job and the slowest component — disable it (faster parse, smaller
             # footprint). We only need tagger + parser for POS + dependency labels.
             _nlp = spacy.load(_SPACY_MODEL, disable=["ner"])
+            # LANGUAGE GUARD — a WRONG-language model is worse than a MISSING one.
+            # A missing model no-ops and screams (see the CRIT at import). A wrong-language model
+            # loads clean and produces confident garbage: en_core_web_sm over "OpenWebUI usa el
+            # puerto 3000" yields one run-on PROPN chunk (no verb, no nsubj, no obj), and finds NO
+            # negation dependency in "No uso el puerto 9004" — so the negation is dropped and the
+            # fact is stored AFFIRMED. That is silent corruption, and it is unrecoverable after the
+            # fact because nothing in the record marks it as suspect. Refuse instead.
+            _want_lang = (os.environ.get("FAULTLINE_LANGUAGE") or "").strip().lower()
+            _got_lang = (getattr(_nlp, "lang", "") or "").strip().lower()
+            if _want_lang and _got_lang and _want_lang != _got_lang:
+                log.critical(
+                    "linguistic_layer.model_language_mismatch",
+                    install_language=_want_lang,
+                    model=_SPACY_MODEL,
+                    model_language=_got_lang,
+                    note="SPACY_MODEL parses a DIFFERENT language than this install. Facts extracted "
+                         "this way are silently wrong (negations dropped, no subject/object arcs) — "
+                         "the layer is being disabled rather than allowed to corrupt the graph. Bake "
+                         "the matching model (Dockerfile ARG SPACY_MODEL) or set FAULTLINE_LANGUAGE "
+                         "to match. Set FAULTLINE_ALLOW_SPACY_LANG_MISMATCH=true to override.",
+                )
+                if (os.environ.get("FAULTLINE_ALLOW_SPACY_LANG_MISMATCH") or "").strip().lower() != "true":
+                    _nlp = None
+                    return None
             _install_identifier_tokenizer(_nlp)  # keep CVE ids / version strings / x86-64 whole
             # …and stop spaCy's own exception table from shattering a cue surface the engine holds
             # (the seeded `id` was dead from the day it was seeded). Fail-safe: no DB → no change.
             _reconcile_cue_tokenizer_exceptions(_nlp)
-            log.info("linguistics.model_loaded", model=_SPACY_MODEL)
+            log.info("linguistics.model_loaded", model=_SPACY_MODEL, lang=_got_lang)
         except Exception as e:  # noqa: BLE001 — model not baked into the image → no-op layer
             log.warning("linguistics.model_load_failed", model=_SPACY_MODEL, error=str(e)[:160])
             _nlp = None
@@ -693,8 +754,8 @@ def analyze_copula(text: str):
             # is the preference seam's job (ingest), not a self-predication.
             subj_self = _is_first_person_personal_pronoun(tok)
 
-            negated = any(c.dep_ == "neg" for c in head.children) or any(
-                c.dep_ == "neg" for c in comp.children
+            negated = any(_is_neg(c) for c in head.children) or any(
+                _is_neg(c) for c in comp.children
             )
             complement = (comp.text or "").strip().lower()
             # FULL-NP NOMINAL COMPLEMENT (premodifier fix): "I am a principal network architect"
@@ -794,7 +855,7 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
                         break
             if comp is None:
                 continue
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 continue  # whole-clause negation → deferred
             # Walk the conj coordination off the ADJ head, collecting ADJ + VBN predicate complements.
             out: list[str] = []
@@ -813,7 +874,7 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
                             nxt.append(c)
                 frontier = nxt
             for m in sorted(members, key=lambda t: t.i):
-                if any(ch.dep_ == "neg" for ch in m.children):
+                if any(_is_neg(ch) for ch in m.children):
                     continue  # this conjunct is negated → skip
                 if m.pos_ == "ADJ" and _adj_has_numeric_measure(m):
                     continue  # "34 years old" → age/measurement (copula-measure chain), not a feeling
@@ -888,8 +949,8 @@ def analyze_copula_relational_predicate(text: str) -> list[dict]:
             adj_lemma = (comp.lemma_ or comp.text or "").strip().lower()
             if not adj_lemma:
                 continue
-            negated = any(c.dep_ == "neg" for c in head.children) or any(
-                c.dep_ == "neg" for c in comp.children)
+            negated = any(_is_neg(c) for c in head.children) or any(
+                _is_neg(c) for c in comp.children)
             for prep_surf, pobj in prep_objs:
                 if not prep_surf:
                     continue
@@ -1038,8 +1099,8 @@ def analyze_possessive_predication(text: str):
             if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
                 continue
 
-            negated = any(c.dep_ == "neg" for c in head.children) or any(
-                c.dep_ == "neg" for c in comp.children
+            negated = any(_is_neg(c) for c in head.children) or any(
+                _is_neg(c) for c in comp.children
             )
             # FULL multi-token value ("O negative", "dark blue"), not just the complement head —
             # see _complement_value_phrase (the "blood type is O negative" → "O" drop fix).
@@ -1387,7 +1448,7 @@ def _complement_value_phrase(comp) -> str:
         _ARTICLES = {"a", "an", "the"}
         mods = []
         for c in comp.children:
-            if c.is_punct or c.dep_ == "neg":
+            if c.is_punct or _is_neg(c):
                 continue
             if c.dep_ in _MOD:
                 mods.append(c)
@@ -1832,7 +1893,7 @@ def _analyze_naming_at(tok, _naming):
     if not named or not proper_name or named == proper_name.lower():
         return None
 
-    negated = any(c.dep_ == "neg" for c in tok.children)
+    negated = any(_is_neg(c) for c in tok.children)
     return NamingAnalysis(named=named, proper_name=proper_name, negated=negated)
 
 
@@ -2020,8 +2081,8 @@ def analyze_named_instance(text: str):
             if name.lower() in (kind, instance_type) or kind == instance_type:
                 continue
 
-            negated = any(c.dep_ == "neg" for c in head.children) or any(
-                c.dep_ == "neg" for c in comp.children
+            negated = any(_is_neg(c) for c in head.children) or any(
+                _is_neg(c) for c in comp.children
             )
             return NamedInstanceAnalysis(
                 kind=kind,
@@ -2350,9 +2411,9 @@ def analyze_name_type_bindings(text):
             if _key in _seen:
                 continue
             _seen.add(_key)
-            negated = (any(c.dep_ == "neg" for c in type_tok.children)
+            negated = (any(_is_neg(c) for c in type_tok.children)
                        or (type_tok.head is not None
-                           and any(c.dep_ == "neg" for c in type_tok.head.children)))
+                           and any(_is_neg(c) for c in type_tok.head.children)))
             out.append(NameTypeBinding(
                 name=name,
                 type_noun=type_noun,
@@ -3210,8 +3271,8 @@ def analyze_svo_relations(text: str) -> list:
             except Exception:  # noqa: BLE001 — offsets are best-effort
                 obj_start, obj_end = obj_tok.idx, obj_tok.idx + len(obj_tok.text)
             # Negation on EITHER the matrix ("I didn't start working …") or the descended activity verb.
-            negated = any(c.dep_ == "neg" for c in tok.children) or (
-                svo_head is not tok and any(c.dep_ == "neg" for c in svo_head.children)
+            negated = any(_is_neg(c) for c in tok.children) or (
+                svo_head is not tok and any(_is_neg(c) for c in svo_head.children)
             )
             key = (subject_text, predicate, object_text)
             if key in seen:
@@ -4450,7 +4511,7 @@ def _build_event_analysis(event_noun, tok, text: str):
         event = _np_phrase(event_noun)
         if not event:
             return None
-        negated = any(c.dep_ == "neg" for c in tok.children)
+        negated = any(_is_neg(c) for c in tok.children)
         # TITLE (the dog/Rex split): a quoted name, PROPN appositive/PP-object, an
         # acl/relcl naming-participle ("workshop called X"), or a Title-Case compound premod
         # ("the Apollo webinar") on the eventive noun is the NAME of THIS occurrence — it rides
@@ -4714,7 +4775,7 @@ def analyze_inchoative(text: str):
             item = _np_phrase(item_tok)
             if not item or len(item) < 3:
                 continue
-            negated = any(c.dep_ == "neg" for c in tok.children)
+            negated = any(_is_neg(c) for c in tok.children)
             # CROP/ITEM ANCHORS (Q8): surface the SPECIFIC crop(s) the start is about so the dated
             # occurrence is reachable from the crop operand a comparison asks about ("tomatoes" /
             # "marigolds"), not just the generic head ("seeds"). THE HARD LINE: each anchor is the
@@ -4956,7 +5017,7 @@ def analyze_acquisition(text: str):
                 if location:
                     break
 
-            negated = any(c.dep_ == "neg" for c in tok.children)
+            negated = any(_is_neg(c) for c in tok.children)
             return AcquisitionAnalysis(device=device, alias=alias,
                                        location=location, negated=negated)
     except Exception as e:  # noqa: BLE001 — fail-safe
@@ -5475,7 +5536,10 @@ _NAME_TYPE_BINDER_TWIN_RELS = frozenset({
     "instance_of", "also_known_as", "has_role", "owns", "age", "has_state",
 })
 
-_BINDER_VALUE_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+# [es branch] Unicode-aware, same reason as _NON_WORD in src/ontology/canonical.py: the ASCII
+# class `[^a-z0-9]+` split words AT their accents, so "Coruña" tokenized to {"coru","a"} and the
+# whole-word overlap test below silently stopped matching Spanish place/person names.
+_BINDER_VALUE_TOKEN_RE = re.compile(r"[\W_]+", re.UNICODE)
 
 
 def _value_word_tokens(value) -> set:
@@ -6198,7 +6262,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _subj is None:
                 continue
             # NEGATED employment clause ("I don't work for them") → skip (absence deferred, SVO parity).
-            if any(c.dep_ == "neg" for c in _v.children):
+            if any(_is_neg(c) for c in _v.children):
                 continue
             # ROLE: "as <NP>" — the prep "as" the verb governs, its NOUN/PROPN pobj is the role head.
             _role = None
@@ -6326,7 +6390,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # passive clause is NOT ours — leave it to the existing chains (no fabricated date, no
             # regression). NEGATED passive ("was not born here") also stays with the existing chains.
             _piso, _pgran = _date_for_verb(_v)
-            if not _piso or any(c.dep_ == "neg" for c in _v.children):
+            if not _piso or any(_is_neg(c) for c in _v.children):
                 continue
             _passive_binds.append((_v, _psubj, _piso, _pgran))
             _passive_suppress.add(_v.i)  # the intransitive chain must never mint (x, has_state, <part>)
@@ -6393,7 +6457,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if (_tok.lemma_ or _tok.text or "").strip().lower() in _kin:
                 continue
             # NEGATED copula → defer (absence modeling, parity with the scalar chains).
-            if any(_c.dep_ == "neg" for _c in _hd.children):
+            if any(_is_neg(_c) for _c in _hd.children):
                 continue
             # A trailing STRUCTURED-ATOMIC pobj must be present in the clause (the routing signal).
             if not any(_d.dep_ == "pobj" and _is_structured_atomic_value(_d.text) for _d in doc):
@@ -6813,8 +6877,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if comp is None:
                 return None
             # NEGATION ("my address is not X") → absence; defer (parity with the other chains).
-            if any(c.dep_ == "neg" for c in head.children) or any(
-                    c.dep_ == "neg" for c in comp.children):
+            if any(_is_neg(c) for c in head.children) or any(
+                    _is_neg(c) for c in comp.children):
                 return None
             # VERBATIM value span = the complement's full subtree (covers "123 Main Street, Riverton,
             # Ontario" / "XR7-9920" / "a Tesla Model 3"), sliced from the sentence text so commas/
@@ -6949,7 +7013,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     return None  # non-1st-person pronoun possessor — don't mis-attribute to the user
                 possessor = "user"
             # NEGATED copula → absence; defer (parity with the other scalar chains).
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 return None
             # COMPLEMENT value: a NOUN/PROPN/NUM value of the copula; skip wh/interrogative.
             comp = None
@@ -6969,14 +7033,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # copula). This is safe precisely because the context noun did the disambiguation.
             if comp is None:
                 for c in head.children:
-                    if c.i <= head.i or c.dep_ == "neg":
+                    if c.i <= head.i or _is_neg(c):
                         continue
                     if any(ch.isdigit() for ch in (c.text or "")):
                         comp = c
                         break
             if comp is None:
                 return None
-            if any(c.dep_ == "neg" for c in comp.children):
+            if any(_is_neg(c) for c in comp.children):
                 return None
             # MEASURE / COUNT GUARD (deterministic, structural — NO unit/currency word list).
             # A genuine reference id is a digit-bearing CODE or a bare NUMBER: the identifier digits
@@ -7156,7 +7220,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     break
             if not possessor:
                 continue
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 continue  # negated copula — absence deferred (parity with the other scalar chains)
             # Balanced QUOTE pair AFTER the copula head → the inner span is the verbatim value.
             q = [t for t in doc if t.i > head.i and (t.text or "").strip() in _QUOTES]
@@ -7216,7 +7280,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if _is_first_person_personal_pronoun(tok):
                 continue  # "I am ..." is the self/feeling/identity lane, never a geo classification
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 continue  # negated copula — absence deferred (parity)
             # An attribute-SCALAR construction ("my address is 123 …") is owned by _chain_attr_scalar.
             if _attr_scalar_binding(tok) is not None:
@@ -7568,8 +7632,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if _xc_lemma and _xc_lemma != "be" and _xc_lemma not in _naming:
                     svo_head = _xc
             # Negation on EITHER the matrix or the descended activity verb → skip (absence deferred).
-            if any(c.dep_ == "neg" for c in tok.children) or (
-                svo_head is not tok and any(c.dep_ == "neg" for c in svo_head.children)
+            if any(_is_neg(c) for c in tok.children) or (
+                svo_head is not tok and any(_is_neg(c) for c in svo_head.children)
             ):
                 continue  # negated clause — absence modeling deferred (parity with analyze_svo)
             # PART 1: exclude PEELED date tokens so the atomizer's "see_on march 1st" wobble never
@@ -7676,7 +7740,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # correction/retraction ("forget X", "it's Luna not Bella") was routed away by the
             # intent gate BEFORE the deriver ran — neither is touched here. Read deterministically
             # from the spaCy ``neg`` dep already at hand; no word list, no LLM.
-            _neg = any(c.dep_ == "neg" for c in tok.children)
+            _neg = any(_is_neg(c) for c in tok.children)
             # STRUCTURAL intransitivity: the verb governs NO object of any kind. ``_svo_object_head``
             # only sees NOUN/PROPN objects (the SVO chain's mergeable-entity objects); a verb with a
             # PRONOUN/clausal object ("she helped ME", "I told THEM") is still TRANSITIVE — not an
@@ -7970,7 +8034,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             pred = head.head
             if pred is None or pred is head:
                 return False
-            return any(c.dep_ == "neg" for c in pred.children)
+            return any(_is_neg(c) for c in pred.children)
         except Exception:  # noqa: BLE001 — fail-safe: never let a parse quirk flip polarity
             return False
 
@@ -8147,7 +8211,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # is excluded by the ADJ/ADV-only complement test below — that is an identity negation
             # the correction gate already owns, not a state. The intent gate ran first; this never
             # touches it. Read from the spaCy ``neg`` dep on the copula head; no word list.
-            _neg = any(c.dep_ == "neg" for c in head.children)
+            _neg = any(_is_neg(c) for c in head.children)
             # the predicative complement: an ADJ (acomp/attr) or a stative ADV particle (advmod ADV,
             # e.g. "is down"). A NOMINAL complement ("is a teacher") is a role/identity, NOT a state —
             # excluded so we never re-route occupation/naming clauses through the state predicate.
@@ -8289,7 +8353,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not proper_name or not role_lemma or proper_name == role_lemma:
                 continue
             # NEGATION ("my sister is not Sarah") → absence; skip (parity with the other chains).
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 continue
             # BIND the kin/role relation to the NAMED person. Kinship role → its specific kin rel
             # (metadata-driven via the kinship_noun rail); a non-kin role → generic has_role with the
@@ -8368,7 +8432,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not rel:
                 continue  # unmapped role → honest no-op (the possessive chain keeps its reading)
             # NEGATION ("Globex is not my employer") → absence; skip (parity with sibling chains).
-            if any(c.dep_ == "neg" for c in head.children):
+            if any(_is_neg(c) for c in head.children):
                 continue
             filler = _np_phrase(tok)
             if not filler or filler == role_lemma:
@@ -8451,7 +8515,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # is owned by the preference/naming seam). A negated construction is skipped (absence).
             _alias_suppress.add(verb.i)
             _claim(verb, name_tok)
-            if any(c.dep_ == "neg" for c in verb.children):
+            if any(_is_neg(c) for c in verb.children):
                 return
             subj_surface, is_first = _resolve_alias_subject(st)
             if is_first or not subj_surface:
@@ -8966,8 +9030,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _xl = (_xc.lemma_ or _xc.text or "").strip().lower()
                 if _xl and _xl != "be" and _xl not in _naming_verbs():
                     svo_head = _xc
-            if any(c.dep_ == "neg" for c in event_verb.children) or (
-                svo_head is not event_verb and any(c.dep_ == "neg" for c in svo_head.children)
+            if any(_is_neg(c) for c in event_verb.children) or (
+                svo_head is not event_verb and any(_is_neg(c) for c in svo_head.children)
             ):
                 continue  # negated event — absence deferred (parity with _chain_svo)
             predicate = _svo_predicate_token(svo_head)
@@ -10582,7 +10646,7 @@ def analyze_directive(text: str):
                 sibling_asserted = any(
                     c is not h
                     and c.dep_ in ("acomp", "attr", "conj")
-                    and not any(g.dep_ == "neg" for g in c.children)
+                    and not any(_is_neg(g) for g in c.children)
                     for c in pred.children
                 )
                 if sibling_asserted:
@@ -10605,8 +10669,8 @@ def analyze_directive(text: str):
                 break
             # Predicate-scoped negation: a ``neg`` on the ROOT itself, or on any token the ROOT
             # heads ("no longer" → neg "no" under advmod "longer"; "not … anymore" → neg on ROOT).
-            _negated = any(c.dep_ == "neg" for c in tok.children) or any(
-                gc.dep_ == "neg" for c in tok.children for gc in c.children
+            _negated = any(_is_neg(c) for c in tok.children) or any(
+                _is_neg(gc) for c in tok.children for gc in c.children
             )
             if _negated:
                 for am in _advmods:
@@ -10632,7 +10696,7 @@ def analyze_directive(text: str):
             if tok.dep_ != "ROOT" or tok.pos_ not in ("VERB", "AUX"):
                 continue
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
-            neg = any(c.dep_ == "neg" for c in tok.children)
+            neg = any(_is_neg(c) for c in tok.children)
             subs = [c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")]
             if tok.pos_ == "VERB":
                 root_verb_lemma = lemma
@@ -10693,9 +10757,15 @@ _NUMERIC_DATE_PATTERNS: tuple = (
 
 # dateparser settings: anchor relatives to the SESSION reference, prefer PAST resolutions
 # (conversation dates are historical), and read ambiguous numeric dates as Month/Day/Year.
+# [es branch] DATE_ORDER is DMY for Spanish. "3/4/2026" means 3 April in es-ES and 4 March in
+# en-US — the same string parses to a DIFFERENT REAL DATE, silently, with no signal that anything
+# went wrong. That is worse than failing to parse. Keyed off the install language so an English
+# install on this branch (FAULTLINE_LANGUAGE unset) keeps the validated MDY behavior.
+_DATE_ORDER: str = "MDY" if (os.environ.get("FAULTLINE_LANGUAGE") or "").strip().lower() in ("", "en") else "DMY"
+
 _DATEPARSER_SETTINGS: dict = {
     "PREFER_DATES_FROM": "past",
-    "DATE_ORDER": "MDY",
+    "DATE_ORDER": _DATE_ORDER,
     # Be strict-ish: require an explicit date-bearing token so bare words don't drift to "now".
     "STRICT_PARSING": False,
 }
@@ -10705,7 +10775,17 @@ _DATEPARSER_SETTINGS: dict = {
 # long-running processes — dateparser issue #457); pinning languages=["en"] is ~1600x faster
 # (~0.25ms) with NO determinism change (English-only here anyway). Passed as a parse() KWARG,
 # NOT a settings key. [dateparser issue #457 / usage docs]
-_DATEPARSER_LANGUAGES: list = ["en"]
+#
+# [es branch] The perf argument is unchanged — this stays a SHORT pinned list, never unrestricted.
+# But pinning ["en"] on a Spanish install was not "no determinism change": it made every Spanish
+# date expression ("hace dos semanas", "el 3 de abril", "ayer") unparseable, so the temporal layer
+# dropped the date entirely. Pin the install language, keeping "en" as a fallback for the mixed
+# English technical vocabulary that shows up in real Spanish conversations.
+_DATEPARSER_LANGUAGES: list = (
+    ["en"]
+    if (os.environ.get("FAULTLINE_LANGUAGE") or "").strip().lower() in ("", "en")
+    else [(os.environ.get("FAULTLINE_LANGUAGE") or "").strip().lower(), "en"]
+)
 
 _nlp_ner = None                 # spaCy Language WITH ner enabled (DATE path only), or None
 _ner_load_attempted = False

@@ -22,9 +22,16 @@ def load_default_model(labels=None) -> "GLiNERAdapter":
     stay concise zero-shot type names; only the underlying weights become multilingual so
     Spanish (and any language) entity typing works. Env-overridable via GLINER_MODEL.
 
-    ⚠️ NOT A PARITY CLAIM, and NOT AUDITED: this is the load site reached by the default
-    path, but OTHER GLiNER load sites have not been swept — a call that constructs GLiNER
-    directly still gets the English-only weights. Verify before relying on this."""
+    ⚠️ DEAD CODE — READ THIS BEFORE TRUSTING IT. The audit this docstring used to ask for has
+    now been done, and the answer was: **this function has NO CALLERS anywhere in the repo.**
+    Its multilingual default was therefore never reached, and every entity typed by the running
+    system went through English-only weights while this docstring claimed otherwise.
+
+    The load site that ACTUALLY runs is the FastAPI startup hook in ``src/api/main.py``
+    (``GLiNER2.from_pretrained``, env var ``GLINER_MODEL``, baked in the Dockerfile because the
+    runtime image sets ``HF_HUB_OFFLINE=1``). It is a different library too: ``pyproject.toml``
+    declares ``gliner2``, not ``gliner``, so the import below would raise ImportError if this
+    were ever called. Change the model THERE; changing it here changes nothing."""
     import os
     from gliner import GLiNER
     _model = os.environ.get("GLINER_MODEL", "urchade/gliner_multi-v2.1")
