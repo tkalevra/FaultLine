@@ -27,7 +27,15 @@ _FAULTLINE_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 # Deterministic, bounded language primitive (a closed pronoun set, not a domain list).
 # Upstream main.py normalizers also rewrite these to "user"; this is the backstop
 # that catches any path/object position they miss (the phantom "i" entity bug).
-_FIRST_PERSON_PRONOUNS = frozenset({"i", "me", "my", "myself", "mine"})
+# [es branch] Spanish first-person forms. Spanish is pro-drop — the subject pronoun is
+# usually OMITTED ("uso el puerto 3000" = "I use port 3000") — but when it DOES surface, or
+# when a possessive appears ("mi servidor"), it must ground to the requesting user exactly
+# like "I"/"my". Without these, every Spanish first-person mention minted a PHANTOM entity
+# named "yo" / "mi" instead of attaching the fact to the user.
+_FIRST_PERSON_PRONOUNS = frozenset({
+    "i", "me", "my", "myself", "mine",
+    "yo", "me", "mi", "mis", "mí", "conmigo", "mismo", "misma", "nosotros", "nosotras", "nos", "nuestro", "nuestra", "nuestros", "nuestras",
+})
 
 
 # Alias preference provenance trust ordering (ALIAS-PROVENANCE-DESIGN).

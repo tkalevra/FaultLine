@@ -12,8 +12,14 @@ COPY pyproject.toml .
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 
-# Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
-RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
+# Pre-download the GLiNER2 model while gliner2 is on PATH via the venv.
+# [es branch] MULTILINGUAL weights — `gliner2-base-v1` is tagged `en` only on HuggingFace, so it
+# typed Spanish entities with English weights. `gliner2-multi-v1` (Apache-2.0, en/es/fr/de/it/pt)
+# is the same GLiNER2 API and the same load call. This MUST be baked: the runtime stage sets
+# HF_HUB_OFFLINE=1, so an unbaked model cannot be fetched at startup — it would just fail to load.
+ARG GLINER_MODEL=fastino/gliner2-multi-v1
+ENV GLINER_MODEL=${GLINER_MODEL}
+RUN python -c "import os; from gliner2 import GLiNER2; GLiNER2.from_pretrained(os.environ['GLINER_MODEL']); print('GLiNER2', os.environ['GLINER_MODEL'], 'baked OK')"
 
 # Pre-download the fastembed model for local CPU embeddings (avoids hitting external LLM).
 # Model id is PARAMETRIZED (no hardcoded literal) — config owns it; ENV propagates to runtime
@@ -25,14 +31,23 @@ RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(os.
 
 # BAKE the spaCy linguistic-layer model into the image (NO runtime `spacy download`).
 # The model name is PARAMETRIZED (no hardcoded literal in the RUN line) — config owns it.
-# Default `en_core_web_sm` — the VALIDATED model the spine dependency chains are tuned to.
-# (`en_core_web_md` was A/B-tested and shifts the inchoative/compound-anchor arcs, breaking the
-# chains — opt-in only, NOT the default; re-tune the chains before switching.) All shipped models
+# [es branch] Default `es_core_news_sm` — the model MUST match the install language. The English
+# model does not degrade on Spanish, it CORRUPTS: no verb/subject/object arcs, and no negation
+# dependency at all, so "No uso el puerto 9004" stores as its affirmative. linguistics.py now
+# refuses to load a model whose nlp.lang disagrees with FAULTLINE_LANGUAGE.
+# The spine dependency chains were originally tuned against en sm's parse shapes and are NOT yet
+# re-tuned for Spanish syntax — Spanish capture trails English until they are.
+# (A larger model shifts the inchoative/compound-anchor arcs again, breaking the chains — opt-in
+# only, NOT the default; re-tune the chains before switching.) All shipped models
 # are PINNED, py3-none-any (Python-version-independent) GitHub-release wheels → install as normal
 # packages into /venv, carried over by the venv COPY below. spaCy itself comes from pyproject
 # (spacy>=3.7,<3.9 → 3.8.x). If this model is ever missing/unset, linguistics.py no-ops.
-# Override at build with `--build-arg SPACY_MODEL=en_core_web_md` (re-tune chains first).
-ARG SPACY_MODEL=en_core_web_sm
+# [es branch] Default es_core_news_sm — MUST match the install language. The English model
+# over Spanish text yields a run-on PROPN chunk with no verb/subject/object and no negation
+# dep, i.e. silent corruption rather than degraded capture. linguistics.py now refuses to
+# load a model whose nlp.lang disagrees with FAULTLINE_LANGUAGE.
+# Override at build with `--build-arg SPACY_MODEL=es_core_news_md` (re-tune chains first).
+ARG SPACY_MODEL=es_core_news_sm
 ARG SPACY_MODEL_VERSION=3.8.0
 ENV SPACY_MODEL=${SPACY_MODEL}
 RUN pip install --no-cache-dir \
@@ -75,8 +90,14 @@ ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
 # (caused a 9/10→2/10 regression). Re-declare the config-layer ARG defaults + propagate as ENV
 # so linguistics.py / embedder.py / llm_output_validator.py (which read these env vars — NO code
 # literals) resolve at runtime. Override via --build-arg or the compose `environment:` block.
-ARG SPACY_MODEL=en_core_web_sm
+ARG SPACY_MODEL=es_core_news_sm
 ENV SPACY_MODEL=${SPACY_MODEL}
+# Same reasoning for the GLiNER2 entity-typing weights (main.py reads GLINER_MODEL). If this is
+# not re-declared here, runtime falls back to the code default — which must therefore stay in
+# lockstep with the ARG in the builder stage, or the baked model and the requested model differ
+# and from_pretrained() fails closed under HF_HUB_OFFLINE=1.
+ARG GLINER_MODEL=fastino/gliner2-multi-v1
+ENV GLINER_MODEL=${GLINER_MODEL}
 ARG FASTEMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
 ENV FASTEMBED_MODEL=${FASTEMBED_MODEL}
 ARG EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5

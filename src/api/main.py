@@ -10752,8 +10752,17 @@ async def lifespan(app: FastAPI):
     global _gliner2_model
     try:
         from gliner2 import GLiNER2
-        _gliner2_model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-        log.info("startup.gliner2_ready")
+        # [es branch] MULTILINGUAL weights. This is the load site that actually runs — the
+        # `load_default_model()` helper in src/gli_ner/extractor.py has NO callers, so its
+        # multilingual default was dead code and every entity typed here went through
+        # English-only weights (`fastino/gliner2-base-v1` is tagged `en` on HuggingFace).
+        # `gliner2-multi-v1` is the same GLiNER2 API and covers en/es/fr/de/it/pt (Apache-2.0).
+        # PURE CONFIG, like SPACY_MODEL — the name is env-resolvable, never a bare code literal.
+        # NOTE: HF_HUB_OFFLINE=1 in the runtime image, so this must be BAKED (Dockerfile) — an
+        # env override alone will fail to download at startup.
+        _gliner2_name = (os.environ.get("GLINER_MODEL") or "").strip() or "fastino/gliner2-multi-v1"
+        _gliner2_model = GLiNER2.from_pretrained(_gliner2_name)
+        log.info("startup.gliner2_ready", model=_gliner2_name)
     except Exception as e:
         log.error("startup.gliner2_failed", error=str(e))
 
@@ -15016,6 +15025,9 @@ PATTERN 3 — IDENTITY/ALIASES (these map alternate names to the same entity):
 
 FIRST-PERSON RESOLUTION:
   - "I", "me", "my", "we" → always map to "user" entity (NEVER use pronouns literally)
+  - Spanish equivalents map the same way: "yo", "me", "mi(s)", "nosotros", "nuestro(a/s)" → "user".
+    Spanish is pro-drop: a first-person VERB ending with no pronoun is still the user
+    ("uso el puerto 3000" → (user, uses, port 3000)).
   - "We have a dog" → (user, has_pet, dog_name)
   - List enumeration applies equally to first-person: "my [group]: A, B, C" → relationship to user for each
 
@@ -20706,7 +20718,15 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
 
     # dprompt-23: First-person pronoun set used by both the /extract/rewrite
     # normalizer and the req.edges normalizer below (dBug-023).
-    _FIRST_PERSON_PRONOUNS = {"i", "me", "my", "myself", "we", "us", "our", "ourselves"}
+    # [es branch] Spanish first-person forms. Spanish is pro-drop — the subject pronoun is
+    # usually OMITTED ("uso el puerto 3000" = "I use port 3000") — but when it DOES surface, or
+    # when a possessive appears ("mi servidor"), it must ground to the requesting user exactly
+    # like "I"/"my". Without these, every Spanish first-person mention minted a PHANTOM entity
+    # named "yo" / "mi" instead of attaching the fact to the user.
+    _FIRST_PERSON_PRONOUNS = {
+        "i", "me", "my", "myself", "we", "us", "our", "ourselves",
+        "yo", "me", "mi", "mis", "mí", "conmigo", "mismo", "misma", "nosotros", "nosotras", "nos", "nuestro", "nuestra", "nuestros", "nuestras",
+    }
 
     # dprompt-086: Third-person pronouns must be resolved by the LLM from conversation
     # context. If the LLM emits them literally, skip them — we cannot guess the referent.

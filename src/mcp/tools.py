@@ -102,17 +102,23 @@ TOOLS = [
             "Ingest structured ontological statements into the knowledge graph as source=llm_learn. "
             "Use this to store concept hierarchies you generate — statements like "
             "'X is a subclass of Y', 'X is an instance of Y', 'X is a part of Y'. "
+            "Spanish is accepted: 'X es una subclase de Y', 'X es una instancia de Y', "
+            "'X es parte de Y' (also 'es un tipo de', 'forma parte de'). "
             "This maps how concepts relate to each other (not general knowledge). "
-            "Facts stored as Class B (staged, source=llm_learn), confirmed over time."
+            "Facts stored as Class B (staged, source=llm_learn), confirmed over time. "
+            "If this returns no_facts, that is a FORMATTING error — rephrase into one of the forms "
+            "above and retry. It does NOT mean ontology storage is unsupported, and it is NOT a "
+            "reason to substitute ingest_document, which stores prose and does not build the graph."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Your generated ontological statements — one per line, "
-                                   "using 'X is a subclass of Y', 'X is an instance of Y', "
-                                   "or 'X is a part of Y' forms only"
+                    "description": "Your generated ontological statements — one per line, using "
+                                   "'X is a subclass of Y', 'X is an instance of Y', or "
+                                   "'X is a part of Y' (ES: 'X es una subclase/instancia de Y', "
+                                   "'X es parte de Y') forms only"
                 },
                 "user_id": {
                     "type": "string",
