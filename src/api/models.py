@@ -352,3 +352,30 @@ class QueryResponse(BaseModel):
     # result (`miss=True`, no fabricated number). None when no calc intent. Additive.
     #   {op, answer, value, unit, granule, miss, cited_dates, [miss_reason]}
     temporal_computation: Optional[dict] = None
+
+
+class DocumentEnqueueRequest(BaseModel):
+    """Enqueue a chunked document into the per-tenant async ingestion registry.
+
+    The flagship `ingest_document` lane chunks the document deterministically
+    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
+    `documents` row status='pending' (chunks retained verbatim) and returns fast.
+    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
+    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
+    """
+    user_id: str
+    chunks: list[str]
+    chunk_count: int = 0
+    source_ref: Optional[str] = None
+    title: Optional[str] = None
+    truncated: bool = False
+    part_index: int = 0
+    part_count: int = 1
+    total_chunks: int = 0
+
+
+class LearnTopicRequest(BaseModel):
+    topic: str
+    user_id: str = "anonymous"
+    source_text: Optional[str] = None
+    source_url: Optional[str] = None
