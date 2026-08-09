@@ -182,6 +182,28 @@ TOOLS = [
     }
 ]
 
+# ── CANONICAL ORDER (2026-07-28 spec §tools): deterministic tool order is what enables client
+# caching and stable prompt-cache hit rates — and ORDER IS DISCOVERABILITY for the models that
+# read this list. The user-memory pair leads (the premise carriers), then the document/learn/
+# retract lanes. Deterministic and declarative: reorder the tuple here, not by hand-moving dict
+# blocks. Non-breaking — no client depends on list position, and `annotations`/`title`/
+# `outputSchema` application is name-keyed, so it is order-independent.
+_CANONICAL_ORDER = (
+    "recall_memory",      # user-memory READ entry point
+    "remember_facts",     # user-memory WRITE entry point
+    "ingest_document",    # document / long-form lane
+    "learn_facts",        # ontological / /expand lane
+    "retract_fact",       # plain-language forget
+    "forget_fact",        # precise single-fact tombstone
+)
+if tuple(t["name"] for t in TOOLS) != _CANONICAL_ORDER:
+    _by_name = {t["name"]: t for t in TOOLS}
+    assert set(_by_name) == set(_CANONICAL_ORDER), (
+        "TOOLS drifted from _CANONICAL_ORDER — add the new tool to the tuple"
+    )
+    TOOLS = [_by_name[n] for n in _CANONICAL_ORDER]
+    del _by_name
+
 
 # MCP SPEC COMPLIANCE: annotations (P1), titles (P9), outputSchema (P4).
 # Non-breaking: clients that understand these fields use them; others ignore them.
@@ -212,6 +234,37 @@ _OUTPUT_SCHEMAS = {
         "properties": {
             "status": {"type": "string", "description": "Write outcome (stored, no_ingest, query_detected, rejected, ingest_disabled, corrected, …). Open set: routed CORRECTION/RETRACTION returns the retract_fact status."},
             "committed": {"type": "integer", "description": "Number of facts committed to long-term storage."},
+            "message": {"type": "string"},
+        },
+    },
+    "ingest_document": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Ingest outcome (pending, accepted, rejected)."},
+            "eta_seconds": {"type": "integer", "description": "Estimated seconds until the document's facts become searchable."},
+            "message": {"type": "string"},
+        },
+    },
+    "learn_facts": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Learn outcome (stored, staged, no_ingest)."},
+            "committed": {"type": "integer", "description": "Number of ontological statements stored."},
+            "message": {"type": "string"},
+        },
+    },
+    "retract_fact": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Retraction outcome (corrected, retracted, clarification_needed, no_ingest)."},
+            "retracted": {"type": "boolean"},
+            "message": {"type": "string"},
+        },
+    },
+    "forget_fact": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Forget outcome (forgotten, retracted, no_ingest)."},
             "message": {"type": "string"},
         },
     },

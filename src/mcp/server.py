@@ -13,6 +13,9 @@ from typing import Any
 
 import httpx
 
+# THE 2026-07-28 protocol constants + server/discover builder — one source, every door.
+import src.mcp.premise as _premise
+
 # ── Injection signal detection ────────────────────────────────────────────────
 # Pre-flight check applied to `text` in remember_facts_tool() before forwarding to
 # /extract/rewrite.  Only matches explicit instruction-override constructs — NOT normal
@@ -2017,15 +2020,54 @@ async def run_mcp_server() -> None:
 
             req_id = request.get("id")
             method = request.get("method", "")
+            params = request.get("params") or {}
 
-            if method == "initialize":
+            # ── 2026-07-28 dual-era negotiation ─────────────────────────────────────────
+            # Modern clients (2026-07-28) are STATELESS: no initialize handshake, every request
+            # carries `io.modelcontextprotocol/protocolVersion` in `_meta`. Legacy clients
+            # (2025-11-25 and earlier) still send `initialize`/`notifications/initialized` and
+            # are gated on `_initialized` as before. A modern request names a version we do not
+            # support → UnsupportedProtocolVersionError with the supported list (the client
+            # picks a mutually-supported version and retries, per spec).
+            _req_meta = params.get("_meta") or {}
+            _modern_version = _req_meta.get("io.modelcontextprotocol/protocolVersion") or ""
+            _is_modern = bool(_modern_version)
+            if _is_modern and _modern_version not in _premise.SUPPORTED_PROTOCOL_VERSIONS:
+                _log(f"Unsupported protocol version {_modern_version!r}")
+                _send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": _premise.ERROR_UNSUPPORTED_PROTOCOL_VERSION,
+                        "message": "Unsupported protocol version",
+                        "data": {
+                            "supported": list(_premise.SUPPORTED_PROTOCOL_VERSIONS),
+                            "requested": _modern_version,
+                        },
+                    },
+                })
+                continue
+
+            if method == "server/discover":
+                # 2026-07-28: the stdio backward-compatibility probe + capability advertisement.
+                # Modern clients MAY send this first; legacy clients get a non-modern error and
+                # fall back to initialize. Answer it identically regardless of the client era.
+                _send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": _premise.discover_result(),
+                })
+
+            elif method == "initialize":
                 _send({
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": _premise.negotiate_protocol_version(
+                            (params or {}).get("protocolVersion")),
                         "capabilities": {"tools": {}, "prompts": {}},
                         "serverInfo": {"name": "faultline-mcp", "version": "1.0.0"},
+                        "resultType": "complete",
                     },
                 })
 
@@ -2037,7 +2079,11 @@ async def run_mcp_server() -> None:
                 _send({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
             elif method in ("tools/list", "tools/call"):
-                if not _initialized:
+                # Dual-era gate: legacy clients must initialize first (unchanged); modern
+                # (2026-07-28) requests are self-contained and bypass the handshake entirely —
+                # gating a stateless request on a handshake the protocol abolished would break
+                # every modern client on this transport.
+                if not _is_modern and not _initialized:
                     _send({
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -2049,19 +2095,27 @@ async def run_mcp_server() -> None:
                     continue
 
                 if method == "tools/list":
-                    _send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+                    # CacheableResult (2026-07-28, SEP-2549): ttlMs + cacheScope + deterministic
+                    # order. Non-breaking for legacy clients.
+                    _send({"jsonrpc": "2.0", "id": req_id,
+                           "result": {
+                               "tools": TOOLS,
+                               "ttlMs": _premise._LIST_TTL_MS,
+                               "cacheScope": _premise._LIST_CACHE_SCOPE,
+                               "resultType": "complete",
+                           }})
 
                 else:  # tools/call
-                    params = request.get("params", {})
                     tool_name = params.get("name", "")
                     arguments = params.get("arguments", {})
                     progress_token = params.get("_meta", {}).get("progressToken")
                     _log(f"Tool call: {tool_name} (user_id={arguments.get('user_id', '?')[:8]}...)")
                     result = await _call_tool(tool_name, arguments, progress_token=progress_token)
+                    result = {**result, "resultType": "complete"}
                     _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
             elif method == "prompts/list":
-                if not _initialized:
+                if not _is_modern and not _initialized:
                     _send({
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -2080,12 +2134,15 @@ async def run_mcp_server() -> None:
                                 "arguments": p.get("arguments", []),
                             }
                             for p in PROMPTS
-                        ]
+                        ],
+                        "resultType": "complete",
+                        "ttlMs": _premise._LIST_TTL_MS,
+                        "cacheScope": _premise._LIST_CACHE_SCOPE,
                     },
                 })
 
             elif method == "prompts/get":
-                if not _initialized:
+                if not _is_modern and not _initialized:
                     _send({
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -2093,7 +2150,6 @@ async def run_mcp_server() -> None:
                     })
                     continue
                 from .prompts import PROMPTS
-                params = request.get("params", {})
                 prompt_name = params.get("name", "")
                 prompt_args = params.get("arguments", {})
 
@@ -2127,6 +2183,7 @@ async def run_mcp_server() -> None:
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
+                        "resultType": "complete",
                         "description": prompt_def.get("description", ""),
                         "messages": [
                             {"role": "user", "content": {"type": "text", "text": text}}
