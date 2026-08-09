@@ -32,6 +32,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
+import src.mcp.premise as _premise
 import src.mcp.server as _mcp
 
 
@@ -129,12 +130,40 @@ app.add_middleware(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _jsonrpc_result(req_id: Any, result: Any) -> dict:
-    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+# 2026-07-28 (SEP-2322): ALL results carry a required `resultType` field — "complete" for
+# ordinary results. Clients MUST treat results from earlier-protocol servers that omit the
+# field as "complete", so adding it is non-breaking for every legacy client while making every
+# result predictably parsable for modern ones. The server also SHOULD identify itself in each
+# result's `_meta` (io.modelcontextprotocol/serverInfo) — self-reported, for display/logging
+# only, never trusted by clients.
+_SERVER_INFO_META = {"io.modelcontextprotocol/serverInfo": {
+    "name": "faultline-mcp", "version": "1.0.0"}}
 
 
-def _jsonrpc_error(req_id: Any, code: int, message: str) -> dict:
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+def _jsonrpc_result(req_id: Any, result: Any, *, _meta: bool = True) -> dict:
+    """Wrap `result` in a 2026-07-28 JSON-RPC envelope (resultType + serverInfo).
+
+    Non-breaking by construction: the spec REQUIRES clients to treat a missing `resultType` as
+    "complete", so adding the field never changes how a legacy client reads the payload — it only
+    makes the shape explicit (predictably parsable) for modern clients. `_meta` serverInfo is
+    SHOULD-level (SEP-2575). A result that already carries `resultType` (server/discover) or its
+    own `_meta` is never double-stamped; an EMPTY result (ping / notifications/initialized ack)
+    is returned byte-identical so legacy ack semantics stay untouched.
+    """
+    envelope = {"jsonrpc": "2.0", "id": req_id, "result": result}
+    if isinstance(result, dict) and result:
+        if "resultType" not in result:
+            envelope["result"]["resultType"] = "complete"
+        if _meta and "_meta" not in result:
+            envelope["result"]["_meta"] = _SERVER_INFO_META
+    return envelope
+
+
+def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> dict:
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -523,12 +552,75 @@ async def mcp_endpoint(
 
     _log(f"method={method!r} id={req_id!r}")
 
+    # ── 2026-07-28 header-based routing (SEP-2243) ────────────────────────────────────
+    # The spec requires Streamable HTTP POSTs to carry `Mcp-Method`/`Mcp-Name` headers so
+    # gateways/WAFs can route and authorize WITHOUT parsing the JSON body. We ACCEPT them and,
+    # when present and self-consistent, they are authoritative for routing: a gateway that
+    # already verified the method can skip body parsing entirely. When they are ABSENT (a
+    # legacy client, or any client that predates the header requirement), we fall back to the
+    # body `method` exactly as before — never break a legacy caller for lack of a header.
+    _hdr_method = request.headers.get("mcp-method")
+    if _hdr_method:
+        # A body method that disagrees with the header is a mis-routed request — the header is
+        # what a load balancer acted on, so surface HeaderMismatchError rather than silently
+        # processing under a different method than the one routed.
+        if method and method != _hdr_method:
+            _log(f"method mismatch header={_hdr_method!r} body={method!r} id={req_id!r}")
+            return JSONResponse(
+                _jsonrpc_error(req_id, _premise.ERROR_HEADER_MISMATCH,
+                               f"Mcp-Method header {_hdr_method!r} disagrees with body method "
+                               f"{method!r}"),
+                status_code=400,
+            )
+        method = _hdr_method
+    _hdr_name = request.headers.get("mcp-name")
+    if _hdr_name:
+        _log(f"Mcp-Name={_hdr_name!r}")
+
+    # ── 2026-07-28 version negotiation (SEP-2575) ─────────────────────────────────────
+    # Modern clients carry `io.modelcontextprotocol/protocolVersion` in `_meta` on EVERY
+    # request (there is no initialize handshake). A modern request naming a version we do not
+    # support gets UnsupportedProtocolVersionError with the supported list, per the spec —
+    # the client picks a mutually-supported version and retries. Legacy requests (no `_meta`
+    # version) are untouched: they negotiate via `initialize` below.
+    _req_meta = (params or {}).get("_meta") or {}
+    _req_version = (
+        _req_meta.get("io.modelcontextprotocol/protocolVersion")
+        or request.headers.get("mcp-protocol-version")
+        or ""
+    )
+    if _req_version and _req_version not in _premise.SUPPORTED_PROTOCOL_VERSIONS:
+        _log(f"Unsupported protocol version {_req_version!r} id={req_id!r}")
+        return JSONResponse(
+            _jsonrpc_error(
+                req_id, _premise.ERROR_UNSUPPORTED_PROTOCOL_VERSION,
+                "Unsupported protocol version",
+                data={
+                    "supported": list(_premise.SUPPORTED_PROTOCOL_VERSIONS),
+                    "requested": _req_version,
+                },
+            ),
+            status_code=400,
+        )
+
     # ── Dispatch table ────────────────────────────────────────────────────────
 
+    if method == "server/discover":
+        # 2026-07-28: servers MUST implement server/discover (SEP-2575). Lets a modern client
+        # learn supported protocol versions + capabilities + identity in one request, before
+        # any other RPC. No auth-gated state here: this is identity/capability advertisement,
+        # answered identically for every caller.
+        _log("server/discover")
+        return JSONResponse(_jsonrpc_result(
+            req_id, _premise.discover_result(), _meta=False))
+
     if method == "initialize":
+        # Spec: echo the client's protocolVersion if we support it, else offer our latest.
+        # (We used to hardcode 2025-03-26 and ignore the request entirely.)
+        _client_ver = (params or {}).get("protocolVersion")
         return JSONResponse(
             _jsonrpc_result(req_id, {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": _premise.negotiate_protocol_version(_client_ver),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "faultline-mcp", "version": "1.0.0"},
             })
@@ -543,7 +635,15 @@ async def mcp_endpoint(
         return JSONResponse(_jsonrpc_result(req_id, {}))
 
     elif method == "tools/list":
-        return JSONResponse(_jsonrpc_result(req_id, {"tools": _mcp.TOOLS}))
+        return JSONResponse(_jsonrpc_result(
+            req_id, {
+                # CacheableResult (2026-07-28, SEP-2549): ttlMs + cacheScope let clients cache
+                # the tool catalog and reduce polling; deterministic order (TOOLS list) keeps
+                # prompt-cache hit rates stable. Non-breaking for legacy clients.
+                "tools": _mcp.TOOLS,
+                "ttlMs": _premise._LIST_TTL_MS,
+                "cacheScope": _premise._LIST_CACHE_SCOPE,
+            }))
 
     elif method == "tools/call":
         tool_name = params.get("name", "")
