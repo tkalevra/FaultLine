@@ -160,41 +160,6 @@ class EpisodicAppendRequest(BaseModel):
     extracted_fact_count: Optional[int] = None
 
 
-class CortexNoteRequest(BaseModel):
-    """Write an AGENT-CORTEX operational note (the /iremember manual door).
-
-    The cortex is the operating-agent's OWN persistent operational memory — gotchas,
-    failed commands, pitfalls, corrections, how-tos, overruns. A note is NEVER a user
-    fact and is NEVER served as one — it lands in the firewalled ``flagent_<uuid>``
-    schema, source ``agent_manual``, durable. Stance is always "my operational note,"
-    never "you told me."
-    """
-    user_id: str
-    note: str
-    # EVIDENCE (optional) — the artifact that produced this claim: {sha, ref, command, output}.
-    # A note is a CLAIM; a claim with no proof rots into a TRAP that manufactures phantom work.
-    # `sha` makes staleness DECIDABLE (git merge-base --is-ancestor <sha> HEAD), and an evidenced
-    # note outranks an unevidenced one at recall. Optional — a note without it is still recorded.
-    evidence: Optional[Union[dict, str]] = None   # dict, or a JSON string (MCP clients vary)
-    category: Optional[str] = None                  # gotcha|failed_command|pitfall|correction|howto|overrun
-    tags: Optional[list[str]] = None                # triggers/topics the note guards
-    context: Optional[dict] = None                  # optional: {command, fix, file, path, ...}
-
-
-class CortexRecallRequest(BaseModel):
-    """Read AGENT-CORTEX operational notes (the /irecall manual door)."""
-    user_id: str
-    query: Optional[str] = None
-    limit: int = 8
-
-
-class LearnTopicRequest(BaseModel):
-    topic: str
-    user_id: str = "anonymous"
-    source_text: Optional[str] = None   # pre-fetched content from a URL
-    source_url: Optional[str] = None    # informational, logged but not fetched again
-
-
 class RewriteRequest(BaseModel):
     """Request for LLM-based fact extraction (triple rewriting).
     Called by OpenWebUI Filter instead of hitting OpenWebUI's LLM directly.

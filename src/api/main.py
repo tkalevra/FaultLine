@@ -36,7 +36,6 @@ from src.api import rel_type_overlay
 from src.api import taxonomy_overlay
 from src.api import temporal_pattern_overlay
 from src.api import linguistic_cue_overlay
-from src.api import cortex as _cortex  # Agent Cortex — firewalled agent operational memory, fail-safe
 from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, DocumentEnqueueRequest, ConversationMessage, QueryPath, QueryResponse, CortexNoteRequest, CortexRecallRequest
 from .llm_client import get_llm_headers, build_llm_payload, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from .llm_calls import call_llm_with_retry_sync, call_llm_no_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
@@ -10697,39 +10696,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_provisioning_reaper_worker())
     log.info("startup.provisioning_reaper_started")
 
-    # SELF-SERVE RETENTION reaper + operator digest (migration 179) — SAAS_MODE ONLY.
-    # Individuals are not kept beyond a grace window past the free trial (privacy). This loop
-    # runs one retention SWEEP (DRY-RUN by default — deletes NOTHING unless the operator armed
-    # SAAS_RETENTION_PURGE_ENABLED) and fires the time-cadenced operator digest when due. The whole
-    # loop is a no-op when SaaS is off (it never imports the saas.* modules in that case).
-    async def _retention_worker():
-        try:
-            from saas.config import saas_mode_enabled as _saas_on
-        except Exception:
-            return
-        if not _saas_on():
-            return
-        # Poll interval: default 6h (retention is a daily-grain policy; sub-hour precision is
-        # pointless). Env-overridable for tests / tuning.
-        interval = int(os.environ.get("SAAS_RETENTION_POLL_SECONDS", str(6 * 60 * 60)))
-        log.info("startup.retention_worker_started", poll_seconds=interval)
-        while True:
-            try:
-                from saas import retention as _retention
-                from saas import retention_report as _retention_report
-                summary = _retention.run_reaper()   # DRY-RUN unless armed by env
-                if summary.get("candidates"):
-                    log.info("retention_sweep",
-                             armed=summary.get("armed"),
-                             candidates=summary.get("candidates"),
-                             purged=len(summary.get("purged", [])),
-                             would_purge=len(summary.get("would_purge", [])))
-                _retention_report.maybe_send_auto_report()   # fires only when the day cadence is due
-            except Exception as e:
-                log.error("retention_worker_error", error=str(e))
-            await asyncio.sleep(interval)
-
-    asyncio.create_task(_retention_worker())
 
     qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
@@ -11504,65 +11470,10 @@ async def _enqueue_reembedder_event(
         return False
 
 
-def _saas_mode_enabled() -> bool:
-    """SAAS_MODE gate — pure env read (mirrors saas.config._truthy). Imports NOTHING, so a
-    public deployment with no saas/ dir and SAAS_MODE off is byte-for-byte unchanged."""
-    return str(os.environ.get("SAAS_MODE") or "").strip().lower() not in ("", "false", "0", "no", "off")
-
-
-async def _saas_bind_tenant_brain(request: Request):
-    """SHARED backend request seam (Gap-B): bind THIS request's tenant BYO engine-brain so every
-    backend LLM call within the request (extraction, /learn, correction extraction, enrichment,
-    …) resolves to the tenant's own configured seat brain instead of the process-global env brain.
-
-    A global FastAPI dependency (NOT BaseHTTPMiddleware): reading the body in a dependency reuses
-    FastAPI's cached ``request._body``, so the endpoint's own body model still parses (the
-    body-consumption hang that plagues BaseHTTPMiddleware does not apply here).
-
-    PRIVATE-SAFE + SAAS-gated: when SAAS_MODE is off this is a pure no-op (no body read, no import,
-    byte-for-byte today's behavior). All account/DB logic lives in ``saas.llm_context`` and is
-    LAZILY imported INSIDE the gate, so a public deployment (no saas/ dir) never imports it.
-    """
-    if not _saas_mode_enabled():
-        yield
-        return
-    token = None
-    try:
-        # Resolve the tenant user uuid the backend already folds into requests: prefer an
-        # explicit query param, else the JSON body's user_id. Body is read defensively and
-        # never re-raised; FastAPI's cache makes the downstream model parse the same bytes.
-        user_id = request.query_params.get("user_id")
-        if not user_id:
-            try:
-                raw = await request.body()
-                if raw:
-                    data = json.loads(raw)
-                    if isinstance(data, dict):
-                        uid = data.get("user_id")
-                        if uid:
-                            user_id = str(uid)
-            except Exception:
-                user_id = None
-        if user_id:
-            from saas.llm_context import bind_request_brain
-            token = bind_request_brain(user_id)
-    except Exception:
-        token = None
-    try:
-        yield
-    finally:
-        if token is not None:
-            try:
-                from saas.llm_context import reset_llm_config
-                reset_llm_config(token)
-            except Exception:
-                pass
-
 
 app = FastAPI(
     title="FaultLine WGM",
     lifespan=lifespan,
-    dependencies=[Depends(_saas_bind_tenant_brain)],
 )
 
 
@@ -43995,92 +43906,6 @@ def documents_pending(user_id: str):
             except Exception:
                 pass
 
-
-@app.post("/cortex/note")
-def cortex_note(req: CortexNoteRequest):
-    """Write an AGENT-CORTEX operational note (the /iremember backend).
-
-    The cortex is the operating-agent's OWN persistent operational memory — gotchas,
-    failed commands, pitfalls, corrections, how-tos, overruns — so it stops repeating its
-    own mistakes. This is NEVER a user fact; it lands in the FIREWALLED ``flagent_<uuid>``
-    schema (source ``agent_manual``, durable), which the user-fact walk can never read.
-    MANUAL capture only. Fail-safe: any failure returns a soft status, never a 500.
-    """
-    user_id = req.user_id or "anonymous"
-    if user_id == "anonymous" or not (req.note or "").strip():
-        return {"status": "soft_error", "written": False}
-    try:
-        ok = _cortex.note(
-            user_id=user_id,
-            note=req.note.strip(),
-            category=req.category,
-            tags=req.tags,
-            context=req.context,
-            evidence=getattr(req, "evidence", None),
-        )
-        return {"status": "stored" if ok else "soft_error", "written": bool(ok)}
-    except Exception as e:  # defense-in-depth; _cortex.note already swallows
-        log.warning("cortex_note.failed", error=str(e)[:160])
-        return {"status": "soft_error", "written": False}
-
-
-@app.post("/cortex/recall")
-def cortex_recall(req: CortexRecallRequest):
-    """Read AGENT-CORTEX operational notes (the /irecall backend).
-
-    Deterministic keyword + tag recall (top-K), rendered held/soft (never user facts).
-    Fail-safe: an absent/unprovisioned cortex schema returns an empty list, never a 500.
-    """
-    user_id = req.user_id or "anonymous"
-    if user_id == "anonymous":
-        return {"status": "ok", "notes": []}
-    try:
-        notes = _cortex.recall_notes(
-            user_id=user_id,
-            query=((req.query or "").strip() or None),
-            limit=req.limit,
-        )
-        return {"status": "ok", "notes": notes}
-    except Exception as e:
-        log.warning("cortex_recall.failed", error=str(e)[:160])
-        return {"status": "soft_error", "notes": []}
-
-
-@app.post("/cortex/usage-patterns")
-def cortex_usage_patterns(req: CortexRecallRequest):
-    """The HOW-YOU-OPERATE surface (memory-teaches-the-model, Phase 1).
-
-    Returns the few SEEDED operating rules relevant to the turn — read ONLY from the FIREWALLED
-    cortex ``usage_pattern`` slice (``flagent_<uuid>``). These are the agent's operating manual,
-    NEVER a user fact and NEVER served as one; a usage pattern can never appear in the user-fact
-    walk. Fail-safe: absent/unprovisioned cortex or any error → empty list, never a 500.
-    """
-    user_id = req.user_id or "anonymous"
-    if user_id == "anonymous":
-        return {"status": "ok", "lines": []}
-    try:
-        pats = _cortex.recall_usage_patterns(
-            user_id=user_id,
-            query=((req.query or "").strip() or None),
-            limit=(req.limit or 4),
-        )
-        lines = [p["note"] for p in pats if p.get("note")]
-        # REFLECTION NUDGE — the model-agnostic third capture lane. A client-side hook can force
-        # an agent to reflect (Claude Code), but FaultLine serves ANY model over MCP and cannot
-        # reach into their turn loops. It CAN see what no client can: a seat that is accruing
-        # auto-captured failures while its DELIBERATE lane sits at zero — working, but learning
-        # nothing. One line, on the operating-brief channel that already exists. Self-limiting:
-        # it stops permanently the moment the seat records one lesson of its own. Fail-safe:
-        # a nudge that breaks recall is a bug, so it can only ever ADD a line.
-        try:
-            _nudge = _cortex.reflection_nudge(user_id)
-            if _nudge:
-                lines.append(_nudge)
-        except Exception as _ne:  # noqa: BLE001
-            log.debug("cortex_usage_patterns.nudge_failed", error=str(_ne)[:120])
-        return {"status": "ok", "lines": lines}
-    except Exception as e:
-        log.warning("cortex_usage_patterns.failed", error=str(e)[:160])
         return {"status": "soft_error", "lines": []}
 
 
