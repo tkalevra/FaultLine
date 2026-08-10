@@ -83,6 +83,16 @@ def test_remember_facts_status_is_open_string_not_enum():
     assert schema["type"] == "string"
 
 
+def test_recall_memory_status_is_open_string_not_enum():
+    """Same landmine as remember_facts: recall_memory diverts to learn/retract/ingest paths,
+    so its status is an open set (ingest_disabled, read_only, corrected, query_detected, …).
+    A closed enum here shipped -32602 to spec-strict clients (opencode) when a diverted
+    recall returned a status outside ["ok","no_ingest","error"]."""
+    schema = _OUTPUT_SCHEMAS["recall_memory"]["properties"]["status"]
+    assert "enum" not in schema
+    assert schema["type"] == "string"
+
+
 def test_advertised_tools_with_schema_are_a_subset_of_tools():
     """Guard: the only tools that carry structuredContent are exactly those in _OUTPUT_SCHEMAS."""
     advertised = {t["name"] for t in _server_mod.TOOLS}
