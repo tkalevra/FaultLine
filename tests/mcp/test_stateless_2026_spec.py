@@ -186,6 +186,43 @@ def test_initialize_echoes_2026_version(client):
     assert r.json()["result"]["protocolVersion"] == "2026-07-28"
 
 
+# ── stock SDK regression (2026-08-10): client SDKs propose 2025-11-25 ──────────
+# The official MCP client SDKs' LATEST_PROTOCOL_VERSION is "2025-11-25" and their supported
+# whitelist rejects any echoed revision it has never seen. We were not listing 2025-11-25, so
+# negotiation replied with 2026-07-28, the client threw "protocol version is not supported",
+# and the connection surfaced the breakage as a misleading transport error.
+
+def test_initialize_echoes_2025_11_25_for_stock_sdk(client):
+    """The SDK's proposed version must be echoed verbatim, not clobbered with 2026-07-28."""
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 30, "method": "initialize",
+                                  "params": {"protocolVersion": "2025-11-25"}})
+    assert r.status_code == 200
+    assert r.json()["result"]["protocolVersion"] == "2025-11-25"
+
+
+def test_2025_11_25_header_on_subsequent_requests_is_accepted(client):
+    """The SDK re-sends the echoed value in `mcp-protocol-version` on every request."""
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 31, "method": "tools/list"},
+                    headers={"MCP-Protocol-Version": "2025-11-25"})
+    assert r.status_code == 200
+    assert "error" not in r.json()
+
+
+def test_negotiate_never_offers_newer_than_requested(client):
+    """An unknown proposed revision gets the newest revision we serve that is <= it."""
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 32, "method": "initialize",
+                                  "params": {"protocolVersion": "2025-12-01"}})
+    assert r.json()["result"]["protocolVersion"] == "2025-11-25"
+    assert r.json()["result"]["protocolVersion"] != premise.LATEST_PROTOCOL_VERSION
+
+
+def test_negotiate_unknown_old_revision_falls_back_to_newest_known(client):
+    """A proposal older than everything we list still yields something parseable."""
+    assert premise.negotiate_protocol_version("2024-08-01") == "2024-10-07"
+    assert premise.negotiate_protocol_version("2025-11-25") == "2025-11-25"
+    assert premise.negotiate_protocol_version(None) == premise.LATEST_PROTOCOL_VERSION
+
+
 # ── Discoverability: canonical order ─────────────────────────────────────────────
 # 2026-07-28 §tools: deterministic order enables caching + stable prompt-cache hits, and ORDER
 # IS DISCOVERABILITY — the user-memory entry points must precede the document/learn lanes so a
