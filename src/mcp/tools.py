@@ -232,7 +232,7 @@ _OUTPUT_SCHEMAS = {
         "type": "object",
         "properties": {
             "memory": {"type": "string", "description": "The recalled memory as natural-language prose."},
-            "status": {"type": "string", "enum": ["ok", "no_ingest", "error"]},
+            "status": {"type": "string", "description": "Recall outcome (ok, no_ingest, error, or any diverted learn/retract/ingest status). Open set — recall_memory_tool delegates and returns the full delegated surface."},
         },
     },
     "remember_facts": {
