@@ -13,7 +13,22 @@ not ported here — keep this file free of any transport-independent marketing/p
 # `_meta`, plus the new `server/discover` RPC. FaultLine is DUAL-ERA: legacy clients
 # (2025-11-25 and earlier) still send initialize; modern clients (2026-07-28) send per-request
 # `_meta`. Both are served.
-SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-06-18", "2025-03-26", "2024-11-05")
+#
+# 2025-11-25 and 2024-10-07 are the revisions proposed by the official MCP client SDKs. The
+# 2026-08-10 incident: a stock client SDK proposed 2025-11-25, we were not listing it, and
+# `negotiate_protocol_version` echoed LATEST (2026-07-28) instead — a stateless revision the
+# client's whitelist has never seen, so initialize failed and the client surfaced the breakage
+# as a misleading transport error. These entries close that class of failure: the SDK's own
+# handshake is served verbatim, and the echoed value is one the client re-sends in the
+# `mcp-protocol-version` header on every subsequent request.
+SUPPORTED_PROTOCOL_VERSIONS = (
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+)
 LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
 
 # 2026-07-28 error-code allocation (SEP-2575): -32020..-32099 is reserved for the MCP
@@ -24,9 +39,23 @@ ERROR_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 
 def negotiate_protocol_version(requested: str | None) -> str:
-    """Echo `requested` if we support it, else offer our latest. Never raises."""
-    if requested in SUPPORTED_PROTOCOL_VERSIONS:
-        return requested
+    """Echo `requested` if we support it; else offer the newest revision we support that is
+    NOT newer than what the client proposed. Never raises.
+
+    The "not newer than requested" cap is the 2026-08-10 fix: our all-caps LATEST
+    (2026-07-28) is a stateless revision that stock client SDKs have never seen. If a client
+    proposes something we do not list, echoing LATEST hands back a revision the client's own
+    whitelist rejects and the handshake dies. All revisions are ISO date strings, so
+    lexicographic comparison is chronological.
+    """
+    if requested:
+        if requested in SUPPORTED_PROTOCOL_VERSIONS:
+            return requested
+        for version in SUPPORTED_PROTOCOL_VERSIONS:  # newest first
+            if version <= requested:                  # newest one the client can parse
+                return version
+        if requested < SUPPORTED_PROTOCOL_VERSIONS[-1]:
+            return SUPPORTED_PROTOCOL_VERSIONS[-1]    # older than we serve: oldest we know
     return LATEST_PROTOCOL_VERSION
 
 
