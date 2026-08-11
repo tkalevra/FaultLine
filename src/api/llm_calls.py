@@ -49,6 +49,7 @@ from typing import Optional, Any
 import httpx
 
 from src.api import llm_source_ip
+from src.api.llm_lane import LLMUnavailable  # re-exported: callers import it from here
 
 log = structlog.get_logger(__name__)
 
@@ -723,6 +724,7 @@ def call_llm_with_retry_sync(
     max_retries: int = 3,
     operation: str = "DEFAULT",
     max_tokens: Optional[int] = None,
+    raise_on_unavailable: bool = False,
 ) -> dict:
     """
     Synchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -907,6 +909,11 @@ def call_llm_with_retry_sync(
              final_error_type=type(last_error).__name__,
              final_error_message=str(last_error)[:200])
 
+    # A caller that CACHES A VERDICT needs to tell "never reached" from "answered nothing".
+    # Raising the raw transport error cannot express that: every LLM helper here wraps its
+    # call in `except Exception: return None`, which collapses both into the same None.
+    if raise_on_unavailable:
+        raise LLMUnavailable("retries_exhausted", operation) from last_error
     if last_error is not None:
         raise last_error
     raise RuntimeError("No LLM endpoint responded")
@@ -924,6 +931,7 @@ async def call_llm_with_retry_async(
     max_retries: int = 3,
     operation: str = "DEFAULT",
     max_tokens: Optional[int] = None,
+    raise_on_unavailable: bool = False,
 ) -> dict:
     """
     Asynchronous LLM call with retry, circuit breaker, and fallback endpoints.
@@ -1097,6 +1105,10 @@ async def call_llm_with_retry_async(
              final_error_type=type(last_error).__name__,
              final_error_message=str(last_error)[:200])
 
+    # See the sync twin: a verdict-caching caller must be able to tell "never reached" from
+    # "answered nothing".
+    if raise_on_unavailable:
+        raise LLMUnavailable("retries_exhausted", operation) from last_error
     if last_error is not None:
         raise last_error
     raise RuntimeError("No LLM endpoint responded")
