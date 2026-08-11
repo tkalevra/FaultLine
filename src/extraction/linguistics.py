@@ -17896,3 +17896,105 @@ _LEADING_TEMPORAL_PREP_RE = re.compile(
     r"(?:\s+the|\s+a|\s+an)?\s*$",
     re.IGNORECASE,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# THE HARD LINE — TYPE-TERM SHAPE (is this surface a PLACE, or a fragment of a MEMORY?)
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# Flag-gated so OFF is byte-for-byte today's behavior (CLAUDE.md flag convention).
+CONCEPT_TERM_SHAPE_GATE: bool = os.environ.get(
+    "CONCEPT_TERM_SHAPE_GATE", "true").strip().lower() in ("1", "true", "yes", "on")
+
+# ORTHOGRAPHIC admissibility for a TERM token. A designation is a LEXICAL item: letters, digits
+# (ipv6, http2), and the two characters the engine's own minted type names use as word joiners —
+# hyphen and underscore (file_extension, web_page) — plus the apostrophe. ANY other character
+# (path separators, dots, '+', '~', '@', ':') marks the surface as a lifted VALUE — a filename,
+# a path, an expression — i.e. user CONTENT, never a type designation. Parser-free, so this rule
+# still holds when spaCy is unavailable.
+_TERM_ADMISSIBLE_CHAR_RE = re.compile(r"^[0-9A-Za-z_\-' ]+$")
+
+# Closed-class POS tags whose PRESENCE disqualifies a surface as a term. These are FUNCTION-word
+# classes — finite, high-frequency, and the part of the tag set a statistical tagger gets right;
+# open-class tags on these short OOV surfaces are NOT reliable and are deliberately not consulted
+# (measured: spaCy en_core_web_sm tags `file_extension`->NUM, `data_structure`->X,
+# `wireguard`->ADJ, `notes.md`->NUM — an open-class rule would destroy the engine's own
+# legitimately-grown type nodes). Universal Dependencies POS tags:
+#   ADP   adposition  — a PP postmodifier makes the surface a DESCRIPTION, not a designation
+#                       ("need for review", "config file at ~/.config")
+#   DET   determiner  — a term is not referring ("the config file")
+#   PRON  pronoun     — anaphoric/deictic, has no independent concept ("my dog", "it")
+#   AUX / SCONJ / CCONJ / PART — clause machinery: running text, not a term
+_TERM_DISQUALIFYING_POS = frozenset({"ADP", "DET", "PRON", "AUX", "SCONJ", "CCONJ", "PART"})
+
+# Linguistic economy (ISO 704 §7.4): a designation is concise. A surface longer than this many
+# tokens is a clause/description lifted from the turn, not a term. Generous on purpose — real
+# multi-word types are 1-3 tokens ("corn snake", "information artifact").
+_TERM_MAX_TOKENS = 4
+
+
+def type_term_shape(surface: str) -> tuple:
+    """THE HARD LINE — is ``surface`` shaped like a TYPE TERM (an L4 PLACE), or is it a fragment
+    of user CONTENT (a MEMORY) that must never be given an is-a ladder?
+
+    Returns ``(ok: bool, reason: str)``. ``ok=True`` means the surface is admissible as a concept
+    designation; ``ok=False`` names the rule that rejected it (for a loud, greppable log line).
+
+    WHY THIS EXISTS. The ingest concept-grounding queue admits ANY un-laddered relational OBJECT
+    as a "novel concept" needing a place in L4. That is correct for a real type and a category
+    error for a value: observed in a live deployment, the queue had minted
+    ``config file at ~/.config/example/settings.json`` (from `owns`), ``alpha+beta`` (`embed`),
+    ``.md file extension`` (`use`), and ``notes.md`` (`instance_of`) as concepts, each then
+    driving repeated LLM "what is X?" classification. Those are things the user SAID — memories —
+    and per the founding distinction a name/value/specific instance NEVER becomes a place.
+
+    THE MECHANISM, AND ITS NAME. This is TERM ADMISSIBILITY, the terminology-science distinction
+    between a DESIGNATION (a term: a noun or noun phrase that names a concept) and a DEFINITION or
+    running text that merely describes one — ISO 704 "Terminology work — Principles and methods"
+    (term formation; §7.4 linguistic economy), the same principle behind ontology class-label
+    conventions such as the OBO Foundry naming conventions (labels are common-noun nominals, not
+    sentences). The test is applied STRUCTURALLY, in three rules, and is subject-agnostic — there
+    is NO domain vocabulary, NO word list, NO entity/type literal, NO similarity score:
+
+      (1) ORTHOGRAPHIC  — every character must be lexically admissible (see
+          ``_TERM_ADMISSIBLE_CHAR_RE``). A path/filename/expression is a VALUE.
+      (2) LEXICAL CONTENT — at least one token carrying >= 2 alphabetic characters, so a bare
+          symbol or single letter ("f") is not minted as a place.
+      (3) CLOSED-CLASS FUNCTION WORDS — no ADP/DET/PRON/AUX/SCONJ/CCONJ/PART token (UD tag set).
+          Function words are the reliably-tagged part of the tag set; their presence means the
+          surface is a phrase or clause, not a designation. Plus the ISO-704 economy bound
+          ``_TERM_MAX_TOKENS``.
+
+    FAIL-SAFE / GRACEFUL DEGRADATION. Rules (1)+(2) are parser-free and always apply. Rule (3)
+    needs spaCy; when the layer is unavailable it is SKIPPED (the surface passes on (1)+(2)
+    alone) rather than rejecting wholesale — an absent parser must not silently stop the engine
+    from growing its ontology. Rejecting a surface never loses user data: the fact, the entity and
+    the alias are already committed by the caller; only the is-a LADDER is withheld, which is
+    exactly the HARD LINE outcome (a memory keeps its place *as a memory*).
+
+    Flag: ``CONCEPT_TERM_SHAPE_GATE`` (default ON; OFF returns ``(True, "gate_off")`` = byte-for-byte
+    today's behavior)."""
+    if not CONCEPT_TERM_SHAPE_GATE:
+        return (True, "gate_off")
+    s = (surface or "").strip()
+    if not s:
+        return (False, "empty")
+    # (1) ORTHOGRAPHIC — a term is a lexical item, not a path/filename/expression.
+    if not _TERM_ADMISSIBLE_CHAR_RE.match(s):
+        return (False, "non_lexical_orthography")
+    toks = s.split()
+    # (3a) ISO 704 §7.4 linguistic economy — a designation is concise, not a clause.
+    if len(toks) > _TERM_MAX_TOKENS:
+        return (False, "too_many_tokens")
+    # (2) LEXICAL CONTENT — at least one real word (>= 2 alphabetic chars).
+    if not any(sum(1 for ch in t if ch.isalpha()) >= 2 for t in toks):
+        return (False, "no_lexical_content")
+    # (3b) CLOSED-CLASS FUNCTION WORDS — needs the parser; absent parser → skip (fail-open).
+    try:
+        doc = _parse(s)
+    except Exception:  # noqa: BLE001 — a parse failure must not block ontology growth
+        doc = None
+    if doc is not None:
+        for tok in doc:
+            if tok.pos_ in _TERM_DISQUALIFYING_POS:
+                return (False, f"function_word:{tok.pos_}:{tok.text.lower()[:24]}")
+    return (True, "term")
