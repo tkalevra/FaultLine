@@ -48,6 +48,8 @@ from typing import Optional, Any
 
 import httpx
 
+from src.api import llm_source_ip
+
 log = structlog.get_logger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -809,7 +811,11 @@ def call_llm_with_retry_sync(
 
                 start_time = time.time()
 
-                response = _llm_http_client.post(
+                # Outbound source-IP spreading (opt-in LLM_SOURCE_IPS): rotate the
+                # bound source address per call. Unset env → uses _llm_http_client
+                # unchanged. Fail-safe: a bad/unbindable IP falls back to it.
+                response = llm_source_ip.post_sync(
+                    _llm_http_client,
                     endpoint,
                     json=payload,
                     headers=get_llm_headers(),
@@ -995,7 +1001,11 @@ async def call_llm_with_retry_async(
                 # Lazy import to avoid circular dependencies
                 from src.api.main import _http_client
 
-                response = await _http_client.post(
+                # Outbound source-IP spreading (opt-in LLM_SOURCE_IPS): rotate the
+                # bound source address per call. Unset env → uses _http_client
+                # unchanged. Fail-safe: a bad/unbindable IP falls back to it.
+                response = await llm_source_ip.post_async(
+                    _http_client,
                     endpoint,
                     json=payload,
                     headers=get_llm_headers(),
@@ -1168,7 +1178,10 @@ def call_llm_no_retry_sync(
 
         start_time = time.time()
 
-        response = _llm_http_client.post(
+        # Outbound source-IP spreading (opt-in LLM_SOURCE_IPS): rotate the bound
+        # source address per call. Unset env → uses _llm_http_client unchanged.
+        response = llm_source_ip.post_sync(
+            _llm_http_client,
             endpoint,
             json=payload,
             headers=get_llm_headers(),
@@ -1287,3 +1300,6 @@ def reset_circuit_breaker():
 def close_llm_http_client() -> None:
     """Close the module-level LLM HTTP client. Call from process shutdown paths."""
     _llm_http_client.close()
+    # Also close any per-source-IP clients cached by the spreading layer (no-op
+    # when LLM_SOURCE_IPS is unset, which is the default).
+    llm_source_ip.close_all()
