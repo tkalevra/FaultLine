@@ -6978,6 +6978,25 @@ def _queue_concept_for_grounding(
     # this mirrors it. Subject-agnostic: user_id is the runtime anchor, not a hardcoded subject.
     if concept_object_id in (subject_id, "user") or (user_id and concept_object_id == user_id):
         return False
+    # THE HARD LINE — TERM ADMISSIBILITY. The un-laddered gate below asks "does this object have a
+    # place yet?"; it never asks "is this object the KIND OF THING that gets a place at all?" So any
+    # relational object lifted verbatim from the turn was queued as a novel CONCEPT: measured on
+    # production, `config file at ~/.config/example/settings.json` (via `owns`), `alpha+beta` (via
+    # `embed`), `.md file extension` (via `use`) and `notes.md` (via `instance_of`) were each
+    # minted as concepts and driven through repeated LLM "what is X?" classification. Those are
+    # MEMORIES — things the user said — and a value/name never becomes a place.
+    # Structural + parser-based, subject-agnostic, no word list (see `type_term_shape`); cheap and
+    # parser-only, so it runs BEFORE the two DB probes below. Fail-safe: on any import/parse error
+    # the surface passes (today's behavior) — an absent parser must not stop ontology growth.
+    try:
+        from src.extraction.linguistics import type_term_shape
+        _ok_term, _term_why = type_term_shape(concept)
+        if not _ok_term:
+            log.info("ingest.concept_grounding_refused_not_a_term",
+                     concept=concept[:80], rel_type=(rel_type or "")[:40], reason=_term_why)
+            return False
+    except Exception:  # noqa: BLE001 — never block ingest over the shape check
+        pass
     try:
         with db_conn.cursor() as _cur:
             _cur.execute("SAVEPOINT sp_queue_concept_ground")
@@ -23966,16 +23985,46 @@ async def ingest(req: IngestRequest, model=Depends(get_gliner_model)):
                                 # engine "what is X?" classifier picks up ONLY genuine
                                 # user-derived misses (the unknown CONCEPT sits in sample_object).
                                 # Plain type-inconsistent quarantines keep the legacy method.
+                                # THE HARD LINE — TERM ADMISSIBILITY (same gate as
+                                # `_queue_concept_for_grounding`; this is the SECOND ingest producer
+                                # of `ingest_miss_pushback` rows and it carried NONE of that
+                                # helper's guards, so a lifted user surface reached the what-is
+                                # classifier through here unchecked). A surface that is not a term
+                                # is DOWNGRADED to the plain quarantine method, NOT dropped: the row
+                                # (and the Class-C staged fact above) still preserve the
+                                # information — we withhold only the L4 CLASSIFICATION, because
+                                # `classify_unknown_concepts` reads `ingest_miss_pushback` only.
+                                # Fail-safe: any error → today's behavior.
+                                _qe_concept = (str(_miss_pushback_object).lower().strip()
+                                               if _miss_pushback_object else "")
+                                _qe_is_term = True
+                                if _miss_pushback_object:
+                                    try:
+                                        from src.extraction.linguistics import type_term_shape
+                                        _qe_is_term, _qe_why = type_term_shape(_qe_concept)
+                                        if not _qe_is_term:
+                                            log.info(
+                                                "ingest.quarantine_pushback_refused_not_a_term",
+                                                concept=_qe_concept[:80],
+                                                rel_type=edge.rel_type.lower()[:40],
+                                                reason=_qe_why)
+                                    except Exception:  # noqa: BLE001 — never block ingest
+                                        _qe_is_term = True
                                 _qe_method = (
                                     "ingest_miss_pushback"
-                                    if _miss_pushback_object
+                                    if (_miss_pushback_object and _qe_is_term)
                                     else "ingest_quarantine"
                                 )
                                 _qe_reason = (
                                     "miss on user-derived thing — C-raw stored; unknown concept "
                                     "queued for background 'what is X?' classify"
-                                    if _miss_pushback_object
-                                    else "type-inconsistent edge quarantined at ingest (info preserved)"
+                                    if (_miss_pushback_object and _qe_is_term)
+                                    else ("miss on user-derived thing — C-raw stored; surface is "
+                                          "not a type TERM (user content), so it is NOT queued for "
+                                          "'what is X?' classify (THE HARD LINE)"
+                                          if _miss_pushback_object
+                                          else "type-inconsistent edge quarantined at ingest "
+                                               "(info preserved)")
                                 )
                                 with db.cursor() as _qe_cur:
                                     _qe_cur.execute(

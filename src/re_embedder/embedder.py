@@ -2392,6 +2392,21 @@ _CLIMB_MAX_ATTEMPTS = int(os.environ.get("ENGINE_CLASSIFY_MAX_ATTEMPTS", "3") or
 # fingerprint change). 0 disables time-backoff (rely on fingerprint + cap only).
 _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or "60")
 
+# LIFETIME CEILING — the cap above is bounded by the FINGERPRINT, and the fingerprint contains a
+# TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
+# nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
+# on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
+# BINDS. Measured on a live deployment: with cap = 3, individual concepts sat at
+# attempt_count in the high hundreds — each one a re-classification burning LLM calls — with
+# dozens of rows over cap and thousands of recorded attempts on a single tenant.
+# This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a
+# global-ontology bump cannot reset. It does NOT replace the additive re-validation: below the
+# ceiling a fingerprint change still re-opens a concept exactly as before. `attempt_count` is a
+# LIFETIME failure counter (reset to 0 only on a 'placed' verdict), so a concept that ever succeeds
+# starts over. 0 disables the ceiling (pure legacy behavior).
+_CLIMB_LIFETIME_MAX_ATTEMPTS = int(
+    os.environ.get("ENGINE_CLASSIFY_LIFETIME_MAX_ATTEMPTS", "25") or "25")
+
 
 def _concept_fingerprint(db_conn, entity_id: str) -> str:
     """Cheap, deterministic per-concept input fingerprint for additive re-validation.
@@ -2462,6 +2477,16 @@ def _climb_state_should_skip(db_conn, entity_id: str, fingerprint: str) -> bool:
     if not row:
         return False
     verdict, attempts, cached_fp, last_at = row[0], int(row[1] or 0), row[2], row[3]
+    # LIFETIME CEILING — checked BEFORE the fingerprint comparison, because the fingerprint carries
+    # a tenant-GLOBAL term that a growing ontology bumps constantly, which re-opens every capped
+    # concept and makes `_CLIMB_MAX_ATTEMPTS` unreachable (see the constant's note for the measured
+    # production numbers). A concept that has failed this many times is not one more ontology
+    # parent away from resolving; it needs its own evidence. `attempt_count` resets to 0 on a
+    # 'placed' verdict, so this never permanently retires a concept that can be placed.
+    if (_CLIMB_LIFETIME_MAX_ATTEMPTS > 0
+            and verdict != "placed"
+            and attempts >= _CLIMB_LIFETIME_MAX_ATTEMPTS):
+        return True
     # Additive re-validation: inputs changed → re-open regardless of prior verdict.
     if (cached_fp or "") != (fingerprint or ""):
         return False
@@ -4500,6 +4525,21 @@ def _quarantine_climb_tip(db_conn, tip_id: Optional[str], tip_name: str) -> None
     name = (tip_name or "").strip().lower()
     if not name:
         return
+    # THE HARD LINE — TERM ADMISSIBILITY (third and last writer of `ingest_miss_pushback` rows;
+    # the two ingest-side writers in main.py carry the same gate). The names arriving here are
+    # LLM-PROPOSED parents/tips, so they are normally well-formed snake_case type names and pass
+    # untouched — this is the defense-in-depth arm that stops a malformed proposal (a path, an
+    # expression, a lifted phrase) from being minted as a concept and re-entering the very
+    # classifier that proposed it. Fail-safe: any import/parse error → today's behavior (insert).
+    try:
+        from src.extraction.linguistics import type_term_shape
+        _ok_term, _term_why = type_term_shape(name)
+        if not _ok_term:
+            log.info("climb.tip_quarantine_refused_not_a_term",
+                     tip=name[:80], reason=_term_why)
+            return
+    except Exception:  # noqa: BLE001 — never break the sweep over the shape check
+        pass
     # sample_subject_id is part of the UNIQUE key (candidate_rel_type, sample_subject_id,
     # sample_object); the tip's own entity UUID keys it (or 'climb' when an unresolved
     # proposed parent has no node yet). The async whatis consumer reads sample_object.
