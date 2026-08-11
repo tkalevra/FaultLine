@@ -67,6 +67,24 @@ _sem: Optional[asyncio.Semaphore] = None
 _sem_loop: Optional[asyncio.AbstractEventLoop] = None
 _sem_lock = threading.Lock()
 
+# Optional host-supplied escalation hook, set via ``set_notifier``. Kept as a plain
+# module-level slot rather than an import of any particular mailer so this file has NO
+# dependency on the layer above it — the open core must not reference the closed one, and a
+# self-hosted install must not need a mail stack to use admission control.
+_notifier = None
+
+
+def set_notifier(fn) -> None:
+    """Register ``fn(message: str, snapshot: dict)`` to escalate a barrier trip.
+
+    Called once at startup by whatever owns alerting for this deployment (an email sender, a
+    webhook, a pager). Passing ``None`` clears it. The callback is invoked at most once per
+    ``TURN_BARRIER_ALERT_INTERVAL_S`` and any exception it raises is swallowed.
+    """
+    global _notifier
+    _notifier = fn
+
+
 _state_lock = threading.Lock()
 _state = {
     "in_flight": 0,
@@ -206,17 +224,20 @@ def notify_trip(log, *, waited_s: float, in_flight: int) -> None:
                     shed_total=snap["shed"], peak_in_flight=snap["peak_in_flight"])
     except Exception:
         pass
-    # Operator email, via the SAME Migadu helper the brain alerts use. Fail-closed inside
-    # send_email (it returns a dict, never raises) and wrapped anyway.
-    try:
-        from saas import platform_settings as _ps
-        to = _ps.notify_email()
-        if to:
-            from saas import smtp_sender as _smtp
-            _smtp.send_email(to, "FaultLine: turn barrier tripped (capacity)",
-                             msg, f"<p>{msg}</p>", require_enabled=True)
-    except Exception:
-        pass
+    # Escalate through whatever the HOST registered, if anything. This module deliberately
+    # knows NOTHING about mail, webhooks, or any particular deployment's alerting — it hands
+    # over a formatted message and a structured snapshot and lets the host decide. A
+    # deployment with no notifier configured gets the log line above and nothing else, which
+    # is the correct default for a self-hosted install that has no operator inbox.
+    #
+    # Best-effort by construction: a notifier that raises is swallowed. This fires while the
+    # box is ALREADY at capacity, and an alerting failure must never become a second outage.
+    fn = _notifier
+    if fn is not None:
+        try:
+            fn(msg, snap)
+        except Exception:
+            pass
 
 
 def busy_alert() -> dict:
