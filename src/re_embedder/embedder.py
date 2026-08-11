@@ -25,6 +25,7 @@ from src.api.llm_calls import (
     LLMTimeouts,
     LLMModels,
 )
+from src.api.llm_lane import LLMUnavailable
 from src.entity_registry.registry import preference_rank, EntityRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -2690,6 +2691,8 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
             user_id="re_embedder",
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # A call that never happened must not be cached as a classification verdict.
+            raise_on_unavailable=True,
         )
         if not result or not isinstance(result, dict):
             return None
@@ -2719,6 +2722,9 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
                 parent = None
         log.info(f"re_embedder.whatis concept={c[:40]} type={entity_type} parent={parent}")
         return {"entity_type": entity_type, "parent": parent}
+    except LLMUnavailable:
+        # Never asked → the caller must NOT record a verdict for this concept.
+        raise
     except Exception as e:
         log.warning(f"re_embedder.whatis_query_failed concept={c[:40]} error={type(e).__name__}: {str(e)[:100]}")
         return None
@@ -2808,6 +2814,10 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             timeout=LLMTimeouts.get("CLASSIFY_CHAIN"),
             operation="CLASSIFY_CHAIN",
             max_tokens=LLMMaxTokens.get("CLASSIFY_CHAIN"),
+            # DIDN'T-HAPPEN must not read as "answered nothing": this function's callers
+            # CACHE A VERDICT on a None return (climb_state 'placed'/'unplaceable') and burn
+            # the concept's retry budget doing it.
+            raise_on_unavailable=True,
         )
         if not result or not isinstance(result, dict):
             return None
@@ -2849,9 +2859,36 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             return None
         log.info(f"re_embedder.whatis_chain concept={cl[:40]} chain={ordered}")
         return ordered
+    except LLMUnavailable:
+        # The brain was NEVER ASKED. Propagate: the caller must skip this concept WITHOUT
+        # recording a verdict.
+        raise
     except Exception as e:
         log.warning(f"re_embedder.whatis_chain_query_failed concept={c[:40]} error={type(e).__name__}: {str(e)[:100]}")
         return None
+
+
+# Sentinel: "the brain was never asked — abandon this sweep", distinct from every real
+# answer INCLUDING None (which legitimately means "asked, and there is no classification").
+_BRAIN_UNAVAILABLE = object()
+
+
+def _ask_brain(fn, *args, stats: Optional[dict] = None, what: str = "", **kwargs):
+    """Call an LLM helper, converting LLMUnavailable into an explicit ABORT sentinel.
+
+    The whole point of the sentinel is that it is NOT None. Every caller in this module
+    treats None as a decision ("the model could not classify this") and caches it; a call
+    that never reached the model has produced no such evidence and must not be recorded.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except LLMUnavailable as e:
+        if stats is not None:
+            stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+        log.warning(f"re_embedder.sweep_aborted_brain_unavailable lane={what} "
+                    f"reason={e.reason} operation={e.operation} "
+                    f"note=no verdict cached, no attempt burned; retried on a later sweep")
+        return _BRAIN_UNAVAILABLE
 
 
 def _is_ancestor_or_descendant(db_conn, x_id: str, y_id: str, max_walk: int = 64) -> bool:
@@ -3089,7 +3126,19 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
                           extra={"concept": concept, "path": "whatis_oe_capped"})
                 continue
 
-            proposal = _query_llm_what_is(concept, qwen_api_url, context=_context)
+            try:
+                proposal = _query_llm_what_is(concept, qwen_api_url, context=_context)
+            except LLMUnavailable as _unavail:
+                # THE BRAIN WAS NEVER ASKED. Do NOT record a verdict, do NOT bump the attempt
+                # counter, and do NOT keep sweeping — every remaining concept in this batch
+                # would hit the same unavailable brain. The rows stay UNDECIDED and are picked
+                # up unchanged on a later cycle.
+                stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+                log.warning(f"re_embedder.whatis_aborted_brain_unavailable "
+                            f"reason={_unavail.reason} concept={concept[:40]} "
+                            f"batch_size={len(rows)} "
+                            f"note=no verdict cached; batch abandoned until the brain returns")
+                break
             if not proposal:
                 # LLM could not classify → record 'unplaceable' so we DON'T re-LLM it every
                 # cycle (the apparel_item 9x/40s runaway). The OE row stays UNDECIDED (C is the
@@ -3998,7 +4047,10 @@ def climb_classification_chains(
                 # one pass, cycle-guarded, superseding the too-direct edge atomically. This fixes
                 # the rung-by-rung STALL (qwen returns the whole taxonomy in one shot but refuses
                 # the next rung asked one at a time).
-                full_chain = _query_llm_full_chain(leaf_name, qwen_api_url)
+                full_chain = _ask_brain(_query_llm_full_chain, leaf_name, qwen_api_url,
+                                        stats=stats, what="climb_splice_full_chain")
+                if full_chain is _BRAIN_UNAVAILABLE:
+                    break
                 advanced += 1
                 if full_chain:
                     # ±6 FROM THE RESIDENCE: the budget for NEW rungs above this anchor is 6 minus
@@ -4025,7 +4077,10 @@ def climb_classification_chains(
 
                 # SINGLE-RUNG SPLICE (FALLBACK): LLM PROPOSES the leaf's IMMEDIATE parent only
                 # (dog → canine). Used when the one-shot full chain returned nothing usable.
-                proposal = _query_llm_what_is(leaf_name, qwen_api_url)
+                proposal = _ask_brain(_query_llm_what_is, leaf_name, qwen_api_url,
+                                      stats=stats, what="climb_splice_single_rung")
+                if proposal is _BRAIN_UNAVAILABLE:
+                    break
                 inter = ((proposal or {}).get("parent") or "").strip().lower() if proposal else ""
                 if not inter or inter == leaf_name or inter == direct_root:
                     # No genuine intermediate (leaf is already one rung below the root, or the
@@ -4084,7 +4139,10 @@ def climb_classification_chains(
             # remaining ladder above the tip and place EVERY rung in one pass (cycle-guarded,
             # terminate at a seeded root, else quarantine the final tip). No too-direct edge to
             # supersede here (old_root_name=None) — we are EXTENDING an un-grounded tip upward.
-            full_chain = _query_llm_full_chain(tip_name, qwen_api_url)
+            full_chain = _ask_brain(_query_llm_full_chain, tip_name, qwen_api_url,
+                                    stats=stats, what="climb_tip_full_chain")
+            if full_chain is _BRAIN_UNAVAILABLE:
+                break
             advanced += 1
             if full_chain:
                 # ±6 FROM THE RESIDENCE: the tip sits `hops` above the residence-leaf, so its
@@ -4108,7 +4166,10 @@ def climb_classification_chains(
                 # else fall through to the single-rung climb FALLBACK below.
 
             # SINGLE-RUNG CLIMB (FALLBACK): ask the LLM "what is <tip>?" (proposes a parent).
-            proposal = _query_llm_what_is(tip_name, qwen_api_url)
+            proposal = _ask_brain(_query_llm_what_is, tip_name, qwen_api_url,
+                                  stats=stats, what="climb_tip_single_rung")
+            if proposal is _BRAIN_UNAVAILABLE:
+                break
             if not proposal or not proposal.get("parent"):
                 # LLM had no genuine parent (already general) → leave it; converge/decay
                 # handle the rest. Not an error. CACHE 'unplaceable'/no_parent — re-open only
