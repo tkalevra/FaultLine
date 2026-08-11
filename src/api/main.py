@@ -5,6 +5,8 @@ import os
 import re
 import traceback
 import uuid
+import threading          # module-level: _REL_TYPE_CATEGORY_LOCK guards the rel_type memo
+import time               # module-level: time.monotonic() for TTL/deadline arithmetic
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -15,6 +17,7 @@ import psycopg2
 import redis
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse   # 503 shed response at the turn barrier
 from src.api.logging_config import set_log_level, get_log_level, LogLevel, log_crit
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry
@@ -39,6 +42,8 @@ from src.api import linguistic_cue_overlay
 from .models import EdgeInput, EntityResult, FactResult, FactCorrectionRequest, FactCorrectionResponse, IngestRequest, IngestResponse, LearnTopicRequest, QueryRequest, RelTypeRequest, RetractRequest, RetractResponse, RewriteRequest, RewriteResponse, StoreContextRequest, StoreContextResponse, EpisodicAppendRequest, DocumentEnqueueRequest, ConversationMessage, QueryPath, QueryResponse
 from .llm_client import get_llm_headers, build_llm_payload, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from .llm_calls import call_llm_with_retry_sync, call_llm_no_retry_sync, LLMTimeouts, LLMModels, generate_rel_type_phrasing
+from . import turn_budget as _turn_budget
+from . import turn_barrier as _turn_barrier
 from .idempotency import IdempotencyManager
 
 log = structlog.get_logger()
@@ -3793,13 +3798,50 @@ def _infer_category(rel_type: str) -> str | None:
         return "identity"
     return None
 
+# ── rel_type category memo (TTL) ──────────────────────────────────────────────────────────
+# _get_rel_type_category opened a BRAND NEW psycopg2 connection per call to run one trivial
+# indexed SELECT, and fetch_facts_from_anchor calls it once per fact. Caught live with py-spy
+# on 2026-08-10, mid-request, on the MainThread:
+#
+#     connect (psycopg2/__init__.py:122) → _get_rel_type_category → fetch_facts_from_anchor
+#
+# On the measured seat that is up to 185 TCP connections + auth handshakes for ONE recall —
+# 3.2s of a 3.26s turn, none of it spent on the query. Distinct rel_types number in the dozens,
+# so the same handful of answers were being re-fetched over a new socket every time.
+#
+# TTL rather than permanent because the DB read exists for a REASON the docstring names: novel
+# rel_types approved by re_embedder must become visible without a restart. 60s bounds that
+# staleness while collapsing the storm to at most one connection per rel_type per minute.
+# Negative results are cached too — an unknown rel_type is the common case in the fact loop and
+# is exactly what was paying full connection cost to learn nothing.
+# Tail reserved for the in-flight inference pass + response assembly when abandoning the
+# informative-abstention walk (see _fetch_informative_abstention).
+_IA_RESERVE_S = float(os.environ.get("INFORMATIVE_ABSTENTION_RESERVE_S", "0.35"))
+_REL_TYPE_CATEGORY_TTL_S = float(os.environ.get("REL_TYPE_CATEGORY_TTL_S", "60"))
+_REL_TYPE_CATEGORY_MEMO: dict[str, tuple[float, str | None]] = {}
+_REL_TYPE_CATEGORY_LOCK = threading.RLock()
+
+
 def _get_rel_type_category(rel_type: str) -> str | None:
     """
-    Get category for rel_type: DB → cache → keyword inference.
-    Queries DB directly to include novel rel_types approved by re_embedder.
+    Get category for rel_type: memo → DB → cache → keyword inference.
+    Queries DB to include novel rel_types approved by re_embedder; the result is memoized for
+    _REL_TYPE_CATEGORY_TTL_S so a fact loop does not reopen a connection per fact.
     """
+    _rt_key = (rel_type or "").lower()
+    _now = time.monotonic()
+    with _REL_TYPE_CATEGORY_LOCK:
+        _hit = _REL_TYPE_CATEGORY_MEMO.get(_rt_key)
+        if _hit is not None and (_now - _hit[0]) < _REL_TYPE_CATEGORY_TTL_S:
+            if _hit[1] is not None:
+                return _hit[1]
+            # Cached MISS → skip the DB round-trip and fall straight through to the static
+            # cache + keyword inference below, which is what the DB miss would have done.
+            _rt_db_miss = True
+        else:
+            _rt_db_miss = False
     dsn = os.environ.get("POSTGRES_DSN")
-    if dsn:
+    if dsn and not _rt_db_miss:
         try:
             with psycopg2.connect(dsn) as conn:
                 with conn.cursor() as cur:
@@ -3809,8 +3851,14 @@ def _get_rel_type_category(rel_type: str) -> str | None:
                     )
                     row = cur.fetchone()
                     if row and row[0]:
+                        with _REL_TYPE_CATEGORY_LOCK:
+                            _REL_TYPE_CATEGORY_MEMO[_rt_key] = (_now, row[0])
                         return row[0]
+                    with _REL_TYPE_CATEGORY_LOCK:
+                        _REL_TYPE_CATEGORY_MEMO[_rt_key] = (_now, None)
         except Exception as e:
+            # NOT memoized: a DB fault is transient and must not pin a degraded answer for the
+            # whole TTL. We fall back for THIS call and retry the DB on the next one.
             log.warning("rel_type_category.db_query_failed", rel_type=rel_type, error=str(e))
     # Fallback to cache
     meta = _REL_TYPE_META.get(rel_type.lower(), {})
@@ -32915,12 +32963,35 @@ def _aspect_map_via_llm(aspect_word: str, candidates: list):
         "Respond with ONLY valid JSON (no markdown):\n"
         '{"attribute": "<one name exactly, or null>", "confidence": 0.0-1.0}'
     )
+    # ── TURN DEADLINE: can this turn afford a brain call AT ALL? ────────────────────────
+    # Measured 2026-08-10 (n=30, one seat): turns that reached this call ran 3.5-19.8s against
+    # a 2s budget; turns that did not ran 0.08-0.79s. This ONE call was the whole gap —
+    # 2 words x 8s = 16s of SYNCHRONOUS LLM inside an async handler, blocking the event loop
+    # for every concurrent tenant, and then DISCARDED on breach because the async backstop
+    # below already handles the word.
+    #
+    # So we ask the turn, not the clock: is there room? If not we do not dial. Returning
+    # ``called_ok=False`` is not a new code path — it is the EXISTING "timed out → let the
+    # async grower handle it" contract, which the caller answers with _aspect_record_miss.
+    # The word still gets mapped; it gets mapped OFF the customer's turn. Steady state is
+    # unchanged (the second query for the same word is deterministic either way) — all we
+    # give up is resolving a brand-new aspect word within the very first query that used it.
+    #
+    # Unbudgeted callers (re_embedder sweeps, tests, CLI) get inf and behave exactly as today.
+    _asp_cost = min(_ASPECT_INLINE_TIMEOUT_S, float(LLMTimeouts.get("ENRICHMENT") or 15))
+    if not _turn_budget.can_afford(_asp_cost, what=f"aspect_synonym:{aspect_word[:24]}"):
+        log.info("aspect_synonym.skipped_over_budget", aspect=aspect_word[:32],
+                 cost_s=round(_asp_cost, 2), remaining_s=round(_turn_budget.remaining(), 3))
+        return None, 0.0, False
+    # Admitted — but never for longer than the turn has left, so a call let in with 0.9s of
+    # budget cannot overrun on its stock 8s socket timeout.
+    _asp_cost = _turn_budget.clamp_timeout(_asp_cost)
     try:
         result = call_llm_no_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("ENRICHMENT"),
             user_id="aspect_synonym",
-            timeout=min(_ASPECT_INLINE_TIMEOUT_S, float(LLMTimeouts.get("ENRICHMENT") or 15)),
+            timeout=_asp_cost,
             operation="ENRICHMENT",
         )
     except Exception:
@@ -38556,6 +38627,34 @@ def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_i
     """
     if db is None or not user_id or not absent_terms:
         return None
+    # ── TURN DEADLINE: this is PRESENTATION, and presentation is the first thing to cut ─────
+    # Measured 2026-08-10 with py-spy against the live handler: this walk was the ENTIRE
+    # remaining latency gap on an abstaining turn — 8.4s of the 8.76s total, caught mid-flight as
+    #
+    #     _gliner_canonical_type → _canon → <genexpr> → _neighbour_matches
+    #       → _fetch_informative_abstention → _query_impl        [MainThread, active+gil]
+    #
+    # i.e. GLiNER2/DeBERTa forward passes run ONCE PER NEIGHBOUR PER TYPE-SIGNAL (139 entities on
+    # the measured seat) — synchronous CPU inference, on the event loop, holding the GIL, so every
+    # OTHER tenant's turn queues behind it too. All of it to upgrade "no record" into "You have a
+    # cat named Luna. You have not mentioned a hamster."
+    #
+    # That upgrade is worth real money on a turn that can afford it and worth nothing on a turn
+    # that has already blown its budget — the customer gets a slower ABSTENTION either way. So we
+    # check the clock before starting, not after. ``None`` is not a new branch: the docstring
+    # above already specifies it as "the caller's honest bare abstention stands", which is what
+    # the caller does with it.
+    #
+    # Cost is estimated, not measured, because the real cost scales with neighbour count we have
+    # not queried yet; ``INFORMATIVE_ABSTENTION_COST_S`` is a floor on "this is not free".
+    _ia_cost = float(os.environ.get("INFORMATIVE_ABSTENTION_COST_S", "1.0"))
+    if _turn_budget.remaining() <= _IA_RESERVE_S or not _turn_budget.can_afford(
+            _ia_cost, what="informative_abstention"):
+        log.info("query.phase5.informative_abstention_skipped_over_budget",
+                 remaining_s=round(_turn_budget.remaining(), 3),
+                 note="bare abstention served instead; answer is unchanged in kind, only less "
+                      "decorated — the turn deadline outranks presentation")
+        return None
     gmodel = get_gliner_model()
     if not gmodel:
         return None  # cannot type the queried noun → no informative walk → honest bare abstention
@@ -38690,6 +38789,105 @@ def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_i
 
 @app.post("/query")
 async def query(request: QueryRequest) -> QueryResponse:
+    """Customer-facing recall door — opens the TURN DEADLINE, then runs the real handler.
+
+    A thin wrapper ON PURPOSE. The budget has to be established at the DOOR, before any
+    downstream code can dial the brain, and the handler beneath is ~2.5k lines whose
+    indentation is not worth churning to wrap in a ``with``. Everything under here — however
+    deep, sync or async — reads the same ambient deadline via ``src.api.turn_budget``.
+
+    The budget NEVER aborts the turn. It only decides whether an OPTIONAL brain call is
+    affordable (see ``_aspect_map_via_llm``); the deterministic walk always runs to
+    completion and always answers. A turn that runs over budget is logged, not failed —
+    the recall still returns facts, and ``query.turn_budget`` is the signal that says which
+    turns are over and what the deadline refused for them.
+
+    ── WHY THE BODY RUNS IN A THREAD ────────────────────────────────────────────────────
+    ``_query_impl`` is ~2.5k lines of BLOCKING work — psycopg2, GLiNER2/DeBERTa inference,
+    Qdrant — and it used to run directly on the event loop. Shortening it (16s of inline LLM
+    removed) reduced how LONG each turn held the loop but never stopped it HOLDING the loop,
+    so turns still serialized. Measured on this container, all HTTP 200, real facts:
+
+        concurrency   4 → p95 1.05s    0% over 2s
+        concurrency   8 → p95 2.20s   12.5% over      <- budget breached here
+        concurrency  40 → p95 10.67s  82.5% over
+
+    ~3.3 req/s ceiling: 20 concurrent turns took 6.13s wall against a 0.27s sequential mean
+    — essentially perfect serialization. Meanwhile ``/health`` at the same concurrency
+    answered in 0.06s, proving the loop itself was fine and the QUERY PATH was the lock.
+    The whole 51k-line module had exactly one ``asyncio.to_thread`` and it was not here.
+
+    ``run_in_threadpool`` puts the blocking body on anyio's worker pool, so the event loop
+    stays free to accept and progress other tenants' turns. It also propagates ContextVars,
+    which is what keeps the ambient turn budget working inside the worker.
+
+    This bounds CONCURRENCY, not CPU: GLiNER2 inference is still CPU-bound and the pool is
+    finite, so enough simultaneous heavy turns will still queue. It removes head-of-line
+    blocking — one slow turn no longer stalls every fast one — which is the property the
+    latency objective actually needs.
+    """
+    # ── ADMISSION CONTROL, BEFORE THE BUDGET ────────────────────────────────────────────
+    # The budget can shed OPTIONAL work inside a turn; it cannot conjure CPU. Past ~16
+    # concurrent this box is capacity-saturated (flat ~9.2 req/s, latency rising linearly
+    # with offered load), and at that point the budget correctly reports every turn as over
+    # while having nothing left to skip. Admission control is the only lever that keeps ANY
+    # turn inside the objective: bound the concurrent set to 14 so those turns stay in
+    # budget, rather than letting 80 customers share one uniformly-terrible experience.
+    #
+    # A turn only sheds after waiting out the grace period, so ordinary bursts become normal
+    # turns and only sustained saturation is refused. Valve: TURN_BARRIER_ENABLED=false.
+    _adm = await _turn_barrier.acquire()
+    if not _adm:
+        _turn_barrier.notify_trip(log, waited_s=_adm.waited_s, in_flight=_adm.in_flight)
+        log.warning("query.shed_at_barrier", waited_s=round(_adm.waited_s, 3),
+                    in_flight=_adm.in_flight, max_concurrent=_turn_barrier.MAX_CONCURRENT)
+        # 503 + Retry-After, NOT an empty 200. An empty recall is a CLAIM about the user's
+        # memory ("nothing stored"); we did not look, so we must not imply it. The alert
+        # rides the same `alerts` array MCP clients already render.
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "1"},
+            content={"anchor": "", "facts": [], "preferred_names": {},
+                     "canonical_identity": "", "confidence_applied": False,
+                     "staged_facts_count": 0,
+                     "error": "server_busy: at capacity, recall not attempted",
+                     "alerts": [_turn_barrier.busy_alert()]},
+        )
+    # The budget starts HERE, before the offload, deliberately. Stamping it inside the
+    # worker would restart the clock after any queueing delay and report a 10s turn as
+    # `over_budget=False` — a deadline that cannot see the wait is a deadline that lies
+    # about exactly the load it was built to survive.
+    #
+    # NOTE it starts AFTER admission on purpose: grace-wait time is queueing for capacity,
+    # not time the turn spent working, and charging it to the budget would make an admitted
+    # turn skip enrichment it can comfortably afford.
+    with _turn_budget.open_budget(label="query"):
+        try:
+            # ASYNC PRELUDE — must not run in the worker thread.
+            # `_ensure_tenant_ready` awaits provisioning; it is the one await this handler
+            # ever had, hoisted here so the body below can be plain sync code.
+            _uid = _require_resolvable_user_id(request.user_id, "/query")
+            await _ensure_tenant_ready(_uid, "/query")
+            from starlette.concurrency import run_in_threadpool
+            return await run_in_threadpool(_query_impl, request)
+        finally:
+            # Emitted for EVERY turn, budgeted or over. This is the observability the
+            # objective is measured on: a deadline you cannot see working is
+            # indistinguishable from one that never fires.
+            try:
+                log.info("query.turn_budget", **_turn_budget.report(),
+                         admission_waited_s=round(_adm.waited_s, 3),
+                         in_flight=_adm.in_flight)
+            except Exception:
+                pass
+            # ALWAYS return the slot — including on an exception path. A leaked slot
+            # permanently shrinks capacity, and enough of them close the barrier on a box
+            # that is actually idle: the failure mode would be a self-inflicted outage that
+            # looks exactly like sustained overload.
+            _turn_barrier.release()
+
+
+def _query_impl(request: QueryRequest) -> QueryResponse:
     """
     Phase 5 Query Endpoint: Simplified orchestration of Phase 1-4 components.
 
@@ -38718,11 +38916,11 @@ async def query(request: QueryRequest) -> QueryResponse:
     7. Return facts as prose (no UUIDs or rel_type names)
     """
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool read).
+    # NOTE: the caller (``query``) has ALREADY resolved the id and awaited
+    # ``_ensure_tenant_ready`` — both are async-side concerns and must happen BEFORE this
+    # body is handed to a worker thread. Re-resolving here is cheap, pure, and keeps this
+    # function correct if it is ever called directly again.
     user_id = _require_resolvable_user_id(request.user_id, "/query")
-
-    # === PHASE 2: BLOCK until the tenant schema is provisioned-AND-ready ===
-    # The recall walk reads tenant rel_types/taxonomies/facts — never read a missing schema.
-    await _ensure_tenant_ready(user_id, "/query")
     query_text = request.text
     conversation_history = request.conversation_history or []
     min_confidence = float(os.environ.get("MIN_INJECT_CONFIDENCE", 0.4))
