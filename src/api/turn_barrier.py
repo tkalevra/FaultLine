@@ -243,9 +243,16 @@ def notify_trip(log, *, waited_s: float, in_flight: int) -> None:
 def busy_alert() -> dict:
     """The alert a SHED turn carries back to the client.
 
-    Rides the existing ``alerts`` array that ``/query`` already returns and MCP clients
-    already render, so a shed turn is visibly 'server busy, retry' rather than silently
-    empty memory — which would otherwise read as 'you have no facts'.
+    It rides the same ``alerts`` array ``/query`` already returns. NOTE, because the earlier
+    version of this docstring overstated it: FaultLine's own MCP client does NOT surface this
+    payload. ``src/mcp/server.py`` calls ``resp.raise_for_status()`` before ``resp.json()``,
+    so on a 503 the body is never parsed — the ``HTTPStatusError`` propagates into
+    ``agent_proxy`` and lands on the non-timeout brain-error branch, which serves stale cache
+    or the non-fabricating "lookup did not finish" note. Behaviour is correct either way; the
+    payload is simply dead for that client and is here for HTTP callers that read the body.
+
+    The 503 status is the load-bearing part, not this text: an empty 200 would read as "you
+    have no facts", which is a claim about the user's memory that we did not look up.
     """
     return {
         "alert_type": "server_busy",
