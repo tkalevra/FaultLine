@@ -6764,8 +6764,17 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # SAME closed marker class as the "as" literal above, different dependency
                 # shape (UD case/mark on an obl/nmod head, not a Penn prep+pobj). NO word
                 # list; the verb-lemma gate (employment_verb cue class) still owns the
-                # construction, so "trabajo como un loco" (manner, non-employment) is
-                # excluded by POS only if "loco" tags ADJ, exactly as EN "work as a beast".
+                # construction.
+                # ⚠️ DIVERGENCE, STATED PLAINLY (critic f2edb560 round-5): Spanish "como"
+                # covers BOTH the role "as" AND the manner "like" ("trabajo como un perro" =
+                # work like a dog), so a MANNER idiom whose head tags NOUN/PROPN (measured:
+                # "loco" tags NOUN in "como un loco", PROPN in the bare "como loco") is read
+                # as an occupation — the exact over-acceptance of EN's own "as" arm ("I work
+                # as a beast" → occupation), with es's unified marker widening the surface to
+                # common idioms. There is NO grammatical discriminator (the role and manner
+                # shapes are structurally identical; an ADJ-tagged manner head — "médica"
+                # below — is excluded by POS, the only case that is) — separating them would
+                # need an occupation-noun word list, which the branch forbids.
                 _role = next(
                     (g for g in _v.children
                      if g.dep_ in ("nmod", "obl") and g.pos_ in ("NOUN", "PROPN")
@@ -8219,7 +8228,23 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # → ``_np_phrase``.
             try:
                 _lo = head.left_edge.i
-                _toks = [doc[_k] for _k in range(_lo, head.i + 1)]
+                _hi = head.i
+                # RIGHT-ATTACHED ROLE COMPLEMENTS (es, measured on es_core_news_md): a Spanish
+                # role title often carries a RIGHT-side modifier that left_edge..head misses —
+                # "ingeniero DE SOFTWARE" (nmod + case "de", a title specifier) and "ingeniero
+                # SENIOR" (amod). EN right-attaches nothing (its title modifiers sit left,
+                # captured whole by left_edge), so EN is byte-identical here. NEVER include an
+                # "en"/"para"-cased nmod — that is the ORG PP ("ingeniero de software EN
+                # Google"), the employer, which the org reader owns and must not fold into the
+                # role. Grammar/dep only, NO word list.
+                for _rc in head.children:
+                    if _rc.i <= head.i:
+                        continue
+                    if _rc.dep_ == "amod" or (_rc.dep_ == "nmod" and any(
+                            _rcc.dep_ == "case" and (_rcc.text or "").strip().lower() == "de"
+                            for _rcc in _rc.children)):
+                        _hi = max(_hi, _rc.i)
+                _toks = [doc[_k] for _k in range(_lo, _hi + 1)]
                 while _toks and (_toks[0].pos_ == "DET" or _toks[0].dep_ == "det"
                                  or _toks[0].pos_ == "SCONJ"  # es "como" role marker (mark of the role NP)
                                  or _toks[0].is_punct or _toks[0].is_space):
@@ -8230,7 +8255,19 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 return _np_phrase(head)
 
         for (_v, _subj, _role, _org) in _emp_binds:
-            if _is_first_person_personal_pronoun(_subj):
+            # RELATIVE-PRONOUN SUBJECT → ANTECEDENT (parity with the _emit chokepoint guard,
+            # which CANNOT fire here: this chain deliberately withholds subj_tok from _emit so
+            # a GLiNER2-minted rel cannot override the authoritative employment reading —
+            # measured: "Mi amigo QUE trabaja en Google" minted (que, works_for, google) until
+            # this arm). Resolve the relative pronoun to the noun it stands for (es "que" via
+            # the PronType=Rel arm, EN "that"/"who" via the Penn arm); unresolved → skip —
+            # a function word is never a memory (THE HARD LINE).
+            if _is_relative_pronoun(_subj):
+                _ante = _relative_pronoun_antecedent(_subj)
+                if not _ante:
+                    continue
+                subject = _ante
+            elif _is_first_person_personal_pronoun(_subj):
                 subject = "user"
             else:
                 subject = _np_phrase(_subj) or (_subj.text or _subj.lemma_ or "").strip().lower()
