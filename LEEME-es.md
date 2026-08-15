@@ -85,10 +85,10 @@ hecho almacenado no está "en inglés".
   `[]` (la captura real va por el seam de auto-predicación).
 - **Verbo en 1ª persona al inicio de frase homónimo de un sustantivo** (`Trabajo en Google`,
   `Corro en el parque`, `Nado en la piscina`, `Como una manzana`): `es_core_news_md` los etiqueta
-  como PROPN/SCONJ (la forma explícita `Yo trabajo en Google` sí captura `(user, trabajar_en, google)`
-  → alias → `works_for`; `Ana come una manzana` sí captura). Es una limitación del modelo, no de las
-  cadenas — sin una lista de verbos (prohibida) no hay señal gramatical que la separe de un nombre
-  propio o de la conjunción `como`.
+  como PROPN/SCONJ (la forma explícita `Yo trabajo en Google` sí captura → `works_for` directo, y
+  `Yo trabajo como ingeniero` → `occupation`, sin corrupción `has_state`; `Ana come una manzana`
+  sí captura). Es una limitación del modelo, no de las cadenas — sin una lista de verbos (prohibida)
+  no hay señal gramatical que la separe de un nombre propio o de la conjunción `como`.
 - **Psicoverbos en tercera persona** (`A María le gusta el café` → `(café, gustar, maría)`): es la
   estructura gramatical española literal («el café gusta a María»), no una inversión; forzarla al
   orden inglés (`(maría, like, café)`) sería imponer una cadena inglesa, contra el diseño de la rama.
@@ -98,11 +98,24 @@ hecho almacenado no está "en inglés".
   una regresión de esta rama); la fecha se resuelve aparte por la capa temporal (`extract_event_date`).
 - Las tablas de patrones sembrados (negación, temporales, pistas lingüísticas, alias de relaciones)
   incluyen ya **semillas en español** (migración 218: meses, días, pistas relativas, clases de
-  parentesco/unidades/verbos, alias `vivir_en`→`lives_in`, `trabajar_en`/verbos → `works_for`)
-  — crecen por tenant, igual que las inglesas.
+  parentesco/unidades/verbos/empleo — `trabajar` en `employment_verb` —, alias `vivir_en`→`lives_in`,
+  `trabajar_en`/verbos → `works_for`) — crecen por tenant, igual que las inglesas. La cadena de
+  empleo lee el marcador de rol `como` y los de organización `en`/`para` gramaticalmente (UD
+  `obl`/`nmod` + `case`/`mark`, gemelos de `as`/`at`/`for`), así que `Yo trabajo como ingeniero en
+  Google` captura `occupation` + `works_for`, igual que el inglés.
+- **Pronombres relativos** (`que` en `Tengo un perro que se llama Rex`): el guard de `_emit` ya
+  resolvía `that`/`who` al antecedente; la rama es de `_is_relative_pronoun` lo reconoce por
+  morfología (`PronType=Int,Rel`), no por etiqueta Penn, así que el nombre se ata al **antecedente**
+  (`(perro, also_known_as, rex)`) y el pronombre jamás se archiva como entidad — supera al inglés
+  (que suelta `I have a dog that is named Rex` sin edge).
 - El modelo español de spaCy **no emite la etiqueta `DATE`**: la capa de fechas usa las **pistas
   temporales en la base de datos** (meses/relativos, migración 218) como autoridad, así que las
-  fechas con palabra (`el 15 de marzo de 1990`, `hace dos semanas`) se resuelven igual que en inglés.
+  fechas con palabra (`el 15 de marzo de 1990`, `hace dos semanas`, `el lunes`) se resuelven
+  igual que en inglés. **Divergencia documentada**: `la próxima semana` SÍ se resuelve (el locale
+  es de dateparser la ancla de forma determinista), mientras la máquina inglesa omite deliberadamente
+  `next week` (`_is_bare_vague_relative`); `la semana que viene` no se siembra porque el locale
+  es no la resuelve (medido). Se supera al inglés, nunca se fabrica más allá de la resolución
+  estándar del locale fijado.
 - **Consulta en inglés en esta rama**: los `natural_language` sembrados son **españoles** (la rama ES
   el idioma, contrato de la rama), así que una consulta inglesa de alcance relacional puede no
   acotar (p. ej. `where do you work?`); la consulta española (`¿dónde trabajas?`) sí. Las

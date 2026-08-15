@@ -281,6 +281,88 @@ def test_spanish_possessive_subject_state_not_the_det():
     assert len(hs) == 1 and hs[0].subject == "perro" and hs[0].object == "marrón", f"{facts}"
 
 
+def test_spanish_employment_como_role_no_corruption():
+    """'Yo trabajo como ingeniero.' must emit occupation(user, ingeniero), NEVER the corruption
+    (user, has_state, trabajar) — the critic's A: 'trabajar' was missing from the es
+    employment_verb cue class, so the intransitive chain read the 1sg nmod role ('ingeniero'
+    parses nmod, not obl) as objectless and minted a FALSE STATE about the user. The 'como'
+    role marker (UD case/mark on an obl/nmod head) is the Spanish twin of Penn 'as'."""
+    facts = _facts("Yo trabajo como ingeniero.")
+    occ = _find(facts, "occupation")
+    assert occ is not None and occ.subject == "user" and occ.object == "ingeniero", f"{facts}"
+    assert _find(facts, "has_state") is None, f"corruption has_state minted: {facts}"
+
+
+def test_spanish_employment_role_and_org_both_captured():
+    """'Yo trabajo como ingeniero en Google.' must capture BOTH the role and the employer —
+    the 'en'/'para' org markers (UD case on an obl/nmod) are the Spanish twins of Penn
+    at/for, read off the verb OR the role head (English parity: 'I work as an engineer at
+    Google' -> occupation + works_for)."""
+    facts = _facts("Yo trabajo como ingeniero en Google.")
+    occ = _find(facts, "occupation")
+    wf = _find(facts, "works_for")
+    assert occ is not None and occ.subject == "user" and occ.object == "ingeniero", f"{facts}"
+    assert wf is not None and wf.subject == "user" and wf.object == "google", f"{facts}"
+
+
+def test_spanish_employment_org_folds_to_works_for():
+    """'Yo trabajo en Google.' / 'Ella trabaja para IBM.' emit works_for DIRECTLY at capture
+    (canonical rel, no alias dependency) — the employment chain's es 'en'/'para' org arm."""
+    for s, org in (("Yo trabajo en Google.", "google"), ("Ella trabaja para IBM.", "ibm")):
+        facts = _facts(s)
+        wf = _find(facts, "works_for")
+        assert wf is not None and wf.object == org, f"{s!r}: {facts}"
+
+
+def test_spanish_relative_pronoun_binds_the_antecedent():
+    """'Tengo un perro que se llama Rex.' must bind the name to the ANTECEDENT (perro, aka,
+    rex), never mint the relative pronoun as an entity (que, ...) — the es 'que' is PRON with
+    PronType=Int,Rel (no Penn WP tag), so the chokepoint relative-pronoun guard was blind to
+    it (critic's D); the es arm of _is_relative_pronoun (morphology, NO word list) now
+    resolves it like EN 'that'."""
+    facts = _facts("Tengo un perro que se llama Rex.")
+    aka = [f for f in facts if f.rel_type == "also_known_as"]
+    assert len(aka) == 1 and aka[0].subject == "perro" and aka[0].object == "rex", f"{facts}"
+    assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
+
+
+def test_spanish_relative_pronoun_never_an_entity():
+    """A relative pronoun is NEVER bound as an entity in any chain: 'El lunes que viene
+    vuelvo.' must not mint (que, ...) — the subject resolves to the antecedent (lunes),
+    mirroring the EN engine's (monday, has_state, come)."""
+    facts = _facts("El lunes que viene vuelvo.")
+    assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
+
+
+def test_spanish_next_week_resolves_with_article(monkeypatch):
+    """'Vuelvo la próxima semana.' resolves against the reference — the relative cue must match
+    the ARTICLE form 'la próxima semana' (dateparser's es locale resolves the article form,
+    NOT the bare 'próxima semana' — measured on the pinned es locale). The es locale grounds
+    the future-week phrase deterministically (exceeds the EN engine, which deliberately skips
+    'next week' — documented divergence)."""
+    monkeypatch.setenv("FAULTLINE_LANGUAGE", "es")
+    import importlib
+    importlib.reload(m)
+    try:
+        iso, gran = m.extract_event_date("Vuelvo la próxima semana.", _REF)
+        assert iso is not None and iso.startswith("2023-06-08"), f"próxima semana: {iso}"
+    finally:
+        importlib.reload(m)
+
+
+def test_spanish_weekday_grounded(monkeypatch):
+    """'Vuelvo el lunes.' resolves to a concrete weekday (prefer-past, like the EN engine's
+    'next Monday' — the weekday translate gate) — the es weekday seeds are live, not dead."""
+    monkeypatch.setenv("FAULTLINE_LANGUAGE", "es")
+    import importlib
+    importlib.reload(m)
+    try:
+        iso, gran = m.extract_event_date("Vuelvo el lunes.", _REF)
+        assert iso is not None and iso.startswith("2023-05-29"), f"lunes: {iso}"
+    finally:
+        importlib.reload(m)
+
+
 # ── LAYER 2: CAPTURE COMPARED AGAINST THE ENGLISH ENGINE (parity) ───────────────
 # The English engine runs on en_core_web_sm; the Spanish engine on es_core_news_md. The
 # deriver reads SPACY_MODEL once at import, so BOTH engines cannot live in one process.
