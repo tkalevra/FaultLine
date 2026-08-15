@@ -35,6 +35,33 @@ from starlette.middleware.cors import CORSMiddleware
 import src.mcp.premise as _premise
 import src.mcp.server as _mcp
 
+# CLIENT CLASSIFICATION (2026-08-14 incident): who is operating this client? The transport
+# edge captures the identity into a ContextVar; the AUTO-write gates in server.py read it.
+from src.mcp import client_class as _client_class
+
+
+def _capture_client_class(request: Request) -> None:
+    """Record WHICH KIND OF CLIENT is talking, ONCE, at the transport edge.
+
+    2026-08-14 incident: a coding agent on a user's credentials polluted a real user's
+    seat through the AUTOMATIC write lanes (recall's turn harvest + the unadvertised
+    store_context tool). The fix's discriminator is client IDENTITY — who is operating
+    the client — never what the text looks like. Identity resolution order: the MCP-spec
+    ``mcp-name`` header first, else the ``User-Agent`` leading token before '/' (so
+    "opencode/1.18" classifies while browsers "Mozilla/5.0 …" and OpenWebUI fall to the
+    chat default). Unknown/empty → unset → chat default → today's behavior. NEVER blocks
+    or fails the request: a completely unidentifiable caller is simply a chat client,
+    which is what every caller was before this existed.
+    """
+    try:
+        _name = (request.headers.get("mcp-name") or "").strip()
+        if not _name:
+            _name = (request.headers.get("user-agent") or "").split("/", 1)[0].strip()
+        _client_class.set_client_class(_name or None)
+    except Exception:
+        # Classification must never take a request down with it.
+        _client_class.set_client_class(None)
+
 
 # ── OpenWebUI OpenAPI tool request/response models ────────────────────────────
 
@@ -352,7 +379,12 @@ def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | 
     a connection in real OpenWebUI wiring (OpenWebUI forwards its OWN logged-in user's
     UUID as X-OpenWebUI-User-Id, which would otherwise mismatch the seat and 403). The
     token proves identity; the header is transport plumbing.
+
+    CLIENT CLASS SEAM (2026-08-14): every REST tool route funnels through HERE — so
+    capturing the client identity at the top of this function covers every REST door
+    with no route left behind.
     """
+    _capture_client_class(request)
     if principal and _mcp._TENANT_UUID_RE.match(principal.strip().lower()):
         return principal.strip().lower()
     claimed = request.headers.get("X-OpenWebUI-User-Id", "") or body_user_id
@@ -574,6 +606,17 @@ async def mcp_endpoint(
     _hdr_name = request.headers.get("mcp-name")
     if _hdr_name:
         _log(f"Mcp-Name={_hdr_name!r}")
+
+    # CLIENT CLASS (2026-08-14): capture who is operating this client at the edge — every
+    # JSON-RPC method below (tools/call included) runs in this request's context, so the
+    # AUTO-write gates inside the tool handlers see this request's client and only this
+    # request's. mcp-name first, else the User-Agent leading token; never blocks the request.
+    # (The initialize handler below deliberately does NOT read clientInfo.name for this
+    # purpose: this transport is STATELESS — the initialize request's context dies with
+    # that request, and initialize never carries a tool call, so a classification set
+    # there can never influence a later tools/call. The handshake's clientInfo IS captured
+    # on the stdio door, which is a single-client process lifetime.)
+    _capture_client_class(request)
 
     # ── 2026-07-28 version negotiation (SEP-2575) ─────────────────────────────────────
     # Modern clients carry `io.modelcontextprotocol/protocolVersion` in `_meta` on EVERY
