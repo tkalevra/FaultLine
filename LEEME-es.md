@@ -102,12 +102,21 @@ hecho almacenado no está "en inglés".
   `trabajar_en`/verbos → `works_for`) — crecen por tenant, igual que las inglesas. La cadena de
   empleo lee el marcador de rol `como` y los de organización `en`/`para` gramaticalmente (UD
   `obl`/`nmod` + `case`/`mark`, gemelos de `as`/`at`/`for`), así que `Yo trabajo como ingeniero en
-  Google` captura `occupation` + `works_for`, igual que el inglés.
+  Google` captura `occupation` + `works_for`, igual que el inglés. El título se captura COMPLETO
+  con sus complementos a la derecha (`ingeniero de software`, `ingeniero senior`; la PP de
+  organización `en Google` nunca se pliega al rol). ⚠️ Divergencia: `como` cubre `as` Y `like`,
+  así que un modismo de modo con cabeza NOUN/PROPN (`trabajo como un perro` = work like a dog)
+  se lee como ocupación — la misma sobreaceptación del brazo `as` inglés (`I work as a beast`),
+  ampliada a los modismos por el marcador unificado; sin lista de palabras prohibida no hay
+  discriminador gramatical.
 - **Pronombres relativos** (`que` en `Tengo un perro que se llama Rex`): el guard de `_emit` ya
   resolvía `that`/`who` al antecedente; la rama es de `_is_relative_pronoun` lo reconoce por
   morfología (`PronType=Int,Rel`), no por etiqueta Penn, así que el nombre se ata al **antecedente**
   (`(perro, also_known_as, rex)`) y el pronombre jamás se archiva como entidad — supera al inglés
-  (que suelta `I have a dog that is named Rex` sin edge).
+  (que suelta `I have a dog that is named Rex` sin edge). La cadena de EMPLEO resuelve también
+  el pronombre relativo por sí misma (`Mi amigo que trabaja en Google` → `(amigo, works_for,
+  google)`, nunca `(que, …)`) — su `_emit` retiene `subj_tok` a propósito, así que el guard del
+  chokepoint no podía alcanzarlo (hallazgo F3 del crítico f2edb560).
 - El modelo español de spaCy **no emite la etiqueta `DATE`**: la capa de fechas usa las **pistas
   temporales en la base de datos** (meses/relativos, migración 218) como autoridad, así que las
   fechas con palabra (`el 15 de marzo de 1990`, `hace dos semanas`, `el lunes`) se resuelven

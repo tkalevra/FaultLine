@@ -334,6 +334,30 @@ def test_spanish_relative_pronoun_never_an_entity():
     assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
 
 
+def test_spanish_employment_relative_subject_binds_antecedent():
+    """'Mi amigo que trabaja en Google vive en Madrid.' must bind the employer to the
+    ANTECEDENT (amigo, works_for, google), never the relative pronoun — the employment
+    chain withholds subj_tok from _emit (so GLiNER2 cannot override the authoritative
+    employment reading), which left the _emit relative-pronoun guard blind; the chain now
+    resolves the relative pronoun itself (critic f2edb560 round-5 finding F3)."""
+    facts = _facts("Mi amigo que trabaja en Google vive en Madrid.")
+    wf = [f for f in facts if f.rel_type == "works_for"]
+    assert len(wf) == 1 and wf[0].subject == "amigo" and wf[0].object == "google", f"{facts}"
+    assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
+
+
+def test_spanish_role_title_keeps_right_complements():
+    """'Yo trabajo como ingeniero de software.' must capture the FULL title (occupation,
+    ingeniero de software) — a Spanish role title right-attaches its specifier ('de <NP>')
+    and adjective ('senior'), which the left-edge span missed; the org PP ('en Google')
+    must NOT fold into the role (critic f2edb560 round-5 minor finding)."""
+    facts = _facts("Yo trabajo como ingeniero de software en Google.")
+    occ = _find(facts, "occupation")
+    assert occ is not None and occ.object == "ingeniero de software", f"{facts}"
+    wf = _find(facts, "works_for")
+    assert wf is not None and wf.object == "google", f"{facts}"
+
+
 def test_spanish_next_week_resolves_with_article(monkeypatch):
     """'Vuelvo la próxima semana.' resolves against the reference — the relative cue must match
     the ARTICLE form 'la próxima semana' (dateparser's es locale resolves the article form,
