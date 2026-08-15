@@ -26,6 +26,7 @@ from src.api.llm_calls import (
     LLMModels,
 )
 from src.api.llm_lane import LLMUnavailable
+from src.api import llm_lane, llm_rate
 from src.entity_registry.registry import preference_rank, EntityRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -1653,6 +1654,17 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
 _episodic_log_missing_schemas: set = set()
 
 
+class RateDeferred(RuntimeError):
+    """This pass never asked the model — the rate gate deferred it.
+
+    Distinct from every other failure BECAUSE THE POISON-ROW GUARD must not stamp
+    it: a rate-deferred row has not had its best-effort pass (the model was never
+    consulted), so stamping reextracted_at would terminally record "uncastable"
+    from a call that did not happen. The guard in reextract_episodic exempts this
+    exception explicitly; anything else keeps today's semantics.
+    """
+
+
 def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
                          statement_route: str) -> list:
     """Extract edges for ONE episodic_log row through the normal front door.
@@ -1673,11 +1685,16 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
     edge would land user_stated → Class A. source="reextract" alone is not enough.
     """
     edges: list = []
+    # The LANE crosses HTTP with us: this process is BACKGROUND (declared at
+    # __main__), and the extraction runs in the API process — without the header
+    # it would arrive INTERACTIVE and fail open under pressure instead of deferring.
+    _lane_headers = {llm_lane.LANE_HEADER: llm_lane.current_lane()}
     if statement_route == "spine":
         try:
             resp = httpx.post(
                 f"{backend_url}/harvest-spans",
                 json={"text": raw_text, "user_id": user_id},
+                headers=_lane_headers,
                 timeout=60.0,
             )
             resp.raise_for_status()
@@ -1688,8 +1705,18 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
             # be a silent loss. Raise → the row stays NULL and retries next cycle.
             if _data.get("status") == "ingest_disabled":
                 raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+            # Rate-deferral guard (the rewrite twin below has the same): this pass
+            # did NOT ask the model. Falling through to /extract/rewrite would
+            # burn more rate budget on a second call the same pass; and treating
+            # the zero/partial edges as "spine found nothing" would be a verdict
+            # from a call that never happened. Raise RateDeferred → the row stays
+            # NULL and retries next cycle; the poison-row guard exempts it.
+            if _data.get("rate_deferred"):
+                raise RateDeferred("spine harvest rate-deferred")
             edges = [e for e in (_data.get("edges", []) or [])
                      if not e.get("low_confidence", False)]
+        except RateDeferred:
+            raise
         except RuntimeError:
             raise
         except Exception as e:
@@ -1701,6 +1728,7 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
         resp = httpx.post(
             f"{backend_url}/extract/rewrite",
             json={"text": raw_text, "user_id": user_id},
+            headers=_lane_headers,
             timeout=60.0,
         )
         resp.raise_for_status()
@@ -1708,6 +1736,12 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
         # Same split-brain guard as the spine branch above.
         if _data.get("status") == "ingest_disabled":
             raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+        # Rate-deferral guard: the backend's rate gate deferred some/all chunk
+        # calls — this pass did NOT ask the model. Zero or partial edges from a
+        # deferred pass are not a verdict; raising leaves reextracted_at NULL so
+        # the row retries next cycle instead of being stamped "uncastable".
+        if _data.get("rate_deferred"):
+            raise RateDeferred("extraction rate-deferred (no capacity this pass)")
         edges = [e for e in (_data.get("edges", []) or [])
                  if not e.get("low_confidence", False)]
     for e in edges:
@@ -1872,6 +1906,16 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                     )
                 db_conn.commit()
                 processed += 1
+
+            except RateDeferred:
+                # The pass never asked the model (no rate capacity). NOT a failure
+                # verdict and NOT a poison-row: stamping here — including via the
+                # 30-day guard below — would terminally record "uncastable" from a
+                # call that did not happen. Leave the row NULL; retry next cycle.
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                log.info(f"re_embedder.reextract_row_deferred episodic_id={row_id} "
+                         f"user_id={user_id[:8]} (rate-deferred; will retry next cycle)")
+                continue
 
             except Exception as e:
                 log.error(f"re_embedder.reextract_row_failed episodic_id={row_id} user_id={user_id[:8]}: {e}")
@@ -5824,6 +5868,10 @@ def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: 
             user_id="re_embedder",
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # The caller STAMPS the row on the outcome ('left_unmapped' is
+            # terminal — the drain only selects NULL rows). A deferral must
+            # therefore arrive as "did not ask", never (None, 0.0).
+            raise_on_unavailable=True,
         )
         if isinstance(result, dict):
             attr = result.get("attribute")
@@ -5833,6 +5881,9 @@ def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: 
                 conf = 0.0
             if attr and str(attr).strip().lower() in _names:
                 return str(attr).strip().lower(), conf
+    except LLMUnavailable:
+        # Re-raise BEFORE the generic catch: a deferral is not "answered nothing".
+        raise
     except Exception as e:
         log.debug(f"re_embedder.aspect_map_llm_failed aspect={aspect_word}: {type(e).__name__}: {str(e)[:120]}")
     return None, 0.0
@@ -5925,7 +5976,15 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
                 stats["skipped"] += 1
                 continue
 
-            attr, conf = _aspect_map_via_llm_async(aspect_word, candidates, qwen_api_url)
+            try:
+                attr, conf = _aspect_map_via_llm_async(aspect_word, candidates, qwen_api_url)
+            except LLMUnavailable:
+                # The call never happened (no rate capacity this pass): leave the
+                # row's decision NULL so a later pass re-attempts it. Stamping
+                # 'left_unmapped' here would terminally record a verdict the model
+                # never gave.
+                stats["skipped"] += 1
+                continue
             names = {c[0] for c in candidates}
             if attr and attr in names and conf >= min_conf:
                 grew = _record_alias(alias=aspect_word, canonical=attr, requires_inversion=False,
@@ -6062,9 +6121,18 @@ Respond with ONLY valid JSON (no markdown):
             user_id="re_embedder",
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # A deferral ("no capacity this pass") is NOT an answer. The caller
+            # MEMOIZES non-convergence into ontology_evaluations — recording a
+            # verdict from a call that never happened would permanently end
+            # convergence for this rel on a merely-paced day. Raise instead.
+            raise_on_unavailable=True,
         )
         if isinstance(result, dict):
             return result
+    except LLMUnavailable:
+        # Re-raise BEFORE the generic catch below — a deferral must reach the
+        # caller as "did not ask", never as the {} "answered nothing" shape.
+        raise
     except Exception as e:
         log.debug(f"re_embedder.synonym_conv_llm_failed rel={novel_rel}: {type(e).__name__}: {str(e)[:120]}")
     return {}
@@ -6232,9 +6300,16 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
             llm_budget -= 1
 
             # ── GATE 2 (LLM proposes, deterministic accept) ──
-            proposal = _llm_propose_equivalence(
-                _rel, novel_nl or "", subj_types, obj_types, candidates, qwen_api_url
-            )
+            try:
+                proposal = _llm_propose_equivalence(
+                    _rel, novel_nl or "", subj_types, obj_types, candidates, qwen_api_url
+                )
+            except LLMUnavailable:
+                # The call never happened (no rate capacity this pass): refund the
+                # budget it never spent and leave the rel UNMEMOIZED — "asked and
+                # did not converge" is the only thing the memo may record.
+                llm_budget += 1
+                continue
             _ans = (proposal.get("equivalent_to") if isinstance(proposal, dict) else None)
             _ans = (_ans or "").strip().lower() if isinstance(_ans, str) else ""
             try:
@@ -8342,6 +8417,17 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
 def main():
     """Main poll loop."""
     global _http_client_sync
+
+    # THE LANE IS A PROPERTY OF THE CALLER: this process is deferrable upkeep — no
+    # user ever waits on a sweep — so it declares itself BACKGROUND once, at startup.
+    # The rate gate then DEFERS this process instead of fail-opening it when capacity
+    # is short, leaving the pace to interactive traffic (src/api/llm_rate.py). Genuinely
+    # user-driven work inside this process wraps itself in llm_lane.use_lane(interactive).
+    llm_lane.set_process_default(llm_lane.LANE_BACKGROUND)
+    # Say which governance mode this process runs under — the shared-budget fallback
+    # warning is the one that matters: per-process budgets multiply outbound by the
+    # process count, and this deployment runs two processes.
+    llm_rate.announce("re_embedder")
 
     # Log startup environment for debugging container issues (using extra= for structured data)
     log.info("re_embedder.startup_environment", extra={
