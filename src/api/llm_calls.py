@@ -48,7 +48,7 @@ from typing import Optional, Any
 
 import httpx
 
-from src.api import llm_source_ip
+from src.api import llm_rate, llm_source_ip
 from src.api.llm_lane import LLMUnavailable  # re-exported: callers import it from here
 
 log = structlog.get_logger(__name__)
@@ -802,6 +802,24 @@ def call_llm_with_retry_sync(
 
     for attempt in range(1, max_retries + 1):
         for endpoint_idx, endpoint in enumerate(endpoints, 1):
+            # PACE PER REQUEST, NOT PER CALL. Every iteration here puts one more
+            # request on the wire, so every iteration spends one token — a call that
+            # retries three times sends three requests and must spend three tokens,
+            # or the bucket under-counts real outbound load by the retry factor. A
+            # BACKGROUND caller that cannot get one yields the whole call rather than
+            # firing into an endpoint that is already refusing us (interactive
+            # callers still fail open; see src/api/llm_rate.py).
+            if not llm_rate.gate_sync(operation, endpoint=endpoint, model=model):
+                log.info("llm_call.deferred_no_capacity",
+                         user_id=user_id, operation=operation,
+                         attempt=attempt, mode="sync_retry")
+                if raise_on_unavailable:
+                    raise LLMUnavailable("rate_deferred", operation)
+                # DISTINGUISHABLE defer: a bare {} is byte-identical downstream to
+                # "the model answered nothing", which a verdict-caching caller would
+                # record as a real answer. The error marker lets callers that can
+                # wait re-pend instead of treating a merely-paced pass as final.
+                return {"error": "rate_deferred"}
             try:
                 # Log attempt details
                 log.debug("llm_call.attempt_start",
@@ -996,6 +1014,17 @@ async def call_llm_with_retry_async(
 
     for attempt in range(1, max_retries + 1):
         for endpoint_idx, endpoint in enumerate(endpoints, 1):
+            # One token per REQUEST (see the sync twin). A background caller with no
+            # capacity yields rather than firing uncapped.
+            if not await llm_rate.gate_async(operation, endpoint=endpoint, model=model):
+                log.info("llm_call.deferred_no_capacity",
+                         user_id=user_id, operation=operation,
+                         attempt=attempt, mode="async_retry")
+                if raise_on_unavailable:
+                    raise LLMUnavailable("rate_deferred", operation)
+                # DISTINGUISHABLE defer — see the sync twin for why a bare {} here
+                # becomes a recorded "answered nothing" on a day that was merely paced.
+                return {"error": "rate_deferred"}
             try:
                 log.debug("llm_call_async.attempt_start",
                          user_id=user_id,
@@ -1181,6 +1210,14 @@ def call_llm_no_retry_sync(
 
         # Try primary endpoint only
         endpoint = endpoints[0]
+
+        # One request per call, one token per request (see the retry twins). A
+        # BACKGROUND caller with no capacity returns None rather than firing uncapped;
+        # the caller's contract for this shape is already "any failure → None".
+        if not llm_rate.gate_sync(operation, endpoint=endpoint, model=model):
+            log.info("llm_call.deferred_no_capacity",
+                     user_id=user_id, operation=operation, mode="no_retry")
+            return None
 
         log.debug("llm_call_no_retry.attempt",
                  user_id=user_id,
