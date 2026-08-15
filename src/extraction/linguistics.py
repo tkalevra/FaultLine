@@ -2014,13 +2014,20 @@ def _is_relative_pronoun(tok) -> bool:
         # the UD twin of the Penn check below. Morphology + dep only, NO word list. EN is
         # unaffected: an EN relative pronoun always carries the Penn tag and is caught below
         # (the morph arm requires pos_=PRON, which an EN WDT "that" is not).
+        # ⚠️ "csubj" is included in BOTH arms: a FUSED/free relative clause headed by the
+        # pronoun ("El QUE trabaja en Google gana mucho dinero" — the clause is the clausal
+        # subject csubj of "gana", measured on es_core_news_md) is the same relative-pronoun
+        # class, and without it the _emit guard stayed blind and minted (que, works_for,
+        # google) — a hard-line violation (critic f2edb560 finding A5, pre-existing). The
+        # antecedent resolver then fails for a csubj-headed pronoun (the head chain leads to
+        # the matrix VERB, never a noun) → the edge is DROPPED, never bound to a function word.
         if tok is not None and tok.pos_ == "PRON":
             _pt = tok.morph.get("PronType")
             if _pt and ("Rel" in _pt or "Int" in _pt):
-                return tok.head is not None and tok.head.dep_ in ("acl", "relcl")
+                return tok.head is not None and tok.head.dep_ in ("acl", "relcl", "csubj")
         if tok is None or tok.tag_ not in ("WP", "WP$", "WDT"):
             return False
-        return tok.head is not None and tok.head.dep_ in ("relcl", "acl")
+        return tok.head is not None and tok.head.dep_ in ("relcl", "acl", "csubj")
     except Exception:  # noqa: BLE001
         return False
 

@@ -334,6 +334,17 @@ def test_spanish_relative_pronoun_never_an_entity():
     assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
 
 
+def test_spanish_fused_relative_pronoun_never_an_entity():
+    """'El que trabaja en Google gana mucho dinero.' must NOT mint (que, works_for, google) —
+    the relative pronoun heads a CSUBJ clause (the fused/free relative 'el que' is the
+    clausal subject of 'gana', measured on es_core_news_md), which the acl/relcl-only check
+    missed; the antecedent resolver then fails (the head chain leads to the matrix VERB) so
+    the edge is DROPPED — a function word is never a memory (critic f2edb560 finding A5,
+    pre-existing, fixed)."""
+    facts = _facts("El que trabaja en Google gana mucho dinero.")
+    assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
+
+
 def test_spanish_employment_relative_subject_binds_antecedent():
     """'Mi amigo que trabaja en Google vive en Madrid.' must bind the employer to the
     ANTECEDENT (amigo, works_for, google), never the relative pronoun — the employment
