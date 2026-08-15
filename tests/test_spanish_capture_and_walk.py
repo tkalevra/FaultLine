@@ -243,6 +243,28 @@ def test_spanish_negated_naming_is_absence():
     assert _find(facts, "also_known_as") is None, f"negated name affirmed: {facts}"
 
 
+def test_spanish_kin_naming_has_no_role_noun_ghost():
+    """'Mi hermana se llama Ana' must NOT mint a standalone (hermana, sibling_of, user) twin
+    alongside the name-bound (ana, sibling_of, user) — the role noun is a slot on the named
+    person (round-1 critic ghost class, re-found by the round-1 re-review)."""
+    facts = _facts("Mi hermana se llama Ana.")
+    kin = [f for f in facts if f.rel_type == "sibling_of"]
+    assert len(kin) == 1 and kin[0].subject == "ana" and kin[0].object == "user", f"{facts}"
+
+
+def test_spanish_teen_cardinal_dates_resolve(monkeypatch):
+    """'hace dieciséis semanas' resolves (the cardinal map covers 16-19, matching the worded-day
+    regex) — the round-1 re-review's dieciséis gap."""
+    monkeypatch.setenv("FAULTLINE_LANGUAGE", "es")
+    import importlib
+    importlib.reload(m)
+    try:
+        iso, gran = m.extract_event_date("La boda fue hace dieciséis semanas.", _REF)
+        assert iso is not None, "dieciséis semanas did not resolve"
+    finally:
+        importlib.reload(m)
+
+
 def test_spanish_con_particle_folds():
     """'Quedo con Ana' must fold quedar_con (the es model parses Ana as obj+case, not obl+case —
     critic round-2 should-fix; the fold arm now reads obj/dobj+case like obl+case)."""

@@ -8696,6 +8696,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # possessed head whose token the named-instance chain suppressed (else "(user, owns, dog)").
             if head.i in _ni_suppress:
                 continue
+            # PRONOMINAL-NAMING GUARD: the kinship head of a pronominal-naming clause ("mi hermana
+            # se llama Ana") is the NAMED THING — the naming chain bound it via (ana, sibling_of,
+            # user) + (hermana, also_known_as, ana). Re-firing (hermana, sibling_of, user) here would
+            # mint the ghost role-noun edge (the round-1 critic's de-genitive ghost class). Skip a
+            # possessed head the es naming chain recorded. English unaffected (never filled).
+            if head.i in _pn_naming_suppress or tok.i in _pn_naming_suppress:
+                continue
             # EMPLOYMENT GUARD: the org affiliation PP ("… at the University of Springfield's Computing
             # Services") is owned by the employment chain — skip a possessed/possessor token inside that
             # span so we never leak the genitive "(computing services, related_to, springfield)" junk.
@@ -10865,6 +10872,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     if _possessor:
                         _emit(proper, _kin, _possessor, obj_tok=None, subj_tok=name_tok)
                         _claim(subj_tok)
+                        # record the NAMED THING's head token so the possessive chain never
+                        # re-fires (hermana, sibling_of, user) on the role noun (round-1 critic
+                        # ghost class; the role is already bound to the name via the kin edge +
+                        # the also_known_as alias below).
+                        _pn_naming_suppress.add(subj_tok.i)
             # the naming edge itself: (named-thing, also_known_as, proper-name).
             _emit(subject, "also_known_as", proper, verb_tok=tok, obj_tok=name_tok, subj_tok=subj_tok)
             _claim(tok, name_tok)
@@ -10986,6 +10998,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # measure/naming construction a Spanish chain already owns must not mint the SVO twin
     # (user, tener, años) / (perro, llamar, rex).
     _svo_es_measure_suppress: set = set()
+    # PRONOMINAL-NAMING head-suppression set: the kinship head of a pronominal-naming clause
+    # ("mi hermana se llama Ana" — hermana is the NAMED THING, bound via (ana, sibling_of, user)
+    # + the role alias (hermana, also_known_as, ana)) must NOT re-fire the possessive chain's
+    # (hermana, sibling_of, user) twin. The naming chain records the head token here; the
+    # possessive chain skips it (the same guard pattern as _ni_suppress). English unaffected
+    # (this set is only filled by the es naming chain).
+    _pn_naming_suppress: set = set()
 
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
@@ -12285,7 +12304,9 @@ _CARDINAL_WORD_TO_DIGIT: dict = {
     "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
     "seis": "6", "siete": "7", "ocho": "8", "nueve": "9",
     "diez": "10", "once": "11", "doce": "12", "trece": "13",
-    "catorce": "14", "quince": "15", "veinte": "20", "treinta": "30",
+    "catorce": "14", "quince": "15", "dieciséis": "16", "dieciseis": "16",
+    "diecisiete": "17", "dieciocho": "18", "diecinueve": "19",
+    "veinte": "20", "treinta": "30",
 }
 
 _VAGUE_MONTH_DAY: dict = {
@@ -12592,8 +12613,12 @@ def _collect_date_spans(text: str) -> list:
                 # whole duration and resolves it against the reference.
                 _head = text[:m.start()]
                 _tail = text[m.end():]
-                _qm = re.search(r"(\d+|dos|tres|cuatro|cinco|seis|un|una|unos|unas)\s*$", _head)
-                _qt = re.match(r"\s+(\d+|dos|tres|cuatro|cinco|seis|un|una|unos|unas)\b", _tail)
+                _qm = re.search(r"(\d+|uno|una|un|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|"
+                                r"diez|once|doce|trece|catorce|quince|dieciséis|dieciseis|"
+                                r"diecisiete|dieciocho|diecinueve|veinte|treinta)\s*$", _head)
+                _qt = re.match(r"\s+(\d+|uno|una|un|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|"
+                               r"diez|once|doce|trece|catorce|quince|dieciséis|dieciseis|"
+                               r"diecisiete|dieciocho|diecinueve|veinte|treinta)\b", _tail)
                 _start = m.start()
                 if _qt is not None:
                     # Spanish: "hace <qty> <unit>" — quantity + unit follow the cue.
