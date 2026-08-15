@@ -31,23 +31,24 @@ RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(os.
 
 # BAKE the spaCy linguistic-layer model into the image (NO runtime `spacy download`).
 # The model name is PARAMETRIZED (no hardcoded literal in the RUN line) — config owns it.
-# [es branch] Default `es_core_news_sm` — the model MUST match the install language. The English
+# [es branch] Default `es_core_news_md` — the model MUST match the install language. The English
 # model does not degrade on Spanish, it CORRUPTS: no verb/subject/object arcs, and no negation
 # dependency at all, so "No uso el puerto 9004" stores as its affirmative. linguistics.py now
 # refuses to load a model whose nlp.lang disagrees with FAULTLINE_LANGUAGE.
 # The spine dependency chains were originally tuned against en sm's parse shapes and are NOT yet
 # re-tuned for Spanish syntax — Spanish capture trails English until they are.
-# (A larger model shifts the inchoative/compound-anchor arcs again, breaking the chains — opt-in
-# only, NOT the default; re-tune the chains before switching.) All shipped models
+# (A larger model shifts the inchoative/compound-anchor arcs again, breaking the chains — the
+# chains are now scheme-portable and were re-verified on es_core_news_md before this default.)
+# All shipped models
 # are PINNED, py3-none-any (Python-version-independent) GitHub-release wheels → install as normal
 # packages into /venv, carried over by the venv COPY below. spaCy itself comes from pyproject
 # (spacy>=3.7,<3.9 → 3.8.x). If this model is ever missing/unset, linguistics.py no-ops.
-# [es branch] Default es_core_news_sm — MUST match the install language. The English model
+# [es branch] Default es_core_news_md — MUST match the install language. The English model
 # over Spanish text yields a run-on PROPN chunk with no verb/subject/object and no negation
 # dep, i.e. silent corruption rather than degraded capture. linguistics.py now refuses to
 # load a model whose nlp.lang disagrees with FAULTLINE_LANGUAGE.
-# Override at build with `--build-arg SPACY_MODEL=es_core_news_md` (re-tune chains first).
-ARG SPACY_MODEL=es_core_news_sm
+# Override at build with `--build-arg SPACY_MODEL=es_core_news_sm` (smaller image, weaker parses).
+ARG SPACY_MODEL=es_core_news_md
 ARG SPACY_MODEL_VERSION=3.8.0
 ENV SPACY_MODEL=${SPACY_MODEL}
 RUN pip install --no-cache-dir \
@@ -90,7 +91,7 @@ ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
 # (caused a 9/10→2/10 regression). Re-declare the config-layer ARG defaults + propagate as ENV
 # so linguistics.py / embedder.py / llm_output_validator.py (which read these env vars — NO code
 # literals) resolve at runtime. Override via --build-arg or the compose `environment:` block.
-ARG SPACY_MODEL=es_core_news_sm
+ARG SPACY_MODEL=es_core_news_md
 ENV SPACY_MODEL=${SPACY_MODEL}
 # Same reasoning for the GLiNER2 entity-typing weights (main.py reads GLINER_MODEL). If this is
 # not re-declared here, runtime falls back to the code default — which must therefore stay in

@@ -39,7 +39,7 @@ services:
         # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
         # text; it does not make the chains correct for that language. Portable in principle
         # (the UD features they key on exist in these models), UNMEASURED in practice.
-        SPACY_MODEL: ${SPACY_MODEL:-es_core_news_sm}
+        SPACY_MODEL: ${SPACY_MODEL:-es_core_news_md}
     image: faultline:latest
     container_name: faultline-api
     ports:

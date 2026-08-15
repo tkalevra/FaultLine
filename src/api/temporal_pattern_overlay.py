@@ -328,6 +328,53 @@ def text_has_date_cue(text: str, dsn: str) -> bool:
         return True
 
 
+# ── WORDED-DATE SPAN PATTERNS (DB authority for month names) ─────────────────────────
+# The es NER emits no DATE spans (measured), so the date lane needs a deterministic
+# worded-date detector. The MONTH NAMES are the DB temporal_patterns formal_absolute rows
+# (seeded English + Spanish, grown per-tenant) — never a code word list. This resolver
+# returns the compiled month-name patterns so the span collector can find "15 de marzo de
+# 1990" / "January 15th" and hand the span to dateparser (already language-pinned).
+def _bootstrap_formal_absolute_patterns() -> list:
+    """Compiled bootstrap formal-absolute (month-name) patterns — DB-down net."""
+    out = []
+    for p in _BOOTSTRAP_ABSOLUTE_CUES:
+        c = _compile(p)
+        if c is not None:
+            out.append(c)
+    return out
+
+def resolve_formal_absolute_patterns(dsn: str) -> list:
+    """Compiled formal_absolute temporal_patterns rows for the bound tenant schema.
+
+    Returns the active month-name patterns (the growable DB authority); falls back to the
+    bootstrap month set when the DB cannot be read. Cache-contract mirrors the gate matcher.
+    """
+    if not dsn:
+        return _bootstrap_formal_absolute_patterns()
+    try:
+        schema_qualifier = "public"
+        if _is_real_tenant_schema(rel_type_overlay.get_current_schema()):
+            schema_qualifier = rel_type_overlay.get_current_schema().strip()
+        with psycopg2.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT pattern_regex FROM {schema_qualifier}.temporal_patterns "
+                    "WHERE is_active = true AND anchor_type = 'absolute_no_year' "
+                    "AND category = 'formal_absolute'"
+                )
+                rows = [r[0] for r in cur.fetchall() if r and r[0]]
+        if not rows:
+            return _bootstrap_formal_absolute_patterns()
+        good = []
+        for p in rows:
+            c = _compile(p)
+            if c is not None:
+                good.append(c)
+        return good or _bootstrap_formal_absolute_patterns()
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        log.warning("temporal_pattern_overlay.formal_absolute_resolve_failed", error=str(e)[:160])
+        return _bootstrap_formal_absolute_patterns()
+
 def invalidate(schema_name=None) -> None:
     """Invalidate caches.
 
