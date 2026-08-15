@@ -36,6 +36,7 @@ from src.api.qdrant_partition import (
 from src.schema_oracle import resolve_entities
 from src.wgm.gate import WGMValidationGate, RelTypeRegistry
 from src.api import rel_type_overlay
+from src.api import llm_lane
 from src.api import taxonomy_overlay
 from src.api import temporal_pattern_overlay
 from src.api import linguistic_cue_overlay
@@ -10692,6 +10693,14 @@ async def lifespan(app: FastAPI):
     _http_client_sync = httpx.Client(timeout=httpx.Timeout(30.0), limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
     log.info("startup.http_clients_initialized", async_client=True, sync_client=True)
 
+    # Outbound LLM rate governance: say OUT LOUD which mode this process runs under.
+    # The entrypoint backgrounds TWO processes (this API and the re-embedder) against
+    # one configured endpoint; with the coordination service available they share ONE
+    # budget, without it each process paces independently and combined outbound
+    # exceeds the configured rate by the process count (src/api/llm_rate.py).
+    from src.api import llm_rate
+    llm_rate.announce("api")
+
     # dprompt-120: Initialize idempotency manager for /ingest deduplication
     # Prevents duplicate extraction LLM calls from OpenWebUI's multiple inlet invocations
     _idempotency_mgr = IdempotencyManager()
@@ -11542,6 +11551,24 @@ app = FastAPI(
     title="FaultLine WGM",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def llm_lane_from_request_header(request: Request, call_next):
+    """THE LANE CROSSES HTTP (src/api/llm_lane.py).
+
+    The re-embedder routes part of its sweep through this API's own endpoints
+    (/harvest-spans, /extract/rewrite); those LLM calls execute HERE, where the
+    caller's ContextVar cannot follow. Without this hop the sweep's traffic arrives
+    INTERACTIVE and fail-opens under pressure — background volume wearing the
+    interactive lane's protection. A caller that declares itself background carries
+    ``X-FL-LLM-Lane: background``; every request this handler then makes (and every
+    gate those requests hit) runs in that lane. No header / anything unrecognised →
+    interactive: a human client owes us nothing and is never deferred by default.
+    """
+    lane = llm_lane.lane_from_header(request.headers.get(llm_lane.LANE_HEADER))
+    with llm_lane.use_lane(lane):
+        return await call_next(request)
 
 
 @app.post("/internal/refresh-intent-pattern-caches")
@@ -17993,6 +18020,12 @@ async def harvest_spans(req: RewriteRequest) -> dict:
     standalone so the recall path can fire it without the (expensive) LLM extraction pass.
     """
     user_id = _require_resolvable_user_id(req.user_id, "/harvest-spans")
+    # Deferral observation (see extract_rewrite's twin): snapshotted BEFORE any
+    # LLM call this request makes, so the response can mark rate_deferred when a
+    # background-lane deferral happened inside the harvest (span-detect, reframe).
+    # A stamping caller must be able to tell "no buried spans" from "never asked".
+    from src.api import llm_rate as _llm_rate_mod
+    _defer_snapshot = _llm_rate_mod.deferred_counter()
     # Freeze switch (knowledge-store mode): the harvest is an INGEST FEEDER — it exists
     # solely to produce edges the caller ingests, and it writes knowledge rows itself
     # (spine deriver entity registration; residue→Class-C store_context floor). Gating it
@@ -18013,6 +18046,13 @@ async def harvest_spans(req: RewriteRequest) -> dict:
         try:
             _sp_result = await _harvest_via_sentence_pipeline(req, user_id)
             if _sp_result is not None:
+                # RATE-DEFERRAL MARKER (see the legacy path's twin below): the
+                # spine helper has many internal returns, so the marker is
+                # stamped HERE — one place covers every one of them.
+                if (isinstance(_sp_result, dict)
+                        and llm_lane.is_background()
+                        and _llm_rate_mod.deferred_counter() > _defer_snapshot):
+                    _sp_result["rate_deferred"] = True
                 return _sp_result
         except Exception as _spe:
             log.warning("harvest_spans.sentence_pipeline_failed",
@@ -18554,6 +18594,13 @@ async def harvest_spans(req: RewriteRequest) -> dict:
         # (problem_noun via the reified event seam). Best-effort. (The spine path flushes inside
         # _harvest_via_sentence_pipeline and returned earlier; /ingest flushes the reified path there.)
         _flush_cue_candidates(user_id)
+        # RATE-DEFERRAL MARKER (same contract as /extract/rewrite): the process-wide
+        # deferral counter moved during this request, so some LLM call inside the
+        # harvest never fired. Zero/partial edges from this pass are NOT a verdict,
+        # and a stamping caller (the re-embedder's spine re-extract) must retry
+        # rather than record "uncastable".
+        if llm_lane.is_background() and _llm_rate_mod.deferred_counter() > _defer_snapshot:
+            return {"edges": edges, "spans": len(spans), "rate_deferred": True}
         return {"edges": edges, "spans": len(spans)}
     except Exception as e:
         log.warning("harvest_spans.failed", user_id=user_id[:8], error=str(e)[:120])
@@ -18768,6 +18815,13 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
     """
     # SECURITY (Phase 0): fail loud on absent identity (no shared-pool path).
     user_id = _require_resolvable_user_id(req.user_id, "/extract/rewrite")
+
+    # Deferral observation, snapshotted BEFORE any LLM call this request makes:
+    # the response's rate_deferred marker is set when the counter moved (see the
+    # marker construction near the response for why the counter, not per-helper
+    # threading, is the mechanism).
+    from src.api import llm_rate as _llm_rate_mod
+    _defer_snapshot = _llm_rate_mod.deferred_counter()
 
     # Freeze switch (knowledge-store mode): /extract/rewrite is NOT pure compute — its
     # GLiNER2 "immediate strengthen" phase registers entities (EntityRegistry.resolve →
@@ -18995,6 +19049,11 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             not in ("0", "false", "no")
         ) or bool(getattr(req, "force_relation_extraction", False))
 
+        # Chunk indices whose LLM call was DEFERRED by the rate gate (the request
+        # never fired). "Asked and got nothing" and "never asked" are different
+        # facts — a stamping caller downstream must be able to tell them apart.
+        _deferred_chunks: list[int] = []
+
         async def _extract_chunk(chunk_sentences: list[str], chunk_idx: int) -> list[dict]:
             """Extract triples from a single chunk."""
             chunk_text = " ".join(chunk_sentences)
@@ -19036,6 +19095,14 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
                         timeout=LLMTimeouts.get("EXTRACT"),
                         operation="EXTRACT",
                     )
+                    # A deferral is NOT an extraction: the background lane found no
+                    # rate capacity and the request never fired. Counted so the
+                    # response can tell "no edges" from "never asked" — a
+                    # stamping caller (the re-embedder's re-extract) must not
+                    # record a verdict from a call that did not happen.
+                    if isinstance(chunk_result, dict) and chunk_result.get("error") == "rate_deferred":
+                        _deferred_chunks.append(chunk_idx)
+                        return []
                     if chunk_result is None or not isinstance(chunk_result, (list, dict)):
                         log.warning("extract_rewrite.chunk_failed",
                                    chunk_idx=chunk_idx,
@@ -19891,7 +19958,22 @@ async def extract_rewrite(req: RewriteRequest) -> dict:
             "error": None,
             "atomized": _was_atomized,  # audit flag: was this turn LLM-atomized before extraction?
         }
-        if _idempotency_mgr and idempotency_key and lock_acquired and len(triples) > 0:
+        # RATE-DEFERRAL MARKER: some (or all) LLM calls in this request never
+        # fired — the background lane found no capacity. Covers the chunk pass AND
+        # every helper that swallows a defer to empty (reframe/atomize,
+        # completeness, merge proposals): the process-wide deferral counter moved
+        # during this request, which only background-lane traffic can do. The
+        # edges list may be empty or PARTIAL, and a stamping caller (the
+        # re-embedder's re-extract) must NOT record this pass as "asked and
+        # uncastable". Not an error: interactive callers ignore the key (they
+        # fail open and can never defer); the idempotency cache must not memorize
+        # a partial extraction as final either (guarded below).
+        if llm_lane.is_background() and (
+                _deferred_chunks or _llm_rate_mod.deferred_counter() > _defer_snapshot):
+            response["rate_deferred"] = True
+            response["deferred_chunks"] = len(_deferred_chunks)
+        if (_idempotency_mgr and idempotency_key and lock_acquired
+                and len(triples) > 0 and "rate_deferred" not in response):
             _idempotency_mgr.cache_response(idempotency_key, response, ttl_seconds=3600)
             log.info("extract_rewrite.idempotency_cached",
                     key=idempotency_key[:12],
