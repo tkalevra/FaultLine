@@ -16,6 +16,10 @@ import httpx
 # THE 2026-07-28 protocol constants + server/discover builder — one source, every door.
 import src.mcp.premise as _premise
 
+# CLIENT CLASSIFICATION (2026-08-14 incident): who is operating this client? Pure module —
+# both transports set the ContextVar at their edge; the AUTO-write gates below read it.
+from src.mcp import client_class as _client_class
+
 # ── Injection signal detection ────────────────────────────────────────────────
 # Pre-flight check applied to `text` in remember_facts_tool() before forwarding to
 # /extract/rewrite.  Only matches explicit instruction-override constructs — NOT normal
@@ -540,14 +544,52 @@ async def retract_tool(
     return resp.json()
 
 
-async def store_context_tool(text: str, user_id: str) -> dict[str, Any]:
-    """Call FaultLine /store_context endpoint."""
+async def _store_context_post(text: str, user_id: str) -> dict[str, Any]:
+    """The raw POST /store_context seam — UNGATED, internal callers only.
+
+    Used by the remainder-capture lanes inside remember_facts / ingest_document, which only
+    fire from EXPLICIT tool calls that already carry a human-submitted turn (never
+    client-class gated — a human talking THROUGH a coding agent must still be remembered,
+    residue included). The dispatchable TOOL surface is store_context_tool below, which
+    gates; keeping the two separate means the incident lane (a coding agent calling the
+    store_context tool with its own brief) is closed without touching the internal seam.
+    """
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/store_context",
         json={"text": text, "user_id": user_id},
     )
     resp.raise_for_status()
     return resp.json()
+
+
+async def store_context_tool(text: str, user_id: str) -> dict[str, Any]:
+    """Call FaultLine /store_context endpoint — HUMAN conversation turns only.
+
+    ⚠️ CLIENT-CLASS GATE (2026-08-14 incident). This tool is unadvertised-but-dispatchable,
+    and it is EXACTLY the lane a build agent used to land its own operating brief in a
+    real user's seat (the sentences hit episodic_log via the deferred lane, source=
+    'store_context_deferred', and were re-mined into durable facts as if the user said
+    them). The discriminator is WHO IS OPERATING THE CLIENT, never what the text looks
+    like (no content sniffing): a coding agent's captures are agent-authored text by
+    construction; a chat frontend's captures are human turns. For a coding-agent client
+    this tool stores NOTHING and returns a model-facing directive instead — a human's
+    statement belongs in remember_facts (which is never client-gated, because a human
+    talking through a coding agent must still be remembered). Same response shape as the
+    backend's StoreContextResponse (status + point_id) plus the directive message.
+    """
+    if _client_class.current_client_is_coding_agent():
+        _log(f"store_context.agent_client_directive user={user_id[:8]} "
+             f"client={_client_class.current_client_name() or 'unknown'} — nothing stored")
+        return {
+            "status": "error",
+            "point_id": "",
+            "message": (
+                "Not stored: this lane captures HUMAN conversation turns only. Your own "
+                "working text is not human context — pass a human's statement with "
+                "remember_facts instead."
+            ),
+        }
+    return await _store_context_post(text, user_id)
 
 
 async def _learn_via_llm(
@@ -837,7 +879,24 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     # The fact that the model called recall_memory is just the entry point; it defers to the
     # backend brain's route. FAIL-SAFE: classify error → fall through to plain recall below.
     _ingest_fallback = None  # non-eating STATEMENT-ingest result; surfaced only if the walk is empty
-    if RECALL_INTENT_ROUTING:
+    # ⚠️ CLIENT-CLASS GATE, HOISTED (2026-08-14 incident, round-2 critic catch): the intent
+    # diverts below are AUTOMATIC classification-driven WRITES — a STATEMENT query is
+    # ingested as user_stated (full LLM triple extraction → durable Class A, a BIGGER write
+    # than the harvest that is gated further down), and a CORRECTION/RETRACTION query
+    # destructively supersedes facts. For a CODING-AGENT client the query is the agent's own
+    # working text, so both asserts are false by construction (a live probe showed a
+    # declarative agent sentence landing as a Class-A fact through this exact divert). The
+    # discriminator is who operates the client, never what the text looks like. Gate BEFORE
+    # the intent block; plain recall still runs — the read is never blocked. A human
+    # stating/correcting a fact THROUGH a coding agent is not lost: the contract routes
+    # explicit human statements and corrections through remember_facts (ungated — it is the
+    # model's explicit attestation that a human said it), which supersedes exactly as this
+    # divert would.
+    _agent_client_recall = _client_class.current_client_is_coding_agent()
+    if _agent_client_recall:
+        _log(f"recall_diverts_skipped_agent_client user={user_id[:8]} "
+             f"client={_client_class.current_client_name() or 'unknown'}")
+    elif RECALL_INTENT_ROUTING:
         try:
             intent, _confidence, _gate = await _classify_and_gate(query, user_id)
         except Exception:
@@ -863,7 +922,21 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     # in the question ("...help me? by the way, I fixed the fence three weeks ago"). The cheap
     # segmenter (trigger_span, no LLM) splits it off and GLiNER2 ingests it — so question-carried
     # facts are stored, not dropped at the QUERY gate. Best-effort; no-op when no span is found.
-    await _harvest_turn_facts(query, user_id)
+    #
+    # ⚠️ CLIENT-CLASS GATE (2026-08-14 incident): this harvest is an AUTOMATIC write — it
+    # ingests the raw query text with source="mcp" → fact_provenance="user_stated", i.e. it
+    # asserts "the human said this". When the client is a CODING AGENT that assertion is
+    # false by construction: the query is the agent's own working text (tool picks, briefs,
+    # repo context), and harvesting it wrote the agent's operating brief into a real user's
+    # seat as if the user had said it. The discriminator is who is OPERATING the client
+    # (identity captured at the transport edge), never what the text looks like. A chat
+    # frontend's queries are human turns → harvest unchanged. Everything else in recall
+    # (the read itself, abstentions) is identical in every client class.
+    if _client_class.current_client_is_coding_agent():
+        _log(f"harvest.skipped_agent_client user={user_id[:8]} "
+             f"client={_client_class.current_client_name() or 'unknown'}")
+    else:
+        await _harvest_turn_facts(query, user_id)
 
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/query",
@@ -1136,7 +1209,10 @@ async def _episodic_capture(text: str, user_id: str, intent: str | None) -> None
         _log(f"episodic_append_failed (non-fatal): {exc!r}")
 
 
-async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
+async def remember_facts_tool(text: str, user_id: str, **_ignored: Any) -> dict[str, Any]:
+    # ``**_ignored``: tolerate stray kwargs from stale/cached tool schemas (a field the
+    # handler never took) instead of TypeErropping the whole write away — a schema/handler
+    # mismatch must silently drop a user's words.
     """Call /extract/rewrite then /ingest — full pipeline in one call.
 
     Mirrors the OpenWebUI Filter intent classification pipeline:
@@ -1230,6 +1306,14 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
         _log(f"no_ingest: too short ({len(text.split())} words): {text[:60]!r}")
         return {"status": "no_ingest", "message": "Respond normally; do not mention memory or storage.",
                 "isError": True}
+
+    # client=<name|chat> on the write-path log line (2026-08-14): the client class is the
+    # discriminator for the AUTO-write gates, so the explicit write log carries WHICH class
+    # made it — an agent-client remember_facts is legitimate (a human turn relayed through a
+    # coding agent is never gated), and the log line is what makes that traceable after the fact.
+    _client_tag = f"client={_client_class.current_client_name() or 'chat'}"
+    _log(f"ingest.verbatim_captured: STATEMENT turn retained for user={user_id[:8]} "
+         f"{_client_tag}")
 
     # ── D1: STATEMENT extractor route (brain-not-transport) ──────────────────
     # WHICH extractor a STATEMENT goes through is a BRAIN decision (gated backend-side by
@@ -1343,7 +1427,7 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
             supplement_parts = ([residual_text] if residual_text else []) + demoted_lines
             if supplement_parts:
                 supplement = " ".join(supplement_parts)
-                await store_context_tool(text=supplement, user_id=user_id)
+                await _store_context_post(text=supplement, user_id=user_id)
                 remainder_stored = True
                 _log(
                     f"remainder_stored: residual_sentences={len(residual_sentences) if residual_text else 0} "
@@ -1552,7 +1636,7 @@ async def ingest_document_tool(
 
                     supplement_parts = ([residual_text] if residual_text else []) + demoted_lines
                     if supplement_parts:
-                        context_result = await store_context_tool(text=" ".join(supplement_parts), user_id=user_id)
+                        context_result = await _store_context_post(text=" ".join(supplement_parts), user_id=user_id)
                         if _is_ingest_disabled(context_result):
                             # Backend freeze switch (chunk had no gate-worthy edges,
                             # so /ingest never ran) — flag disabled, count nothing.
@@ -2059,6 +2143,17 @@ async def run_mcp_server() -> None:
                 })
 
             elif method == "initialize":
+                # CLIENT CLASS (2026-08-14 incident): stdio is a SINGLE-CLIENT transport —
+                # one process speaks for one client for its whole lifetime, so the handshake's
+                # clientInfo.name is captured ONCE here and the ContextVar simply holds it for
+                # every later tools/call on this process (the auto-write gates read it deep in
+                # the handlers). Fail-safe: missing/garbled clientInfo → stays unset → chat
+                # default → today's behavior.
+                try:
+                    _stdio_client = ((request.get("params") or {}).get("clientInfo") or {})
+                    _client_class.set_client_class(str(_stdio_client.get("name") or ""))
+                except Exception:
+                    pass
                 _send({
                     "jsonrpc": "2.0",
                     "id": req_id,
