@@ -92,6 +92,10 @@ hecho almacenado no está "en inglés".
 - **Psicoverbos en tercera persona** (`A María le gusta el café` → `(café, gustar, maría)`): es la
   estructura gramatical española literal («el café gusta a María»), no una inversión; forzarla al
   orden inglés (`(maría, like, café)`) sería imponer una cadena inglesa, contra el diseño de la rama.
+- **Adverbio temporal en copulativa** (`La reunión es mañana` → `(reunión, has_state, mañana)`): el
+  modelo etiqueta `mañana` como ADJ/estado y la cadena de estado la archiva como tal; el guard de
+  semana/mes cubre solo la cadena de clasificación, no `has_state`. Pre-existente en la base (no es
+  una regresión de esta rama); la fecha se resuelve aparte por la capa temporal (`extract_event_date`).
 - Las tablas de patrones sembrados (negación, temporales, pistas lingüísticas, alias de relaciones)
   incluyen ya **semillas en español** (migración 218: meses, días, pistas relativas, clases de
   parentesco/unidades/verbos, alias `vivir_en`→`lives_in`, `trabajar_en`/verbos → `works_for`)
