@@ -76,9 +76,9 @@ def _load_is_neg():
 def _spanish_nlp():
     spacy = pytest.importorskip("spacy", reason="spaCy not installed")
     try:
-        return spacy.load("es_core_news_sm")
+        return spacy.load("es_core_news_md")
     except OSError:
-        pytest.skip("es_core_news_sm not installed (pip install the 3.8.0 wheel)")
+        pytest.skip("es_core_news_md not installed (pip install the 3.8.0 wheel)")
 
 
 def _english_nlp():
@@ -292,11 +292,18 @@ def test_language_guard_exists_and_is_overridable():
 
 
 def test_es_branch_ships_a_spanish_spacy_default():
-    """The root cause: this branch shipped en_core_web_sm and parsed Spanish with it."""
-    assert "SPACY_MODEL=es_core_news_sm" in (REPO / ".env.example").read_text()
+    """The root cause: this branch shipped en_core_web_sm and parsed Spanish with it.
+
+    The default is now es_core_news_md, measured on the real deriver: sm mis-tags
+    sentence-initial 1sg preterite verbs as PROPN ("Corrí", "Mido", "Nací"), mis-parses
+    "Mi madre" as a PROPN/flat name, and mis-reads the object of "Prefiero el café" as
+    nsubj; md parses all of those correctly (Corrí/VERB, madre/NOUN/nsubj, café/obj).
+    md is a larger wheel (the Docker bake URL is parameterized by the same ARG), so sm
+    remains a valid smaller-image choice — never a silently-wrong one."""
+    assert "SPACY_MODEL=es_core_news_md" in (REPO / ".env.example").read_text()
     dockerfile = (REPO / "Dockerfile").read_text()
-    assert "ARG SPACY_MODEL=es_core_news_sm" in dockerfile
-    assert "en_core_web_sm" not in dockerfile.replace("es_core_news_sm", "")
+    assert "ARG SPACY_MODEL=es_core_news_md" in dockerfile
+    assert "en_core_web_sm" not in dockerfile.replace("es_core_news_md", "")
 
 
 def test_gliner_weights_are_multilingual_and_baked_consistently():

@@ -440,6 +440,305 @@ def _is_neg(tok) -> bool:
         return False
 
 
+
+# ── DEPENDENCY-SCHEME PORTABILITY (ClearNLP/Penn ⇄ UD v2) ─────────────────────────────
+# The chains in this file were written against the dependency labels spaCy's ENGLISH models
+# emit (ClearNLP/Penn: poss, attr/acomp, dobj, prep/pobj, nsubjpass/auxpass/oprd,
+# npadvmod; the copula "be" is the AUX ROOT with the predicate as its attr/acomp child).
+# Every *_core_news_* model — Spanish included — emits **Universal Dependencies v2**, which
+# names and STRUCTURES several of these differently. The predicates below answer the SAME
+# grammatical question under EITHER scheme (the _is_neg shim above is the established
+# precedent for exactly this pattern). They are consulted at the chain chokepoints; English
+# output is byte-identical because the Penn branch matches first and the UD arms only fire
+# on labels the en models never produce.
+#
+# The scheme differences that matter here, with primary sources:
+#   • POSSESSIVE  — Penn: "my" is a PRON with dep "poss". UD es: "mi"/"mis"/"tu"/"su" are
+#     DETERMINERS carrying Poss=Yes + person morphology, attached as det/nmod — never a
+#     "poss" arc. NGLE §18.1a: los posesivos (mi, tu, su) son determinantes que expresan
+#     posesión y comparten con los pronombres personales los rasgos de persona.
+#   • COPULA      — Penn: the copula "be" is the AUX ROOT; the predicate is its attr/acomp
+#     child. UD: the NONVERBAL PREDICATE is the head of the clause and the copula is an AUX
+#     **child** of it with dep_ == "cop" (universaldependencies.org/u/dep/cop.html:
+#     "A cop (copula) is the relation of a function word used to link a subject to a
+#     nonverbal predicate … only when the nonverbal predicate is treated as the head of the
+#     clause"). So "es"/"está"/"soy" attach UPWARD from the predicate.
+#   • NULL SUBJECT — Spanish verbal inflection licenses subject-less sentences; the null
+#     subject (Ø) has pronominal properties that trigger person/number agreement on the
+#     finite verb (NGLE §33.4a-b: "las propiedades de la flexión verbal permiten que puedan
+#     formarse en español oraciones sin sujeto expreso … Estos sujetos tácitos tienen
+#     propiedades pronominales que desencadenan la concordancia de número y persona con el
+#     verbo"). So first person is read OFF THE FINITE VERB, not off a pronoun token.
+#   • PRONOMINAL VERBS — a verb that is inherently reflexive ("llamarse", "sentirse") always
+#     occurs with a reflexive clitic attached as expl:pv INSTEAD of obj
+#     (universaldependencies.org/u/dep/expl-pv.html). This is the Spanish NAMING
+#     construction ("me llamo Marco", "se llama Rex").
+#   • DATIVE EXPERIENCER — verbs of affection ("gustar", "encantar") express sensations the
+#     EXPERIENCER (dative "me"/"le") undergoes toward a STIMULUS that is the clause SUBJECT
+#     (NGLE §15.11o: "Los VERBOS DE AFECCIÓN, que expresan las sensaciones y estados físicos
+#     o psicológicos que experimenta un individuo respecto de alguna entidad").
+#   • DE-GENITIVE — Spanish possession/relational genitives use a de-PP (case + nmod/obl),
+#     not the English 's (poss) construction.
+#   • OBJECT      — Penn dobj / UD obj (the SVO reader already dual-reads these).
+#
+# Fail-safe contract (same as _is_neg): every predicate returns False/None on any attribute
+# error or malformed token — a portability probe must never break an extraction.
+
+def _is_possessive_marker(tok) -> bool:
+    """True iff tok is a POSSESSIVE marker ("my" / "mi") under EITHER scheme.
+
+    Penn: dep_ == "poss". UD: a DET/PRON carrying Poss=Yes morphology (the Spanish
+    possessive determiners mi/mis/tu/su/sus — NGLE §18.1a) — read from morphology, NOT a
+    token list. Fail-safe -> False.
+    """
+    try:
+        if tok.dep_ == "poss":
+            return True
+        return (
+            tok.pos_ in ("DET", "PRON")
+            and "Yes" in tok.morph.get("Poss")
+        )
+    except Exception:  # noqa: BLE001 — fail-safe
+        return False
+
+
+def _first_person_possessive_marker(tok) -> bool:
+    """True iff tok is a 1st-PERSON possessive marker ("my"/"our"/"mi"/"mis"/
+    "nuestro"/"nuestra") under EITHER scheme — the possessive that grounds to the USER.
+
+    Penn: poss + Person=1 + Poss=Yes. UD: DET/PRON with Poss=Yes + Person=1
+    (NGLE §18.1a: possessives share the person features of personal pronouns). Grammar-only.
+    """
+    try:
+        if not _is_possessive_marker(tok):
+            return False
+        return tok.morph.get("Person") == ["1"]
+    except Exception:  # noqa: BLE001 — fail-safe
+        return False
+
+
+def _possessive_children(head) -> list:
+    """The possessive-marker child token(s) of a nominal head, under EITHER scheme.
+
+    Penn: children with dep_ == "poss" ("my dog" -> my). UD es: children that are
+    possessive DETERMINERS ("mi perro" -> mi, dep det/nmod). Grammar-only; the caller
+    decides first-person via _first_person_possessive_marker.
+    """
+    out: list = []
+    try:
+        for c in (getattr(head, "children", None) or ()):
+            if _is_possessive_marker(c):
+                out.append(c)
+    except Exception:  # noqa: BLE001 — fail-safe
+        return []
+    return out
+
+
+def _copular_predicate(subj_tok):
+    """The COPULA + PREDICATE of a copular clause whose subject is subj_tok, under EITHER
+    scheme. Returns (copula_tok, predicate_tok) or None.
+
+    Penn: subj_tok.head IS the copula "be" (AUX); the predicate is its attr/acomp child.
+    UD: subj_tok.head IS the PREDICATE (the nonverbal predicate is the head of the clause,
+    UD cop page); the copula is an AUX child with dep_ == "cop". The caller asks for the
+    predicate when it wants the complement, and the copula when it wants negation / date
+    binding on the copular head.
+    """
+    try:
+        head = subj_tok.head
+        if head is None:
+            return None
+        # Penn: the subject's head IS the copula be (AUX ROOT).
+        if head.lemma_ == "be" and head.pos_ == "AUX":
+            # the predicate is the attr/acomp child of the copula (nominal or ADJ),
+            # or a stative ADV particle ("is down") attached as advmod.
+            for c in head.children:
+                if c.dep_ in ("attr", "acomp"):
+                    return (head, c)
+                if c.dep_ == "advmod" and c.pos_ == "ADV":
+                    return (head, c)
+            return (head, None)
+        # UD: the subject's head is the PREDICATE; an AUX child with dep_ == "cop" is the
+        # copula (Spanish es/está/soy). Also covers a participle-headed predicate whose
+        # copula is attached as aux.
+        for c in head.children:
+            if c.dep_ in ("cop", "aux") and c.pos_ == "AUX":
+                return (c, head)
+        return None
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+
+
+def _prodrop_copular(doc):
+    """The (copula_tok, predicate_tok) of a NULL-SUBJECT 1st-person copular clause, or None.
+
+    Spanish pro-drop extends to copular clauses (NGLE 33.4a-b): "soy ingeniero" /
+    "estoy cansado" have NO subject token at all — the ROOT is the PREDICATE
+    (ingeniero/cansado) and the copula (soy/estoy) is an AUX child with dep_ == "cop"
+    carrying Person=1. Returns the pair when the ROOT predicate's copula agrees in 1st
+    person, so the caller binds the subject to the user. English has no such construction
+    (the en model never emits a cop-aux without a subject), so this never fires there.
+    Fail-safe -> None.
+    """
+    try:
+        for t in doc:
+            if t.dep_ != "ROOT":
+                continue
+            if t.pos_ not in ("NOUN", "ADJ", "ADV", "PROPN"):
+                continue
+            for c in (getattr(t, "children", None) or ()):
+                if c.dep_ != "cop" or c.pos_ != "AUX":
+                    continue
+                try:
+                    if c.morph.get("Person") == ["1"]:
+                        return (c, t)
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
+def _subject_token_of(verb_tok):
+    """The REAL grammatical subject child of a finite verb, or None.
+
+    Thin scheme-portable wrapper over the direct nsubj/nsubjpass read, with ONE Spanish
+    artifact repair: es_core_news_md sometimes mis-attaches a possessive DETERMINER as the
+    nsubj of a pronominal-verb clause ("Mi perro se llama Rex" -> Mi/DET/nsubj, perro as
+    its flat) - a DET is never a subject, so when the nsubj child is a possessive DET the
+    possessed noun (its flat/nmod child, or its own head if the DET was demoted) is the
+    real subject. Grammar-only (morphology + flat/nmod), NO token list; fail-safe: any
+    miss returns the direct nsubj read (today's behavior).
+    """
+    try:
+        direct = next((c for c in (getattr(verb_tok, "children", None) or ())
+                       if c.dep_ in ("nsubj", "nsubjpass")), None)
+        if direct is None or not _is_possessive_marker(direct):
+            return direct
+        # A possessive DET mis-attached as nsubj — find the noun it actually possesses.
+        for c in (getattr(direct, "children", None) or ()):
+            if c.dep_ in ("flat", "nmod") and c.pos_ in ("NOUN", "PROPN"):
+                return c
+        h = getattr(direct, "head", None)
+        if h is not None and h is not verb_tok and h.pos_ in ("NOUN", "PROPN"):
+            return h
+        return direct
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+
+
+def _first_person_finite_verb(doc):
+
+    """The finite ROOT VERB carrying 1st-person agreement, for a NULL-SUBJECT clause, or None.
+
+    Spanish is pro-drop (NGLE §33.4a-b): "tengo", "soy", "estoy", "llamo" carry Person=1
+    on the verb and there is often NO subject token at all. Returns the verb token when the
+    clause's ROOT finite verb agrees in 1st person AND has no nominal subject of its own —
+    the deterministic signal that the clause's subject IS the speaker (user). English has no
+    such construction (English requires an overt subject), so this never fires on the en
+    model. Fail-safe -> None.
+    """
+    try:
+        for t in doc:
+            if t.dep_ != "ROOT":
+                continue
+            if t.pos_ not in ("VERB", "AUX"):
+                continue
+            try:
+                if t.morph.get("Person") != ["1"]:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            # A clause with an explicit nominal subject is NOT pro-drop.
+            if any(c.dep_ in ("nsubj", "nsubjpass") for c in t.children):
+                continue
+            return t
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
+def _clitic_pronoun_of(verb_tok):
+    """The REFLEXIVE / pronominal-verb clitic child of verb_tok (Spanish se/me/te attached
+    as expl:pv, or iobj/obj with Reflex=Yes), or None.
+
+    UD expl:pv page: an inherently reflexive (pronominal) verb always occurs with a
+    reflexive clitic attached as expl:pv INSTEAD of obj. This is the structural marker of
+    the Spanish naming construction ("se llama X") and of reflexive feelings ("me siento X").
+    The clitic's person is read from morphology (Person=1 -> the speaker is the subject).
+    """
+    try:
+        for c in (getattr(verb_tok, "children", None) or ()):
+            if c.pos_ != "PRON":
+                continue
+            try:
+                _reflex = "Yes" in c.morph.get("Reflex")
+            except Exception:  # noqa: BLE001
+                _reflex = False
+            if c.dep_ == "expl:pv" or _reflex or "Reflex" in c.morph:
+                return c
+            # 1SG/2SG CLITIC FORM (es_core_news_md quirk): the 1sg/2sg pronominal-verb clitic
+            # ("Me llamo Carlos", "te llamas Ana") parses as an IOBJ with Case=Dat and the
+            # clitic's PrepCase=Npr form, NOT expl:pv/Reflex (measured on the real model:
+            # "me" -> iobj/Case=Dat/PrepCase=Npr/PronType=Prs). This IS the pronominal
+            # marker of the same construction (NGLE §16.4: the clitic is part of the
+            # pronominal verb; the model just tags its form differently). PrepCase=Npr +
+            # PronType=Prs is the CLITIC form (vs the stressed "mí" PrepCase=Pre) — grammar,
+            # no token list. The naming/dative-experiencer chains already gate on the verb
+            # lemma (naming cue class / verb-of-affection), so this cannot mis-fire on a
+            # plain dative ("le di el libro" -> le/PrepCase=Npr is read ONLY when the verb
+            # is a naming verb, which "di" is not).
+            if c.dep_ in ("iobj", "obj") and c.pos_ == "PRON":
+                try:
+                    if "Npr" in c.morph.get("PrepCase") \
+                            and "Prs" in c.morph.get("PronType") \
+                            and c.morph.get("Person") in (["1"], ["2"]):
+                        return c
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
+def _dative_experiencer_of(verb_tok):
+    """The DATIVE EXPERIENCER clitic of a verb-of-affection clause (Spanish "me gusta" -> the
+    "me" iobj with Case=Dat), or None.
+
+    NGLE §15.11o: verbs of affection express sensations the EXPERIENCER undergoes toward a
+    STIMULUS; the experiencer surfaces as a dative clitic (me/te/le), NOT the subject — the
+    stimulus is the nsubj. Grammar-only (iobj + Case=Dat / Case=Acc with Person), never a
+    verb list. Fail-safe -> None.
+    """
+    try:
+        for c in (getattr(verb_tok, "children", None) or ()):
+            if c.pos_ != "PRON":
+                continue
+            try:
+                _case = c.morph.get("Case") or []
+            except Exception:  # noqa: BLE001
+                _case = []
+            if c.dep_ in ("iobj", "dative") or "Dat" in _case:
+                return c
+    except Exception:  # noqa: BLE001 — fail-safe
+        return None
+    return None
+
+
+def _is_de_genitive(case_tok) -> bool:
+    """True iff case_tok is the Spanish genitive preposition "de" (the de-PP that carries
+    possession/relational genitives, e.g. "el nombre de mi madre"). Closed grammatical
+    class (the genitive preposition of the language), like _ADJ_TOPIC_PREPS.
+    """
+    try:
+        return (
+            case_tok.pos_ == "ADP"
+            and (case_tok.lemma_ or case_tok.text or "").strip().lower() == "de"
+        )
+    except Exception:  # noqa: BLE001 — fail-safe
+        return False
+
+
 def _get_nlp():
     """Return the loaded spaCy pipeline, or ``None`` if unavailable (flag off / no spaCy / no model).
 
@@ -824,6 +1123,13 @@ def analyze_copula(text: str):
       (ADJ→feels, NOUN→occupation, PROPN→also_known_as); a VERB participle ("I am exhausted")
       is reported WITHOUT a relation (ambiguous → caller's residue path decides).
 
+      SCHEME-PORTABLE + PRO-DROP (Spanish; NGLE §33.4a-b): UD es structures the copular clause with
+      the PREDICATE as the head and the copula (es/está/soy) as an AUX ``cop`` child — and Spanish
+      licenses subject-less clauses whose person features live on the copula ("soy ingeniero",
+      "estoy cansado" — the null subject IS the speaker). Both shapes are read here via
+      ``_copular_predicate`` / ``_prodrop_copular``, so Spanish feelings/occupations are captured
+      exactly like their English "I am X" twins.
+
       ``subject_is_self`` is set ONLY for a genuine 1st-person personal-pronoun subject ("I"/"we");
       a possessive subject ("my favorite color is blue") is reported with ``subject_is_self=False``
       so the caller routes it to the preference seam, NOT the self-predication path.
@@ -837,102 +1143,69 @@ def analyze_copula(text: str):
     doc = _parse(text)
     if doc is None:
         return None
+
+    def _build(subject, subj_self, cop_tok, comp):
+        """The shared CopulaAnalysis builder — guards + complement enrichment + rel first-cut.
+        Mirrors the historical per-nsubj tail exactly (byte-identical for English); used by BOTH
+        the nsubj loop and the pro-drop path so the two cannot drift."""
+        negated = any(_is_neg(c) for c in cop_tok.children) or any(
+            _is_neg(c) for c in comp.children
+        )
+        complement = (comp.text or "").strip().lower()
+        if comp.pos_ in ("NOUN", "PROPN"):
+            try:
+                _np = (_np_phrase(comp) or "").strip().lower()
+                if _np:
+                    complement = _np
+            except Exception:  # noqa: BLE001 — fail-safe
+                pass
+        if not complement:
+            return None
+        if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
+            return None
+        if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
+            return None
+        if comp.pos_ == "ADJ" and _adj_has_prep_object(comp):
+            return None
+        rel = _COMPLEMENT_POS_TO_REL.get(comp.pos_)
+        if comp.pos_ in ("NOUN", "PROPN") and any(c.dep_ == "det" for c in comp.children):
+            rel = "occupation"
+        return CopulaAnalysis(
+            subject=subject,
+            subject_is_self=subj_self,
+            complement=complement,
+            complement_pos=comp.pos_,
+            relation=rel,
+            negated=negated,
+        )
+
     try:
+        # PRO-DROP FIRST: a subject-less copular clause whose copula carries Person=1 → the user.
+        _pd = _prodrop_copular(doc)
+        if _pd is not None:
+            _pd_cop, _pd_pred = _pd
+            _pd_res = _build("user", True, _pd_cop, _pd_pred)
+            if _pd_res is not None:
+                return _pd_res
         for tok in doc:
-            # Subject of a clause whose head is the copula "be".
+            # Subject of a clause whose head is the copula "be" (Penn) or the PREDICATE (UD).
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            # The copula clause head is "be" (AUX). Two shapes spaCy produces:
-            #   "I am worried"  → head is the AUX "am" (ROOT, lemma be); complement is its child.
-            #   "I am exhausted"→ head is the participle VERB (ROOT); "am" is auxpass; the
-            #                     complement IS the head (participle). Handle both.
-            comp = None
-            if head.lemma_ == "be" and head.pos_ == "AUX":
-                # complement is attr/acomp child of the copula
-                for child in head.children:
-                    if child.dep_ in ("attr", "acomp"):
-                        comp = child
-                        break
-            elif any(c.dep_ in ("cop", "aux", "auxpass") and c.lemma_ == "be" for c in head.children):
-                # participle/predicate-adjective head with a "be" copula/aux child → head is comp
-                comp = head
-            if comp is None:
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
-
+            _cop, _pred = _cp
+            if _pred is None:
+                continue
             subject = (tok.lemma_ or tok.text or "").strip().lower()
-            # SELF-DETECTION IS GRAMMATICAL, NOT A WORD-LIST. ``subject_is_self`` is True ONLY when
-            # the nsubj token is itself a genuine 1st-person PERSONAL pronoun ("I"/"we") — decided
-            # from morphology (Person=1 ∧ PronType=Prs ∧ no Poss). A possessive-1st-person subject
-            # ("my favorite color is blue") is DELIBERATELY NOT self: "my" carries Poss=Yes so the
-            # clause predicates about the possessed noun ("color"), not the speaker — that residue
-            # is the preference seam's job (ingest), not a self-predication.
             subj_self = _is_first_person_personal_pronoun(tok)
-
-            negated = any(_is_neg(c) for c in head.children) or any(
-                _is_neg(c) for c in comp.children
-            )
-            complement = (comp.text or "").strip().lower()
-            # FULL-NP NOMINAL COMPLEMENT (premodifier fix): "I am a principal network architect"
-            # parses architect(NOUN, attr) ← amod(principal) + compound(network); taking only
-            # ``comp.text`` truncated the occupation to "architect". Build the complement from the
-            # head's NP span (``_np_phrase``: head + left compound/amod modifiers, det/poss
-            # excluded — the SAME NP-construction rule the deriver chains use). SCOPED to NOMINAL
-            # complements (NOUN/PROPN) ONLY: an ADJ/VERB complement stays the bare head so the
-            # copula-feeling capture ("I am excited" → feels excited) is byte-identical. The UD
-            # copula analysis treats the NONVERBAL PREDICATE (the full predicate-nominal NP) as
-            # the clause's predicate — the modifiers are part of it, not discardable
-            # (universaldependencies.org/u/dep/cop.html; spaCy attr = predicate "attribute").
-            if comp.pos_ in ("NOUN", "PROPN"):
-                try:
-                    _np = (_np_phrase(comp) or "").strip().lower()
-                    if _np:
-                        complement = _np
-                except Exception:  # noqa: BLE001 — fail-safe: NP-build miss → bare head (today's value)
-                    pass
-            if not complement:
-                continue
-            # A QUESTION ("what am I?", "who are you?") is not a value statement — skip an
-            # interrogative complement (grammatical: PronType=Int / wh-tags, not a word list).
-            if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
-                continue
-            # MEASURED-ADJECTIVE GUARD: "I am 34 years old" / "I am 6 feet tall" predicates a
-            # MEASUREMENT (age/height), not a feeling — the ADJ is modified by a numeric measure.
-            # Decline the self-predication so the copula-measure chain owns it as a scalar. Fires
-            # ONLY when the number measures the adjective itself; a bare feeling ("I am sad") or a
-            # separate co-occurring number ("I am 45, sad") is untouched. Subject-agnostic, grammar.
-            if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
-                continue
-            # RELATIONAL-PREDICATE GUARD (data-loss fix): "I am allergic TO penicillin" / "I am afraid
-            # OF spiders" is a predicate adjective carrying a PREPOSITIONAL OBJECT — a RELATION with an
-            # object, NOT a bare feeling. Reading it as ``feels`` both mis-types it AND drops the object
-            # (penicillin). DECLINE the self-predication here so the copula-feeling capture never claims
-            # it; the object is captured on the ``<adj>_<prep>`` relation by the relational-predicate
-            # seam (analyze_copula_relational_predicate). Grammar-driven (prep→pobj), subject-agnostic,
-            # NO adjective/domain word list — mirrors the measured-adjective guard directly above.
-            if comp.pos_ == "ADJ" and _adj_has_prep_object(comp):
-                continue
-            rel = _COMPLEMENT_POS_TO_REL.get(comp.pos_)  # None for VERB / other → ambiguous residue
-            # DETERMINER OVERRIDE (casing-robust): a complement introduced by an article
-            # ("a"/"an"/"the" — a ``det`` child) is a COMMON NOUN describing a role, NEVER a proper
-            # name — "I am a Systems Analyst" is an occupation even though the sm model tags the
-            # title-cased head as PROPN. The ``det`` dependency is a grammatical primitive (not a
-            # casing/word-list rule): if present, route the nominal complement to "occupation".
-            if comp.pos_ in ("NOUN", "PROPN") and any(c.dep_ == "det" for c in comp.children):
-                rel = "occupation"
-            return CopulaAnalysis(
-                subject=subject,
-                subject_is_self=subj_self,
-                complement=complement,
-                complement_pos=comp.pos_,
-                relation=rel,
-                negated=negated,
-            )
+            _res = _build(subject, subj_self, _cop, _pred)
+            if _res is not None:
+                return _res
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.analyze_copula_failed", error=str(e)[:160])
         return None
     return None
-
 
 def analyze_copula_affect_complements(text: str) -> list[str]:
     r"""Enumerate ALL coordinated affective complements of a 1st-person copula.
@@ -951,33 +1224,30 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
         ongoing action) and any other POS are excluded.
       • A conjunct carrying its OWN ``neg`` ("…but not exhausted") is skipped (negation deferred).
     Returns ``[]`` when there is no first-person affective copula (the caller then has nothing to add).
-    Fail-safe → ``[]``."""
+    Fail-safe → ``[]``.
+
+    SCHEME-PORTABLE + PRO-DROP (Spanish; NGLE §33.4a-b): the copular clause is read via the same
+    scheme-portable machinery — UD es puts the predicate as the clause head with the copula as an
+    AUX ``cop`` child, and a subject-less "estoy cansado" binds the null subject (Person=1 on the
+    copula) to the speaker. Both shapes are captured here exactly like the English "I am X" twin.
+    """
     doc = _parse(text)
     if doc is None:
         return []
     try:
-        for tok in doc:
-            if tok.dep_ not in ("nsubj", "nsubjpass"):
-                continue
-            if not _is_first_person_personal_pronoun(tok):
-                continue
-            head = tok.head
-            comp = None
-            if head.lemma_ == "be" and head.pos_ == "AUX":
-                for child in head.children:
-                    if child.dep_ == "acomp" and child.pos_ == "ADJ":
-                        comp = child
-                        break
-            if comp is None:
-                continue
-            if any(_is_neg(c) for c in head.children):
-                continue  # whole-clause negation → deferred
-            # Walk the conj coordination off the ADJ head, collecting ADJ + VBN predicate complements.
+        def _walk_affect(_cop, _comp, _subj_self):
+            """Enumerate the coordinated ADJ/VBN complements of a 1st-person affective copula."""
+            if not _subj_self:
+                return []
+            if _comp is None:
+                return []
+            if any(_is_neg(c) for c in _cop.children):
+                return []  # whole-clause negation → deferred
             out: list[str] = []
             seen: set = set()
-            frontier = [comp]
-            visited = {comp.i}
-            members = [comp]
+            frontier = [_comp]
+            visited = {_comp.i}
+            members = [_comp]
             while frontier:
                 nxt = []
                 for t in frontier:
@@ -992,19 +1262,37 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
                 if any(_is_neg(ch) for ch in m.children):
                     continue  # this conjunct is negated → skip
                 if m.pos_ == "ADJ" and _adj_has_numeric_measure(m):
-                    continue  # "34 years old" → age/measurement (copula-measure chain), not a feeling
+                    continue
                 if m.pos_ == "ADJ" and _adj_has_prep_object(m):
-                    continue  # "allergic to X" / "afraid of X" → a RELATION w/ an object, not a feeling
+                    continue
                 surf = (m.text or m.lemma_ or "").strip().lower()
                 if surf and surf not in seen:
                     seen.add(surf)
                     out.append(surf)
             return out
+
+        # PRO-DROP FIRST: a subject-less 1st-person affective copula ("estoy cansado").
+        _pd = _prodrop_copular(doc)
+        if _pd is not None:
+            _pd_cop, _pd_pred = _pd
+            if _pd_pred.pos_ in ("ADJ", "VBN", "VERB"):
+                return _walk_affect(_pd_cop, _pd_pred, True)
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            if not _is_first_person_personal_pronoun(tok):
+                continue
+            _cp = _copular_predicate(tok)
+            if _cp is None:
+                continue
+            _cop, _pred = _cp
+            if _pred is None or _pred.pos_ not in ("ADJ", "VBN", "VERB"):
+                continue
+            return _walk_affect(_cop, _pred, True)
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.analyze_copula_affect_complements_failed", error=str(e)[:160])
         return []
     return []
-
 
 def analyze_copula_relational_predicate(text: str) -> list[dict]:
     r"""Capture a 1st-person copular predicate ADJECTIVE that carries a PREPOSITIONAL OBJECT as a
@@ -1130,24 +1418,21 @@ def analyze_possessive_predication(text: str):
             # The subject must be a NOUN possessed by a 1st-person possessive determiner.
             if tok.pos_ not in ("NOUN", "PROPN"):
                 continue
+            # SCHEME-PORTABLE POSSESSIVE READ: English "my" is a poss PRON; UD es "mi" is a
+            # possessive DETERMINER (DET with Poss=Yes + Person, NGLE §18.1a) attached as det/nmod.
             poss_first_person = any(
-                c.dep_ == "poss"
-                and c.morph.get("Person") == ["1"]
-                and "Yes" in c.morph.get("Poss")
+                _first_person_possessive_marker(c)
                 for c in tok.children
             )
             if not poss_first_person:
                 continue
 
-            head = tok.head
-            comp = None
-            if head.lemma_ == "be" and head.pos_ == "AUX":
-                for child in head.children:
-                    if child.dep_ in ("attr", "acomp"):
-                        comp = child
-                        break
-            elif any(c.dep_ in ("cop", "aux", "auxpass") and c.lemma_ == "be" for c in head.children):
-                comp = head
+            # SCHEME-PORTABLE COPULA READ (see _copular_predicate): Penn be-ROOT + attr/acomp child,
+            # OR UD predicate-ROOT (the subject's head IS the predicate) with an AUX/cop child.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
+                continue
+            _cop, comp = _cp
             if comp is None:
                 continue
 
@@ -1214,7 +1499,7 @@ def analyze_possessive_predication(text: str):
             if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
                 continue
 
-            negated = any(_is_neg(c) for c in head.children) or any(
+            negated = any(_is_neg(c) for c in _cop.children) or any(
                 _is_neg(c) for c in comp.children
             )
             # FULL multi-token value ("O negative", "dark blue"), not just the complement head —
@@ -2667,9 +2952,23 @@ def _svo_predicate_token(verb_tok, exclude_idx=None, include_agent=False) -> str
         # Does the verb already govern a DIRECT object (dobj/obj) or a linking complement (attr/oprd)?
         # If so, any prepositional child is a circumstantial ADJUNCT, not load-bearing → never folded.
         # A date-span token (exclude_idx) is NOT a real object — never count it as the direct object.
+        # A "direct object" for the fold decision is a BARE object — a dobj/obj that carries
+        # its own load-bearing "case" child (es quirk: "Quedo con Ana" parses Ana as obj with
+        # con/case; "Salgo con Pedro" parses Pedro as obl) is a PREPOSITIONAL object, i.e. the
+        # verb's only object, exactly like a Penn pobj — foldable, never a circumstantial
+        # adjunct that blocks the fold. Date-span tokens are never a real object.
+        def _is_case_object(_c):
+            if _c.dep_ not in ("obj", "dobj"):
+                return False
+            try:
+                return any(_g.dep_ == "case" and (_g.text or "").strip().lower() in _particles
+                           for _g in _c.children)
+            except Exception:  # noqa: BLE001
+                return False
+
         has_direct_object = any(
             c.dep_ in ("dobj", "obj", "attr", "oprd") and c.pos_ in ("NOUN", "PROPN")
-            and not _in_date(c)
+            and not _in_date(c) and not _is_case_object(c)
             for c in verb_tok.children
         )
         # One immediately-following load-bearing particle/preposition that the verb governs.
@@ -2678,12 +2977,33 @@ def _svo_predicate_token(verb_tok, exclude_idx=None, include_agent=False) -> str
         #                                                   object (the pobj IS the object: "go to X").
         # Take the FIRST qualifying child only.
         for c in verb_tok.children:
+            # UD es OBLIQUE-CASE FOLD FIRST ("vive en Madrid" -> Madrid/obl, en/case): in the UD
+            # scheme the preposition is a "case" child of the OBLIQUE NOMINAL, never a child of
+            # the verb — so the particle-surface guard below (which tests the CHILD's own surface)
+            # would skip the obl NOUN ("madrid" is not a particle) and this arm would be DEAD
+            # CODE (measured: "Mis hermanos viven en México" emitted the bare "vivir", never
+            # "vivir_en"). Check the obl/nmod+case shape BEFORE the surface guard: a load-bearing
+            # case particle is folded the same way Penn folds prep, so "vivir_en" / "trabajar_en"
+            # are the Spanish residence/employment predicates. The fold itself only PRODUCES the
+            # token; canonicalization to lives_in / works_for is the DB alias rail (migration 218:
+            # vivir_en/trabajar_en/trabajar_para → lives_in/works_for, the SAME seam English
+            # live_in/work_for ride at /ingest). English byte-identical (en models emit prep->pobj,
+            # never case->obl).
+            if c.dep_ in ("obl", "nmod", "obj", "dobj") and not has_direct_object \
+                    and not _in_date(c):
+                for _cc in c.children:
+                    if _cc.dep_ == "case" \
+                            and (_cc.text or "").strip().lower() in _particles:
+                        parts.append((_cc.lemma_ or _cc.text or "").strip().lower())
+                        break
+                if len(parts) > 1:
+                    break
             surf = (c.text or "").strip().lower()
             if surf not in _particles:
                 continue
             # PEELED-DATE GUARD (PART 1): a prep that introduces a date span ("on" governing "march 1st",
             # or a prep token that IS inside the date span) is a temporal adjunct — never fold it onto
-            # the predicate, so the atomizer's ``see_on`` never survives.
+            # the predicate, so the atomizer's see_on never survives.
             if _in_date(c) or any(gc.dep_ == "pobj" and _in_date(gc) for gc in c.children):
                 continue
             if c.dep_ == "prt":
@@ -2737,12 +3057,38 @@ def _load_bearing_prep_of(verb_tok, exclude_idx=None) -> str | None:
             return _t is not None and _t.i in _excl
 
         _particles = _svo_keep_particles()
+        # A "direct object" for the fold decision is a BARE object — a dobj/obj that carries
+        # its own load-bearing "case" child (es quirk: "Quedo con Ana" parses Ana as obj with
+        # con/case; "Salgo con Pedro" parses Pedro as obl) is a PREPOSITIONAL object, i.e. the
+        # verb's only object, exactly like a Penn pobj — foldable, never a circumstantial
+        # adjunct that blocks the fold. Date-span tokens are never a real object.
+        def _is_case_object(_c):
+            if _c.dep_ not in ("obj", "dobj"):
+                return False
+            try:
+                return any(_g.dep_ == "case" and (_g.text or "").strip().lower() in _particles
+                           for _g in _c.children)
+            except Exception:  # noqa: BLE001
+                return False
+
         has_direct_object = any(
             c.dep_ in ("dobj", "obj", "attr", "oprd") and c.pos_ in ("NOUN", "PROPN")
-            and not _in_date(c)
+            and not _in_date(c) and not _is_case_object(c)
             for c in verb_tok.children
         )
         for c in verb_tok.children:
+            # UD es OBLIQUE-CASE FOLD FIRST — the lock-step twin of the _svo_predicate_token
+            # arm: the preposition is a "case" child of the oblique nominal ("vive en Madrid"
+            # -> Madrid/obl, en/case), never a child of the verb, so the particle-surface
+            # guard below would skip it and the load-bearing prep would go unread (the
+            # preposition guard in _emit would then fail to protect "vivir_en" from a
+            # prep-blind minted rel). Same grammar, same fail-safe, English byte-identical.
+            if c.dep_ in ("obl", "nmod", "obj", "dobj") and not has_direct_object \
+                    and not _in_date(c):
+                for _cc in c.children:
+                    if _cc.dep_ == "case" \
+                            and (_cc.text or "").strip().lower() in _particles:
+                        return (_cc.lemma_ or _cc.text or "").strip().lower() or None
             surf = (c.text or "").strip().lower()
             if surf not in _particles:
                 continue
@@ -2950,6 +3296,18 @@ def _svo_object_head(verb_tok, exclude_idx=None, include_agent=False):
                     if gc.dep_ == "pobj" and gc.pos_ in ("NOUN", "PROPN") and _ok(gc) \
                             and not _object_candidate_is_temporal(gc):
                         return gc
+        # UD locative/oblique object of a load-bearing preposition (es): the es model attaches the
+        # prepositional object directly as ``obl`` on the VERB, with the preposition as a ``case``
+        # child of the nominal ("vive en Madrid" -> Madrid/obl, en/case) — not Penn's prep->pobj.
+        # Read it the same way when the ``case`` particle is load-bearing, so the SVO + residence
+        # lanes fire for Spanish exactly as for English.
+        for c in verb_tok.children:
+            if c.dep_ not in ("obl", "nmod") or c.pos_ not in ("NOUN", "PROPN") or not _ok(c):
+                continue
+            for _cc in c.children:
+                if _cc.dep_ == "case" and (_cc.text or "").strip().lower() in _particles \
+                        and not _object_candidate_is_temporal(c):
+                    return c
         # Attribute complement of a non-copula linking verb ("became a manager").
         for c in verb_tok.children:
             if c.dep_ in ("attr", "oprd") and c.pos_ in ("NOUN", "PROPN") and _ok(c):
@@ -7316,9 +7674,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD) — see _copular_predicate. The
+            # subject's head is the copula in Penn, the PREDICATE in UD; _cop is the AUX
+            # copula (for negation/date binding), _pred the predicate/complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
+            head = _cop  # chains below read head as the copula (negation, verb_tok)
             # POSSESSOR — 1st-person poss determiner → user; genitive NOUN/PROPN poss → that possessor.
             possessor = None
             for c in tok.children:
@@ -7390,9 +7753,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD) — see _copular_predicate. The
+            # subject's head is the copula in Penn, the PREDICATE in UD; _cop is the AUX
+            # copula (for negation/date binding), _pred the predicate/complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
+            head = _cop  # chains below read head as the copula (negation, verb_tok)
             if _is_first_person_personal_pronoun(tok):
                 continue  # "I am ..." is the self/feeling/identity lane, never a geo classification
             if any(_is_neg(c) for c in head.children):
@@ -7407,16 +7775,140 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #     city") is a TYPE the subject is an instance of; a PROPN complement is a name (owned
             #     by the naming chains), a bare NOUN with no determiner is a state/role (other chains).
             type_comp = None
-            for c in head.children:
-                if c.dep_ in ("attr", "oprd") and c.pos_ == "NOUN" and \
-                        any(g.dep_ == "det" for g in c.children):
+            # Penn: the type is the copula's attr/oprd NOUN child with a determiner. UD es: the
+            # PREDICATE ITSELF is the nonverbal predicate (UD cop page) — "Rex es un labrador"
+            # parses labrador as the ROOT with det "un" — so _pred IS the type complement.
+            if _pred is not None and _pred.pos_ == "NOUN" and \
+                    any(g.dep_ == "det" for g in _pred.children):
+                # PERSON-SUBJECT GATE (UD ROOT shape ONLY — critic round-2 finding: "Mi coche es
+                # EL AZUL" minted (coche, instance_of, azul)). es_core_news_md tags a nominalized
+                # ADJECTIVE under the definite article as NOUN ("el azul" = the blue one), so a
+                # thing subject + NOUN-tagged color/quality complement files a PROPERTY as a TYPE.
+                # The discriminator is the subject's personhood (the SAME gate the bare-NOUN arm
+                # uses): an article-less/articled type under ser is an occupation/class only for a
+                # PERSON subject (kinship-class head or a determiner-less PROPN name — "Rex es un
+                # labrador", "París es la capital", "Juan es el médico" ALL stay instance_of; the
+                # DET-arm fabrication cases all have THING subjects: mi coche / el libro / el
+                # perro-with-det). Scoped to the UD-ROOT shape (predicate-as-head, copula child —
+                # _pred.dep_ == "ROOT") so ENGLISH is byte-identical: the en model's copular
+                # complement is Penn "attr" (never ROOT), and English already protects possessive
+                # subjects via the attr-scalar claim ("my dog is a labrador" -> (user, dog,
+                # labrador), no instance_of) — the exact parity target. Grammar + DB kinship
+                # class, NO word list. Applied as a BOOLEAN at the single admission point below
+                # (a None here would be overwritten by the calendar guard's re-admission).
+                _det_person_gate_pass = True
+                try:
+                    if _pred.dep_ == "ROOT" and not (
+                            (tok.lemma_ or tok.text or "").strip().lower() in _kinship_nouns()
+                            or (tok.pos_ == "PROPN" and not any(
+                                g.dep_ == "det" for g in tok.children))):
+                        _det_person_gate_pass = False  # thing subject — mis-tagged property
+                except Exception:  # noqa: BLE001 — gate fail-safe: keep today's admission
+                    _det_person_gate_pass = True
+                try:
+                    if "Int" not in _pred.morph.get("PronType") \
+                            and _pred.tag_ not in ("WP", "WP$", "WDT", "WRB"):
+                        # TEMPORAL-COMPLEMENT GUARD (es): a weekday/month noun as the copular
+                        # complement ("La reunión es EL LUNES") is a CALENDAR expression, never
+                        # a type — the es model tags "lunes"/"mayo" as a plain NOUN (no DATE
+                        # ent), so without this guard the classification chain mints junk
+                        # (reunión, instance_of, lunes). The Spanish weekday/month names are
+                        # DB temporal_patterns rows (growable, seeded migration 218) — consult
+                        # them via the overlay, the SAME authority the date gate uses. English
+                        # unaffected (the en model DATE-labels these, so this arm never sees a
+                        # bare weekday complement).
+                        _tcomp_surface = (_pred.text or "").strip().lower()
+                        _is_calendar = False
+                        try:
+                            from src.api import temporal_pattern_overlay as _tpo_cls
+                            _dsn_cls = os.environ.get("POSTGRES_DSN", "")
+                            for _cc, _cpat in (_tpo_cls.resolve_current(_dsn_cls) or []):
+                                try:
+                                    if _cpat.search(_tcomp_surface):
+                                        _is_calendar = True
+                                        break
+                                except Exception:  # noqa: BLE001
+                                    continue
+                        except Exception:  # noqa: BLE001 — DB miss -> keep (not a date)
+                            _is_calendar = False
+                        if not _is_calendar and _det_person_gate_pass:
+                            type_comp = _pred
+                except Exception:  # noqa: BLE001
+                    pass
+            if type_comp is None:
+                for c in head.children:
+                    if c.dep_ in ("attr", "oprd") and c.pos_ == "NOUN" and \
+                            any(g.dep_ == "det" for g in c.children):
+                        try:
+                            if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                                continue
+                        except Exception:  # noqa: BLE001
+                            pass
+                        type_comp = c
+                        break
+            # BARE-NOUN OCCUPATION ARM (Spanish "ser" + article-less noun): Spanish omits the
+            # article with professions after the identity copula "ser" ("Mi madre es ENFERMERA",
+            # "Soy INGENIERO") — NGLE: professions take no article in this predication. The
+            # det-requiring arms above would drop it, losing the instance_of the English engine
+            # captures ("My mother is A nurse"). The discriminator is the COPULA: UD es tags the
+            # identity copula "ser" as an AUX/cop child — a closed two-member class (ser=identity,
+            # estar=state) read from the parse, never a word list. A bare NOUN predicate under
+            # "ser" is an occupation/type; under "estar" it stays a state (the state chain owns it).
+            if type_comp is None and _pred is not None and _pred.pos_ == "NOUN" \
+                    and _pred.dep_ == "ROOT" and not any(g.dep_ == "det" for g in _pred.children):
+                _is_ser = False
+                try:
+                    for _cc in _pred.children:
+                        if _cc.dep_ == "cop" and _cc.pos_ == "AUX" \
+                                and (_cc.lemma_ or _cc.text or "").strip().lower() == "ser":
+                            _is_ser = True
+                            break
+                except Exception:  # noqa: BLE001
+                    _is_ser = False
+                if _is_ser:
+                    # PERSON-SUBJECT GATE (critic round-2 finding: "Mi coche es rojo" minted
+                    # (coche, instance_of, rojo) because es_core_news_md tags the ADJECTIVE rojo
+                    # as NOUN — the same color tags ADJ when inflected ("La manzana es roja"), so
+                    # POS alone cannot separate an occupation NOUN from a mis-tagged adjective).
+                    # The grammatical discriminator is the SUBJECT's personhood: a profession is
+                    # predicated of a PERSON (NGLE §12.5 los sustantivos de parentesco are persons
+                    # by definition; occupations "es enfermera"/"es ingeniero" attach to people),
+                    # never of a thing — so an article-less NOUN under "ser" is an occupation ONLY
+                    # when the subject is (a) a kinship-class head (the DB-grown person class), or
+                    # (b) a PROPN name (a person or named being — "Ana es médica", "Rex es un
+                    # labrador"). A thing subject ("mi coche", "la manzana") with a NOUN-tagged
+                    # complement is a mis-tagged property, NOT a type — honest-empty (the pre-fix
+                    # state), never a fabricated instance_of. Grammar + DB kinship class, NO word
+                    # list. English unaffected (the en model never emits this ROOT-NOUN-under-ser
+                    # shape — copula-as-ROOT/attr is Penn; this arm only sees the UD es shape).
+                    _subject_is_person = False
                     try:
-                        if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
-                            continue
+                        _sl = (tok.lemma_ or tok.text or "").strip().lower()
+                        if _sl in _kinship_nouns():
+                            _subject_is_person = True
+                        elif tok.pos_ == "PROPN" and not any(
+                                g.dep_ == "det" for g in tok.children):
+                            _subject_is_person = True
                     except Exception:  # noqa: BLE001
-                        pass
-                    type_comp = c
-                    break
+                        _subject_is_person = False
+                    if not _subject_is_person:
+                        continue  # thing subject — NOUN complement is a mis-tagged property
+                    _tcomp_surface = (_pred.text or "").strip().lower()
+                    _is_calendar = False
+                    try:
+                        from src.api import temporal_pattern_overlay as _tpo_cls2
+                        _dsn_cls2 = os.environ.get("POSTGRES_DSN", "")
+                        for _cc2, _cpat2 in (_tpo_cls2.resolve_current(_dsn_cls2) or []):
+                            try:
+                                if _cpat2.search(_tcomp_surface):
+                                    _is_calendar = True
+                                    break
+                            except Exception:  # noqa: BLE001
+                                continue
+                    except Exception:  # noqa: BLE001
+                        _is_calendar = False
+                    if not _is_calendar:
+                        type_comp = _pred
             if type_comp is not None:
                 _type = _np_phrase(type_comp)
                 if _type and _type != subject:
@@ -7549,11 +8041,23 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         _LOC_PREPS = ("in", "within", "inside", "at")  # closed locative-preposition primitive
 
         def _under_locative_prep(_tok):
-            # True when _tok is the pobj of a locative preposition (a genuine "in <city>" PP).
+            # True when _tok is the object of a locative preposition (a genuine "in <city>" PP).
+            # SCHEME-PORTABLE (Penn <-> UD): Penn attaches the city as pobj under a prep
+            # ("lives in Madrid" -> Madrid/pobj, in/prep); UD es attaches it as obl directly on
+            # the VERB with the preposition as a case child ("vive en Madrid" -> Madrid/obl,
+            # en/case). Accept both so the residence bridge fires for Spanish exactly as English.
             try:
                 _h = _tok.head
-                return (_h is not None and _h.dep_ == "prep" and _tok.dep_ == "pobj"
-                        and (_h.text or "").strip().lower() in _LOC_PREPS)
+                if _h is None:
+                    return False
+                if _tok.dep_ == "pobj" and _h.dep_ == "prep":
+                    return (_h.text or "").strip().lower() in _LOC_PREPS
+                if _tok.dep_ in ("obl", "nmod"):
+                    # UD: the locative preposition is a case child of the nominal itself.
+                    for _c in (getattr(_tok, "children", None) or ()):
+                        if _c.dep_ == "case" and (_c.text or "").strip().lower() in _LOC_PREPS:
+                            return True
+                return False
             except Exception:  # noqa: BLE001
                 return False
 
@@ -7713,20 +8217,30 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the quantity-of chain owns this verb ("take 500 mg of metformin") — scalar
             if tok.i in _alias_suppress:
                 continue  # the alias chain owns this verb ("goes by Dee") — no (she, go_by, dee)
+            if tok.i in _svo_es_measure_suppress:
+                continue  # a Spanish construction chain owns this verb (tener-measure / pronominal
+                          # naming) — no (user, tener, años) / (perro, llamar, rex) SVO twin
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
             if lemma in _naming:
                 continue  # naming construction → analyze_naming owns it (caller runs that seam)
-            subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            subj_tok = _subject_token_of(tok)
+            _prodrop_self = False
             if subj_tok is None:
                 # DENSE DECOMPOSITION: a subordinate/coordinated predicate ("…, attributed to X",
                 # "and was prescribed Y", "overruled Baker") has no subject of its own — carry it by
                 # coreference from the clause it shares/modifies so this verb still yields its fact.
                 subj_tok = _carried_subject_token(tok)
-            if subj_tok is None:
+            # PRO-DROP FIRST-PERSON (Spanish; NGLE §33.4a-b): the ROOT finite verb carries Person=1
+            # and there is NO subject token at all ("Tengo un perro"). The null subject's person/
+            # number features live on the verb, so the clause's subject IS the speaker.
+            if subj_tok is None and _first_person_finite_verb(doc) is not None \
+                    and _first_person_finite_verb(doc).i == tok.i:
+                _prodrop_self = True
+            if subj_tok is None and not _prodrop_self:
                 continue
-            if _is_first_person_personal_pronoun(subj_tok):
+            if _prodrop_self or _is_first_person_personal_pronoun(subj_tok):
                 subject = "user"
             else:
                 subject = (subj_tok.text or subj_tok.lemma_ or "").strip().lower()
@@ -7838,7 +8352,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             if lemma in _naming_verbs():
                 continue
-            subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
+            subj_tok = _subject_token_of(tok)
             if subj_tok is None:
                 # DENSE DECOMPOSITION: an objectless subordinate/coordinated predicate ("…, decided in
                 # 2019", "and was cited by …") shares/modifies a subject — carry it by coreference so
@@ -8159,7 +8673,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # a RELATIONAL/component/kinship Y → its inherent relation; a SORTAL Y → generic related_to.
         _relnouns = _relational_nouns()
         for tok in doc:
-            if tok.dep_ != "poss":
+            # SCHEME-PORTABLE POSSESSIVE GATE (Penn <-> UD). English emits the possessive as a
+            # poss PRON ("my"); UD es emits possessive DETERMINERS (mi/mis/tu/su - DET with
+            # Poss=Yes + person morphology, NGLE 18.1a) attached as det/nmod. Accept BOTH so
+            # the same relational/kinship/sortal split below serves both languages. English
+            # is byte-identical: the Penn poss arm matches first, and the UD arm only fires
+            # on a DET/PRON with Poss=Yes morphology, which the en model never produces on a
+            # possessive (en tags "my" PRON/poss). Grammar-only, NO token list.
+            if not _is_possessive_marker(tok):
                 continue
             head = tok.head
             if head is None or head.pos_ not in ("NOUN", "PROPN"):
@@ -8197,10 +8718,30 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #       "name"-as-entity leak. Skip it; the genitive-name chain mints the real edges.
             # Detected grammatically (lemma "name" + nsubj-of-be), NO word list.
             def _is_name_copula_nsubj(_n):
-                return (_n is not None and (_n.lemma_ or "").strip().lower() == "name"
-                        and _n.dep_ in ("nsubj", "nsubjpass")
-                        and _n.head is not None
-                        and _n.head.lemma_ == "be" and _n.head.pos_ == "AUX")
+                # SCHEME-PORTABLE (Penn <-> UD): Penn parses "my name is Carol" with the naming
+                # noun as nsubj of the copula "be" (head.lemma_=="be"); UD es parses "mi nombre
+                # es Carlos" with the naming noun as nsubj of the PREDICATE (Carlos/ROOT) and the
+                # copula as an AUX/cop child. "nombre" (lemma) is the Spanish naming noun, the
+                # same grammatical slot "name" fills in English — a closed naming-noun primitive,
+                # not a word list. The copular read (via _copular_predicate) accepts both shapes.
+                if _n is None or (_n.lemma_ or "").strip().lower() not in ("name", "nombre"):
+                    return False
+                if _n.dep_ not in ("nsubj", "nsubjpass"):
+                    return False
+                if _n.head is None:
+                    return False
+                try:
+                    _cp = _copular_predicate(_n)
+                    if _cp is None:
+                        return False
+                    _cop_tok, _pred_tok = _cp
+                    # the naming predication's complement is the assigned NAME — a PROPN
+                    # ("Carlos", "Diane" as the es ROOT) or a NOUN the en model tags as attr
+                    # ("Diane" in "My mother's name is Diane" is NOUN/attr). Either way the
+                    # "name" head must never be minted as an entity by the possessive chain.
+                    return _pred_tok is not None and _pred_tok.pos_ in ("PROPN", "NOUN")
+                except Exception:  # noqa: BLE001
+                    return False
             if head.dep_ == "poss" and _is_name_copula_nsubj(head.head):
                 continue   # (a) possessor leg of "my mother's name is Carol"
             # (a2) APOSTROPHE-STRIPPED possessor leg (Failure 1). When the atomizer drops the genitive
@@ -8314,9 +8855,18 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD). Penn: the subject's head IS the
+            # copula "be" (AUX ROOT) with the predicate as its attr/acomp child. UD es:
+            # the subject's head IS the PREDICATE (the nonverbal predicate is the head of
+            # the clause, universaldependencies.org/u/dep/cop.html) and the copula
+            # (es/está/soy) is an AUX child with dep_ == "cop". _copular_predicate returns
+            # (copula_tok, predicate_tok) under either scheme; the chains below keep their
+            # Penn complement read (attr/acomp child of the copula) and add the UD arm
+            # where the PREDICATE ITSELF is the complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
             # SELF subject → feeling seam owns it; never a copula STATE here.
             if _is_first_person_personal_pronoun(tok):
                 continue
@@ -8326,18 +8876,29 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # is excluded by the ADJ/ADV-only complement test below — that is an identity negation
             # the correction gate already owns, not a state. The intent gate ran first; this never
             # touches it. Read from the spaCy ``neg`` dep on the copula head; no word list.
-            _neg = any(_is_neg(c) for c in head.children)
+            # Negation is read off the COPULA (the AUX be in Penn, the AUX/cop child in UD)
+            # AND the PREDICATE — UD es attaches the negation adverb to the predicate head
+            # ("no está caído" → no/advmod → caído), not to the copula, so a _cop-only read
+            # would miss it and store the fact AFFIRMED. Penn English keeps the _is_neg shim
+            # semantics (a ``neg`` arc on the copula).
+            _neg = any(_is_neg(c) for c in _cop.children) or any(
+                _is_neg(c) for c in (_pred.children if _pred is not None else ()))
             # the predicative complement: an ADJ (acomp/attr) or a stative ADV particle (advmod ADV,
             # e.g. "is down"). A NOMINAL complement ("is a teacher") is a role/identity, NOT a state —
             # excluded so we never re-route occupation/naming clauses through the state predicate.
+            # Penn: the attr/acomp/advmod child of the copula. UD: the PREDICATE ITSELF (the
+            # subject's head is the predicate, UD cop page) when it is ADJ/ADV.
             comp = None
-            for c in head.children:
-                if c.dep_ in ("acomp", "attr") and c.pos_ == "ADJ":
-                    comp = c
-                    break
-                if c.dep_ == "advmod" and c.pos_ == "ADV":
-                    comp = c
-                    break
+            if _pred is not None and _pred.pos_ in ("ADJ", "ADV"):
+                comp = _pred
+            if comp is None:
+                for c in _cop.children:
+                    if c.dep_ in ("acomp", "attr") and c.pos_ == "ADJ":
+                        comp = c
+                        break
+                    if c.dep_ == "advmod" and c.pos_ == "ADV":
+                        comp = c
+                        break
             if comp is None:
                 continue
             # MEASUREMENT GUARD (Fix 3 interplay): "she is 62 years old" / "he is 6 feet tall" parse the
@@ -8384,8 +8945,25 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     continue
             except Exception:  # noqa: BLE001 — fail-safe
                 pass
-            subject = (tok.text or tok.lemma_ or "").strip().lower()
-            _cr = _coref(tok)
+            # SUBJECT REPAIR (parity with the SVO/naming chains — critic round-3 blocker): the
+            # es model sometimes mis-attaches a possessive DETERMINER as the nsubj of a
+            # predicate-head copular clause ("Mi perro es marrón" -> Mi/DET/nsubj, perro as its
+            # flat). The raw nsubj read would emit (mi, has_state, marrón) — a garbage "mi"
+            # entity — and LOSE the real fact (perro). Here the nsubj IS the possessive DET
+            # (unlike the SVO chain where the DET is a child of the VERB), so resolve the
+            # possessed noun directly from its flat/nmod child (the same grammar _subject_token_of
+            # uses); a non-possessive subject is returned unchanged (byte-identical).
+            _subj_tok = tok
+            if _is_possessive_marker(tok):
+                try:
+                    for _pc in (getattr(tok, "children", None) or ()):
+                        if _pc.dep_ in ("flat", "nmod") and _pc.pos_ in ("NOUN", "PROPN"):
+                            _subj_tok = _pc
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+            subject = (_subj_tok.text or _subj_tok.lemma_ or "").strip().lower()
+            _cr = _coref(_subj_tok)
             if _cr:
                 subject = _cr
             if not subject:
@@ -8394,9 +8972,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not state:
                 continue
             # CONFIRMED (durable B): a predicative adjectival/stative state IS a resultant state.
-            # ``verb_tok=head`` so a date on the copula governing verb still binds; ``obj_tok=comp`` so
-            # the state span is typeable / resolves to a reusable node (mirrors the intransitive emit).
-            _emit(subject, _STATE_REL, state, verb_tok=head, obj_tok=comp, subj_tok=tok,
+            # ``verb_tok=_cop`` (the copula, Penn or UD) so a date on the copular head still
+            # binds; ``obj_tok=comp`` so the state span is typeable / resolves to a reusable node
+            # (mirrors the intransitive emit).
+            _emit(subject, _STATE_REL, state, verb_tok=_cop, obj_tok=comp, subj_tok=tok,
                   tentative=False, negated=_neg)
 
     def _chain_copula_name(doc):
@@ -8513,9 +9092,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD) — see _copular_predicate. The
+            # subject's head is the copula in Penn, the PREDICATE in UD; _cop is the AUX
+            # copula (for negation/date binding), _pred the predicate/complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
+            head = _cop  # chains below read head as the copula (negation, verb_tok)
             # The FILLER is a nominal subject NP (PROPN "Globex Industries", or a lowercase-robust
             # common-noun NP); a pronoun / 1st-person subject is NOT this construction.
             if tok.pos_ not in ("PROPN", "NOUN") or _is_first_person_personal_pronoun(tok):
@@ -8688,9 +9272,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # copula be with an nsubj whose lemma is the naming noun "name"
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD) — see _copular_predicate. The
+            # subject's head is the copula in Penn, the PREDICATE in UD; _cop is the AUX
+            # copula (for negation/date binding), _pred the predicate/complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
+            head = _cop  # chains below read head as the copula (negation, verb_tok)
             if (tok.lemma_ or "").strip().lower() != "name":
                 continue
             # the role-noun: a poss child of "name" (mother/son/wife/…). The genitive apostrophe
@@ -8850,9 +9439,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for tok in doc:
             if tok.dep_ not in ("nsubj", "nsubjpass"):
                 continue
-            head = tok.head
-            if head is None or not (head.lemma_ == "be" and head.pos_ == "AUX"):
+            # SCHEME-PORTABLE COPULA READ (Penn <-> UD) — see _copular_predicate. The
+            # subject's head is the copula in Penn, the PREDICATE in UD; _cop is the AUX
+            # copula (for negation/date binding), _pred the predicate/complement.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
                 continue
+            _cop, _pred = _cp
+            head = _cop  # chains below read head as the copula (negation, verb_tok)
             # SUBJECT: a 1st-person self ("I am 34 years old") is the USER — resolve to "user" and let
             # the measurement detection below decide. (Previously this chain SKIPPED all 1st-person and
             # punted to the "self path", but that path reads the ADJ "old" as a FEELING and DROPPED the
@@ -10092,6 +10686,307 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                       subj_tok=_owner_tok, obj_tok=None, scalar_datatype="string")
                 _claim(_b["unit"], _b["num"])
 
+    # ── SPANISH-CONSTRUCTION CHAINS (scheme-portable, subject-agnostic, NO word lists) ────────────
+    # The six constructions this engine cares about, in their Spanish grammatical shapes. Every rule
+    # is driven off dependency labels/morphology under EITHER scheme (the portability predicates
+    # above), with the lexical classes (kinship nouns, units, naming/possession verbs) resolved from
+    # the per-tenant cue-class overlay — never a token list. Each chain is fail-safe: any miss emits
+    # nothing and the residue guard / growth path still sees the span.
+
+    def _chain_es_tener_measure(doc):
+        # TENER-MEASURE ("Tengo 34 años" → (user, age, 34); "Pesa 80 kilos" → (<subj>, weight, 80)).
+        # Spanish expresses age/height/weight with a POSSESSION verb + a NUM-modded unit noun as the
+        # OBJECT ("tengo 34 años" — literally "I have 34 years"), NOT the English copula + measured
+        # adjective ("I am 34 years old" → _chain_copula_measure). The unit noun is in the per-tenant
+        # unit_scalar cue map (año→age, metro→height, kilo→weight — NGLE documents "tener + N años" as
+        # THE Spanish age construction); the value is the NUM surface. The subject is the pro-drop
+        # first-person verb ("tengo") → user, or an explicit subject ("ella tiene 60 años"). Grammar-
+        # driven (possession-verb class ∪ unit_scalar map), NO number/unit word list.
+        _units = _unit_scalar_map()
+        _poss = _possession_verbs()
+        for tok in doc:
+            # the measure head: a VERB, or a ROOT ADJ participle — es_core_news_md mis-tags a
+            # sentence-initial 1sg verb like "Mido" as an ADJ participle (VerbForm=Part, ROOT).
+            # Both carry the unit-bearing object with a NUM nummod; grammar + unit map decide.
+            if tok.pos_ not in ("VERB", "ADJ"):
+                continue
+            if tok.dep_ not in ("ROOT", "conj", "acl", "advcl") and tok.pos_ != "VERB":
+                continue
+            if tok.i in _ni_suppress or tok.i in _emp_suppress or tok.i in _quantity_verb_suppress:
+                continue
+            lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            # The MEASURE construction is keyed on the OBJECT's unit_scalar class, not the verb:
+            # "tengo 34 años" (possession verb + year unit), "pesa 80 kilos" (weight verb + kilo
+            # unit), "corrí 5 kilómetros" (motion verb + distance unit) all express a MEASURE of
+            # the subject. The unit_scalar cue map is the gate (año→age, kilo→weight, kilómetro→
+            # distance); the verb class is NOT consulted (a measure object is a measure regardless
+            # of the verb) — grammar + metadata, NO verb/number word list.
+            if not lemma or lemma == "be" or lemma in _naming_verbs():
+                continue
+            # the unit-bearing object: a NOUN child (obj/dobj in the md/sm es models; a motion
+            # verb may attach the distance as obl/nmod) in the unit_scalar map with a NUM nummod.
+            unit_tok = None
+            num_tok = None
+            rel = None
+            for c in tok.children:
+                if c.pos_ != "NOUN" or c.dep_ not in ("obj", "dobj", "obl", "nmod"):
+                    continue
+                _ul = (c.lemma_ or c.text or "").strip().lower()
+                _ut = (c.text or "").strip().lower()
+                _mapped = _units.get(_ul) or _units.get(_ut)
+                if not _mapped:
+                    continue
+                _n = next((g for g in c.children if g.pos_ == "NUM" and g.dep_ == "nummod"), None)
+                if _n is None:
+                    continue
+                unit_tok, num_tok, rel = c, _n, _mapped
+                break
+            if unit_tok is None or rel is None:
+                continue
+            # subject: explicit nominal (coref-resolved) or the pro-drop first-person verb → user.
+            subject = None
+            _s = _subject_token_of(tok)
+            if _s is not None:
+                subject = (_s.text or _s.lemma_ or "").strip().lower()
+                _cr = _coref(_s) or _person_coref(_s)
+                if _cr:
+                    subject = _cr
+            else:
+                try:
+                    if tok.morph.get("Person") == ["1"]:
+                        subject = "user"
+                except Exception:  # noqa: BLE001
+                    pass
+                # FIRST-PERSON PRO-DROP MEASURE (NGLE §33.4a-b): a SUBJECT-LESS sentence-initial
+                # measure clause is unambiguously first-person in Spanish — "Mido 1.75 metros"
+                # can only mean "I measure 1.75 m" (you cannot state a bare measure about a
+                # third party). Both es models mis-tag the 1sg verb here (sm: PROPN, md: ADJ
+                # participle), destroying the Person feature — so the construction itself is the
+                # signal: a ROOT measure head with a unit-bearing object and NO subject is the
+                # speaker. Gated to the measure shape (a real 3sg "pesa 80 kilos" has NO subject
+                # either but is left unbound — no referent, honest skip).
+                if not subject and tok.dep_ == "ROOT" and tok.pos_ == "ADJ" \
+                        and unit_tok is not None:
+                    subject = "user"
+            if not subject:
+                continue
+            value = (num_tok.text or "").strip()
+            _emit(subject, rel, value, verb_tok=tok, obj_tok=num_tok, subj_tok=_s)
+            _claim(unit_tok, num_tok)
+            # SUPPRESS the SVO twin: (user, tener, años) would mint a junk relational object.
+            _svo_es_measure_suppress.add(tok.i)
+
+    def _chain_es_pronominal_naming(doc):
+        # PRONOMINAL-VERB NAMING ("Me llamo Marco" / "Mi perro se llama Rex" / "Mi hermana se llama
+        # Ana"). UD expl:pv page: an inherently reflexive verb always occurs with a reflexive clitic
+        # attached as expl:pv INSTEAD of obj — "llamarse" is precisely this (the Spanish naming
+        # construction). The name is the verb's obj/attr complement; the NAMED THING is the subject
+        # (the possessive NP "mi perro" → perro, or the pro-drop first-person "me" → user). Emits
+        # (named, <kin|also_known_as>, …) so the naming layer binds the proper name to the thing
+        # (THE HARD LINE: the name is filed on the entity, never classified into L4). Grammar-only
+        # (expl:pv/reflexive clitic + naming-verb cue class from the overlay), NO verb token list.
+        _naming = _naming_verbs()
+        for tok in doc:
+            if tok.pos_ != "VERB":
+                continue
+            lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            if not lemma or lemma not in _naming:
+                continue
+            clit = _clitic_pronoun_of(tok)
+            if clit is None:
+                continue  # not the pronominal naming construction ("se llama"/"me llamo")
+            # NEGATION-AS-ABSENCE (parity with the SVO/dative lanes): a negated naming clause
+            # ("No me llamo Carlos" / "I am not called Carlos") denies the NAME — capturing the
+            # affirmed (user, also_known_as, carlos) would INVERT the user's statement (the same
+            # corruption the branch's LEEME-es.md warns about for negated preferences). The es
+            # model attaches "no" as an advmod on the verb (Penn as a neg arc) — _is_neg covers
+            # both.
+            if any(_is_neg(c) for c in tok.children):
+                continue
+            # the PROPER NAME: the verb's obj/dobj/attr complement that is a PROPN.
+            # IOBJ-CLITIC SHAPE (es_core_news_md quirk, measured): with the 1sg/2sg clitic
+            # form ("Me llamo Carlos") the model puts the NAME in the NSUBJ slot (the clitic
+            # took the obj slot) — "Carlos" is nsubj of "llamo". Accept the nsubj PROPN as
+            # the name ONLY in the pronominal-clitic construction (the clitic is what makes
+            # it naming, not a plain transitive "llamo a Carlos" where Carlos would be obj).
+            name_tok = None
+            for c in tok.children:
+                if c.dep_ in ("obj", "dobj", "attr", "oprd") and c.pos_ == "PROPN":
+                    name_tok = c
+                    break
+            if name_tok is None and clit is not None:
+                for c in tok.children:
+                    if c.dep_ in ("nsubj", "nsubjpass") and c.pos_ == "PROPN":
+                        name_tok = c
+                        break
+            if name_tok is None:
+                continue
+            proper = (name_tok.text or "").strip().lower()
+            if not proper:
+                continue
+            # the NAMED THING: the possessive NP subject ("mi perro" → perro), the user
+            # (pro-drop first-person, or the 1sg clitic when the NAME is the nsubj — the
+            # nsubj slot holds the name, so the named thing is the clitic's referent).
+            subject = None
+            subj_tok = _subject_token_of(tok)
+            if subj_tok is not None and not _is_possessive_marker(subj_tok) \
+                    and not (name_tok.i == subj_tok.i and clit is not None):
+                subject = (subj_tok.text or subj_tok.lemma_ or "").strip().lower()
+            else:
+                try:
+                    if clit is not None and clit.morph.get("Person") == ["1"]:
+                        subject = "user"
+                except Exception:  # noqa: BLE001
+                    pass
+            if not subject:
+                continue
+            # KINSHIP-HEAD bind: "mi hermana se llama Ana" → (ana, sibling_of, user) — the name IS
+            # the person; the role is a slot on her. Mirrors _chain_genitive_name's collapse.
+            # POSSESSOR NOT HARDCODED: a kinship noun's possessor is its OWN de-PP ("la madre DE
+            # JUAN se llama Ana" → juan, never the user) or a first-person possessive ("mi madre"
+            # → user). The old code always bound "user", fabricating (ana, parent_of, user) for a
+            # third-party mother — the same corruption class as the round-1 ghosts. Resolution
+            # mirrors _chain_es_de_genitive: first-person possessive DET → user; de-PP PROPN →
+            # that name; neither → no kin bind (the also_known_as edge below still stands).
+            if subj_tok is not None and subj_tok.pos_ in ("NOUN", "PROPN"):
+                _hl = (subj_tok.lemma_ or subj_tok.text or "").strip().lower()
+                if _hl in _kinship_nouns():
+                    _kin = _inherent_relation_for_noun(_hl)
+                    _possessor = None
+                    for _pc in subj_tok.children:
+                        if _first_person_possessive_marker(_pc):
+                            _possessor = "user"
+                            break
+                        if _pc.dep_ == "nmod" and _pc.pos_ == "PROPN" and any(
+                                _pg.dep_ == "case" and _is_de_genitive(_pg)
+                                for _pg in _pc.children):
+                            _possessor = (_pc.text or _pc.lemma_ or "").strip().lower()
+                            break
+                    if _possessor:
+                        _emit(proper, _kin, _possessor, obj_tok=None, subj_tok=name_tok)
+                        _claim(subj_tok)
+            # the naming edge itself: (named-thing, also_known_as, proper-name).
+            _emit(subject, "also_known_as", proper, verb_tok=tok, obj_tok=name_tok, subj_tok=subj_tok)
+            _claim(tok, name_tok)
+            _svo_es_measure_suppress.add(tok.i)
+
+    def _chain_es_dative_experiencer(doc):
+        # DATIVE EXPERIENCER ("Me gusta la pizza" → (user, gustar, pizza)). NGLE §15.11o: verbs of
+        # AFFECTION (gustar/encantar/…) express sensations the EXPERIENCER (a dative clitic "me")
+        # undergoes toward a STIMULUS that is the clause SUBJECT ("pizza" is the nsubj of "gusta").
+        # The experiencer is therefore the SPEAKER when the clitic is first person; the stimulus is the
+        # nsubj. Emits (user, <verb-lemma>, <stimulus>) — the verb lemma is the grown rel, exactly like
+        # the SVO lane's verb-lemma rels. Grammar-only (iobj + Case=Dat morphology), NO verb word list.
+        for tok in doc:
+            if tok.pos_ != "VERB":
+                continue
+            if tok.i in _ni_suppress or tok.i in _emp_suppress:
+                continue
+            if tok.i in _svo_es_measure_suppress:
+                continue  # a Spanish construction chain owns this verb (pronominal naming —
+                          # "Me llamo Carlos" also carries an iobj/Case=Dat clitic, which is NOT
+                          # a dative experiencer; the naming chain emits the also_known_as edge)
+            # NAMING-VERB EXCLUSION (parity with the SVO/intransitive lanes): the 1sg pronominal
+            # naming clitic ("Me llamo Carlos") is grammatically identical to a dative clitic
+            # (iobj/Case=Dat), so without this the dative chain would twin the naming edge as a
+            # verb-lemma rel (user, llamar, carlos). The naming chain owns the construction.
+            if (tok.lemma_ or tok.text or "").strip().lower() in _naming_verbs():
+                continue
+            # NEGATION-AS-ABSENCE (parity with the English SVO lane): a negated clause
+            # ("No me gusta el café" / "I don't like coffee") asserts the ABSENCE of the
+            # preference — capturing the affirmed (user, gustar, café) would INVERT the
+            # user's statement (the branch's own LEEME-es.md names this corruption).
+            # The negation is read off the verb's children (UD es attaches "no" as an
+            # advmod on the verb; Penn English as a neg arc — the _is_neg shim covers both).
+            if any(_is_neg(c) for c in tok.children):
+                continue
+            exp = _dative_experiencer_of(tok)
+            if exp is None:
+                continue
+            try:
+                if exp.morph.get("Person") != ["1"]:
+                    continue  # only the speaker's own preferences are captured
+            except Exception:  # noqa: BLE001
+                continue
+            # the STIMULUS is the clause SUBJECT (a nominal, not a pronoun).
+            stim_tok = next((c for c in tok.children
+                             if c.dep_ in ("nsubj", "nsubjpass") and c.pos_ in ("NOUN", "PROPN")),
+                            None)
+            if stim_tok is None:
+                continue
+            lemma = (tok.lemma_ or tok.text or "").strip().lower()
+            if not lemma or lemma == "be":
+                continue
+            stim = _np_phrase(stim_tok)
+            if not stim or len(stim) < 2:
+                continue
+            _emit("user", lemma, stim, verb_tok=tok, obj_tok=stim_tok, subj_tok=None)
+            _claim(stim_tok)
+
+    def _chain_es_de_genitive(doc):
+        # DE-GENITIVE NAME-BINDING ("El nombre de mi madre es Diane" → (diane, parent_of, user)).
+        # Spanish relational genitives use a de-PP (case + nmod), not the English 's (poss) the
+        # genitive-name chain keys on. Shape: <naming noun "nombre"> nsubj → copula es → ROOT PROPN,
+        # with a de-PP (case de + nmod role noun, itself carrying a possessive DET "mi") hanging off
+        # the naming noun. Binds the PROPER NAME as the person and attaches the kin/rel role to THAT
+        # person, collapsing the role noun (never a standalone entity) — the exact Fix-2 semantics of
+        # _chain_genitive_name, in the Spanish de-PP shape. Metadata-driven (kinship_noun cue class),
+        # grammatical (case de + nmod + possessive DET), NO noun literal.
+        for tok in doc:
+            if tok.dep_ not in ("nsubj", "nsubjpass"):
+                continue
+            if (tok.lemma_ or tok.text or "").strip().lower() != "nombre":
+                continue
+            # the copula es + the ROOT PROPN name.
+            _cp = _copular_predicate(tok)
+            if _cp is None:
+                continue
+            _cop, _pred = _cp
+            if _pred is None or _pred.pos_ != "PROPN":
+                continue
+            proper = (_pred.text or "").strip().lower()
+            if not proper:
+                continue
+            # the de-PP role noun hanging off "nombre": a child nmod whose case child is "de".
+            role_tok = None
+            for c in tok.children:
+                if c.dep_ != "nmod" or c.pos_ not in ("NOUN", "PROPN"):
+                    continue
+                if any(_is_de_genitive(g) for g in c.children if g.dep_ == "case"):
+                    role_tok = c
+                    break
+            if role_tok is None:
+                continue
+            role_lemma = (role_tok.lemma_ or role_tok.text or "").strip().lower()
+            # the possessor: a 1st-person possessive DET inside the role NP ("mi madre") → user;
+            # a named possessor ("la madre de Juan") → that name. When the de-PP itself IS a PROPN
+            # ("el nombre DE JUAN es Pedro" — no role noun in between), the de-PP names the
+            # possessor directly; fall back to it so the named-possessor naming shape captures
+            # (pedro, related_to, juan) exactly like English "Juan's name is Pedro" (parity gap
+            # found while probing: pre-fix this returned [] vs English's related_to edge).
+            possessor = None
+            for c in role_tok.children:
+                if _first_person_possessive_marker(c):
+                    possessor = "user"
+                    break
+                if c.pos_ == "PROPN":
+                    possessor = (c.text or "").strip().lower()
+            if not possessor and role_tok.pos_ == "PROPN":
+                possessor = (role_tok.text or role_tok.lemma_ or "").strip().lower()
+            if not possessor:
+                continue
+            if role_lemma in _kinship_nouns():
+                _kin = _inherent_relation_for_noun(role_lemma)
+            else:
+                _kin = "related_to"
+            _emit(proper, _kin, possessor, obj_tok=None, subj_tok=_pred)
+            _claim(tok, role_tok)
+
+    # Spanish-construction SVO-suppression set (filled by the chains above): a verb whose
+    # measure/naming construction a Spanish chain already owns must not mint the SVO twin
+    # (user, tener, años) / (perro, llamar, rex).
+    _svo_es_measure_suppress: set = set()
+
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
     # "all the shapes the deriver knows", not "the order to try them in". Add a shape → add a chain.
@@ -10108,6 +11003,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         (_chain_dash_specifier,) if dash_specifier_only else
         (_chain_employment,
          _chain_alias_predicate,
+         _chain_es_tener_measure, _chain_es_pronominal_naming, _chain_es_dative_experiencer,
+         _chain_es_de_genitive,
          _chain_svo, _chain_intransitive, _chain_passive_event, _chain_copula_state,
          _chain_dated_occurrence,
          _chain_possessive, _chain_genitive_name, _chain_copula_name,
@@ -11379,6 +12276,18 @@ def _resolve_weekday_relative(span: str, reference):
 # user-stated day) so recall never over-claims day precision we don't have. CLOSED formal class:
 # the 3 vague qualifiers × the 12 month names (the same closed month set as ``_date_granularity``)
 # — a language primitive, NOT a domain word-list. Surface-deterministic, NO LLM, NO ML.
+# CLOSED cardinal number-WORD -> digit map (Spanish "hace DOS semanas"). A closed grammatical
+# class (the cardinal numerals 1-9 + the ten/dozen teens dateparser's es locale fails to
+# resolve in the "hace <word> <unit>" frame — measured), the same kind of closed set as
+# _MONTH_INDEX / _VAGUE_MONTH_DAY. NOT a domain/lexical word list. English unaffected.
+_CARDINAL_WORD_TO_DIGIT: dict = {
+    "uno": "1", "una": "1", "un": "1",
+    "dos": "2", "tres": "3", "cuatro": "4", "cinco": "5",
+    "seis": "6", "siete": "7", "ocho": "8", "nueve": "9",
+    "diez": "10", "once": "11", "doce": "12", "trece": "13",
+    "catorce": "14", "quince": "15", "veinte": "20", "treinta": "30",
+}
+
 _VAGUE_MONTH_DAY: dict = {
     "early": 5,
     "mid": 15,
@@ -11623,6 +12532,87 @@ def _collect_date_spans(text: str) -> list:
                     seen_spans.add(span.lower())
     except Exception as e:  # noqa: BLE001 — fail-safe
         log.warning("linguistics.date_regex_failed", error=str(e)[:160])
+    # ── WORDED-DATE SPANS (month-name anchor, DB authority) ─────────────────────────────
+    # The es NER emits NO DATE spans (measured on the real model), so a Spanish worded date
+    # ("el 15 de marzo de 1990", "el 3 de mayo") never enters the candidate list. This arm
+    # finds a day+month (and optional year) phrase anchored on the DB formal_absolute month
+    # patterns — the SAME growable per-tenant temporal_patterns rows the gate reads (English
+    # months seeded, Spanish months seeded by migration 218, grown per-tenant). The span is the
+    # WHOLE "<day> de <month> [de <year>]" phrase (dateparser strips the leading article), so
+    # the temporal lane normalizes it exactly like an English worded date. Fail-safe: no DB /
+    # no pattern / any error → no extra candidates (NER + numeric net unchanged).
+    try:
+        from src.api import temporal_pattern_overlay as _tpo
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        _month_pats = _tpo.resolve_formal_absolute_patterns(dsn)
+        if _month_pats:
+            # "(?:el |la )?<day> de <month> (?:de <year>)?" — day may be digits or a word.
+            for _mp in _month_pats:
+                _worded = re.compile(
+                    r"(?:el\s+|la\s+)?(?:\d{1,2}|primero|uno|dos|tres|cuatro|cinco|seis|siete|"
+                    r"ocho|nueve|diez|once|doce|trece|catorce|quince|dieciséis|dieciseis|"
+                    r"diecisiete|dieciocho|diecinueve|veinte|veintiuno|veintidós|veintidos)"
+                    r"\s+de\s+" + _mp.pattern.strip(r"\b") + r"(?:\s+de\s+(?:19|20)\d{2})?\b",
+                    re.IGNORECASE,
+                )
+                for m in _worded.finditer(text):
+                    span = m.group(0).strip()
+                    if not span:
+                        continue
+                    # strip a leading Spanish article ("el 15 de marzo" -> "15 de marzo") —
+                    # dateparser rejects the article (measured) but accepts the bare day+month.
+                    _bare = re.sub(r"^(?:el|la)\s+", "", span, count=1, flags=re.IGNORECASE).strip()
+                    _rec = _bare or span
+                    if _rec.lower() not in seen_spans:
+                        candidates.append((m.start() + (len(span) - len(_rec)), _rec))
+                        seen_spans.add(_rec.lower())
+    except Exception as e:  # noqa: BLE001 — fail-safe: worded-date arm never sinks the lane
+        log.warning("linguistics.worded_date_spans_failed", error=str(e)[:160])
+    # ── RELATIVE-CUE SPANS (DB authority) ──────────────────────────────────────────────
+    # A deictic/relative cue ("mañana", "ayer", "hace dos semanas", "el año pasado") is a
+    # REAL date span the es NER never labels. The per-tenant temporal_patterns relative_cue
+    # rows are the growable authority (English seeded, Spanish seeded by migration 218); match
+    # each compiled cue directly so dateparser (language-pinned) resolves it. For "hace <N>
+    # <unit>" the whole phrase is the span — dateparser resolves "hace dos semanas" only as a
+    # bare relative, so the N unit phrase is expanded when the cue is preceded by a quantity.
+    try:
+        from src.api import temporal_pattern_overlay as _tpo
+        dsn = os.environ.get("POSTGRES_DSN", "")
+        for _rc, _rcomp in (_tpo.resolve_current(dsn) or []):
+            for m in _rcomp.finditer(text):
+                span = m.group(0).strip()
+                if not span:
+                    continue
+                # expand a quantity BEFORE the cue (English "three weeks ago") or AFTER it
+                # (Spanish "hace dos semanas" — the quantity FOLLOWS the deictic).
+                # NOTE: the relative cue regexes are bare single tokens (\bmañana\b etc.), so
+                # "hace dos semanas" matches only the cue "hace". Build the full phrase by
+                # consuming the quantity + unit noun AFTER the cue (Spanish) or BEFORE it
+                # (English "two weeks ago" — the quantity precedes). dateparser then sees the
+                # whole duration and resolves it against the reference.
+                _head = text[:m.start()]
+                _tail = text[m.end():]
+                _qm = re.search(r"(\d+|dos|tres|cuatro|cinco|seis|un|una|unos|unas)\s*$", _head)
+                _qt = re.match(r"\s+(\d+|dos|tres|cuatro|cinco|seis|un|una|unos|unas)\b", _tail)
+                _start = m.start()
+                if _qt is not None:
+                    # Spanish: "hace <qty> <unit>" — quantity + unit follow the cue.
+                    _q = _qt.group(1)
+                    _unit_m = re.match(r"\s+([a-záéíóúñ]+)\b", _tail[_qt.end():])
+                    _u = _unit_m.group(1) if _unit_m is not None and len(_unit_m.group(1)) <= 12 else ""
+                    span = (span + " " + _q + (" " + _u if _u else "")).strip()
+                elif _qm is not None:
+                    # English: "<qty> <unit> ago" — quantity + unit precede the cue.
+                    _q = _qm.group(0).strip()
+                    _unit_m = re.match(r"([a-z]+)\s*$", _head[:-_qm.end()].rstrip())
+                    _u = _unit_m.group(1) if _unit_m is not None and len(_unit_m.group(1)) <= 12 else ""
+                    span = (_q + (" " + _u if _u else "") + " " + span).strip()
+                    _start = m.start() - len(_q) - (len(_u) + 1 if _u else 0)
+                if span.lower() not in seen_spans:
+                    candidates.append((_start, span))
+                    seen_spans.add(span.lower())
+    except Exception as e:  # noqa: BLE001 — fail-safe: relative arm never sinks the lane
+        log.warning("linguistics.relative_date_spans_failed", error=str(e)[:160])
     # ── MODEL-YEAR REJECT (structural; UD dep + POS) ──────────────────────────────────
     # Drop a bare 4-digit-YEAR candidate that grammatically PRE-MODIFIES a non-temporal NOUN/PROPN
     # (a model/spec year — "2018 Ford Mustang GT", "a 2018 model", "my 2015 ThinkPad"). The DATE-NER
@@ -11756,6 +12746,20 @@ def _resolve_first_valid_date(text: str, reference):
         span_anchor = _classify_span_anchor(span)
         anchor_absolute = span_anchor == "absolute_no_year"
         settings = abs_settings if anchor_absolute else base_settings
+        # SPANISH "hace <N> <unit>" DIGIT NORMALIZATION. dateparser's es locale resolves
+        # "hace 2 semanas" but NOT "hace dos semanas" (measured) — a locale gap, not ours.
+        # The cardinal number WORDS are a CLOSED grammatical class (like _MONTH_INDEX): map the
+        # phrase-internal cardinal word to its digit so the relative duration resolves against
+        # the reference. English unaffected (no "hace" cue).
+        try:
+            _hm = re.match(r"hace\s+([a-záéíóúñ]+)\s+(?:de\s+)?([a-záéíóúñ]+)", span, re.IGNORECASE)
+            if _hm is not None:
+                _w = _hm.group(1).strip().lower()
+                _num = _CARDINAL_WORD_TO_DIGIT.get(_w)
+                if _num is not None:
+                    span = "hace " + _num + " " + _hm.group(2)
+        except Exception:  # noqa: BLE001 — fail-safe
+            pass
         try:
             parsed = dateparser.parse(span, languages=_DATEPARSER_LANGUAGES, settings=settings)
         except Exception as e:  # noqa: BLE001 — a parse failure on one span → try the next

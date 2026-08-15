@@ -7,9 +7,11 @@
 > (*as is*), **sin garantía alguna** de funcionamiento, corrección o continuidad.
 >
 > - Las funcionalidades pueden estar **incompletas**, cambiar sin previo aviso o **no funcionar**.
-> - La extracción **determinista** (motor *spine*) está **parcialmente** disponible en español: el
->   analizador y la detección de negación ya funcionan, pero las **cadenas de dependencias** del
->   *spine* siguen ajustadas a la sintaxis inglesa y **no se han re-ajustado** para el español.
+> - La extracción **determinista** (motor *spine*) está disponible en español: el analizador, la
+>   detección de negación, y las **cadenas de dependencias** (posesión/kinship, sentimientos y
+>   preferencias, cantidades y medidas, fechas y duraciones, nombres y clasificación) leen el
+>   esquema **Universal Dependencies** que el modelo español emite, de la mano del modelo por
+>   defecto `es_core_news_md` (verificado por la suite `tests/test_spanish_capture_and_walk.py`).
 > - **Úsala bajo tu propia responsabilidad.** Para la versión **estable** (en inglés) usa la rama
 >   `master` / `main`.
 
@@ -45,10 +47,11 @@ extrae entidades y relaciones de los mensajes del usuario y las conserva de form
 hecho almacenado no está "en inglés".
 
 ## Cómo funciona en español (en esta rama)
-- El analizador de spaCy es **`es_core_news_sm`** por defecto — y ahora se **verifica al arrancar**:
-  si `SPACY_MODEL` no coincide con `FAULTLINE_LANGUAGE`, la capa se **desactiva** y registra
-  `linguistic_layer.model_language_mismatch` en vez de producir datos incorrectos en silencio.
-  (Escape: `FAULTLINE_ALLOW_SPACY_LANG_MISMATCH=true`.)
+- El analizador de spaCy es **`es_core_news_md`** por defecto (medido: `sm` etiqueta mal los
+  verbos en pretérito de 1ª persona al inicio de frase y rompe el parseo de posesivos) — y se
+  **verifica al arrancar**: si `SPACY_MODEL` no coincide con `FAULTLINE_LANGUAGE`, la capa se
+  **desactiva** y registra `linguistic_layer.model_language_mismatch` en vez de producir datos
+  incorrectos en silencio. (Escape: `FAULTLINE_ALLOW_SPACY_LANG_MISMATCH=true`.)
 - El tipado de entidades usa **`fastino/gliner2-multi-v1`** (Apache-2.0; en/es/fr/de/it/pt), que se
   **hornea en la imagen** — obligatorio, porque el runtime va con `HF_HUB_OFFLINE=1`.
 - La **negación** se detecta con `advmod`/`det` además de `neg`, así que «no», «nunca», «tampoco»,
@@ -64,15 +67,42 @@ hecho almacenado no está "en inglés".
 - La **extracción** sigue apoyándose también en la vía **LLM** (*rewrite*), que entiende el español
   de forma nativa.
 
-### Lo que TODAVÍA no está en paridad
-- Las **cadenas de dependencias** del *spine* están construidas sobre etiquetas del esquema inglés
-  (`dobj`, `pobj`, `nsubjpass`, `attr`, `acomp`, `oprd`). En UD el **árbol tiene otra forma**, no
-  solo otros nombres, así que no es un simple renombrado. La captura en español será **menor** que
-  en inglés hasta que se re-ajusten.
-- Las tablas de patrones sembrados (negación, temporales, pistas lingüísticas, alias de relaciones —
-  unas 431 filas) **siguen siendo solo en inglés** y aún no tienen columna de idioma.
-- El modelo español de spaCy **no emite la etiqueta `DATE`**, que es la única fuente de tramos de
-  fecha del motor determinista.
+### Lo que TODAVÍA no está en paridad (residuales honestos)
+- Las **cadenas de dependencias** del *spine* leen el esquema **Universal Dependencies** que el modelo
+  español emite (posesión/kinship, sentimientos y preferencias, cantidades y medidas, fechas y
+  duraciones, nombres y clasificación — verificado por `tests/test_spanish_capture_and_walk.py`),
+  así que la captura básica es **equivalente a la inglesa** en esas construcciones. Residuales
+  conocidos y documentados: los adjetivos que el modelo etiqueta como NOUN en posición copulativa
+  (`Mi coche es rojo`, `Mi coche es el azul`) se dejan **vacíos honestos**, nunca se archivan
+  como tipo (una ocupación/persona bajo `ser` — parentesco o nombre — sí se clasifica: `Rex es un
+  labrador`, `París es la capital`, `Mi madre es enfermera`). Caso límite del mismo límite: un ser
+  nombrado + cualidad nominalizada (`Rex es el negro`) admite instance_of porque la puerta de persona
+  no puede separar `un labrador` de `el negro` sin lista de palabras — el inglés emite basura
+  equivalente (`(rex, age, one)`), ninguno de los dos es una fabricación limpia; una ocupación etiquetada como ADJ
+  (`Mi padre es médico`) o como participio (`Mi hermana es abogada`) cae en `has_state` (sin
+  señal gramatical que la separe de un adjetivo descriptivo sin lista de palabras); `Soy ingeniero`
+  (pro-drop, sin sujeto) devuelve `[]` en el deriver — paridad con el inglés `I am an engineer` →
+  `[]` (la captura real va por el seam de auto-predicación).
+- **Verbo en 1ª persona al inicio de frase homónimo de un sustantivo** (`Trabajo en Google`,
+  `Corro en el parque`, `Nado en la piscina`, `Como una manzana`): `es_core_news_md` los etiqueta
+  como PROPN/SCONJ (la forma explícita `Yo trabajo en Google` sí captura `(user, trabajar_en, google)`
+  → alias → `works_for`; `Ana come una manzana` sí captura). Es una limitación del modelo, no de las
+  cadenas — sin una lista de verbos (prohibida) no hay señal gramatical que la separe de un nombre
+  propio o de la conjunción `como`.
+- **Psicoverbos en tercera persona** (`A María le gusta el café` → `(café, gustar, maría)`): es la
+  estructura gramatical española literal («el café gusta a María»), no una inversión; forzarla al
+  orden inglés (`(maría, like, café)`) sería imponer una cadena inglesa, contra el diseño de la rama.
+- Las tablas de patrones sembrados (negación, temporales, pistas lingüísticas, alias de relaciones)
+  incluyen ya **semillas en español** (migración 218: meses, días, pistas relativas, clases de
+  parentesco/unidades/verbos, alias `vivir_en`→`lives_in`, `trabajar_en`/verbos → `works_for`)
+  — crecen por tenant, igual que las inglesas.
+- El modelo español de spaCy **no emite la etiqueta `DATE`**: la capa de fechas usa las **pistas
+  temporales en la base de datos** (meses/relativos, migración 218) como autoridad, así que las
+  fechas con palabra (`el 15 de marzo de 1990`, `hace dos semanas`) se resuelven igual que en inglés.
+- **Consulta en inglés en esta rama**: los `natural_language` sembrados son **españoles** (la rama ES
+  el idioma, contrato de la rama), así que una consulta inglesa de alcance relacional puede no
+  acotar (p. ej. `where do you work?`); la consulta española (`¿dónde trabajas?`) sí. Las
+  instalaciones inglesas usan `master`/`main`.
 
 ## Idioma y base de datos (léelo antes de instalar)
 El idioma se elige **al principio** de `quickstart.py`, antes que cualquier otra cosa, y esa elección
@@ -91,18 +121,21 @@ Se usa **ICU** y no una locale del sistema porque la imagen de postgres **no inc
 así que `--locale=es_ES.utf8` fallaría directamente.
 
 ## Estado y detalles técnicos
-Esta rama `es` sigue siendo **experimental**. El analizador ya coincide con el texto y la negación
-ya no se pierde, pero **eso no es una garantía de paridad**: las cadenas del *spine* están
-construidas y validadas contra el inglés y **no se han re-ajustado** al español. Espera una captura
-**inferior** a la del inglés, no equivalente. Para contribuir o reportar problemas, ten presente el
-aviso de arriba.
+Esta rama `es` sigue siendo **experimental** (no es una release oficial), pero la **extracción
+determinista** (motor *spine*) ya lee el esquema UD del modelo español en las construcciones
+principales — posesión/kinship, sentimientos y preferencias, cantidades y medidas, fechas y
+duraciones, nombres y clasificación — verificadas por `tests/test_spanish_capture_and_walk.py`
+(paridad de captura contra el motor inglés, construcción por construcción, más el paseo de
+consulta «capturar → preguntar en español → devolver»). Los residuales honestos están listados en
+«Lo que TODAVÍA no está en paridad» arriba.
 
 Las correcciones descritas aquí están cubiertas por `tests/test_spanish_language_support.py`
-(53 pruebas). Las que dependen de spaCy se **omiten** limpiamente si `es_core_news_sm` no está
+y `tests/test_spanish_capture_and_walk.py` (80 pruebas en total con el DSN del banco de
+pruebas). Las que dependen de spaCy se **omiten** limpiamente si `es_core_news_md` no está
 instalado, así que la suite sigue pasando en un checkout en inglés.
 
 ### Licencias
-`es_core_news_sm` se distribuye bajo **GNU GPL 3.0** (por el corpus AnCora), mientras que
+`es_core_news_md` se distribuye bajo **GNU GPL 3.0** (por el corpus AnCora), mientras que
 `en_core_web_sm` es MIT. FaultLine es **AGPL-3.0-only**, así que la combinación es compatible y no
 supone un problema para este proyecto — pero conviene saberlo si redistribuyes la imagen con el
 modelo español horneado bajo otros términos. `fastino/gliner2-multi-v1` es Apache-2.0.

@@ -21,6 +21,14 @@ from fastapi.responses import JSONResponse   # 503 shed response at the turn bar
 from src.api.logging_config import set_log_level, get_log_level, LogLevel, log_crit
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry
+from src.entity_registry.registry import _FIRST_PERSON_PRONOUNS as _QUERY_FIRST_PERSON_PRONOUNS
+# The POSSESSIVE half of the shared first-person set (English my/mine; Spanish mi/mis/nuestro*).
+# Rule 1 (identity) must exclude these — a possessive in the identity set hijacks Rule 2's
+# possessive-ENTITY resolution and Rule 2.5's self-scalar path (critic round-2 blocker).
+_QUERY_POSSESSIVE_PRONOUNS = frozenset({
+    "my", "mine", "mi", "mis",
+    "nuestro", "nuestra", "nuestros", "nuestras",
+})
 from src.entity_registry.entity_type_cache import initialize_entity_type_cache, get_entity_type_cache
 from src.fact_store.store import FactStoreManager
 from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
@@ -26569,7 +26577,7 @@ def _determine_query_scope_unused(db, query_text: str, user_id: str) -> set[str]
 
     # Extract keywords from query (split on whitespace, remove punctuation)
     query_lower = query_text.lower()
-    keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
+    keywords = set(re.findall(r'\b[a-záéíóúñü]+\b', query_lower))  # unicode-aware: [a-z]+ splits at Spanish accents
 
     # Filter noise words
     noise_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -28506,9 +28514,20 @@ def resolve_anchor(
     words = query_text.split()
 
     try:
-        # Rule 1: Identity keywords — only when used as subject/possessive,
-        # NOT in dative "tell me about X" / "show me X" patterns where X is the real subject.
-        identity_keywords = ["me", "i", "myself"]
+        # Rule 1: Identity keywords — SUBJECT/OBJECT first-person forms ONLY, NOT possessives.
+        # (English: me/i/myself — the original set; Spanish: yo/mí/conmigo/nosotros/nos/me…).
+        # CRITICAL ROLE SPLIT (critic round-2 blocker): the shared registry set
+        # (_FIRST_PERSON_PRONOUNS) mixes SUBJECT forms with POSSESSIVES ("my"/"mi"/"mis"),
+        # and a possessive in Rule 1 hijacks Rule 2's possessive-entity resolution ("my
+        # router's IP" must anchor the ROUTER, not firehose the user — the SCOPE FIX just
+        # below) AND Rule 2.5's self-scalar path ("how long is my daily commute" must anchor
+        # user via self_scalar, not identity). Rule 1 stays subject-only: "i"/"me"/"myself"
+        # (+ the Spanish subject/oblique forms); possessives belong to Rule 2 where the
+        # possessive-entity / taxonomy / self-scalar seams live. Pro-drop means the pronoun
+        # is often absent — the finite-verb morphology handles that via the query intent
+        # layer; this covers the overt forms.
+        identity_keywords = sorted(
+            _QUERY_FIRST_PERSON_PRONOUNS - _QUERY_POSSESSIVE_PRONOUNS)
         _dative_prefixes = ("tell me", "show me", "explain to me", "teach me",
                             "help me understand", "let me know", "remind me")
         _is_dative = any(query_lower.startswith(p) or query_lower.startswith("can you " + p)
@@ -28523,7 +28542,11 @@ def resolve_anchor(
 
         # Rule 2: Possessive + taxonomy keyword
         # "my family", "my job", "my location" → user (not entity)
-        possessive_keywords = ["my", "mine"]
+        # Possessive keywords: the shared first-person set ("my"/"mi"/"mis"/"nuestro"… —
+        # English + Spanish possessive forms from the SAME registry set the ingest path
+        # uses). A Spanish query "mi madre" anchors on the user, then the walk descends
+        # the parent_of edge to the mother entity — exactly like English "my mother".
+        possessive_keywords = sorted(_QUERY_FIRST_PERSON_PRONOUNS)
         for i, word in enumerate(words):
             if word.lower() in possessive_keywords:
                 # Look at word AFTER possessive
@@ -33582,7 +33605,7 @@ def determine_path(
             # Non-fatal: fall through to keyword / GLiNER2 logic below
 
     # Extract keywords (words, remove common stopwords)
-    keywords = set(re.findall(r'\b[a-z]+\b', query_lower))
+    keywords = set(re.findall(r'\b[a-záéíóúñü]+\b', query_lower))  # unicode-aware: [a-z]+ splits at Spanish accents
 
     noise_words = {
         'the', 'a', 'an', 'i', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -33752,14 +33775,14 @@ def determine_path(
                         # subject-agnostic (head comes from the query + the stored attribute only).
                         if not _hit:
                             _attr_name_seq = [
-                                _t for _t in re.findall(r'[a-z]+', _attr_lc)
+                                _t for _t in re.findall(r'[a-záéíóúñü]+', _attr_lc)
                                 if len(_t) >= 3 and _t not in _tmpl_stop
                             ]
                             if _attr_name_seq:
                                 _hit = _attr_name_seq[-1] in _aspect_words
                         if not _hit and _nl:
                             _nl_tokens = {
-                                _t for _t in re.findall(r'[a-z]+', str(_nl).lower())
+                                _t for _t in re.findall(r'[a-záéíóúñü]+', str(_nl).lower())
                                 if len(_t) >= 3 and _t not in _tmpl_stop
                             }
                             _hit = bool(_aspect_words & _nl_tokens)
@@ -33827,7 +33850,7 @@ def determine_path(
                         _hit = _rt_lc in _aspect_words
                         if not _hit and _nl:
                             _nl_tokens = {
-                                _t for _t in re.findall(r'[a-z]+', str(_nl).lower())
+                                _t for _t in re.findall(r'[a-záéíóúñü]+', str(_nl).lower())
                                 if len(_t) >= 3 and _t not in _tmpl_stop
                             }
                             _hit = bool(_aspect_words & _nl_tokens)
@@ -33913,14 +33936,14 @@ def determine_path(
                             continue
                         # (1a) content TOKENS of the rel's OWN name (compound → verb stem).
                         _name_tokens = {
-                            _t for _t in re.findall(r'[a-z]+', _rel_lc)
+                            _t for _t in re.findall(r'[a-záéíóúñü]+', _rel_lc)
                             if len(_t) >= 3 and _t not in _tmpl_stop
                         }
                         _hit = bool(_aspect_words & _name_tokens)
                         # (1b) content words of the rel's natural_language template.
                         if not _hit and _rel_nl:
                             _rel_nl_tokens = {
-                                _t for _t in re.findall(r'[a-z]+', str(_rel_nl).lower())
+                                _t for _t in re.findall(r'[a-záéíóúñü]+', str(_rel_nl).lower())
                                 if len(_t) >= 3 and _t not in _tmpl_stop
                             }
                             _hit = bool(_aspect_words & _rel_nl_tokens)
