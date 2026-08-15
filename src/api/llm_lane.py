@@ -118,6 +118,25 @@ def use_lane(lane: str) -> Iterator[None]:
             _lane.reset(token)
 
 
+# ── CROSSING HTTP ────────────────────────────────────────────────────────────
+# The lane is a property of the CALLER, but the re-embedder routes part of its
+# sweep through the API's own HTTP endpoints (/extract/rewrite, /harvest-spans):
+# those LLM calls execute in the API process, where the ContextVar cannot follow.
+# Without an explicit hop the traffic arrives as INTERACTIVE and fail-opens under
+# pressure — background sweep volume wearing the interactive lane's protection.
+# The SENDER stamps its lane in a header; the RECEIVER re-enters that lane for the
+# request's duration. Unset/invalid header → interactive (a human client owes us
+# nothing and must never be deferred by default).
+
+LANE_HEADER = "X-FL-LLM-Lane"
+
+
+def lane_from_header(value: str | None) -> str:
+    """Validate an inbound lane header. Anything unrecognised → INTERACTIVE."""
+    raw = str(value or "").strip().lower()
+    return raw if raw in _VALID_LANES else LANE_INTERACTIVE
+
+
 class LLMUnavailable(RuntimeError):
     """The call DID NOT HAPPEN — the model was never asked.
 
