@@ -2007,6 +2007,17 @@ def _is_relative_pronoun(tok) -> bool:
     here (and the question is already dropped upstream). Subject-agnostic, NO word list. Fail-safe →
     False."""
     try:
+        # SPANISH PORTABILITY (UD es, measured on es_core_news_md): the es tagset has no Penn
+        # WP/WP$/WDT — the relative pronoun ("que" in "el perro que se llama Rex") is PRON with
+        # PronType=Int,Rel heading an acl/relcl clause ("Tengo un perro que se llama Rex" →
+        # que/nsubj of llama/acl of perro). Same grammatical class, different surface encoding —
+        # the UD twin of the Penn check below. Morphology + dep only, NO word list. EN is
+        # unaffected: an EN relative pronoun always carries the Penn tag and is caught below
+        # (the morph arm requires pos_=PRON, which an EN WDT "that" is not).
+        if tok is not None and tok.pos_ == "PRON":
+            _pt = tok.morph.get("PronType")
+            if _pt and ("Rel" in _pt or "Int" in _pt):
+                return tok.head is not None and tok.head.dep_ in ("acl", "relcl")
         if tok is None or tok.tag_ not in ("WP", "WP$", "WDT"):
             return False
         return tok.head is not None and tok.head.dep_ in ("relcl", "acl")
@@ -6744,6 +6755,24 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _as is not None:
                 _role = next((g for g in _as.children
                               if g.dep_ == "pobj" and g.pos_ in ("NOUN", "PROPN")), None)
+            if _role is None:
+                # SPANISH "como" role marker — UD es: the role NP hangs off the verb as an
+                # obl/nmod whose case/mark child is "como" (measured on es_core_news_md: "Yo
+                # trabajo como ingeniero" → ingeniero/nmod + como/mark; "Ella trabaja como
+                # ingeniera" → ingeniera/obl + como/mark). NGLE: "trabajar como + N" is the
+                # Spanish role-predication frame; "como" is the UD twin of Penn "as" — the
+                # SAME closed marker class as the "as" literal above, different dependency
+                # shape (UD case/mark on an obl/nmod head, not a Penn prep+pobj). NO word
+                # list; the verb-lemma gate (employment_verb cue class) still owns the
+                # construction, so "trabajo como un loco" (manner, non-employment) is
+                # excluded by POS only if "loco" tags ADJ, exactly as EN "work as a beast".
+                _role = next(
+                    (g for g in _v.children
+                     if g.dep_ in ("nmod", "obl") and g.pos_ in ("NOUN", "PROPN")
+                     and any(_c.dep_ in ("case", "mark")
+                             and (_c.text or "").strip().lower() == "como"
+                             for _c in g.children)),
+                    None)
             # ORG: "at|for <PROPN/NOUN>" governed by the verb OR nested under the role head. A pobj that
             # is a resolved date span / DATE-TIME entity (duration "for 3 years") is not an employer.
             _org = None
@@ -6758,6 +6787,25 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     if _po is not None:
                         _org = _po
                         break
+                if _org is None:
+                    # SPANISH "en"/"para" org markers — UD es: the org NP is an obl/nmod of the
+                    # verb (or the role head) with a case child "en"/"para" ("Yo trabajo en
+                    # Google", "Ella trabaja para IBM", "Yo trabajo como ingeniero en Google" —
+                    # the org may hang off the verb OR nest under the role head, like the
+                    # English at/for note above). The UD twin of the Penn ("at", "for") literal:
+                    # the same closed marker class, different dependency shape. Date spans /
+                    # DATE-TIME entities are never employers (mirrors the English exclusion).
+                    # The employment_verb lemma gate scopes this to employment verbs, so "vivir
+                    # en" (residence, not employment) still routes to the SVO fold untouched.
+                    _org = next(
+                        (g for g in _h.children
+                         if g.dep_ in ("nmod", "obl") and g.pos_ in ("NOUN", "PROPN")
+                         and g.i not in _date_token_idx
+                         and (g.ent_type_ or "").upper() not in ("DATE", "TIME")
+                         and any(_c.dep_ == "case"
+                                 and (_c.text or "").strip().lower() in ("en", "para")
+                                 for _c in g.children)),
+                        None)
                 if _org is not None:
                     break
             if _role is None and _org is None:
@@ -8173,6 +8221,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _lo = head.left_edge.i
                 _toks = [doc[_k] for _k in range(_lo, head.i + 1)]
                 while _toks and (_toks[0].pos_ == "DET" or _toks[0].dep_ == "det"
+                                 or _toks[0].pos_ == "SCONJ"  # es "como" role marker (mark of the role NP)
                                  or _toks[0].is_punct or _toks[0].is_space):
                     _toks.pop(0)
                 _ph = " ".join(t.text.strip() for t in _toks if t.text and t.text.strip()).lower()

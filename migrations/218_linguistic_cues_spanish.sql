@@ -117,6 +117,19 @@ VALUES
   ('tengo',   'possession_verb', 'Stative possession verb, 1sg form',                           'Tengo un perro', 'seed_possession', 0.90)
 ON CONFLICT (cue, category) DO NOTHING;
 
+-- ── employment_verb: the Spanish employment verb (role-predication + affiliation) ──
+-- "trabajar" is THE Spanish employment verb ("Yo trabajo como ingeniero", "Ella trabaja para
+-- IBM") — NGLE §16.4/§33.4a-b; the same employment class the English work/serve rows seed
+-- (migration 125). Matched on the VERB LEMMA by _chain_employment's pre-pass; the class IS the
+-- safety gate (a verb NOT in it is never read as an occupation, mirroring English dress/know).
+-- The role marker "como" and the org markers "en"/"para" are read GRAMMATICALLY in the chain
+-- (UD obl/nmod + case/mark shapes, the UD twins of Penn "as"/"at"/"for") — not seeded here.
+INSERT INTO public.linguistic_cues
+    (cue, category, description, example_text, source, global_confidence)
+VALUES
+  ('trabajar', 'employment_verb', 'Employment / role-predication verb: subject works as a role / at an employer', 'Yo trabajo como ingeniero', 'seed_employment', 0.92)
+ON CONFLICT (cue, category) DO NOTHING;
+
 -- ── temporal_patterns: Spanish month names (formal_absolute) + deictic relative cues ─
 -- The es NER emits no DATE spans (measured), so the date lane depends on these DB cues to open,
 -- and dateparser (already pinned es) resolves them. DATE_ORDER=DMY is already the es-install default.
@@ -143,8 +156,18 @@ VALUES
   ('\bahora\b',       'relative', 'Deictic: now',                         'ahora',               'relative_cue',    'seed_dateparser_es', 0.85),
   ('\bhace\b',        'relative', 'Relative: "hace N <units>" (N units ago)', 'hace dos semanas', 'relative_cue', 'seed_dateparser_es', 0.92),
   ('\bel\s+año\s+pasado\b', 'relative', 'Relative: last year',          'el año pasado',       'relative_cue',    'seed_dateparser_es', 0.92),
-  ('\bpróxima\s+semana\b',   'relative', 'Relative: next week',          'la próxima semana',   'relative_cue',    'seed_dateparser_es', 0.90),
-  ('\bsemana\s+que\s+viene\b', 'relative', 'Relative: the coming week', 'la semana que viene', 'relative_cue',    'seed_dateparser_es', 0.88)
+  -- 'la próxima semana': the span MUST include the article — dateparser's es locale resolves
+  -- 'la próxima semana' but NOT the bare 'próxima semana' (measured on the pinned es locale).
+  -- ⚠️ LANGUAGE DIVERGENCE, stated plainly: the EN engine deliberately does NOT ground a bare
+  -- future period ("next week" -> NULL via _is_bare_vague_relative, an EN-shape gate). The es
+  -- locale's rule engine DOES resolve "la próxima semana" deterministically (a week-scale
+  -- anchor resolved to a concrete day by the pinned es locale) — so es grounds it. That
+  -- EXCEEDS the EN engine; it never fabricates
+  -- beyond the pinned es locale's standard resolution. Kept + documented, not hidden.
+  ('\b(?:la\s+)?próxima\s+semana\b', 'relative', 'Relative: next week (article form — dateparser es resolves only "la próxima semana")', 'la próxima semana', 'relative_cue', 'seed_dateparser_es', 0.90)
+  -- ⚠️ 'la semana que viene' is DELIBERATELY NOT SEEDED: dateparser's es locale cannot resolve
+  -- it (measured — None with and without the article), so a row for it would be a dead cue that
+  -- overclaims capture. Same removal rationale as the 'ábril' typo row.
 ON CONFLICT (pattern_regex, anchor_type) DO NOTHING;
 
 -- ── rel_types.natural_language: Spanish recall templates (per-tenant growable) ─────────
@@ -222,10 +245,13 @@ ON CONFLICT (alias) DO NOTHING;
 -- Spanish employment predicate ALIAS: the folded SVO predicate "trabajar_en" / "trabajar_para"
 -- (verb lemma + load-bearing particle "en"/"para") maps to the CANONICAL works_for rel, exactly
 -- like the English "work_for" folds via the /ingest seeded-morphology fold. Alias-only (NO
--- rel_type row — an exact PK would shadow the alias at RUNG 2, the vivre_en lesson). Without
--- this, "Yo trabajo en Google" emits (user, trabajar_en, google) under a novel unseeded rel
--- that the walk's works_for projection never admits — the fold-arm comment's "exactly like
--- English" claim was false until these rows existed (critic round-2 blocker).
+-- rel_type row — an exact PK would shadow the alias at RUNG 2, the vivre_en lesson).
+-- ⚠️ Since the employment chain gained its es "en"/"para" org arm, a VERB-tagged employment
+-- clause with an explicit subject ("Yo trabajo en Google", "Ella trabaja para IBM") emits
+-- works_for DIRECTLY at capture (verb suppressed — no fold edge). These aliases remain the
+-- BACKSTOP fold rail for any employment-verb clause the chain misses (pro-drop, a particle
+-- form the chain's closed markers don't read), so a fold edge never lands under a novel
+-- unseeded rel the walk's works_for projection would not admit.
 INSERT INTO public.rel_type_aliases (canonical_rel_type, alias, source, confidence)
 VALUES
   ('works_for', 'trabajar_en',   'es_seed', 0.95),
@@ -255,6 +281,6 @@ VALUES
   ('a',      'svo_particle', 'Load-bearing particle: "ir a <lugar>"',       'Voy a Madrid',   'seed_svo_particle_es', 0.90),
   ('de',     'svo_particle', 'Load-bearing particle: "venir de <lugar>"',   'Vengo de Madrid','seed_svo_particle_es', 0.90),
   ('con',    'svo_particle', 'Load-bearing particle: "quedar con <alguien>"','Quedo con Ana','seed_svo_particle_es', 0.90),
-  ('para',   'svo_particle', 'Load-bearing particle: "trabajar para <org>"','Trabajo para IBM','seed_svo_particle_es', 0.90),
+  ('para',   'svo_particle', 'Load-bearing particle: "trabajar para <org>"','Ella trabaja para IBM','seed_svo_particle_es', 0.90),
   ('por',    'svo_particle', 'Load-bearing particle: "pasar por <lugar>"',  'Paso por casa',  'seed_svo_particle_es', 0.90)
 ON CONFLICT (cue, category) DO NOTHING;
