@@ -69,19 +69,41 @@ class IdempotencyManager:
 
     def generate_key(self, text: str, user_id: str, endpoint: str,
                      messages: list = None, typed_entities: dict = None,
-                     memory_facts: list = None, is_correction: bool = False) -> str:
+                     memory_facts: list = None, is_correction: bool = False,
+                     edges: list = None) -> str:
         """Generate idempotency key from ALL request parameters (request fingerprinting).
 
-        Includes text, user, endpoint, conversation context, entity hints, memory, correction flag.
-        Two requests with same text but different context get different keys (no collisions).
+        Includes text, user, endpoint, conversation context, entity hints, memory, correction
+        flag, and — for pre-extracted submissions — the EDGE SET.
+
+        ⚠️ ``edges`` is load-bearing, added 2026-07-30. This method promised "ALL request
+        parameters … no collisions" while omitting the one field that carries the actual
+        payload for ``/ingest``. Two ``/ingest`` calls with the SAME text but DIFFERENT edges
+        therefore collided, and the second was answered from cache without ever being written.
+
+        That silently defeated the document lane's own recovery path: a degraded chunk commits
+        a partial salvage edge set, the document is re-pended, the chunk is re-extracted (this
+        time cleanly, with the full edge set), and the re-ingest — same text — hit the cache
+        and returned the DEGRADED result. The retry built to recover the loss was the thing
+        that discarded the recovery. Well inside the 3600s TTL, so this was the normal case.
+
+        The edge component is appended ONLY when edges are present, so keys for endpoints that
+        never send edges (``/extract/rewrite`` etc.) are byte-identical to before and their
+        in-flight cache entries stay valid.
         """
         msg_hash = hashlib.sha256(json.dumps(messages or []).encode()).hexdigest()[:8]
         entity_hash = hashlib.sha256(json.dumps(typed_entities or {}).encode()).hexdigest()[:8]
         memory_hash = hashlib.sha256(json.dumps(memory_facts or []).encode()).hexdigest()[:8]
         correction_flag = str(is_correction)
 
-        content = f"{text}|{user_id}|{endpoint}|{msg_hash}|{entity_hash}|{memory_hash}|{correction_flag}".encode('utf-8')
-        return hashlib.sha256(content).hexdigest()
+        content = f"{text}|{user_id}|{endpoint}|{msg_hash}|{entity_hash}|{memory_hash}|{correction_flag}"
+        if edges:
+            # sort_keys so an equivalent edge set hashes the same regardless of dict ordering;
+            # default=str so a stray non-JSON value degrades instead of raising.
+            edge_hash = hashlib.sha256(
+                json.dumps(edges, sort_keys=True, default=str).encode()).hexdigest()[:12]
+            content = f"{content}|{edge_hash}"
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
     def get_cached_response(self, idempotency_key: str) -> Optional[dict]:
         """Retrieve cached response for this idempotency key.

@@ -1,4 +1,4 @@
--- Migration 215: generic reference/identifier CODE as a scalar_atomic pattern
+-- Migration 185: generic reference/identifier CODE as a scalar_atomic pattern
 -- Date: 2026-08-04
 --
 -- WHY

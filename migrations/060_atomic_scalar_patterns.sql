@@ -152,15 +152,18 @@ VALUES
 
 ON CONFLICT (pattern_regex, rel_type) DO NOTHING;
 
--- Ensure new rel_types added here exist in rel_types table (permissive defaults)
--- WGM novel-rel-type LLM inference will refine metadata on first use
-INSERT INTO rel_types (rel_type, label, head_types, tail_types, is_symmetric, category, engine_generated, source, confidence)
-VALUES
-  ('has_subnet',  'Has subnet',  ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_mac',     'Has MAC address', ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_email',   'Has email',   ARRAY['ANY'], ARRAY['SCALAR'], false, 'identity', true, 'bootstrap', 0.85),
-  ('has_phone',   'Has phone',   ARRAY['ANY'], ARRAY['SCALAR'], false, 'identity', true, 'bootstrap', 0.85),
-  ('has_port',    'Has port',    ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.80),
-  ('has_url',     'Has URL',     ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_uuid',    'Has UUID',    ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85)
-ON CONFLICT (rel_type) DO NOTHING;
+-- THE `INSERT INTO rel_types (...) VALUES (... 'bootstrap' ...)` THAT USED TO FOLLOW IS GONE
+-- (gauntlet first-boot-migration-corpus, 2026-09-16). It seeded has_subnet / has_mac / has_email
+-- / has_phone / has_port / has_url / has_uuid with source = 'bootstrap' — a value
+-- `rel_types_source_check` (007: wikidata|builtin|engine|user; 072/073 add expand) has NEVER
+-- admitted. PostgreSQL rejected the statement (SQLSTATE 23514 check_violation) on EVERY boot of
+-- EVERY box, so the ledger recorded this file `failed` forever and re-ran it on every start —
+-- and each re-run re-INSERTed the seed rows above, RESURRECTING the has_phone (migration 184)
+-- and has_port (migration 198) regexes those migrations had corrected, as live duplicates
+-- beside the corrected rows (measured: two active has_port rows, the clock-time false positive
+-- 198 fixed among them). Six of the seven rels are seeded properly (source = 'builtin',
+-- tail_types = {SCALAR}, fact_class = 'B') by 061_fix_networking_rel_types.sql; `has_port`, the
+-- one 061 does not carry, is seeded by 275_seed_has_port_rel_type.sql with the metadata its
+-- siblings received (061 + 101). The duplicate pattern rows are retired by
+-- 276_retire_resurrected_060_pattern_rows.sql. With the dead statement gone this file applies
+-- on the first pass and the ledger stops re-running it.

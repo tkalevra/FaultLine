@@ -13,7 +13,7 @@ class FactStoreManager:
     def __init__(self, db_conn):
         self.db_conn = db_conn
 
-    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A", fact_provenance: str = "llm_inferred", source_ref: str | None = None) -> int:
+    def commit(self, connections: list[tuple], confidence: float = 1.0, unified_confidence: float = None, fact_class: str = "A", fact_provenance: str = "llm_inferred", source_ref: str | None = None, replay: bool = False) -> int:
         """
         Insert edges into facts with temporal metadata.
         connections: list of tuples with varying length:
@@ -103,10 +103,23 @@ class FactStoreManager:
                         "       WHEN 'B' IN (facts.fact_class, EXCLUDED.fact_class) THEN 'B'"
                         "       ELSE 'C'"
                         "   END,"
-                        "   confirmed_count = facts.confirmed_count + 1,"
+                                        "   confirmed_count = CASE WHEN facts.superseded_at IS NOT NULL AND %s THEN facts.confirmed_count ELSE facts.confirmed_count + 1 END,"
                         "   last_seen_at    = now(),"
                         "   updated_at      = now(),"
-                        "   superseded_at   = NULL,"
+                                        # DEFERRED-REPLAY GUARD (perfect-flow, B5-routed): the MCP seam re-POSTs a
+                # byte-identical body after a restart/blip - exactly when the in-memory
+                # idempotency cache is EMPTY - so this upsert is the only thing standing
+                # between a replay and a row that /retract/correct retired in the
+                # interleaving. Un-guarded, a replay did superseded_at=NULL (resurrecting
+                # the OLD value: old-value-unreachability bar) and confirmed_count+1
+                # (reinforcing a superseded row: 0-reinforcement bar). On replay (the
+                # X-FL-Deferred-Replay header, threaded from /ingest) the row KEEPS its
+                # retired state and count; all other mutations unchanged. A genuine user
+                # RE-STATEMENT (new turn, fresh ingest, no replay marker) still
+                # resurrects the row - user-is-truth untouched. The marker rides an HTTP
+                # header, never the body: the idempotency key hashes edges and the seam
+                # pins byte-identity.
+                "   superseded_at   = CASE WHEN facts.superseded_at IS NOT NULL AND %s THEN facts.superseded_at ELSE NULL END,"
                         "   unified_confidence = EXCLUDED.unified_confidence,"
                         "   rel_type_definition = EXCLUDED.rel_type_definition,"
                         "   storage_type = COALESCE(EXCLUDED.storage_type, facts.storage_type),"
@@ -124,7 +137,7 @@ class FactStoreManager:
                         "       WHEN EXCLUDED.fact_provenance = 'user_stated' THEN 'user_stated'"
                         "       ELSE facts.fact_provenance"
                         "   END",
-                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class, fact_provenance, source_ref),
+                        (sub, obj, rel, prov, confidence, unified_confidence, is_preferred, definition, storage_type, is_hierarchy_rel, taxonomies, statement_date, valid_until, fact_class, fact_provenance, source_ref, bool(replay), bool(replay)),
                     )
                     count += 1
             self.db_conn.commit()
@@ -221,7 +234,7 @@ class FactStoreManager:
                 conditions.append("object_id = %s")
                 params.append(old_value)
             where = " AND ".join(conditions)
-            cur.execute(f"SELECT id FROM facts WHERE {where}", params)
+            cur.execute(f"SELECT id FROM facts WHERE {where}", params)  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — where clause built from fixed column names; all values passed as %s params
             ids = [r[0] for r in cur.fetchall()]
 
         # Fallback: object-side match (entity being retracted is the object)
@@ -234,7 +247,7 @@ class FactStoreManager:
                 conditions.append("rel_type = %s")
                 params.append(rel_type.lower())
             where = " AND ".join(conditions)
-            cur.execute(f"SELECT id FROM facts WHERE {where}", params)
+            cur.execute(f"SELECT id FROM facts WHERE {where}", params)  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — where clause built from fixed column names; all values passed as %s params
             ids = [r[0] for r in cur.fetchall()]
 
         facts_ids = ids
@@ -261,7 +274,7 @@ class FactStoreManager:
                 conditions.append("object_id = %s")
                 params.append(old_value)
             where = " AND ".join(conditions)
-            cur.execute(f"SELECT id FROM staged_facts WHERE {where}", params)
+            cur.execute(f"SELECT id FROM staged_facts WHERE {where}", params)  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — where clause built from fixed column names; all values passed as %s params
             staged_ids = [r[0] for r in cur.fetchall()]
 
         # Apply the staged-table UPDATE (tombstone/restore/promote).
@@ -292,19 +305,19 @@ class FactStoreManager:
                 # marks it forgotten (vs superseded) and is the eventual purge target. NOT a DELETE.
                 cur.execute(
                     f"UPDATE facts SET archived_at = now(), deleted_at = now(), qdrant_synced = false "
-                    f"WHERE id IN ({placeholders})",
+                    f"WHERE id IN ({placeholders})",  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — placeholders are %s positionals, data in facts_ids param tuple
                     facts_ids,
                 )
             elif mode == "unforget":
                 # UN-FORGET — clear the tombstone, restore to the live view.
                 cur.execute(
                     f"UPDATE facts SET archived_at = NULL, deleted_at = NULL, qdrant_synced = false "
-                    f"WHERE id IN ({placeholders})",
+                    f"WHERE id IN ({placeholders})",  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — placeholders are %s positionals, data in facts_ids param tuple
                     facts_ids,
                 )
             else:
-                cur.execute(
-                    f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE id IN ({placeholders})",
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                    f"UPDATE facts SET superseded_at = now(), qdrant_synced = false WHERE id IN ({placeholders})",  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — placeholders are %s positionals, data in facts_ids param tuple
                     facts_ids,
                 )
 

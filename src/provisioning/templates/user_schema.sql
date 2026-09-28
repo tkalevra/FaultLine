@@ -135,7 +135,16 @@ CREATE TABLE IF NOT EXISTS staged_facts (
     hit_count INT NOT NULL DEFAULT 1,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ,
+    -- THE CLASS-C CLOCK (migration 012). Short-term memory is short-term BECAUSE it expires:
+    -- a Class C row has exactly two legitimate destinies, it expires or it earns promotion to
+    -- B. This template previously declared the column with NO default, silently dropping
+    -- migration 012's `NOT NULL DEFAULT now() + interval '30 days'` for every tenant built
+    -- from it. A row born with a NULL expiry is outside the lifecycle in BOTH directions —
+    -- `expire_staged_facts` / `decay_class_c_hits` key on `expires_at <= now()` and NULL never
+    -- satisfies it, while `fetch_unsynced_staged` and the recall lanes that filter
+    -- `expires_at > now()` never see it either. Not NOT NULL, because live tenants carry NULL
+    -- rows the backfill below repairs; the DEFAULT is what makes new rows correct.
+    expires_at TIMESTAMPTZ DEFAULT (now() + interval '30 days'),
     promoted_at TIMESTAMPTZ,
     qdrant_synced BOOLEAN NOT NULL DEFAULT false,
     rel_type_definition TEXT DEFAULT '',
@@ -174,6 +183,12 @@ ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS polarity TEXT NOT NULL DEFAULT
 ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- Idempotent backfill for tenant schemas created before migration 128 (citable provenance).
 ALTER TABLE staged_facts ADD COLUMN IF NOT EXISTS source_ref TEXT;
+-- Belt-and-braces for the Class-C clock. `ADD COLUMN IF NOT EXISTS` cannot repair a column that
+-- already exists with the wrong default, so state it explicitly here too; naturally idempotent.
+-- NOTE: this template is applied ONLY at schema creation, so it cannot reach tenants that were
+-- already built without the default — migration 264 is what repairs those, and it must stay
+-- paired with the CREATE TABLE default above.
+ALTER TABLE staged_facts ALTER COLUMN expires_at SET DEFAULT (now() + interval '30 days');
 
 CREATE INDEX IF NOT EXISTS idx_staged_facts_deleted_at
     ON staged_facts (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -199,6 +214,12 @@ CREATE INDEX IF NOT EXISTS idx_staged_facts_temporal
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT NOT NULL PRIMARY KEY,
     entity_type TEXT DEFAULT 'unknown',
+    -- FIRST-CLASS value/place property (THE HARD LINE, migration 192). {value,place,name,both};
+    -- NULL = unstamped/legacy (falls through to structural re-derivation). value/name/both = a
+    -- MEMORY (never laddered/typed/superseded by inferred type); place = an L4 type node; both =
+    -- OWL punning. Derived/stamped/read by src/api/node_role.py under VALUE_PLACE_FIRST_CLASS
+    -- (default OFF). See the internal design record
+    node_role TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -209,7 +230,20 @@ CREATE INDEX IF NOT EXISTS idx_entities_type
 CREATE TABLE IF NOT EXISTS entity_aliases (
     id SERIAL PRIMARY KEY,
     entity_id TEXT NOT NULL,
-    alias TEXT NOT NULL,
+    -- [it branch] COLLATE "it-IT-x-icu" — the Italian install's ICU locale (quickstart.py
+    -- _LANGUAGES["it"]["icu_locale"] = it-IT, the same locale initdb and the entrypoint's
+    -- collation guard use). Deterministic like the English "en-US-x-icu" it replaces here.
+    -- COLLATE (migration 216): this database is created by an image whose libc
+    -- (musl, on postgres:*-alpine) cannot resolve the `en_US.utf8` it DECLARES, so the default
+    -- collation silently degrades to BYTE ordering — `école` and `résumé` sort after `zebra`.
+    -- `alias` is the display sort key (13 `ORDER BY ... alias` sites, several `LIMIT 1`, so the
+    -- collation picks the rendered name), hence the column-level collation: every unqualified
+    -- `ORDER BY alias` resolves against it, with no query carrying a COLLATE clause.
+    -- DETERMINISTIC by design — it changes ORDERING ONLY. Equality stays bytewise, so `alias`
+    -- keeps every other semantic intact: the matching key, the dedup key, the UUID-v5 input,
+    -- `UNIQUE (entity_id, alias)` and the `ON CONFLICT` target. A NON-deterministic collation
+    -- would make 'ete' = 'été' and collapse distinct people onto one row — never use one here.
+    alias TEXT NOT NULL COLLATE "it-IT-x-icu",
     -- OBSERVED CASING OVERLAY of `alias` (migration 214). NULL = no casing was observed for
     -- this name, and the renderer falls back to `alias` — i.e. today's lowercase output.
     -- INVARIANT, enforced in Python at the write seam (src/extraction/display_case.py), NOT
@@ -218,9 +252,23 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
     -- read by everything except the ONE sanctioned read-time presentation seam in /query.
     -- (No CHECK because PostgreSQL's collation-dependent lower() can disagree with Python's
     -- str.lower() on non-ASCII, and a violation there would cost the user's whole sentence.)
-    display_form TEXT DEFAULT NULL,
+    -- COLLATE as above (migration 216) — this is the column that is actually RENDERED, so it
+    -- must not be the one left on byte ordering. It carries no index, so the collation is free.
+    display_form TEXT DEFAULT NULL COLLATE "it-IT-x-icu",
     is_preferred BOOLEAN NOT NULL DEFAULT false,
     preference_source TEXT NOT NULL DEFAULT 'unspecified',
+    -- The AUTHORITY that licensed this surface to co-refer with the entity's other labels
+    -- (e.g. 'wordnet_synset', 'abbreviation_definition'), or NULL for no recorded licence.
+    -- ORTHOGONAL to preference_source: that column records TRUST and is arbitrated by rank,
+    -- this one records JUSTIFICATION and must be merged by UNION, never by rank.
+    -- Added here 2026-08-27 to close a MEASURED template gap: migration 244 fans this column
+    -- into existing tenants, but the template never gained it, so every freshly minted tenant
+    -- was born one column short and depended on the next boot's fan-out to repair it. That gap
+    -- was the ONLY structural difference between a fresh mint and a fully-swept one, and closing
+    -- it is what makes stamping a new tenant migration-current provably safe
+    -- (src/provisioning/boot_migrations.py::stamp_schema_as_current). Pinned by
+    -- tests/test_boot_migrations.py::test_fresh_mint_is_migration_equivalent.
+    coreference_warrant TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     valid_from TIMESTAMP WITH TIME ZONE DEFAULT now(),
     valid_until TIMESTAMP WITH TIME ZONE,
@@ -235,6 +283,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_aliases_one_preferred
 CREATE INDEX IF NOT EXISTS idx_entity_aliases_preferred
     ON entity_aliases (is_preferred)
     WHERE is_preferred = true;
+-- Partial index (migration 244): warranted rows are the rare case and are the ones the
+-- alias co-reference guard asks about.
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_coreference_warrant
+    ON entity_aliases (entity_id) WHERE coreference_warrant IS NOT NULL;
 
 -- Entity attributes: scalar facts (age, height, occupation, etc.)
 -- Per-user schema: user_id is implicit through schema isolation, not stored
@@ -273,6 +325,50 @@ CREATE INDEX IF NOT EXISTS idx_entity_attributes_user_id
     ON entity_attributes (user_id);
 CREATE INDEX IF NOT EXISTS idx_entity_attributes_user_entity
     ON entity_attributes (user_id, entity_id);
+
+-- SCALAR SUPERSESSION HISTORY (scalar-supersession gauntlet, 2026-09-03). The attribute
+-- lane's PK is single-row (entity_id, attribute), so an in-place value change DESTROYS the
+-- prior value with no retirement stamp and no audit trail -- the one user-value store
+-- without the bi-temporal discipline the facts lane already has (facts supersede by
+-- stamping superseded_at and retaining the row; entity_attributes cannot retain because
+-- the next value OVERWRITES the only row). This APPEND-ONLY ledger is the SS1 alternative
+-- sanctioned by the spec: every supersede/retire writes one row carrying the PRIOR value
+-- snapshot, the NEW value snapshot, timestamp, provenance of both sides, and the cause.
+-- THE HARD LINE: history rows are CONTENT, never places -- no entity minting, no L4, no
+-- rel_type rows are ever grown from here. Values are user truth; this table is its
+-- audit surface. Tenant-schema-resident by construction (never public -- SS5 isolation).
+-- Existing tenant schemas receive it via migrations/273 (boot-migration ledger); new
+-- tenants get it here at provisioning.
+CREATE TABLE IF NOT EXISTS entity_attributes_history (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    entity_id TEXT NOT NULL,
+    attribute TEXT NOT NULL,
+    -- PRIOR (superseded/retired) value snapshot -- the recoverable history (SS1)
+    prior_value_text TEXT,
+    prior_value_int INT,
+    prior_value_float DOUBLE PRECISION,
+    prior_value_date DATE,
+    prior_provenance TEXT,
+    prior_datatype TEXT,
+    prior_created_at TIMESTAMP WITH TIME ZONE,
+    -- SUPERSEDING (new) value snapshot -- NULL on a pure retire (retraction/negation)
+    new_value_text TEXT,
+    new_value_int INT,
+    new_value_float DOUBLE PRECISION,
+    new_value_date DATE,
+    new_provenance TEXT,
+    -- 'superseded' = value replaced (correction/re-statement); 'retired' = value removed
+    -- (retraction/negation, row stamped superseded_at); 'restated' = a retired slot's value
+    -- re-asserted by a genuine fresh user statement (un-retired).
+    action TEXT NOT NULL CHECK (action IN ('superseded', 'retired', 'restated')),
+    -- what wrote this row: 'ingest_restate' | 'correct_fact' | 'retract_lane' |
+    -- 'negation_retire' (free-form diagnostic vocabulary, not a closed enum)
+    cause TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_entity_attributes_history_slot
+    ON entity_attributes_history (entity_id, attribute);
 CREATE INDEX IF NOT EXISTS idx_entity_attributes_entity
     ON entity_attributes (entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_attributes_attribute
@@ -327,6 +423,14 @@ CREATE TABLE IF NOT EXISTS rel_types (
     value_min DOUBLE PRECISION NULL,
     value_max DOUBLE PRECISION NULL,
     unit TEXT NULL,
+    -- CARDINALITY (migration 168, DESIGN-memory-temporal-lifecycle §5): does the rel hold at
+    -- most ONE CURRENT value per subject? TRUE = OWL-functional STATE (residence) → recency
+    -- picks the latest as current, older coexisting undated 'now' value(s) render as FORMER.
+    -- FALSE (default, non-destructive) = multi-valued (speaks/likes) → all values stay current.
+    -- Read by the query render seams; ingest/supersession unchanged (both values still coexist).
+    -- Appended LAST to match migration 168's ALTER … ADD COLUMN ordinal in public so the
+    -- bootstrap `INSERT INTO rel_types SELECT * FROM public.rel_types` stays aligned.
+    is_single_valued BOOLEAN NOT NULL DEFAULT false,
     CONSTRAINT rel_types_source_check CHECK (source = ANY (ARRAY['wikidata', 'builtin', 'engine', 'user', 'expand'])),
     CONSTRAINT chk_rel_types_temporal_class CHECK (temporal_class IN ('immutable', 'state', 'event')),
     CONSTRAINT chk_rel_types_scalar_datatype CHECK (scalar_datatype IS NULL OR scalar_datatype IN (
@@ -972,7 +1076,8 @@ CREATE INDEX IF NOT EXISTS idx_temporal_patterns_category ON {schema_name}.tempo
 --   * 'naming_verb'      — predicative naming/dubbing verbs (analyze_naming / _event_title /
 --                          is_naming_predicate): "a dog named/titled/dubbed X". (migration 105)
 --   * 'lvc_support_verb' — light/support verbs governing an eventive object (analyze_event /
---                          analyze_svo_relations): have/go/attend/take/do/make/get/participate. (mig 108)
+--                          analyze_svo_relations): have/go/attend/take/do/make/get/participate
+--                          /volunteer. (mig 108; volunteer mig 191)
 --   * 'svo_particle'     — load-bearing particles/preps on a verb (_svo_predicate_token /
 --                          _svo_object_head): to/for/with/in/on/at/from/into/about/of. (mig 108)
 --   * 'shell_noun'       — generic abstract/shell anaphoric heads (derive_sentence_facts._topic_
@@ -1108,13 +1213,44 @@ CREATE TABLE IF NOT EXISTS {schema_name}.episodic_log (
     id                   BIGSERIAL   PRIMARY KEY,
     user_id              TEXT        NOT NULL,
     raw_text             TEXT        NOT NULL,
+    -- ORIGIN LANE — ⚠️ LOAD-BEARING FOR PROVENANCE (migration 206).
+    -- reextract_episodic resolves the ORIGINAL /ingest source from this value, so it
+    -- decides whether a re-mined fact comes back as USER TESTIMONY (Class A) or as
+    -- ENGINE INFERENCE. Before that fix a user-STATED turn was re-ingested under
+    -- source="reextract" and returned DEMOTED — the owner's ruling ("re-stated should
+    -- be able to go from B→A; user is truth should be respected") is enforced HERE.
+    --   'mcp'                    → chat turn, user-stated
+    --   'document'               → document chunk, user-stated
+    --   'store_context_deferred' → Class-C residue, NOT elevatable
+    --   NULL / anything else     → origin unestablished, NOT elevatable (never guessed)
+    -- A new writer MUST set this honestly — EpisodicAppendRequest.source DEFAULTS to
+    -- 'mcp' (src/api/models.py), so omitting the field records the row as a user turn.
     source               TEXT,
     source_ref           TEXT,
     intent               TEXT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     extracted_fact_count INTEGER     DEFAULT NULL,
-    reextracted_at       TIMESTAMPTZ DEFAULT NULL
+    reextracted_at       TIMESTAMPTZ DEFAULT NULL,
+    -- Migration 197 (ontology-regrowth marks). A zero-edge turn is stamped
+    -- `reextracted_at = now(), extracted_fact_count = 0` and the backfill scans
+    -- `WHERE reextracted_at IS NULL`, so it is frozen out PERMANENTLY — the growth engine never
+    -- runs backwards over history. These two columns let a zero-edge turn be RE-OPENED once the
+    -- tenant has grown enough walkable places to have somewhere to put it.
+    -- ⚠️ MUST live here as well as in the migration: a migration-only change silently skips every
+    -- NEWLY PROVISIONED tenant, which is exactly what happened when 197 shipped without this.
+    reextract_ontology_mark  BIGINT  DEFAULT NULL,
+    reextract_attempts       INTEGER NOT NULL DEFAULT 0,
+    -- Migration 274 parity: per-turn idempotency key (client-generated, one per turn, shared by
+    -- every retry attempt of that turn). The partial UNIQUE index below is what makes two
+    -- in-flight append attempts converge on ONE row — a retry after a client-side ReadTimeout
+    -- reads back the existing id instead of appending a duplicate. NULL for keyless writers.
+    -- ⚠️ MUST live here as well as in the migration (a migration-only change skips new tenants).
+    turn_key                 TEXT    DEFAULT NULL
 );
+
+-- Migration 274 parity: two attempts of one turn can never produce two rows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_episodic_log_turn_key
+    ON {schema_name}.episodic_log (turn_key) WHERE turn_key IS NOT NULL;
 
 -- Partial index supporting the future re-extraction backfill scan.
 CREATE INDEX IF NOT EXISTS idx_episodic_log_reextract
@@ -1123,3 +1259,235 @@ CREATE INDEX IF NOT EXISTS idx_episodic_log_reextract
 -- Chronological scan index.
 CREATE INDEX IF NOT EXISTS idx_episodic_log_created_at
     ON {schema_name}.episodic_log (created_at);
+
+-- Migration 197 parity: the ontology-regrowth re-mine scans zero-fact turns by their mark.
+-- (Template-equivalence: a fresh mint swept by the full corpus must gain nothing.)
+CREATE INDEX IF NOT EXISTS idx_episodic_log_regrowth
+    ON {schema_name}.episodic_log (reextract_ontology_mark) WHERE extracted_fact_count = 0;
+
+-- Migration 063 parity: Class-C hit-lifecycle decay/promotion scan.
+CREATE INDEX IF NOT EXISTS idx_staged_facts_class_c_lifecycle
+    ON {schema_name}.staged_facts (fact_class, expires_at, hit_count)
+    WHERE fact_class = 'C' AND promoted_at IS NULL;
+
+-- Migration 206 parity: the provenance contract must be discoverable on the column for a
+-- NEWLY PROVISIONED tenant too, not just for the tenants the migration looped over. A
+-- migration-only change silently skips every new tenant (the exact failure 197 shipped with).
+COMMENT ON COLUMN {schema_name}.episodic_log.source IS
+    'ORIGIN LANE of this retained turn. LOAD-BEARING: reextract_episodic resolves the '
+    'original /ingest source from this value, so it decides whether a re-mined fact '
+    'returns as USER TESTIMONY (Class A) or ENGINE INFERENCE. '
+    '''mcp'' = chat turn (user-stated); ''document'' = document chunk (user-stated); '
+    '''store_context_deferred'' = Class-C residue (NOT elevatable); '
+    'NULL/unknown = origin unestablished (NOT elevatable -- never guessed). '
+    'A new writer MUST set this honestly: EpisodicAppendRequest.source defaults to '
+    '''mcp'', so omitting the field records the row as a user turn. See migration 206.';
+
+
+-- ============================================================================
+-- documents — per-tenant ASYNC document-ingestion registry.
+--   The flagship `ingest_document` lane chunks a doc, writes ONE pending row here
+--   (chunks retained verbatim in JSONB), and returns FAST. The re_embedder poll
+--   loop drains pending rows, runs the per-chunk hybrid extraction (deterministic
+--   spine FIRST + tenant-brain LLM /extract/rewrite for the sentences the spine
+--   dropped) through the WGM gate (source="mcp" → user_stated, durable), and flips
+--   status → 'ready'/'error'. Recall surfaces an honest "still processing" line
+--   while a document is pending, without blocking recall of already-ready facts.
+--   The chunks JSONB is the per-document verbatim safety net.
+-- Per-tenant: search_path has NO public, so this table MUST exist in every tenant
+--   schema. NO public seed — document rows are inherently user-specific.
+-- (migration 183 backfills this table into existing provisioned schemas)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS {schema_name}.documents (
+    id               BIGSERIAL   PRIMARY KEY,
+    user_id          TEXT        NOT NULL,
+    source_ref       TEXT,
+    title            TEXT,
+    chunks           JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    chunk_count      INTEGER     NOT NULL DEFAULT 0,
+    status           TEXT        NOT NULL DEFAULT 'pending',
+    chunks_failed    INTEGER     NOT NULL DEFAULT 0,
+    facts_committed  INTEGER     NOT NULL DEFAULT 0,
+    facts_staged     INTEGER     NOT NULL DEFAULT 0,
+    context_stored   INTEGER     NOT NULL DEFAULT 0,
+    truncated        BOOLEAN     NOT NULL DEFAULT false,
+    -- DOCLOSS part accounting (migration 195): an over-cap document is SEGMENTED across
+    -- consecutive rows instead of having its tail discarded. These say which slice of the
+    -- original document this row carries. Defaults = a legacy single-part document.
+    part_index       INTEGER     NOT NULL DEFAULT 0,
+    part_count       INTEGER     NOT NULL DEFAULT 1,
+    total_chunks     INTEGER     NOT NULL DEFAULT 0,
+    -- Bounded at-least-once redelivery: a brain-level outage re-pends the whole document;
+    -- `attempts` stops a permanently-sick document re-pending forever (terminates 'error').
+    attempts         INTEGER     NOT NULL DEFAULT 0,
+    -- The deferral-episode WALL CLOCK (migration 264): set at the first non-paced
+    -- brain-unavailable defer, cleared only on PROGRESS (terminal finalize or a
+    -- PRODUCTIVE deadline requeue whose owed count decreased; an unproductive
+    -- requeue keeps/stamps it, bounding the owed lane by the same episode — a claim
+    -- does NOT clear it: a claim is a pure DB write that succeeds mid-outage).
+    -- The terminal verdict
+    -- for a document that cannot make progress is measured on THIS (one continuous
+    -- episode, DOC_BRAIN_DEFER_MAX_AGE = 30 days, the system's own horizon for
+    -- unprocessed user content), never on the attempt count — a count is outage
+    -- duration sized by the drain interval, which killed innocent uploads ~5 minutes
+    -- into hours-long outages (95fb517b measured; the decision was deferred then).
+    brain_deferred_since TIMESTAMPTZ DEFAULT NULL,
+    -- PARALLEL per-chunk terminal ledger (migration 205). Maps a chunk INDEX to its terminal
+    -- state: {"7": {"s":"done","c":4,"g":1}} / {"7": {"s":"failed","a":3,"e":"..."}}.
+    -- A chunk with NO entry has no terminal state and is therefore still OWED — that, not a
+    -- counter, is what the parallel drain re-queues on reclaim. It is what makes a failed
+    -- chunk RE-MINABLE instead of burned into a terminal 'partial'. '{}' = no parallel drain
+    -- has run (the legacy lane never writes it).
+    chunk_state      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    error            TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at       TIMESTAMPTZ DEFAULT NULL,
+    ready_at         TIMESTAMPTZ DEFAULT NULL
+);
+
+-- Partial index driving BOTH the worker drain and the recall not-ready probe.
+CREATE INDEX IF NOT EXISTS idx_documents_active
+    ON {schema_name}.documents (created_at) WHERE status IN ('pending', 'processing');
+
+
+-- ============================================================================
+-- artefacts — per-tenant ARTEFACT RETENTION (stage A) + caption binding (A.5).
+--   Spec: the internal design record The same safety-net
+--   principle as episodic_log (a turn) and documents.chunks (a document), applied
+--   to BYTES: retain the artefact the user handed us, understand it later. Every
+--   later understanding pass is then a pure ADDITION over a retained artefact.
+--
+--   `bytea`, NOT pg_largeobject: large objects are a per-DATABASE catalog addressed
+--   by OID, so `search_path` gives them ZERO isolation, and DROP SCHEMA CASCADE
+--   ORPHANS them instead of erasing them (a GDPR Art. 17 hole). `bytea` is erased by
+--   the same schema drop as everything else — one boundary, one erasure surface.
+--   `bytes` is STORAGE EXTERNAL (a PDF/JPEG is already entropy-coded; TOAST's default
+--   compression attempt burns CPU for ~nothing).
+--
+--   `external_ref` ships unused ON PURPOSE — it is the pre-built object-storage flip
+--   point, so outgrowing in-database storage is CONFIG, NOT A MIGRATION. Exactly one
+--   of (bytes, external_ref) is set; ONE accessor resolves whichever it is
+--   (src/ingest/artefacts.load_artefact_payload).
+--
+--   PROVENANCE / TIER (§4): the UPLOAD EVENT is the user's own act, nothing inferred →
+--   user_stated / Class A (real memory before a pixel is read). The CAPTION binding is
+--   the engine's geometry guess → Class B. Never C: C carries a 30-day expiry, and a
+--   caption is TYPED fine — the engine is merely less sure it belongs to that image,
+--   which is a confidence question (caption_confidence), not a classification failure.
+--   The artefacts_caption_class_b CHECK makes the database refuse a Class-C caption.
+--
+--   Stage B (OCR / vision) is DEFERRED: ocr_* columns are reserved and nothing writes
+--   them. ocr_text is NEVER merged into text_layer — different provenance, different
+--   trust.
+-- Per-tenant: search_path has NO public, so this table MUST exist in every tenant
+--   schema. NO public seed — artefacts are inherently user-specific.
+-- (migration 203 backfills this table into existing provisioned schemas)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS {schema_name}.artefacts (
+    id               BIGSERIAL   PRIMARY KEY,
+    user_id          TEXT        NOT NULL,
+    -- the `documents` row this artefact arrived with, when it arrived with one.
+    -- Deliberately NOT a FK: a retained artefact must survive its registry row.
+    document_id      BIGINT,
+
+    -- ── IDENTITY of the thing the user handed us (the UPLOAD EVENT) ─────────────
+    filename         TEXT,
+    media_type       TEXT        NOT NULL,
+    byte_size        BIGINT      NOT NULL,
+    sha256           TEXT        NOT NULL,
+    page_index       INTEGER,          -- NULL = the whole file
+    artefact_index   INTEGER,          -- NULL = the whole file; else ordinal on the page
+
+    -- ── STORAGE: exactly one of these. The pre-built object-storage flip point ──
+    bytes            BYTEA,
+    external_ref     TEXT,
+
+    -- ── CAPTURE PROVENANCE: grounded, not inferred ─────────────────────────────
+    source_ref       TEXT,
+    fact_provenance  TEXT        NOT NULL DEFAULT 'user_stated',
+    fact_class       TEXT        NOT NULL DEFAULT 'A',
+    captured_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- ── PLACEMENT GEOMETRY: stage A.5 INPUT, read off the file itself ───────────
+    -- top-origin (pdfplumber `top`/`bottom`) — ONE convention, recorded so a later
+    -- reader cannot mix bottom-origin geometry from another library into it.
+    page_width       REAL,
+    page_height      REAL,
+    bbox_x0          REAL,
+    bbox_top         REAL,
+    bbox_x1          REAL,
+    bbox_bottom      REAL,
+
+    -- ── ASSOCIATION: stage A.5 OUTPUT — engine inference. B, never A, never C ───
+    caption_text            TEXT,
+    caption_provenance      TEXT,
+    caption_fact_class      TEXT,
+    caption_confidence      REAL,
+    caption_method          TEXT,
+    caption_declined_reason TEXT,   -- WHY we refused to bind. A decline is a RESULT.
+    caption_bound_at        TIMESTAMPTZ,
+
+    -- ── CONTEXT TIE: which chunk of the document was this printed beside? (mig 208) ──
+    -- `document_id` + `page_index` say which FILE and which PAGE. Neither says what was
+    -- being SAID around the artefact — the mined prose lives in `documents.chunks`, a
+    -- JSONB ARRAY, and facts are extracted per CHUNK. `chunk_index` is that array
+    -- position, so document_id + chunk_index is a complete coordinate: this figure
+    -- belongs beside THAT paragraph, and a walk reaching the paragraph reaches the figure.
+    -- `chunk_bind_method` keeps the two ways apart instead of laundering a coarse guess
+    -- into a precise one: 'caption' = the bound caption was found verbatim in that chunk;
+    -- 'page_lead' = A.5 declined, so the page's first substantial line anchors it.
+    -- Both NULL = neither resolved, recorded as unbound rather than fabricated.
+    chunk_index         INTEGER,
+    chunk_bind_method   TEXT,
+
+    -- ── UNDERSTANDING: stage B, DEFERRED. Reserved; nothing writes these ────────
+    text_layer       TEXT,
+    ocr_text         TEXT,
+    ocr_engine       TEXT,
+    ocr_confidence   REAL,
+    understood_at    TIMESTAMPTZ,
+
+    CONSTRAINT artefacts_storage_xor
+        CHECK (num_nonnulls(bytes, external_ref) <= 1),
+    CONSTRAINT artefacts_byte_size_nonneg
+        CHECK (byte_size >= 0),
+    CONSTRAINT artefacts_identity_provenance
+        CHECK (fact_provenance IN ('user_stated','llm_inferred','llm_learned')),
+    CONSTRAINT artefacts_identity_class
+        CHECK (fact_class IN ('A','B')),
+    -- THE 30-DAY-FUSE GUARD: a caption may only ever be Class B.
+    CONSTRAINT artefacts_caption_class_b
+        CHECK (caption_fact_class IS NULL OR caption_fact_class = 'B'),
+    CONSTRAINT artefacts_caption_needs_class
+        CHECK (caption_text IS NULL OR caption_fact_class IS NOT NULL),
+    -- A binding method may only be one we can justify, and never without an index to
+    -- describe: the database refuses an unexplained tie (mig 208).
+    CONSTRAINT artefacts_chunk_bind_method
+        CHECK (chunk_bind_method IS NULL
+               OR (chunk_index IS NOT NULL
+                   AND chunk_bind_method IN ('caption','page_lead')))
+);
+
+ALTER TABLE {schema_name}.artefacts ALTER COLUMN bytes SET STORAGE EXTERNAL;
+
+-- Dedup / "have I seen this before". COALESCE because NULLs are DISTINCT in a plain
+-- UNIQUE, and page_index IS NULL is the common case — a plain constraint would let the
+-- same 200-page PDF double-store silently.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_artefacts_identity
+    ON {schema_name}.artefacts (user_id, sha256,
+                                COALESCE(page_index, -1), COALESCE(artefact_index, -1));
+
+-- Read path: "show me what came in with this document, in page order".
+CREATE INDEX IF NOT EXISTS idx_artefacts_document
+    ON {schema_name}.artefacts (document_id, page_index, artefact_index);
+
+-- Work queue: artefacts A.5 has neither bound nor declined yet.
+CREATE INDEX IF NOT EXISTS idx_artefacts_unassociated
+    ON {schema_name}.artefacts (id)
+    WHERE caption_text IS NULL AND caption_declined_reason IS NULL;
+
+-- The READ the context tie exists for (mig 208): "what came in beside THIS chunk of THIS
+-- document". Partial, so it stays small — most artefacts never resolve a chunk.
+CREATE INDEX IF NOT EXISTS idx_artefacts_chunk
+    ON {schema_name}.artefacts (document_id, chunk_index)
+    WHERE chunk_index IS NOT NULL;

@@ -1,4 +1,4 @@
--- Migration 217: type postal_code as a SCALAR rel_type (was engine-grown mis-typed)
+-- Migration 215: type postal_code as a SCALAR rel_type (was engine-grown mis-typed)
 -- Date: 2026-08-04
 --
 -- WHY

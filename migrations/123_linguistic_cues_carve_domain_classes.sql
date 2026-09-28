@@ -44,8 +44,16 @@
 -- ============================================================================
 -- Remove the seeded rows only (a grown public row should never exist — growth never writes public —
 -- but guard with the seed-source filter anyway). After this, the blanket provisioning copy yields none.
+-- ⚠️ AMENDED 2026-08-27 (migration 272): 'social_role' REMOVED from this DELETE list.
+-- This file re-runs on EVERY container start (docker-entrypoint.sh:155 psql -f's every migration).
+-- Migration 272 seeds social_role as a CLOSED-CLASS English structure (colleague/coworker/teammate
+-- — the same category as the already-seeded kinship_noun), on the owner's ruling that engine
+-- scaffolding is seeded and grown, not gated. Leaving 'social_role' here would delete-then-reinsert
+-- those rows on every boot AND — because the delete is unconditional on is_active — would RESURRECT
+-- (as active) any row a user had DEACTIVATED, silently undoing the one correction path the class
+-- has. The carve-out stands for problem_noun and thin_type, which ARE domain-flavored.
 DELETE FROM public.linguistic_cues
- WHERE category IN ('social_role', 'problem_noun', 'thin_type')
+ WHERE category IN ('problem_noun', 'thin_type')
    AND (source LIKE 'seed_%' OR source IS NULL);
 
 -- ============================================================================
@@ -67,10 +75,10 @@ BEGIN
         ) THEN
             EXECUTE format($del$
                 DELETE FROM %I.linguistic_cues
-                 WHERE category IN ('social_role', 'problem_noun', 'thin_type')
+                 WHERE category IN ('problem_noun', 'thin_type')
                    AND (source LIKE 'seed_%%' OR source IS NULL)
             $del$, _schema);
-            RAISE NOTICE 'Migration 120: carved social_role/problem_noun/thin_type seed rows removed from %', _schema;
+            RAISE NOTICE 'Migration 123: carved problem_noun/thin_type seed rows removed from %', _schema;
         END IF;
     END LOOP;
 END $$;

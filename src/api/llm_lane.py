@@ -44,8 +44,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 from contextvars import ContextVar
-from typing import Iterator
+from typing import Any, Iterator, Optional
 
 # The two lanes. INTERACTIVE = a user is waiting on this call. BACKGROUND = deferrable
 # upkeep that must yield to interactive traffic.
@@ -97,6 +98,19 @@ def set_process_default(lane: str) -> None:
     """
     if lane in _VALID_LANES:
         os.environ["FL_LLM_DEFAULT_LANE"] = lane
+
+
+def lane_from_raw(value: Any) -> Optional[str]:
+    """Validate a raw header/env value as a lane name. Unknown/empty/garbage → None.
+
+    The receiving side must treat None as "no opinion" and leave the lane untouched —
+    never map garbage onto a lane, and never let a client-set value widen privileges:
+    INTERACTIVE is not privileged (it keeps the fail-open, which is the LEAST protective
+    setting for the provider), so a spoofed header can only make the caller's own
+    background work defer MORE, never less.
+    """
+    raw = str(value or "").strip().lower()
+    return raw if raw in _VALID_LANES else None
 
 
 @contextlib.contextmanager
@@ -152,3 +166,73 @@ class LLMUnavailable(RuntimeError):
         self.operation = operation
         super().__init__(f"llm unavailable ({reason})"
                          + (f" for {operation}" if operation else ""))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE TURN BUDGET (Deliverable D — additive, do not touch the lane
+# primitives above; they are load-bearing)
+# ──────────────────────────────────────────────────────────────────────────────
+# WHY A SECOND BUDGET ContextVar (and not a reuse of src/api/turn_budget.py)
+# -----------------------------------------------------------------------
+# ``turn_budget.py`` already implements an ambient monotonic deadline on a ContextVar
+# for the /query READ path, with the right shape (nestable, fail-open-to-inf, monotonic).
+# The ingest write path needs the SAME shape but on a SEPARATE var: a /query turn's
+# deadline and an ingest turn's deadline are different requests on different code paths,
+# and a budget set on one must not bleed into the other. Reusing the shape (not the
+# variable) is the deliberate choice — copy the proven contract, bind it to a different
+# ContextVar so the two paths stay independent.
+#
+# FAIL-OPEN, ALWAYS — same as ``turn_budget``: unset → ``turn_budget_remaining()`` is
+# ``inf`` and admission falls through to today's behaviour. The failure mode of a
+# mis-wired budget is "behaves exactly like today", never "silently defers every turn".
+INTERACTIVE_TURN_BUDGET_S = float(os.environ.get("INTERACTIVE_TURN_BUDGET_S", "4.0"))
+
+# The owner's "couple of seconds" bar (spec §4). Default 4.0 leaves a tail reserve for the
+# HTTP transport after admission + extraction + ingest round out the call.
+
+_turn_deadline: ContextVar[Optional[float]] = ContextVar(
+    "fl_interactive_turn_deadline", default=None
+)
+
+
+def set_turn_budget_deadline(monotonic_deadline: Optional[float]) -> None:
+    """Bind the per-request monotonic deadline directly (the helper behind
+    ``open_turn_budget``). Pass None to clear. Use ``open_turn_budget`` unless you have a
+    specific reason to set the raw value (e.g. constructing a deadline from an externally
+    measured starting point). Never raises."""
+    _turn_deadline.set(monotonic_deadline)
+
+
+@contextlib.contextmanager
+def open_turn_budget(budget_s: float):
+    """Bind an interactive turn budget for the enclosed scope.
+
+    Re-entrant by NESTING, not by replacement: an inner block inherits
+    ``min(remaining_outer, requested)`` so it can only ever be STRICTER than the turn
+    that contains it. Mirrors ``turn_budget.open_budget``'s contract verbatim — without
+    that, a nested ``open_turn_budget(2.0)`` late in an already-3.9s-old turn would hand
+    out a fresh 2s and the outer guarantee would silently evaporate."""
+    requested = float(budget_s)
+    outer = _turn_deadline.get()
+    now = time.monotonic()
+    if outer is not None:
+        requested = min(requested, max(0.0, outer - now))
+    deadline = now + requested
+    token = _turn_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            _turn_deadline.reset(token)
+
+
+def turn_budget_remaining() -> float:
+    """Seconds left on the interactive turn budget.
+
+    ``inf`` when unbudgeted (off the hot path → no deadline to enforce, today's
+    behaviour). Negative clamped to 0 so a caller comparing ``remaining <= 0`` is not
+    surprised by a tiny negative from clock skew."""
+    d = _turn_deadline.get()
+    if d is None:
+        return float("inf")
+    return max(0.0, d - time.monotonic())
