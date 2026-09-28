@@ -130,6 +130,49 @@ hecho almacenado no está "en inglés".
   acotar (p. ej. `where do you work?`); la consulta española (`¿dónde trabajas?`) sí. Las
   instalaciones inglesas usan `master`/`main`.
 
+### Motor v2 (puerto `foss-migrate-v2`): qué llega al español y qué queda inerte
+El motor v2 (corpus de migraciones con libro de arranque, deriver *spine* a nivel saas, ontología,
+consulta/paseo, MCP) se portó encima de todo lo anterior sin revertir ninguna corrección española.
+Lo que **sí** llega al español:
+- **Negación**: todas las comprobaciones nuevas `neg` del deriver pasan por `_is_neg` (Penn `neg` o
+  UD `advmod`/`det` con lema negativo), así que `No uso el puerto 8081` se guarda **negado**.
+- **Clases de pistas nuevas** sembradas en español (migración 282): `naming_noun` (nombre, apodo,
+  apellido…), `social_role` (amigo/amiga → `friend_of`; colega, compañero, vecino, conocido →
+  `knows`; sin ellas `mi amiga Lucía` archivaba a una persona como objeto poseído), `dosage_noun` /
+  `measure_noun` (dosis, cantidad, nivel, récord, vocabulario), `unit_scalar` segundo(s) y `días`.
+  Las plantillas `natural_language` de `duration` y `postal_code` pasan al español como en la 218.
+- **Colación** de nombres visibles: `es-x-icu` (la ñ va después de la n; los acentos siguen siendo
+  diferencias secundarias; determinista, así que la igualdad y la deduplicación no cambian).
+- **Pregunta de conocimiento** tras `/expand`: `¿Qué sé/sabes sobre X?` (y `qué se sabe de X`) se
+  reconoce igual que `what do I know about X`.
+- El **atomizador** (reframe) recibe la regla de conservar el idioma del mensaje (nunca traducir).
+- Las cadenas españolas (`_chain_es_*`) sólo se ejecutan sobre un análisis en español
+  (`Doc.lang_ == "es"`); antes también disparaban sobre frases inglesas.
+
+Lo que queda **inerte en español**, deliberadamente (sin gramática española todavía — no se envía
+una heurística incorrecta):
+- Las cadenas nuevas que leen estructura Penn/inglesa (`prep`→`pobj` con preposiciones inglesas,
+  `npadvmod`, `auxpass`, estándar `than`, compuestos con núcleo final): reubicación, participio
+  locativo, sustantivo identificador, puesto, verbo ligero, nacimiento (`nacer`), implicativos,
+  ejemplificación (`tales como`), adverbios continuativos, verbo de medida. Sus clases **no** se
+  siembran en español (una fila sin consumidor sería una pista muerta). `Rex nació el 15 de marzo`
+  no produce edge todavía.
+- La redirección de compuestos de la familia de medidas (`<sustancia> <sustantivo>`, núcleo final)
+  no casa con el español de núcleo inicial (`dosis de vitamina D`); el rechazo de `dosis`/`nivel`
+  sueltos como entidad sí funciona.
+- Los **votantes de negación** del atajo destructivo de corrección/retracción
+  (`analyze_negation_scopes`) siguen leyendo sólo el arco Penn `neg`: el español no aporta votante
+  hasta medir ese enrutado con turnos en español, y el conjunto cae a GLiNER2 (dirección no
+  destructiva). Igual que la sonda de negación contrastiva de `analyze_directive`.
+- Los marcos de consulta nuevos en regex inglesa (conteo/suma, comparativos, historial temporal) se
+  suman a los detectores de conteo/duración/temporal que la rama ya tenía sin localizar: no casan
+  con una pregunta en español.
+- Los eventos con nombre (festivos) y los desfases `N unidades in advance` son inglés; la prosa MCP
+  (abstención «I don't have any information…», sobres degradados) sigue en inglés como el resto de la
+  prosa para el modelo; la reducción de sujeto de la abstención cae a la versión genérica en español.
+- La lematización nominal de `normalize_nominal_rel` (plural inglés) se aplica tal cual a nombres de
+  relación españoles; el plural español no se invierte bien sin léxico (`colores`→`colore`).
+
 ## Idioma y base de datos (léelo antes de instalar)
 El idioma se elige **al principio** de `quickstart.py`, antes que cualquier otra cosa, y esa elección
 fija la **colación (collation) de PostgreSQL** mediante ICU (`es-ES`).

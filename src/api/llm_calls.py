@@ -38,6 +38,7 @@ HARD CONSTRAINTS (violations will cause Phase 2 rejection):
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import re as _re
@@ -52,6 +53,67 @@ from src.api import llm_rate, llm_source_ip
 from src.api.llm_lane import LLMUnavailable  # re-exported: callers import it from here
 
 log = structlog.get_logger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM NON-ANSWER LEDGER (request-scoped) — "FAIL LOUD, NEVER SILENT"
+# ──────────────────────────────────────────────────────────────────────────────
+# Every function in this module answers a NON-ANSWER the same way it answers a real
+# one: by RETURNING (a bare {}, or the circuit-breaker's {"error": ...} dict). That is
+# deliberate — an ingest lane must degrade, not crash. But it also means a caller that
+# only reads the returned edges CANNOT TELL "the brain said there is nothing here" from
+# "the brain never answered", and so reports a degraded run as a clean one.
+#
+# This ledger is a pure OBSERVER: a ContextVar that is None unless a caller explicitly
+# opens a scope, so with no scope open the recording call is a single dict-get and NOTHING
+# about any existing code path changes. A caller that opens a scope can then report, on its
+# own response envelope, exactly which operations went unanswered while it ran.
+#
+# EVIDENCE. Martin Fowler, "CircuitBreaker" (martinfowler.com/bliki/CircuitBreaker.html):
+# "Any change in breaker state should be logged and breakers should reveal details of their
+# state for deeper monitoring." REVEALING the state is half the pattern, and it is the half a
+# `return {}` silently drops.
+_LLM_NONANSWER_LEDGER: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "_llm_nonanswer_ledger", default=None)
+
+
+def begin_llm_degradation_scope():
+    """Open a request-scoped LLM non-answer ledger. Returns a token for reset."""
+    return _LLM_NONANSWER_LEDGER.set({"total": 0, "by_operation": {}, "reasons": []})
+
+
+def reset_llm_degradation_scope(token) -> None:
+    """Close the scope opened by begin_llm_degradation_scope(). Never raises."""
+    try:
+        _LLM_NONANSWER_LEDGER.reset(token)
+    except Exception:  # noqa: BLE001 — an observer must never break its host
+        pass
+
+
+def llm_degradation_snapshot() -> Optional[dict]:
+    """The current scope's ledger, or None when no scope is open / nothing failed."""
+    ledger = _LLM_NONANSWER_LEDGER.get()
+    if not ledger or not ledger.get("total"):
+        return None
+    return {
+        "llm_calls_unanswered": ledger["total"],
+        "llm_unanswered_operations": dict(ledger["by_operation"]),
+        "llm_first_unanswered_reason": ledger["reasons"][0] if ledger["reasons"] else None,
+    }
+
+
+def _record_llm_nonanswer(operation: str, reason: str) -> None:
+    """Record ONE non-answer against the open scope. No scope ⇒ no-op, no raise."""
+    ledger = _LLM_NONANSWER_LEDGER.get()
+    if ledger is None:
+        return
+    try:
+        ledger["total"] += 1
+        op = str(operation or "UNKNOWN")
+        ledger["by_operation"][op] = ledger["by_operation"].get(op, 0) + 1
+        if len(ledger["reasons"]) < 10:
+            ledger["reasons"].append(f"{op}:{reason}")
+    except Exception:  # noqa: BLE001 — an observer must never break its host
+        pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 # THINK-TAG STRIPPING: Qwen3 models wrap reasoning in <think>...</think> tags
@@ -387,6 +449,7 @@ class LLMTimeouts:
         "EMBEDDING": 10.0,               # Text embedding operations
         "TAXONOMY_DISCOVERY": 20.0,      # Discover new taxonomies
         "NATURAL_LANGUAGE_FILL": 10.0,   # Ontology phrasing (3p+2p) for a grown rel_type — short single-rel JSON
+        "NATURAL_LANGUAGE_FILL_BATCH": 20.0,  # ONE call phrasing every grown rel_type minted in a single ingest turn (replaces N serial NATURAL_LANGUAGE_FILL round-trips)
         "DEFAULT": 30.0,                 # Fallback for unknown operations
     }
 
@@ -462,6 +525,7 @@ class LLMMaxTokens:
         "CLASSIFY_CHAIN": 256,      # One-shot FULL is-a ladder: short JSON {entity_type, chain:[...]} of snake_case tokens up to a general root — bigger than a single rung, far smaller than dense EXTRACT
         "REFRAME": 256,             # Short JSON list of short atomic statements — restructuring, NOT dense triple generation; do NOT reuse 2048 EXTRACT budget
         "NATURAL_LANGUAGE_FILL": 200,  # Small JSON {natural_language, natural_language_2p} for ONE rel_type
+        "NATURAL_LANGUAGE_FILL_BATCH": 900,  # JSON MAP {rel_type: {natural_language, natural_language_2p}} for EVERY novel rel in one turn
         "DEFAULT": 500,       # Safe fallback for every other operation
     }
 
@@ -675,6 +739,107 @@ def generate_rel_type_phrasing(rel_type: str,
     return out
 
 
+def _validate_rel_phrasing_pair(rt: str, nl: str, nl_2p: str) -> dict:
+    """Apply the SAME placeholder contract generate_rel_type_phrasing enforces to ONE
+    (natural_language, natural_language_2p) pair. Factored out so the single-rel and the
+    batch generators validate byte-identically (no divergent copy). Returns whichever key
+    validated; a broken value is dropped (never stored)."""
+    out: dict = {}
+    nl = (nl or "").strip()
+    nl_2p = (nl_2p or "").strip()
+    if nl:
+        if "X" in nl:
+            out["natural_language"] = nl
+        else:
+            log.warning("rel_type_phrasing.natural_language_missing_placeholder",
+                        rel_type=rt, generated_value=nl,
+                        reason="LLM response missing X subject placeholder — dropping")
+    if nl_2p:
+        if "Y" in nl_2p and "X" not in nl_2p:
+            out["natural_language_2p"] = nl_2p
+        else:
+            log.warning("rel_type_phrasing.natural_language_2p_invalid",
+                        rel_type=rt, generated_value=nl_2p,
+                        reason="2p missing Y or contains X — dropping")
+    return out
+
+
+def generate_rel_type_phrasing_batch(rel_types: list,
+                                     user_id: str = "engine") -> dict:
+    """Phrase EVERY grown rel_type minted in one ingest turn in a SINGLE LLM round-trip.
+
+    SPEED / SERIALIZATION FIX (owner: "LLM only where needed; stop N serial round-trips on
+    the one shared LLM slot"). The per-rel ``generate_rel_type_phrasing`` fires ONE blocking
+    NATURAL_LANGUAGE_FILL call per novel rel_type at ingest — a dense turn that mints
+    fly_to / tour / purchase / present / present_at pays FIVE serial calls for what is one
+    tiny ontology-phrasing task. This asks for all of them in ONE JSON map, so a turn's novel
+    rels cost ONE call instead of N. The DECISION (which rels are novel) is unchanged and
+    deterministic; only the number of LLM round-trips drops. Phrasing output is byte-identical
+    per rel (same prompt shape, same placeholder contract) → ZERO capture / render change.
+
+    Returns ``{rel_type: {natural_language?, natural_language_2p?}}`` for whichever rels/keys
+    validated. A rel absent from the result (LLM omitted it / failed its contract) is simply
+    not cached — the caller falls back to the per-rel generator / the re_embedder Job-7 async
+    backfill, exactly as today. NEVER raises; any error → ``{}`` (caller keeps today's serial
+    path). Purely an LLM ontology-phrasing task — it NEVER touches GLiNER2.
+    """
+    rts = []
+    _seen_rt: set = set()
+    for r in (rel_types or []):
+        r = (r or "").strip().lower()
+        if r and r not in _seen_rt:
+            _seen_rt.add(r)
+            rts.append(r)
+    if not rts:
+        return {}
+    # A single novel rel is cheaper via the single-rel path (smaller prompt/budget) — the
+    # batch is only worth a round-trip when there are >=2 rels to phrase.
+    if len(rts) == 1:
+        one = generate_rel_type_phrasing(rts[0], user_id=user_id)
+        return {rts[0]: one} if one else {}
+
+    _rt_lines = "\n".join(f'  - "{r}"' for r in rts)
+    try:
+        messages = [
+            {"role": "system", "content":
+             "You are an ontology expert. Respond with ONLY a JSON object, no markdown."},
+            {"role": "user", "content":
+             f'Generate human-readable phrases for EACH of these relationship types:\n'
+             f'{_rt_lines}\n\n'
+             f'For every relationship type produce TWO phrasings:\n'
+             f'1. "natural_language": third-person, use X for subject and Y for object.\n'
+             f'   Example: "parent_of" -> "X is the parent of Y", "has_ip" -> "X has IP address Y".\n'
+             f'2. "natural_language_2p": SECOND-PERSON, subject baked in as "you"/"your", keep ONLY Y for the object. MUST contain Y, MUST NOT contain X.\n'
+             f'   Example: "parent_of" -> "You are the parent of Y", "has_ip" -> "You have IP address Y".\n\n'
+             f'Respond with ONLY a JSON object mapping each relationship type to its phrasings, e.g.:\n'
+             f'{{"parent_of": {{"natural_language": "X is the parent of Y", "natural_language_2p": "You are the parent of Y"}}, ...}}'},
+        ]
+        result = call_llm_with_retry_sync(
+            messages=messages,
+            model=LLMModels.get("NATURAL_LANGUAGE_FILL_BATCH"),
+            user_id=user_id,
+            operation="NATURAL_LANGUAGE_FILL_BATCH",
+        )
+    except Exception as e:
+        log.warning("rel_type_phrasing.batch_generation_failed",
+                    rel_count=len(rts), error=str(e)[:200])
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    out: dict = {}
+    for r in rts:
+        row = result.get(r)
+        if not isinstance(row, dict):
+            continue
+        validated = _validate_rel_phrasing_pair(
+            r, row.get("natural_language") or "", row.get("natural_language_2p") or "")
+        if validated:
+            out[r] = validated
+    log.info("rel_type_phrasing.batch_generated",
+             requested=len(rts), phrased=len(out))
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # GLOBALS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -775,6 +940,7 @@ def call_llm_with_retry_sync(
                    user_id=user_id,
                    operation=operation,
                    time_until_reset_seconds=max(1, int(time_until_reset)))
+        _record_llm_nonanswer(operation, "circuit_breaker_open")
         return error_msg
 
     # Select timeout based on operation type
@@ -819,6 +985,7 @@ def call_llm_with_retry_sync(
                 # "the model answered nothing", which a verdict-caching caller would
                 # record as a real answer. The error marker lets callers that can
                 # wait re-pend instead of treating a merely-paced pass as final.
+                _record_llm_nonanswer(operation, "rate_deferred")
                 return {"error": "rate_deferred"}
             try:
                 # Log attempt details
@@ -871,6 +1038,7 @@ def call_llm_with_retry_sync(
                 content = _strip_think_tags(content)
 
                 if not content:
+                    _record_llm_nonanswer(operation, "empty_llm_content")
                     return {}
 
                 try:
@@ -886,6 +1054,7 @@ def call_llm_with_retry_sync(
                                    user_id=user_id,
                                    operation=operation,
                                    content_preview=content[:200])
+                        _record_llm_nonanswer(operation, "unparseable_llm_response")
                         return {}
 
             except Exception as e:
@@ -926,6 +1095,7 @@ def call_llm_with_retry_sync(
              total_endpoints=len(endpoints),
              final_error_type=type(last_error).__name__,
              final_error_message=str(last_error)[:200])
+    _record_llm_nonanswer(operation, f"all_retries_exhausted:{type(last_error).__name__}")
 
     # A caller that CACHES A VERDICT needs to tell "never reached" from "answered nothing".
     # Raising the raw transport error cannot express that: every LLM helper here wraps its
@@ -988,6 +1158,7 @@ async def call_llm_with_retry_async(
                    user_id=user_id,
                    operation=operation,
                    time_until_reset_seconds=max(1, int(time_until_reset)))
+        _record_llm_nonanswer(operation, "circuit_breaker_open")
         return error_msg
 
     # Select timeout based on operation type
@@ -1024,6 +1195,7 @@ async def call_llm_with_retry_async(
                     raise LLMUnavailable("rate_deferred", operation)
                 # DISTINGUISHABLE defer — see the sync twin for why a bare {} here
                 # becomes a recorded "answered nothing" on a day that was merely paced.
+                _record_llm_nonanswer(operation, "rate_deferred")
                 return {"error": "rate_deferred"}
             try:
                 log.debug("llm_call_async.attempt_start",
@@ -1078,6 +1250,7 @@ async def call_llm_with_retry_async(
                 content = _strip_think_tags(content)
 
                 if not content:
+                    _record_llm_nonanswer(operation, "empty_llm_content")
                     return {}
 
                 try:
@@ -1093,6 +1266,7 @@ async def call_llm_with_retry_async(
                                    user_id=user_id,
                                    operation=operation,
                                    content_preview=content[:200])
+                        _record_llm_nonanswer(operation, "unparseable_llm_response")
                         return {}
 
             except Exception as e:
@@ -1133,6 +1307,7 @@ async def call_llm_with_retry_async(
              total_endpoints=len(endpoints),
              final_error_type=type(last_error).__name__,
              final_error_message=str(last_error)[:200])
+    _record_llm_nonanswer(operation, f"all_retries_exhausted:{type(last_error).__name__}")
 
     # See the sync twin: a verdict-caching caller must be able to tell "never reached" from
     # "answered nothing".

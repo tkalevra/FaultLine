@@ -8,8 +8,8 @@
 -- The hierarchy rel_types already exist but their structural flags were left unset, so
 -- traversal never walks them. This wires the CLOSED, CURATED hierarchy set:
 --   hierarchy rels (is_hierarchy_rel=true): instance_of, is_a, member_of, part_of, subclass_of
---   transitive (has_transitivity=true + transitive_rel_types={self}): subclass_of, part_of, member_of
---   NON-transitive (left as-is): instance_of, is_a
+--   transitivity is an entity_taxonomies property (019), NOT a rel_types column — see the note
+--   below the first UPDATE for why the two transitivity UPDATEs this file used to carry are gone.
 -- ("my animals" walks DOWN transitive subclass_of to Rex; instance_of is a single hop.)
 --
 -- These are guarded UPDATEs against EXISTING curated rel_types — they touch nothing else and
@@ -26,15 +26,19 @@ UPDATE public.rel_types
    SET is_hierarchy_rel = true
  WHERE rel_type IN ('instance_of', 'is_a', 'member_of', 'part_of', 'subclass_of');
 
-UPDATE public.rel_types
-   SET has_transitivity     = true,
-       transitive_rel_types = ARRAY[rel_type]::TEXT[]
- WHERE rel_type IN ('subclass_of', 'part_of', 'member_of');
-
--- instance_of / is_a stay NON-transitive (instance ≠ subclass; rdf:type is not transitive).
-UPDATE public.rel_types
-   SET has_transitivity = false
- WHERE rel_type IN ('instance_of', 'is_a');
+-- TWO `has_transitivity` / `transitive_rel_types` UPDATEs REMOVED HERE, and the matching two
+-- EXECUTEs in the fan-out below (gauntlet first-boot-migration-corpus, 2026-09-16). They
+-- targeted `public.rel_types.has_transitivity` — a column that has NEVER existed on rel_types
+-- in any migration or in the template. `has_transitivity` / `transitive_rel_types` live on
+-- `entity_taxonomies` (019, seeded there; read by taxonomy_overlay.py and nowhere else) and the
+-- design this file cites wires them THERE. Nothing in src/ reads a rel_types transitivity
+-- column. Result on every box: SQLSTATE 42703 on both statements on EVERY boot, the ledger
+-- recorded this file `failed` forever and re-ran it on every start — and because the fan-out
+-- DO block below EXECUTEd the same broken UPDATE, the WHOLE block rolled back each time, so the
+-- per-tenant is_hierarchy_rel wiring it promised never landed on a single existing tenant.
+-- Adding the column to satisfy the statement would mint an unread column; the taxonomy rows
+-- already carry the transitivity the design asks for. Only the is_hierarchy_rel wiring — the
+-- part that is read — remains, and with it the file applies and the ledger stops re-running it.
 
 -- ── 2. Fan out to existing tenant schemas ───────────────────────────────────
 DO $$
@@ -49,19 +53,6 @@ BEGIN
             UPDATE %I.rel_types
                SET is_hierarchy_rel = true
              WHERE rel_type IN ('instance_of', 'is_a', 'member_of', 'part_of', 'subclass_of')
-        $upd$, _schema);
-
-        EXECUTE format($upd$
-            UPDATE %I.rel_types
-               SET has_transitivity     = true,
-                   transitive_rel_types = ARRAY[rel_type]::TEXT[]
-             WHERE rel_type IN ('subclass_of', 'part_of', 'member_of')
-        $upd$, _schema);
-
-        EXECUTE format($upd$
-            UPDATE %I.rel_types
-               SET has_transitivity = false
-             WHERE rel_type IN ('instance_of', 'is_a')
         $upd$, _schema);
 
         RAISE NOTICE 'Migration 089: hierarchy flags wired in %', _schema;

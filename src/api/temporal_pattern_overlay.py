@@ -38,12 +38,12 @@ import re
 import time
 import threading
 
-import psycopg2
 import structlog
 
 # Reuse the SAME request-schema ContextVar binding as the rel_type/taxonomy overlays so ONE
 # set_current_schema()/reset_current_schema() per request governs ALL overlays.
 from src.api import rel_type_overlay
+from src.api.db_read import read_only_connection
 
 log = structlog.get_logger()
 
@@ -133,7 +133,10 @@ def _fetch_relative_cues(dsn: str, schema_qualifier: str) -> list:
     # connect_timeout (CONNECTION guard, NOT an LLM/op timeout): a momentarily-slow PG must not
     # block a turn unboundedly on a cold cue read. On timeout/failure psycopg2 raises → the
     # caller's fail-safe (bootstrap cue set) applies; correctness is preserved.
-    with psycopg2.connect(dsn, connect_timeout=5) as conn:
+    # read_only_connection (src/api/db_read.py): autocommit + readonly + guaranteed close.
+    # A metadata read must never own a transaction (AccessShareLock held across a slow
+    # caller stalled prod deprovision + pg_dump) and never own a backend past its scope.
+    with read_only_connection(dsn, connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT pattern_regex FROM {schema_qualifier}.temporal_patterns "
@@ -239,7 +242,10 @@ def _fetch_gate_patterns(dsn: str, schema_qualifier: str) -> list:
     """Read ALL active pattern_regex rows (ANY anchor_type) from one explicit schema, for the
     combined gate. Raises on a missing table / read error so the caller's fail-safe applies."""
     out: list = []
-    with psycopg2.connect(dsn, connect_timeout=5) as conn:
+    # read_only_connection (src/api/db_read.py): autocommit + readonly + guaranteed close.
+    # A metadata read must never own a transaction (AccessShareLock held across a slow
+    # caller stalled prod deprovision + pg_dump) and never own a backend past its scope.
+    with read_only_connection(dsn, connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT pattern_regex FROM {schema_qualifier}.temporal_patterns "
@@ -355,7 +361,11 @@ def resolve_formal_absolute_patterns(dsn: str) -> list:
         schema_qualifier = "public"
         if _is_real_tenant_schema(rel_type_overlay.get_current_schema()):
             schema_qualifier = rel_type_overlay.get_current_schema().strip()
-        with psycopg2.connect(dsn, connect_timeout=5) as conn:
+        # read_only_connection (src/api/db_read.py), like the two sibling resolvers above:
+        # autocommit + readonly + guaranteed close. (This module no longer imports psycopg2
+        # directly — the bare psycopg2.connect here raised NameError into the fail-safe and
+        # silently served only the bootstrap months.)
+        with read_only_connection(dsn, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT pattern_regex FROM {schema_qualifier}.temporal_patterns "

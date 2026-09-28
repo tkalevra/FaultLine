@@ -22,9 +22,16 @@ DECLARE
 BEGIN
     FOR _schema IN
         SELECT schema_name
-        FROM   public.user_provisioning
-        WHERE  status = 'ready'
-          AND  schema_name IS NOT NULL
+        FROM   public.user_provisioning up
+        WHERE  up.status = 'ready'
+          AND  up.schema_name IS NOT NULL
+          -- SKIP A REGISTRY ROW WHOSE SCHEMA NO LONGER EXISTS. Without this join a stale
+          -- `user_provisioning` row (registry outliving its schema — deprovision, manual drop,
+          -- restore) raises `schema "faultline_..." does not exist` INSIDE this single-transaction
+          -- DO block, which aborts the WHOLE block, so NO schema gets the object. Found 2026-07-31
+          -- when migration 200 copied this pattern verbatim and failed on 11 stale rows.
+          AND  EXISTS (SELECT 1 FROM information_schema.schemata s
+                       WHERE s.schema_name = up.schema_name)
     LOOP
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.system_alerts (

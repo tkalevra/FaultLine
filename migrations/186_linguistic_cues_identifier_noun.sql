@@ -1,9 +1,9 @@
--- Migration 216: linguistic_cues — seed the identifier_noun CONTEXT-SIGNAL cue class
+-- Migration 186: linguistic_cues — seed the identifier_noun CONTEXT-SIGNAL cue class
 -- Date: 2026-08-04
 --
 -- WHY
 -- ---
--- Migration 215 added a VALUE-SHAPE atomic pattern (has_reference_id) for alphanumeric identifier
+-- Migration 185 added a VALUE-SHAPE atomic pattern (has_reference_id) for alphanumeric identifier
 -- CODES ("ABC-12345", "2024-CV-00931"), gated to require letters+digits so it never eats a plain
 -- number (a bare count). But a user who DIRECTLY STATES a PURE-NUMERIC identifier WITH CONTEXT —
 -- "my ticket number is 1234567", "my case number is 8891002", "the confirmation number is 55021" —
@@ -31,10 +31,10 @@
 --   • "my favorite number is 7" / "my lucky number is 13" → no STRONG cue ("favorite"/"lucky" are
 --     not cues, "number" is only a suffix) → this path does NOT fire; the value is not an identifier.
 --   • An alphanumeric id in an identifier-context sentence ("my ticket number is ABC-12345") is
---     claimed by BOTH this chain and the mig-147 atomic as (user, has_reference_id, "ABC-12345") —
+--     claimed by BOTH this chain and the mig-185 atomic as (user, has_reference_id, "ABC-12345") —
 --     the harvest's (subject, rel, object) dedup collapses them to ONE edge.
 --
--- has_reference_id is a SCALAR rel (tail_types={SCALAR}, migration 215) → routed to entity_attributes
+-- has_reference_id is a SCALAR rel (tail_types={SCALAR}, migration 185) → routed to entity_attributes
 -- exactly like has_ip / age; the value is stored VERBATIM (scalar_datatype='string').
 --
 -- Mirrors the DB-DOWN code-fallback in linguistic_cue_overlay._BOOTSTRAP_IDENTIFIER_NOUN_ROLE_MAP.

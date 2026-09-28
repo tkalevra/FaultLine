@@ -10,7 +10,7 @@
 -- this seam, that chain emitted `(subject, <verb-lemma>, <verb-surface-as-object>)` — which
 -- made the verb surface ("broke") a registered ENTITY, queued it for grounding, and the
 -- context-free grounder mis-sensed it ("broke"=bankrupt) into a FINANCIAL L4 hierarchy.
--- Two symptoms, one root cause. (DEV/bugs/strength-passing-recursion/SPEC.md §10.4.)
+-- Two symptoms, one root cause. (the internal design record §10.4.)
 --
 -- THE OWNER'S DECISION (SPEC §10.4): the THING is grounded; the STATE is the DATED MEMORY
 -- attached to it — NOT an entity, NOT resolved to a UUID, NOT grounded into L4 (there is no
@@ -64,22 +64,23 @@ VALUES
     ('has_state', 'Has State', NULL, false, 1.0, 'builtin', 'supersede')
 ON CONFLICT (rel_type) DO NOTHING;
 
--- 1b. has_state metadata (guarded — only fills the freshly-inserted skeleton)
-UPDATE public.rel_types SET
-    head_types          = ARRAY['ANY']::TEXT[],
-    tail_types          = ARRAY['SCALAR']::TEXT[],
-    is_symmetric        = false,
-    inverse_rel_type    = NULL,
-    is_hierarchy_rel    = false,
-    fact_class          = 'B',
-    storage_target      = 'entity_attributes',
-    category            = 'state',
-    temporal_class      = 'event',
-    scalar_datatype     = 'string',
-    natural_language    = 'X is in state Y',
-    natural_language_2p = 'You are in state Y'
-WHERE rel_type = 'has_state'
-  AND (head_types IS NULL OR head_types = '{}');
+-- 1b. (REMOVED — see below.) This file now mints the has_state SKELETON only; its metadata is
+-- migration 111's, which supersedes this file forward ("Re-mint has_state as a RELATIONAL
+-- state predicate (supersedes 110)").
+--
+-- THE SCALAR METADATA UPDATE THAT STOOD HERE, and its twin in the per-tenant loop below, are
+-- GONE (gauntlet first-boot-migration-corpus, 2026-09-16). It set `storage_target =
+-- 'entity_attributes'` — a value `check_storage_target` (024: facts|events|staged_only; 085
+-- adds entity_synonyms) has NEVER admitted on public.rel_types. On every FRESH database the
+-- skeleton row above is untyped, the guard matched it, PostgreSQL rejected the UPDATE
+-- (SQLSTATE 23514 check_violation) and the ledger recorded this file `failed`; on a
+-- twice-booted box 111 had already typed the row, so the guard matched nothing and the file
+-- "applied" with zero rows. The SCALAR design it carried was REJECTED by the owner
+-- (the internal design record; 111's header) and 111 forces
+-- the RELATIONAL metadata with an unguarded UPDATE on every path — so on no box, ever, did
+-- this statement's values survive to be read. Removing it changes no end state; it lets the
+-- file apply on the first pass. The skeleton INSERT stays: 111's ON CONFLICT DO UPDATE and
+-- the per-tenant loop are written against a row that already exists.
 
 -- ============================================================================
 -- Part 2: Per-user schemas (loop over faultline_* schemas) — EXISTING tenants
@@ -107,25 +108,10 @@ BEGIN
                 ON CONFLICT (rel_type) DO NOTHING
             $ins$, _schema);
 
-            EXECUTE format($upd$
-                UPDATE %I.rel_types SET
-                    head_types          = ARRAY['ANY']::TEXT[],
-                    tail_types          = ARRAY['SCALAR']::TEXT[],
-                    is_symmetric        = false,
-                    inverse_rel_type    = NULL,
-                    is_hierarchy_rel    = false,
-                    fact_class          = 'B',
-                    storage_target      = 'entity_attributes',
-                    category            = 'state',
-                    temporal_class      = 'event',
-                    scalar_datatype     = 'string',
-                    natural_language    = 'X is in state Y',
-                    natural_language_2p = 'You are in state Y'
-                WHERE rel_type = 'has_state'
-                  AND (head_types IS NULL OR head_types = '{}')
-            $upd$, _schema);
+            -- (the guarded SCALAR metadata UPDATE that followed is removed — see 1b above;
+            --  111 types the row on every path)
         END IF;
 
-        RAISE NOTICE 'Migration 110: minted has_state scalar predicate into %', _schema;
+        RAISE NOTICE 'Migration 110: minted has_state skeleton into %', _schema;
     END LOOP;
 END $$;

@@ -112,43 +112,88 @@ if [ -n "${FAULTLINE_DB_ICU_LOCALE:-}" ]; then
 fi
 
 # Check for duplicate migration numbers (CRITICAL VALIDATION)
+# Signal preservation (2026-08-19): a warning that fires on EVERY boot teaches
+# everyone to ignore it. Twelve numbers are duplicated across the backlog; those
+# are disjoint-table idempotent pairs that execute safely by glob order (no
+# applied-migrations ledger; every file runs). The case this check exists to
+# catch is two migrations modifying the SAME table. So: count benign
+# number-collisions informationally, WARN only on same-table collisions.
 echo "Validating migration files..."
 MIGRATION_NUMBERS=$(ls /app/migrations/*.sql 2>/dev/null | sed 's/^.*\///; s/_.*\.sql$//' | sort)
 DUPLICATES=$(echo "$MIGRATION_NUMBERS" | uniq -d)
 if [ -n "$DUPLICATES" ]; then
-  echo "WARNING: Duplicate migration numbers found: $DUPLICATES"
-  echo "Note: Multiple definitions of same migration number may cause issues."
-  echo "This is acceptable if they modify different tables or schemas."
-  # Don't exit - let migrations proceed (idempotency handled by migrations themselves)
+  BENIGN_COUNT=$(echo "$DUPLICATES" | wc -l | tr -d ' ')
+  echo "INFO: $BENIGN_COUNT duplicate migration numbers (disjoint-table pairs execute safely by glob order)"
+  for NUM in $DUPLICATES; do
+    FILE_COUNT=$(ls /app/migrations/${NUM}_*.sql 2>/dev/null | wc -l | tr -d ' ')
+    UNIQUE_TABLES=$(cat /app/migrations/${NUM}_*.sql 2>/dev/null \
+      | grep -oiE '(ALTER TABLE|CREATE TABLE( IF NOT EXISTS)?)\s+(IF EXISTS\s+)?[a-z_.]+' \
+      | grep -oiE '[a-z_.]+$' | sort -u)
+    # `|| true` is LOAD-BEARING: `grep -c .` exits 1 on EMPTY input (a duplicate
+    # number whose files touch no ALTER/CREATE TABLE — DO-block migrations), and
+    # under `set -e` that killed the entrypoint at line 133's assignment on the
+    # first boot of this check: the container crash-looped between "PostgreSQL
+    # is up" and "Migration validation complete" with no error line. Measured
+    # live on pre-prod 2026-08-19 (migration 031, empty UNIQUE_TABLES).
+    TABLE_COUNT=$(echo "$UNIQUE_TABLES" | grep -c . || true)
+    TABLE_COUNT=${TABLE_COUNT:-0}
+    if [ "$FILE_COUNT" -gt 1 ] && [ "$TABLE_COUNT" -gt 0 ] && [ "$TABLE_COUNT" -lt "$FILE_COUNT" ]; then
+      echo "WARNING: migration $NUM: multiple files touch the SAME table(s): $(echo $UNIQUE_TABLES | tr '\n' ' ')"
+      echo "Note: same-table duplicate migrations can race or conflict — review before relying on them."
+    fi
+  done
 fi
 echo "Migration validation complete"
 
 # Run migrations
-# NOTE: execution semantics are unchanged (every file runs fully, errors do not
-# stop startup — legacy migrations rely on continue-past-error idempotency), but
-# ERROR lines are now surfaced and summarized instead of silently swallowed.
-# A silently-failed ADD CONSTRAINT here is how dBug-074 happened.
+#
+# GATED BY A PER-SCHEMA APPLIED-ONCE LEDGER (2026-08-27).
+# This loop used to run EVERY migration on EVERY boot. Measured on a 9-tenant database that
+# cost 3,978 row-writes into EXISTING tenant schemas per start (ins=738 upd=3106 del=134) —
+# re-applying, on every deploy, migrations that finished months ago. 95 of the files fan out
+# into every tenant schema and a dozen write inside that fan-out.
+#
+# src/provisioning/boot_migrations.py now checks public.schema_migration_status first and runs
+# only what is not already applied at the file's CURRENT checksum (so a MODIFIED file is
+# detected and re-applied, never silently skipped). It still executes each file with the same
+# `psql -f`, in the same order, and still CONTINUES PAST ERRORS and prints the same end-of-run
+# ERROR summary — a silently-failed ADD CONSTRAINT is how dBug-074 happened, and that reporting
+# is deliberately preserved.
+#
+# FAIL-SAFE: if the ledger cannot be read, it runs EVERYTHING (this loop's old behaviour) and
+# says so loudly. Over-application is bounded and survivable; a silently skipped migration is
+# not — see the module docstring for the full argument.
+#
+# ROLLBACK LEVER: FAULTLINE_MIGRATION_LEDGER=false restores the legacy every-file sweep.
 echo "Running migrations..."
-MIGRATION_ERRORS=""
-for migration in /app/migrations/*.sql; do
-  echo "Applying $migration..."
-  MIG_OUT=$(psql "${POSTGRES_DSN}" -f "$migration" 2>&1) || true
-  echo "$MIG_OUT"
-  ERR_COUNT=$(echo "$MIG_OUT" | grep -c 'ERROR:' || true)
-  if [ "$ERR_COUNT" -gt 0 ]; then
-    echo ">>> $migration produced $ERR_COUNT ERROR line(s) (execution continued)"
-    MIGRATION_ERRORS="${MIGRATION_ERRORS}  - ${migration} (${ERR_COUNT} error(s))\n"
+if ! FAULTLINE_MIGRATIONS_DIR=/app/migrations python -m src.provisioning.boot_migrations; then
+  # The gate never exits non-zero for a migration failure (startup must continue, as before).
+  # Reaching here means the gate ITSELF could not run — fall back to the legacy sweep rather
+  # than starting with migrations unapplied.
+  echo "=================================================================="
+  echo "WARNING: the migration gate could not run. Falling back to the legacy"
+  echo "         every-file sweep so nothing is left unapplied."
+  echo "=================================================================="
+  MIGRATION_ERRORS=""
+  for migration in /app/migrations/*.sql; do
+    echo "Applying $migration..."
+    MIG_OUT=$(psql "${POSTGRES_DSN}" -f "$migration" 2>&1) || true
+    echo "$MIG_OUT"
+    ERR_COUNT=$(echo "$MIG_OUT" | grep -c 'ERROR:' || true)
+    if [ "$ERR_COUNT" -gt 0 ]; then
+      echo ">>> $migration produced $ERR_COUNT ERROR line(s) (execution continued)"
+      MIGRATION_ERRORS="${MIGRATION_ERRORS}  - ${migration} (${ERR_COUNT} error(s))\n"
+    fi
+  done
+  if [ -n "$MIGRATION_ERRORS" ]; then
+    echo "=================================================================="
+    echo "WARNING: migrations produced ERROR lines (startup continues):"
+    printf "%b" "$MIGRATION_ERRORS"
+    echo "Some errors are expected re-run noise (e.g. duplicate_object on"
+    echo "unguarded ADD CONSTRAINT), but a NEW migration appearing here means"
+    echo "its schema change may NOT have applied. Inspect before trusting."
+    echo "=================================================================="
   fi
-done
-
-if [ -n "$MIGRATION_ERRORS" ]; then
-  echo "=================================================================="
-  echo "WARNING: migrations produced ERROR lines (startup continues):"
-  printf "%b" "$MIGRATION_ERRORS"
-  echo "Some errors are expected re-run noise (e.g. duplicate_object on"
-  echo "unguarded ADD CONSTRAINT), but a NEW migration appearing here means"
-  echo "its schema change may NOT have applied. Inspect before trusting."
-  echo "=================================================================="
 fi
 
 echo "Migrations complete"

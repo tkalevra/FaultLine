@@ -219,52 +219,21 @@ WHERE rel_type = 'related_to' AND (head_types IS NULL OR head_types = '{}');
 -- ============================================================================
 -- HIERARCHY REL_TYPES: Classification & Composition (is_hierarchy_rel = true)
 -- ============================================================================
-
--- instance_of: entity is instance of class (NOT transitive per CLAUDE.md)
-UPDATE rel_types SET
-  head_types = ARRAY['ANY']::TEXT[],
-  tail_types = ARRAY['Concept']::TEXT[],
-  is_symmetric = false,
-  is_hierarchy_rel = true,
-  inverse_rel_type = NULL
-WHERE rel_type = 'instance_of' AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false);
-
--- subclass_of: class hierarchy (transitive, IS_HIERARCHY_REL)
-UPDATE rel_types SET
-  head_types = ARRAY['Concept']::TEXT[],
-  tail_types = ARRAY['Concept']::TEXT[],
-  is_symmetric = false,
-  is_hierarchy_rel = true,
-  inverse_rel_type = NULL
-WHERE rel_type = 'subclass_of' AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false);
-
--- part_of: composition (object is part of subject, hierarchical)
-UPDATE rel_types SET
-  head_types = ARRAY['ANY']::TEXT[],
-  tail_types = ARRAY['ANY']::TEXT[],
-  is_symmetric = false,
-  is_hierarchy_rel = true,
-  inverse_rel_type = NULL
-WHERE rel_type = 'part_of' AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false);
-
--- is_a: general inheritance (hierarchical alias for subclass_of)
-UPDATE rel_types SET
-  head_types = ARRAY['ANY']::TEXT[],
-  tail_types = ARRAY['Concept']::TEXT[],
-  is_symmetric = false,
-  is_hierarchy_rel = true,
-  inverse_rel_type = NULL
-WHERE rel_type = 'is_a' AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false);
-
--- member_of: entity membership in group (hierarchical)
-UPDATE rel_types SET
-  head_types = ARRAY['ANY']::TEXT[],
-  tail_types = ARRAY['Concept', 'Organization']::TEXT[],
-  is_symmetric = false,
-  is_hierarchy_rel = true,
-  inverse_rel_type = NULL
-WHERE rel_type = 'member_of' AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false);
-
+-- FIVE UPDATEs REMOVED HERE (gauntlet first-boot-migration-corpus, 2026-09-16) — they were
+-- DEAD ON EVERY PATH. Each typed one hierarchy rel (instance_of / subclass_of / part_of / is_a /
+-- member_of: head_types, tail_types, is_symmetric, is_hierarchy_rel=true, inverse NULL) behind
+-- the guard `WHERE ... AND (is_hierarchy_rel IS NULL OR is_hierarchy_rel = false)`. Migration
+-- 022_rel_types_metadata.sql — eight files EARLIER in this same corpus — already sets
+-- is_hierarchy_rel = TRUE for exactly those five rels, so the guard was unsatisfiable on every
+-- boot of every box since the day this file was written; measured on a three-boot database:
+-- all five carry head_types = tail_types = NULL. NOT made live: the values they carried
+-- (instance_of / is_a tail_types = {Concept}, member_of tail_types = {Concept, Organization})
+-- would turn a never-enforced constraint ON for the L4 ladder that files Animal / Object /
+-- Location instances at type nodes, and production tenants already carry gate-WIDENED
+-- member_of tail types ({Organization, ANY} after migration 271). Flipping that on is an ingest
+-- validation change, not a boot-order repair — an owner decision, taken separately if at all.
+-- What they set that still matters (is_hierarchy_rel = true) is carried by 022 and 089.
+--
 -- created_by: creation/authorship relationship
 UPDATE rel_types SET
   head_types = ARRAY['ANY']::TEXT[],

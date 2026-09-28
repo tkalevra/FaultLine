@@ -142,6 +142,98 @@ def _literals(s: str) -> set[str]:
     return {t for t in _content_tokens(s) if any(c.isdigit() for c in t)}
 
 
+# ── SET-LEVEL NO-DROP GUARD: sacred source tokens must SURVIVE the atomization ────────
+# The per-atom guardrail (_guardrail_check) enforces the NO-ADD / NO-ALTER direction of
+# "USER IS TRUTH" (Tiers 1–3: no invented token, byte-intact literals, subject kept). It is
+# structurally BLIND to the SYMMETRIC failure — a DROP: an atom that silently OMITS part of
+# the source is a pure token-SUBSET, so it sails through every tier. Live LongMemEval miss
+# (e47becba): "I graduated with a degree in Business Administration, which has definitely
+# helped me" → the atomizer split the relative clause (prompt rule 7) and, in doing so, DROPPED
+# the nominal PP-complement "in Business Administration" from the degree atom (emitting only
+# "I graduated with a degree"). Every atom passed the per-atom guardrail; the degree FIELD —
+# the answer — never reached the deterministic spine, and recall surfaced only "Degree".
+#
+# This guard is a SET-LEVEL coverage check over the FULL atom set: the SACRED source tokens —
+# PROPER NOUNS (names/titles = the naming layer, THE HARD LINE's user truth) and DIGIT-BEARING
+# LITERALS (numbers / dates / IPs / values) — must each still appear SOMEWHERE in the union of
+# the accepted atoms. A sacred token present in the source but in NO atom means the LLM dropped
+# user truth → the whole LLM atomization is DISCARDED and the caller falls back to the LOSSLESS
+# deterministic segmentation (segment_clauses), which never drops a token. Common nouns /
+# adjectives / function words are NOT sacred (the atomizer legitimately de-noises describers,
+# venue adjuncts, opinions), so a clean split never trips this. Subject-agnostic (POS + digit
+# shape only — NO name/number/domain list). Fail-safe: spaCy off / parse error → no sacred set
+# → covered (today's behavior), never a crash, never a new drop.
+
+def reframe_sacred_coverage_enabled() -> bool:
+    """No-drop coverage sub-flag — REFRAME_SACRED_COVERAGE (default true)."""
+    return _flag("REFRAME_SACRED_COVERAGE", "true")
+
+
+# spaCy NER labels that are NUMERIC / TEMPORAL, NOT names. Their digit-bearing parts are already
+# protected by ``_literals`` (byte-intact), and the atomizer DELIBERATELY canonicalizes dates
+# (prompt rule D / the event shape), so treating a whole DATE span as sacred would force a fallback
+# on every legitimately-reshaped date. So the "named" sacred set = NER entities MINUS these labels.
+# This is the universal spaCy NER schema (subject-agnostic), NOT a domain/name list.
+_NUMERIC_TEMPORAL_NER_LABELS: frozenset[str] = frozenset(
+    {"DATE", "TIME", "CARDINAL", "ORDINAL", "QUANTITY", "PERCENT", "MONEY"})
+
+
+def _sacred_source_tokens(raw: str) -> set[str]:
+    """Lowercased SACRED tokens of the source that must survive atomization: NAMED-ENTITY tokens
+    (any NER span that is not numeric/temporal — PERSON/ORG/GPE/PRODUCT/EVENT/…) ∪ proper nouns
+    (parser ``pos_ == 'PROPN'``) ∪ digit-bearing literals. Fail-safe → literals-only / ``set()``."""
+    sacred: set[str] = set(_literals(raw))
+    try:
+        from src.extraction.linguistics import _get_nlp, _get_nlp_ner
+    except Exception:  # noqa: BLE001
+        return sacred
+    # NAMES: NER entities (Carol→PERSON, Business Administration→ORG, Todoist→ORG/PRODUCT). The
+    # dependency-parse model tags many names as bare NOUN in copula position ("my name is Carol"),
+    # so the NER model is the authoritative naming signal here.
+    try:
+        ner = _get_nlp_ner()
+        if ner is not None:
+            for ent in ner(raw).ents:
+                if (ent.label_ or "").upper() in _NUMERIC_TEMPORAL_NER_LABELS:
+                    continue
+                for tok in ent:
+                    if not any(c.isalnum() for c in (tok.text or "")):
+                        continue
+                    t = (tok.text or "").strip().lower()
+                    if t and t not in _FUNCTION_WORDS:
+                        sacred.add(t)
+    except Exception:  # noqa: BLE001 — NER failure → keep parser/literal signal
+        pass
+    # PROPER NOUNS (belt-and-suspenders — catches a title the NER missed, e.g. a quoted event name).
+    try:
+        nlp = _get_nlp()
+        if nlp is not None:
+            for tok in nlp(raw):
+                if tok.pos_ != "PROPN":
+                    continue
+                t = (tok.text or "").strip().lower()
+                if t and t not in _FUNCTION_WORDS:
+                    sacred.add(t)
+    except Exception:  # noqa: BLE001 — parser failure → keep NER/literal signal
+        pass
+    return sacred
+
+
+def _atomization_drops_sacred_token(raw: str, atoms: list) -> set[str]:
+    """Return the set of SACRED source tokens the atom set DROPPED (empty ⇒ lossless).
+
+    A non-empty return means the LLM atomization silently lost a name/value the user stated —
+    the caller should DISCARD it and fall back to the lossless deterministic segmentation."""
+    sacred = _sacred_source_tokens(raw)
+    if not sacred:
+        return set()
+    covered: set[str] = set()
+    for a in atoms or []:
+        txt = getattr(a, "text", "") or ""
+        covered.update(_TOKEN_RE.findall(txt.lower()))
+    return {s for s in sacred if s not in covered}
+
+
 # ── Tier 3: SUBJECT-PRESERVATION (grammatical, spaCy-only — no word lists) ───────────
 # A subject-DROPPED atom ("attending the workshop ... last Saturday" from "I have been
 # attending the workshop ... last Saturday") is a strict TOKEN SUBSET of the source — it
@@ -432,14 +524,114 @@ def _guardrail_ok(atom_text: str, source_span: str, full_message: str) -> bool:
 _SYSTEM_PROMPT = 'You are helping build a MEMORY GRAPH. The same real thing must come out in the SAME clean canonical form EVERY time, so it can be matched and de-duplicated downstream. Your job is to reformat one chat message into clean, single-fact statements.\n\nWHO each fact is ABOUT (critical — the graph is subject-agnostic):\nKeep each statement\'s TRUE SUBJECT exactly as the user wrote it. If the user wrote "I" / "my car" / "my son Theodore" / "the server", that EXACT subject stays. NEVER reattribute a fact to someone else, NEVER rewrite the subject to "the user", and NEVER force first person. A fact about the user\'s son stays about the son; a fact about a server stays about the server. Keep the user\'s OWN action verb ("drove", "received", "met", "attended") — do not swap it for a different verb.\n\nHARD RULES — obey every one:\n1. NEVER add a fact, name, number, date, place, or value that is not in the message. Copy every number/date/name/address EXACTLY, character for character.\n2. NEVER drop a real fact, and NEVER invent one. Every concrete statement in the message — including a fact tucked into a "by the way" aside — becomes its own line.\n3. ONE fact per line. Split compound sentences; keep each statement short. Never split one fact across two lines and never merge two facts into one line.\n4. STRIP the chatter and any request or question to the assistant, but KEEP every concrete stated fact in the SAME message. Remove ONLY the conversational parts — greetings, "by the way", "I just", "also", "anyway", and the request/question clause itself ("can you help me", "do you have any tips", "do you have any recommendations", "do you have any ideas"). A message can ASK a question AND state a fact in passing — keep the fact, drop the question. The request/question wording must never appear in a statement, but any concrete fact tucked beside or behind it (a "by the way" aside, an "I recall that…" background note, a stated event/date/name) STILL becomes its own statement. Return {"atoms": []} ONLY when the message states no concrete fact at all.\n5. DROP pure opinion/plan/feeling that names no concrete thing ("excited to capture great shots", "it was an amazing event"). Keep every clause that states something concrete about a subject.\n6. Resolve a pronoun ONLY to a noun literally present earlier in the SAME message; otherwise leave the pronoun as-is. When the pronoun could refer to EITHER a person\'s proper NAME or a common-noun role word for that SAME person (the message already gave both, e.g. "my mother\'s name is Carol" then "she ...", or "my sister is Sarah" then "she ..."), resolve the pronoun to the proper NAME, never the role word. This affects ONLY the pronoun\'s own clause; the earlier naming statement still becomes its own separate line unchanged.\n7. A RELATIVE CLAUSE IS A SEPARATE FACT. "X who is 10", "the server that runs Linux", "Paris, which is in France" each state a SECOND fact about that thing — split it onto its OWN line with the thing ITSELF as the subject ("Mia is 10.", "The server runs Linux.", "Paris is in France."). NEVER let a relative pronoun (who, that, which) be the subject of a line, and never leave "who is 10" attached to a list.\n8. A LIST OF DISTINCT THINGS SPLITS PER THING. When one clause introduces several distinct things — a comma/"and" list, or a count followed by the items ("three kids: Mia, Theo, and Leo", "two cars: a Tesla and a truck", "three servers: a web server named Apollo, a database named Vault, and a cache named Echo") — keep the bare NAMES listed together on the ONE membership line (carrying the shared subject and verb, e.g. "We have three kids: Mia, Theo, and Leo."), and put each thing\'s OWN attribute (its age, type, owner, location) on its own separate line. When a list item is itself "a <type> named <Name>", give it its own membership line in that exact form ("We run a database named Vault."). Never collapse two different things onto one line, and never invent a singular noun for an item the message only named inside the list.\n\nNAMING THINGS — ONE STABLE CANONICAL FORM (this is what lets the graph de-duplicate):\nA. Refer to a named thing by its EXACT proper/quoted TITLE — same words, same order, with its quotes — EVERY time, no matter how the surrounding sentence was phrased.\nB. For a named EVENT, the event phrase MUST be written in this EXACT shape, every single time:\n       the \'<Exact Title>\' event\n   - ALWAYS keep the quoted title AND the literal word "event" right after it. Never omit "event".\n   - NEVER put any other word between the title and "event", and NEVER fold extra words into the phrase: drop describers like "auto racking"/"annual", and drop any venue/place adjunct ("at the local racing track", "in nearby city") from the event phrase.\n   - If a date is given for the event, append it as  on <date>  AFTER the word "event" (a venue/place is dropped, only the date may follow). \n   This identical shape must come out for EVERY mention of the same event, whatever verb the user used and wherever the title sat in the original sentence.\n   Examples (identical event phrase every time; the user\'s own verb is kept):\n     "I participated in the \'Turbocharged Tuesdays\' auto racking event ... on June 14th"  ->  "I participated in the \'Turbocharged Tuesdays\' event on June 14th."\n     "I drove my car at the \'Turbocharged Tuesdays\' event ... on June 14th"  ->  "I drove my car at the \'Turbocharged Tuesdays\' event on June 14th."\n     "I met a mechanic ... at the \'Turbocharged Tuesdays\' event"  ->  "I met a mechanic at the \'Turbocharged Tuesdays\' event."\n     "just got back from the \'Rack Fest\' in nearby city on June 18th"  ->  "I got back from the \'Rack Fest\' event on June 18th."  (venue "in nearby city" dropped, "event" added)\n     "I attended the \'Rack Fest\' event last weekend, on June 18th"  ->  "I attended the \'Rack Fest\' event on June 18th."\nC. When the message gives a specific name next to a general word for the SAME thing ("the laptop, Dell XPS 13"), use the SPECIFIC name ("Dell XPS 13").\nD. EACH date belongs to EXACTLY ONE statement — the fact it actually describes. Never copy one date onto two statements, never strip a date off the thing it modifies.\n\nNO-FACT TURNS: if the message states no concrete fact (a pure question, greeting, or filler), return {"atoms": []}. Do not invent a statement just to have output.\n\nOUTPUT: strict JSON, nothing else — an OBJECT with one key "atoms":\n{"atoms": [ {"statement": "<clean single-fact sentence>", "source": "<the exact substring of the original message this came from>"} , ... ] }\nIf there is no statable fact, return {"atoms": []}.\n\nEXAMPLES:\nMessage: "My favorite color is red."\nOutput: {"atoms": [{"statement": "My favorite color is red.", "source": "My favorite color is red"}]}\nMessage: "By the way, my son Theodore broke his leg last Tuesday."\nOutput: {"atoms": [{"statement": "My son Theodore broke his leg last Tuesday.", "source": "my son Theodore broke his leg last Tuesday"}]}\nMessage: "The server in the rack went down on March 3rd."\nOutput: {"atoms": [{"statement": "The server in the rack went down on March 3rd.", "source": "The server in the rack went down on March 3rd"}]}\nMessage: "We have three kids: Mia who is 10, Theo who is 12, and Leo who is 19."\nOutput: {"atoms": [{"statement": "We have three kids: Mia, Theo, and Leo.", "source": "We have three kids: Mia who is 10, Theo who is 12, and Leo who is 19"}, {"statement": "Mia is 10.", "source": "Mia who is 10"}, {"statement": "Theo is 12.", "source": "Theo who is 12"}, {"statement": "Leo is 19.", "source": "Leo who is 19"}]}\nMessage: "We run two servers: a web server named Apollo and a cache named Echo."\nOutput: {"atoms": [{"statement": "We run a web server named Apollo.", "source": "a web server named Apollo"}, {"statement": "We run a cache named Echo.", "source": "a cache named Echo"}]}\nMessage: "What\'s the best way to clean and maintain my hiking boots?"\nOutput: {"atoms": []}\n'
 
 
+# [es branch] SOURCE-LANGUAGE PRESERVATION. The rules above are written in English and their
+# examples are English, but this install ingests SPANISH. An atom is checked token-by-token
+# against the source (the NO-ADD guardrail), so a translated atom — or an English scaffold word
+# such as the literal "event" of rule B — is an INVENTED token and is rejected back to its
+# verbatim span; the spine then parses the Spanish verbatim span with the Spanish model. Saying
+# so in the prompt keeps the LLM from spending the turn on output the guardrail must discard.
+# Worded in terms of the source language (not "Spanish") so it stays true for any message.
+_SYSTEM_PROMPT = _SYSTEM_PROMPT + (
+    "\n\nLANGUAGE: write every statement in the SAME LANGUAGE as the message, reusing the "
+    "message's own words — NEVER translate. A Spanish message yields Spanish statements "
+    "(\"Mi hijo Teo tiene 10 años.\"). For rule B in a Spanish message the shape is  "
+    "el evento '<Título exacto>'  (the word \"evento\" only when the message itself uses it)."
+)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONTEXT-WINDOW SPLIT — the silent `segment_clauses` degrade, killed
+# ──────────────────────────────────────────────────────────────────────────────
+# THE FAILURE THIS CLOSES. When a request exceeds the brain's context window the endpoint
+# REFUSES it (llama.cpp: HTTP 400 `exceed_context_size_error`). Until now that arrived here
+# as an ordinary exception → `reframe.llm_failed` → `used_llm=False` → the caller fell back
+# to `segment_clauses`. The turn was never atomized, nobody was told, and the benchmark
+# scored it as a capture miss. That is the EXACT failure mode named in the brief.
+#
+# The atomizer is the ONE caller that can genuinely recover, because atomization is
+# decomposable: a turn split on sentence boundaries and atomized window-by-window yields
+# the same atom set as atomizing the whole turn (the prompt's rules are sentence-local;
+# only cross-sentence pronoun resolution, already best-effort and already bounded to the
+# same message, sees a narrower window). So an over-window turn SPLITS. It never silently
+# degrades, and when it cannot split it fails LOUD.
+#
+# ⚠️ Splitting is attempted ONLY on a real context-overrun verdict, never on a generic
+# failure — a timeout must keep today's fail-open-fast behaviour, not fan out into N more
+# calls against an endpoint that is already struggling.
+
+def reframe_context_split_enabled() -> bool:
+    """Over-window split sub-flag — REFRAME_CONTEXT_SPLIT (default true)."""
+    return _flag("REFRAME_CONTEXT_SPLIT", "true")
+
+
+def _system_prompt_chars() -> int:
+    return len(_SYSTEM_PROMPT)
+
+
+def _content_budget_chars() -> int | None:
+    """Characters of USER content one REFRAME window may carry, or None if unknowable.
+
+    Derived from the discovered window: total prompt budget (window − completion reserve)
+    minus what the fixed system prompt already spends. None ⇒ the window is unknown ⇒ we
+    must not pretend to split (there is nothing to split TO).
+    """
+    try:
+        from src.api import context_window
+        from src.api.llm_calls import LLMMaxTokens
+        total = context_window.prompt_budget_chars(LLMMaxTokens.get("REFRAME"))
+    except Exception:  # noqa: BLE001 — never break atomization over a budget read
+        return None
+    if not total:
+        return None
+    budget = total - _system_prompt_chars()
+    return budget if budget > 0 else None
+
+
+def _split_into_windows(raw: str, budget_chars: int) -> list[str] | None:
+    """Greedy sentence-boundary packing into windows of at most ``budget_chars``.
+
+    Deterministic (spaCy sentence segmentation, same segmenter the fail-safe path uses —
+    no LLM, no cosine, no arbitrary character cut that would sever a fact mid-sentence).
+    Returns None when it cannot help: no segmenter, one window (nothing gained), or a
+    SINGLE sentence that alone exceeds the budget — that last case is a genuine dead end
+    and the caller must fail LOUD rather than mutilate the user's sentence.
+    """
+    try:
+        from src.extraction.linguistics import segment_clauses
+        sentences = [s for s in (segment_clauses(raw) or []) if s and s.strip()]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(sentences) <= 1:
+        return None
+    windows: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for s in sentences:
+        s_len = len(s) + 1
+        if s_len > budget_chars:
+            return None          # one sentence cannot fit — splitting cannot rescue this
+        if cur and cur_len + s_len > budget_chars:
+            windows.append(" ".join(cur))
+            cur, cur_len = [], 0
+        cur.append(s)
+        cur_len += s_len
+    if cur:
+        windows.append(" ".join(cur))
+    return windows if len(windows) > 1 else None
+
+
+def _is_context_overrun(result) -> bool:
+    return isinstance(result, dict) and result.get("error") == "context_overrun"
+
 
 async def reframe_to_atomic(
     text: str,
     user_id: str = "anonymous",
     messages: list[dict] | None = None,
+    _split_depth: int = 0,
 ) -> ReframeResult:
     """De-ramble ``text`` into clean atomic statements with verbatim source spans.
 
@@ -481,6 +673,65 @@ async def reframe_to_atomic(
         log.warning("reframe.llm_failed", user_id=(user_id or "?")[:8], error=str(e)[:160])
         return ReframeResult(atoms=[], used_llm=False)
 
+    # ── OVER-WINDOW: the brain REFUSED this turn. Split it; never degrade silently. ──────
+    # `used_llm=False` here would be a lie by omission: the model never saw the turn, so the
+    # caller's `segment_clauses` fallback is a capture LOSS being scored as an engine result.
+    if _is_context_overrun(result):
+        _overrun = result.get("context_overrun") or {}
+        if reframe_context_split_enabled() and _split_depth == 0:
+            budget = _content_budget_chars()
+            windows = _split_into_windows(raw, budget) if budget else None
+            if windows:
+                log.warning("reframe.context_overrun_split",
+                            user_id=(user_id or "?")[:8], raw_len=len(raw),
+                            windows=len(windows), budget_chars=budget,
+                            window=_overrun.get("window"),
+                            prompt_tokens_est=_overrun.get("prompt_tokens_est"),
+                            note="turn exceeded the brain's context window; atomizing it in "
+                                 "sentence-boundary windows instead of dropping to "
+                                 "deterministic-only capture")
+                try:
+                    from src.api import context_window as _cw
+                    _cw.count(_cw.EV_CALLER_SPLIT, "REFRAME")
+                except Exception:  # noqa: BLE001
+                    pass
+                merged: list[Atom] = []
+                used_any = False
+                rejected_total = 0
+                for w in windows:
+                    sub = await reframe_to_atomic(w, user_id=user_id, _split_depth=1)
+                    used_any = used_any or sub.used_llm
+                    rejected_total += sub.rejected_count
+                    merged.extend(sub.atoms)
+                if merged:
+                    log.info("reframe.context_overrun_split_done",
+                             user_id=(user_id or "?")[:8], windows=len(windows),
+                             atom_count=len(merged), rejected_count=rejected_total)
+                    return ReframeResult(atoms=merged, used_llm=used_any,
+                                         rejected_count=rejected_total)
+        # Cannot split (window unknown, single oversized sentence, flag off, or already a
+        # window) → FAIL LOUD with the measured numbers. The fall-through is still the
+        # lossless deterministic segmentation, but it is now named and countable instead of
+        # being indistinguishable from an engine capture miss.
+        from src.api.logging_config import log_crit
+        log_crit(
+            log,
+            "reframe.context_overrun_unsplittable",
+            user_id=(user_id or "?")[:8],
+            raw_len=len(raw),
+            split_depth=_split_depth,
+            window=_overrun.get("window"),
+            window_source=_overrun.get("window_source"),
+            prompt_tokens_est=_overrun.get("prompt_tokens_est"),
+            prompt_tokens=_overrun.get("prompt_tokens"),
+            system_prompt_chars=_system_prompt_chars(),
+            remediation="the atomizer could not fit this turn in the brain's context window "
+                        "and could not split it; capture for this turn is DETERMINISTIC-ONLY "
+                        "(segment_clauses). Raise the brain's per-request window (llama.cpp: "
+                        "usable window is n_ctx / n_parallel) or shrink the REFRAME prompt.",
+        )
+        return ReframeResult(atoms=[], used_llm=False)
+
     # Centralized stack returns {} on no-JSON/parse-failure, {"error": ...} on circuit-open.
     if not isinstance(result, dict) or result.get("error"):
         log.warning("reframe.no_usable_output",
@@ -498,6 +749,24 @@ async def reframe_to_atomic(
         return ReframeResult(atoms=[], used_llm=True)
 
     atoms = _apply_guardrail(raw_atoms, raw)
+
+    # SET-LEVEL NO-DROP GUARD (symmetric to the per-atom NO-ADD guardrail). If the atom SET
+    # silently dropped a SACRED source token (a proper name / title or a digit-bearing value),
+    # the atomization LOST user truth — discard it and fall back to the LOSSLESS deterministic
+    # segmentation (segment_clauses on the raw turn). Empty-atoms fall-back preserves every token.
+    if reframe_sacred_coverage_enabled():
+        try:
+            _dropped = _atomization_drops_sacred_token(raw, atoms)
+        except Exception:  # noqa: BLE001 — guard must never break atomization
+            _dropped = set()
+        if _dropped:
+            log.warning("reframe.sacred_token_dropped",
+                        user_id=(user_id or "?")[:8], raw_len=len(raw),
+                        dropped=sorted(_dropped)[:8], atom_count=len(atoms),
+                        note="atom set omitted a source name/value → discarding LLM atomization; "
+                             "caller falls back to lossless deterministic segmentation")
+            return ReframeResult(atoms=[], used_llm=True)
+
     rejected = sum(1 for a in atoms if a.rejected)
     # "rejected" counts atoms whose LLM rewrite was DISCARDED in favor of the verbatim span (the
     # ``Atom.rejected`` flag set by the guardrail). It is a fail-loud health signal (model drift /

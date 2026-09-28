@@ -2,13 +2,13 @@
 
 THE DEFECT
 ==========
-Every entity name in every recall response renders lowercase: *"diane does not live in
+Every entity name in every recall response renders lowercase: *"carol does not live in
 toronto"*.  The cause is not one line — ``alias`` is lowercased at the registry
 (``entity_registry/registry.py``), but by then the casing is ALREADY gone: the whole ingest
 pipeline works on pre-lowercased strings by design (``.strip().lower()`` appears at 500+ sites
 in ``extraction/linguistics.py`` and again across ``api/main.py``), because "all string
 compares on pre-lowercased values" is a load-bearing repo invariant.  Measured on a live local
-stack: ``entity_registry.resolve_start`` logs ``original_name=diane`` / ``original_name=ibm`` —
+stack: ``entity_registry.resolve_start`` logs ``original_name=carol`` / ``original_name=ibm`` —
 the registry never sees a capital letter at all.
 
 So the casing cannot be recovered by threading a display string down the edge path; it would
@@ -31,7 +31,7 @@ user actually typed and nothing else — it never invents a capital.
 
 THE HARD LINE (why naive capture is wrong)
 ==========================================
-A MEMORY is user truth (the name ``Diane``); a PLACE is an L4 type node (``dog``, ``city``)
+A MEMORY is user truth (the name ``Carol``); a PLACE is an L4 type node (``dog``, ``city``)
 that the engine builds and files memories AT.  A name is never a place.  Capturing the observed
 surface naively breaks that: *"Dogs are great"* would record ``Dogs`` as the display form of
 the type node ``dog``, and the type would start rendering like a proper name.
@@ -145,7 +145,7 @@ def observe_display_forms(text: str) -> dict:
     Admitted: a maximal run of contiguous ``PROPN`` tokens whose FIRST token is not
     sentence-initial and whose surface differs from its own lowercase.  Both the whole run and
     each of its tokens are recorded, because the pipeline may bind either the multi-word name
-    (``miss bee providore``) or a single token of it (``diane``) as the entity surface.
+    (``miss bee providore``) or a single token of it (``carol``) as the entity surface.
 
     CONFLICT ⇒ DROP.  If one lowercase key is observed with two different surfaces in the same
     turn, neither is recorded.  There is no principled winner, and inventing one would fabricate
@@ -188,7 +188,7 @@ def observe_display_forms(text: str) -> dict:
             if tok.pos_ == "PROPN":
                 # Sentence-initial capitalisation is orthographically obligatory and therefore
                 # evidence-free.  Discard the whole run it starts — not just that one token —
-                # because "Diane lives here" gives no more evidence for the run than for its
+                # because "Carol lives here" gives no more evidence for the run than for its
                 # first word.
                 if not run and tok.is_sent_start:
                     run = []
