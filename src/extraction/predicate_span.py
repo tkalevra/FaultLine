@@ -95,6 +95,18 @@ _MENTAL_STATE: frozenset[str] = frozenset({
 # Complementizers that, after a mental-state head, introduce the (unrealized) complement.
 _INTENT_COMPLEMENTIZERS: frozenset[str] = frozenset({"to", "of", "about", "for"})
 
+# Volition / preference verbs: a 1st-person subject on one of these expresses a WANT or a LIKING
+# toward the complement — a PREFERENCE fact ("I want to learn Spanish", "I love jazz"), not an
+# occurrence and not a bare feeling. This is the CONSTRUCTIVE counterpart to the _CATENATIVE /
+# _MENTAL_STATE INTENT firewall above (which REJECTS these from occurrence extraction so an
+# intention is never mis-minted as a thing the user DID): the same clauses carry a real preference
+# the walk should surface, so a dedicated seam captures them here. Bounded as a language primitive
+# (the English volition-verb class, the same kind of closed grammatical set as _CATENATIVE); NOT a
+# domain/world list and NOT grown by domain — it holds for any subject in any domain.
+_PREFERENCE_VERBS: frozenset[str] = frozenset({
+    "like", "love", "prefer", "enjoy", "want", "wish", "hope", "fancy", "adore", "favor",
+})
+
 
 def _find_span_position(span_lower: str, needle: str) -> Optional[tuple[int, int]]:
     """Return (start, end) char offsets of ``needle`` in ``span_lower`` (word-boundary aware),

@@ -35,23 +35,20 @@ from starlette.middleware.cors import CORSMiddleware
 import src.mcp.premise as _premise
 import src.mcp.server as _mcp
 
-# CLIENT CLASSIFICATION (2026-08-14 incident): who is operating this client? The transport
-# edge captures the identity into a ContextVar; the AUTO-write gates in server.py read it.
+# CLIENT LABEL (owner ruling 2026-08-15: a label, never a gate): the transport edge captures
+# the client's self-reported name into a ContextVar; write-path log lines in server.py read it
+# for traceability. Capability never branches on it — auth is the only gate.
 from src.mcp import client_class as _client_class
 
 
 def _capture_client_class(request: Request) -> None:
-    """Record WHICH KIND OF CLIENT is talking, ONCE, at the transport edge.
+    """Record the client's self-reported NAME, ONCE, at the transport edge — a LABEL only.
 
-    2026-08-14 incident: a coding agent on a user's credentials polluted a real user's
-    seat through the AUTOMATIC write lanes (recall's turn harvest + the unadvertised
-    store_context tool). The fix's discriminator is client IDENTITY — who is operating
-    the client — never what the text looks like. Identity resolution order: the MCP-spec
-    ``mcp-name`` header first, else the ``User-Agent`` leading token before '/' (so
-    "opencode/1.18" classifies while browsers "Mozilla/5.0 …" and OpenWebUI fall to the
-    chat default). Unknown/empty → unset → chat default → today's behavior. NEVER blocks
-    or fails the request: a completely unidentifiable caller is simply a chat client,
-    which is what every caller was before this existed.
+    Resolution order: the MCP-spec ``mcp-name`` header first, else the ``User-Agent`` leading
+    token before '/'. Unknown/empty → unset. Used for write-path traceability
+    (``client=<name|chat>`` log lines); NEVER consulted for admission — the name is chosen
+    by the end user, so a name gate is a denylist masquerading as a safety control. NEVER
+    blocks or fails the request.
     """
     try:
         _name = (request.headers.get("mcp-name") or "").strip()
@@ -59,7 +56,7 @@ def _capture_client_class(request: Request) -> None:
             _name = (request.headers.get("user-agent") or "").split("/", 1)[0].strip()
         _client_class.set_client_class(_name or None)
     except Exception:
-        # Classification must never take a request down with it.
+        # Labeling must never take a request down with it.
         _client_class.set_client_class(None)
 
 
@@ -123,7 +120,7 @@ def _log(msg: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _mcp._http_client = httpx.AsyncClient(timeout=30.0)
+    _mcp._http_client = _mcp.TurnBoundedClient(httpx.AsyncClient(timeout=30.0))  # round 17: every request honours the turn wall
     _log(f"HTTP transport started. FaultLine API: {_mcp.FAULTLINE_API_URL}")
     if MCP_API_KEY:
         _log(f"Auth ENABLED — MCP_API_KEY set ({len(MCP_API_KEY)} chars)")
@@ -133,9 +130,21 @@ async def lifespan(app: FastAPI):
             "This is an unauthenticated write path into every tenant's knowledge "
             "graph — dev/localhost ONLY, never a deployment posture."
         )
+    # Re-queue any spooled (still-unconfirmed) retained turns from a previous process, so a
+    # restart never silently forgets a pending re-append.
+    try:
+        await _mcp.episodic_spool_recover()
+    except Exception as _sp_exc:  # noqa: BLE001 — recovery is best-effort, never blocks startup
+        _log(f"episodic_spool_recover failed (non-fatal): {_sp_exc!r}")
     try:
         yield
     finally:
+        # Bounded flush of the episodic re-append drain, then a CRITICAL inventory of anything
+        # still unconfirmed (the in-memory queue does not survive this exit; the spool does).
+        try:
+            await _mcp.episodic_shutdown_flush()
+        except Exception as _fl_exc:  # noqa: BLE001
+            _log(f"episodic_shutdown_flush failed (non-fatal): {_fl_exc!r}")
         await _mcp._http_client.aclose()
         _log("HTTP transport shut down.")
 
@@ -364,6 +373,34 @@ def require_auth(
     return principal
 
 
+def _tool_response(result: Any, status_code: int = 200,
+                   tool_name: str | None = None) -> JSONResponse:
+    """Return a tool result on the REST door, stamped with the same failure verdict as JSON-RPC.
+
+    The two doors are different code paths — the REST endpoints call their handlers directly and
+    never touch ``_call_tool`` — so anything the JSON-RPC dispatcher does for free has to be
+    arranged here explicitly (``stamp_is_error`` is the single place "did this fail?" is
+    answered). Zero-count lanes (forget/retract) pass their ``tool_name`` so "did this operation
+    actually do anything?" reaches this door too.
+    """
+    return JSONResponse(_mcp.stamp_is_error(result, tool_name), status_code=status_code)
+
+
+def _rest_validation_error(tool_name: str, arguments: dict) -> JSONResponse | None:
+    """Run the SAME input validation the JSON-RPC door runs, or return None if the input is fine.
+
+    Every JSON-RPC call goes through ``_call_tool``, which validates first; every REST endpoint
+    calls its handler DIRECTLY, so without this an empty query reached the backend and came
+    back as a cheerful "I don't have any information about that". 400 is the honest status for
+    input the server refuses to act on; the body keeps the JSON-RPC ``{"error": ...}`` shape.
+    """
+    err = _mcp._validate_tool_input(tool_name, arguments)
+    if err is None:
+        return None
+    _log(f"REST {tool_name} rejected: {err.get('error')}")
+    return JSONResponse(err, status_code=400)
+
+
 def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | None) -> str:
     """Resolve the tenant for a REST shorthand call via the SAME identity seam as /mcp.
 
@@ -380,9 +417,8 @@ def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | 
     UUID as X-OpenWebUI-User-Id, which would otherwise mismatch the seat and 403). The
     token proves identity; the header is transport plumbing.
 
-    CLIENT CLASS SEAM (2026-08-14): every REST tool route funnels through HERE — so
-    capturing the client identity at the top of this function covers every REST door
-    with no route left behind.
+    CLIENT LABEL SEAM: every REST tool route funnels through HERE — so capturing the client
+    label at the top of this function covers every REST door with no route left behind.
     """
     _capture_client_class(request)
     if principal and _mcp._TENANT_UUID_RE.match(principal.strip().lower()):
@@ -414,17 +450,17 @@ async def rest_recall_memory(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST recall_memory user_id={user_id[:8]}...")
+    _invalid = _rest_validation_error("recall_memory", {"query": body.query, "user_id": user_id})
+    if _invalid is not None:
+        return _invalid
     # Provisioning gate — the REST path (OpenWebUI's live door) must wait out provisioning
     # too, else a fresh tenant's first recall races the schema. Backend _ensure_tenant_ready
     # is the real guard; this returns the clean retry signal without a doomed backend call.
-    if not await _mcp._ensure_provisioned(user_id):
-        return JSONResponse(
-            {"status": "provisioning",
-             "message": "Memory is being set up for you — please retry in a moment.",
-             "facts": []}
-        )
+    _gate = await _mcp._ensure_provisioned(user_id)
+    if not _gate:  # honest wait OR terminal failure — rendered by the ONE envelope
+        return _tool_response(_mcp.provisioning_gate_envelope(_gate, facts=[]))
     result = await _mcp.recall_memory_tool(query=body.query, user_id=user_id)
-    return JSONResponse(result)
+    return _tool_response(result)
 
 
 @app.post(
@@ -447,16 +483,16 @@ async def rest_remember_facts(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST remember_facts user_id={user_id[:8]}...")
+    _invalid = _rest_validation_error("remember_facts", {"text": body.text, "user_id": user_id})
+    if _invalid is not None:
+        return _invalid
     # Provisioning gate — wait out provisioning on the REST path so a fresh tenant's first
     # remember does not race the schema. Backend _ensure_tenant_ready is the authoritative guard.
-    if not await _mcp._ensure_provisioned(user_id):
-        return JSONResponse(
-            {"status": "provisioning",
-             "message": "Memory is being set up for you — please retry in a moment.",
-             "committed": 0}
-        )
+    _gate = await _mcp._ensure_provisioned(user_id)
+    if not _gate:  # honest wait OR terminal failure — rendered by the ONE envelope
+        return _tool_response(_mcp.provisioning_gate_envelope(_gate, committed=0))
     result = await _mcp.remember_facts_tool(text=body.text, user_id=user_id)
-    return JSONResponse(result)
+    return _tool_response(result)
 
 
 @app.post(
@@ -477,21 +513,21 @@ async def rest_ingest_document(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST ingest_document user_id={user_id[:8]}... chars={len(body.text)} ref={body.source_ref!r}")
+    _invalid = _rest_validation_error("ingest_document", {"text": body.text, "user_id": user_id})
+    if _invalid is not None:
+        return _invalid
     # Provisioning gate — wait out provisioning on the REST path so a fresh tenant's first
     # document does not race the schema. Backend _ensure_tenant_ready is the authoritative guard.
-    if not await _mcp._ensure_provisioned(user_id):
-        return JSONResponse(
-            {"status": "provisioning",
-             "message": "Memory is being set up for you — please retry in a moment.",
-             "chunks": 0}
-        )
+    _gate = await _mcp._ensure_provisioned(user_id)
+    if not _gate:  # honest wait OR terminal failure — rendered by the ONE envelope
+        return _tool_response(_mcp.provisioning_gate_envelope(_gate, chunks=0))
     result = await _mcp.ingest_document_tool(
         text=body.text,
         user_id=user_id,
         source_ref=body.source_ref,
         title=body.title,
     )
-    return JSONResponse(result)
+    return _tool_response(result)
 
 
 @app.post(
@@ -510,8 +546,11 @@ async def rest_learn_facts(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST learn_facts user_id={user_id[:8]}...")
+    _invalid = _rest_validation_error("learn_facts", {"text": body.text, "user_id": user_id})
+    if _invalid is not None:
+        return _invalid
     result = await _mcp.learn_facts_tool(text=body.text, user_id=user_id)
-    return JSONResponse(result)
+    return _tool_response(result)
 
 
 @app.post(
@@ -529,8 +568,11 @@ async def rest_retract_fact(
 ) -> JSONResponse:
     user_id = _resolve_rest_user_id(request, body.user_id, _principal)
     _log(f"REST retract_fact user_id={user_id[:8]}...")
+    _invalid = _rest_validation_error("retract_fact", {"text": body.text, "user_id": user_id})
+    if _invalid is not None:
+        return _invalid
     result = await _mcp.retract_fact_tool(text=body.text, user_id=user_id)
-    return JSONResponse(result)
+    return _tool_response(result, tool_name="retract_fact")
 
 
 @app.post(
@@ -559,7 +601,87 @@ async def rest_forget_fact(
         rel_type=body.rel_type,
         old_value=body.old_value,
     )
-    return JSONResponse(result)
+    return _tool_response(result, tool_name="forget_fact")
+
+
+class DocumentStatusRequest(BaseModel):
+    document_id: int | None = Field(None, description="OPTIONAL: report one document only. Omit for all.")
+    user_id: str = ""
+
+
+class IngestFileB64Request(BaseModel):
+    data_b64: str = Field(..., description="The file's raw bytes as base64 — the whole file, not an excerpt. Required.")
+    filename: str = Field("", description="OPTIONAL: the file's name (citation label).")
+    source_ref: str = Field("", description="OPTIONAL: where the file came from (URL/path).")
+    title: str = Field("", description="OPTIONAL: document title.")
+    user_id: str = ""
+
+
+@app.post("/ingest_file_b64")
+async def rest_ingest_file_b64(
+    request: Request, body: IngestFileB64Request, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    """The OpenAPI/tool-shorthand door for the binary lane (JSON base64): same core, same
+    gates, same best-effort contract as the ``ingest_file`` MCP tool."""
+    from src.ingest import binary_intake as _bi
+    if not _bi.binary_intake_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    _log(f"REST ingest_file_b64 user_id={user_id[:8]}... b64chars={len(body.data_b64)} "
+         f"name={body.filename!r}")
+    _gate = await _mcp._ensure_provisioned(user_id)
+    if not _gate:  # honest wait OR terminal failure — rendered by the ONE envelope
+        return _tool_response(_mcp.provisioning_gate_envelope(_gate, chunks=0))
+    result = await _mcp.ingest_file_tool(
+        data_b64=body.data_b64, user_id=user_id, filename=body.filename,
+        source_ref=body.source_ref, title=body.title)
+    return _tool_response(result)
+
+
+@app.post("/document_status")
+async def rest_document_status(
+    request: Request, body: DocumentStatusRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    result = await _mcp.document_status_tool(user_id=user_id, document_id=body.document_id)
+    return _tool_response(result)
+
+
+class ReviewStructureRequest(BaseModel):
+    kind: str = Field("", description="Optional filter: cues | rel_types | groupings | ladder. Omit for all.")
+    cue: str = Field("", description="To retire one derived cue: its exact cue string as listed by a prior read. Requires category.")
+    category: str = Field("", description="The exact category of the cue being retired. Required alongside cue.")
+    reactivate: bool = Field(False, description="Restore a previously retired cue (undo).")
+    user_id: str = ""
+
+
+@app.post("/review_structure")
+async def rest_review_structure(
+    request: Request, body: ReviewStructureRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    result = await _mcp.review_structure_tool(
+        user_id=user_id, kind=body.kind or None, cue=body.cue or None,
+        category=body.category or None, reactivate=bool(body.reactivate),
+    )
+    return _tool_response(result)
+
+
+class RetryDocumentRequest(BaseModel):
+    document_id: int | None = Field(None, description="The document id to retry (from document_status). Optional if source_ref is given.")
+    source_ref: str = Field("", description="Alternative: retry every partially-imported document with this URL/filename.")
+    user_id: str = ""
+
+
+@app.post("/retry_document")
+async def rest_retry_document(
+    request: Request, body: RetryDocumentRequest, _principal: str = Depends(require_auth)
+) -> JSONResponse:
+    user_id = _resolve_rest_user_id(request, body.user_id, _principal)
+    _log(f"REST retry_document user_id={user_id[:8]}... doc={body.document_id} ref={body.source_ref!r}")
+    result = await _mcp.retry_document_tool(
+        user_id=user_id, document_id=body.document_id, source_ref=body.source_ref or None)
+    return _tool_response(result)
 
 
 @app.post("/mcp")
@@ -607,15 +729,9 @@ async def mcp_endpoint(
     if _hdr_name:
         _log(f"Mcp-Name={_hdr_name!r}")
 
-    # CLIENT CLASS (2026-08-14): capture who is operating this client at the edge — every
-    # JSON-RPC method below (tools/call included) runs in this request's context, so the
-    # AUTO-write gates inside the tool handlers see this request's client and only this
-    # request's. mcp-name first, else the User-Agent leading token; never blocks the request.
-    # (The initialize handler below deliberately does NOT read clientInfo.name for this
-    # purpose: this transport is STATELESS — the initialize request's context dies with
-    # that request, and initialize never carries a tool call, so a classification set
-    # there can never influence a later tools/call. The handshake's clientInfo IS captured
-    # on the stdio door, which is a single-client process lifetime.)
+    # CLIENT LABEL: capture the client's self-reported name at the edge — every JSON-RPC
+    # method below runs in this request's context, so write-path log lines see this
+    # request's client label. A label only; never blocks the request, never gates.
     _capture_client_class(request)
 
     # ── 2026-07-28 version negotiation (SEP-2575) ─────────────────────────────────────

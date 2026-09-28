@@ -1,9 +1,16 @@
+-- IDEMPOTENCY GUARDS ADDED (gauntlet first-boot-migration-corpus, 2026-09-16): the CREATE
+-- TABLE and five CREATE INDEX statements below carried no IF NOT EXISTS, so on every box that
+-- had ALREADY applied this file before the boot ledger existed (every pre-ledger box, including
+-- production) the first ledger boot rejected them (SQLSTATE 42P07 duplicate_table /
+-- duplicate_object), the file was recorded `failed` and it re-ran — bootstrap INSERT included —
+-- on every start thereafter, never converging. The guards make the statements idempotent; the
+-- one-time re-run the changed checksum triggers is a no-op where the objects exist.
 -- Migration 058: Extraction Patterns Metadata-Driven Table
 -- Purpose: Move hardcoded regex patterns from compound.py to database
 -- Bootstrap with patterns extracted from compound.py
 -- Re-embedder evaluates patterns asynchronously, updates global_confidence
 
-CREATE TABLE extraction_patterns (
+CREATE TABLE IF NOT EXISTS extraction_patterns (
     id SERIAL PRIMARY KEY,
     pattern_regex VARCHAR(1024) NOT NULL,
     rel_type VARCHAR(128) NOT NULL,
@@ -31,11 +38,11 @@ CREATE TABLE extraction_patterns (
     UNIQUE(pattern_regex, rel_type)
 );
 
-CREATE INDEX idx_extraction_patterns_active_confidence
+CREATE INDEX IF NOT EXISTS idx_extraction_patterns_active_confidence
   ON extraction_patterns(is_active, global_confidence DESC);
-CREATE INDEX idx_extraction_patterns_rel_type
+CREATE INDEX IF NOT EXISTS idx_extraction_patterns_rel_type
   ON extraction_patterns(rel_type);
-CREATE INDEX idx_extraction_patterns_category
+CREATE INDEX IF NOT EXISTS idx_extraction_patterns_category
   ON extraction_patterns(category);
 
 -- Bootstrap: Identity patterns (self-identification via "my name is", "I am", "call me")
@@ -106,7 +113,7 @@ CREATE TABLE IF NOT EXISTS extraction_pattern_matches (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_extraction_pattern_matches_pattern_id
+CREATE INDEX IF NOT EXISTS idx_extraction_pattern_matches_pattern_id
   ON extraction_pattern_matches(pattern_id);
-CREATE INDEX idx_extraction_pattern_matches_confirmed
+CREATE INDEX IF NOT EXISTS idx_extraction_pattern_matches_confirmed
   ON extraction_pattern_matches(confirmed);

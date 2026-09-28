@@ -55,36 +55,38 @@ def _load_extraction_patterns() -> list[tuple[re.Pattern, str]]:
 
     # Import here to avoid circular dependency at module load time
     try:
-        import psycopg2
         from os import environ
 
+        # read_only_connection (src/api/db_read.py): autocommit + readonly + close() in a
+        # finally. The old body did `db = psycopg2.connect(...)` … `db.close()` on the SUCCESS
+        # path ONLY — any exception between the SELECT and the close (e.g. a bad row) abandoned
+        # an OPEN connection sitting IDLE IN TRANSACTION on extraction_patterns. That is the
+        # same class of leak that stalled prod deprovision + pg_dump on 2026-08-01.
+        from src.api.db_read import read_only_connection
+
         dsn = environ.get('POSTGRES_DSN', 'postgresql://faultline:faultline@localhost:5432/faultline')
-        db = psycopg2.connect(dsn)
-        cur = db.cursor()
-
-        # Query active compound patterns only — scalar_atomic category is handled
-        # exclusively by _detect_atomic_values() in main.py at ingest time.
-        # The category column is the metadata-driven boundary between the two
-        # pattern populations; do not collapse them into one load path.
-        cur.execute("""
-            SELECT pattern_regex, rel_type
-            FROM extraction_patterns
-            WHERE is_active = true
-              AND category != 'scalar_atomic'
-            ORDER BY global_confidence DESC
-        """)
-
         patterns = []
-        for pattern_regex, rel_type in cur.fetchall():
-            try:
-                compiled = re.compile(pattern_regex, re.IGNORECASE)
-                patterns.append((compiled, rel_type))
-            except re.error as e:
-                # Log but continue — invalid regex should not crash extraction
-                print(f"[WARNING] Invalid regex in extraction_patterns (rel_type={rel_type}): {e}")
+        with read_only_connection(dsn) as db:
+            with db.cursor() as cur:
+                # Query active compound patterns only — scalar_atomic category is handled
+                # exclusively by _detect_atomic_values() in main.py at ingest time.
+                # The category column is the metadata-driven boundary between the two
+                # pattern populations; do not collapse them into one load path.
+                cur.execute("""
+                    SELECT pattern_regex, rel_type
+                    FROM extraction_patterns
+                    WHERE is_active = true
+                      AND category != 'scalar_atomic'
+                    ORDER BY global_confidence DESC
+                """)
 
-        cur.close()
-        db.close()
+                for pattern_regex, rel_type in cur.fetchall():
+                    try:
+                        compiled = re.compile(pattern_regex, re.IGNORECASE)
+                        patterns.append((compiled, rel_type))
+                    except re.error as e:
+                        # Log but continue — invalid regex should not crash extraction
+                        print(f"[WARNING] Invalid regex in extraction_patterns (rel_type={rel_type}): {e}")
 
         _EXTRACTION_PATTERNS_CACHE = patterns
         return patterns
@@ -112,37 +114,14 @@ def _has_correction_signal(text: str) -> bool:
     return any(sig in text.lower() for sig in correction_signals)
 
 
-# ── Property-to-rel_type mapping ────────────────────────────────────────────
-# Kept for backward compatibility and fast property classification
-# (not used by metadata-driven patterns, but may be needed for other code paths)
-_PROPERTY_REL_MAP: dict[str, str] = {
-    "hostname": "hostname",
-    "fqdn": "fqdn",
-    "ip": "ip_address",
-    "ip address": "ip_address",
-    "internal ip": "ip_address",
-    "os": "instance_of",
-    "operating system": "instance_of",
-    "processor": "instance_of",
-    "cpu": "instance_of",
-    "ram": "has_ram",
-    "memory": "has_ram",
-    "storage": "has_storage",
-    "hard drive": "has_storage",
-    "disk": "has_storage",
-    "certificate": "expires_on",
-}
-
-def _classify_property_rel(property_name: str) -> str:
-    """Map a property name to a rel_type, falling back to 'related_to'."""
-    key = property_name.lower().strip()
-    if key in _PROPERTY_REL_MAP:
-        return _PROPERTY_REL_MAP[key]
-    # Partial matches
-    for known, rel in _PROPERTY_REL_MAP.items():
-        if known in key:
-            return rel
-    return "related_to"
+# REMOVED 2026-08-12 — `_PROPERTY_REL_MAP` + `_classify_property_rel`. A hardcoded
+# property-name → rel_type dict (hostname/ip/cpu/ram/… → ip_address/has_ram/…) and its only
+# reader. Dead: zero occurrences of either name anywhere in src/, tests/,
+# benchmarks/ or tools/ beyond their own definitions, so nothing could reach the map. Its own
+# comment ("not used by metadata-driven patterns, but may be needed for other code paths")
+# had been true for the "not used" half only. It also contradicted the metadata-driven rule
+# this module is built on — rel_types are resolved from the per-tenant `extraction_patterns`
+# / `rel_types` tables, never from an in-code domain word list.
 
 
 # ── Main extraction ─────────────────────────────────────────────────────────

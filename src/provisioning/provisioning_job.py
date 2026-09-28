@@ -9,6 +9,7 @@ import os
 import psycopg2
 import psycopg2.extensions
 from typing import List, Dict, Any, Optional
+from src.api.db_read import release_read_transaction
 from .schema_manager import create_user_schema, get_postgres_connection
 
 log = structlog.get_logger()
@@ -220,6 +221,17 @@ def process_provisioning_queue(batch_size: int = 10) -> Dict[str, Any]:
                 return results
 
             log.info(f"provisioning_queue_found_pending", count=len(pending))
+
+            # The queue SELECT above opened a read transaction on THIS connection, but the
+            # per-user provisioning below runs on SEPARATE connections (user_db) and takes
+            # tens of seconds each (template apply via psql subprocess). Held open, the
+            # queue transaction sat idle-in-transaction across the WHOLE batch. Release the
+            # pure-read transaction BEFORE the slow loop; this connection does no further
+            # reads here.
+            try:
+                release_read_transaction(db, context="provisioning_queue_fetch")
+            except Exception:
+                pass  # fail-safe: the release protects lock retention, never the job
 
             for user_id, schema_name in pending:
                 try:

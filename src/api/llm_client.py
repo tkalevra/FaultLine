@@ -1,6 +1,7 @@
 """Centralized LLM endpoint authentication, configuration, and request building."""
 
 import os
+import re
 import httpx
 import structlog
 import uuid
@@ -23,6 +24,158 @@ _BACKEND_PATHS: dict[str, str] = {
     "localai":    "/v1/chat/completions",
     "raw":        "",  # full URL in LLM_BASE_URL
 }
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# ENDPOINT RESOLUTION — one join for the WHOLE family (chat · models · embeddings · health)
+# ══════════════════════════════════════════════════════════════════════════════════════
+#
+# WHY: ``_BACKEND_PATHS`` assumes the tenant's base_url stops at the host (or at an
+# unversioned prefix) and that WE supply the version segment. That assumption is wrong for
+# a large slice of the real world, and it was wrong in several places at once — chat here,
+# ``get_embedding_url`` and ``get_health_check_url`` — each hardcoding its own ``/v1/…``.
+# Fixing only chat leaves a tenant with a working brain
+# whose model picker 404s and whose health probe lies. So the join lives HERE, once, and
+# every site calls it.
+#
+# THE THREE SHAPES A REAL TENANT PASTES (all three must work; all three were observed):
+#   1. version in the BASE      https://api.z.ai/api/paas/v4          → …/v4/chat/completions
+#   2. no version at all        https://…/compatible-mode/            → …/compatible-mode/v1/chat/completions
+#   3. the FULL endpoint        https://api.z.ai/api/paas/v4/chat/completions → unchanged
+# Shape 1 produced ``…/v4/v1/chat/completions`` (404). Fighting that, the natural next move
+# is to paste the full endpoint — which produced ``…/chat/completions/v1/chat/completions``
+# (404 again). Shape 3 is therefore not a hypothetical: it is where a blocked user lands.
+#
+# HOW (structural, never a provider list — this repo forbids ``if "z.ai" in url``):
+#   a) ``_api_root`` strips a trailing OPERATION tail (``…/chat/completions``, ``…/messages``)
+#      from whatever the tenant pasted, yielding the provider's API root. Shape 3 collapses
+#      onto shape 1, and every family member then derives from the SAME root — which is the
+#      whole point: models/embeddings/health can no longer disagree with chat.
+#   b) ``_join_path`` appends the canonical suffix, skipping any LEADING run of suffix
+#      segments the root already carries. Segment equality is exact, EXCEPT that two version
+#      segments are interchangeable (``v4`` satisfies the suffix's ``v1``) — the base's
+#      version wins, because it is what the tenant read off the provider's own docs.
+#
+# WHAT THE OVERLAP RULE DELIBERATELY DOES NOT DO: it never reaches into the MIDDLE of a
+# suffix. Groq's ``/openai/v1/chat/completions`` starts with ``openai``, not a version, so a
+# base of ``https://api.groq.com/v1`` overlaps nothing and the legacy (doubled) URL is
+# preserved verbatim — we do not silently reshape a suffix whose leading segment we did not
+# put there. A base of ``https://api.groq.com/openai/v1`` DOES overlap two segments and
+# resolves cleanly. Both are pinned.
+#
+# The version grammar is ``v`` + digits + an optional standard pre-release qualifier: ``v1``,
+# ``v4``, and the real in-the-wild ``v1beta`` / ``v1alpha`` (Google generativelanguage),
+# ``v1beta1`` (Kubernetes-style). It deliberately does NOT match ordinary words that merely
+# start with v+digits (``v2ray``), and it is only ever matched against PATH segments, so a
+# host like ``v4.example.com`` is never mistaken for a versioned base.
+_VERSION_SEGMENT_RE = re.compile(r"^v\d+(?:alpha|beta|rc)?\d*$", re.IGNORECASE)
+
+# Operation tails a tenant may have pasted INSTEAD of a base URL (shape 3). Longest first;
+# exactly one is stripped. These are terminal OPERATION names — a base URL legitimately
+# ending in one of them does not exist, which is what makes the strip safe. Note that
+# ``/api/chat/completions`` (OpenWebUI) needs no entry of its own: stripping ``chat/completions``
+# leaves ``…/api``, which the overlap rule then absorbs when the suffix is re-appended.
+_ENDPOINT_TAILS: tuple[tuple[str, ...], ...] = (
+    ("chat", "completions"),
+    ("messages",),
+    ("completions",),
+    ("responses",),
+    ("embeddings",),
+)
+
+# scheme://host[:port] — matched so the path can be manipulated as segments without
+# ``urlsplit`` mis-reading a scheme-less ``host:port`` base (LM Studio / Ollama style) as a
+# URL scheme. No match (no ``://``) → the whole string is treated as path, which round-trips
+# such a base byte-for-byte.
+_SCHEME_HOST_RE = re.compile(r"^(?P<head>[a-zA-Z][a-zA-Z0-9+.\-]*://[^/?#]*)(?P<rest>.*)$")
+
+
+def _split_base(url: str) -> tuple[str, list[str], str]:
+    """``url`` → (scheme+host, path segments, ``?query#fragment``).
+
+    Query/fragment are carried through untouched (Azure-style ``?api-version=…`` bases) and
+    re-attached AFTER the appended path, which plain string concatenation got wrong.
+    """
+    u = (url or "").strip()
+    tail = ""
+    cuts = [i for i in (u.find("?"), u.find("#")) if i != -1]
+    if cuts:
+        cut = min(cuts)
+        u, tail = u[:cut], u[cut:]
+    m = _SCHEME_HOST_RE.match(u)
+    head, rest = (m.group("head"), m.group("rest")) if m else ("", u)
+    return head, [s for s in rest.split("/") if s], tail
+
+
+def _rebuild(head: str, segments: list[str], tail: str) -> str:
+    path = "/".join(segments)
+    if head:
+        return head + ("/" + path if path else "") + tail
+    return path + tail
+
+
+def _segments_interchangeable(a: str, b: str) -> bool:
+    """Exact match, OR both are API version segments (``v4`` satisfies a suffix's ``v1``)."""
+    if a.lower() == b.lower():
+        return True
+    return bool(_VERSION_SEGMENT_RE.match(a) and _VERSION_SEGMENT_RE.match(b))
+
+
+def _leading_overlap(base_segments: list[str], suffix_segments: list[str]) -> int:
+    """Longest k such that the base's LAST k segments are the suffix's FIRST k segments."""
+    for k in range(min(len(base_segments), len(suffix_segments)), 0, -1):
+        if all(_segments_interchangeable(base_segments[len(base_segments) - k + i],
+                                         suffix_segments[i])
+               for i in range(k)):
+            return k
+    return 0
+
+
+def _api_root(url: str) -> str:
+    """Strip one trailing OPERATION tail so ``url`` becomes the provider's API root.
+
+    ``https://api.z.ai/api/paas/v4/chat/completions`` → ``https://api.z.ai/api/paas/v4``.
+    A URL that is already a root is returned unchanged.
+    """
+    if not url:
+        return ""
+    head, segments, tail = _split_base(url)
+    lowered = [s.lower() for s in segments]
+    for candidate in _ENDPOINT_TAILS:
+        n = len(candidate)
+        if n <= len(segments) and tuple(lowered[-n:]) == candidate:
+            segments = segments[:-n]
+            break
+    return _rebuild(head, segments, tail)
+
+
+def resolve_endpoint(base_url: str, suffix: str) -> str:
+    """THE join. ``base_url`` (whatever the tenant pasted) + a canonical operation suffix.
+
+    Every LLM URL this codebase builds goes through here — chat, model discovery, embeddings
+    and the health probe — so a tenant whose chat endpoint resolves can never have a model
+    picker or a health probe pointing somewhere else.
+
+    An empty ``suffix`` means "the base IS the full URL" (backend_type ``raw``): returned
+    verbatim, never rewritten.
+    """
+    if not base_url:
+        return ""
+    if not suffix:
+        return base_url.rstrip("/")
+    head, segments, tail = _split_base(_api_root(base_url))
+    suffix_segments = [s for s in suffix.strip("/").split("/") if s]
+    k = _leading_overlap(segments, suffix_segments)
+    if k:
+        log.debug("llm.endpoint.overlap_absorbed",
+                  base_url=base_url, suffix=suffix, absorbed=suffix_segments[:k])
+    return _rebuild(head, segments + suffix_segments[k:], tail)
+
+
+def resolve_chat_endpoint(backend_type: str, base_url: str) -> str:
+    """The chat-completions URL for ``backend_type`` given the tenant's ``base_url``."""
+    return resolve_endpoint(
+        base_url, _BACKEND_PATHS.get(backend_type, "/v1/chat/completions"))
+
 
 # Response parsing strategy per backend type.
 # "openai" covers all OpenAI-compatible backends.
@@ -74,8 +227,10 @@ def get_backend_endpoint() -> str | None:
     base_url = os.environ.get("LLM_BASE_URL", "").rstrip("/")
     if not base_url:
         return None
-    path = _BACKEND_PATHS.get(backend_type, "/v1/chat/completions")
-    return f"{base_url}{path}"
+    # NOT ``base_url + _BACKEND_PATHS[...]``: that double-appended a version onto a base that
+    # already carried one, and re-appended a whole endpoint onto a base that WAS one. See
+    # ``resolve_endpoint`` — the same join the models/embeddings/health URLs use.
+    return resolve_chat_endpoint(backend_type, base_url)
 
 
 def get_backend_response_format() -> str:

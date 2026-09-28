@@ -184,57 +184,94 @@ def test_resolve_anchor_no_db(user_id):
 # `fetchone` unstubbed — it returned a truthy MagicMock, so every keyword "matched" a taxonomy
 # named <MagicMock>. That junk match is now a hard TypeError at main.py:31260.
 #
-# The DELIBERATE branch (main.py:31100, verbatim):
+# The branch these pinned (main.py, verbatim):
 #     "fetch_all only when there is truly no signal — vague/empty query. If keywords existed but
 #      matched nothing in the ontology (topic not yet in the knowledge graph), return the empty
 #      path so Qdrant semantic search handles it without a DB fact flood."
-# So: keywords ∧ no ontology match → EMPTY, UNSCOPED path (Qdrant's job).
-#     no keywords at all          → fetch_all_details=True.
-# Both branches are pinned below — stricter than the old `or` chain, and DB-independent.
+#
+# ⚠️ CONTRACT CHANGE 2026-07-31 (SCOPEPROJ) — "Qdrant's job" IS NO LONGER A JOB ANYONE DOES.
+# That branch handed the unresolved case to the vector lane. Under `VECTOR_CLASS_C_ONLY`
+# (default ON) the vector lane serves **Class C ONLY** — the re_embedder skips the A/B sync and
+# /query drops any Qdrant result whose authoritative class is A/B. So a Class-A fact that fell
+# in this branch was unreachable from BOTH lanes, and the state was neither of the two the scope
+# contract names (CLAUDE.md: "scope_active False → behaviour matches legacy fetch-all"): scope
+# inert AND fetch-all withheld = a DEAD lane. Measured consequence on a live tenant: the NARROW
+# "What video editing software do I like?" returned nothing while the BROADER "What do I like?"
+# returned the very same Class-A `likes` rows — a more specific question returning strictly less.
+#
+# The current contract, pinned below:
+#     keywords ∧ no match ∧ 1st/2nd-person recall ∧ subject present in memory
+#                                 → DEFER to fetch-all ("return-to-sender", Cook C `671323f`)
+#     keywords ∧ no match ∧ concept ABSENT from this tenant → stay empty (anti-fabrication)
+#     keywords ∧ no match ∧ no 1st/2nd-person reference     → stay empty
+#     no keywords at all                                    → fetch_all_details=True
 
-def _assert_unscoped_no_flood(path):
-    """Keywords present but nothing matched: empty path, no scope, and NO fetch-all flood."""
+def _assert_unscoped(path):
+    """Keywords present but nothing matched: no rels, no taxonomy, scoping inert."""
     assert isinstance(path, QueryPath)
     assert path.scalar_rels == []
     assert path.relationship_rels == []
     assert path.taxonomy_groups == []
     assert not path.scope_active        # nothing to project → scoping is inert
-    assert not path.fetch_all_details   # and deliberately NOT a DB fact flood
     # Whatever lands in taxonomy_groups must be real taxonomy NAMES (strings) — the walk
-    # lowercases them (main.py:31260). Pins the mock's honesty against the MagicMock fossil.
+    # lowercases them. Pins the mock's honesty against the MagicMock fossil.
     assert all(isinstance(t, str) for t in path.taxonomy_groups)
 
 
 def test_determine_path_scalar_query_unresolvable_against_empty_ontology():
-    """A scalar query ('how old am i') whose rel is absent from the ontology → unscoped path."""
+    """A scalar query ('how old am i') whose rel is absent from the ontology.
+
+    Scope stays INERT (nothing resolved), but the query is a first-person recall about the
+    speaker with no absent concept named, so it DEFERS to the unscoped lane rather than
+    dead-ending — the user's own `age` must be reachable."""
     mock_db = MagicMock()
     _empty_cursor(mock_db)  # empty DB: fetchone → None (see _empty_cursor note)
 
     path = determine_path("how old am i", mock_db)
-    _assert_unscoped_no_flood(path)
+    _assert_unscoped(path)
+    assert path.fetch_all_details       # return-to-sender, not a dead lane
+
+
+def test_determine_path_no_first_person_reference_stays_empty():
+    """PRECISION side of the defer: no 1st/2nd-person reference → NO fetch-all.
+
+    "what is a dog" is a classification ask about the world, not a recall about the speaker.
+    Nothing resolved, so it terminates empty — the defer must not fire."""
+    mock_db = MagicMock()
+    _empty_cursor(mock_db)
+
+    path = determine_path("what is a dog", mock_db)
+    _assert_unscoped(path)
+    assert not path.fetch_all_details
 
 
 def test_determine_path_relationship_query_unresolvable_against_empty_ontology():
-    """A relationship query ('my spouse') whose rel is absent from the ontology → unscoped."""
+    """A relationship query ('my spouse') whose rel is absent from the ontology.
+
+    Scope inert, but a first-person possessive recall must not dead-end — it returns to
+    sender so the spouse fact (if the tenant holds one) is reachable."""
     mock_db = MagicMock()
     _empty_cursor(mock_db)
 
     path = determine_path("tell me about my spouse", mock_db)
-    _assert_unscoped_no_flood(path)
+    _assert_unscoped(path)
+    assert path.fetch_all_details
 
 
 def test_determine_path_all_details_only_when_no_signal_keywords():
-    """fetch_all_details fires ONLY for a query with no signal keywords at all.
+    """Both fetch-all routes: the no-keyword fallback AND the unresolved-aspect defer.
 
-    'tell me everything' keeps the keyword 'everything', which matches nothing → unscoped path.
-    A query that is pure noise words has NO keywords → the genuine fetch-all fallback.
+    'tell me everything' keeps the keyword 'everything', which matches nothing — but it is a
+    1st/2nd-person recall naming no absent concept, so it defers to the unscoped lane (which
+    is plainly what "tell me everything" asks for). A query that is pure noise words has NO
+    keywords at all → the original fetch-all fallback.
     """
     mock_db = MagicMock()
     _empty_cursor(mock_db)
 
-    # Has a signal keyword ('everything') that matches nothing → no flood.
     path = determine_path("tell me everything", mock_db)
-    _assert_unscoped_no_flood(path)
+    _assert_unscoped(path)
+    assert path.fetch_all_details
 
     # Pure noise ('tell me about my') → no keywords survive → fetch-all fallback fires.
     mock_db_2 = MagicMock()

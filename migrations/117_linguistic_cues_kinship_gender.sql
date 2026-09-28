@@ -93,9 +93,14 @@ VALUES
   ('neighbor',     'social_role', 'knows',     'my neighbor',        'seed_social_role', 0.82),
   ('acquaintance', 'social_role', 'knows',     'an acquaintance',    'seed_social_role', 0.80),
   ('classmate',    'social_role', 'knows',     'my classmate',       'seed_social_role', 0.80),
-  ('roommate',     'social_role', 'knows',     'my roommate',        'seed_social_role', 0.80),
-  ('boss',         'social_role', 'knows',     'my boss',            'seed_social_role', 0.80),
-  ('manager',      'social_role', 'knows',     'my manager',         'seed_social_role', 0.80)
+  ('roommate',     'social_role', 'knows',     'my roommate',        'seed_social_role', 0.80)
+-- ⚠️ AMENDED 2026-08-27 (migration 272): ('boss'|'manager', 'social_role', 'knows', ...) REMOVED.
+-- Both lemmas are already seeded in `role_noun`, and a lemma in two cue classes is a DIRECTION BUG,
+-- not a redundancy: `linguistics._person_role_relation` resolves social_role BEFORE role_noun, so
+-- these rows made `my manager` resolve `knows` and SUPPRESS the role-derived `manager_of` that the
+-- same function's docstring specifies. The collision was invisible while migration 123 deleted every
+-- social_role row on each boot; migration 272 stops that delete, so it had to be fixed here.
+-- Migration 272 Part 0 removes the rows already inserted (seed-sourced only).
 ON CONFLICT (cue, category) DO NOTHING;
 
 -- ============================================================================

@@ -44,7 +44,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import src.mcp.server as _server_mod
-from src.mcp.server import remember_facts_tool, store_context_tool
+from src.mcp.server import remember_facts_tool
 from src.mcp.tools import TOOLS
 from src.mcp.client_class import set_client_class
 
@@ -130,30 +130,6 @@ async def test_remember_facts_tolerates_stray_schema_kwargs():
     assert any("/ingest" in u for u in urls), urls
 
 
-# ── The agent-client directive names ONLY tools that exist here ──────────────
-
-
-async def test_store_context_directive_names_only_existing_tools():
-    """The coding-agent store_context directive routes the caller to remember_facts. It
-    must not name tools that do not exist on this server (the upstream lineage has a
-    separate agent-memory lane; FOSS does not) — a directive naming a nonexistent tool
-    strands the agent with nowhere to put the turn. And it must not store anything."""
-    set_client_class("opencode")
-    mock_client = MagicMock()
-    mock_client.post = AsyncMock()
-
-    with patch("src.mcp.server._http_client", mock_client):
-        result = await store_context_tool("agent brief prose", "user-carol")
-
-    mock_client.post.assert_not_awaited()
-    assert result["status"] == "error"
-    assert "remember_facts" in result["message"]
-    # Every tool-shaped token the directive names must exist in the dispatch table.
-    import re as _re
-    for tok in _re.findall(r"[a-z_]+_[a-z_]+", result["message"]):
-        assert tok in _server_mod.TOOL_DISPATCH, (
-            f"directive names {tok!r} which is not a dispatchable tool — the agent is stranded"
-        )
 
 
 # ── The advertised user lane stays human-turn shaped ────────────────────────

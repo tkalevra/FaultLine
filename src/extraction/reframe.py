@@ -142,6 +142,98 @@ def _literals(s: str) -> set[str]:
     return {t for t in _content_tokens(s) if any(c.isdigit() for c in t)}
 
 
+# ── SET-LEVEL NO-DROP GUARD: sacred source tokens must SURVIVE the atomization ────────
+# The per-atom guardrail (_guardrail_check) enforces the NO-ADD / NO-ALTER direction of
+# "USER IS TRUTH" (Tiers 1–3: no invented token, byte-intact literals, subject kept). It is
+# structurally BLIND to the SYMMETRIC failure — a DROP: an atom that silently OMITS part of
+# the source is a pure token-SUBSET, so it sails through every tier. Live LongMemEval miss
+# (e47becba): "I graduated with a degree in Business Administration, which has definitely
+# helped me" → the atomizer split the relative clause (prompt rule 7) and, in doing so, DROPPED
+# the nominal PP-complement "in Business Administration" from the degree atom (emitting only
+# "I graduated with a degree"). Every atom passed the per-atom guardrail; the degree FIELD —
+# the answer — never reached the deterministic spine, and recall surfaced only "Degree".
+#
+# This guard is a SET-LEVEL coverage check over the FULL atom set: the SACRED source tokens —
+# PROPER NOUNS (names/titles = the naming layer, THE HARD LINE's user truth) and DIGIT-BEARING
+# LITERALS (numbers / dates / IPs / values) — must each still appear SOMEWHERE in the union of
+# the accepted atoms. A sacred token present in the source but in NO atom means the LLM dropped
+# user truth → the whole LLM atomization is DISCARDED and the caller falls back to the LOSSLESS
+# deterministic segmentation (segment_clauses), which never drops a token. Common nouns /
+# adjectives / function words are NOT sacred (the atomizer legitimately de-noises describers,
+# venue adjuncts, opinions), so a clean split never trips this. Subject-agnostic (POS + digit
+# shape only — NO name/number/domain list). Fail-safe: spaCy off / parse error → no sacred set
+# → covered (today's behavior), never a crash, never a new drop.
+
+def reframe_sacred_coverage_enabled() -> bool:
+    """No-drop coverage sub-flag — REFRAME_SACRED_COVERAGE (default true)."""
+    return _flag("REFRAME_SACRED_COVERAGE", "true")
+
+
+# spaCy NER labels that are NUMERIC / TEMPORAL, NOT names. Their digit-bearing parts are already
+# protected by ``_literals`` (byte-intact), and the atomizer DELIBERATELY canonicalizes dates
+# (prompt rule D / the event shape), so treating a whole DATE span as sacred would force a fallback
+# on every legitimately-reshaped date. So the "named" sacred set = NER entities MINUS these labels.
+# This is the universal spaCy NER schema (subject-agnostic), NOT a domain/name list.
+_NUMERIC_TEMPORAL_NER_LABELS: frozenset[str] = frozenset(
+    {"DATE", "TIME", "CARDINAL", "ORDINAL", "QUANTITY", "PERCENT", "MONEY"})
+
+
+def _sacred_source_tokens(raw: str) -> set[str]:
+    """Lowercased SACRED tokens of the source that must survive atomization: NAMED-ENTITY tokens
+    (any NER span that is not numeric/temporal — PERSON/ORG/GPE/PRODUCT/EVENT/…) ∪ proper nouns
+    (parser ``pos_ == 'PROPN'``) ∪ digit-bearing literals. Fail-safe → literals-only / ``set()``."""
+    sacred: set[str] = set(_literals(raw))
+    try:
+        from src.extraction.linguistics import _get_nlp, _get_nlp_ner
+    except Exception:  # noqa: BLE001
+        return sacred
+    # NAMES: NER entities (Carol→PERSON, Business Administration→ORG, Todoist→ORG/PRODUCT). The
+    # dependency-parse model tags many names as bare NOUN in copula position ("my name is Carol"),
+    # so the NER model is the authoritative naming signal here.
+    try:
+        ner = _get_nlp_ner()
+        if ner is not None:
+            for ent in ner(raw).ents:
+                if (ent.label_ or "").upper() in _NUMERIC_TEMPORAL_NER_LABELS:
+                    continue
+                for tok in ent:
+                    if not any(c.isalnum() for c in (tok.text or "")):
+                        continue
+                    t = (tok.text or "").strip().lower()
+                    if t and t not in _FUNCTION_WORDS:
+                        sacred.add(t)
+    except Exception:  # noqa: BLE001 — NER failure → keep parser/literal signal
+        pass
+    # PROPER NOUNS (belt-and-suspenders — catches a title the NER missed, e.g. a quoted event name).
+    try:
+        nlp = _get_nlp()
+        if nlp is not None:
+            for tok in nlp(raw):
+                if tok.pos_ != "PROPN":
+                    continue
+                t = (tok.text or "").strip().lower()
+                if t and t not in _FUNCTION_WORDS:
+                    sacred.add(t)
+    except Exception:  # noqa: BLE001 — parser failure → keep NER/literal signal
+        pass
+    return sacred
+
+
+def _atomization_drops_sacred_token(raw: str, atoms: list) -> set[str]:
+    """Return the set of SACRED source tokens the atom set DROPPED (empty ⇒ lossless).
+
+    A non-empty return means the LLM atomization silently lost a name/value the user stated —
+    the caller should DISCARD it and fall back to the lossless deterministic segmentation."""
+    sacred = _sacred_source_tokens(raw)
+    if not sacred:
+        return set()
+    covered: set[str] = set()
+    for a in atoms or []:
+        txt = getattr(a, "text", "") or ""
+        covered.update(_TOKEN_RE.findall(txt.lower()))
+    return {s for s in sacred if s not in covered}
+
+
 # ── Tier 3: SUBJECT-PRESERVATION (grammatical, spaCy-only — no word lists) ───────────
 # A subject-DROPPED atom ("attending the workshop ... last Saturday" from "I have been
 # attending the workshop ... last Saturday") is a strict TOKEN SUBSET of the source — it
@@ -436,10 +528,96 @@ _SYSTEM_PROMPT = 'You are helping build a MEMORY GRAPH. The same real thing must
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CONTEXT-WINDOW SPLIT — the silent `segment_clauses` degrade, killed
+# ──────────────────────────────────────────────────────────────────────────────
+# THE FAILURE THIS CLOSES. When a request exceeds the brain's context window the endpoint
+# REFUSES it (llama.cpp: HTTP 400 `exceed_context_size_error`). Until now that arrived here
+# as an ordinary exception → `reframe.llm_failed` → `used_llm=False` → the caller fell back
+# to `segment_clauses`. The turn was never atomized, nobody was told, and the benchmark
+# scored it as a capture miss. That is the EXACT failure mode named in the brief.
+#
+# The atomizer is the ONE caller that can genuinely recover, because atomization is
+# decomposable: a turn split on sentence boundaries and atomized window-by-window yields
+# the same atom set as atomizing the whole turn (the prompt's rules are sentence-local;
+# only cross-sentence pronoun resolution, already best-effort and already bounded to the
+# same message, sees a narrower window). So an over-window turn SPLITS. It never silently
+# degrades, and when it cannot split it fails LOUD.
+#
+# ⚠️ Splitting is attempted ONLY on a real context-overrun verdict, never on a generic
+# failure — a timeout must keep today's fail-open-fast behaviour, not fan out into N more
+# calls against an endpoint that is already struggling.
+
+def reframe_context_split_enabled() -> bool:
+    """Over-window split sub-flag — REFRAME_CONTEXT_SPLIT (default true)."""
+    return _flag("REFRAME_CONTEXT_SPLIT", "true")
+
+
+def _system_prompt_chars() -> int:
+    return len(_SYSTEM_PROMPT)
+
+
+def _content_budget_chars() -> int | None:
+    """Characters of USER content one REFRAME window may carry, or None if unknowable.
+
+    Derived from the discovered window: total prompt budget (window − completion reserve)
+    minus what the fixed system prompt already spends. None ⇒ the window is unknown ⇒ we
+    must not pretend to split (there is nothing to split TO).
+    """
+    try:
+        from src.api import context_window
+        from src.api.llm_calls import LLMMaxTokens
+        total = context_window.prompt_budget_chars(LLMMaxTokens.get("REFRAME"))
+    except Exception:  # noqa: BLE001 — never break atomization over a budget read
+        return None
+    if not total:
+        return None
+    budget = total - _system_prompt_chars()
+    return budget if budget > 0 else None
+
+
+def _split_into_windows(raw: str, budget_chars: int) -> list[str] | None:
+    """Greedy sentence-boundary packing into windows of at most ``budget_chars``.
+
+    Deterministic (spaCy sentence segmentation, same segmenter the fail-safe path uses —
+    no LLM, no cosine, no arbitrary character cut that would sever a fact mid-sentence).
+    Returns None when it cannot help: no segmenter, one window (nothing gained), or a
+    SINGLE sentence that alone exceeds the budget — that last case is a genuine dead end
+    and the caller must fail LOUD rather than mutilate the user's sentence.
+    """
+    try:
+        from src.extraction.linguistics import segment_clauses
+        sentences = [s for s in (segment_clauses(raw) or []) if s and s.strip()]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(sentences) <= 1:
+        return None
+    windows: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for s in sentences:
+        s_len = len(s) + 1
+        if s_len > budget_chars:
+            return None          # one sentence cannot fit — splitting cannot rescue this
+        if cur and cur_len + s_len > budget_chars:
+            windows.append(" ".join(cur))
+            cur, cur_len = [], 0
+        cur.append(s)
+        cur_len += s_len
+    if cur:
+        windows.append(" ".join(cur))
+    return windows if len(windows) > 1 else None
+
+
+def _is_context_overrun(result) -> bool:
+    return isinstance(result, dict) and result.get("error") == "context_overrun"
+
+
 async def reframe_to_atomic(
     text: str,
     user_id: str = "anonymous",
     messages: list[dict] | None = None,
+    _split_depth: int = 0,
 ) -> ReframeResult:
     """De-ramble ``text`` into clean atomic statements with verbatim source spans.
 
@@ -481,6 +659,65 @@ async def reframe_to_atomic(
         log.warning("reframe.llm_failed", user_id=(user_id or "?")[:8], error=str(e)[:160])
         return ReframeResult(atoms=[], used_llm=False)
 
+    # ── OVER-WINDOW: the brain REFUSED this turn. Split it; never degrade silently. ──────
+    # `used_llm=False` here would be a lie by omission: the model never saw the turn, so the
+    # caller's `segment_clauses` fallback is a capture LOSS being scored as an engine result.
+    if _is_context_overrun(result):
+        _overrun = result.get("context_overrun") or {}
+        if reframe_context_split_enabled() and _split_depth == 0:
+            budget = _content_budget_chars()
+            windows = _split_into_windows(raw, budget) if budget else None
+            if windows:
+                log.warning("reframe.context_overrun_split",
+                            user_id=(user_id or "?")[:8], raw_len=len(raw),
+                            windows=len(windows), budget_chars=budget,
+                            window=_overrun.get("window"),
+                            prompt_tokens_est=_overrun.get("prompt_tokens_est"),
+                            note="turn exceeded the brain's context window; atomizing it in "
+                                 "sentence-boundary windows instead of dropping to "
+                                 "deterministic-only capture")
+                try:
+                    from src.api import context_window as _cw
+                    _cw.count(_cw.EV_CALLER_SPLIT, "REFRAME")
+                except Exception:  # noqa: BLE001
+                    pass
+                merged: list[Atom] = []
+                used_any = False
+                rejected_total = 0
+                for w in windows:
+                    sub = await reframe_to_atomic(w, user_id=user_id, _split_depth=1)
+                    used_any = used_any or sub.used_llm
+                    rejected_total += sub.rejected_count
+                    merged.extend(sub.atoms)
+                if merged:
+                    log.info("reframe.context_overrun_split_done",
+                             user_id=(user_id or "?")[:8], windows=len(windows),
+                             atom_count=len(merged), rejected_count=rejected_total)
+                    return ReframeResult(atoms=merged, used_llm=used_any,
+                                         rejected_count=rejected_total)
+        # Cannot split (window unknown, single oversized sentence, flag off, or already a
+        # window) → FAIL LOUD with the measured numbers. The fall-through is still the
+        # lossless deterministic segmentation, but it is now named and countable instead of
+        # being indistinguishable from an engine capture miss.
+        from src.api.logging_config import log_crit
+        log_crit(
+            log,
+            "reframe.context_overrun_unsplittable",
+            user_id=(user_id or "?")[:8],
+            raw_len=len(raw),
+            split_depth=_split_depth,
+            window=_overrun.get("window"),
+            window_source=_overrun.get("window_source"),
+            prompt_tokens_est=_overrun.get("prompt_tokens_est"),
+            prompt_tokens=_overrun.get("prompt_tokens"),
+            system_prompt_chars=_system_prompt_chars(),
+            remediation="the atomizer could not fit this turn in the brain's context window "
+                        "and could not split it; capture for this turn is DETERMINISTIC-ONLY "
+                        "(segment_clauses). Raise the brain's per-request window (llama.cpp: "
+                        "usable window is n_ctx / n_parallel) or shrink the REFRAME prompt.",
+        )
+        return ReframeResult(atoms=[], used_llm=False)
+
     # Centralized stack returns {} on no-JSON/parse-failure, {"error": ...} on circuit-open.
     if not isinstance(result, dict) or result.get("error"):
         log.warning("reframe.no_usable_output",
@@ -498,6 +735,24 @@ async def reframe_to_atomic(
         return ReframeResult(atoms=[], used_llm=True)
 
     atoms = _apply_guardrail(raw_atoms, raw)
+
+    # SET-LEVEL NO-DROP GUARD (symmetric to the per-atom NO-ADD guardrail). If the atom SET
+    # silently dropped a SACRED source token (a proper name / title or a digit-bearing value),
+    # the atomization LOST user truth — discard it and fall back to the LOSSLESS deterministic
+    # segmentation (segment_clauses on the raw turn). Empty-atoms fall-back preserves every token.
+    if reframe_sacred_coverage_enabled():
+        try:
+            _dropped = _atomization_drops_sacred_token(raw, atoms)
+        except Exception:  # noqa: BLE001 — guard must never break atomization
+            _dropped = set()
+        if _dropped:
+            log.warning("reframe.sacred_token_dropped",
+                        user_id=(user_id or "?")[:8], raw_len=len(raw),
+                        dropped=sorted(_dropped)[:8], atom_count=len(atoms),
+                        note="atom set omitted a source name/value → discarding LLM atomization; "
+                             "caller falls back to lossless deterministic segmentation")
+            return ReframeResult(atoms=[], used_llm=True)
+
     rejected = sum(1 for a in atoms if a.rejected)
     # "rejected" counts atoms whose LLM rewrite was DISCARDED in favor of the verbatim span (the
     # ``Atom.rejected`` flag set by the guardrail). It is a fail-loud health signal (model drift /

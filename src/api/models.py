@@ -44,6 +44,18 @@ class EdgeInput(BaseModel):
     # temporal_status/event_date ride their own columns. Mirrors the facts.polarity DEFAULT.
     polarity: str = "affirmed"                     # affirmed | negated
 
+    # PRESUPPOSED (Frege-Strawson backgrounding). True when the deriver captured this fact from
+    # BACKGROUNDED content rather than from what the clause ASSERTS — the possessive/definite
+    # presupposition of "my favourite colour", which survives negation and questioning ("What is my
+    # favourite colour?" still presupposes the user HAS one). SEP "Presupposition" (Beaver, Geurts &
+    # Denlinger 2021, §2 "The Frege-Strawson tradition"): presupposed information is "taken for
+    # granted, rather than being part of the main propositional content of a speech act", and
+    # possessives are listed triggers. The deriver has computed this flag all along; it had no field
+    # to ride on, so it was DROPPED at the transport and backgrounded content committed at Class A /
+    # confidence 1.0 identically to asserted content. Consumed by assign_class_and_confidence under
+    # PRESUPPOSED_TIER_B. Default False → every existing producer is unchanged.
+    presupposed: bool = False
+
     # PER-EDGE TEMPORAL STATUS OVERRIDE (relocation / past-habitual residence). Normally
     # temporal_status (now|past|future) is derived at request level from the parsed event_date vs now
     # (purely date-driven). A GRAMMATICALLY-past residence ("I used to live in London") carries NO
@@ -113,6 +125,33 @@ class RelTypeRequest(BaseModel):
     is_symmetric: Optional[bool] = None     # bidirectional (spouse, knows, same_as)
     inverse_rel_type: Optional[str] = None  # reverse relationship (parent_of ↔ child_of)
     is_hierarchy_rel: Optional[bool] = None # classification/taxonomy (instance_of, subclass_of)
+    # ── WHERE the write lands (see POST /ontology/rel_types) ───────────────────────────
+    # `user_id` names the TENANT whose ontology is being asserted against; the handler
+    # derives `faultline_<slug>` from it and binds `SET search_path TO <schema>` WITHOUT
+    # `public`, exactly as `DeactivateCueRequest` does for the cue lane. Required for the
+    # default (`scope="tenant"`) lane.
+    user_id: Optional[str] = None
+    # `scope` is the seed-template ESCAPE HATCH and defaults to the tenant lane. Only the
+    # literal "public" targets `public.rel_types` — the template every future tenant is
+    # provisioned from — and that lane additionally demands the operator credential. It is
+    # opt-in and explicit so a `public` write can never be the accidental default of an
+    # unbound connection (which is precisely how it behaved before).
+    scope: Optional[str] = None
+
+
+class DeactivateCueRequest(BaseModel):
+    """Retire (or restore) ONE engine-grown / seeded linguistic cue for ONE tenant.
+
+    The target is the table's own UNIQUE key `(cue, category)` -- an EXACT identifier the
+    caller must have read from `/structure/grown` first. It is deliberately NOT free text:
+    a free-text target would need matching, and matching is the seam that turns a structure
+    edit into a memory deletion. `reactivate=True` is the inverse (is_active back to true),
+    which is what makes the whole lane reversible.
+    """
+    user_id: str
+    cue: str
+    category: str
+    reactivate: bool = False
 
 
 class RetractRequest(BaseModel):
@@ -158,6 +197,88 @@ class EpisodicAppendRequest(BaseModel):
     source_ref: Optional[str] = None
     intent: Optional[str] = None
     extracted_fact_count: Optional[int] = None
+    # Per-turn idempotency key (migration 274): generated ONCE per turn by the client and carried
+    # by every retry attempt of that turn. Enforced by a partial UNIQUE index, so two in-flight
+    # attempts converge on one row and the second attempt's answer is the read-back. Optional:
+    # a keyless writer keeps the plain append.
+    turn_key: Optional[str] = None
+
+
+class ArtefactPlacement(BaseModel):
+    """ONE embedded image's placement + the deterministic verdicts computed about it.
+
+    Every field here was derived WITHOUT a model of any kind: the box comes off the PDF's
+    own content stream, the caption from page GEOMETRY (`src/ingest/artefact_geometry.py`),
+    the chunk index from locating that caption verbatim in the chunked text. A decline is
+    carried explicitly (`caption_declined_reason`) because a decline is a RESULT, not a
+    failure — it is what lets recall say "I kept this figure but could not tell which text
+    describes it" instead of asserting a neighbour's caption.
+    """
+    page_index: int
+    artefact_index: int
+    bbox: list[float] = []            # x0, top, x1, bottom — TOP-ORIGIN, pdfplumber's
+    page_size: list[float] = []       # width, height
+    caption_text: Optional[str] = None
+    caption_confidence: Optional[float] = None
+    caption_method: Optional[str] = None
+    caption_declined_reason: Optional[str] = None
+    chunk_index: Optional[int] = None
+    chunk_bind_method: Optional[str] = None
+
+
+class ArtefactRetainRequest(BaseModel):
+    """Persist a retained upload + its placements into the per-tenant `artefacts` table.
+
+    The BYTES arrive here because this process is the one that binds the tenant schema
+    (`SET search_path TO faultline_<slug>` WITHOUT public). The MCP door does the
+    deterministic compute (sniff, extract, geometry, caption, chunk tie) and never touches
+    the database — that separation is deliberate, and it is why this lane adds NO new
+    isolation boundary: it reuses the existing tenant-derivation chokepoint exactly as
+    `/documents/enqueue` does.
+
+    `data_b64` carries the container file. Base64 is used on this INTERNAL hop only (the
+    public door takes raw bytes) because the hop is JSON over the container network and
+    the 33 % inflation buys a single uniform request shape.
+    """
+    user_id: str
+    media_type: str
+    data_b64: str
+    filename: Optional[str] = None
+    source_ref: Optional[str] = None
+    document_id: Optional[int] = None
+    placements: list[ArtefactPlacement] = []
+
+
+class DocumentEnqueueRequest(BaseModel):
+    """Enqueue a chunked document into the per-tenant async ingestion registry.
+
+    The flagship `ingest_document` lane chunks the document deterministically
+    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
+    `documents` row status='pending' (chunks retained verbatim) and returns fast.
+    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
+    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
+    """
+    user_id: str
+    chunks: list[str]
+    chunk_count: int = 0
+    source_ref: Optional[str] = None
+    title: Optional[str] = None
+    truncated: bool = False
+    # DOCLOSS-A part accounting: a document larger than the per-row chunk bound is
+    # SEGMENTED across consecutive rows instead of having its tail discarded. These
+    # describe WHICH slice of the original document this row carries, so the terminal
+    # signal read off the registry can state the truth about the whole document.
+    # Defaults reproduce a single-part document exactly (legacy callers unchanged).
+    part_index: int = 0
+    part_count: int = 1
+    total_chunks: int = 0
+
+
+class LearnTopicRequest(BaseModel):
+    topic: str
+    user_id: str = "anonymous"
+    source_text: Optional[str] = None   # pre-fetched content from a URL
+    source_url: Optional[str] = None    # informational, logged but not fetched again
 
 
 class RewriteRequest(BaseModel):
@@ -170,6 +291,16 @@ class RewriteRequest(BaseModel):
     messages: list[dict] | None = None  # Prior conversation context
     typed_entities: list[dict] | None = None  # Pre-extracted entities from GLiNER2
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution
+    force_relation_extraction: bool = False  # DOC LANE: force LLM relation extraction even when the global flag is detect-only (interactive path unaffected)
+    # DOC LANE: per-request override of SPINE_DETERMINISTIC_SEGMENTATION for /harvest-spans.
+    # None (every caller today) → the process-wide flag decides → byte-identical behaviour.
+    # True → the spine segments with the deterministic decomposer and escalates to the LLM
+    # atomizer ONLY for units whose parse still shows an un-decomposed second assertion.
+    # WHY a per-REQUEST field rather than one global flag: the atomizer's prompt and budget are
+    # sized for "one short chat message" (LLMMaxTokens REFRAME=256, LLMTimeouts REFRAME=6.0s),
+    # which a multi-sentence document chunk overruns — while a chat turn still benefits from it.
+    # The shape of the INPUT differs per caller, so the decision belongs on the call, not the process.
+    deterministic_segmentation: Optional[bool] = None
 
 
 class RewriteResponse(BaseModel):
@@ -187,6 +318,14 @@ class FactCorrectionRequest(BaseModel):
     intent: Optional[str] = None  # GLiNER2 classification from Filter: CORRECTION or RETRACTION
     context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
     idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)
+    # AUTHORSHIP (default True): the correction was EXPLICITLY routed by the model through
+    # the retract_fact tool -- the model's attestation that a human said it, so the
+    # superseding rows are written user_stated / Class A / confidence 1.0 exactly as
+    # historically. False marks an UNATTESTED lane (recall's auto-detected CORRECTION
+    # divert): the same supersede mechanics run, but the superseding rows land
+    # llm_inferred / Class B / 0.7 -- a machine side-effect never claims the human said
+    # it, and the ladder to A stays open via a later explicit correction or remember_facts.
+    attested: bool = True
 
 
 class FactCorrectionResponse(BaseModel):
@@ -272,6 +411,14 @@ class QueryPath(BaseModel):
     #   (network ⊃ subnets, body ⊃ parts behave identically). Empty for a plain concept/
     #   temporal query → that projection is byte-for-byte unchanged.
     nesting_rels: list[str] = []
+    # aspect_bound_rels: rels the query's OWN possessed noun phrase resolved to through the
+    #   tenant's grown place-index (rel_type_aliases: "my email address" → email_address →
+    #   has_email — the row `_ground_aspect_term_place` wrote at ingest). A fact on one of
+    #   these rels is on the question's topic BY CONSTRUCTION (the tenant's ontology bound
+    #   the user's own term to it), so the lexical topic gate must not re-judge it — the
+    #   same authority the taxonomy-scope skip already carries. Subset of allowed_rels.
+    #   Empty when no possessed NP resolved → every consumer is byte-for-byte unchanged.
+    aspect_bound_rels: list[str] = []
     # hierarchy_intent: True when the QUERY REFERENCE asks for a hierarchy / map / full
     #   grouping and the walk should DESCEND the containment/membership tree from the
     #   anchor ("the network hierarchy under dc-toronto", "the org tree from acme",
@@ -296,6 +443,25 @@ class QueryPath(BaseModel):
     #   grown canonical attribute for observability/tests only — None on the steady-state
     #   (deterministic) path and on a non-grow miss. NOT part of allowed_rels.
     aspect_grown: Optional[str] = None
+    # when_pinned_entity_ids (issue #17, when-ask object-pinning): the SPECIFIC entity
+    #   ids a when-interrogative names ("When did I start taking METFORMIN?" → the
+    #   metformin entity), resolved in determine_path from the query's own concept
+    #   tokens against THIS tenant's alias registry (the same grounding
+    #   `_query_scoped_to_absent_concept` uses). When non-empty, a dated row riding the
+    #   aspect-bound exemption must BELONG to one of these entities (its subject or
+    #   object slot) — rel-granular breadth (#15) is kept ONLY for entity-less shapes
+    #   ("When did I take anything?"). L4 places (type nodes) and the speaker are never
+    #   pinned. Empty → byte-for-byte the #15 behaviour.
+    when_pinned_entity_ids: list[str] = []
+    # measure_axis_admission (issue #17, measure-axis grown-rung voice): True when the
+    #   measure-interrogative admission (#13/#11) actually resolved the axis from the
+    #   anchor's own stored rows (`measure_interrogative_aspect` fired). The render then
+    #   gives the ASKED CHAIN's grown classification rungs their voice back on THIS
+    #   question — they render in the HELD band (their own provenance), the same
+    #   contract the ladder question already carries, without touching the growth gate
+    #   or what the walk admits. False (default) → the rung-silencing gate is
+    #   byte-for-byte unchanged.
+    measure_axis_admission: bool = False
 
     @property
     def allowed_rels(self) -> set[str]:
@@ -329,6 +495,14 @@ class QueryResponse(BaseModel):
     facts: list[dict] = []  # Structured facts with metadata (definition contains prose)
     preferred_names: dict = {}  # UUID → display name mapping for Filter's UUID resolution
     canonical_identity: Optional[str] = None  # Same as anchor, for backward compatibility
+    # OWNER RULING (2026-08-20, additive option): `anchor`/`canonical_identity` KEEP the
+    # raw entity UUID — consuming software (MCP slot resolution, OpenWebUI filter) keys on
+    # it — and this ADDITIVE field carries the human-readable name ALONGSIDE it. Sourced
+    # from the store's alias tables (entity_aliases, preferred-first; the user-identity
+    # lane for the seat owner), never an enumerated list. None = honest absence (the
+    # anchor is not a known entity or carries no surfaceable name) — a UUID is never the
+    # value and no placeholder name is invented.
+    anchor_name: Optional[str] = None
     attributes: dict = {}  # entity_id → {attr: value} mapping for attributes
     confidence_applied: bool = True
     staged_facts_count: int = 0  # Class C facts included
@@ -354,28 +528,5 @@ class QueryResponse(BaseModel):
     temporal_computation: Optional[dict] = None
 
 
-class DocumentEnqueueRequest(BaseModel):
-    """Enqueue a chunked document into the per-tenant async ingestion registry.
-
-    The flagship `ingest_document` lane chunks the document deterministically
-    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
-    `documents` row status='pending' (chunks retained verbatim) and returns fast.
-    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
-    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
-    """
-    user_id: str
-    chunks: list[str]
-    chunk_count: int = 0
-    source_ref: Optional[str] = None
-    title: Optional[str] = None
-    truncated: bool = False
-    part_index: int = 0
-    part_count: int = 1
-    total_chunks: int = 0
 
 
-class LearnTopicRequest(BaseModel):
-    topic: str
-    user_id: str = "anonymous"
-    source_text: Optional[str] = None
-    source_url: Optional[str] = None

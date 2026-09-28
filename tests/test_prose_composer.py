@@ -503,20 +503,20 @@ def test_inverse_dedup_prefers_user_subject():
         {"prose": "you are the child of mother", "subj_id": "U", "obj_id": "M",
          "rel_type": "child_of", "subject_is_you": True},
     ]
-    out = _dedup_inverse_pairs(rendered, overlay)
+    out = [r["prose"] for r in _dedup_inverse_pairs(rendered, overlay)]
     assert out == ["you are the child of mother"]
 
 
 def test_inverse_dedup_keeps_non_inverse():
     overlay = {"spouse": {"inverse_rel_type": None}}
     rendered = [
-        {"prose": "you are married to marla", "subj_id": "U", "obj_id": "X",
+        {"prose": "you are married to nora", "subj_id": "U", "obj_id": "X",
          "rel_type": "spouse", "subject_is_you": True},
-        {"prose": "you have a dog named fraggle", "subj_id": "U", "obj_id": "D",
+        {"prose": "you have a dog named rex", "subj_id": "U", "obj_id": "D",
          "rel_type": "has_pet", "subject_is_you": True},
     ]
-    out = _dedup_inverse_pairs(rendered, overlay)
-    assert out == ["you are married to marla", "you have a dog named fraggle"]
+    out = [r["prose"] for r in _dedup_inverse_pairs(rendered, overlay)]
+    assert out == ["you are married to nora", "you have a dog named rex"]
 
 
 def test_inverse_dedup_distinct_pairs_not_collapsed():
