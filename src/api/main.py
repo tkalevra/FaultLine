@@ -26325,7 +26325,7 @@ async def _ground_self_predication(text: str, user_id: str) -> list[dict]:
                 "The user is describing THEMSELF with 'I am X' / \"I'm X\". Decide what X represents "
                 "about the user and pick the single best-fit relation:\n"
                 "- feels: an emotion / mood / transient affective state (worried, anxious, happy, exhausted).\n"
-                "- also_known_as: their name, nickname, or what they go by (Chris, Ace).\n"
+                "- also_known_as: their name, nickname, or what they go by ((Sam, Ace)).\n"
                 "- occupation: their job / role / profession (teacher, engineer, student).\n"
                 "- none: anything else, a NEGATION ('I am not X'), or unclear.\n"
                 'Respond with STRICT JSON only: {"relation":"' + _rels + ' | none","object":"<the core word, lowercase>"}.'
