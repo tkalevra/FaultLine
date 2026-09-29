@@ -43,5 +43,18 @@
 - `il mio nome è X` (frame copulativo) e il conteggio restano sul percorso LLM.
 - I voti di negazione della correzione (`analyze_negation_scopes`) restano solo inglesi.
 - `compagno/compagna` (partner o compagno) non è seminato: ambiguo.
+- **Aggiornamento del motore inglese (incremento 1)**, disattivato sull'installazione italiana
+  (`FAULTLINE_LANGUAGE=it`, `english_grammar_available()`) e su ogni analisi UD: (1) la riparazione
+  dei composti nominali spezzati, che presuppone la testa a destra (inglese) e invertirebbe
+  `nave scuola`; (2) la dimensione dell'aggettivo di grado (`28 feet long` → `length`), che
+  interroga WordNet (inglese, già spento qui) sull'arco `npadvmod` — `lungo`/`alto` non vi sono
+  mai cercati e le misure restano quelle della migrazione 282. (3) Il ramo passivo inglese
+  `is called/named N` gira solo su un'analisi inglese; su un'analisi UD la denominazione
+  riflessiva italiana resta l'unica. Il resto dell'incremento (cornice di correzione
+  `Correction:`, contrasto di misura, negazione che ritira solo il valore nominato, validatore is-a
+  di `/learn`, lettere Unicode nella forma dei termini — `città`, `caffè`) è indipendente dalla
+  lingua o resta inerte da solo (lettori di domanda con `how`/`do`, arco Penn `neg`, `acomp`).
+  Senza WordNet, l'astensione informativa non aggiunge contesto per le classi residue
+  (Object/Concept): meglio un'astensione nuda che un elenco di righe non correlate.
 
 Prompt e testi MCP restano in inglese (convenzione dei rami di lingua).

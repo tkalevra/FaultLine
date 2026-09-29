@@ -281,8 +281,13 @@ def test_a_measured_adjective_still_belongs_to_the_copula_measure_chain(monkeypa
     (unit noun -> the unit_scalar rel). Without the measured-adjective deferral the widening would
     silently flatten a typed ``height`` scalar into a verbatim per-noun attribute."""
     monkeypatch.setattr(linguistics, "_attribute_nouns", frozenset, raising=False)
+    # issue #52: the measure keeps its unit (value verbatim) unless the rel metadata declares a
+    # bare count; the seeded height metadata is pinned so the pin does not depend on a DSN
+    monkeypatch.setattr(linguistics, "_rel_overlay_meta_map", lambda: {
+        "height": {"scalar_datatype": "quantity", "head_types": ["Person"],
+                   "tail_types": ["SCALAR"]}})
     rels = _rels("my horse is 5 feet tall.")
-    assert ("horse", "height", "5") in rels, rels
+    assert ("horse", "height", "5 feet") in rels, rels
     assert not [t for t in rels if t[1] == "horse"], rels
 
 

@@ -153,3 +153,17 @@ def test_empty_and_none_are_refused_safely():
     for surface in ("", "   ", None):
         ok, reason = type_term_shape(surface)
         assert ok is False and reason == "empty"
+
+
+def test_term_shape_admits_unicode_letters():
+    """The orthographic rule was ASCII-only, so accented / non-Latin terms were refused an is-a
+    ladder as non_lexical_orthography. Letters are letters in any script."""
+    for surface in ("técnica", "carpintería", "año", "cigüeña", "café", "naïve"):
+        ok, reason = type_term_shape(surface)
+        assert ok is True, f"{surface!r} must stay admissible; got {reason!r}"
+
+
+def test_unicode_widening_still_refuses_value_characters():
+    for surface in ("notes.md", "~/.config/x", "alpha+beta", "a@b", "café.txt"):
+        ok, reason = type_term_shape(surface)
+        assert ok is False and reason == "non_lexical_orthography", (surface, reason)
