@@ -239,7 +239,9 @@ def test_genuine_places_still_capture(sentence, place):
 # PREDICATE — never pobj. Unrelated dimensions: age (year), height (foot), duration (hour/minute).
 _COPULA_MEASURE_CASES = [
     ("She is 62 years old.",     "age",    "62"),
-    ("He is 6 feet tall.",       "height", "6"),
+    # a degree-adjective measure keeps its unit unless the dimension declares a bare count
+    # (age is integer-typed, so "62 years old" stays 62; height is a quantity)
+    ("He is 6 feet tall.",       "height", "6 feet"),
     ("Sarah is 28.",             "age",    "28"),
     ("My daughter is 10 years old.", "age", "10"),
 ]

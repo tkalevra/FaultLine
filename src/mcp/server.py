@@ -366,6 +366,8 @@ _ABS_FIRST_PERSON = frozenset(
     "i me my we us our mine ours myself ourselves".split())
 _ABS_MISC_LEAD = frozenset("times time ago back".split())
 _ABS_DO_SUPPORT = frozenset("do does did".split())
+# Closed-class prepositions a do-support verb drop can strand at the head of the residual.
+_ABS_STRANDED_PREP = frozenset("about of on in at for with from to into over".split())
 _ABS_SCAFFOLD = _ABS_WH | _ABS_HOWMOD | _ABS_AUX | _ABS_FIRST_PERSON | _ABS_MISC_LEAD
 _ABS_WORD_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9'\-]*")
 
@@ -412,6 +414,12 @@ def _query_subject_phrase(query: str) -> str:
     # do-support: the fronted main verb sits right after the consumed pronoun run.
     if saw_do_support and i < len(toks):
         i += 1
+        # A prepositional verb's particle is stranded by the verb drop ("what do I know
+        # ABOUT woodworking" → "about woodworking"), and the template already supplies its
+        # own "about" — measured: "I don't have any information about about woodworking"
+        # (issue #38). Drop the stranded preposition (closed class, like the sets above).
+        while i < len(toks) - 1 and toks[i] in _ABS_STRANDED_PREP:
+            i += 1
     residual = toks[i:]
     if not residual or len(residual) > 9:
         return ""
