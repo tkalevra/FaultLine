@@ -1069,3 +1069,85 @@ def hypernym_rungs(term: str, gliner_type: str | None = None,
         # GAP B: no synset for the full type → head-noun reduction (clean compounds only).
         return _multiword_head_rungs(term, gliner_type, max_rungs, context_hypernym)
     return _rungs_from_synset(term, synset, max_rungs)
+
+
+def degree_adjective_dimensions(adjective: str) -> frozenset:
+    """EVERY dimension name a gradable degree adjective can measure — the lemma names of all its
+    WordNet ATTRIBUTE synsets, space-form (``long`` → {length, duration}; ``tall`` → {stature,
+    height}; ``wide`` → {width, breadth}). The query-side twin of ``degree_adjective_dimension``
+    (issue #48): the question has no unit to disambiguate the sense, so the reader keeps the whole
+    set and lets the ANCHOR's stored attributes pick the one it actually holds — ingest named the
+    stored attribute with the same lexicon, so the two sides meet on the same lemma. Empty set
+    when the word carries no attribute pointer or WordNet is unavailable (fail-safe)."""
+    wn = _wn()
+    if wn is None:
+        return frozenset()
+    lemma = (adjective or "").strip().lower()
+    if not lemma or not lemma.isalpha():
+        return frozenset()
+    try:
+        out = set()
+        for s in (wn.synsets(lemma, pos="a") or []) + (wn.synsets(lemma, pos="s") or []):
+            for a in s.attributes() or []:
+                out.update(n.lower().replace("_", " ") for n in a.lemma_names())
+        return frozenset(out)
+    except Exception as e:  # noqa: BLE001 — fail-safe: no binding, caller keeps its family read
+        log.warning("wordnet_ladder.degree_dimensions_failed", error=str(e)[:160])
+        return frozenset()
+
+
+def degree_adjective_dimension(adjective: str, anchor_attribute: str | None = None,
+                               known_attributes=frozenset()) -> str | None:
+    """The DIMENSION a gradable degree adjective measures, read off WordNet's own structure.
+
+    Issue #36. In a measure phrase ``<N> <unit> <ADJ>`` ("28 feet LONG", "3 metres TALL",
+    "2 metres WIDE") the adjective names the dimension being measured and the unit only names the
+    scale. WordNet links a descriptive adjective to the noun it is a value of through the
+    ATTRIBUTE pointer (``long.a.02 → length.n.01``, ``tall.a.01 → stature.n.02``,
+    ``wide.a.01 → width.n.01``, ``old.a.01 → age.n.01``; Princeton WordNet ``wngloss(7WN)``:
+    "attribute — a noun for which adjectives express values"). So the dimension is derived from the
+    lexicon's structure — never from a per-word table.
+
+    Polysemy (``long`` is a value of both ``length`` and ``duration``) is resolved against
+    ``anchor_attribute`` — the attribute the UNIT's own scale already implies (the grown
+    ``unit_scalar`` map: foot→height, hour→duration): the attribute synset most similar to it wins
+    (WordNet path similarity), so "28 feet long" → length and "2 hours long" → duration.
+
+    Naming: among the chosen synset's lemmas, one the tenant already knows (``known_attributes``,
+    the rel_type overlay keys) is preferred — ``stature.n.02``'s lemmas are {stature, height}, so a
+    tenant carrying ``height`` gets ``height`` back — else the synset's head lemma. Returns None
+    when the word is not an attribute-bearing adjective or WordNet is unavailable (fail-safe: the
+    caller keeps today's unit-derived attribute).
+    """
+    wn = _wn()
+    if wn is None:
+        return None
+    lemma = (adjective or "").strip().lower()
+    if not lemma or not lemma.isalpha():
+        return None
+    try:
+        attrs = []
+        for s in (wn.synsets(lemma, pos="a") or []) + (wn.synsets(lemma, pos="s") or []):
+            for a in s.attributes() or []:
+                if a not in attrs:
+                    attrs.append(a)
+        if not attrs:
+            return None
+        chosen = attrs[0]
+        anchor = (anchor_attribute or "").strip().lower().replace(" ", "_")
+        anchors = wn.synsets(anchor, pos="n") if anchor else []
+        if anchors and len(attrs) > 1:
+            def _sim(a):
+                return max(((a.path_similarity(r) or 0.0) for r in anchors), default=0.0)
+            chosen = max(attrs, key=_sim)  # max() keeps the first on ties → WordNet sense order
+        names = [n.lower() for n in chosen.lemma_names()]
+        known = {str(k).strip().lower() for k in (known_attributes or ())}
+        if anchor:
+            known.add(anchor)  # the unit's own attribute is always a known name for its scale
+        for n in names:
+            if n in known:
+                return n.replace("_", " ")
+        return names[0].replace("_", " ") if names else None
+    except Exception as e:  # noqa: BLE001 — fail-safe: keep the unit-derived attribute
+        log.warning("wordnet_ladder.degree_dimension_failed", error=str(e)[:160])
+        return None

@@ -2795,6 +2795,49 @@ def linguistics_available() -> bool:
     return _get_nlp() is not None
 
 
+def _repair_split_nominal_compound(doc) -> int:
+    """Re-join a noun compound the parser split into two SIBLING arguments. Returns repairs made.
+
+    Issue #37: "I feed my sourdough starter every 12 hours." parses ``sourdough`` AND ``starter`` as
+    two ``dobj`` children of ``feed`` (with ``my`` on the first), and the deriver then minted THREE
+    entities for one NP — ``sourdough`` (``user owns sourdough``), ``starter`` (``user feed starter``)
+    and, from the naming atom, ``sourdough starter``. A verb has ONE direct object and a clause ONE
+    subject: two CONTIGUOUS common-noun siblings carrying the SAME argument label under the SAME head,
+    with nothing between them (no conjunction, no punctuation), are one nominal whose left member is
+    a compound modifier of the right (English noun-noun compounds are right-headed; CGEL ch.19 §4).
+    The repair re-attaches the left noun as ``compound`` of the right one and moves its determiner /
+    possessor onto the right one, so ``_np_phrase`` rebuilds "sourdough starter" and the possessive
+    chain reads the same NP the naming chain filed. A PROPN member (a name), a genuine coordination
+    ("apples and pears"), a dative/second complement (``dative``/``oprd``), or non-adjacent siblings
+    are untouched. Dependency/POS only, no word list; fail-safe → 0 (the parse is left as-is).
+
+    [es branch] ENGLISH-ONLY: the right-headed reading is an English fact. Spanish noun-noun
+    compounds are LEFT-headed ("coche bomba", "hombre rana"), so re-attaching the left noun under
+    the right one would invert the head on a Spanish parse. Inert when ``_doc_is_spanish(doc)``."""
+    n = 0
+    if _doc_is_spanish(doc):
+        return 0
+    try:
+        for i in range(len(doc) - 1):
+            left, right = doc[i], doc[i + 1]
+            if left.pos_ != "NOUN" or right.pos_ != "NOUN":
+                continue
+            if left.dep_ != right.dep_ or left.dep_ not in (
+                    "dobj", "obj", "nsubj", "nsubjpass", "pobj", "attr"):
+                continue
+            if left.head.i != right.head.i or left.head.i in (left.i, right.i):
+                continue
+            left.head = right
+            left.dep_ = "compound"
+            for c in list(left.children):
+                if c.dep_ in ("poss", "det") and c.i < left.i:
+                    c.head = right
+            n += 1
+    except Exception as e:  # noqa: BLE001 — fail-safe: leave the parse as spaCy produced it
+        log.debug("linguistics.split_compound_repair_failed", error=str(e)[:120])
+    return n
+
+
 def _parse(text: str):
     """Parse ``text`` once. Returns the spaCy ``Doc`` or ``None`` on any failure (fail-safe)."""
     if not text or not text.strip():
@@ -3136,9 +3179,16 @@ def _adj_has_numeric_measure(adj_tok) -> bool:
     feeling ("I am sad") has no such child; a number that measures NOTHING on the adjective ("I am
     45, sad" — the 45 is a separate ``attr`` of the copula, not a modifier of "sad") does NOT trip
     it, so a real feeling co-occurring with a number is preserved. Grammar-driven, subject-agnostic,
-    NO unit/emotion word list. Fail-safe → False."""
+    NO unit/emotion word list. Fail-safe → False.
+
+    The predicate is recognised by POS ``ADJ`` OR by the ``acomp`` DEPENDENCY (issue #48): the
+    POS of a measured degree word is unstable — "my kayak is 16 feet LONG, not 14" tags "long"
+    ``ADV`` while "my kayak is 14 feet long" tags it ``ADJ`` — and a POS-only gate let the contrast
+    sentence fall through to the preference seam as ``(user, kayak, "feet long 14")``. The
+    predicative-complement dependency is the grammar (the same rule ``_is_measure_interrogative``
+    already applies to "how LONG is X")."""
     try:
-        if adj_tok is None or adj_tok.pos_ != "ADJ":
+        if adj_tok is None or (adj_tok.pos_ != "ADJ" and adj_tok.dep_ != "acomp"):
             return False
         for ch in adj_tok.children:
             # a unit noun / adverbial measure modifying the ADJ, itself carrying a NUMBER (or a bare
@@ -3417,7 +3467,7 @@ def analyze_copula(text: str):
             return None
         if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
             return None
-        if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
+        if _adj_has_numeric_measure(comp):  # ADJ or acomp (POS unstable, #48)
             return None
         if comp.pos_ == "ADJ" and _adj_has_prep_object(comp):
             return None
@@ -3515,8 +3565,8 @@ def analyze_copula_affect_complements(text: str) -> list[str]:
             for m in sorted(members, key=lambda t: t.i):
                 if any(_is_neg(ch) for ch in m.children):
                     continue  # this conjunct is negated → skip
-                if m.pos_ == "ADJ" and _adj_has_numeric_measure(m):
-                    continue
+                if _adj_has_numeric_measure(m):  # ADJ or acomp (POS unstable, #48)
+                    continue  # "34 years old" → age/measurement (copula-measure chain), not a feeling
                 if m.pos_ == "ADJ" and _adj_has_prep_object(m):
                     continue
                 surf = (m.text or m.lemma_ or "").strip().lower()
@@ -3701,7 +3751,7 @@ def analyze_possessive_predication(text: str):
             # here. Fires ONLY when the number measures the adjective ITSELF; a plain single-word
             # preference ("my favorite colour is blue") has no numeric measure on the ADJ and is
             # untouched. Grammar-driven (_adj_has_numeric_measure), subject-agnostic, NO word list.
-            if comp.pos_ == "ADJ" and _adj_has_numeric_measure(comp):
+            if _adj_has_numeric_measure(comp):  # ADJ or acomp: the POS is unstable (#48)
                 return None
 
             # KINSHIP-POSSESSIVE GUARD (metadata-driven, kinship_noun cue class). "my daughter is …",
@@ -4446,6 +4496,11 @@ def _complement_value_phrase(comp) -> str:
         mods = []
         for c in comp.children:
             if c.is_punct or _is_neg(c):
+                continue
+            # ASSERTED CONTRAST (issue #48): a dependent carrying its OWN ``neg`` is the REJECTED
+            # value of a contrast ("16 feet long, NOT 14" hangs "14" npadvmod on "long" with the
+            # neg on "14") — never part of the asserted value phrase. Structural, no word list.
+            if any(g.dep_ == "neg" for g in c.children):
                 continue
             if c.dep_ in _MOD:
                 mods.append(c)
@@ -13781,6 +13836,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         doc = sentence
     if doc is None:
         return []
+    _repair_split_nominal_compound(doc)
     sentence = doc.text  # the deriver's date/offset logic operates on the parsed text
     if not sentence or not sentence.strip():
         return []
@@ -20988,6 +21044,30 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 comp = _pred
             if comp is None:
                 continue
+            # CONTRASTED-AWAY COMPLEMENT (issue #35): a complement that carries its OWN ``neg`` child
+            # is the value the speaker is REJECTING ("my favourite mineral is labradorite, NOT
+            # fluorite" — spaCy tags the rejected noun ADJ/acomp and hangs the asserted one under it
+            # as amod). Filing it as an affirmed state wrote (mineral, has_state, fluorite) — the
+            # exact value the turn retired. Distinct from a NEGATED STATE ("the server is not down"),
+            # whose ``neg`` hangs off the copula and is captured with polarity above. Structural
+            # (``neg`` dependency on the complement itself), no word list.
+            # The CONTRAST WITNESS is the punctuation that opens the rejected-value appendage
+            # ("…, not fluorite"). Without it a ``neg`` on the complement is an ordinary NEGATED
+            # PREDICATE — "The situation is no different." hangs ``no`` as ``neg`` on ``different``
+            # with nothing asserted instead — and declining it deleted a true (negated) user fact.
+            _neg_kids = [c.i for c in comp.children if c.dep_ == "neg"]
+            if _neg_kids and min(_neg_kids) > 0 and comp.doc[min(_neg_kids) - 1].is_punct:
+                # ...and the ASSERTED value is the complement's own punct-separated pre-neg
+                # dependent ("my tent is BLUE, not orange": spaCy hangs "blue" as amod/conj of the
+                # negated "orange"). File that one; decline when there is none (round 2).
+                _neg_i = min(_neg_kids)
+                _asserted = next((c for c in comp.children
+                                  if c.dep_ in ("amod", "conj", "appos") and c.i < _neg_i
+                                  and c.pos_ in ("ADJ", "NOUN", "PROPN", "VERB")
+                                  and any(t.is_punct for t in comp.doc[c.i + 1:_neg_i])), None)
+                if _asserted is None:
+                    continue
+                comp = _asserted
             # MEASUREMENT GUARD (Fix 3 interplay): "she is 62 years old" / "he is 6 feet tall" parse the
             # measurement adjective ("old"/"tall") as the acomp complement, with a NUM-bearing UNIT noun
             # ("years"/"feet") in its subtree. That is a SCALAR measurement owned by
@@ -21020,12 +21100,15 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _ut = (_measure_unit_tok.text or "").strip().lower()
                 _would_rel = _units.get(_ul) or _units.get(_ut)
                 if _would_rel:
-                    try:
-                        _subj_et = (tok.ent_type_ or "").strip()
-                    except Exception:  # noqa: BLE001
-                        _subj_et = ""
-                    if _scalar_rel_admits_subject(_would_rel, _subj_et):
-                        continue  # the measure chain lands its scalar → this state would be junk; skip
+                    # issue #36: the measure chain now lands the MAGNITUDE for EVERY subject type
+                    # (the adjective's dimension, the unit's admitted attribute, or — when a
+                    # Person-scoped attribute refuses the subject — the generic measure rel, value
+                    # verbatim). So a degree adjective carrying a measure phrase is never a state:
+                    # the quantity is the fact and the adjective is its dimension. The old
+                    # "suppress only when the scalar rel admits the subject" arm filed
+                    # (sailboat, has_state, long) beside the measure, and the SHARED "long" state
+                    # node then pulled a second owned object into the first one's answer.
+                    continue
             # a QUESTION complement ("what is it?") is not a value — skip wh / interrogative.
             try:
                 if "Int" in comp.morph.get("PronType") or comp.tag_ in ("WP", "WP$", "WDT", "WRB"):
@@ -21913,7 +21996,81 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             role_lemma = (role.lemma_ or role.text or "").strip().lower()
             if role_lemma not in _kin_rel_nouns:
-                continue  # a TYPE/sortal role → owned by the named-instance/naming seams, never a kin bind
+                # A TYPE/sortal subject is never a kin bind — but the passive naming frame still
+                # NAMES it (issue #37). "My sailboat is called Windrift" / "My sourdough starter is
+                # named Clint" / "the queen is named Beatrix" bound NOTHING at HEAD: this chain
+                # declined every non-kin head and no other seam reads the passive surface (the
+                # named-instance detector's naming-verb branch reads only the reduced relative
+                # "a sailboat named Windrift"), so the name was dropped whole. "X is called/named
+                # N" assigns X its NAME — the prefLabel (SKOS S13/S14), the same rel the correction
+                # lane files for "my starter is named Doughbi, not Clint" — so file
+                # ``(<subject NP>, pref_name, <name>)``: the name lands IN the alias layer ON the
+                # subject entity (never a second entity, never L4 — THE HARD LINE), keyed by the
+                # FULL NP (compounds kept: ONE NP = ONE entity). Measured: routing it through the
+                # named-instance edge set instead ((name instance_of type) + (user owns name) +
+                # (type aka name)) split the thing into TWO registry entities that both carried
+                # the name and orphaned its measure from "how long is my sailboat?".
+                # Subject-agnostic: naming verb = the DB naming_verb cue class, the name = a PROPN
+                # complement (determiner-introduced complements are TYPES), the subject = whatever
+                # common noun the passive takes. Negation is declined above. Fail-safe → no emit.
+                # [es branch] ENGLISH-ONLY: this arm reads the English passive surface ("is
+                # called/named N"); the Spanish pronominal naming frame ("mi perro se llama Fido")
+                # is owned by the ``_chain_es_*`` naming chains. Inert on a Spanish parse.
+                if _doc_is_spanish(doc):
+                    continue
+                _nm = None
+                for c in tok.children:
+                    if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN" \
+                            and not any(d.dep_ == "det" for d in c.children):
+                        try:
+                            if "Int" in c.morph.get("PronType") or c.tag_ in (
+                                    "WP", "WP$", "WDT", "WRB"):
+                                continue
+                        except Exception:  # noqa: BLE001 — fail-safe
+                            pass
+                        _nm = c
+                        break
+                if _nm is None:
+                    continue
+                _nm_surface = " ".join(
+                    [m.text for m in sorted(
+                        (m for m in _nm.children
+                         if m.dep_ in ("compound", "flat") and m.pos_ == "PROPN" and m.i < _nm.i),
+                        key=lambda m: m.i)] + [_nm.text or ""]).strip().lower()
+                _subj_np = (_np_phrase(role) or role.text or "").strip().lower()
+                if not _nm_surface or not _subj_np or _nm_surface == _subj_np:
+                    continue
+                # REFERENT GATE (round 2). ``_np_phrase`` drops determiners and possessors, so the
+                # bare NP surface only identifies the SPEAKER's own thing. A THIRD-PARTY genitive
+                # ("my neighbour's dog is named Fido") keyed on "dog" rebound Fido onto the user's
+                # own dog; a bare definite with no turn antecedent ("The disease is called Lyme")
+                # named a generic node. Emit only when the possessor is the speaker (Person=1 ∧
+                # Poss=Yes), or the subject is a DEFINITE NP (Definite=Def) with an antecedent
+                # already in the turn (the bridging "…my beehive… the queen is named Beatrix").
+                # Anything else keeps HEAD behaviour: no name edge (the turn stays in the
+                # episodic log), never a wrong-referent bind.
+                _poss_c = next((c for c in role.children if c.dep_ == "poss"), None)
+                _speaker_owned = False
+                if _poss_c is not None:
+                    try:
+                        _speaker_owned = (_poss_c.morph.get("Person") == ["1"]
+                                          and "Yes" in _poss_c.morph.get("Poss"))
+                    except Exception:  # noqa: BLE001
+                        _speaker_owned = False
+                    if not _speaker_owned:
+                        continue  # third-party possessor → never rebind onto a bare NP surface
+                else:
+                    _def = any(c.dep_ == "det" and "Def" in c.morph.get("Definite")
+                               for c in role.children)
+                    if not (_def and _prior):
+                        continue
+                # preferred_label: the construction ASSERTS the display label (the same prefLabel
+                # thread the name-repair lane uses) — without it the registry files the name as a
+                # non-preferred altLabel and the thing keeps rendering by its type noun.
+                _emit(_subj_np, "pref_name", _nm_surface, obj_tok=_nm, subj_tok=role,
+                      preferred_label=True)
+                _claim(tok, _nm)
+                continue
             # the PROPER NAME assigned — the naming verb's oprd/attr/dobj PROPN complement.
             proper = None
             for c in tok.children:
@@ -22248,6 +22405,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             rel = None
             value = None
             num_tok = None
+            _dim_override = None  # (dimension rel, degree-adjective tok, unit tok) — issue #36
+            _degree_unit_tok = None  # unit tok of an AGREEING "<N> <unit> <ADJ>" measure — #52
             # (a) UNIT-bearing: a unit noun (in the unit_scalar map) carrying a NUM nummod child.
             for t in doc:
                 if t.pos_ != "NOUN":
@@ -22303,6 +22462,35 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 rel = _mapped
                 value = (_num.text or "").strip()
                 num_tok = _num
+                # DIMENSION FROM THE DEGREE ADJECTIVE (issue #36). In "<N> <unit> <ADJ>" the unit
+                # is an npadvmod under the degree word ("28 feet LONG"); the UNIT names only the
+                # scale (foot → the unit map's height), the ADJECTIVE names the dimension. Reading
+                # the unit alone filed "180 centimeters long" as height. The dimension comes from
+                # WordNet's attribute pointer (long → length, wide → width, tall → height), the unit
+                # map's attribute disambiguating the adjective's senses; when it agrees with the
+                # unit's attribute ("6 feet tall" → height, "62 years old" → age) nothing changes.
+                # POS is not trusted for the degree word: spaCy tags "long" ADV/amod under a
+                # "…, not 180" contrast — the npadvmod attachment is the structural witness.
+                # [es branch] ENGLISH-ONLY: WordNet is the English lexicon and ``npadvmod`` is an
+                # English (ClearNLP) label — a Spanish degree adjective ("alto", "largo") must never
+                # be looked up there (a same-spelled English word would name a wrong dimension).
+                # Inert on a Spanish parse (``_doc_is_spanish``); the unit's attribute stands.
+                if t.dep_ == "npadvmod" and t.head is not None and t.head.i != t.i \
+                        and t.head.pos_ in ("ADJ", "ADV") and not _doc_is_spanish(doc):
+                    try:
+                        from src.api import wordnet_ladder as _wl_dim
+                        _dim = _wl_dim.degree_adjective_dimension(
+                            (t.head.lemma_ or t.head.text or ""), _mapped,
+                            _rel_overlay_meta_map().keys())
+                    except Exception:  # noqa: BLE001 — fail-safe: keep the unit's attribute
+                        _dim = None
+                    if _dim and _dim.replace(" ", "_") != _mapped:
+                        _dim_override = (_dim.replace(" ", "_"), t.head, t)
+                    else:
+                        # The unit's attribute AGREES with the degree word's dimension ("60
+                        # centimeters tall" → height). Same "<N> <unit> <ADJ>" frame, so the value
+                        # keeps its unit too (issue #52) — decided at the emit below.
+                        _degree_unit_tok = t
                 break
             # (a.5) CURRENCY COMPLEMENT ("the lights were $40"): a NUM copula-complement whose
             # IMMEDIATE left token is a currency SYMBOL ($/£/€/¥) is MONEY, not an age/measure —
@@ -22383,7 +22571,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     if _full_measure:
                         _emit(subject, "related_measure", _full_measure,
                               verb_tok=head, obj_tok=num_tok, subj_tok=None,
-                              scalar_datatype="string")
+                              scalar_datatype="quantity")
                         _ul_rec = ((_u_tok.lemma_ or _u_tok.text or "").strip().lower()
                                    if _u_tok is not None and _u_tok.pos_ == "NOUN" else "")
                         if _ul_rec and (_ul_rec not in _units):
@@ -22427,6 +22615,35 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # guard's real job is the COMMON-noun over-reach ("the tomatoes are 2-3 inches tall" → leave
             # to has_state). A PROPN named subject is never that case, so trust the grammar, not the
             # noisy NER. Grammatical (PROPN), subject-agnostic, NO word list.
+            # DIMENSION EMIT (issue #36): the degree adjective named a dimension the unit map did not
+            # ("28 feet long" → length, not height). File the measure VERBATIM (magnitude + unit —
+            # the W2 rule) under that dimension, as a PLACED quantity (so the meaning-level coverage
+            # gate reads it as the scalar it is), on the subject. The degree adjective + the measure
+            # span are claimed with the subject, so the copula-state chain never re-files the
+            # dimension word as a state ("sailboat has_state long" was the live row, and the shared
+            # "long" state node then bled one boat's answer into another's). When the dimension is a
+            # KNOWN rel whose head types refuse this subject, fall through to the Q8 generic lane
+            # below (unchanged). Fail-safe: any error → the legacy path with the unit's attribute.
+            if _dim_override is not None:
+                try:
+                    _drel, _dtok, _utok = _dim_override
+                    _known_dim = (_drel in _rel_overlay_meta_map())
+                    if tok.pos_ == "PROPN" or not _known_dim \
+                            or _scalar_rel_admits_subject(_drel, _subj_et):
+                        _full = " ".join(p for p in ((num_tok.text or "").strip(),
+                                                     (_utok.text or "").strip()) if p)
+                        _emit(subject, _drel, _full, verb_tok=head, obj_tok=num_tok,
+                              subj_tok=tok, scalar_datatype="quantity")
+                        _claim(tok, _utok, num_tok)  # degree word: state guard owns it (round 2, M12b)
+                        log.info("linguistics.copula_measure_dimension_emit",
+                                 subject=str(subject)[:48], dimension=_drel, measure=_full,
+                                 degree=(_dtok.text or "")[:24],
+                                 note="dimension read from the degree adjective (WordNet "
+                                      "attribute), not the unit; value kept verbatim")
+                        continue
+                    rel = _drel  # refused known dimension → Q8 generic lane below keeps the value
+                except Exception as _de:  # noqa: BLE001 — never block capture
+                    log.debug("linguistics.copula_measure_dimension_failed", error=str(_de)[:120])
             if tok.pos_ != "PROPN" and not _scalar_rel_admits_subject(rel, _subj_et):
                 # Q8 still steps aside for the PERSON-scoped rel (the gate would quarantine
                 # it) — but the step-aside must not ANNIHILATE the MAGNITUDE (issue #29 W2:
@@ -22451,7 +22668,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     if _full_measure:
                         _emit(subject, "related_measure", _full_measure,
                               verb_tok=head, obj_tok=num_tok, subj_tok=None,
-                              scalar_datatype="string")
+                              scalar_datatype="quantity")
                         _ul_rec = (_u_tok.lemma_ or _u_tok.text or "").strip().lower() \
                             if _u_tok is not None else ""
                         if _ul_rec and (_ul_rec not in _units):
@@ -22473,6 +22690,23 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # SCALAR emit: object is the STRING value; verb_tok=head so a date could bind (rare);
             # obj_tok=num_tok claims the number span. The rel carries tail_types={SCALAR} downstream so
             # the value lands in entity_attributes, never resolved to a UUID.
+            # A DEGREE-ADJECTIVE MEASURE KEEPS ITS UNIT (issue #52). "My dog is 60 centimeters
+            # tall" filed ``height = 60`` — the unit agreed with the degree word, so the #36
+            # dimension emit never fired and the bare magnitude rode this legacy emit: 60 of
+            # nothing. The value is the user's datum VERBATIM (the W2 rule), EXCEPT where the
+            # dimension's own metadata declares a bare count (``scalar_datatype = integer`` — age:
+            # "62 years old" → 62, the unit IS the attribute's scale). Metadata unreadable → the
+            # magnitude alone, byte-identical to before (fail-safe).
+            if _degree_unit_tok is not None and num_tok is not None:
+                try:
+                    _dt_meta = (_rel_overlay_meta_map().get(rel) or {})
+                    _dt = str(_dt_meta.get("scalar_datatype") or "").strip().lower()
+                    if _dt_meta and _dt != "integer":
+                        value = " ".join(p for p in (value, (_degree_unit_tok.text or "").strip())
+                                         if p)
+                        _claim(_degree_unit_tok)
+                except Exception:  # noqa: BLE001 — fail-safe: keep the magnitude
+                    pass
             _emit(subject, rel, value, verb_tok=head, obj_tok=num_tok, subj_tok=tok)
             _claim(tok)
 
@@ -26472,6 +26706,137 @@ def peel_discourse_frame(text: str):
         return None
     except Exception as e:  # noqa: BLE001 — fail-safe: decline = today's behaviour
         log.warning("linguistics.peel_discourse_frame_failed", error=str(e)[:160])
+        return None
+
+
+@dataclass(frozen=True)
+class UtteranceFrame:
+    """A sentence-initial frame set off from the clause it scopes (issue #35).
+
+    - ``frame``          : the frame span's surface (delimiter excluded), e.g. ``"Correction"``,
+      ``"I was wrong earlier"``.
+    - ``frame_lemmas``   : lowercased lemmas of the frame's content tokens.
+    - ``kind``           : ``"nominal"`` (a verbless NOUN/PROPN-headed label, "Correction:") or
+      ``"clausal"`` (a finite clause with its own overt subject, "I was wrong earlier,").
+    - ``frame_subject_is_self`` : a clausal frame whose subject is the 1st-person speaker.
+    - ``main_clause``    : the rest of the turn after the delimiter (the content the frame scopes).
+
+    Pure grammar — this type says WHERE a frame is, never WHAT it means. Whether a frame is a
+    speech-act REPAIR is decided by the caller against the tenant's grown correction cues."""
+    frame: str
+    frame_lemmas: frozenset
+    kind: str
+    frame_subject_is_self: bool
+    main_clause: str
+    # lemmas of the frame's HEAD token(s) only (a nominal label's head noun, a clausal frame's
+    # predicate) — "Correction tape:" heads on "tape", so a marker lemma sitting in a MODIFIER
+    # never makes the frame a repair (round 2).
+    head_lemmas: frozenset = frozenset()
+
+
+def split_utterance_frame(text: str):
+    """Split a sentence-initial FRAME off the clause it scopes. ``UtteranceFrame`` | None.
+
+    WHY (issue #35, live smoke): a repair frame that scopes the whole utterance —
+    ``"Correction: my favourite mineral is labradorite, not fluorite."`` /
+    ``"I was wrong earlier, my sailboat is 30 feet long."`` — is METALINGUISTIC: it says something
+    about the speaker's PRIOR utterance, not about the world. The router never saw it (spaCy makes
+    the label noun the sentence ROOT and hangs the real clause under it as ``acl``, so the
+    clause-initial ADV/INTJ marker scan and ``peel_discourse_frame``'s finite-ROOT test both miss
+    it), and the harvest filed the frame itself as content (an entity named ``correction`` holding
+    the new measurement; ``user feels wrong``).
+
+    THE CONSTRUCTION: a boundary mark (``_DISCOURSE_FRAME_DELIMITERS``) with, to its LEFT, either
+      * a VERBLESS fragment whose head(s) are NOUN/PROPN (a label — "Correction:", "Small
+        correction:"). ADV/INTJ single-word markers ("Actually,") are deliberately NOT frames here:
+        the existing clause-initial marker scan owns them, with their own ambiguity policy
+        ("Actually I do like pizza" is emphatic, not a repair); or
+      * a FINITE clause with its own overt subject and no subordinator (``mark``) — a
+        comma-spliced self-report ("I was wrong earlier,"). A fronted subordinate clause ("When I
+        was young, …") carries a ``mark`` and is declined;
+    and, to its RIGHT, a finite, non-interrogative predicate with its OWN overt subject located
+    after the mark (the scoped main clause). Parse-shape agnostic: the test is positional
+    (left span / right span of the mark), so it holds whether spaCy roots the sentence on the label
+    noun (``acl`` attachment) or on the main predicate (``nsubj``/``ccomp`` attachment) — both
+    were measured on the smoke turns.
+
+    Dependency/POS/morphology only; no word list. Fail-safe: any miss → None (today's behaviour).
+    """
+    doc = _parse(text)
+    if doc is None:
+        return None
+    try:
+        sent = next(iter(doc.sents), None)
+        if sent is None:
+            return None
+        for mark in sent:
+            if mark.pos_ != "PUNCT" or mark.text not in _DISCOURSE_FRAME_DELIMITERS:
+                continue
+            if mark.i <= sent.start or mark.i >= sent.end - 1:
+                continue
+            left = [t for t in doc[sent.start:mark.i] if not (t.is_punct or t.is_space)]
+            if not left:
+                continue
+            # RIGHT: a finite predicate with an overt subject of its own, inside the right span.
+            right_preds = [
+                t for t in doc[mark.i + 1:sent.end]
+                if t.pos_ in ("VERB", "AUX") and "Fin" in t.morph.get("VerbForm")
+                and any(c.dep_ in ("nsubj", "nsubjpass") and c.i > mark.i for c in t.children)
+            ]
+            if not right_preds:
+                continue
+            main_clause = doc[mark.i + 1:].text.strip()
+            if not main_clause or is_interrogative_clause(main_clause) is not False:
+                continue
+            left_verbal = [t for t in left if t.pos_ in ("VERB", "AUX")]
+            kind = None
+            self_subj = False
+            head_toks = []
+            if not left_verbal:
+                # the fragment's own head(s): tokens whose head lies OUTSIDE the left span (or is
+                # itself — a label noun spaCy made the sentence ROOT).
+                heads = [t for t in left
+                         if t.head.i == t.i or not (sent.start <= t.head.i < mark.i)]
+                if heads and all(h.pos_ in ("NOUN", "PROPN") for h in heads):
+                    kind = "nominal"
+                    head_toks = heads
+            else:
+                finite = [t for t in left_verbal if "Fin" in t.morph.get("VerbForm")]
+                if len(finite) != 1:
+                    continue
+                pred = finite[0]
+                # a fronted SUBORDINATE clause is not a frame: a subordinator (``mark``: "because",
+                # "if") or a wh-adverbial/relative subordinator (WRB/WDT/WP: "when", "whenever")
+                # anywhere in the left span ("When I was young, …").
+                if any(c.dep_ == "mark" for c in pred.children) or any(
+                        t.tag_ in ("WRB", "WDT", "WP", "WP$") for t in left):
+                    continue
+                subj = next((c for c in pred.children
+                             if c.dep_ in ("nsubj", "nsubjpass") and c.i < mark.i), None)
+                if subj is None:
+                    continue
+                kind = "clausal"
+                self_subj = bool(_is_first_person_personal_pronoun(subj))
+                head_toks = [pred] + [c for c in pred.children
+                                      if c.dep_ in ("acomp", "attr") and c.i < mark.i]
+            if kind is None:
+                continue
+            lemmas = frozenset(
+                (t.lemma_ or t.text or "").strip().lower() for t in left
+                if (t.lemma_ or t.text or "").strip())
+            return UtteranceFrame(
+                frame=doc[sent.start:mark.i].text.strip(),
+                frame_lemmas=lemmas,
+                kind=kind,
+                frame_subject_is_self=self_subj,
+                main_clause=main_clause,
+                head_lemmas=frozenset(
+                    (t.lemma_ or t.text or "").strip().lower() for t in head_toks
+                    if (t.lemma_ or t.text or "").strip()),
+            )
+        return None
+    except Exception as e:  # noqa: BLE001 — fail-safe: no frame = today's behaviour
+        log.warning("linguistics.split_utterance_frame_failed", error=str(e)[:160])
         return None
 
 

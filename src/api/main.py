@@ -11285,8 +11285,71 @@ def _ladder_answer_subject_ids(anchor, facts, classification_rels=None) -> set:
     return _chain
 
 
+# The IngestRequest SOURCE stamp the /learn writer puts on every row it files
+# (`learn_topic`: source="llm_learn" on the hierarchy batch AND on the interest anchor).
+# A writer stamp, like `_GROWN_TOPIC_TAXONOMY_SOURCES` — metadata, not a domain word.
+_LEARN_WRITER_SOURCES = frozenset({"llm_learn"})
+
+
+def _learn_anchored_topic(db, anchor, user_id) -> bool:
+    """True when the /learn writer anchored the SPEAKER to `anchor` — i.e. the user ran
+    /expand on this very node.
+
+    THE #31 R2 SEAM: `_grown_topic_answer_subject_ids` recognised an expanded topic ONLY by
+    an `entity_taxonomies` row titled with its surface. That row is a SIDE EFFECT of two
+    other writers — the ingest grouping mint (freq-gated: ≥2 distinct part_of members) and
+    the operational seeder (a second LLM call that can fail) — so whether a topic "counts"
+    depended on how many part_of edges the brain happened to emit. Measured on pre-prod:
+    /expand woodworking grew a taxonomy row, /expand beekeeping (one part_of edge) did not,
+    and "What do I know about beekeeping?" silenced `apiary subclass_of beekeeping` while
+    rendering only the interest line. The one row /learn writes for EVERY topic,
+    unconditionally, is the interest anchor: a row whose SUBJECT is the speaker and whose
+    OBJECT is the topic, stamped with the /learn writer's source. Read by structure (subject
+    = the seat's user, source = the writer stamp) — no rel name, no domain word. Fail-safe:
+    False on any error or missing input (today's taxonomy-only behaviour stands).
+    """
+    if not db or not anchor or not user_id or str(anchor) == str(user_id):
+        return False
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM staged_facts WHERE subject_id = %s AND object_id = %s"
+                "   AND provenance = ANY(%s) AND deleted_at IS NULL"
+                " UNION ALL "
+                "SELECT 1 FROM facts WHERE subject_id = %s AND object_id = %s"
+                "   AND provenance = ANY(%s) AND superseded_at IS NULL"
+                "   AND deleted_at IS NULL LIMIT 1",
+                (str(user_id), str(anchor), list(_LEARN_WRITER_SOURCES),
+                 str(user_id), str(anchor), list(_LEARN_WRITER_SOURCES)))
+            return cur.fetchone() is not None
+    except Exception as _lae:  # noqa: BLE001 — fail-safe: not recognised → today's gate
+        log.debug("learn_anchored_topic_probe_failed", error=str(_lae)[:120])
+        return False
+
+
+def _anchor_is_grown_topic(db, anchor, user_id=None, names=None) -> bool:
+    """The anchor IS an expanded topic place: an alias names a /learn-grown taxonomy row
+    (`_grown_topic_taxonomy`) OR the /learn writer anchored the speaker to it
+    (`_learn_anchored_topic`). One predicate for every reader that must recognise it.
+    Fail-safe False."""
+    if not anchor or not db:
+        return False
+    try:
+        if names is None:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT alias FROM entity_aliases WHERE entity_id = %s LIMIT 8",
+                    (str(anchor),))
+                names = [r[0] for r in cur.fetchall() if r and r[0]]
+        return bool(any(_grown_topic_taxonomy(db, _n) for _n in (names or ()))
+                    or _learn_anchored_topic(db, anchor, user_id))
+    except Exception as _age:  # noqa: BLE001 — fail-safe: not recognised
+        log.debug("anchor_is_grown_topic_probe_failed", error=str(_age)[:120])
+        return False
+
+
 def _grown_topic_answer_subject_ids(anchor, facts, db,
-                                    classification_rels=None) -> set:
+                                    classification_rels=None, user_id=None) -> set:
     """The spoken-chain for an /expand-grown TOPIC anchor: its own tree, both directions.
 
     THE ISSUE-#20 RESIDUAL: `_ladder_answer_subject_ids` scopes the ladder exemption UPWARD
@@ -11309,11 +11372,17 @@ def _grown_topic_answer_subject_ids(anchor, facts, db,
                 "SELECT alias FROM entity_aliases WHERE entity_id = %s LIMIT 8",
                 (str(anchor),))
             _names = [r[0] for r in cur.fetchall() if r and r[0]]
-        if not _names or not any(_grown_topic_taxonomy(db, _n) for _n in _names):
+        if not _names:
             return set()
-        _chain = _ladder_answer_subject_ids(
+        if not _anchor_is_grown_topic(db, anchor, user_id, names=_names):
+            return set()
+        _up = _ladder_answer_subject_ids(
             anchor, facts, classification_rels=classification_rels)
         _axis = set(classification_rels or ()) or set(_LADDER_RELS)
+        # The DOWN walk starts at the ANCHOR ONLY (round-2 critic G1): seeding it from the
+        # whole up-chain admitted SIBLING topics under a shared parent (cheesemaking and
+        # brewing both subclass_of food preparation → the brewing tree rode along).
+        _down = {str(anchor)}
         _changed = True
         while _changed:
             _changed = False
@@ -11323,12 +11392,12 @@ def _grown_topic_answer_subject_ids(anchor, facts, db,
                         continue
                     _sid = _fact_entity_id(f, "subject")
                     _oid = _fact_entity_id(f, "object")
-                    if _oid in _chain and _sid and _sid not in _chain:
-                        _chain.add(_sid)
+                    if _oid in _down and _sid and _sid not in _down:
+                        _down.add(_sid)
                         _changed = True
                 except Exception:  # noqa: BLE001 — a malformed row never sinks the chain
                     continue
-        return _chain
+        return set(_up) | _down
     except Exception as _gte:  # noqa: BLE001 — fail-safe: empty chain → gate stands
         log.debug("grown_topic_chain_reconstruct_failed", error=str(_gte)[:120])
         return set()
@@ -13190,7 +13259,86 @@ _CORRECTION_MARKER_LEMMAS: frozenset = frozenset({
 _CESSATION_ADVMOD_LEMMAS: frozenset = frozenset({"long", "anymore", "more"})
 
 
-def _spacy_cue_route(text: str) -> tuple:
+def _tenant_correction_signals(user_id: str | None) -> list:
+    """The tenant's GROWN correction cues — ``[(pattern, pattern_type, confidence)]`` from its own
+    ``correction_signals`` table (seeded per tenant, grown by the re_embedder from LLM-marked
+    ``is_correction`` turns). Only LITERAL patterns are returned: a row carrying a regex
+    metacharacter (the ``is .+ not`` negation shapes) is a whole-clause pattern the dependency
+    detector already owns, and a DB-held regex is never compiled here. Fail-safe: no tenant / no
+    DSN / any error → ``[]`` (the frame then routes on the closed marker inventory alone)."""
+    if not user_id or user_id == "anonymous":
+        return []
+    dsn = os.getenv("POSTGRES_DSN")
+    if not dsn:
+        return []
+    try:
+        from psycopg2 import sql as psycopg2_sql
+        from src.provisioning.schema_manager import derive_user_slug_from_uuid as _dslug
+        _schema = f"faultline_{_dslug(user_id)}"
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    psycopg2_sql.SQL(
+                        "SELECT pattern, pattern_type, confidence FROM {}.correction_signals"
+                    ).format(psycopg2_sql.Identifier(_schema)))
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        out = []
+        for pattern, ptype, conf in rows or []:
+            p = " ".join(re.sub(r"[^\w\s']", " ", (pattern or "").lower()).split())
+            if not p or any(ch in (pattern or "") for ch in ".+*?[](){}|\\^$"):
+                continue
+            out.append((p, (ptype or "").strip().lower(), float(conf or 0.0)))
+        return out
+    except Exception as e:  # noqa: BLE001 — fail-safe: no grown cue, never a destructive route
+        log.warning("spacy_cue_route.correction_signals_unreadable", error=str(e)[:160])
+        return []
+
+
+def _repair_frame(text: str, user_id: str | None = None):
+    """Is ``text`` opened by a speech-act REPAIR frame? → ``(UtteranceFrame, tier)`` | None.
+
+    Issue #35. ``linguistics.split_utterance_frame`` finds WHERE a sentence-initial frame is (pure
+    grammar); this decides whether it is a REPAIR of the speaker's prior utterance, from two
+    signals the engine already owns — never a new word list:
+      * a NOMINAL label frame ("Correction:", "Small correction:") whose lemmas meet the closed
+        repair-marker inventory ``_CORRECTION_MARKER_LEMMAS`` (the same set the clause-initial
+        marker scan uses) or whose surface matches a grown ``correction_signals`` literal;
+      * a CLAUSAL frame whose subject is the SPEAKER ("I was wrong earlier,") and whose surface
+        matches a grown ``correction_signals`` literal of type ``contradiction`` — the speaker
+        asserting that their own earlier statement was false.
+    Tier: ``confident`` when the frame's evidence is at/above ``INTENT_SUPERSEDE_MIN_CONF`` (a
+    marker-lemma label, or the matched grown row's STORED weight); otherwise ``ambiguous`` (the
+    caller corroborates with the LLM). Fail-safe: any miss → None (today's route)."""
+    try:
+        from src.extraction.linguistics import split_utterance_frame
+        fr = split_utterance_frame(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if fr is None:
+        return None
+    if fr.kind == "nominal" and (fr.head_lemmas & _CORRECTION_MARKER_LEMMAS):
+        return (fr, "confident")
+    if fr.kind == "clausal" and not fr.frame_subject_is_self:
+        return None
+    # A nominal label is judged by its HEAD only ("Mistake log:" heads on "log"); a clausal
+    # self-report by its whole surface (the grown "was wrong" row spans the predicate).
+    _src = " ".join(sorted(fr.head_lemmas)) if fr.kind == "nominal" else fr.frame.lower()
+    _surface = " " + " ".join(re.sub(r"[^\w\s']", " ", _src).split()) + " "
+    _best = None
+    for pattern, ptype, conf in _tenant_correction_signals(user_id):
+        if fr.kind == "clausal" and ptype != "contradiction":
+            continue
+        if f" {pattern} " in _surface and (_best is None or conf > _best):
+            _best = conf
+    if _best is None:
+        return None
+    return (fr, "confident" if _best >= INTENT_SUPERSEDE_MIN_CONF else "ambiguous")
+
+
+def _spacy_cue_route(text: str, user_id: str | None = None) -> tuple:
     """Deterministic spaCy-parse cue route for the correction/retraction bypass.
 
     Returns ``(route, tier)``:
@@ -13244,6 +13392,14 @@ def _spacy_cue_route(text: str) -> tuple:
                     return ("RETRACTION", "confident")
         except Exception as _ce:  # noqa: BLE001 — fail-safe: never route destructive on an error
             log.warning("spacy_cue_route.cessative_resolve_failed", error=str(_ce)[:160])
+    # CORRECTION (repair FRAME, issue #35): a sentence-initial label/self-report frame that
+    # scopes the utterance as a repair ("Correction: …", "I was wrong earlier, …"). The marker
+    # scan below only sees a clause-initial ADV/INTJ, and spaCy roots these turns on the label
+    # noun — so before this branch they fell through to GLiNER2/affect as a STATEMENT and the
+    # frame itself was filed as a fact. See ``_repair_frame``.
+    _rf = _repair_frame(text, user_id)
+    if _rf is not None:
+        return ("CORRECTION", _rf[1])
     _marker = bool(d.clause_initial_markers & _CORRECTION_MARKER_LEMMAS)
     # CORRECTION (confident): explicit 1st-person repair ("I meant …"), OR a repair marker that
     # co-occurs with contrastive negation ("Actually … Luna, not Bella").
@@ -13860,6 +14016,200 @@ def _retire_scalar_value_siblings(db_conn, entity_id: str, attribute: str,
                  note="same-(subject, rel) rows carrying the superseded value retired "
                       "(facts superseded_at / staged deleted_at)")
     return retired
+
+
+# ── ISSUE #52: a measure is a scalar in every store ─────────────────────────────────────────────
+# Live: the atomizer split "my canoe is 5 meters long, not 4" into the
+# asserted measure and "My canoe is not 4 meters long." The negated measure was routed to `facts`
+# by the negation firewall (polarity lives there), which RESOLVED the quantity "4 meters" as an
+# object entity; and the negation-retire block retired the live `length` WITHOUT comparing values
+# — so "not 4 meters" retired the "5 meters" the same turn had just asserted.
+
+def _edge_is_negated_quantity(edge) -> bool:
+    """A NEGATED edge whose object the extractor typed as a QUANTITY (``object_datatype``, the
+    scalar datatype vocabulary of migration 101 — the same label the measure chains emit). Such an
+    edge cancels a VALUE; its object is a magnitude + unit, never a referent, so it has no place
+    in ``facts`` (which needs an entity object). Fail-safe → False (today's routing)."""
+    try:
+        if str(getattr(edge, "polarity", "affirmed") or "affirmed").strip().lower() != "negated":
+            return False
+        if str(getattr(edge, "object_datatype", "") or "").strip().lower() == "quantity":
+            return True
+        # the rel's OWN metadata declares a quantity value (seeded height/weight): an agreeing
+        # "<N> <unit> tall" measure rides the rel's datatype rather than stamping one per edge
+        _meta = _rel_meta(str(getattr(edge, "rel_type", "") or "").strip().lower()) or {}
+        return str(_meta.get("scalar_datatype") or "").strip().lower() == "quantity"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _routed_fact_provenance(source: str | None, edge_provenance: str | None) -> str:
+    """The provenance the /ingest router assigns an edge (``ingest.provenance_routed``), as a
+    pure function of the request source and the edge's own stamp — for a seam that must decide
+    authority BEFORE the router runs (the negated-quantity lane runs at object resolution, so
+    the quantity is never minted). Mirrors the router's branches exactly: llm_learn → llm_learned;
+    unattested/document → llm_inferred; mcp/assistant → user_stated; else the edge's own
+    canonical stamp, non-canonical → llm_inferred."""
+    if source == "llm_learn":
+        return "llm_learned"
+    if source in ("unattested", "document"):
+        return "llm_inferred"
+    if source in ("mcp", "assistant"):
+        return "user_stated"
+    if edge_provenance in ("user_stated", "llm_inferred", "llm_learned"):
+        return edge_provenance
+    return "llm_inferred"
+
+
+def _leading_magnitude(text) -> float | None:
+    m = re.match(r"\s*([-+]?\d+(?:\.\d+)?)", str(text or "").replace(",", ""))
+    try:
+        return float(m.group(1)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _negation_cancels_value(live_texts: list[str], negated_value) -> bool:
+    """Does "X is NOT <negated_value>" cancel the live value? Exact (case/space-normalised)
+    equality with any text form of the live value, or — for a bare magnitude ("not 4") — the
+    same leading magnitude ("4 meters"). A negation of a DIFFERENT value cancels nothing: "my
+    canoe is not 4 meters long" says nothing against a live "5 meters"."""
+    neg = " ".join(str(negated_value or "").lower().split())
+    if not neg:
+        return False
+    lives = [" ".join(str(v).lower().split()) for v in (live_texts or []) if v is not None]
+    if neg in lives:
+        return True
+    try:
+        float(neg)
+        bare = True
+    except ValueError:
+        bare = False
+    if bare:
+        n = _leading_magnitude(neg)
+        return n is not None and any(_leading_magnitude(v) == n for v in lives)
+    return False
+
+
+def _retire_negated_scalar_value(db_conn, user_id, entity_id: str, attribute: str,
+                                 negated_value, *, cause: str = "negation_retire") -> int:
+    """Retire the live ``entity_attributes`` value at (entity, attribute) IFF the user-stated
+    negation cancels THAT value (``_negation_cancels_value``). Non-destructive: history snapshot
+    (``_record_scalar_supersession``) + same-slot sibling retirement + ``superseded_at`` /
+    ``valid_until`` stamp — the bi-temporal model the unconditional block used. Returns the rows
+    stamped. The caller owns the commit. Fail-safe: no live row / no match / error → 0."""
+    if not db_conn or not entity_id or not attribute:
+        return 0
+    with db_conn.cursor() as _sel:
+        _sel.execute(
+            "SELECT value_text, value_int, value_float, value_date,"
+            "       provenance, datatype, superseded_at, created_at"
+            "  FROM entity_attributes"
+            " WHERE entity_id = %s AND attribute = %s AND superseded_at IS NULL",
+            (entity_id, attribute))
+        _nr = _sel.fetchone()
+    if not _nr:
+        return 0
+    _texts = _scalar_value_texts(_nr[0], _nr[1], _nr[2], _nr[3])
+    if not _negation_cancels_value(_texts, negated_value):
+        log.info("ingest.negation_spares_other_value", entity=str(entity_id)[:16],
+                 attribute=attribute, negated=str(negated_value)[:40],
+                 live=str(_nr[0])[:40],
+                 note="the negation names a DIFFERENT value than the live one — nothing to "
+                      "retire (issue #52: 'not 4 meters' must never retire '5 meters')")
+        return 0
+    _prior = {"value_text": _nr[0], "value_int": _nr[1], "value_float": _nr[2],
+              "value_date": _nr[3], "provenance": _nr[4], "datatype": _nr[5],
+              "superseded_at": _nr[6], "created_at": _nr[7]}
+    _record_scalar_supersession(db_conn, user_id, entity_id, attribute, _prior, None,
+                                action="retired", cause=cause)
+    _retire_scalar_value_siblings(db_conn, entity_id, attribute, _texts)
+    with db_conn.cursor() as _cur:
+        _cur.execute(
+            "UPDATE entity_attributes"
+            "   SET superseded_at = now(), valid_until = now(), updated_at = now()"
+            " WHERE entity_id = %s AND attribute = %s AND superseded_at IS NULL",
+            (entity_id, attribute))
+        return _cur.rowcount or 0
+
+
+def _retire_scalar_slot_relational_twins(db_conn, entity_id: str, attribute: str) -> int:
+    """A SCALAR correction states the one value of a single-valued slot (``entity_attributes``
+    PK is (entity_id, attribute)). A live RELATIONAL row carrying the same (subject, rel) is that
+    slot in the wrong store — the pre-#52 negated-quantity row ``(canoe, length, <"4 meters">)``
+    is the live example — so the correction retires it (facts ``superseded_at``, staged
+    ``deleted_at``): "the old value is retired in whichever store holds it". Non-destructive.
+    Fail-safe: an error logs and returns 0; the correction itself still lands."""
+    if not db_conn or not entity_id or not attribute:
+        return 0
+    n = 0
+    for _sql in ("UPDATE facts SET superseded_at = now(), qdrant_synced = false "
+                 "WHERE subject_id = %s AND rel_type = %s AND superseded_at IS NULL",
+                 "UPDATE staged_facts SET deleted_at = now() "
+                 "WHERE subject_id = %s AND rel_type = %s AND deleted_at IS NULL"):
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute(_sql, (entity_id, attribute))
+                n += cur.rowcount or 0
+        except Exception as e:  # noqa: BLE001
+            log.warning("correct_fact.scalar_slot_twin_retire_failed",
+                        entity=str(entity_id)[:16], attribute=attribute, error=str(e)[:160])
+    if n:
+        log.info("correct_fact.scalar_slot_relational_twin_retired", entity=str(entity_id)[:16],
+                 attribute=attribute, rows=n,
+                 note="the corrected scalar slot's relational twin (same subject, same rel) "
+                      "retired — one slot, one live value, whichever store held the old one")
+    return n
+
+
+def _stated_measure_value(text: str, attribute: str, value):
+    """The corrected value AS STATED, when the correction LLM returned only its magnitude.
+
+    Live: "Correction: my canoe is 5 meters long, not 4." → the LLM's ``new_value='5'`` — the
+    unit dropped — and the scalar lane upserted ``length = 5``. The deterministic deriver reads
+    the same sentence as ``(canoe, length, '5 meters', quantity)``; when the LLM value is a bare
+    magnitude and the statement carries a measure (magnitude + unit) with it (preferring the
+    one filed under ``attribute``), the stated measure wins. Mirrors the identifier recovery
+    (``_recover_alnum_identifier_in_text``) for measures. Grammar-driven, no unit list.
+    Anything else (non-numeric value, no quantity measure, ambiguity, error) → ``value``
+    unchanged."""
+    v = str(value or "").strip()
+    try:
+        float(v.replace(",", ""))
+    except ValueError:
+        return value
+    try:
+        from datetime import datetime
+        from src.extraction import linguistics as _L
+        if not _L.linguistics_available():
+            return value
+        _texts = [text]
+        try:
+            _fr = _L.split_utterance_frame(text)
+            if _fr is not None and getattr(_fr, "main_clause", None):
+                _texts.insert(0, _fr.main_clause)
+        except Exception:  # noqa: BLE001
+            pass
+        attr = (attribute or "").strip().lower()
+        for _t in _texts:
+            cands = []
+            for f in _L.derive_sentence_facts(_t, datetime.now()) or []:
+                if getattr(f, "negated", False):
+                    continue
+                # a MEASURE: the magnitude followed by its unit word(s) — the quantity chains
+                # (`scalar_datatype='quantity'`) and the agreeing-dimension emit alike (#52)
+                obj = " ".join(str(f.object or "").split())
+                _toks = obj.split()
+                if _toks[:1] == [v] and len(_toks) > 1 and _toks[1][:1].isalpha():
+                    cands.append((str(f.rel_type or "").lower(), obj))
+            exact = [o for (r, o) in cands if r == attr]
+            pick = exact[0] if len(set(exact)) == 1 else (
+                cands[0][1] if len({o for (_r, o) in cands}) == 1 and cands else None)
+            if pick:
+                return pick
+    except Exception as e:  # noqa: BLE001 — fail-safe: the LLM value stands
+        log.warning("correct_fact.stated_measure_recover_failed", error=str(e)[:160])
+    return value
 
 
 def _scalar_retired_value_texts(db_conn, entity_id: str, attribute: str) -> list[str]:
@@ -18826,7 +19176,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         # live spaCy∧LLM agreement IS the gate, so there is no substring zoo to accrete into.
         # OFF-LOOP: spaCy parse (and, on the first request after boot, the ~2.7s lazy
         # `linguistics.model_loaded` load) — same event-loop-freeze class as GLiNER2 below.
-        _cue_route, _cue_tier = await asyncio.to_thread(_spacy_cue_route, text)
+        _cue_route, _cue_tier = await asyncio.to_thread(_spacy_cue_route, text, user_id)
 
         # TIER 1 — unambiguous dependency cue: deterministic route, no LLM.
         if _cue_route and _cue_tier == "confident":
@@ -22810,6 +23160,24 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     text = (_text_no_marker or req.text or "").strip()
     if not text:
         return {"edges": [], "spans": 0}
+
+    # 1a. REPAIR-FRAME PEEL (issue #35). A sentence-initial speech-act REPAIR frame
+    #     ("Correction: …", "I was wrong earlier, …") is ABOUT the speaker's prior utterance, not
+    #     content: harvested raw it minted an entity named "correction" carrying the corrected
+    #     measurement and filed (user, feels, wrong). Same detector the intent router uses
+    #     (``_repair_frame``), so the frame the route acted on is exactly the frame peeled here;
+    #     only the scoped main clause reaches the atomizer/spine. A non-repair frame is untouched.
+    #     Fail-safe: any miss → the full text (today's behaviour).
+    try:
+        _rf_h = await run_cpu(_repair_frame, text, user_id)
+    except Exception:  # noqa: BLE001
+        _rf_h = None
+    if _rf_h is not None and (_rf_h[0].main_clause or "").strip():
+        log.info("sentence_pipeline.repair_frame_peeled", user_id=user_id[:8],
+                 frame=_rf_h[0].frame[:48], kind=_rf_h[0].kind,
+                 note="metalinguistic repair frame is not content — only the scoped main "
+                      "clause is harvested")
+        text = _rf_h[0].main_clause.strip()
 
     # POSSESSIVE-PRESUPPOSITION RECOVERY accumulators. Every interrogative clause the firewall/gate
     # DROPS is collected here so its first-person possessive presupposition ("…for my Sony A7R IV?")
@@ -28828,6 +29196,24 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
     # "anonymous" shared-pool collapse (which also skipped SET search_path).
     user_id = _require_resolvable_user_id(req.user_id, "/ingest")
 
+    # LEARNED IS-A TYPE CHECK AT THE INGEST SEAM (issue #31 R2, round-2 G3b). Every
+    # source=llm_learn writer lands here — learn_topic's in-process ingest AND the MCP
+    # learn_facts tool, which POSTs its parsed edges straight to /ingest — so the check lives
+    # at the one door they share (strength on ingest), not in one caller. Only classification
+    # edges whose two ends carry concrete, different kinds are dropped (`_drop_learned_type_
+    # clashes`); every other edge passes untouched. Fail-open.
+    if (req.source or "") in _LEARN_WRITER_SOURCES and req.edges:
+        try:
+            _lv_in = [{"subject": e.subject, "rel_type": e.rel_type, "object": e.object,
+                       "subject_type": getattr(e, "subject_type", None),
+                       "object_type": getattr(e, "object_type", None), "_edge": e}
+                      for e in req.edges]
+            _lv_kept = _drop_learned_type_clashes(_lv_in, user_id)
+            if len(_lv_kept) != len(_lv_in):
+                req.edges = [d["_edge"] for d in _lv_kept]
+        except Exception as _lve:  # noqa: BLE001 — fail-open: the validator never sinks a write
+            log.warning("ingest.learn_type_validator_failed", error=str(_lve)[:160])
+
     # DEFERRED-REPLAY MARKER (transport, HEADER-only — never the body: the idempotency
     # key hashes edges and the seam pins byte-identity between attempts). The MCP seam's
     # retry lane (attempt >= 2) and deferred drain re-POST a byte-identical body for a
@@ -31310,6 +31696,44 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                     # carrying ``object_datatype`` is a SCALAR by construction even when its (novel)
                     # rel_type is not SCALAR-tailed in the seeded ontology — keep the VERBATIM value,
                     # never resolve it to a phantom UUID entity.
+                    # NEGATED QUANTITY (issue #52): "my canoe is NOT 4 meters long" cancels a VALUE.
+                    # The negation firewall below routes negations to `facts` (polarity lives
+                    # there), and `facts` needs an ENTITY object — so the quantity "4 meters" was
+                    # minted as an entity: (canoe, length, <"4 meters">). A quantity is never an
+                    # entity. The negation's whole content is the retirement of the value it names
+                    # (value-matched, user-stated only — the same authority gate as the negation-
+                    # retire block), with the history row as its durable record. The edge is then
+                    # dropped LOUDLY here, before the object would be resolved.
+                    if _edge_is_negated_quantity(edge):
+                        _nq_rows = 0
+                        if _routed_fact_provenance(req.source, getattr(edge, "fact_provenance",
+                                                                       None)) == "user_stated":
+                            try:
+                                _nq_rows = _retire_negated_scalar_value(
+                                    db, req.user_id, canonical_subject, edge.rel_type.lower(),
+                                    edge.object, cause="negation_retire")
+                                db.commit()
+                            except Exception as _nq_e:  # noqa: BLE001 — never sink the ingest
+                                try:
+                                    db.rollback()
+                                    if schema_name:
+                                        with db.cursor() as _r:
+                                            _r.execute(f"SET search_path TO {schema_name}")
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                log.warning("ingest.negated_quantity_retire_failed",
+                                            error=str(_nq_e)[:160])
+                        log.info("ingest.negated_quantity_value_lane",
+                                 entity=str(canonical_subject)[:16],
+                                 attribute=edge.rel_type.lower(), negated=str(edge.object)[:40],
+                                 retired=_nq_rows)
+                        _record_ingest_drop(
+                            dropped, edge, stage="negated_quantity",
+                            reason=("a negated measure cancels a value; its quantity is never "
+                                    "an entity — matching live value retired" if _nq_rows else
+                                    "a negated measure cancels a value; its quantity is never "
+                                    "an entity — no live value matched it"))
+                        continue
                     if _edge_is_scalar(edge):
                         canonical_object = edge.object.lower().strip()
                         log.info("ingest.object_kept_as_scalar",
@@ -33224,49 +33648,12 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                     if str(getattr(edge, "polarity", "affirmed") or "affirmed").strip().lower() \
                             == "negated" and getattr(edge, "fact_provenance", None) == "user_stated":
                         try:
-                            # SS1 — snapshot the live row BEFORE stamping it retired, so the
-                            # negated value is recoverable history (the stamp alone retains the
-                            # value in the row, but the NEXT value at this slot would overwrite
-                            # it — the audit row is what makes the prior value durable), and
-                            # retire same-entity siblings carrying it (SS3).
-                            _neg_prior = None
-                            with db.cursor() as _neg_sel:
-                                _neg_sel.execute(
-                                    "SELECT value_text, value_int, value_float, value_date,"
-                                    "       provenance, datatype, superseded_at, created_at"
-                                    "  FROM entity_attributes"
-                                    " WHERE entity_id = %s AND attribute = %s"
-                                    "   AND superseded_at IS NULL",
-                                    (canonical_subject, edge.rel_type.lower()),
-                                )
-                                _nr = _neg_sel.fetchone()
-                                if _nr:
-                                    _neg_prior = {
-                                        "value_text": _nr[0], "value_int": _nr[1],
-                                        "value_float": _nr[2], "value_date": _nr[3],
-                                        "provenance": _nr[4], "datatype": _nr[5],
-                                        "superseded_at": _nr[6], "created_at": _nr[7],
-                                    }
-                            if _neg_prior is not None:
-                                _record_scalar_supersession(
-                                    db, req.user_id, canonical_subject,
-                                    edge.rel_type.lower(), _neg_prior, None,
-                                    action="retired", cause="negation_retire")
-                                _retire_scalar_value_siblings(
-                                    db, canonical_subject, edge.rel_type.lower(),
-                                    _scalar_value_texts(
-                                        _neg_prior["value_text"], _neg_prior["value_int"],
-                                        _neg_prior["value_float"], _neg_prior["value_date"]))
-                            with db.cursor() as _neg_cur:
-                                _neg_cur.execute(
-                                    "UPDATE entity_attributes"
-                                    "   SET superseded_at = now(), valid_until = now(),"
-                                    "       updated_at = now()"
-                                    " WHERE entity_id = %s AND attribute = %s"
-                                    "   AND superseded_at IS NULL",
-                                    (canonical_subject, edge.rel_type.lower()),
-                                )
-                                _retired = _neg_cur.rowcount or 0
+                            # VALUE-MATCHED (issue #52): the negation retires the live value only
+                            # when it names THAT value — "not 4 meters" never retires "5 meters".
+                            # The helper keeps SS1 (history snapshot) and SS3 (same-slot siblings).
+                            _retired = _retire_negated_scalar_value(
+                                db, req.user_id, canonical_subject, edge.rel_type.lower(),
+                                edge.object, cause="negation_retire")
                             db.commit()
                             if _retired:
                                 log.info("ingest.scalar_retired_by_negation",
@@ -37383,7 +37770,20 @@ def _annotate_date_derivation(fact: dict, prose: str) -> str:
             return prose
         if "(age " in prose:
             return prose
-        years = _derive_age_from_value(fact.get("object"))
+        # A BARE 4-DIGIT NUMBER IS A YEAR ONLY WHEN THE REL SAYS IT IS A DATE (issue #38).
+        # `_scalar_value_as_date` accepts "2020" as Jan 1 2020 — right for a date-typed slot,
+        # wrong for a count/rating that happens to have four digits: measured on pre-prod,
+        # "Your chess rating is 1520 (age 506)" (1520 read as the year 1520). The VALUE alone
+        # cannot tell the two apart, so the rel's own metadata decides — `scalar_datatype`
+        # 'date' or `category` 'temporal' (per-tenant overlay, no rel name). An ISO
+        # YYYY-MM-DD value is unambiguous and keeps deriving regardless.
+        _obj = fact.get("object")
+        if _YEAR_ONLY_RE.match(str(_obj if _obj is not None else "")):
+            _rmeta = _rel_meta(str(fact.get("rel_type") or "").strip().lower()) or {}
+            if not ((str(_rmeta.get("scalar_datatype") or "").lower() == "date")
+                    or (str(_rmeta.get("category") or "").lower() == "temporal")):
+                return prose
+        years = _derive_age_from_value(_obj)
         if years is None:
             return prose
         return f"{prose} (age {years})"
@@ -38580,15 +38980,29 @@ def _is_measure_interrogative(query_text: str) -> bool:
     anchored scalar read.
 
     FAIL-SAFE: layer unavailable / parse miss / any error → False (today's resolution)."""
+    return _measure_interrogative_degree(query_text) is not None
+
+
+def _measure_interrogative_degree(query_text: str) -> str | None:
+    """The DEGREE WORD of a measure interrogative ("how LONG is my kayak?" → ``"long"``), or None
+    when the query is not that frame. Same grammar as ``_is_measure_interrogative`` (its boolean
+    view): interrogative ``how`` as ``advmod`` of a copular ``acomp`` head or of an ADJ clause
+    predicate.
+
+    Issue #48: the degree word is the frame's ASPECT — it names the dimension asked for (bound
+    through the WordNet attribute pointer, the same one ingest's ``degree_adjective_dimension``
+    uses) and is NEVER a referent. The anchor resolver drops it from its entity candidates, so a
+    seat carrying a pre-#36 junk node named ``long`` cannot hijack "how long is my kayak?".
+    FAIL-SAFE: any error → None (today's resolution)."""
     if not query_text or not query_text.strip():
-        return False
+        return None
     try:
         from src.extraction.linguistics import _parse as _ling_parse, linguistics_available
         if not linguistics_available():
-            return False
+            return None
         doc = _ling_parse(query_text)
         if doc is None:
-            return False
+            return None
         _CLAUSE_DEPS = {"ROOT", "conj", "xcomp", "ccomp"}
         for tok in doc:
             if (tok.text or "").strip().lower() != "how" or tok.dep_ != "advmod":
@@ -38596,14 +39010,13 @@ def _is_measure_interrogative(query_text: str) -> bool:
             head = tok.head
             if head is None:
                 continue
-            if head.dep_ == "acomp":  # copular degree frame ("how long is X")
-                return True
-            if head.pos_ == "ADJ" and head.head is not None \
-                    and head.head.dep_ in _CLAUSE_DEPS:  # eventive ("how big does X get")
-                return True
-        return False
+            if head.dep_ == "acomp" or (  # copular degree frame ("how long is X")
+                    head.pos_ == "ADJ" and head.head is not None
+                    and head.head.dep_ in _CLAUSE_DEPS):  # eventive ("how big does X get")
+                return (head.text or "").strip().lower() or None
+        return None
     except Exception:  # noqa: BLE001 — fail-safe: undecidable → today's resolution
-        return False
+        return None
 
 
 class _MiAspectDeclined(Exception):
@@ -39501,6 +39914,13 @@ def resolve_anchor(
                      "is", "are", "tell", "show", "what", "who", "how", "do",
                      "does", "can", "could", "would", "know"} | set(_LEADING_DETERMINERS)
             _clean_words = [w.lower().strip('.,!?') for w in words if w.lower().strip('.,!?') not in _stop and len(w) >= 2]
+            # MEASURE-INTERROGATIVE DEGREE WORD IS AN ASPECT, NEVER A REFERENT (issue #48):
+            # "how LONG is my kayak?" — the degree word names the dimension asked for; a seat
+            # carrying a pre-#36 junk node named after it ((sailboat, has_state, long)) must not
+            # let the leftmost 1-gram "long" beat "kayak". Grammar (the degree frame), no list.
+            _mi_deg_word = _measure_interrogative_degree(query_text)
+            if _mi_deg_word:
+                _clean_words = [w for w in _clean_words if w != _mi_deg_word]
 
             # CONTAINMENT-ANCHOR (hierarchy descent): for a "give me the tree UNDER X"
             # query ("the full network hierarchy under datacenter dc-toronto",
@@ -41762,6 +42182,26 @@ def _detect_count_intent(t: str) -> dict:
             if _phrase:
                 return {"type_phrase": _phrase, "scope": _scope, "since": _since,
                         "window": _window}
+        # DO-SUPPORT WITH A NON-SPEAKER SUBJECT — decline (issue #38). "how many frames does
+        # my beehive have?" fronts a dummy do/does/did whose SUBJECT is another NP ("my
+        # beehive"), i.e. a count OF THAT NP's possessions. Shape A owns the speaker frame
+        # (do + I/you/we); Shape C's auxiliary set has no do-support, so its lazy head ran on
+        # to the next auxiliary and swallowed the clause — measured: type_phrase "frames does
+        # my beehive" and the render "You have 3 frames does my beehive on record." The count
+        # lane voices the SPEAKER's cardinality ("You have N …"), which is the wrong subject
+        # here; the possessor's own stored scalar answers the question, so the lane declines.
+        # Grammatical (closed-class do-support + pronoun), no domain word. Token scan, not a
+        # lazy-quantifier regex (linear; the polynomial-redos shape CodeQL flags).
+        _ds_toks = re.findall(r"[a-z']+", _t)
+        for _i in range(len(_ds_toks) - 1):
+            if _ds_toks[_i] == "how" and _ds_toks[_i + 1] == "many":
+                _tail = _ds_toks[_i + 2:]
+                for _j in range(1, len(_tail) - 1):
+                    if _tail[_j] in ("do", "does", "did"):
+                        if _tail[_j + 1] not in ("i", "you", "we"):
+                            return {}
+                        break
+                break
         # Shape C — EVENTIVE / PASSIVE THIRD-PERSON cardinality: "how many <TYPE> (were|was|are|
         # is|have|had|got) <predicate> …" where the COUNTED TYPE is itself the clause subject, NOT a
         # 1st/2nd-person possessor ("how many babies were BORN to friends and family …", "how many
@@ -47367,6 +47807,17 @@ def determine_path(
         'me', 'about', 'like', 'know', 'have', 'tell'
     }
     keywords -= noise_words
+    # THE DEGREE WORD IS THE ASPECT, NEVER A KEYWORD (issue #52). #48 dropped it from the anchor
+    # resolver's candidates only; here it stayed a keyword (live: keywords=['canoe', 'long']),
+    # so an unresolved scope deferred to fetch-all with "long" still in hand. The measure-
+    # interrogative admission below binds it to its dimension (WordNet attribute pointer); as a
+    # keyword it can only resolve the pre-#36 junk node named after it. Grammar, no list.
+    try:
+        _kw_degree = _measure_interrogative_degree(query_text)
+    except Exception:  # noqa: BLE001 — fail-safe: keywords unchanged
+        _kw_degree = None
+    if _kw_degree:
+        keywords.discard(_kw_degree)
 
     if not keywords:
         # Phase 0 may have already populated taxonomy_groups — only fall back to
@@ -47631,6 +48082,20 @@ def determine_path(
                     _asp = _mi_aspect_subject_pending
                     _asp_stem = _asp[:-3] if _asp and _asp.endswith("age") else _asp
                     _dose_frame = _asp_stem is not None
+                    # The degree word's dimensions (WordNet attribute pointer — the lexicon ingest
+                    # NAMED the stored attribute with, #36/#48). Read BEFORE the admission loop
+                    # (issue #52): an attribute whose NAME is the asked dimension is a member of
+                    # the measure family by construction, whatever its stored value looks like —
+                    # a pre-fix seat holds the unit-dropped ``length = 5`` that no unit test
+                    # admits, and the question fell to the unscoped fetch-all.
+                    _mi_dims = frozenset()
+                    if _mi_degree:
+                        try:
+                            from src.api.wordnet_ladder import degree_adjective_dimensions
+                            _mi_dims = degree_adjective_dimensions(
+                                _measure_interrogative_degree(query_text) or "")
+                        except Exception:  # noqa: BLE001 — fail-safe: keep the family read
+                            _mi_dims = frozenset()
                     for _attr, _val in cur.fetchall():
                         if not _attr:
                             continue
@@ -47640,7 +48105,7 @@ def determine_path(
                         _vt = str(_val or "").lower()
                         if not any(ch.isdigit() for ch in _vt):
                             continue  # a measurement carries a quantity
-                        _family = _a in _mv
+                        _family = _a in _mv or _a.replace("_", " ") in _mi_dims
                         if not _family and _dose_frame:
                             _a_stem = _a.rstrip("e")
                             _family = (_a == "quantity") or (
@@ -47669,6 +48134,27 @@ def determine_path(
                         if _family:
                             path.scalar_rels.append(_a)
                             _mi_admitted.append(_a)
+                    # DEGREE → DIMENSION BINDING (issue #48). The degree word names the dimension
+                    # asked for through the SAME WordNet attribute pointer ingest used to NAME the
+                    # stored attribute (#36 degree_adjective_dimension: "16 feet long" → length).
+                    # When the anchor's admitted family holds that dimension, the question binds to
+                    # it alone ("how long" → length, never the kayak's width) and the row is on-topic
+                    # by construction. No bound row → the family admission stands unchanged
+                    # (fail-toward-not-losing: "how big" has no stored `size` on most seats).
+                    if _mi_degree and _mi_admitted:
+                        _mi_bound = [a for a in _mi_admitted
+                                     if a.replace("_", " ") in _mi_dims]
+                        if _mi_bound:
+                            for _a in _mi_admitted:
+                                if _a not in _mi_bound and _a in path.scalar_rels:
+                                    path.scalar_rels.remove(_a)
+                            _mi_admitted = _mi_bound
+                            for _a in _mi_bound:
+                                if _a not in (path.aspect_bound_rels or []):
+                                    path.aspect_bound_rels.append(_a)
+                            log.info("determine_path.degree_dimension_bound",
+                                     dims=sorted(_mi_dims)[:6], bound=_mi_bound,
+                                     query=query_text[:50])
                     if not _mi_admitted and _mi_aspect_subject_pending and not _mi_degree:
                         # The mirror frame's aspect bound NOTHING on this anchor — decline the
                         # whole admission loudly (a resolution, never a failure; no family is
@@ -49351,8 +49837,13 @@ def fetch_facts_from_anchor(
                             user_id=user_id,
                         )
                     else:
-                        # Non-user anchor: keep the original safety fallback.
+                        # Non-user anchor: keep the original safety fallback. The
+                        # projection computed above ran while nothing was scoped (it is
+                        # structural/axis rels only) — reset it, or the downstream
+                        # `if _direct_scope_rels:` gates project the anchor's 1-hop
+                        # neighbourhood onto structural rels and drop its own rows (#39).
                         path.fetch_all_details = True
+                        _direct_scope_rels = None
                         log.warning(
                             "query.empty_path_fallback_to_fetchall",
                             reason="no_taxonomy_or_rels_matched",
@@ -51752,6 +52243,32 @@ def _topic_gate_should_run(path, topic=None) -> bool:
     return chain[0] not in groups
 
 
+def _residual_direct_facts(residual: str, facts: list) -> list:
+    """Knowledge-ask residual the corpus never measured: keep facts that NAME it, verbatim.
+
+    WordNet/SemCor cannot rank a residual like "woodworking" (count 0 = "not measured", see
+    `_topic_lemmas`), so there is no expansion to judge by — but the user's own word is still
+    the strongest evidence there is. A fact whose surface carries one of the residual's
+    open-class tokens is on the topic; one that carries none is not (measured: the
+    membership walk under "woodworking" also delivered `ccd camera part_of astrophotography`,
+    which an undecidable-keeps-all gate would have spoken). NO expansion here — a direct
+    token match only, the tightest tier `_topic_grounded_facts` already trusts. Tokens come
+    from the parser's own open-class candidates (`_query_topic_candidates`); raw ≥3-letter
+    tokens when the parser is unavailable. No tokens at all → undecidable → facts unchanged.
+    """
+    try:
+        _cands = _query_topic_candidates(residual)
+        if _cands is None:
+            _toks = {w for w in re.findall(r"[a-z]+", (residual or "").lower()) if len(w) >= 3}
+        else:
+            _toks = {w for s, l, _p in _cands for w in (s, l) if w and len(w) >= 2}
+        if not _toks:
+            return facts
+        return [f for f in facts if (_fact_surface_tokens(f) & _toks)]
+    except Exception:  # noqa: BLE001 — the gate must never break the recall it guards
+        return facts
+
+
 def _topic_grounded_facts(query_text: str, facts: list) -> list:
     """Drop facts that are not on the query's topic. Returns ``facts`` unchanged when undecidable.
 
@@ -51768,8 +52285,17 @@ def _topic_grounded_facts(query_text: str, facts: list) -> list:
         # same structural signal the abstention renderer already uses. No name list.
         if re.search(r"(?<=[a-z,;:]\s)[A-Z][a-zA-Z'’\-]{2,}", (query_text or "").strip()):
             return facts
-        _lemmas = _topic_lemmas(query_text)
+        # KNOWLEDGE-ASK FRAME (issue #31 R2): "What do I know about X?" is closed-class
+        # function words around the residual X (`_knowledge_ask_residual`). The frame's own
+        # verb must never compete for the topic — measured on the live seat: `woodworking` and
+        # `beekeeping` are SemCor-unmeasured, so `know` won the argmin as the only measured
+        # lemma and the gate dropped every row about the topic (13 → 0, honest-empty on a
+        # topic the user had just expanded). The topic is judged from the residual alone.
+        _ka_residual = _knowledge_ask_residual(query_text)
+        _lemmas = _topic_lemmas(_ka_residual or query_text)
         if not _lemmas:
+            if _ka_residual:
+                return _residual_direct_facts(_ka_residual, facts)
             return facts
         _topic = _lemmas[0]
         _expanded = _topic_expansion(_topic)
@@ -54464,6 +54990,43 @@ def _gliner_canonical_type(term: str, gmodel) -> str | None:
         return None
 
 
+# The two RESIDUAL buckets of the closed six-label GLiNER2 type system
+# (`_CANONICAL_ENTITY_TYPES`): everything inanimate lands in Object, everything abstract in
+# Concept — the same pair `learn_topic` already treats as abstract upper-ontology types. A
+# class match on one of them is therefore NOT kind evidence by itself (Person/Animal/
+# Organization/Location are kinds; "a thing" is not). Measured on pre-prod (issue #38): "What
+# do I know about sailing?" typed `sailing` into a residual bucket and the informative
+# abstention voiced sixteen unrelated owned rows (firewall rules, the router, tomato plants,
+# metformin…) as "context" — the fetch-all dump the abstention exists to stop. Under a residual
+# class a neighbour additionally needs LEXICAL kinship (`_residual_class_kinship`) — so the
+# pinned guitar→piano context (both noun.artifact) survives, sailing (noun.act) → sailboat
+# (noun.artifact) does not, and a term WordNet does not know gets no neighbour context.
+_RESIDUAL_UPPER_CLASSES = frozenset({"object", "concept"})
+
+
+def _residual_class_kinship(term: str, signal_words, class_label: str) -> bool:
+    """True when some neighbour type-signal word shares a WordNet noun lexicographer file with
+    the queried term (noun.Tops — the unique beginners — excluded, and the bare class label
+    itself is not kind evidence). A term WordNet does not know → False: under a residual class
+    there is then NO kind evidence at all, and a class-only match is exactly the unrelated
+    owned-object dump (round-2 critic G2: kitesurfing / pickleball / bouldering). The caller
+    then abstains bare. No word list: lexicon metadata only."""
+    t_lex = _wordnet_noun_lexnames(term)
+    if not t_lex:
+        return False
+    t_lex = set(t_lex) - {"noun.Tops"}
+    if not t_lex:
+        return False
+    for w in signal_words or ():
+        w = str(w or "").strip().lower()
+        if not w or w == class_label:
+            continue
+        w_lex = _wordnet_noun_lexnames(w)
+        if w_lex and (set(w_lex) - {"noun.Tops"}) & t_lex:
+            return True
+    return False
+
+
 def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_id: str,
                                   schema_name: str | None) -> dict | None:
     """INFORMATIVE ABSTENTION (read-time presentation, lean-query exception — same class as
@@ -54593,9 +55156,11 @@ def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_i
                             _sig = {_row[0].lower()}
                 except Exception:  # noqa: BLE001
                     _sig = set()
-            if _target_class in _sig:
-                return True
-            return any(_canon(_w) == _target_class for _w in _sig)
+            _hit = (_target_class in _sig
+                    or any(_canon(_w) == _target_class for _w in _sig))
+            if _hit and _target_class in _RESIDUAL_UPPER_CLASSES:
+                return _residual_class_kinship(_term, _sig, _target_class)
+            return _hit
 
         # Try each absent term (singularized) — the FIRST that grounds a matching neighbourhood
         # wins. A term that types to nothing, or whose L4 place has no grounded neighbour, is
@@ -54618,6 +55183,11 @@ def _fetch_informative_abstention(query_text: str, absent_terms: set, db, user_i
             _tq = _gliner_canonical_type(_term, gmodel)
             if not _tq:
                 continue
+            if _tq in _RESIDUAL_UPPER_CLASSES:
+                log.info("query.phase5.informative_abstention_residual_class",
+                         term=_term, queried_class=_tq,
+                         note="the queried noun typed only to a residual upper bucket — "
+                              "neighbours also need lexical kinship with it")
             _matched: list[dict] = []
             for _rel, _oid, _fc, _conf, _prov in _neighbours:
                 # HEADROOM, not the bare deadline. Abandoning exactly AT zero measured 2.07s on a
@@ -55580,6 +56150,15 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                 for w in query_lower.split()
                 if len(w.strip("?.,!'\"")) >= 4 and w.strip("?.,!'\"") not in stop
             ]
+            # The degree word of a measure interrogative names the ASPECT, never an entity
+            # (#48 anchor resolver, #52 keywords) — the same holds for this expansion, or a
+            # pre-#36 junk node named "long" re-enters every "how long …?" answer.
+            try:
+                _ec_degree = _measure_interrogative_degree(query_text)
+            except Exception:  # noqa: BLE001 — fail-safe: words unchanged
+                _ec_degree = None
+            if _ec_degree:
+                query_words = [w for w in query_words if w != _ec_degree]
 
             entity_matches: set[str] = set()
             if query_words and db:
@@ -56671,6 +57250,14 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                                 if _r[1]:
                                     _wl.extend(_r[1])
                     _classif = {c.lower() for c in _get_classification_rels(db)}
+                    # GROWN-TOPIC ANCHOR (issue #31 R2): when the anchor IS an expanded topic
+                    # place, its OWN classification rungs (`apiary subclass_of beekeeping`,
+                    # `beekeeping subclass_of agriculture`) are the question's answer, not an
+                    # off-axis chain — measured: the fuzzy membership guess (computer_system)
+                    # projected them out before the grown-topic voice could speak them. Only
+                    # rows TOUCHING the anchor are kept; the rest of the chain rule stands.
+                    _gt_anchor = (str(anchor) if anchor and anchor != user_id
+                                  and _anchor_is_grown_topic(db, anchor, user_id) else None)
                     _proj = []
                     for _f in gated_facts:
                         _rel = (_f.get("rel_type") or "").lower()
@@ -56686,6 +57273,10 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                             _proj.append(_f)
                         elif _is_scalar:
                             _proj.append(_f)              # member/anchor scalar (age, name, …)
+                        elif _rel in _classif and _gt_anchor and _gt_anchor in (
+                                str(_f.get("_subject_id") or _f.get("subject") or ""),
+                                str(_f.get("_object_id") or _f.get("object") or "")):
+                            _proj.append(_f)              # the expanded topic's own rung
                         elif _rel in _classif:
                             continue                      # classification chain → off membership axis
                         elif _rel in _axis_rels:
@@ -57576,7 +58167,8 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # doctrine stands for every other anchor). The growth gate `_is_grown_ontology_row`
         # is untouched — this only lifts the SILENCING of the asked tree's rungs.
         _grown_topic_chain = _grown_topic_answer_subject_ids(
-            anchor, facts_with_definition, db, classification_rels=_classif_axis)
+            anchor, facts_with_definition, db, classification_rels=_classif_axis,
+            user_id=user_id)
         if _grown_topic_chain and not _ladder_was_asked:
             log.info("query.phase5.grown_topic_rung_voice", query=query_text[:60],
                      chain=len(_grown_topic_chain),
@@ -57602,7 +58194,6 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                      dropped=len(facts_with_definition) - len(_spoken),
                      kept=len(_spoken), query=query_text[:60])
             facts_with_definition = _spoken
-
         # NOW strip the private UUID keys — the chain scoping above has read them, and
         # they must never leak into the API response (CLAUDE.md: no UUIDs). Synthetic
         # rows injected between the copy loop and here carry none, so the pop is a
@@ -58084,6 +58675,31 @@ def _apply_structural_correction(detection: dict, db_conn, schema_name: str) -> 
             pass
         log.warning("structural_correction.apply_failed", error=str(e)[:120])
         return False
+
+
+def _correction_subject_label(db, subject_uuid, user_id, old_value, new_value, fallback=None):
+    """The label a correction response names its SUBJECT by: the entity the write landed on.
+
+    Issue #37. The seat's own entity (its id IS the seat uuid) keeps the extractor's label (a
+    first-person correction about the speaker). Any OTHER entity is named by one of its OWN aliases,
+    preferring the preferred alias — but never one the correction itself just moved (a name
+    correction flips the preferred alias to the new value, so "✓ doughbi: pref_name=Clint →
+    Doughbi" would name the thing by the value being changed). Read-only; fail-safe → ``fallback``.
+    """
+    try:
+        if not subject_uuid or str(subject_uuid) == str(user_id):
+            return fallback
+        _moved = {str(v).strip().lower() for v in (old_value, new_value) if v}
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+                "ORDER BY is_preferred DESC, created_at, alias", (str(subject_uuid),))
+            for (alias,) in cur.fetchall() or []:
+                if alias and alias.strip().lower() not in _moved:
+                    return alias
+    except Exception as e:  # noqa: BLE001 — a label is presentation; never fail the correction
+        log.warning("correct_fact.subject_label_failed", error=str(e)[:120])
+    return fallback
 
 
 # ── SURGICAL FACT CORRECTION ENDPOINT ────────────────────────────────────────
@@ -59245,6 +59861,28 @@ def correct_fact(req: FactCorrectionRequest):
                         cur, subject_uuid, old_rel_type, old_value, req.user_id,
                         dsn=os.getenv("POSTGRES_DSN"), schema=schema_name,
                         text=req.text)
+                    if not _addr_via and not is_retraction:
+                        # STATED-VALUE HOLDER (issue #52): the extractor's attribute name is held
+                        # nowhere on the subject, but the correction's own stated measure already
+                        # IS a live value of the subject — the turn's harvest filed it (a typed
+                        # non-Person "tall" measure lands under the generic measure rel, while
+                        # the LLM names the seeded `height`). That row is the slot the user's words
+                        # name; writing the LLM's name would fork a second attribute carrying the
+                        # same measure. Exact value equality on the subject's own rows, unique.
+                        try:
+                            _sv = _stated_measure_value(req.text, old_rel_type, new_value)
+                            if _sv and _sv != new_value:
+                                cur.execute(
+                                    "SELECT attribute FROM entity_attributes WHERE entity_id = %s"
+                                    " AND superseded_at IS NULL AND lower(value_text) = lower(%s)",
+                                    (subject_uuid, _sv))
+                                _sv_attrs = sorted({r[0] for r in cur.fetchall() if r[0]})
+                                if len(_sv_attrs) == 1:
+                                    _addr_subj, _pinned_attr = subject_uuid, _sv_attrs[0]
+                                    _addr_via = "stated_value_holder"
+                        except Exception as _sv_e:  # noqa: BLE001 — keep the LLM's name
+                            log.warning("correct_fact.stated_value_holder_failed",
+                                        error=str(_sv_e)[:160])
                     if _addr_via:
                         subject_uuid = _addr_subj
                         log.info("correct_fact.scalar_target_addressed",
@@ -59363,6 +60001,15 @@ def correct_fact(req: FactCorrectionRequest):
                         # user-is-truth, so the value is trusted (no rejection) — we only TYPE it.
                         _corr_rel_meta = _rel_meta(_pinned_attr.lower()) or None
                         _corr_dt = (_corr_rel_meta or {}).get("scalar_datatype")
+                        # THE STATED MEASURE, NOT THE LLM'S MAGNITUDE (issue #52): the correction
+                        # LLM returns "5" for "my canoe is 5 meters long, not 4"; the sentence's
+                        # own quantity measure carries the unit.
+                        _stated_nv = _stated_measure_value(req.text, _pinned_attr, new_value)
+                        if _stated_nv != new_value:
+                            log.info("correct_fact.stated_measure_recovered",
+                                     attribute=_pinned_attr, llm_value=str(new_value)[:40],
+                                     stated=str(_stated_nv)[:40])
+                            new_value = _stated_nv
                         (value_text, value_int, value_float, value_date,
                          value_normalized, value_unit) = _coerce_scalar_typed(
                             new_value, _corr_dt, _corr_rel_meta)
@@ -59445,6 +60092,9 @@ def correct_fact(req: FactCorrectionRequest):
                             # — the prior value was superseded in place. Count it so a successful
                             # scalar correction reports facts_superseded >= 1 (user-is-truth landed).
                             _scalar_superseded = max(_scalar_superseded, 1)
+                            # ...and the same slot held RELATIONALLY (a pre-#52 negated quantity
+                            # minted as an entity) is retired too — one slot, one live value.
+                            _retire_scalar_slot_relational_twins(db, subject_uuid, _pinned_attr)
 
                         log.info("correct_fact.scalar_updated",
                                 entity=subject_uuid,
@@ -60982,10 +61632,17 @@ def correct_fact(req: FactCorrectionRequest):
                 new=f"{new_rel_type}={new_value}",
                 facts_superseded=_superseded_count)
 
+        # SUBJECT LABEL = the entity the write actually landed on (issue #37). The response used the
+        # extractor's own ``subject_name`` — "user" for every first-person possessive ("my sourdough
+        # starter is named Doughbi, not Clint") — so it announced "✓ user: pref_name=Clint → …" while
+        # the alias moved on the starter entity, reading as if the USER's own name had changed.
+        _subject_label = _correction_subject_label(
+            db, subject_uuid, req.user_id, old_value, new_value,
+            fallback=extraction.get("subject_name"))
         response = FactCorrectionResponse(
             status="corrected",
             subject_uuid=subject_uuid,
-            subject_name=extraction.get("subject_name"),
+            subject_name=_subject_label,
             old_rel_type=_reported_old_rel,
             old_value=old_value,
             new_rel_type=_reported_new_rel,
@@ -60994,7 +61651,7 @@ def correct_fact(req: FactCorrectionRequest):
             confidence=confidence,
             facts_superseded=_superseded_count,
             hierarchies_modified=[],
-            message=(f"✓ {extraction.get('subject_name')}: "
+            message=(f"✓ {_subject_label}: "
                      f"{_reported_old_rel}={old_value} → {_reported_new_rel}={new_value}")
         )
 
@@ -62866,6 +63523,120 @@ def _parse_learn_statements(text: str) -> list[dict]:
     return edges
 
 
+# The kind-bearing labels of the closed six-label type system that do NOT name a kind a
+# class can be checked against (the residual buckets — see `_RESIDUAL_UPPER_CLASSES`) plus
+# the no-type markers. A class is routinely typed Concept by the brain ("raspberry pi
+# (Object) is an instance of single-board computer (Concept)"), so these never refuse.
+_LEARN_KIND_UNDECIDABLE = frozenset({"", "unknown", "any", "concept", "scalar"})
+
+
+def _wordnet_noun_lexnames(phrase: str) -> frozenset | None:
+    """WordNet lexicographer files (noun.person, noun.artifact, noun.animal …) over ALL noun
+    senses of `phrase`, or None when WordNet does not know it / is unavailable. Metadata of
+    the lexicon itself — no word list. None = undecidable, never a refusal."""
+    try:
+        from . import wordnet_ladder as _wl
+        wn = _wl._wn()
+        if wn is None:
+            return None
+        syns = wn.synsets((phrase or "").strip().replace(" ", "_"), pos="n")
+        if not syns:
+            return None
+        return frozenset(s.lexname() for s in syns)
+    except Exception:  # noqa: BLE001 — undecidable, never a refusal
+        return None
+
+
+def _learned_classification_type_clash(edge: dict, stored_types: dict,
+                                       classification_rels) -> str | None:
+    """Reason string when a LEARNED classification edge cannot be an is-a, else None.
+
+    ISSUE #31 R2 (learn quality): the live brain staged `queen bee instance_of hive`,
+    `worker bee instance_of hive`, `beekeeper instance_of apiary`. An instance_of/subclass_of
+    edge asserts the OBJECT is a CLASS OF the SUBJECT, so the two ends must be of one kind.
+    Checked against what the tenant has already GROWN, subject-agnostically:
+
+      1. KIND CLASH — both ends carry a concrete kind (the tenant's stored
+         `entities.entity_type` when concrete, else the edge's declared type) and the kinds
+         differ: an Animal is never an instance of an Object (queen bee → hive).
+      A residual-bucket object (a class the brain typed Concept) is UNDECIDABLE and admitted.
+      A WordNet-lexname clash branch was tried and REMOVED (round-2 critic G3): lexicographer
+      files are not an is-a test — it refused `nurse instance_of profession` (noun.person vs
+      noun.act), `pilot instance_of occupation`, `carpenter instance_of trade`, `sourdough
+      subclass_of bread` and a pet named mocha `instance_of cat`. Residual accepted:
+      `beekeeper (Person) instance_of apiary (Concept)` is now admitted.
+
+    Only CLASSIFICATION rels (per-tenant `rel_types` P31/P279 metadata) are judged;
+    part_of and every other rel pass untouched. Returns None (admit) on any doubt.
+    """
+    try:
+        rel = str(edge.get("rel_type") or "").strip().lower()
+        if rel not in set(classification_rels or ()):
+            return None
+        subj = str(edge.get("subject") or "").strip().lower()
+        obj = str(edge.get("object") or "").strip().lower()
+        if not subj or not obj or subj == obj:
+            return None
+
+        def _kind(name, declared):
+            stored = str(stored_types.get(name) or "").strip().lower()
+            if stored and stored not in _LEARN_KIND_UNDECIDABLE:
+                return stored
+            return str(declared or "").strip().lower()
+
+        s_kind = _kind(subj, edge.get("subject_type"))
+        o_kind = _kind(obj, edge.get("object_type"))
+        s_concrete = s_kind not in _LEARN_KIND_UNDECIDABLE
+        o_concrete = o_kind not in _LEARN_KIND_UNDECIDABLE
+        if s_concrete and o_concrete and s_kind != o_kind:
+            return f"kind_clash:{s_kind}!={o_kind}"
+        return None
+    except Exception:  # noqa: BLE001 — a validator error admits (today's behaviour)
+        return None
+
+
+def _drop_learned_type_clashes(raw_edges: list[dict], user_id: str) -> list[dict]:
+    """Filter /learn edges through `_learned_classification_type_clash` against the tenant's
+    grown typing (stored entity types + per-tenant classification rels). Fail-open: any DB
+    error keeps every edge (the pre-validator behaviour)."""
+    if not raw_edges:
+        return raw_edges
+    stored: dict = {}
+    classif = None
+    try:
+        from src.provisioning.schema_manager import (
+            derive_user_slug_from_uuid, derive_schema_name)
+        _schema = derive_schema_name(derive_user_slug_from_uuid(user_id))
+        _dsn = os.environ.get("POSTGRES_DSN")
+        if _dsn and _schema:
+            _names = sorted({str(e.get(k) or "").strip().lower()
+                             for e in raw_edges for k in ("subject", "object")} - {""})
+            with psycopg2.connect(_dsn) as _vdb:
+                with _vdb.cursor() as _vc:
+                    _vc.execute("SET search_path TO %s", (_schema,))
+                    _vc.execute(
+                        "SELECT a.alias, e.entity_type FROM entity_aliases a"
+                        "  JOIN entities e ON e.id = a.entity_id"
+                        " WHERE a.alias = ANY(%s)", (_names,))
+                    for _a, _t in _vc.fetchall():
+                        if _t and str(_t).strip().lower() not in _LEARN_KIND_UNDECIDABLE:
+                            stored.setdefault(_a, _t)
+                classif = _get_classification_rels(_vdb)
+    except Exception as _ve:  # noqa: BLE001 — fail-open, logged
+        log.warning("learn_topic.type_validator_unavailable", error=str(_ve)[:160])
+    if classif is None:
+        classif = _get_classification_rels()
+    kept = []
+    for e in raw_edges:
+        why = _learned_classification_type_clash(e, stored, classif)
+        if why:
+            log.info("learn_topic.skip_type_clash_edge", subject=e.get("subject"),
+                     rel_type=e.get("rel_type"), object=e.get("object"), reason=why)
+            continue
+        kept.append(e)
+    return kept
+
+
 def _bind_orphans_to_seed(
     edges: list[dict], seed: str, binding_rel: str = "part_of"
 ) -> tuple[list[dict], list[str]]:
@@ -63770,6 +64541,8 @@ async def learn_topic(req: LearnTopicRequest):
         log.info("learn_topic.system_entity_edges_filtered",
                  topic=topic, skipped=skipped_system, kept=len(filtered_edges))
 
+    # Learned is-a edges are type-checked at the /ingest seam (source=llm_learn), which every
+    # learn writer shares — see `_ingest_impl` (issue #31 R2).
     raw_edges = filtered_edges
     if not raw_edges:
         log.warning("learn_topic.all_edges_filtered_as_system", topic=topic)

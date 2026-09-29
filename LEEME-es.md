@@ -172,6 +172,16 @@ una heurística incorrecta):
   prosa para el modelo; la reducción de sujeto de la abstención cae a la versión genérica en español.
 - La lematización nominal de `normalize_nominal_rel` (plural inglés) se aplica tal cual a nombres de
   relación españoles; el plural español no se invierte bien sin léxico (`colores`→`colore`).
+- **Actualización del motor inglés (incremento 1)**, tres piezas desactivadas sobre un análisis en
+  español (`_doc_is_spanish`, `Doc.lang_ == "es"`): (1) la reparación de compuestos nominales
+  partidos, que asume núcleo final (inglés) y invertiría el núcleo de `coche bomba`; (2) la
+  dimensión del adjetivo de grado (`28 feet long` → `length`), que consulta WordNet (léxico inglés)
+  sobre el arco `npadvmod` — `alto`/`largo` nunca se buscan allí y la unidad conserva su atributo;
+  (3) el brazo pasivo `is called/named N` para sustantivos no de parentesco — el nombramiento
+  pronominal (`mi perro se llama Fido`) sigue siendo de las cadenas `_chain_es_*`. El resto del
+  incremento (marco de reparación `Corrección:`, contraste de medida, negación que retira sólo el
+  valor nombrado, validador is-a de `/learn`) es independiente del idioma o se queda inerte por sí
+  solo (lectores de pregunta con `how`/`do`, arco Penn `neg`, `acomp`).
 
 ### Mejora del motor (uplift es-1): qué se corrigió y qué queda desactivado
 Verificado por `tests/test_spanish_uplift.py` (rojo en la base publicada, verde con la corrección,
