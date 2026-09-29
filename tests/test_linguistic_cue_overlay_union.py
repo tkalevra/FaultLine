@@ -149,13 +149,15 @@ def test_bootstrap_for_registered_categories_return_their_own_floor():
 def test_every_set_category_constant_is_registered():
     """The unregistered path is now a fault, so nothing shipped may be relying on it.
 
-    THIN_TYPE / UNIT_SCALAR / KINSHIP_GENDER / SOCIAL_ROLE / ROLE_NOUN / ALIAS_PREDICATE are KEYED
+    THIN_TYPE / UNIT_SCALAR / KINSHIP_GENDER / SOCIAL_ROLE / ROLE_NOUN / ALIAS_PREDICATE /
+    DIMENSION_ADJECTIVE / DIMENSION_VERB are KEYED
     classes: they never reach ``_bootstrap_for`` (``_resolve_keyed_map`` takes its floor as an
     argument), so they are legitimately absent from the SET registry.
     """
     keyed_only = {
         lco.THIN_TYPE_CATEGORY, lco.UNIT_SCALAR_CATEGORY, lco.KINSHIP_GENDER_CATEGORY,
         lco.SOCIAL_ROLE_CATEGORY, lco.ROLE_NOUN_CATEGORY, lco.ALIAS_PREDICATE_CATEGORY,
+        lco.DIMENSION_ADJECTIVE_CATEGORY, lco.DIMENSION_VERB_CATEGORY,
     }
     missing = []
     for name in dir(lco):

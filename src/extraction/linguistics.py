@@ -2268,6 +2268,9 @@ def _get_nlp():
             # …and stop spaCy's own exception table from shattering a cue surface the engine holds
             # (the seeded `id` was dead from the day it was seeded). Fail-safe: no DB → no change.
             _reconcile_cue_tokenizer_exceptions(_nlp)
+            # …and, on a NON-English (UD) pipeline, restore the Person feature a model drops from
+            # the language's first-person possessive determiners (DB cue class; see the helper).
+            _install_ud_morph_bridge(_nlp)
             log.info("linguistics.model_loaded", model=_SPACY_MODEL)
         except Exception as e:  # noqa: BLE001 — model not baked into the image → no-op layer
             log.warning("linguistics.model_load_failed", model=_SPACY_MODEL, error=str(e)[:160])
@@ -2551,6 +2554,218 @@ def _is_first_person_possessive(tok) -> bool:
         )
     except Exception:  # noqa: BLE001 — morphology probe must never crash extraction
         return False
+
+
+# ── UD POSSESSIVE BRIDGE (non-English installs) ───────────────────────────────────────────────
+# Two scheme gaps stand between a UD possessive determiner and every English-written possessive test:
+#   (1) THE LABEL. ClearNLP/Penn attaches "my" as ``poss``; UD v2 attaches the possessive determiner
+#       as ``det:poss`` (Italian "il mio cane" = det(il) + det:poss(mio)) or ``nmod:poss``. It is the
+#       same grammatical relation under another name, so ``_is_possessive_marker`` answers for both.
+#   (2) THE PERSON FEATURE. UD annotates person on possessives (``Person=1`` with ``Poss=Yes``), but
+#       it_core_news_sm drops it on mio/mia/miei/mie/nostro/… (measured: ``Poss=Yes|PronType=Prs``
+#       only), so the speaker's "mia figlia" reads as a third party everywhere ``Person=1 ∧ Poss=Yes``
+#       is tested — the deriver's possessive/naming chains AND the query's first-person hook
+#       (main._query_has_first_person_possessive). The possessive paradigm is a CLOSED class, so its
+#       first-person members are a per-language DB cue class (``first_person_possessive``, seeded by
+#       the language's migration, grown per tenant) and ``_ud_first_person_possessive_repair`` — a
+#       pipeline component, so every ``nlp(...)`` call site gets it — writes the missing feature back.
+#       Only ever ADDS ``Person=1`` to a token that already carries ``Poss=Yes`` and NO Person value;
+#       never touches an English (Penn) doc. Fail-safe: no DB / no rows / any error → doc unchanged.
+_UD_POSS_DEPS = frozenset({"det:poss", "nmod:poss"})
+_UD_MORPH_BRIDGE_COMPONENT = "faultline_ud_first_person_possessive"
+
+
+def _is_possessive_marker(tok) -> bool:
+    """True iff ``tok`` is a POSSESSIVE modifier of a nominal under EITHER label scheme.
+
+    Penn: ``dep_ == "poss"`` (unchanged — English reads exactly what it read before). UD: the
+    ``det:poss``/``nmod:poss`` subtypes carrying ``Poss=Yes``. A bare ``Poss=Yes`` pronoun in an
+    argument slot ("il libro è mio" / "the book is mine") is NOT a marker. Fail-safe → False."""
+    try:
+        if tok.dep_ == "poss":
+            return True
+        return tok.dep_ in _UD_POSS_DEPS and "Yes" in (tok.morph.get("Poss") or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _first_person_possessive_marker(tok) -> bool:
+    """True iff ``tok`` is a 1st-PERSON possessive marker ("my"/"our"/"mia"/"nostro") under either
+    scheme — the possessive that grounds to the USER. Morphology only (``Person=1``; on a UD model
+    that drops the feature the pipeline bridge restores it from the DB cue class). Fail-safe → False."""
+    try:
+        return _is_possessive_marker(tok) and tok.morph.get("Person") == ["1"]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _first_person_possessive_cues() -> frozenset[str]:
+    """The per-tenant ``first_person_possessive`` cue set (lemmas + surfaces). Empty floor: DB-down
+    or an unseeded tenant → empty → the bridge repairs nothing (today's behaviour)."""
+    try:
+        from src.api import linguistic_cue_overlay  # deferred: avoid import cycle / hard dep
+        return linguistic_cue_overlay.resolve_first_person_possessives(
+            os.environ.get("POSTGRES_DSN", "")) or frozenset()
+    except Exception as e:  # noqa: BLE001
+        log.warning("linguistics.first_person_possessive_resolve_failed", error=str(e)[:160])
+        return frozenset()
+
+
+def _ud_first_person_possessive_repair(doc):
+    """Pipeline component body: add ``Person=1`` to a ``Poss=Yes`` token that has no Person value
+    and whose lemma or surface is a ``first_person_possessive`` cue. English (Penn) docs pass through
+    untouched. Returns the doc (spaCy component contract). Fail-safe → doc unchanged."""
+    try:
+        if (getattr(doc, "lang_", "") or "").strip().lower() in ("", "en"):
+            return doc
+        cands = [t for t in doc
+                 if "Yes" in (t.morph.get("Poss") or []) and not t.morph.get("Person")]
+        if not cands:
+            return doc
+        cues = _first_person_possessive_cues()
+        if not cues:
+            return doc
+        for t in cands:
+            if ((t.lemma_ or "").strip().lower() in cues
+                    or (t.text or "").strip().lower() in cues):
+                feats = t.morph.to_dict()
+                feats["Person"] = "1"
+                t.set_morph(feats)
+    except Exception as e:  # noqa: BLE001 — a morphology repair must never break a parse
+        log.warning("linguistics.ud_possessive_repair_failed", error=str(e)[:160])
+    return doc
+
+
+def _ud_morph_bridge_entry(doc):
+    # Stable trampoline: the registered component resolves the CURRENT module's function on every
+    # call, so a test's importlib.reload never leaves the pipeline calling a stale module's globals.
+    import sys as _sys
+    _mod = _sys.modules.get(__name__)
+    fn = getattr(_mod, "_ud_first_person_possessive_repair", None) if _mod else None
+    return fn(doc) if fn is not None else doc
+
+
+def _install_ud_morph_bridge(nlp) -> None:
+    """Append the UD possessive bridge to a NON-English pipeline (English is left byte-identical).
+    Fail-safe: any registration/add error → pipeline unchanged."""
+    try:
+        if (getattr(nlp, "lang", "") or "").strip().lower() in ("", "en"):
+            return
+        from spacy.language import Language
+        if not Language.has_factory(_UD_MORPH_BRIDGE_COMPONENT):
+            Language.component(_UD_MORPH_BRIDGE_COMPONENT, func=_ud_morph_bridge_entry)
+        if _UD_MORPH_BRIDGE_COMPONENT not in nlp.pipe_names:
+            nlp.add_pipe(_UD_MORPH_BRIDGE_COMPONENT, last=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("linguistics.ud_morph_bridge_install_failed", error=str(e)[:160])
+
+
+# ── UD PRONOMINAL NAMING FRAME ("mia figlia si chiama Anna" / "mi chiamo Marco") ───────────────
+# Romance languages name with an INHERENTLY REFLEXIVE verb (it. "chiamarsi"): the reflexive clitic
+# fills the object slot and the NAME is the predicative complement. it_core_news_sm (measured):
+#     mia figlia si chiama Anna  →  figlia nsubj, si PRON expl Clitic=Yes, chiama ROOT, Anna PROPN xcomp
+#     Mi chiamo Marco            →  Mi PRON expl Clitic=Yes Person=1, chiamo ROOT, Marco PROPN nsubj
+#     Io mi chiamo Marco         →  mi PRON obj Clitic=Yes Person=1, Marco PROPN obj
+# and the SAME verb without the clitic is plain "call": "Mia madre chiama Anna ogni giorno" (my
+# mother calls Anna every day) ALSO parses Anna as xcomp — so the clitic, not the complement label,
+# is what makes the clause a naming frame. UD expl page: an ``expl`` clitic of a pronominal verb
+# occupies the argument slot without being an argument. An ``obj`` clitic counts only when its
+# person EQUALS the verb's and is 1st/2nd ("mi chiamo" = I call myself; "mi chiama" = she calls
+# me), because a 1st/2nd-person clitic co-referring with the verb's own person is necessarily
+# reflexive, while a 3rd-person obj clitic ("lo chiama") is someone else. Grammar only — no verb
+# list; the verb itself is the DB naming_verb cue class. English (Penn) docs never reach this: their
+# naming frame is the passive the English chains already read, byte-for-byte unchanged.
+def _doc_is_ud(doc) -> bool:
+    """True when ``doc`` came from a NON-English (UD-scheme) pipeline. Fail-safe → False."""
+    try:
+        return (getattr(doc, "lang_", "") or "").strip().lower() not in ("", "en")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ud_reflexive_naming_clitic(verb):
+    """The reflexive clitic that makes ``verb`` a pronominal (naming) frame on a UD parse, or None."""
+    try:
+        if verb is None or not _doc_is_ud(verb.doc):
+            return None
+        _vp = verb.morph.get("Person") or []
+        for c in verb.children:
+            if c.pos_ != "PRON" or "Yes" not in (c.morph.get("Clitic") or []):
+                continue
+            # PERSON AGREEMENT, both arms: a reflexive clitic co-refers with the verb's subject, so
+            # its person must match the verb's. "Mi chiama Luca" (mi = 1st, chiama = 3rd) is "Luca
+            # calls me", never "my name is Luca" — it_core_news_sm still labels that mi ``expl``.
+            _cp = c.morph.get("Person") or []
+            if _cp and _vp and _cp != _vp:
+                continue
+            if c.dep_.startswith("expl"):
+                return c
+            if c.dep_ == "obj":
+                if _cp and _cp == _vp and _cp[0] in ("1", "2"):
+                    return c
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _naming_verb_member(tok, naming) -> bool:
+    """True when ``tok`` is a member of the naming-verb cue class. English: the lemma (unchanged).
+    UD: the lemma OR the lowercased surface — it_core_news_sm lemmatizes the 1sg "chiamo" to the
+    non-word "chire"/"chare" (measured), so a seeded inflected surface of the same closed class is
+    the only way the most common Italian naming sentence reaches its chain."""
+    try:
+        if (tok.lemma_ or "").strip().lower() in naming:
+            return True
+        return _doc_is_ud(tok.doc) and (tok.text or "").strip().lower() in naming
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _naming_frame_licensed(verb) -> bool:
+    """A naming-verb token heads a NAMING frame. English: always (the passive/participle shapes the
+    English chains test are their own gate — byte-identical). UD: only with the reflexive clitic or
+    a passive (``aux:pass``/``nsubj:pass``) — an active clitic-less "chiama Anna" is plain calling."""
+    try:
+        if not _doc_is_ud(verb.doc):
+            return True
+        if _ud_reflexive_naming_clitic(verb) is not None:
+            return True
+        return any(c.dep_ in ("aux:pass", "nsubj:pass") for c in verb.children)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _naming_name_complement(verb):
+    """The PROPN NAME a naming verb assigns, or None. Penn: oprd/attr/dobj/obj (unchanged). UD
+    reflexive frame: also ``xcomp`` (the predicative complement it_core_news_sm emits). Never a
+    determiner-introduced nominal (a TYPE) nor an interrogative."""
+    try:
+        deps = ("oprd", "attr", "dobj", "obj")
+        if _ud_reflexive_naming_clitic(verb) is not None:
+            deps = deps + ("xcomp",)
+        for c in verb.children:
+            if c.dep_ not in deps or c.pos_ != "PROPN":
+                continue
+            try:
+                if "Int" in (c.morph.get("PronType") or []) or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            return c
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _proper_name_span(tok) -> str:
+    """The full proper-name run headed by ``tok`` (its PROPN compound/flat children on either side),
+    lowercased — "Marco Rossi" = Marco + flat:name(Rossi). Fail-safe → the head surface."""
+    try:
+        parts = [tok] + [c for c in tok.children
+                         if c.pos_ == "PROPN" and c.dep_ in ("compound", "flat", "flat:name")]
+        return " ".join(t.text for t in sorted(parts, key=lambda t: t.i)).strip().lower()
+    except Exception:  # noqa: BLE001
+        return (getattr(tok, "text", "") or "").strip().lower()
 
 
 def _is_second_person_personal_pronoun(tok) -> bool:
@@ -15426,6 +15641,141 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     except Exception:  # noqa: BLE001 — fail-safe: has-measure detection is best-effort
         _has_measure_binds, _has_measure_suppress = [], set()
 
+    # ── UD MEASURE PRE-PASS (non-English installs) ──────────────────────────────────────────────
+    # The English measure chains read the Penn copula ("X is N <unit> <adj>": the copula ``be`` is
+    # the AUX ROOT) and the English possession light verb; on a UD parse the NONVERBAL PREDICATE is
+    # the clause head with the copula as its ``cop`` child (universaldependencies.org/u/dep/cop.html),
+    # and Italian states age with the possession verb ("ho 34 anni", "mia sorella ha 30 anni"). So on
+    # an Italian parse a measure fell to the SVO/count lanes as junk: (sorella, avere, anni) +
+    # (anni, instance_of, anno) + (sorella, avere_anni, 30). Three UD shapes, all keyed on a UNIT
+    # noun (the DB ``unit_scalar`` map) carrying a numeral (a ``nummod`` child, or the NUM token
+    # immediately before it — it_core_news_sm attaches "80" in "pesa 80 chili" to the verb):
+    #   • POSSESSION — unit is the obj of a ``possession_verb`` (avere): a measure OF the subject;
+    #   • DIMENSION — unit hangs off a gradable ADJ that governs a ``cop``: the adjective's
+    #     ``dimension_adjective`` row names the dimension (lungo → length), else the unit map;
+    #   • MEASURE VERB — unit hangs off a ``measure_verb`` (pesare, durare): the unit map's rel.
+    # Subject: the head's nominal subject (never the unit itself — the model sometimes makes the unit
+    # a second nsubj), else a 1st-person head (the verb, or the copula) → the speaker. Age keeps the
+    # bare number (English parity); any other dimension keeps "N unit" verbatim (the unit is part of
+    # the value). Negated → nothing. Grammar + DB cue classes only; English never runs this.
+    _ud_measure_binds: list = []
+    _ud_measure_suppress: set = set()
+    if _doc_is_ud(doc):
+        try:
+            _umap_ud = _unit_scalar_map()
+            try:
+                from src.api import linguistic_cue_overlay as _lco_ud
+                _dsn_ud = os.environ.get("POSTGRES_DSN", "")
+                _dim_ud = _lco_ud.resolve_dimension_adjective_map(_dsn_ud) or {}
+                _dimv_ud = _lco_ud.resolve_dimension_verb_map(_dsn_ud) or {}
+            except Exception:  # noqa: BLE001
+                _dim_ud, _dimv_ud = {}, {}
+            _poss_ud = _possession_verbs()
+
+            def _ud_dimension(_row, _unit_rel):
+                # A dimension row reads "<dimension><-<unit rel>,<unit rel>…": the head NAMES the
+                # dimension, and the row applies only when the unit's own rel is one it accepts —
+                # "dura 3 anni" (anni → age, durare accepts age) → duration; "è lungo 2 ore"
+                # (ore → duration, lungo accepts height) → no reading. Data, not code: the rows
+                # are per-language DB cues. A row without "<-" names the dimension for any unit.
+                _row = (_row or "").strip()
+                if not _row:
+                    return None
+                _dim, _sep, _acc = _row.partition("<-")
+                if not _sep:
+                    return _dim.strip() or None
+                return _dim.strip() if _unit_rel in {a.strip() for a in _acc.split(",")} else None
+
+            def _ud_not_present(_hd):
+                # A past/imperfect clause ("avevo 20 anni", "era lungo") or a subordinate temporal
+                # clause ("Quando avevo 20 anni…") does not state a CURRENT measure.
+                _toks = [_hd] + [c for c in _hd.children if c.dep_ in ("aux", "aux:pass", "cop")]
+                if any((t.morph.get("Tense") or [None])[0] in ("Imp", "Past") for t in _toks):
+                    return True
+                _cl = _hd.head if _hd.dep_ in ("aux", "cop") and _hd.head is not None else _hd
+                return _cl.dep_ == "advcl" or any(c.dep_ == "mark" for c in _cl.children) \
+                    or any(c.dep_ == "mark" for c in _hd.children)
+            for _u in doc:
+                if _u.pos_ != "NOUN":
+                    continue
+                _ul = (_u.lemma_ or "").strip().lower()
+                _ut = (_u.text or "").strip().lower()
+                _urel = _umap_ud.get(_ut) or _umap_ud.get(_ul)
+                if not _urel:
+                    continue
+                _unum = next((c for c in _u.children if c.dep_ == "nummod" and c.pos_ == "NUM"
+                              and any(ch.isdigit() for ch in (c.text or ""))), None)
+                if _unum is None and _u.i > 0:
+                    _prev = doc[_u.i - 1]
+                    if _prev.pos_ == "NUM" and any(ch.isdigit() for ch in (_prev.text or "")):
+                        _unum = _prev
+                if _unum is None:
+                    continue
+                _h = _u.head
+                if _h is None or _h.i == _u.i:
+                    continue
+                _hl = (_h.lemma_ or "").strip().lower()
+                _cop = next((c for c in _h.children if c.dep_ == "cop"), None)
+                # A unit with its own di-complement ("10 anni DI esperienza", "2 chili DI farina",
+                # "3 ore DI tempo") measures THAT complement, not the owner. it_core_news_sm
+                # attaches the complement to the unit (nmod) or to the verb (obl) — either way its
+                # case marker sits right after the unit. Structural, no preposition list.
+                _unit_compl = any(
+                    t.dep_ in ("nmod", "obl") and t.i > _u.i
+                    and any(c.dep_ == "case" and c.i == _u.i + 1 for c in t.children)
+                    for t in list(_u.children) + list(_h.children))
+                if _u.dep_ == "obj" and _h.pos_ in ("VERB", "AUX") and _hl in _poss_ud:
+                    if _unit_compl:
+                        continue
+                    _rel_m, _person_tok = _urel, _h
+                elif _h.pos_ == "ADJ" and _cop is not None:
+                    if _hl in _dim_ud:
+                        _rel_m = _ud_dimension(_dim_ud.get(_hl), _urel)
+                        if not _rel_m:
+                            continue  # the unit is not a measure of this dimension
+                    else:
+                        _rel_m = _urel
+                    _person_tok = _cop
+                elif _h.pos_ == "VERB" and _hl in _dimv_ud:
+                    _rel_m = _ud_dimension(_dimv_ud.get(_hl), _urel)
+                    if not _rel_m:
+                        continue
+                    _person_tok = _h
+                else:
+                    continue
+                if _ud_not_present(_h):
+                    _ud_measure_suppress.add(_h.i)
+                    continue
+                if _predicate_negated(_h):
+                    # a denied measure asserts nothing — and the SVO/count twins must not file one
+                    _ud_measure_suppress.add(_h.i)
+                    continue
+                _sj = next((c for c in _h.children
+                            if c.dep_ in ("nsubj", "nsubj:pass") and c.i != _u.i
+                            and c.pos_ in ("NOUN", "PROPN", "PRON")), None)
+                _subj_s = None
+                if _sj is not None:
+                    if _sj.pos_ == "PRON":
+                        if _is_first_person_personal_pronoun(_sj):
+                            _subj_s = "user"
+                    elif _sj.pos_ == "PROPN":
+                        _subj_s = _proper_name_span(_sj)
+                    else:
+                        _subj_s = (_np_phrase(_sj) or _sj.text or "").strip().lower()
+                elif (_person_tok.morph.get("Person") or []) == ["1"]:
+                    _subj_s = "user"
+                if not _subj_s:
+                    continue
+                if _rel_m == "age":
+                    _val_m = (_unum.text or "").strip()
+                else:
+                    _val_m = f"{(_unum.text or '').strip()} {(_u.text or '').strip()}".strip()
+                _ud_measure_binds.append({"head": _h, "unit": _u, "num": _unum, "subj": _sj,
+                                          "subject": _subj_s, "rel": _rel_m, "value": _val_m})
+                _ud_measure_suppress.add(_h.i)
+        except Exception:  # noqa: BLE001 — fail-safe: the measure reading is best-effort
+            _ud_measure_binds, _ud_measure_suppress = [], set()
+
     # ── QUANTITY-OF-SUBSTANCE PRE-PASS (SCALAR "<num> <unit> [of <substance>]") ────────────────────
     # "I take 500 milligrams of metformin", "my NAS has 40 terabytes of storage", "humans have 23
     # pairs of chromosomes", "the server has 64 gigabytes of RAM", "lisinopril 10 milligrams" — a
@@ -15482,7 +15832,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # (A) UNIT as the dobj/obj of a verb → possession (have) vs content (any other verb).
             if _dep in ("dobj", "obj") and _u.head is not None and _u.head.pos_ in ("VERB", "AUX"):
                 _v = _u.head
-                if _v.i in _ni_suppress or _v.i in _has_measure_suppress:
+                if _v.i in _ni_suppress or _v.i in _has_measure_suppress or _v.i in _ud_measure_suppress:
                     continue
                 if _ofnoun is None:
                     # ── DOSAGE APPOSITION, SIBLING-DOBJ SHAPE (dosage-frame, issue #14) ─────
@@ -16095,7 +16445,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not _is_light and not _is_eventive:
                 continue
             if (_v.i in _ni_suppress or _v.i in _has_measure_suppress
-                    or _v.i in _quantity_verb_suppress or _v.i in _verb_measure_suppress):
+                    or _v.i in _quantity_verb_suppress or _v.i in _verb_measure_suppress
+                    or _v.i in _ud_measure_suppress):
                 continue
             if any(_c.dep_ == "neg" for _c in _v.children):
                 continue
@@ -18489,6 +18840,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue  # the quantity-of chain owns this verb ("take 500 mg of metformin") — scalar
             if tok.i in _verb_measure_suppress:
                 continue  # the measure-verb chain owns this verb ("takes 45 minutes") — scalar, no SVO twin
+            if tok.i in _ud_measure_suppress:
+                continue  # the UD measure chain owns this verb ("ha 30 anni") — scalar, no SVO twin
             if tok.i in _alias_suppress:
                 continue  # the alias chain owns this verb ("goes by Dee") — no (she, go_by, dee)
             if tok.i in _reloc_suppress:
@@ -18503,7 +18856,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
-            if lemma in _naming:
+            if lemma in _naming or _naming_verb_member(tok, _naming):
                 continue  # naming construction → analyze_naming owns it (caller runs that seam)
             subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
             if subj_tok is None:
@@ -18893,7 +19246,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not lemma or lemma == "be":
                 continue
-            if lemma in _naming_verbs():
+            if lemma in _naming_verbs() or _naming_verb_member(tok, _naming_verbs()):
                 continue
             subj_tok = next((c for c in tok.children if c.dep_ in ("nsubj", "nsubjpass")), None)
             if subj_tok is None:
@@ -19414,7 +19767,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # a RELATIONAL/component/kinship Y → its inherent relation; a SORTAL Y → generic related_to.
         _relnouns = _relational_nouns()
         for tok in doc:
-            if tok.dep_ != "poss":
+            # UD possessive determiners attach as det:poss (see _is_possessive_marker); English
+            # reads exactly the ``poss`` arc it always did.
+            if not _is_possessive_marker(tok):
                 continue
             head = tok.head
             if head is None or head.pos_ not in ("NOUN", "PROPN"):
@@ -19538,12 +19893,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # collapses. Naming-cue + kinship/relational gated, grammatical (dep/pos), subject-agnostic,
             # NO noun literal. Mirrors the genitive-name interplay guards (a)/(a2) for the "is named"
             # surface. Only steps aside when the naming construction actually assigns a PROPN.
-            if head.dep_ in ("nsubjpass", "nsubj") and head.head is not None \
-                    and (head.head.lemma_ or "").strip().lower() in _naming_verbs() \
+            if head.dep_ in ("nsubjpass", "nsubj", "nsubj:pass") and head.head is not None \
+                    and _naming_verb_member(head.head, _naming_verbs()) \
+                    and _naming_frame_licensed(head.head) \
                     and (head.lemma_ or head.text or "").strip().lower() in (
                         _kinship_nouns() | _relational_nouns()) \
-                    and any(_c.dep_ in ("oprd", "attr", "dobj", "obj") and _c.pos_ == "PROPN"
-                            for _c in head.head.children):
+                    and _naming_name_complement(head.head) is not None:
                 continue
             # INTERPLAY GUARD (Fix B, Part 2 — flag-gated): "My sister is Sarah" is owned by the
             # COPULA-NAME chain (it binds the kin rel to the named person + registers the role as an
@@ -20956,6 +21311,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _emit(_owner, "also_known_as", proper_name, obj_tok=None, subj_tok=None)
             _claim(tok, proper)
 
+    def _chain_ud_measure(doc):
+        # Emits the UD measure pre-pass binds (see "UD MEASURE PRE-PASS"): (subject, <scalar rel>,
+        # value) with the head verb/adjective as the clause predicate; claims the unit + numeral.
+        for _b in _ud_measure_binds:
+            _emit(_b["subject"], _b["rel"], _b["value"], verb_tok=_b["head"], obj_tok=_b["num"],
+                  subj_tok=_b["subj"])
+            _claim(_b["unit"], _b["num"])
+
     def _chain_named_role(doc):
         # PASSIVE NAMING ON A POSSESSED ROLE (Fix 2 — the sibling of _chain_genitive_name for the "is
         # named/called" SURFACE). "My mother is named Sarah" / "My sister is called Kate" — the passive
@@ -20979,17 +21342,59 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # named-instance / naming seams. Fail-safe → no emit.
         _naming = _naming_verbs()
         _kin_rel_nouns = _kinship_nouns() | _relational_nouns()
+        _ud = _doc_is_ud(doc)
         for tok in doc:
             if tok.pos_ not in ("VERB", "AUX"):
                 continue
-            if (tok.lemma_ or "").strip().lower() not in _naming:
+            if not _naming_verb_member(tok, _naming):
+                continue
+            # UD: the verb names only inside the pronominal/passive frame ("si chiama"), never as a
+            # plain active "chiama Anna" (= calls Anna). English: always licensed (unchanged).
+            if not _naming_frame_licensed(tok):
                 continue
             # NEGATION ("my mother is not named Sarah") → absence; skip (parity with sibling chains).
-            if any(c.dep_ == "neg" for c in tok.children):
+            # UD has no ``neg`` arc — "non si chiama" is advmod + PronType=Neg (_predicate_negated).
+            if any(c.dep_ == "neg" for c in tok.children) or (_ud and _predicate_negated(tok)):
                 continue
             # the ROLE noun = the naming verb's passive/active subject, a COMMON noun.
             role = next((c for c in tok.children
-                         if c.dep_ in ("nsubjpass", "nsubj") and c.pos_ == "NOUN"), None)
+                         if c.dep_ in ("nsubjpass", "nsubj", "nsubj:pass") and c.pos_ == "NOUN"),
+                        None)
+            if role is None and _ud:
+                # UD FIRST-PERSON PRONOMINAL NAMING ("Mi chiamo Marco" / "Io mi chiamo Marco"): the
+                # reflexive clitic is 1st person, so the NAMED one is the speaker; the name is the
+                # PROPN complement (it_core_news_sm puts it in nsubj when the clitic took expl, or
+                # obj/xcomp). Emits the SAME edge English "My name is Marco" files:
+                # (user, also_known_as, <name>). A 3rd-person pro-drop "Si chiama Luca" has no
+                # referent in the clause → nothing (never guess). Grammar only.
+                _clit = _ud_reflexive_naming_clitic(tok)
+                # RELATIVE-CLAUSE NAMING ("Ho una figlia che si chiama Anna"): the subject is the
+                # relative pronoun (UD PronType=Rel, the naming verb an acl:relcl of its antecedent),
+                # so the NAMED one is the antecedent NP — the SAME (antecedent, also_known_as, name)
+                # edge English "I have a daughter who is called Anna" files. Grammar only.
+                _rel_subj = next((c for c in tok.children
+                                  if c.dep_ in ("nsubj", "nsubj:pass") and _is_relative_pronoun(c)),
+                                 None)
+                if _rel_subj is not None and tok.head is not None and tok.head.i != tok.i \
+                        and tok.head.pos_ == "NOUN":
+                    _nmr = _naming_name_complement(tok)
+                    _ante = (_np_phrase(tok.head) or tok.head.text or "").strip().lower()
+                    if _nmr is not None and _ante:
+                        _nr = _proper_name_span(_nmr)
+                        if _nr and _nr != _ante:
+                            _emit(_ante, "also_known_as", _nr, subj_tok=tok.head, obj_tok=_nmr)
+                            _claim(tok, _rel_subj, _nmr)
+                    continue
+                if _clit is not None and (_clit.morph.get("Person") or []) == ["1"]:
+                    _nm1 = _naming_name_complement(tok) or next(
+                        (c for c in tok.children
+                         if c.dep_ in ("nsubj", "nsubj:pass") and c.pos_ == "PROPN"), None)
+                    if _nm1 is not None:
+                        _n1 = _proper_name_span(_nm1)
+                        if _n1:
+                            _emit("user", "also_known_as", _n1, subj_tok=_clit, obj_tok=_nm1)
+                            _claim(tok, _clit, _nm1)
+                continue
             if role is None:
                 # BARE FIRST-PERSON POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Jonathan is MY name":
                 # the functional noun's argument is a 1st-person POSSESSIVE PRONOUN, so there is no
@@ -21029,28 +21434,53 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             role_lemma = (role.lemma_ or role.text or "").strip().lower()
             if role_lemma not in _kin_rel_nouns:
-                continue  # a TYPE/sortal role → owned by the named-instance/naming seams, never a kin bind
-            # the PROPER NAME assigned — the naming verb's oprd/attr/dobj PROPN complement.
-            proper = None
-            for c in tok.children:
-                if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN":
-                    try:
-                        if "Int" in c.morph.get("PronType") or c.tag_ in ("WP", "WP$", "WDT", "WRB"):
-                            continue
-                    except Exception:  # noqa: BLE001 — fail-safe
-                        pass
-                    proper = c
-                    break
+                if not _ud:
+                    continue  # a TYPE/sortal role → owned by the named-instance/naming seams, never a kin bind
+                # UD PRONOMINAL NAMING OF A THING ("il mio cane si chiama Fido"). The reflexive frame
+                # assigns the subject its NAME — the prefLabel (SKOS S13/S14) — so file
+                # (<subject NP>, pref_name, <name>) with preferred_label=True: the name lands IN the
+                # alias layer ON the subject entity (never a second entity, never L4 — THE HARD
+                # LINE), keyed by the full NP. The same shape the English passive-naming arm files
+                # for a non-kin head on the engine's development line; on this release English keeps
+                # its own path untouched, so this arm is gated to the UD parse.
+                # REFERENT GATE: the bare NP surface only identifies the SPEAKER's own thing — emit
+                # ONLY when the possessor is 1st person. A bare definite ("Il cane si chiama Rex"
+                # after "Mia sorella ha un cane") has no referent model to tell whose dog it is:
+                # keyed on the bare "cane" it would name — and a later "il mio cane si chiama Fido"
+                # would REBIND — the wrong entity. A third-party possessor ("il cane di Luca",
+                # "il suo cane") or a bare generic likewise stays unbound (never a wrong bind).
+                _nm = _naming_name_complement(tok)
+                if _nm is None or any(d.dep_ == "det" for d in _nm.children):
+                    continue
+                _nm_surface = _proper_name_span(_nm)
+                _subj_np = (_np_phrase(role) or role.text or "").strip().lower()
+                if not _nm_surface or not _subj_np or _nm_surface == _subj_np:
+                    continue
+                _poss_c = next((c for c in role.children if _is_possessive_marker(c)), None)
+                if _poss_c is None or not _first_person_possessive_marker(_poss_c):
+                    continue
+                if any(c.dep_ == "nmod" for c in role.children):
+                    continue  # "il mio amico di Luca…" — a genitive owner beside the possessive
+                _emit(_subj_np, "pref_name", _nm_surface, obj_tok=_nm, subj_tok=role,
+                      preferred_label=True)
+                _claim(tok, _nm)
+                continue
+            # the PROPER NAME assigned — the naming verb's oprd/attr/dobj PROPN complement (UD
+            # reflexive frame: also xcomp — see _naming_name_complement).
+            proper = _naming_name_complement(tok)
             if proper is None:
                 continue
             proper_name = (proper.text or "").strip().lower()
+            if _ud:
+                proper_name = _proper_name_span(proper)
             if not proper_name or proper_name == role_lemma:
                 continue
             # the POSSESSOR of the role noun: a 1st-person poss pronoun ("my"/"our") → user; a PROPN/NOUN
             # possessor ("John's mother is named Susan") → that person. Grammar (Poss morphology / PROPN),
             # no token list. A frame with no possessor is dropped (never fabricate the anchor).
+            # UD: the possessive determiner is ``det:poss`` (see _is_possessive_marker).
             possessor = None
-            poss_tok = next((c for c in role.children if c.dep_ == "poss"), None)
+            poss_tok = next((c for c in role.children if _is_possessive_marker(c)), None)
             if poss_tok is not None:
                 try:
                     _is_first = (poss_tok.morph.get("Person") == ["1"]
@@ -23684,7 +24114,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
          _chain_dated_occurrence,
          _chain_possessive, _chain_genitive_name, _chain_self_name, _chain_named_role,
          _chain_copula_name, _chain_copula_role_predicate,
-         _chain_copula_measure, _chain_date_attribute, _chain_dash_specifier,
+         _chain_copula_measure, _chain_ud_measure, _chain_date_attribute, _chain_dash_specifier,
          _chain_possessed_typed_atomic,
          _chain_identifier_context,
          _chain_attr_scalar, _chain_quoted_value, _chain_classification_containment,

@@ -942,6 +942,21 @@ _BOOTSTRAP_OFFSPRING_BIRTH_MAP: dict[str, str] = {
 }
 OFFSPRING_NOUN_CATEGORY = "offspring_noun"
 
+# ── FIRST-PERSON POSSESSIVE class (category='first_person_possessive') ─────────────────
+# The lemmas (and inflected surfaces) of the language's FIRST-PERSON possessive determiners. UD makes
+# person a feature of the possessive (``Person=1`` alongside ``Poss=Yes``), and the English models
+# carry it on my/our — but some UD models omit it: it_core_news_sm tags "mia"/"mio"/"nostra"
+# ``Poss=Yes|PronType=Prs`` with NO ``Person`` (measured), so every ``Person=1 ∧ Poss=Yes`` test in
+# the engine (possessive chains, naming chains, the query's first-person-possessive hook) reads the
+# speaker's "mia figlia" as a third party. The possessive paradigm is a CLOSED class, so its first-
+# person members live here, per language, in the DB (seeded by the language's migration), and
+# ``linguistics._ud_first_person_possessive_repair`` restores the missing ``Person=1`` feature on a
+# ``Poss=Yes`` token whose lemma/surface is a member. The floor is DELIBERATELY EMPTY: English never
+# needs it (the feature is present), and a code word list would be exactly the transliteration zoo
+# the doctrine forbids — DB-down means no repair (today's behaviour), never a guessed one.
+_BOOTSTRAP_FIRST_PERSON_POSSESSIVES: frozenset[str] = frozenset()
+FIRST_PERSON_POSSESSIVE_CATEGORY = "first_person_possessive"
+
 # Per-category DB-DOWN fallback seed. resolve_cues consults this when a category resolves empty / the
 # read fails, so EVERY category fails safe to its own evidenced floor (never the wrong class, never
 # empty). naming_verb keeps its dedicated bootstrap for back-compat with resolve_naming_verbs.
@@ -979,6 +994,8 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     MEASURE_VERB_CATEGORY: _BOOTSTRAP_MEASURE_VERBS,
     DOSAGE_NOUN_CATEGORY: _BOOTSTRAP_DOSAGE_NOUNS,
     MEASURE_NOUN_CATEGORY: _BOOTSTRAP_MEASURE_NOUNS,
+    # MUST be registered even though the floor is EMPTY (same reason as attribute_noun).
+    FIRST_PERSON_POSSESSIVE_CATEGORY: _BOOTSTRAP_FIRST_PERSON_POSSESSIVES,
     # THIN_TYPE_CATEGORY is intentionally NOT here: it is a keyed-value (surface→type) class resolved
     # by resolve_thin_type() into a dict, not a flat cue set. Its DB-DOWN fallback is
     # _BOOTSTRAP_THIN_TYPE_MAP, applied in resolve_thin_type().
@@ -1364,6 +1381,13 @@ def resolve_naming_nouns(dsn: str) -> frozenset[str]:
     return resolve_cues(dsn, rel_type_overlay.get_current_schema(), NAMING_NOUN_CATEGORY)
 
 
+def resolve_first_person_possessives(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE first-person possessive set (lemmas + surfaces) for the
+    ContextVar-bound current request schema. CAN BE EMPTY (empty floor — see the class comment):
+    the caller then repairs nothing."""
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), FIRST_PERSON_POSSESSIVE_CATEGORY)
+
+
 def resolve_kinship_nouns(dsn: str) -> frozenset[str]:
     """Resolve the per-tenant ACTIVE KINSHIP-noun set for the ContextVar-bound current request schema
     (tenant-only), via the SAME binding as the naming/rel_type/temporal resolvers. Used by the
@@ -1688,6 +1712,33 @@ def resolve_unit_scalar_map(dsn: str) -> dict[str, str]:
     entity_attributes). Same contract as resolve_thin_type. Fail-safe: bootstrap floor
     (`_BOOTSTRAP_UNIT_SCALAR_MAP`)."""
     return _resolve_keyed_map(dsn, UNIT_SCALAR_CATEGORY, _BOOTSTRAP_UNIT_SCALAR_MAP)
+
+
+# DIMENSION-ADJECTIVE class (category='dimension_adjective', keyed: adjective lemma → scalar rel).
+# The gradable adjective of a copular measure predicate NAMES the dimension the measure phrase
+# fills ("la corda è lunga 4 metri" → length; "è alta 120 centimetri" → height): the unit alone
+# (metro) cannot tell length from height. Per-language rows (Italian: migration 282). EMPTY floor:
+# with no row the chain falls back to the unit map, never a guessed dimension.
+DIMENSION_ADJECTIVE_CATEGORY = "dimension_adjective"
+_BOOTSTRAP_DIMENSION_ADJECTIVE_MAP: dict[str, str] = {}
+
+
+# DIMENSION-VERB class (category='dimension_verb', keyed: verb lemma → "<dimension><-<unit rels>").
+# The measure verb names the dimension ("il corso dura 3 anni" → duration, never age). Same row
+# format and empty floor as dimension_adjective.
+DIMENSION_VERB_CATEGORY = "dimension_verb"
+_BOOTSTRAP_DIMENSION_VERB_MAP: dict[str, str] = {}
+
+
+def resolve_dimension_verb_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE dimension-verb MAP (keyed; empty floor)."""
+    return _resolve_keyed_map(dsn, DIMENSION_VERB_CATEGORY, _BOOTSTRAP_DIMENSION_VERB_MAP)
+
+
+def resolve_dimension_adjective_map(dsn: str) -> dict[str, str]:
+    """Resolve the per-tenant ACTIVE dimension-adjective → scalar rel_type MAP. Same contract as
+    resolve_unit_scalar_map; the floor is empty."""
+    return _resolve_keyed_map(dsn, DIMENSION_ADJECTIVE_CATEGORY, _BOOTSTRAP_DIMENSION_ADJECTIVE_MAP)
 
 
 def resolve_measure_verbs(dsn: str) -> frozenset[str]:

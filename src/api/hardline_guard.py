@@ -156,18 +156,90 @@ def enabled() -> bool:
     return os.getenv(_FLAG, "true").strip().lower() not in ("0", "false", "no", "off")
 
 
-def _surface_is_common_type(surface: str | None) -> bool:
+# LANGUAGE-NEUTRAL FALLBACK (R6 when the lexical DB has no answer). Princeton WordNet is an
+# ENGLISH lexicon and is deliberately gated off on a non-English install (English homographs would
+# mint wrong ladders — wordnet_ladder._wn), so `has_common_noun_sense` answers None for EVERY
+# surface there and R6 refused every user-asserted node. The fallback admits a node ONLY on
+# evidence the engine itself holds, never on a guess:
+#   (0) the node's INGEST type is a named-referent class (Person / Organization / Location, the
+#       closed canonical typer labels) → a NAME, refused;
+#   (1) THE GROWN ONTOLOGY — the node already sits on the tenant's L4 as a TYPE: it holds a
+#       `subclass_of` rung of its own, or something is filed AT it (`instance_of`/`subclass_of`
+#       object). A place the engine or the user already built is a type by construction.
+# Anything else → refused (fail closed, the module's polarity). A bare-token POS reading was tried
+# and REMOVED: the tagger's prior on a lone lowercase token calls "marco", "xqzt", "blorf" and
+# "iphone" NOUN, so names typed in lowercase got subclass rungs. Consequence, stated: on such an
+# install a genuinely new common noun waits for the ontology (the ±6 build-out or /learn) to place
+# it before it receives a user-asserted rung.
+# Scope: consulted ONLY on a non-English install (FAULTLINE_LANGUAGE), where the lexicon is gated
+# off by language; an English install whose corpus is missing keeps refusing, as documented above.
+_CLASSIFICATION_RELS = ("instance_of", "subclass_of")
+_NAMED_REFERENT_TYPES = ("person", "organization", "location")
+_TYPE_NODE_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM facts x WHERE ((x.object_id = %s AND x.rel_type = ANY(%s))"
+    "                 OR (x.subject_id = %s AND x.rel_type = 'subclass_of'))"
+    "                 AND x.superseded_at IS NULL AND x.archived_at IS NULL"
+    "               UNION ALL"
+    "               SELECT 1 FROM staged_facts x WHERE ((x.object_id = %s AND x.rel_type = ANY(%s))"
+    "                 OR (x.subject_id = %s AND x.rel_type = 'subclass_of'))"
+    "                 AND x.promoted_at IS NULL AND x.deleted_at IS NULL),"
+    "  (SELECT lower(coalesce(e.entity_type, '')) FROM entities e WHERE e.id = %s)"
+)
+
+
+def _language_neutral_common_type(surface: str, db_conn=None, node_id=None) -> bool:
+    if db_conn is None or not node_id:
+        return False
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SAVEPOINT sp_ladder_hardline_type")
+            try:
+                nid = str(node_id)
+                cur.execute(_TYPE_NODE_SQL, (nid, list(_CLASSIFICATION_RELS), nid,
+                                             nid, list(_CLASSIFICATION_RELS), nid, nid))
+                row = cur.fetchone()
+                cur.execute("RELEASE SAVEPOINT sp_ladder_hardline_type")
+            except Exception:  # noqa: BLE001
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_ladder_hardline_type")
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+    except Exception:  # noqa: BLE001 — no cursor → fail closed
+        return False
+    if row is None:
+        return False
+    if (row[1] or "") in _NAMED_REFERENT_TYPES:
+        return False
+    return bool(row[0])
+
+
+def _surface_is_common_type(surface: str | None, db_conn=None, node_id=None) -> bool:
     """R6 morphology oracle: True iff `surface` names a COMMON-noun type. Delegates to the
-    deterministic offline WordNet lane (grammar/morphology, LV6). Any failure — including the
-    lexical DB being unavailable — returns False, i.e. NOT a common type → the rung is refused
-    (FAIL CLOSED: uncertain means do-not-ladder, the opposite polarity of node_role)."""
+    deterministic offline WordNet lane (grammar/morphology, LV6). When the lexical DB has NO
+    answer (None — unavailable, or gated off on a non-English install) the language-neutral
+    fallback above decides (ingest type, then the grown ontology). A lexical
+    False stays False (English byte-identical). Any failure returns False, i.e. NOT a common
+    type → the rung is refused (FAIL CLOSED: uncertain means do-not-ladder, the opposite
+    polarity of node_role)."""
     if not surface:
         return False
     try:
         from src.api.wordnet_ladder import has_common_noun_sense
         verdict = has_common_noun_sense(surface)
-    except Exception:  # noqa: BLE001 — lexical source unavailable/unimportable → fail closed
-        return False
+    except Exception:  # noqa: BLE001 — lexical source unimportable → language-neutral fallback
+        verdict = None
+    if verdict is None:
+        # The fallback answers only where the English lexicon is gated off BY LANGUAGE. An English
+        # install with the corpus missing keeps its documented fail-closed refusal, byte-identical.
+        try:
+            from src.extraction.install_language import english_grammar_available
+            _english = english_grammar_available()
+        except Exception:  # noqa: BLE001
+            _english = True
+        if _english:
+            return False
+        return _language_neutral_common_type(surface, db_conn, node_id)
     return bool(verdict)
 
 
@@ -261,6 +333,6 @@ def refuses_subclass_rung(
         return (True, "instance_slot_object")
     if role in _STAMP_PROTECTED:
         return (True, f"node_role={role}")
-    if row[_EV_ASSERTED] and not _surface_is_common_type(surface):
+    if row[_EV_ASSERTED] and not _surface_is_common_type(surface, db_conn, node_id):
         return (True, "lexical_not_common_type")
     return (False, None)
