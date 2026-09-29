@@ -476,7 +476,9 @@ def test_spanish_naming_matches_english_capture():
     en_rels = {f["rel_type"] for f in en}
     assert "sibling_of" in es_rels, f"{es}"
     assert "sibling_of" in en_rels, f"{en}"
-    assert "also_known_as" in es_rels, f"{es}"  # Spanish ALSO binds the name
+    # the name IS the sibling (kin edge subject = 'ana', filed as her alias at ingest) — exactly
+    # the English shape; a separate (hermana, also_known_as, ana) minted a role-noun ghost entity.
+    assert not any(f.rel_type == "also_known_as" and f.subject == "hermana" for f in es), f"{es}"
 
 
 # ── LAYER 3: QUERY-BACK WALK (DSN-gated) ───────────────────────────────────────

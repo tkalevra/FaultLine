@@ -36806,6 +36806,71 @@ def _relword_to_rel_candidates(db, rel_word: str) -> list[dict]:
         # rel_type_aliases may not be seeded yet on an older tenant → degrade to today.
         log.warning("relword_to_rel_candidates.failed", word=word, error=str(e)[:120])
         return []
+    if not out:
+        out = _relword_candidates_from_role_cues(db, word)
+    return out
+
+
+def _relword_candidates_from_role_cues(db, word: str) -> list[dict]:
+    """The SAME role-noun classes INGEST binds with, read back for the query anchor.
+
+    Ingest files "mi hermana se llama Lucía" / "my sister …" through the per-tenant
+    ``kinship_noun`` / ``social_role`` cue classes (``linguistic_cues``: the row's description
+    is the rel the ROLE HOLDER bears to the possessor — (hermana, sibling_of, owner),
+    (hijo, child_of, owner), (amiga, friend_of, owner)). ``rel_type_aliases`` only carries the
+    role nouns someone seeded there (English), so on a tenant whose role nouns live in the cue
+    classes alone (a language branch; any tenant-grown kin noun) "¿Dónde vive mi hermana?"
+    mapped to no rel and the anchor fell back to the speaker, walking to nothing — while the
+    ingest side had filed the sister correctly. Groundable ⇒ findable: the query reads the
+    class the writer used. Direction: the cue rel R holds (holder, R, owner), so from the
+    OWNER the filler is reached over inverse(R) as subject or R as object — the candidate
+    shape ``_resolve_possessive_rel_target`` pairs directionally. Consulted only when
+    rel_type_aliases has no row for the word (the seeded alias stays authoritative).
+    Tenant-only read; fail-safe → [] (caller defers)."""
+    out: list[dict] = []
+    _sp = False
+    try:
+        with db.cursor() as cur:
+            # SAVEPOINT: a failed read must not abort the caller's transaction (a rollback
+            # would also revert the request's session search_path bind).
+            cur.execute("SAVEPOINT relword_role_cue")
+            _sp = True
+            cur.execute(
+                "SELECT DISTINCT c.description, r.inverse_rel_type"
+                "  FROM linguistic_cues c"
+                "  JOIN rel_types r ON r.rel_type = c.description"
+                " WHERE c.cue = %s AND c.category IN ('kinship_noun', 'social_role')"
+                "   AND COALESCE(c.is_active, TRUE)",
+                (word,),
+            )
+            for holder_rel, inverse_rt in cur.fetchall():
+                if not holder_rel:
+                    continue
+                owner_rel = inverse_rt or holder_rel
+                if any(o["rel_type"] == owner_rel for o in out):
+                    continue
+                out.append({
+                    "rel_type": owner_rel,
+                    "requires_inversion": False,
+                    "inverse_rel_type": holder_rel if owner_rel != holder_rel else None,
+                    # The cue row names the rel CLASS, not the role: 77 of the 101 role cues map
+                    # to catch-alls (knows/related_to), so "my aunt" would otherwise resolve to any
+                    # knows/related_to filler. The caller must corroborate with the role slot.
+                    "requires_slot_alias": True,
+                })
+            cur.execute("RELEASE SAVEPOINT relword_role_cue")
+    except Exception as e:  # noqa: BLE001 — fail-safe: an unreadable cue table defers
+        if _sp:
+            try:
+                with db.cursor() as _c:
+                    _c.execute("ROLLBACK TO SAVEPOINT relword_role_cue")
+            except Exception:  # noqa: BLE001
+                pass
+        log.warning("relword_to_rel_candidates.role_cue_failed", word=word, error=str(e)[:120])
+        return []
+    if out:
+        log.info("relword_to_rel_candidates.role_cue", word=word,
+                 rels=[o["rel_type"] for o in out])
     return out
 
 
@@ -36904,6 +36969,33 @@ def _resolve_possessive_rel_target(db, owner_uuid: str, rel_word: str) -> str | 
             )
             fillers.update(r[0] for r in cur.fetchall() if r[0] and r[0] != owner_uuid)
 
+        # ROLE-CUE CANDIDATES NEED THE SLOT (issue #59): a rel reached only through the
+        # kinship_noun/social_role class (no rel_type_aliases row for the word) identifies the rel
+        # CLASS, which many role nouns share — (user, knows, bob) must not answer "my colleague",
+        # nor (rose, related_to, user) "my aunt". Such a filler is accepted only when it carries
+        # the asked role word as an alias — the slot the naming chain files on the named person
+        # ((lucía, also_known_as, hermana)) — even when it is the only filler.
+        if any(c.get("requires_slot_alias") for c in candidates):
+            if not fillers:
+                return None
+            try:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT entity_id FROM entity_aliases"
+                        " WHERE entity_id = ANY(%s) AND alias = %s",
+                        (sorted(fillers), rel_word.strip().lower()),
+                    )
+                    _slotted = {r[0] for r in cur.fetchall() if r and r[0]}
+            except Exception as _se:  # noqa: BLE001 — fail-safe: no corroboration → defer
+                log.debug("resolve_possessive_rel.role_cue_slot_probe_failed", error=str(_se)[:120])
+                return None
+            if len(_slotted) == 1:
+                log.info("resolve_possessive_rel.role_cue_slot_corroborated",
+                         rel_word=rel_word.lower(), fillers=len(fillers))
+                return next(iter(_slotted))
+            log.info("resolve_possessive_rel.role_cue_uncorroborated_defer",
+                     rel_word=rel_word.lower(), fillers=len(fillers), slotted=len(_slotted))
+            return None
         if len(fillers) == 1:
             return next(iter(fillers))
         # >1 fillers on the SAME rel-class: the ROLE is a finer key than its rel. Two parents
@@ -63472,10 +63564,31 @@ async def learn_topic(req: LearnTopicRequest):
             "Go as deep as possible. No prose. No headers. No explanations. Statements only."
         )
 
+    # SOURCE-LANGUAGE PRESERVATION (the atomizer's rule, reframe._SYSTEM_PROMPT): on a
+    # non-English install a /learn of "apicultura" came back as English nodes (beekeeping, hive,
+    # honey) hung under the Spanish topic — a Spanish query can never ground them, so the grown
+    # shelf is unreachable in the install's own language. The node NAMES follow the topic's
+    # language; the connecting phrases stay verbatim because the parser reads them, and any
+    # backbone node the prompt names is reused exactly as written. Worded in terms of the
+    # topic's language (not a named language) so it holds for any install.
+    # The install language (FAULTLINE_LANGUAGE, ISO 639-1) names the target when configured: a
+    # one-word topic is often shared across languages (measured: "apicultura" with only "the
+    # topic's language" came back Portuguese — colmeia, abelha). English installs keep today's
+    # prompt byte-for-byte.
+    _install_lang = (os.environ.get("FAULTLINE_LANGUAGE") or "").strip().lower()
+    _lang_target = (f"the language with ISO 639-1 code '{_install_lang}'"
+                    if _install_lang else f"the language the topic '{topic}' is written in")
+    _lang_directive = "" if _install_lang in ("", "en") else (
+        f"LANGUAGE: write every NEW node name (X and Y) in {_lang_target} — never translate a "
+        f"node into English. Only the connecting phrases (is a subclass of / is an instance of / "
+        f"is a part of), the (Type) labels, and any existing node named below stay exactly as "
+        f"written.\n\n"
+    )
+
     if req.source_text:
         # Truncate to 6000 chars to avoid LLM context overflow
         source_excerpt = req.source_text[:6000].strip()
-        prompt = (
+        prompt = _lang_directive + (
             f"Using the following reference material about '{topic}':\n\n"
             f"{source_excerpt}\n\n"
             f"Generate a {'shallow' if _LEARN_BOUNDED_GROWTH else 'complete'} ontological "
@@ -63494,7 +63607,7 @@ async def learn_topic(req: LearnTopicRequest):
                  topic=topic, source_url=req.source_url or "none",
                  source_len=len(source_excerpt))
     else:
-        prompt = (
+        prompt = _lang_directive + (
             f"Generate {'a shallow' if _LEARN_BOUNDED_GROWTH else 'the complete'} ontological "
             f"hierarchy for: {topic}\n"
             f"Use ONLY these exact forms, one per line:\n"

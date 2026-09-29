@@ -2463,6 +2463,48 @@ def _first_person_finite_verb(doc):
     return None
 
 
+def _reads_as_first_person_verb(tok) -> bool:
+    """[es] True when ``tok`` — whatever the tagger called it — re-lemmatizes as a FINITE 1st-person
+    singular verb whose lemma is in the pipeline lemmatizer's verb index (the same test the
+    subject-agreement repair uses). Covers es_core_news_md tagging a clause-medial "mido" as ADJ.
+    Non-Spanish parses and any failure → False. The token is restored before returning."""
+    try:
+        if not _doc_is_spanish(tok.doc) or tok.pos_ not in ("VERB", "ADJ", "NOUN", "PROPN"):
+            return False
+        nlp = _nlp
+        if nlp is None or "lemmatizer" not in nlp.pipe_names:
+            return False
+        lem = nlp.get_pipe("lemmatizer")
+        index = set(lem.lookups.get_table("lemma_index").get("verb", []) or [])
+        if tok.pos_ == "VERB":
+            return "1" in tok.morph.get("Person") and (tok.lemma_ or "") in index
+        old_pos, old_morph = tok.pos_, str(tok.morph)
+        try:
+            tok.pos_ = "VERB"
+            tok.set_morph("Mood=Ind|Number=Sing|Person=1|Tense=Pres|VerbForm=Fin")
+            cands = lem.rule_lemmatize(tok)
+        finally:
+            tok.pos_ = old_pos
+            tok.set_morph(old_morph)
+        return any(c in index and c != tok.lower_ for c in cands)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_possessed_common_role(tok) -> bool:
+    """True when ``tok`` is a nominal carrying a POSSESSIVE DETERMINER child (UD ``det`` with
+    ``Poss=Yes`` — es "mi/tu/su", or an English ``poss`` pronoun). A proper name does not take a
+    possessive determiner, so a PROPN-tagged "madre" in "Mi madre se llama Rosa" (es_core_news_md
+    tags the sentence-initial role PROPN) is the COMMON-NOUN role, not a name. Fail-safe → False."""
+    try:
+        if tok is None or tok.pos_ not in ("NOUN", "PROPN"):
+            return False
+        return any(c.dep_ in ("det", "poss") and "Yes" in c.morph.get("Poss")
+                   for c in tok.children)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _clitic_pronoun_of(verb_tok):
     """The REFLEXIVE / pronominal-verb clitic child of verb_tok (Spanish se/me/te attached
     as expl:pv, or iobj/obj with Reflex=Yes), or None.
@@ -2607,6 +2649,9 @@ def _get_nlp():
             # …and stop spaCy's own exception table from shattering a cue surface the engine holds
             # (the seeded `id` was dead from the day it was seeded). Fail-safe: no DB → no change.
             _reconcile_cue_tokenizer_exceptions(_nlp)
+            # …and repair a finite verb the tagger read as a noun under a nominative pronoun
+            # subject (subject–verb agreement; see _install_subject_agreement_repair).
+            _install_subject_agreement_repair(_nlp)
             log.info("linguistics.model_loaded", model=_SPACY_MODEL, lang=_got_lang)
         except Exception as e:  # noqa: BLE001 — model not baked into the image → no-op layer
             log.warning("linguistics.model_load_failed", model=_SPACY_MODEL, error=str(e)[:160])
@@ -2629,6 +2674,121 @@ def _doc_is_spanish(doc) -> bool:
         return (getattr(doc, "lang_", "") or "").strip().lower() == "es"
     except Exception:  # noqa: BLE001
         return False
+
+_AGREEMENT_REPAIR_PIPE = "faultline_subject_agreement_repair"
+# UD features the repair reads. A nominative personal pronoun of the 1st/2nd person is the
+# speaker/addressee as grammatical subject — its person/number are what a finite verb agrees with.
+_AGREEMENT_SUBJECT_PERSONS = frozenset({"1", "2"})
+# Dependents that make a NOUN head a legitimate nominal predicate (UD: a nominal predicate with a
+# subject carries a copula; an auxiliary likewise marks the head as a verb phrase already parsed).
+_AGREEMENT_PREDICATE_DEPS = frozenset({"cop", "aux", "aux:pass"})
+
+
+def _repair_subject_agreement(doc, lem=None):
+    """[es] Re-read a finite verb the tagger mis-tagged, from subject–verb agreement.
+
+    Measured on es_core_news_md: in ``Yo trabajo en Google como ingeniero`` the ROOT ``trabajo``
+    is tagged NOUN (lemma ``trabajo``) because the 1st-person present form is homographic with
+    the noun, so the employment chain never sees ``trabajar``; ``Yo corro en el parque`` keeps
+    the VERB tag but reads Person=3 and lemma ``corro``. The grammar already disambiguates it:
+    a nominative 1st/2nd-person personal pronoun (``Case=Nom|PronType=Prs|Person=1``) as the
+    ``nsubj`` of a head with NO copula/auxiliary cannot be a nominal predicate (UD: a nominal
+    predicate with a subject takes ``cop``) — the head is a finite verb agreeing with that
+    pronoun. The verb lemma comes from the language's OWN morphology: the pipeline's rule
+    lemmatizer re-run with VERB + the agreeing features, and it is accepted ONLY when the result
+    is in the lemmatizer's verb index (an attested verb) — otherwise the parse is left
+    untouched. The head's ``nmod`` dependents become ``obl`` (UD: nominal dependents of a verb).
+
+    Gated to Spanish parses: the lemmatizer rules and the homography are Spanish facts; other
+    languages keep their parse byte-identical. Fail-safe: any error → the doc unchanged."""
+    try:
+        if not _doc_is_spanish(doc):
+            return doc
+        if lem is None or not hasattr(lem, "rule_lemmatize"):
+            return doc
+        verb_index = set(lem.lookups.get_table("lemma_index").get("verb", []) or [])
+        if not verb_index:
+            return doc
+        for tok in doc:
+            if tok.pos_ not in ("NOUN", "PROPN", "VERB"):
+                continue
+            kids = list(tok.children)
+            if any(c.dep_ in _AGREEMENT_PREDICATE_DEPS for c in kids):
+                continue
+            subj = None
+            for c in kids:
+                if (c.dep_ == "nsubj" and c.pos_ == "PRON"
+                        and "Nom" in c.morph.get("Case")
+                        and "Prs" in c.morph.get("PronType")
+                        and set(c.morph.get("Person")) & _AGREEMENT_SUBJECT_PERSONS):
+                    subj = c
+                    break
+            if subj is None:
+                continue
+            person = subj.morph.get("Person")[0]
+            number = (subj.morph.get("Number") or ["Sing"])[0]
+            if tok.pos_ == "VERB":
+                # Already a verb: repair only a DISAGREEING reading (wrong person) — an agreeing
+                # verb is the parse working and is never touched.
+                if person in tok.morph.get("Person") or not tok.morph.get("Person"):
+                    continue
+            old_pos, old_morph, old_lemma = tok.pos_, str(tok.morph), tok.lemma_
+            chosen = None
+            for tense in ("Pres", "Past"):
+                feats = f"Mood=Ind|Number={number}|Person={person}|Tense={tense}|VerbForm=Fin"
+                tok.pos_ = "VERB"
+                tok.set_morph(feats)
+                try:
+                    cands = lem.rule_lemmatize(tok)
+                except Exception:  # noqa: BLE001
+                    cands = []
+                hit = next((l for l in cands if l in verb_index and l != tok.lower_), None)
+                if hit:
+                    chosen = (feats, hit)
+                    break
+            if chosen is None:
+                tok.pos_ = old_pos
+                tok.set_morph(old_morph)
+                tok.lemma_ = old_lemma
+                continue
+            tok.set_morph(chosen[0])
+            tok.lemma_ = chosen[1]
+            if old_pos != "VERB":
+                tok.tag_ = "VERB"
+                for c in kids:
+                    if c.dep_ == "nmod":
+                        c.dep_ = "obl"
+            log.debug("linguistics.subject_agreement_repair", token=tok.text,
+                      old_pos=old_pos, old_lemma=old_lemma, lemma=chosen[1])
+    except Exception as e:  # noqa: BLE001 — a repair must never break a parse
+        log.warning("linguistics.subject_agreement_repair_failed", error=str(e)[:160])
+    return doc
+
+
+def _install_subject_agreement_repair(nlp) -> None:
+    """Append ``_repair_subject_agreement`` to the grammar pipeline once (after the lemmatizer).
+
+    Only Spanish pipelines get the component (the repair is gated per-doc as well). Fail-safe."""
+    try:
+        if (getattr(nlp, "lang", "") or "").lower() != "es":
+            return
+        if "lemmatizer" not in nlp.pipe_names:
+            return
+        from spacy.language import Language
+        if _AGREEMENT_REPAIR_PIPE not in Language.factories:
+            # The factory resolves the repair through sys.modules at build time, so a reloaded
+            # module (tests reload linguistics) builds the component from its CURRENT code.
+            def _make(nlp, name):
+                import sys as _sys
+                _mod = _sys.modules[__name__]
+                _lem = nlp.get_pipe("lemmatizer")
+                return lambda doc: _mod._repair_subject_agreement(doc, _lem)
+            Language.factory(_AGREEMENT_REPAIR_PIPE, func=_make)
+        if _AGREEMENT_REPAIR_PIPE not in nlp.pipe_names:
+            nlp.add_pipe(_AGREEMENT_REPAIR_PIPE, last=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("linguistics.subject_agreement_repair_install_failed", error=str(e)[:160])
+
 
 def linguistics_available() -> bool:
     """True iff the kill-switch is ON and the spaCy model is loadable. Cheap after first call."""
@@ -14095,6 +14255,11 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         for _tk in (subj_tok, obj_tok):
             if _tk is not None and _tk.i in _date_attr_suppress:
                 return
+        # PRONOMINAL-NAMING RE-KEY (es): a role noun collapsed into its named person
+        # (_pn_name_rebind) is never itself a subject — the edge belongs to the person.
+        if subj_tok is not None and subj_tok.i in _pn_name_rebind \
+                and subj == (subj_tok.text or "").strip().lower():
+            subj = _pn_name_rebind[subj_tok.i]
         # SURFACE fallback: many chains (named-instance, measure, possessive) resolve a SURFACE and do
         # not pass the exact token, so the index guard alone misses "March"→instance_of/age /
         # "date"→owns junk. Drop a NON-scalar emit whose subject/object surface is a suppressed token
@@ -14527,6 +14692,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # (guard error → distribute as before).
                 def _sib_is_absorbed_clause(_sib) -> bool:
                     try:
+                        if _sib.i in _cross_measure_claimed:
+                            return True  # a re-homed 1st-person clause head (es measure chain)
                         return any(c.dep_ == "poss" for c in _sib.children)
                     except Exception:  # noqa: BLE001
                         return False
@@ -19223,10 +19390,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # PART 1: exclude PEELED date tokens so the atomizer's "see_on march 1st" wobble never
             # folds "on" into the predicate nor lifts the date phrase as the object — both
             # atomizations land (user, see, house)@event_date. ``_date_token_idx`` is in closure.
-            predicate = _svo_predicate_token(svo_head, exclude_idx=_date_token_idx, include_agent=True)
+            # A unit object the es measure chain re-homed across a coordination boundary is not
+            # this verb's object (empty set on every other parse → identical exclusion).
+            _svo_excl = (set(_date_token_idx) | _cross_measure_claimed) if _cross_measure_claimed \
+                else _date_token_idx
+            predicate = _svo_predicate_token(svo_head, exclude_idx=_svo_excl, include_agent=True)
             if not predicate:
                 continue
-            obj_tok = _svo_object_head(svo_head, exclude_idx=_date_token_idx, include_agent=True)
+            obj_tok = _svo_object_head(svo_head, exclude_idx=_svo_excl, include_agent=True)
             if obj_tok is None:
                 # OBJECT-PRONOUN COREF RESCUE: a 3rd-person personal pronoun in object position
                 # ("I started working with HER on 2/15") is not a mergeable entity, so
@@ -19264,6 +19435,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     continue  # a named-instance collective/type the binding chain owns
                 if _ct.i in _kin_collective:
                     continue  # kinship COLLECTIVE ("kids") — members route via the kinship rel (dash chain)
+                if _ct.i in _cross_measure_claimed:
+                    continue  # a re-homed conjunct clause head / its measure (es measure chain)
                 if _ct.i in _count_suppress:
                     continue  # a bare-count object the count-scalar chain owns ("I have 3 cats" → the
                     #           count scalar; no (user, have, cats) pet-twin, no companion instance_of)
@@ -21219,6 +21392,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
             # (A) NAMING-VERB complement — "called/named <PROPN>".
             if lemma in _naming:
+                # The Spanish PRONOMINAL naming construction ("<X> se llama <Name>") is OWNED by
+                # _chain_es_pronominal_naming, which binds a possessed role noun to the named person
+                # (kin/social rel + role alias). Reading it here as well filed the name as an alias
+                # OF THE ROLE NOUN whenever the model tagged the role PROPN ("Mi madre se llama
+                # Rosa" → (madre, also_known_as, rosa)) — the pronominal clitic is the ownership
+                # marker (UD expl:pv), so defer to the construction's own chain.
+                if _doc_is_spanish(doc) and _clitic_pronoun_of(tok) is not None:
+                    continue
                 name_tok = next(
                     (c for c in tok.children
                      if c.dep_ in ("oprd", "attr", "dobj", "obj") and c.pos_ == "PROPN"), None)
@@ -24423,6 +24604,26 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _n = next((g for g in c.children if g.pos_ == "NUM" and g.dep_ == "nummod"), None)
                 if _n is None:
                     continue
+                # CLAUSE BOUNDARY: a unit object lying AFTER a coordinator that opens a LATER
+                # conjunct ("Mi hermana vive en Lima y mido 1,80 metros" — the model hangs
+                # "metros" on "vive" but "y" belongs to "mido") is that conjunct's measure, not
+                # this verb's; never bind it to this verb's subject (the termination rule
+                # _terminated_scope_tokens applies to a negation scope).
+                _cc = next((t for t in doc[tok.i + 1:c.i]
+                            if t.dep_ == "cc" and t.head.i != tok.i), None)
+                if _cc is not None:
+                    # The measure belongs to the conjunct the coordinator opens. When that
+                    # conjunct has no subject of its own and reads as a 1st-person finite verb
+                    # (the language's own lemmatizer, _reads_as_first_person_verb — es tags "mido"
+                    # ADJ), it is the speaker's measure; otherwise it stays unbound (honest miss).
+                    _cj = _cc.head
+                    if _subject_token_of(_cj) is None and _reads_as_first_person_verb(_cj):
+                        _emit("user", _mapped, (_n.text or "").strip(), verb_tok=_cj,
+                              obj_tok=_n, subj_tok=None)
+                        _cross_measure_claimed.add(_cj.i)  # a clause head, never an NP conjunct
+                    _claim(c, _n)
+                    _cross_measure_claimed.add(c.i)
+                    continue
                 unit_tok, num_tok, rel = c, _n, _mapped
                 break
             if unit_tok is None or rel is None:
@@ -24430,6 +24631,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # subject: explicit nominal (coref-resolved) or the pro-drop first-person verb → user.
             subject = None
             _s = _subject_token_of(tok)
+            # COORDINATED PREDICATE: in "Mi perro se llama Toby y tiene 5 años" the conjoined verb
+            # carries no subject child — UD attaches the shared subject to the FIRST conjunct only
+            # (UD "conj": dependents of the first conjunct are shared unless overridden). Inherit
+            # it when the conjunct's own agreement is 3rd person (a 1st/2nd-person conjunct keeps
+            # the pro-drop reading below). Before this the measure chain skipped the clause and
+            # the SVO lane filed (perro, tener, años) plus a junk años instance_of año rung.
+            if _s is None and tok.dep_ == "conj" and tok.head.i != tok.i \
+                    and tok.head.pos_ in ("VERB", "AUX") \
+                    and "3" in tok.morph.get("Person"):
+                _s = _subject_token_of(tok.head)
             if _s is not None:
                 subject = (_s.text or _s.lemma_ or "").strip().lower()
                 _cr = _coref(_s) or _person_coref(_s)
@@ -24534,10 +24745,21 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # third-party mother — the same corruption class as the round-1 ghosts. Resolution
             # mirrors _chain_es_de_genitive: first-person possessive DET → user; de-PP PROPN →
             # that name; neither → no kin bind (the also_known_as edge below still stands).
+            _kin_bound = False
             if subj_tok is not None and subj_tok.pos_ in ("NOUN", "PROPN"):
                 _hl = (subj_tok.lemma_ or subj_tok.text or "").strip().lower()
-                if _hl in _kinship_nouns():
-                    _kin = _inherent_relation_for_noun(_hl)
+                _hs = (subj_tok.text or "").strip().lower()
+                # PERSON-ROLE head: kinship OR social role (the same full ladder every possessed-role
+                # chain reads — _possessed_person_role_rel). Tried on the surface and the lemma: the
+                # es lemmatizer folds amiga→amigo but the seeded cue rows carry both genders. A PROPN
+                # counts only when a possessive determiner marks it as a common-noun role
+                # (es_core_news_md tags a sentence-initial "Mi madre" as PROPN; a proper name takes no
+                # possessive determiner).
+                _role_ok = subj_tok.pos_ == "NOUN" or _is_possessed_common_role(subj_tok)
+                _kin = None
+                if _role_ok:
+                    _kin = _possessed_person_role_rel(_hs) or _possessed_person_role_rel(_hl)
+                if _kin:
                     _possessor = None
                     for _pc in subj_tok.children:
                         if _first_person_possessive_marker(_pc):
@@ -24550,14 +24772,32 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                             break
                     if _possessor:
                         _emit(proper, _kin, _possessor, obj_tok=None, subj_tok=name_tok)
+                        # ROLE-ALIAS LEG (parity with _chain_copula_name, same flag): the role the
+                        # user named is a slot alias ON the named person, (lucía, also_known_as,
+                        # hermana) — the query anchor narrows "mi hermana" by exactly this slot.
+                        if SPINE_NAMING_CHAIN and _hs and _hs != proper:
+                            _emit(proper, "also_known_as", _hs, obj_tok=None, subj_tok=name_tok)
+                        # CONJUNCT RE-KEY: any other clause sharing this subject ("… se llama
+                        # Lucía y vive en Sevilla") is ABOUT the named person, not a bare role noun.
+                        _pn_name_rebind[subj_tok.i] = proper
                         _claim(subj_tok)
                         # record the NAMED THING's head token so the possessive chain never
                         # re-fires (hermana, sibling_of, user) on the role noun (round-1 critic
                         # ghost class; the role is already bound to the name via the kin edge +
                         # the also_known_as alias below).
                         _pn_naming_suppress.add(subj_tok.i)
-            # the naming edge itself: (named-thing, also_known_as, proper-name).
-            _emit(subject, "also_known_as", proper, verb_tok=tok, obj_tok=name_tok, subj_tok=subj_tok)
+                        _kin_bound = True
+            # the naming edge itself: (named-thing, also_known_as, proper-name) — ONLY when the
+            # named thing is a referent in its own right ("mi perro se llama Rex"). When the kin
+            # bind above fired, the role noun COLLAPSED into the named person (the kin edge's
+            # subject IS the name, which ingest files as that person's alias — the
+            # _chain_genitive_name shape, English "my sister is called Ana" → (ana, sibling_of,
+            # user) alone). Emitting (hermana, also_known_as, ana) there minted a SECOND entity
+            # keyed on the role noun that carried the name: measured in-process, "¿Dónde vive mi
+            # hermana?" then anchored on that role-noun ghost (alias 'hermana') and walked to
+            # nothing while the residence sat on the real person.
+            if not _kin_bound:
+                _emit(subject, "also_known_as", proper, verb_tok=tok, obj_tok=name_tok, subj_tok=subj_tok)
             _claim(tok, name_tok)
             _svo_es_measure_suppress.add(tok.i)
 
@@ -24688,6 +24928,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     # possessive chain skips it (the same guard pattern as _ni_suppress). English unaffected
     # (this set is only filled by the es naming chain).
     _pn_naming_suppress: set = set()
+    # Unit-object token .i whose measure the es tener-measure chain re-homed across a coordination
+    # boundary — the SVO lane must not read it as the earlier verb's object.
+    _cross_measure_claimed: set = set()
+    # PRONOMINAL-NAMING subject re-key: role-noun token .i → the proper name it was bound to. Read
+    # at _emit so a conjoined predicate that shares the role-noun subject lands on the person.
+    _pn_name_rebind: dict = {}
 
     # The chain COLLECTION — a data-driven set the loop iterates; NOT a priority ladder. Convergence
     # in ``_emit`` makes the result order-independent (see comment above), so this list expresses
@@ -28707,7 +28953,12 @@ CONCEPT_TERM_SHAPE_GATE: bool = os.environ.get(
 # (path separators, dots, '+', '~', '@', ':') marks the surface as a lifted VALUE — a filename,
 # a path, an expression — i.e. user CONTENT, never a type designation. Parser-free, so this rule
 # still holds when spaCy is unavailable.
-_TERM_ADMISSIBLE_CHAR_RE = re.compile(r"^[0-9A-Za-z_\-' ]+$")
+# LETTERS ARE UNICODE LETTERS: the class was ASCII [A-Za-z], so every accented or non-Latin
+# term (técnica, carpintería, año, niño, café) failed rule (1) as "non_lexical_orthography" and
+# was refused an is-a ladder — measured on a Spanish /learn, where the grown nodes then floated.
+# `\w` (str patterns are Unicode-aware) is letters + digits + underscore in any script; the
+# refused VALUE characters (/ . + ~ @ :) are still outside it.
+_TERM_ADMISSIBLE_CHAR_RE = re.compile(r"^[\w\-' ]+$")
 
 # Closed-class POS tags whose PRESENCE disqualifies a surface as a term. These are FUNCTION-word
 # classes — finite, high-frequency, and the part of the tag set a statistical tagger gets right;

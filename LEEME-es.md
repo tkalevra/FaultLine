@@ -173,6 +173,49 @@ una heurística incorrecta):
 - La lematización nominal de `normalize_nominal_rel` (plural inglés) se aplica tal cual a nombres de
   relación españoles; el plural español no se invierte bien sin léxico (`colores`→`colore`).
 
+### Mejora del motor (uplift es-1): qué se corrigió y qué queda desactivado
+Verificado por `tests/test_spanish_uplift.py` (rojo en la base publicada, verde con la corrección,
+más un control de dominio nuevo por cada arreglo):
+- **`¿Dónde vive mi hermana?`** ya devuelve la residencia de la hermana nombrada. Dos causas:
+  (1) `Mi hermana se llama Lucía` emitía además `(hermana, also_known_as, lucía)`, que creaba una
+  segunda entidad con el alias `hermana` en la que la consulta se anclaba; ahora el sustantivo de
+  parentesco se funde con la persona nombrada, igual que en inglés. (2) El ancla posesiva de la
+  consulta sólo leía `rel_type_aliases` (con los roles ingleses); ahora, si esa tabla no tiene la
+  palabra, lee las mismas clases `kinship_noun` / `social_role` que usa la ingesta, con la
+  dirección correcta (`mi madre` nunca devuelve al hijo). `¿Dónde vive mi amiga?` funciona igual.
+  Como esas clases agrupan muchos roles bajo relaciones genéricas (`knows`, `related_to`), la
+  respuesta exige que la persona lleve el rol preguntado como alias (`(lucía, also_known_as,
+  hermana)`, que la ingesta archiva al nombrarla); sin ese alias la consulta se abstiene en vez de
+  devolver a cualquier conocido o pariente (también en instalaciones inglesas: `my aunt`).
+  `Mi madre se llama Rosa` (el modelo etiqueta `madre` como PROPN), `Mi amiga se llama Carmen` y
+  `…se llama Lucía y vive en Sevilla` (la residencia va a Lucía) quedan cubiertos.
+- **`Yo trabajo en Google como ingeniero`** captura `works_for` + `occupation`. El modelo etiqueta
+  `trabajo` como NOUN; un sujeto pronominal nominativo de 1ª/2ª persona sin cópula ni auxiliar
+  implica un verbo finito, y el lema se recalcula con el propio lematizador del modelo (sólo si el
+  resultado está en su índice de verbos). Corrige también `Yo corro…` (lema `corro` → `correr`) y
+  `Yo estudio…`. **Sigue siendo residual** la forma pro-drop sin sujeto (`Trabajo en Google`): no
+  hay señal gramatical que la separe de un sintagma nominal.
+- **`¿Cuál es mi profesión?`** encuentra la ocupación (migración 283: `profesión`, `ocupación`,
+  `oficio` → `occupation`).
+- **Correcciones y `/expand` con un LLM real** (medido en proceso contra el endpoint del banco de
+  pruebas): 3/3 correcciones en español corregidas (edad escalar, residencia relacional, color).
+  Se corrigieron tres fallos encontrados así: un verbo de medida coordinado (`…se llama Toby y
+  tiene 5 años`) hereda el sujeto del primer conjunto; la forma de término ya no rechaza letras
+  acentuadas (`técnica`, `carpintería` se quedaban sin escalera is-a); y `/learn` pide al LLM los
+  nodos nuevos en el idioma de la instalación (`FAULTLINE_LANGUAGE`) — antes devolvía nodos en
+  inglés (o portugués para `apicultura`).
+- **`analyze_negation_scopes` sigue desactivado para el español** (sólo el arco Penn `neg`).
+  Medido en 10 turnos negativos (6 afirmaciones negadas benignas, 4 correcciones reales):
+  sólo con la pista UD `no` el detector encuentra el ámbito pero ningún votante dispara
+  (0/6 retracciones falsas, 0/4 correcciones); añadiendo un brazo UD de predicado nominal
+  (predicado con `cop`), el conjunto enrutó **1/6 afirmaciones benignas como CORRECCIÓN**
+  (`Mi perro no es un labrador.`) y 2/4 correcciones reales. Una retracción falsa es destructiva,
+  así que se queda desactivado hasta tener una calibración española de los pesos.
+- Residual conocido: la aposición (`Mi hermano Pablo vive en Bilbao`) no archiva el alias de rol,
+  así que `¿Dónde vive mi hermano?` se abstiene hasta que se diga `Mi hermano se llama Pablo`; el
+  inglés tampoco lo archiva en la aposición. En `Mi hermano Pablo tiene 30 años` la edad queda en
+  `hermano` (preexistente en la base).
+
 ## Idioma y base de datos (léelo antes de instalar)
 El idioma se elige **al principio** de `quickstart.py`, antes que cualquier otra cosa, y esa elección
 fija la **colación (collation) de PostgreSQL** mediante ICU (`es-ES`).
