@@ -326,9 +326,9 @@ def test_inverse_anchor_daughter_article_unchanged():
         rel_type="child_of",
         rel_meta={"inverse_rel_type": "parent_of", "is_symmetric": False},
         anchor_name="you", anchor_is_you=True,
-        instance_name="Marisol", instance_type_name="daughter",
+        instance_name="marisol", instance_type_name="daughter",
     )
-    assert out == "you have a daughter named Marisol"
+    assert out == "you have a daughter named marisol"
 
 
 def test_inverse_anchor_non_kin_metadata_driven():
