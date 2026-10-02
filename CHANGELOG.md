@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — fresh-install fixes
+
+Found by a fresh-install validation of the 2026-10-02 release.
+
+- **Build:** `gliner2` pinned to `1.3.2` (2.0.0 moved torch into an extra and broke every fresh
+  image build); `transformers` bounded to 4.x; every shipped dependency has an upper bound.
+- **Operator token:** the auto-generated `FAULTLINE_ADMIN_TOKEN` is now minted once, stored
+  hashed (`public.operator_admin_token`) and printed only on first boot; it survives restarts.
+  `python -m src.api.operator_token --rotate` prints a replacement.
+- **Seats and OpenWebUI:** every OpenWebUI user occupies one of the 5 seats. A refused user's
+  403 names its user id and how to seat it; the console's OpenWebUI tab lists users waiting
+  for a seat (refused, or holding memory without one) and seats them in one click.
+- **MCP key:** rotating the key in the console supersedes the `.env` `MCP_API_KEY`; the console
+  reports which key is in force.
+- **Console:** `GET /api/dashboard/health` no longer 500s.
+- **Compose:** `.env` reaches the backend (`env_file`, Compose v2.24+; the network-facing MCP gets only the keys it reads); `.env.example`
+  defaults match compose; container names, host ports and the image tag are overridable for a
+  second stack (defaults unchanged); Qdrant and Ollama bind `127.0.0.1`; the network has a fixed
+  name, `faultline-net`, for OpenWebUI to join.
+- **Wizard:** `.env`/`.env.bak` written `0600`; a re-run keeps the existing keys by default;
+  a failed `docker compose up --build` exits non-zero; a custom DB name also sets `POSTGRES_DB`.
+- **Logs:** the Qdrant collection-create race on first boot no longer logs an ERROR.
+- **Docs:** first login and seats, OpenWebUI networking, the published-ports table, tool lists
+  and RAM figures corrected; the Claude Desktop extension asks for a seat token.
+
+## 2026-10-02 — Single-tenant seat cap and backend lockdown
+
+- **Seat cap.** FOSS is one instance with up to 5 seats (`FOSS_MAX_SEATS`, a source constant).
+  The cap bounds tenants, not just seat tokens: a new tenant is admitted only for an active
+  seat, or while no seat was ever minted, under the mint advisory lock. Once any seat exists,
+  every MCP principal must hold an active seat, and the seat gate fails closed.
+- **Seat tokens.** A seat token, minted in the operator console and shown once, is the client's
+  Bearer on `:8002` and is its identity; revoking keeps the memory, re-seating restores access.
+- **Operator console** at `http://localhost:8000/` (operator bearer `FAULTLINE_ADMIN_TOKEN`):
+  seats, the LLM Brain, MCP key rotation, health. Every `/admin` and `/internal` route is
+  operator- or service-gated; `ADMIN_API_KEY` is gone.
+- **Backend lockdown.** `:8000` binds `127.0.0.1` and requires `X-FaultLine-Backend-Secret`
+  (auto-generated into the database when `FAULTLINE_BACKEND_SECRET` is unset). No source address
+  is trusted. The OpenWebUI Filter/Function send the secret.
+
 ## Unreleased (2026-08-03) — MCP Safety + UX Pass
 
 **MCP layer (`src/mcp/server.py`):**

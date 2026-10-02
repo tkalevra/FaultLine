@@ -1,7 +1,6 @@
 -- Migration 087: entity_taxonomy nesting (member_taxonomies) + demo animal/pets/family nesting
 -- Date: 2026-06-14
 -- Purpose: SCHEMA FOUNDATION for the hierarchy-ladder redesign (rung 4 — the backbone).
---          See DEV/DESIGN-hierarchy-ladder-and-growth.md §"Hierarchy (rung 4)".
 --
 -- WHAT
 -- ----

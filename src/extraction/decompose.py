@@ -1,6 +1,6 @@
 """Turn decomposition — the swappable clause/sentence seam for the ingest spine.
 
-PART 1 of DEV/DESIGN-ingest-spine-and-temporal-recall.md (item 1). Decompose a turn into the
+Part of the ingest spine (item 1). Decompose a turn into the
 fact-bearing clauses that the one guardrailed builder will route. The DEFAULT decomposer is the
 union of:
 

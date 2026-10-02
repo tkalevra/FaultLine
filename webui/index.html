@@ -75,9 +75,11 @@
       <summary data-i18n="login.where">Where do I get the token?</summary>
       <div class="help-body">
         <p>The admin token is the operator credential for the FaultLine control API on this instance.
-          On a fresh FOSS install it is printed by the backend on first boot (look for the
-          <code>FAULTLINE_ADMIN_TOKEN</code> line in the container logs). Set it as an env var on the
-          backend; paste the same value here.</p>
+          On a fresh FOSS install it is printed ONCE by the backend on its first boot:
+          <code>docker compose logs faultline | grep -A1 FAULTLINE_ADMIN_TOKEN</code>. It is stored
+          hashed and survives restarts. Lost it? <code>docker compose exec faultline python -m
+          src.api.operator_token --rotate</code> prints a replacement. To pin your own, set
+          <code>FAULTLINE_ADMIN_TOKEN</code> in <code>.env</code> and restart.</p>
         <p>This console is the <strong>business + access control plane</strong> — health, seats, the
           LLM Brain and OpenWebUI wiring. It is separate from your chat client (OpenWebUI / Claude
           Desktop), which talks to the MCP server on <code>:8002</code> with a per-seat token.</p>
@@ -127,6 +129,7 @@
         A seat is one end-user memory store, scoped to its own database schema. Minting a seat
         returns a connection token <strong>once</strong> — store it immediately. Wire it into your
         chat client as a Bearer token. Each seat is identified by its <code>user_id</code>.
+        OpenWebUI users also occupy seats: seat them on the OpenWebUI tab.
       </p>
       <div class="form-row" style="margin-bottom:10px">
         <input type="text" id="seat-label" class="fl-in" placeholder="optional label (e.g. jane-laptop)" autocomplete="off" style="max-width:320px">
@@ -216,11 +219,12 @@
       </p>
       <ol class="steps">
         <li><strong>Settings → Tools → <code>+</code></strong> (Manage Tool Servers). For an instance-wide server, use <strong>Admin Settings → Tools</strong>.</li>
-        <li><strong>URL:</strong> <code id="owui-step-url">http://faultline-mcp:8002</code> (same Docker network) or <code>http://&lt;host&gt;:8002</code>. If the modal pre-fills <code>https://</code>, change it to <code>http://</code> for a local server, then hit refresh.</li>
-        <li><strong>Auth:</strong> <code>Bearer</code> → your MCP key (or a per-seat token).</li>
+        <li><strong>URL:</strong> <code id="owui-step-url">http://faultline-mcp:8002</code> (OpenWebUI attached to the <code>faultline-net</code> Docker network) or <code>http://&lt;host&gt;:8002</code>. If the modal pre-fills <code>https://</code>, change it to <code>http://</code> for a local server, then hit refresh.</li>
+        <li><strong>Auth:</strong> <code>Bearer</code> → this instance's MCP key.</li>
         <li>Set <code>ENABLE_FORWARD_USER_INFO_HEADERS=true</code> in OpenWebUI's environment so each user's memory is scoped to them via the <code>X-OpenWebUI-User-Id</code> header. Without it, per-user memory will not work.</li>
-        <li>OpenWebUI reads <code>/openapi.json</code> and surfaces all six tools — <code>recall_memory</code>, <code>remember_facts</code>, <code>ingest_document</code>, <code>learn_facts</code>, <code>retract_fact</code>, <code>forget_fact</code> — in every conversation.</li>
+        <li>OpenWebUI reads <code>/openapi.json</code> and surfaces every FaultLine tool — <code>recall_memory</code>, <code>remember_facts</code>, <code>ingest_document</code>, <code>ingest_file</code>, <code>document_status</code>, <code>review_structure</code>, <code>retry_document</code>, <code>learn_facts</code>, <code>retract_fact</code>, <code>forget_fact</code> — in every conversation.</li>
       </ol>
+      <p class="hint" data-i18n="owui.seats.short">Each OpenWebUI user occupies one seat — see <strong>OpenWebUI users &amp; seats</strong> below.</p>
       <div class="pre-head"><span class="lbl" data-i18n="owui.filter">Filter script (legacy inlet/outlet)</span>
         <button class="btn sm" id="btn-owui-copy-filter" data-i18n="owui.copy">⎘ copy</button></div>
       <pre id="owui-filter"><code data-i18n="owui.filter.placeholder">-- backend wiring pending -- the live filter script is served by GET /api/dashboard/openwebui</code></pre>
@@ -229,6 +233,35 @@
         Calling → Legacy</strong>. The legacy inlet/outlet Filter lives in
         <code>openwebui/faultline_function.py</code> (Workspace → Functions) for automatic injection.
       </div>
+    </div>
+
+    <div class="section-label" data-i18n="owui.seats.title">OpenWebUI users &amp; seats</div>
+    <div class="panel">
+      <p class="hint" style="margin-top:0" data-i18n="owui.seats.help">
+        Every OpenWebUI user is its own memory store and occupies one of this instance's seats
+        (FOSS: up to 5). Until the first seat is minted, OpenWebUI users are admitted
+        automatically, up to 5 users. Once any seat exists, only seated users are admitted: a user
+        without a seat gets a 403 that names their user_id, and is listed below. Seat them here.
+        Seating keeps their existing memory, and they keep using the instance MCP key; the seat
+        token is not needed for OpenWebUI.
+      </p>
+      <div class="kv"><span class="k" data-i18n="owui.seats.posture">Seat enforcement</span><span class="v" id="owui-seat-posture">—</span></div>
+      <div class="form-row" style="margin:10px 0">
+        <input type="text" id="owui-seat-uid" class="fl-in" data-i18n-placeholder="owui.seats.uid.placeholder" placeholder="OpenWebUI user id (uuid)" autocomplete="off" style="max-width:340px">
+        <input type="text" id="owui-seat-label" class="fl-in" data-i18n-placeholder="owui.seats.label.placeholder" placeholder="optional label (e.g. jane)" autocomplete="off" style="max-width:220px">
+        <button class="btn accent" id="btn-owui-seat" data-i18n="owui.seats.seat">＋ seat this user</button>
+      </div>
+      <div class="msg" id="owui-seat-msg"></div>
+      <table>
+        <thead><tr>
+          <th>user_id</th>
+          <th data-i18n="owui.seats.col.why">Why listed</th>
+          <th data-i18n="owui.seats.col.seen">Last seen</th>
+          <th style="text-align:right" data-i18n="seats.col.actions">Actions</th>
+        </tr></thead>
+        <tbody id="owui-waiting-body"></tbody>
+      </table>
+      <div class="empty hidden" id="owui-waiting-empty" data-i18n="owui.seats.empty">no users waiting for a seat</div>
     </div>
   </div>
 
@@ -287,7 +320,7 @@ AI:   "DevBox has IP address 10.0.1.10."</pre>
       <p>FaultLine hooks into an LLM you already run — it does not host one. Point the
         <strong>LLM Brain</strong> tab at host + port and pick a backend type. Local servers
         (Ollama, LM Studio) need no key; hosted APIs (OpenAI, Anthropic, Groq) do.</p>
-      <p>Your chat client is separate: it talks to the MCP server on <code>:8002</code>. OpenWebUI is wired once with this instance's MCP key (every signed-in user is scoped automatically); a single-user client such as Claude Desktop or opencode uses a per-seat token. See the <strong>OpenWebUI</strong> tab for the supported wiring.</p>
+      <p>Your chat client is separate: it talks to the MCP server on <code>:8002</code>. OpenWebUI is wired once with this instance's MCP key; each signed-in OpenWebUI user is scoped to its own memory and occupies one seat (seat them on the OpenWebUI tab). A single-user client such as Claude Desktop or opencode uses a per-seat token. See the <strong>OpenWebUI</strong> tab for the supported wiring.</p>
     </div>
   </div>
 

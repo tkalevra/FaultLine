@@ -287,6 +287,18 @@ def _mcp_key_active_db(credentials: Optional[str]) -> bool:
     ) is not None
 
 
+def _rotated_mcp_key_exists() -> bool:
+    """True once the operator has rotated the MCP key from the console (an active DB key).
+
+    From then on the env ``MCP_API_KEY`` is SUPERSEDED and no longer accepted (#147): an
+    operator rotates because the old key leaked, and the wizard-written ``.env`` key is that
+    old key. Revoking every DB key never re-enables the env key (rotation always leaves one
+    active key). A DB error reads as "no rotated key", i.e. the pre-rotation behaviour."""
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
+    ) is not None
+
+
 def _any_dashboard_credential_configured() -> bool:
     """True if the operator has minted ANY seat or rotated key (DB-gated).
 
@@ -314,7 +326,9 @@ def _resolve_principal(credentials: str | None) -> str | None:
       1. Per-seat token (DB) → returns the seat's user_id UUID. bind_tenant's
          Option A then treats the token as the authoritative identity.
       2. Rotated MCP key (DB) → 'shared'.
-      3. Env MCP_API_KEY (back-compat / bootstrap) → 'shared'.
+      3. Env MCP_API_KEY (back-compat / bootstrap) → 'shared', ONLY while the key has never
+         been rotated from the console. Once a rotated key is active it is the one key that
+         wins, and the env key is refused (#147).
       4. Anonymous dev mode → only when NO credentials are configured anywhere
          (no env key AND no DB seats/keys) AND no credential was presented.
 
@@ -330,10 +344,13 @@ def _resolve_principal(credentials: str | None) -> str | None:
     # 2. Rotated MCP key in the DB.
     if _mcp_key_active_db(credentials):
         return "shared"
-    # 3. Env MCP_API_KEY.
+    # 3. Env MCP_API_KEY — superseded (refused) once the key was rotated in the console.
     if MCP_API_KEY:
         from src.api.backend_auth import safe_equals
         if credentials is not None and safe_equals(credentials, MCP_API_KEY):
+            if _rotated_mcp_key_exists():
+                _log("REST 401 — env MCP_API_KEY presented after a console rotation (superseded)")
+                return None
             return "shared"
         return None
     # 4. Anonymous dev mode — only when nothing is configured AND nothing was
@@ -364,7 +381,8 @@ def _seat_cap_refusal(user_id: str, principal: str | None) -> Optional[str]:
     is deleted, re-minting a seat for that user_id restores access). In the open posture a
     NEW tenant is admitted only under the FOSS_MAX_SEATS cap (the backend enforces that
     atomically at tenant birth; this makes it a clean 403 here). Checked per request, so a
-    revoke takes effect on the next call. Read-only.
+    revoke takes effect on the next call. The only write: a seat-less user_id is listed in
+    public.dashboard_seat_requests so the operator can seat it from the console (#148).
 
     FAILS CLOSED (#122): no seat store configured, or the store erroring, refuses with 503
     (reason logged) and never admits an unverifiable user_id.
@@ -376,13 +394,28 @@ def _seat_cap_refusal(user_id: str, principal: str | None) -> Optional[str]:
         _log("seat gate FAIL-CLOSED: POSTGRES_DSN is not set on the MCP service (seat store unreachable)")
         return _SeatGateRefusal("seat store unavailable: the MCP server cannot verify seats", 503)
     try:
-        from src.provisioning.provisioning_status import seat_admission_refusal
+        from src.provisioning.provisioning_status import seat_refusal
         with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
-            reason = seat_admission_refusal(cur, user_id)
+            err = seat_refusal(cur, user_id)
     except Exception as exc:  # noqa: BLE001
         _log(f"seat gate FAIL-CLOSED: seat store error {type(exc).__name__}: {str(exc)[:160]}")
         return _SeatGateRefusal("seat store unavailable: the MCP server cannot verify seats", 503)
-    return _SeatGateRefusal(reason, 403) if reason else None
+    if not err:
+        return None
+    if err.kind == "seat_required":
+        _record_seat_request(dsn, user_id)
+    return _SeatGateRefusal(err.message, 403)
+
+
+def _record_seat_request(dsn: str, user_id: str) -> None:
+    """List a seat-less user_id in the operator console (#148). Best effort: the refusal stands
+    whether or not this write lands, so an error here is logged and swallowed."""
+    try:
+        from src.provisioning.provisioning_status import record_seat_request
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            record_seat_request(cur, user_id)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"seat request not recorded: {type(exc).__name__}: {str(exc)[:160]}")
 
 
 def require_auth(
@@ -450,7 +483,7 @@ def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | 
     """Resolve the tenant for a REST shorthand call via the SAME identity seam as /mcp.
 
     Reads X-OpenWebUI-User-Id (which OpenWebUI stamps on the REST path too — previously
-    dropped here, DEV/SECURITY-multiuser-tenant-isolation.md Finding 1), falling back to
+    dropped here), falling back to
     body.user_id, then runs it through bind_tenant() (spoof-guard + UUID validation +
     FAULTLINE_USER_ID single-user fallback). Translates a spoof/malformed rejection into
     the matching HTTP status — fail loud, never silently route to a wrong/shared tenant.

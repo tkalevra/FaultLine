@@ -1,8 +1,7 @@
 """
 Per-tenant rel_type resolution (closes the per-tenant ontology loop).
 
-ARCHITECTURE (authoritative — see CLAUDE.md "The Strengthening Layer",
-"Schema Provisioning", and DEV/SELF-GROWTH-RESTORATION-PROMPT.md):
+ARCHITECTURE (authoritative):
 
 FaultLine is per-tenant. `public.rel_types` is a TEMPLATE / SEED-SOURCE ONLY,
 read solely by provisioning/migrations. Provisioning copies the seed INTO each

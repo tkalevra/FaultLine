@@ -5,8 +5,8 @@ This is the quick start.
 
 ## Prerequisites
 
-- Docker & Docker Compose v2+
-- ~4 GB RAM (8 GB recommended)
+- Docker & Docker Compose v2.24+
+- About 4 GB of RAM free for the stack (it uses ~3 GB after boot); 8 GB recommended
 - An LLM backend you already run (Ollama, LM Studio, OpenWebUI, or an
   OpenAI-compatible API)
 
@@ -28,15 +28,32 @@ curl http://localhost:8000/health
 
 ## Services & ports
 
-| Service | Port | Purpose |
+What is published where (host ports are overridable, see `.env.example` "STACK NAMING"):
+
+| Service | Published on the host | Purpose |
 |---|---|---|
-| `faultline` | **8000** | Backend API — `/ingest`, `/query`, `/health` |
-| `faultline-mcp` | **8002** | MCP server — `recall_memory`, `remember_facts`, `learn_facts`, `retract_fact` (the live integration path) |
-| `postgres` | 5432 | PostgreSQL — authoritative fact storage (per-tenant schemas) |
-| `qdrant` | 6333 | Qdrant — present in the stack; retired for user memory (holds no user facts) |
+| `faultline-mcp` | **`0.0.0.0:8002`** — the only network-facing port | MCP server, the live integration path (every FaultLine tool) |
+| `faultline` | `127.0.0.1:8000` | Backend API + operator console (`/`), `/health` |
+| `qdrant` | `127.0.0.1:6333` | Qdrant — present in the stack; retired for user memory (holds no user facts) |
+| `postgres` | not published (`postgres:5432` on `faultline-net`) | PostgreSQL — authoritative fact storage (per-tenant schemas) |
+| `redis` | not published | Coordination / dedup cache |
+| `ollama` (profile) | `127.0.0.1:11434` | Optional bundled LLM |
 
 The **MCP server on `:8002`** is the production integration path. The OpenWebUI
 Filter in `openwebui/` is intentionally disabled and is not the live path.
+
+## First login and seats
+
+- Operator console: `http://localhost:8000/` (loopback only; `ssh -L 8000:localhost:8000 <host>`).
+- Operator token: printed once on first boot,
+  `docker compose logs faultline | grep -A1 FAULTLINE_ADMIN_TOKEN`; it survives restarts.
+  Replace it with `docker compose exec faultline python -m src.api.operator_token --rotate`.
+- FOSS = one instance, up to **5 seats** (`FOSS_MAX_SEATS`, a source constant). Mint a seat in
+  the console; the seat token (shown once) is the client's Bearer on `:8002` and is the identity.
+- The shared `MCP_API_KEY` admits any user id only until the first seat exists. After that, every
+  user id needs a seat, including each OpenWebUI user (seat them on the console's OpenWebUI tab).
+  Rotating the MCP key in the console supersedes the `.env` value.
+- The backend secret protects `:8000`; it is auto-generated (see Production notes).
 
 ## Configuration
 
@@ -53,7 +70,9 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
 
 - Use external volumes for PostgreSQL and Qdrant data persistence.
 - Set `MCP_API_KEY` to a secret token (the MCP HTTP transport on `:8002` is
-  network-accessible — leaving it blank is dev-only).
+  network-accessible — leaving it blank is dev-only). Rotating the key in the operator
+  console supersedes it: from then on only the rotated key is accepted and the `.env` value
+  is refused.
 - **The backend `:8000` is not a network service.** It trusts the `user_id` its caller
   sends (the MCP server authenticates people and resolves the tenant), so
   `docker-compose.yml` publishes it on `127.0.0.1` only. The operator console
@@ -70,7 +89,10 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
   API refuses (fail closed). The MCP seat gate also fails closed (503) when the seat store
   is unreachable.
 - Every `/admin/*` and operator `/internal/*` route requires the operator bearer
-  `FAULTLINE_ADMIN_TOKEN` (auto-generated and printed once at first boot if unset).
+  `FAULTLINE_ADMIN_TOKEN`. If unset, the backend generates it on its first boot, stores only
+  its hash in the database and prints it once (`docker compose logs faultline | grep -A1
+  FAULTLINE_ADMIN_TOKEN`). It survives restarts. Lost it? `docker compose exec faultline
+  python -m src.api.operator_token --rotate` prints a replacement.
 - Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
 - Monitor `/health` for dependency status.
 
@@ -78,6 +100,6 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
 
 ```bash
 docker compose logs faultline
-docker compose restart faultline
+docker compose restart faultline     # the operator token survives this (stored hashed)
 docker compose exec postgres psql -U faultline -d faultline -c "SELECT 1"
 ```

@@ -1,6 +1,6 @@
 -- Migration 098: event_date_granularity on facts & staged_facts
 -- Date: 2026-06-17
--- Purpose: PHASE 1 of DEV/DESIGN-memory-temporal-lifecycle.md §3.3.
+-- Purpose: PHASE 1 of the memory temporal lifecycle (event-date granularity).
 --
 -- WHAT
 -- ----

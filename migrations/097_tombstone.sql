@@ -1,6 +1,6 @@
 -- Migration 097: deleted_at tombstone on facts & staged_facts
 -- Date: 2026-06-18
--- Purpose: PHASE 4 of DEV/DESIGN-memory-temporal-lifecycle.md §3.2 / §6 (Delete-Safety Lifecycle).
+-- Purpose: PHASE 4 of the memory temporal lifecycle (delete-safety tombstone).
 --
 -- WHAT
 -- ----

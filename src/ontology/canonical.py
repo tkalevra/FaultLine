@@ -1,7 +1,7 @@
 """Deterministic canonical ladder — rungs 1-3 + 7 of the resolution ladder.
 
-This is the PURE, deterministic, DB-backed front of the rel_type resolution ladder from
-``DEV/DESIGN-hierarchy-ladder-and-growth.md`` §"The deterministic resolution ladder":
+This is the PURE, deterministic, DB-backed front of the deterministic rel_type resolution
+ladder:
 
     1. normalize_rel()      — RUNG 1: surface morphology only (no semantics, no DB, no LLM)
     2. resolve_canonical()  — RUNG 2 exact rel_types PK lookup, then

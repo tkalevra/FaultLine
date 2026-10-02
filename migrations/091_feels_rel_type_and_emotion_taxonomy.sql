@@ -10,8 +10,8 @@
 -- by the loose name regex and mis-filed as `also_known_as`. Feelings are real, capturable
 -- facts (the user's affective state). This mints the seam GLiNER2 deliberately doesn't
 -- cover: a `feels` relation + an `emotion` taxonomy to ground feelings into.
--- Spec: DEV/DESIGN-feeling-and-temporal-capture.md (research-grounded: Emotion Frame
--- Ontology — experiencer→emotion→trigger; intensity-ordered is-a ladder).
+-- Grounding: the Emotion Frame Ontology (experiencer→emotion→trigger; intensity-ordered
+-- is-a ladder).
 --
 -- METADATA RATIONALE (feels)
 -- --------------------------

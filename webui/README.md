@@ -25,8 +25,11 @@ sends `Authorization: Bearer <FAULTLINE_ADMIN_TOKEN>`; 401 on missing/mismatch
 (constant-time compare).
 
 **Operator token (`FAULTLINE_ADMIN_TOKEN`):**
-- **Unset** → the backend auto-mints a random one on first boot and prints it to the
-  container logs (search for `FAULTLINE_ADMIN_TOKEN`). Paste that into the sign-in.
+- **Unset** → the backend mints a random one on its FIRST boot, stores only its hash in
+  `public.operator_admin_token` and prints it once to the container logs
+  (`docker compose logs faultline | grep -A1 FAULTLINE_ADMIN_TOKEN`). It survives restarts.
+  Lost it? `docker compose exec faultline python -m src.api.operator_token --rotate` prints a
+  replacement (the old one stops working within 30 s).
 - **Set** (in `.env` / the compose `environment:` block) → that exact value is the login.
 
 The seat cap (`FOSS_MAX_SEATS = 5`) is enforced **server-side** — it is a source
