@@ -415,7 +415,18 @@ _PROD_FLAGS = {
 
 
 @pytest.fixture(scope="module")
-def e2e():
+def backend_secret():
+    """#126: the backend requires X-FaultLine-Backend-Secret on every API call (#121). Pin a
+    known value for THIS module through a module-scoped MonkeyPatch (undone at module end,
+    never a module-level os.environ write: #63)."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv("FAULTLINE_BACKEND_SECRET", "smoke-35-36-37-secret")
+    yield {"X-FaultLine-Backend-Secret": "smoke-35-36-37-secret"}
+    mp.undo()
+
+
+@pytest.fixture(scope="module")
+def e2e(backend_secret):
     if not _DSN or not _DSN.rsplit("/", 1)[-1].endswith("_test"):
         pytest.skip("E2E needs a throwaway *_test POSTGRES_DSN (skipped — disclosed)")
     mp = pytest.MonkeyPatch()
@@ -461,6 +472,9 @@ def e2e():
     mp.setattr(M, "_idempotency_mgr", _Idem())
     from starlette.testclient import TestClient
     with TestClient(M.app) as client:
+        # #121/#126: every backend call carries the module's pinned service secret (one value
+        # for the whole module, so no test can see a different secret than this client sends).
+        client.headers.update(backend_secret)
         import time
         t0 = time.time()
         while L._nlp is None and time.time() - t0 < 180:
@@ -729,7 +743,7 @@ def test_clausal_frame_needs_a_contradiction_row(monkeypatch):
 
 # M2 — /classify-intent hands the SEAT to the cue route (the grown clausal route is per-tenant)
 @_spine
-def test_classify_intent_passes_the_seat_to_the_cue_route(monkeypatch):
+def test_classify_intent_passes_the_seat_to_the_cue_route(monkeypatch, backend_secret):
     import httpx
     M = _main()
     uid = "00000000-0000-4000-8000-000000000035"
@@ -746,7 +760,7 @@ def test_classify_intent_passes_the_seat_to_the_cue_route(monkeypatch):
     try:
         async def _go():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=M.app),
-                                         base_url="http://t") as c:
+                                         base_url="http://t", headers=backend_secret) as c:
                 return await c.post("/classify-intent", params={"user_id": uid},
                                     json={"text": "I was wrong earlier, my sailboat is 30 feet long."})
         r = asyncio.run(_go())

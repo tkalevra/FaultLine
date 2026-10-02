@@ -97,6 +97,8 @@
     "help.correct": "Correzioni e ritrattazioni",
     "help.connect": "Collegare un modello",
 
+    "seats.reseat.placeholder": "optional: existing user_id to re-seat",
+    "seats.reseat.title": "Re-mint a seat for a revoked or pre-seat user_id to restore access to its memory",
     "cmp.title": "FOSS vs SaaS",
     "cmp.intro": "Lo stesso motore, due modi di eseguirlo. Questo confronto è fattuale, non promozionale: scegli ciò che fa al caso tuo.",
     "cmp.foss": "Self-hosted (FOSS)",
