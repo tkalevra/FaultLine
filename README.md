@@ -166,9 +166,9 @@ Each schema contained **only** its own entities and hierarchy — zero cross-ten
 
 ## Requirements
 
-- Docker and Docker Compose
+- Docker and Docker Compose v2.24 or newer (`docker compose version`)
 - An LLM backend — [Ollama](https://ollama.ai/), [LM Studio](https://lmstudio.ai/), [OpenWebUI](https://openwebui.com/), or a hosted API (OpenAI, Anthropic, Groq)
-- 8 GB RAM minimum, 16 GB recommended
+- About 4 GB of RAM free for the stack (it uses ~3 GB after boot); 8 GB recommended. A local LLM needs its own memory on top.
 
 ---
 
@@ -187,7 +187,7 @@ setup.bat             # Windows
 #  or, on any platform:  python3 quickstart.py
 ```
 
-> **🌍 Language.** The wizard opens with a language choice. **English** continues on `main`. **Italiano** (experimental) switches to the `it` branch — an unofficial, work-in-progress Italian instance (Italian setup + `LEGGIMI-it.md`); extraction there rides the LLM path. Not production-ready — use at your own risk; for the stable version stay on English/`main`.
+> **🌍 Language.** The wizard opens with a language choice. **English** continues on `main`. **Italiano** (experimental) switches to the `it` branch and **Español** (experimental) to the `es` branch — unofficial, work-in-progress instances (localized setup + their own READMEs); extraction there rides the LLM path. Not production-ready — use at your own risk; for the stable version stay on English/`main`.
 
 **Or configure manually:**
 
@@ -196,7 +196,7 @@ cp .env.example .env
 # Set LLM_BACKEND_TYPE + LLM_BASE_URL to point at the LLM you already run
 # (Ollama, LM Studio, OpenWebUI, OpenAI, Anthropic, ...)
 
-docker compose up -d
+docker compose up -d --build
 
 curl http://localhost:8000/health
 # {"status": "ok", ...}
@@ -204,16 +204,55 @@ curl http://localhost:8000/health
 
 Re-run the connectivity check anytime with `python3 quickstart.py --validate`.
 
+> **`.env` holds secrets** (`LLM_API_KEY`, `MCP_API_KEY`). The wizard writes it and its
+> `.env.bak` backup owner-only (`0600`); if you create it by hand, run `chmod 600 .env`.
+
 > **Ports.** `:8002` (MCP) is the only network-facing service; secure it with `MCP_API_KEY`.
+> Qdrant (`:6333`) is published on `127.0.0.1` only; Postgres and Redis are not published.
 > The backend `:8000` (API + operator console) is published on `127.0.0.1` only, because it
 > trusts the caller's `user_id`. Reach the console from another machine with
 > `ssh -L 8000:localhost:8000 <host>`. Its API also requires a service secret that the MCP
 > server and the re-embedder send automatically. The secret is auto-generated on first boot
 > (zero config), or you can pin it with `FAULTLINE_BACKEND_SECRET` (see `.env.example`).
 
+> **Model choice.** Use a non-reasoning (instruct/chat) model. Reasoning models that write
+> their chain of thought into the reply `content` (instead of a separate reasoning field)
+> are not supported: FaultLine's short structured calls time out or get unparseable text,
+> and writes come back `extraction_degraded`. If your backend is slow, raise the
+> `LLM_TIMEOUT_*` values in `.env` (start with `LLM_TIMEOUT_REFRAME`).
+
 FaultLine hooks into an LLM you already run — it doesn't host one. (If you *don't* have a model handy, `docker compose --profile ollama up -d` starts a bundled Ollama alongside the stack.)
 
 The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no GPU or CUDA required). Takes 3–5 minutes.
+
+### First login and seats
+
+FaultLine (FOSS) is one instance with **up to 5 seats**. A seat is one person's private memory
+store. Everything is managed from the **operator console** at `http://localhost:8000/` on the
+FaultLine host (from another machine: `ssh -L 8000:localhost:8000 <host>`).
+
+1. **Sign in as the operator.** The operator token is printed once on the backend's first boot:
+   ```bash
+   docker compose logs faultline | grep -A1 FAULTLINE_ADMIN_TOKEN
+   ```
+   It is stored hashed and survives restarts. Lost it?
+   `docker compose exec faultline python -m src.api.operator_token --rotate` prints a new one.
+   To pin your own, set `FAULTLINE_ADMIN_TOKEN` in `.env`.
+2. **Mint a seat** (Seats & Tokens → mint seat). The seat token is shown **once**.
+3. **Put the seat token in the client as the Bearer**, e.g. Claude Desktop's "MCP API Key" field
+   or `Authorization: Bearer <seat token>` on `:8002`. The token *is* the identity: any user-id
+   header or setting is ignored, so no user id is needed.
+4. **OpenWebUI** is wired once with the instance MCP key, and each OpenWebUI user occupies a seat
+   of its own. Seat them on the console's **OpenWebUI** tab (see "Connect to OpenWebUI", step 5).
+
+**The shared MCP key and seats.** Until the first seat is minted, the MCP key (`MCP_API_KEY`)
+admits any user id, up to 5 users. Once any seat exists, only seated user ids are admitted: a
+client on the shared key with an unseated user id gets `403 seat required`, naming the id and
+how to seat it. Seats can be revoked (memory is kept) and re-seated by user id. The 5-seat cap is
+a source constant (`FOSS_MAX_SEATS` in `src/api/dashboard.py`).
+
+**The backend secret** (`FAULTLINE_BACKEND_SECRET`) is separate: it protects `:8000` and is
+auto-generated. You only need it for the legacy OpenWebUI Filter (see below).
 
 ### Connecting a client
 
@@ -228,11 +267,11 @@ Two independent choices — the wizard handles both, or set them by hand.
 | OpenWebUI | `openwebui` | `http://open-webui:8080` |
 | OpenAI / Anthropic / Groq | `openai` / `anthropic` / `groq` | provider API base URL |
 
-**2. How your chat client calls FaultLine's memory tools** — all through the **MCP server on `:8002`** (Bearer `MCP_API_KEY`). Any number of clients can share one store at once:
+**2. How your chat client calls FaultLine's memory tools** — all through the **MCP server on `:8002`**, with a seat token (or the shared `MCP_API_KEY` for OpenWebUI) as the Bearer. See "First login and seats" above:
 
 - **OpenWebUI** → Settings → Tools → `+` (OpenAPI), or Admin Settings → External Tools (native MCP, 0.6.31+) *(below)*
 - **Claude Desktop** → the `.mcpb` extension *(below)*
-- **Cursor / other MCP clients** → `http://<host>:8002/mcp` with header `Authorization: Bearer <MCP_API_KEY>`
+- **Cursor / other MCP clients** → `http://<host>:8002/mcp` with header `Authorization: Bearer <seat token>`
 
 ### Connect to OpenWebUI
 
@@ -243,11 +282,35 @@ FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWeb
 **Option A — OpenAPI tool server (recommended):**
 
 1. **Settings → Tools → `+`** (Manage Tool Servers). For an instance-wide server, use **Admin Settings → Tools** instead.
-2. **URL:** `http://faultline-mcp:8002` (same Docker network) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
+2. **URL:** `http://faultline-mcp:8002` (OpenWebUI attached to the `faultline-net` Docker network, see below) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
 3. **Auth:** `Bearer` → your `MCP_API_KEY`.
 4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them. It forwards the `X-OpenWebUI-User-Id` header FaultLine keys on (also `-User-Name`/`-Email`/`-Role`) — without it, per-user memory won't work.
+5. **Seats.** Every OpenWebUI user is its own memory store and occupies one of the instance's seats (FOSS: up to 5). Until the first seat is minted, OpenWebUI users are admitted automatically, up to 5 users. Once any seat exists (for example one you minted for Claude Desktop), only seated users are admitted: a user without a seat gets `403 seat required` naming their user_id. Seat them in the operator console (`http://localhost:8000/`) → **OpenWebUI** tab → **OpenWebUI users & seats**: refused users and users who already hold memory are listed there with a **seat** button, or paste a user id. Seating keeps the user's existing memory; OpenWebUI users keep using the MCP key, they don't need the seat token.
 
-OpenWebUI reads `/openapi.json` and surfaces all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — in every conversation.
+OpenWebUI reads `/openapi.json` and surfaces every FaultLine tool — `recall_memory`, `remember_facts`, `ingest_document`, `ingest_file`, `document_status`, `review_structure`, `retry_document`, `learn_facts`, `retract_fact`, `forget_fact` — in every conversation.
+
+**Running OpenWebUI next to FaultLine (Docker).** `http://faultline-mcp:8002` only resolves when the OpenWebUI container is on FaultLine's Docker network. That network has a fixed name, **`faultline-net`** (`<FAULTLINE_PREFIX>-net` if you changed the prefix). Attach OpenWebUI to it once, either in OpenWebUI's compose file:
+
+```yaml
+services:
+  open-webui:
+    # ...your existing service...
+    environment:
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+    networks: [default, faultline-net]
+networks:
+  faultline-net:
+    external: true
+```
+
+or on a running container: `docker network connect faultline-net open-webui`. Then use these URLs from OpenWebUI:
+
+| What | URL from OpenWebUI | Auth |
+|---|---|---|
+| Option A tool server (recommended) | `http://faultline-mcp:8002` | `Bearer` MCP key |
+| Legacy Filter / `faultline_mcp.py` Function (`FAULTLINE_URL` valve) | `http://faultline:8000` | `FAULTLINE_BACKEND_SECRET` (see below) |
+
+The backend `:8000` is published on the host's `127.0.0.1` only, so `http://<host>:8000` does **not** work from another container or machine; only the network path above does. If OpenWebUI runs on a different machine, use Option A with `http://<faultline-host>:8002` (the legacy Filter is not supported across hosts). Each OpenWebUI user occupies a seat once any seat exists (step 5 above).
 
 **Option B — native MCP (OpenWebUI 0.6.31+):**
 
@@ -279,13 +342,13 @@ FaultLine ships a `.mcpb` extension for one-click installation in Claude Desktop
 
 2. In Claude Desktop: **Settings → Extensions → Advanced settings → Install Extension** → select `faultline.mcpb`
 
-3. Claude Desktop prompts for three values:
+3. Claude Desktop prompts for these values:
 
    | Field | What it is | How to get it |
    |---|---|---|
    | **FaultLine MCP URL** | HTTP endpoint for the MCP server | Default: `http://localhost:8002`. Change the host if FaultLine runs on another machine. |
-   | **User ID** | UUID that isolates your memory store | Generate one: `python -c "import uuid; print(uuid.uuid4())"`. If you also use OpenWebUI, use the same UUID from **OpenWebUI → Settings → Account** so both clients share one memory store. |
-   | **MCP API Key** | Bearer token for authentication | Must match `MCP_API_KEY` in your `.env`. Generate one: `python -c "import secrets; print(secrets.token_hex(32))"` |
+   | **MCP API Key** | Your **seat token** | Operator console → Seats & Tokens → mint seat (shown once). The token identifies you. |
+   | **User ID** | Optional | Leave blank with a seat token. Only needed with the shared `MCP_API_KEY` before any seat exists. |
 
 4. Make sure your Docker stack is running (`docker compose up -d`) — the extension connects to the MCP server at port 8002.
 
@@ -306,7 +369,7 @@ MCP clients that support HTTP transport directly (no stdio needed) can connect w
   "mcpServers": {
     "faultline": {
       "url": "http://YOUR-HOST:8002/mcp",
-      "headers": { "Authorization": "Bearer YOUR_MCP_API_KEY" }
+      "headers": { "Authorization": "Bearer YOUR_SEAT_TOKEN" }
     }
   }
 }
@@ -322,8 +385,12 @@ MCP clients that support HTTP transport directly (no stdio needed) can connect w
 | `learn_facts` | Ingest structured ontological statements directly (`X is a subclass of Y`, …) |
 | `retract_fact` | Remove a fact from the knowledge graph (natural-language retraction) |
 | `forget_fact` | Tombstone ONE specific named fact (`subject` + optional `rel_type`/`old_value`) |
+| `ingest_file` | Store a PDF or image (base64); same document lane as `ingest_document` |
+| `document_status` | Progress of a document ingest (read-only) |
+| `retry_document` | Re-run the failed chunks of a document ingest |
+| `review_structure` | Show (and retire a wrong cue in) the structure FaultLine grew for you — never your memories |
 
-All six tools are backed by the same store your OpenWebUI conversations write to.
+All these tools are backed by the same store your OpenWebUI conversations write to.
 
 ### System prompt (important)
 

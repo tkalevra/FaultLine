@@ -1,7 +1,6 @@
 """Deterministic predicate verb-lift — RUNG-1 extractor for novel activity rels.
 
-This is the "Option B" verb-lift from ``DEV/fix-reports/RC-route-growth-ingest.md`` and the
-open mechanism in ``DEV/DESIGN-trigger-span-gliner2-extraction.md`` (lines 50-55): given a
+This is the "Option B" verb-lift of the trigger-span → GLiNER2 extraction design: given a
 fact-bearing span and a GLiNER2-found entity PAIR (subject, object), lift the user's own
 connecting verb phrase between the pair verbatim, then normalize it deterministically through
 ``src/ontology/canonical.py::normalize_rel`` (RUNG 1 morphology — "fixed" → "fix"). The

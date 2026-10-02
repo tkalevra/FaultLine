@@ -162,6 +162,62 @@ def _checksum(sql_bytes: bytes) -> str:
     return hashlib.sha256(sql_bytes).hexdigest()
 
 
+# COMMENT-ONLY REVISIONS. A file whose only change is in SQL comments gets a new checksum, and
+# the run decision would then RE-RUN it against every existing tenant (several of these files
+# INSERT/UPDATE inside a per-tenant fan-out) for no schema change at all.
+#
+# Each entry maps a PRIOR checksum to the ONE reviewed CURRENT checksum it is equivalent to.
+# A schema whose ledger row carries the prior is re-stamped ONLY while the file on disk still
+# hashes to that expected current value (#162). Any later change to the file (a real SQL edit,
+# or another comment edit) hashes to something else and takes the normal changed-migration
+# path: it re-runs. tests/test_foss_migration_comment_scrub.py checks every expected value
+# against the file on disk and, when the pre-scrub commit is in the clone, re-proves the pair
+# comment-only from git history. Add an entry ONLY for a reviewed comment-only edit.
+#   #158 (2026-10-02): references to private design docs scrubbed from these headers.
+_COMMENT_ONLY_PRIOR_CHECKSUMS: Dict[str, Dict[str, str]] = {
+    "086_trigger_span_patterns": {
+        "8ed7ac277a46532890e81db644afc7cd6f41b3252190cfa08fad1336491630e8":
+            "c4b30f7880e0f4b29fb8bbd3dc1f5692b07626604601c1e8fcb502c5c6f3a513",
+    },
+    "087_entity_taxonomy_nesting": {
+        "1f64240a0bddc8787c490600701af1f06589ddf83c879a77dce416f592e9c2df":
+            "71dde164b868b77afd6f03e980bbd2ee46f83808939d552d100cd8ca5d96a6c3",
+    },
+    "088_temporal_model": {
+        "db5e107578198f43ea8868963267219f666015de7c6aa4e199b6d778ab94f5bb":
+            "3aed8975fd81cdc5aca3478084e7aa1140b517d71e143049bf3b095659e5a263",
+    },
+    "089_wire_hierarchy_flags": {
+        "dac13cf5e5610d7cdd392b368ab256935cdc989b70d34b7498c876064d5f92a2":
+            "851832c27a7ae08f54b8b6e3abd6113b77e62465f74a9336ce5265a7032e404e",
+    },
+    "091_feels_rel_type_and_emotion_taxonomy": {
+        "e5d85244c117c5c9577e3717fec21fd68ce5d3e9db270fc94425c0f6a145bfb6":
+            "e551db436887c37f60edfdcec466c4fb4182d7f8588606eaa8cf272ab27e89e7",
+    },
+    "096_temporal_class": {
+        "8e69e3dc44b22584ca34c12394686f4326010a715a95e52d40b9b4ddea0cbd8d":
+            "68eba25978cba38a132c94d7279be8f9c4e5f855104cf9ef1f574b4d38c822b6",
+    },
+    "097_tombstone": {
+        "9c7e53dd3387b7132685a92b969e44bb1344d3afbd2571be8246512337f5da29":
+            "ade161b5c25e98cfeb0ec3d7ec41dac70b53d0d493558c2535d3108bcca091f4",
+    },
+    "098_event_date_granularity": {
+        "a434ec243ba2cb552aac248ded30878aeb89244a5f30f028ea350eaf5b9bd317":
+            "a31595529b0364ede5661f48f848062e0dd8cfaa778ea9404dd438741bf78af5",
+    },
+    "100_attended_rel_type_event_capture": {
+        "7aa2e15978bc51b901bf028144570e226bac1a9736d5201478e07c234a6f9444":
+            "c019dda568da883d0a96b4fff10e3016b486f7726f19ec37c58cfae02d56dc67",
+    },
+    "111_has_state_relational_predicate": {
+        "20a7cc25b8ab13d89550b4cdd6ea6efc3a4bb8813d3dcb9080d1d56a3fe64d77":
+            "6f20f1729ac3dd9721eb56f190054fc5906c0d82bb11ffa64e16741ef6d6bc37",
+    },
+}
+
+
 @dataclass
 class BootSummary:
     """What one boot actually did. These counts are PRINTED — the proof that the gate works is
@@ -490,7 +546,15 @@ def run_boot_migrations(
     for migration_id, path, checksum in migrations:
         needed: List[str] = []
         if summary.ledger_active:
-            needed = [s for s in schemas if applied.get((s, migration_id)) != checksum]
+            prior = _COMMENT_ONLY_PRIOR_CHECKSUMS.get(migration_id, {})
+            equivalent = [s for s in schemas
+                          if prior.get(applied.get((s, migration_id)) or "") == checksum]
+            if equivalent and conn is not None:
+                # Applied under a comment-only-different revision: re-stamp, never re-run.
+                summary.stamped_pairs += _stamp(
+                    conn, [(s, migration_id) for s in equivalent], checksum, "applied")
+            needed = [s for s in schemas
+                      if applied.get((s, migration_id)) != checksum and s not in equivalent]
             if not needed:
                 summary.skipped.append(migration_id)
                 continue

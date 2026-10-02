@@ -1,6 +1,6 @@
 -- Migration 096: temporal_class on rel_types — drives supersede-vs-coexist deterministically
 -- Date: 2026-06-17
--- Purpose: PHASE 0 of DEV/DESIGN-memory-temporal-lifecycle.md §3.1.
+-- Purpose: PHASE 0 of the memory temporal lifecycle (temporal class).
 --
 -- WHAT
 -- ----

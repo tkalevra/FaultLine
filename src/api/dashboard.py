@@ -10,8 +10,8 @@ and surface stack health. Every count, identity, and cap decision is derived
 server-side from the DB; the webui is a view, never a source of truth.
 
 Auth: a single operator bearer token (``FAULTLINE_ADMIN_TOKEN``). Constant-time
-compared. If unset at boot, the lifespan loader mints a random one and logs it
-once (the webui's login help documents this "first boot" behaviour). Every
+compared. If unset, the backend mints one on its FIRST boot, persists only its
+hash and prints it once; it survives restarts (``src/api/operator_token.py``). Every
 ``/api/dashboard/*`` endpoint requires it; 401 on missing/mismatch.
 
 The seat cap (``FOSS_MAX_SEATS = 5``) is a SOURCE CONSTANT — deliberately NOT an
@@ -70,21 +70,17 @@ def _sha256_hex(value: str) -> str:
 
 _bearer = HTTPBearer(auto_error=False, description="FAULTLINE_ADMIN_TOKEN bearer")
 
-# Resolved once at import: the env value if set, else None. The lifespan loader
-# in main.py may seed os.environ with an auto-minted token at boot; we re-read
-# os.environ on each request so the auto-minted value is honoured immediately.
-def _admin_token() -> Optional[str]:
-    return (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip() or None
-
-
 def require_operator(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> str:
-    """Constant-time operator-token check. 401 on missing/mismatch/unconfigured."""
-    expected = _admin_token()
+    """Constant-time operator-token check. 401 on missing/mismatch/unconfigured.
+
+    The credential is the env ``FAULTLINE_ADMIN_TOKEN`` or, when unset, the token persisted
+    (hashed) on first boot — see ``src/api/operator_token.py``."""
+    from src.api.operator_token import operator_auth_configured, operator_token_ok
     presented = creds.credentials if creds is not None else None
     # No token configured at all → fail loud (do not run an open control plane).
-    if not expected:
+    if not operator_auth_configured():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="operator auth not configured: set FAULTLINE_ADMIN_TOKEN",
@@ -96,8 +92,7 @@ def require_operator(
             detail="Unauthorized",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    from src.api.backend_auth import safe_equals
-    if not safe_equals(presented, expected):
+    if not operator_token_ok(presented):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
@@ -235,14 +230,22 @@ def _resolve_mcp_url(request: Request) -> str:
     explicit = (os.environ.get("MCP_EXTERNAL_URL") or "").strip()
     if explicit:
         return explicit.rstrip("/")
-    # Derive from the request host, swapping the port to the MCP port (8002),
-    # mirroring the webui's own guessMcpBase() so the two never disagree.
+    # Derive from the request host, swapping the port to the MCP host port
+    # (FAULTLINE_MCP_PORT, default 8002 — compose passes the published port).
+    port = _mcp_port()
     host = request.headers.get("host", "")
     if host:
         host_no_port = host.split(":", 1)[0]
         scheme = "https" if (request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https") else "http"
-        return f"{scheme}://{host_no_port}:8002"
-    return "http://localhost:8002"
+        return f"{scheme}://{host_no_port}:{port}"
+    return f"http://localhost:{port}"
+
+
+def _mcp_port() -> int:
+    try:
+        return int((os.environ.get("FAULTLINE_MCP_PORT") or "8002").strip())
+    except ValueError:
+        return 8002
 
 
 def _read_filter_script() -> str:
@@ -284,11 +287,17 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
 @router.get("/health")
-def dashboard_health(_op: str = Depends(require_operator)) -> dict:
-    """Aggregate the existing /health data for the dashboard pills."""
+async def dashboard_health(_op: str = Depends(require_operator)) -> dict:
+    """Aggregate the existing /health data for the dashboard pills.
+
+    ``main.health`` is ``async def`` (stale-while-revalidate on the event loop), so this
+    handler must be async and AWAIT it: calling it from a sync def returned an un-awaited
+    coroutine and every console poll 500'd on ``coroutine.get`` (#146)."""
     try:
         from src.api import main as _main
-        health = _main.health()  # reuse the live, cached collector
+        health = await _main.health()  # reuse the live, cached collector
+        if not isinstance(health, dict):
+            raise TypeError(f"health() returned {type(health).__name__}")
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — degrade gracefully
@@ -316,7 +325,7 @@ def dashboard_config(request: Request, _op: str = Depends(require_operator)) -> 
     return {
         "version": FAULTLINE_VERSION,
         "backend_port": 8000,
-        "mcp_port": 8002,
+        "mcp_port": _mcp_port(),
         "backend_type": llm.get("backend_type", "unknown"),
         "model": llm.get("model", "(unset)"),
         "embedding_model": os.environ.get("EMBEDDING_MODEL", "(default)"),
@@ -410,6 +419,13 @@ def dashboard_seat_mint(body: SeatMintRequest, _op: str = Depends(require_operat
                 "active = TRUE, revoked_at = NULL",
                 (user_id, label, token_hash),
             )
+            # #148: a seated user_id is no longer waiting for a seat. Best effort (the
+            # table may predate a migration run); a savepoint keeps the mint intact.
+            cur.execute("SAVEPOINT seat_req")
+            try:
+                cur.execute("DELETE FROM public.dashboard_seat_requests WHERE user_id = %s", (user_id,))
+            except Exception:  # noqa: BLE001
+                cur.execute("ROLLBACK TO SAVEPOINT seat_req")
         conn.commit()
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
@@ -446,6 +462,73 @@ def dashboard_seat_revoke(user_id: str, _op: str = Depends(require_operator)) ->
         raise HTTPException(status_code=503, detail="seat revoke failed")
     _log_action("revoke_seat", target_user_id=user_id)
     return {"revoked": True, "user_id": user_id}
+
+
+@router.get("/seat-requests")
+def dashboard_seat_requests(_op: str = Depends(require_operator)) -> dict:
+    """User_ids that need a seat to be admitted (#148), for one-click seating.
+
+    Two sources, both minus every active seat:
+      * ``requested``: the MCP seat gate refused this user_id for lack of a seat (an OpenWebUI
+        user signing in after the first seat was minted, a pinned-id client on the shared key);
+      * ``has_memory``: a tenant that already holds memory (created before the first seat, or
+        whose seat was revoked). In seat posture it is refused until it is seated again.
+    ``seat_posture`` says whether seats are enforced yet (any seat ever minted)."""
+    rows: dict[str, dict] = {}
+    try:
+        with psycopg2.connect(_dsn()) as db, db.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT 1 FROM public.dashboard_seats)")
+            seat_posture = bool(cur.fetchone()[0])
+            cur.execute(
+                "SELECT p.user_id, p.created_at FROM public.user_provisioning p "
+                "WHERE NOT EXISTS (SELECT 1 FROM public.dashboard_seats s "
+                "                  WHERE s.active AND s.user_id = p.user_id) "
+                "ORDER BY p.created_at DESC LIMIT 50"
+            )
+            for uid, created_at in cur.fetchall():
+                rows[str(uid)] = {"user_id": str(uid), "source": "has_memory",
+                                  "last_seen": created_at.isoformat() if created_at else None,
+                                  "attempts": 0}
+            cur.execute("SAVEPOINT seat_req")
+            try:
+                cur.execute(
+                    "SELECT r.user_id, r.last_seen, r.attempts FROM public.dashboard_seat_requests r "
+                    "WHERE NOT EXISTS (SELECT 1 FROM public.dashboard_seats s "
+                    "                  WHERE s.active AND s.user_id = r.user_id) "
+                    "ORDER BY r.last_seen DESC"
+                )
+                for uid, last_seen, attempts in cur.fetchall():
+                    entry = rows.setdefault(str(uid), {"user_id": str(uid), "source": "requested"})
+                    if entry["source"] == "has_memory":
+                        entry["source"] = "has_memory+requested"
+                    entry["last_seen"] = last_seen.isoformat() if last_seen else None
+                    entry["attempts"] = int(attempts or 0)
+            except psycopg2.Error:
+                cur.execute("ROLLBACK TO SAVEPOINT seat_req")
+            cur.execute("SELECT COUNT(*) FROM public.dashboard_seats WHERE active = TRUE")
+            active = int(cur.fetchone()[0])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("dashboard.seat_requests.list_failed", error=str(exc)[:160])
+        raise HTTPException(status_code=503, detail="seat store unavailable")
+    waiting = sorted(rows.values(), key=lambda r: r.get("last_seen") or "", reverse=True)
+    return {"waiting": waiting, "seat_posture": seat_posture,
+            "active": active, "limit": FOSS_MAX_SEATS}
+
+
+@router.delete("/seat-requests/{user_id}")
+def dashboard_seat_request_dismiss(user_id: str, _op: str = Depends(require_operator)) -> dict:
+    """Drop a user_id from the waiting list (it is listed again if it is refused again)."""
+    try:
+        uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="malformed user_id")
+    try:
+        with psycopg2.connect(_dsn()) as db, db.cursor() as cur:
+            cur.execute("DELETE FROM public.dashboard_seat_requests WHERE user_id = %s", (user_id,))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("dashboard.seat_requests.dismiss_failed", error=str(exc)[:160])
+        raise HTTPException(status_code=503, detail="seat store unavailable")
+    return {"dismissed": True, "user_id": user_id}
 
 
 @router.get("/llm")
@@ -535,11 +618,20 @@ def dashboard_llm_test(_op: str = Depends(require_operator)) -> dict:
 
 @router.get("/openwebui")
 def dashboard_openwebui(request: Request, _op: str = Depends(require_operator)) -> dict:
-    """MCP wiring URL, key-set flag, and the legacy filter script body."""
-    api_key_set = bool(os.environ.get("MCP_API_KEY", "").strip()) or _has_active_mcp_key()
+    """MCP wiring URL, which MCP key is in force, and the legacy filter script body.
+
+    ``api_key_source`` says which key the MCP server accepts (#147): ``rotated`` (a key
+    rotated here; the ``.env`` MCP_API_KEY, if any, is superseded and refused), ``env`` (the
+    ``MCP_API_KEY`` from ``.env``; compose passes it to this service too, so this reads the
+    same value the MCP server does) or ``none``."""
+    env_key_set = bool(os.environ.get("MCP_API_KEY", "").strip())
+    rotated = _has_active_mcp_key()
+    source = "rotated" if rotated else ("env" if env_key_set else "none")
     return {
         "mcp_url": _resolve_mcp_url(request),
-        "api_key_set": api_key_set,
+        "api_key_set": source != "none",
+        "api_key_source": source,
+        "env_key_superseded": bool(rotated and env_key_set),
         "filter_script": _read_filter_script(),
     }
 
@@ -549,7 +641,9 @@ def dashboard_openwebui_rotate_key(_op: str = Depends(require_operator)) -> JSON
     """Rotate the MCP/OWUI key: mint new, revoke all others, return new ONCE.
 
     The MCP server consults the dashboard_mcp_keys table on every auth, so the
-    old key stops working immediately (no cache, single indexed lookup)."""
+    old key stops working immediately (no cache, single indexed lookup). That
+    includes the ``MCP_API_KEY`` from ``.env``: once a rotated key exists the env
+    key is superseded and refused (#147)."""
     _check_rate("operator:rotate")
     new_key = secrets.token_urlsafe(32)
     key_hash = _sha256_hex(new_key)

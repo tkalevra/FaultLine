@@ -1,6 +1,6 @@
 """Qdrant partition choke-point — the ONE place that resolves a Qdrant op's target.
 
-Ratified in ``DEV/DESIGN-qdrant-multitenancy-security.md``. This module is the vector-side
+This module is the vector-side
 analogue of the Postgres ``subject_cursor`` factory: EVERY Qdrant read/search/scroll/delete/
 upsert resolves its (collection, tenant-filter) here, and — in the consolidated model — an op
 that would reach Qdrant WITHOUT a bound tenant filter THROWS rather than run a full-collection

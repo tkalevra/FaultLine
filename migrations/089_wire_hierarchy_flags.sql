@@ -1,7 +1,6 @@
 -- Migration 089: wire the dormant hierarchy flags on rel_types
 -- Date: 2026-06-14
 -- Purpose: SCHEMA FOUNDATION for the hierarchy ladder (rung 4 + transitive trace-back).
---          See DEV/DESIGN-hierarchy-ladder-and-growth.md §"Hierarchy (rung 4)" / §"Build order #1".
 --
 -- WHAT
 -- ----

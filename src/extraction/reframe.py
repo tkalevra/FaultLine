@@ -1,7 +1,7 @@
 """LLM reframe / atomize — de-ramble a multi-topic turn into clean one-fact-per-line atoms.
 
 This is the "make it less like the ramblings of a 7-year-old that just learned English"
-pre-segmentation normalizer of ``DEV/fix-reports/RC-reframe-atomize.md``. It runs at the very
+pre-segmentation normalizer (reframe → atomize). It runs at the very
 TOP of the segmentation entry points (``/extract/rewrite`` before ``_split_sentences``, and the
 ``/harvest-spans`` recall path on already-isolated fact-bearing spans), BEFORE the trigger-span
 segmenter, the LLM chunked extract pass, and the deterministic verb-lift. It hands those

@@ -31,7 +31,7 @@
 -- word-list, NO LLM, NO GLiNER2) constructs the pair; the eventive noun grounds into an
 -- `event` place via the EXISTING re_embedder "what is X" pushback (exactly as anxious→emotion);
 -- the DATE rides the existing per-edge event_date gate (no change there).
--- Spec: DEV/DESIGN-feeling-and-temporal-capture.md (events = reified occurrences).
+-- Model: events are reified occurrences.
 -- Precedent: `met` is already temporal_class='event' (migration 096).
 --
 -- THE HARD LINE: event-TYPE is a PLACE (a node in the L4 hierarchy), the DATE is a SCALAR

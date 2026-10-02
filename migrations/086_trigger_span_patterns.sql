@@ -1,7 +1,6 @@
 -- Migration 086: trigger-span detection patterns (category='trigger')
 -- Date: 2026-06-14
 -- Purpose: bolt the trigger→GLiNER2 detection layer to the DB.
---          See DEV/DESIGN-trigger-span-gliner2-extraction.md.
 --
 -- A `category='trigger'` row's pattern_regex is a FACT SIGNAL (date, issue/event verb,
 -- "my X is", acquisition verb, "by the way" lead-in). It does NOT map to a rel_type — it

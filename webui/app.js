@@ -563,13 +563,79 @@ function loadOpenWebUI() {
     var url = d.mcp_url || guessMcpBase();
     S.mcpBase = url;
     $('owui-url').textContent = url;
-    $('owui-keyset').textContent = d.api_key_set ? t('brain.key.set') : t('brain.key.unset');
+    $('owui-keyset').textContent = d.api_key_source === 'rotated' ? t('owui.key.rotated')
+      : (d.api_key_source === 'env' ? t('owui.key.env')
+      : (d.api_key_set ? t('brain.key.set') : t('brain.key.unset')));
     if (d.filter_script) {
       var pre = $('owui-filter'); pre.textContent = d.filter_script;
     }
     var step = url.replace(/^https?:\/\//, '').replace(/\/mcp$/, '');
     $('owui-step-url').textContent = 'http://' + step;
+  }).then(loadSeatRequests);
+}
+
+/* #148: every OpenWebUI user occupies a seat. List the ones waiting and seat them. */
+function loadSeatRequests() {
+  return callApi('GET', '/api/dashboard/seat-requests').then(function (r) {
+    var body = $('owui-waiting-body');
+    if (!body) return;
+    if (r.pending || !r.ok) {
+      body.innerHTML = '';
+      $('owui-waiting-empty').classList.remove('hidden');
+      if (r.err && !r.pending) setMsg('owui-seat-msg', 'err', friendly(r.err));
+      return;
+    }
+    var d = r.data || {};
+    $('owui-seat-posture').textContent = (d.seat_posture ? t('owui.seats.posture.on') : t('owui.seats.posture.off')) +
+      '  (' + (d.active || 0) + ' / ' + (d.limit || SEAT_LIMIT) + ')';
+    var rows = d.waiting || [];
+    if (!rows.length) { body.innerHTML = ''; $('owui-waiting-empty').classList.remove('hidden'); return; }
+    $('owui-waiting-empty').classList.add('hidden');
+    body.innerHTML = rows.map(function (w) {
+      var why = String(w.source || '').split('+').map(function (k) { return t('owui.seats.why.' + k); }).join(', ');
+      return '<tr>' +
+        '<td class="mono-id">' + esc(w.user_id) + '</td>' +
+        '<td>' + esc(why) + (w.attempts ? ' (' + esc(w.attempts) + '×)' : '') + '</td>' +
+        '<td>' + esc(fmtDate(w.last_seen)) + '</td>' +
+        '<td class="row-actions">' +
+          '<button class="btn sm accent" data-act="seat" data-uid="' + esc(w.user_id) + '">seat</button>' +
+          (String(w.source || '').indexOf('requested') >= 0 ?
+            '<button class="btn sm" data-act="dismiss" data-uid="' + esc(w.user_id) + '">dismiss</button>' : '') +
+        '</td></tr>';
+    }).join('');
+    qsa('#owui-waiting-body button[data-act]').forEach(function (btn) {
+      btn.addEventListener('click', onWaitingAction);
+    });
   });
+}
+
+function seatOwuiUser(uid, label) {
+  var body = { user_id: uid };
+  if (label) body.label = label;
+  setMsg('owui-seat-msg', '', '');
+  return callApi('POST', '/api/dashboard/seats', body).then(function (r) {
+    if (r.pending) { setMsg('owui-seat-msg', 'warn', t('err.pending')); return; }
+    if (!r.ok) {
+      if (r.err && r.err.status === 409 && r.err.data && r.err.data.limit) {
+        setMsg('owui-seat-msg', 'err', t('seats.cap.reached'));
+      } else {
+        setMsg('owui-seat-msg', 'err', friendly(r.err));
+      }
+      return;
+    }
+    setMsg('owui-seat-msg', 'ok', t('owui.seats.seated'));
+    loadSeatRequests(); loadSeats(); loadDashboard();
+  });
+}
+
+function onWaitingAction(e) {
+  var btn = e.currentTarget;
+  var uid = btn.dataset.uid;
+  if (btn.dataset.act === 'seat') {
+    seatOwuiUser(uid, '');
+  } else if (btn.dataset.act === 'dismiss') {
+    callApi('DELETE', '/api/dashboard/seat-requests/' + encodeURIComponent(uid)).then(function () { loadSeatRequests(); });
+  }
 }
 
 function rotateKey() {
@@ -719,6 +785,13 @@ function wire() {
   $('btn-llm-save').addEventListener('click', saveLLM);
   $('btn-llm-test').addEventListener('click', testLLM);
   $('btn-owui-rotate').addEventListener('click', rotateKey);
+  $('btn-owui-seat').addEventListener('click', function () {
+    var uid = ($('owui-seat-uid').value || '').trim();
+    if (!uid) { setMsg('owui-seat-msg', 'err', 'enter the OpenWebUI user id'); return; }
+    seatOwuiUser(uid, ($('owui-seat-label').value || '').trim()).then(function () {
+      $('owui-seat-uid').value = ''; $('owui-seat-label').value = '';
+    });
+  });
   $('btn-owui-copy-filter').addEventListener('click', function () {
     copyText($('owui-filter').textContent).then(function (ok) {
       setMsg('owui-msg', ok ? 'ok' : 'err', ok ? 'filter script copied.' : 'copy failed — select and copy manually.');

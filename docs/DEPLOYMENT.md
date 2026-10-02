@@ -113,13 +113,13 @@ Performance overhead: `INFO` ~2–5%, `DEBUG` ~5–15%. Use `INFO` in production
 ### Reading backend logs
 
 ```bash
-docker logs faultline                                  # all backend logs
-docker logs faultline | grep "extract_rewrite"         # extraction
-docker logs faultline | grep "wgm_gate\|fact_store\|commit"   # ingest pipeline
-docker logs faultline | grep "query_user_facts"        # query
-docker logs faultline | grep "gliner2"                 # entity typing
-docker logs faultline | grep "re_embedder"             # background loop
-docker logs faultline | grep "ERROR\|CRITICAL\|Exception"
+docker compose logs faultline                          # all backend logs
+docker compose logs faultline | grep "extract_rewrite"         # extraction
+docker compose logs faultline | grep "wgm_gate\|fact_store\|commit"   # ingest pipeline
+docker compose logs faultline | grep "query_user_facts"        # query
+docker compose logs faultline | grep "gliner2"                 # entity typing
+docker compose logs faultline | grep "re_embedder"             # background loop
+docker compose logs faultline | grep "ERROR\|CRITICAL\|Exception"
 ```
 
 ### Key pipeline log patterns (DEBUG)
@@ -169,18 +169,21 @@ docker logs faultline | grep "ERROR\|CRITICAL\|Exception"
 
 ### Docker network
 
+The shipped `docker-compose.yml` puts every service on one bridge network with a fixed
+name, `faultline-net` (`<FAULTLINE_PREFIX>-net` when you change the prefix). Another stack,
+such as OpenWebUI, joins it as an external network:
+
 ```yaml
 services:
-  faultline:
-    container_name: faultline
-    networks: [faultline-net]
-  faultline-mcp:
-    container_name: faultline-mcp
-    networks: [faultline-net]
+  open-webui:
+    networks: [default, faultline-net]
 networks:
   faultline-net:
-    driver: bridge
+    external: true
 ```
+
+From a container on that network, the MCP server is `http://faultline-mcp:8002` and the
+backend is `http://faultline:8000` (the backend is published on the host's `127.0.0.1` only).
 
 ### Hardening checklist
 
