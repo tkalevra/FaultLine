@@ -17,6 +17,13 @@
 # Verify:  curl http://localhost:8000/health
 # MCP:     http://localhost:8002/mcp        (Claude Desktop or any MCP client)
 #
+# Exposure: :8002 (MCP) is the network front door. The backend :8000 trusts the
+# user_id its caller sends, so it is published on 127.0.0.1 ONLY — the operator
+# console (http://localhost:8000/) and the health check work on this host; from
+# another machine use an SSH tunnel:  ssh -L 8000:localhost:8000 <host>
+# Defence in depth: the backend API also requires a service secret, auto-generated on
+# first boot into the shared DB (or pinned with FAULTLINE_BACKEND_SECRET on both services).
+#
 # Per-client setup lives in the README "Connecting a client" table — the only
 # thing that changes between OpenWebUI / LM Studio / Claude is these env values.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,7 +50,8 @@ services:
     image: faultline:latest
     container_name: faultline-api
     ports:
-      - "8000:8000"
+      # Loopback only (#117): never expose the backend to the network.
+      - "127.0.0.1:8000:8000"
     environment:
       # INSTALL LANGUAGE — set by quickstart.py's language gate; both EMPTY for English, which
       # makes the entrypoint's collation guard a total no-op (not one query issued).
@@ -85,6 +93,9 @@ services:
       # Unset → the backend auto-mints a random one and prints it once to the logs
       # (look for the FAULTLINE_ADMIN_TOKEN line). Set it here to pin a known value.
       FAULTLINE_ADMIN_TOKEN: ${FAULTLINE_ADMIN_TOKEN:-}
+      # Backend service secret. Unset = auto-generated on first boot into the shared DB
+      # (zero config). Set it to pin a value; use the same value on faultline-mcp.
+      FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
       # Optional friendly MCP URL shown in the OpenWebUI tab (defaults derived).
       MCP_EXTERNAL_URL: ${MCP_EXTERNAL_URL:-}
     extra_hosts:
@@ -119,6 +130,7 @@ services:
       FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
+      FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
       # Shared postgres — lets the MCP server validate per-seat tokens minted
       # from the control-plane webui AND honour rotated MCP keys immediately
       # (dashboard_seats / dashboard_mcp_keys tables, public schema). Falls back

@@ -63,13 +63,15 @@ services:
     container_name: faultline
     restart: unless-stopped
     ports:
-      - "8001:8000"
+      # Loopback only (#117): the backend trusts the caller's user_id.
+      - "127.0.0.1:8001:8000"
     environment:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
       LLM_BASE_URL: ${LLM_BASE_URL:-http://open-webui:8080}
       LLM_BACKEND_TYPE: ${LLM_BACKEND_TYPE:-openwebui}
       LLM_API_KEY: ${LLM_API_KEY}
       FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
+      FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: faultline-test
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -110,6 +112,10 @@ services:
       FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
+      FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
+      # The seat store + the auto-minted backend secret live in the shared DB: without
+      # this DSN seat tokens cannot authenticate and the seat gate fails closed (503).
+      POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
     depends_on:
       - faultline
     logging:

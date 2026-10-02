@@ -17,6 +17,78 @@ import asyncio
 import threading
 
 import httpx
+
+# ── Backend service secret (#125) ───────────────────────────────────────────────
+# The FaultLine backend (:8000) requires X-FaultLine-Backend-Secret on every API call.
+# OpenWebUI has no access to FaultLine's database, so it CANNOT read the auto-minted secret:
+# set FAULTLINE_BACKEND_SECRET explicitly on BOTH the FaultLine services and here (the
+# FAULTLINE_BACKEND_SECRET valve, or the env var of the OpenWebUI container).
+# The header is attached by an httpx request hook ONLY to the FaultLine backend origin,
+# never to the LLM endpoint.
+FAULTLINE_BACKEND_SECRET_HEADER = "X-FaultLine-Backend-Secret"
+_FL_VALVE_SECRET: str = ""
+_FL_BACKEND_ORIGINS: set = set()
+
+
+def _origin(url: str):
+    from urllib.parse import urlsplit
+    u = urlsplit(url if "://" in url else "http://" + url)
+    return (u.hostname, u.port or (443 if u.scheme == "https" else 80))
+
+
+def _fl_register_backend(url: str) -> None:
+    try:
+        _FL_BACKEND_ORIGINS.add(_origin(url))
+    except Exception:
+        pass
+
+
+def _fl_backend_secret() -> str:
+    return (_FL_VALVE_SECRET or os.environ.get("FAULTLINE_BACKEND_SECRET", "")).strip()
+
+
+def _fl_is_backend(url) -> bool:
+    try:
+        return (url.host, url.port or (443 if url.scheme == "https" else 80)) in _FL_BACKEND_ORIGINS
+    except Exception:
+        return False
+
+
+def _fl_add_secret(request) -> None:
+    secret = _fl_backend_secret()
+    if secret and _fl_is_backend(request.url) and FAULTLINE_BACKEND_SECRET_HEADER not in request.headers:
+        request.headers[FAULTLINE_BACKEND_SECRET_HEADER] = secret
+
+
+def _fl_explain_401(response) -> None:
+    if response.status_code == 401 and _fl_is_backend(response.request.url):
+        print("[FaultLine] ERROR: the FaultLine backend answered 401 (backend service "
+              "credential required). Set FAULTLINE_BACKEND_SECRET to the SAME value on the "
+              "FaultLine services and in this function's FAULTLINE_BACKEND_SECRET valve "
+              "(OpenWebUI cannot read FaultLine's auto-generated secret).",
+              file=sys.stderr, flush=True)
+
+
+async def _fl_add_secret_async(request) -> None:
+    _fl_add_secret(request)
+
+
+async def _fl_explain_401_async(response) -> None:
+    _fl_explain_401(response)
+
+
+_FL_SYNC_HOOKS = {"request": [_fl_add_secret], "response": [_fl_explain_401]}
+
+
+def _fl_headers_for(url: str) -> dict:
+    """For bare httpx.post/get calls (no client to hook): the secret header, backend only."""
+    secret = _fl_backend_secret()
+    try:
+        is_backend = _origin(url) in _FL_BACKEND_ORIGINS
+    except Exception:
+        is_backend = False
+    return {FAULTLINE_BACKEND_SECRET_HEADER: secret} if secret and is_backend else {}
+_FL_ASYNC_HOOKS = {"request": [_fl_add_secret_async], "response": [_fl_explain_401_async]}
 import redis
 from pydantic import BaseModel, Field
 
@@ -220,7 +292,7 @@ def _can_reach_url(url: str, timeout: float = 1.0) -> bool:
     """
     try:
         # Use httpx.Client (synchronous, no async overhead)
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout, event_hooks=_FL_SYNC_HOOKS) as client:
             response = client.head(url, follow_redirects=False)
             # 2xx or 3xx = reachable
             return 200 <= response.status_code < 400
@@ -229,7 +301,7 @@ def _can_reach_url(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
-def _get_faultline_url(valve_url: Optional[str] = None) -> str:
+def _get_faultline_url_impl(valve_url: Optional[str] = None) -> str:
     """
     Detect FaultLine backend URL via smart priority chain.
 
@@ -294,6 +366,13 @@ def _get_faultline_url(valve_url: Optional[str] = None) -> str:
     return fallback_url
 
 # Persistent HTTP client for pooled connections (avoid socket churn from new client per request)
+def _get_faultline_url(valve_url: Optional[str] = None) -> str:
+    """Resolve the backend URL and register its origin for the service-secret hook."""
+    url = _get_faultline_url_impl(valve_url)
+    _fl_register_backend(url)
+    return url
+
+
 _http_client: httpx.AsyncClient = None
 
 def _parse_response_json_robust(response_text: str, context: str = "") -> dict | list | None:
@@ -353,6 +432,7 @@ async def _initialize_http_client():
     global _http_client
     if _http_client is None:
         _http_client = httpx.AsyncClient(
+            event_hooks=_FL_ASYNC_HOOKS,
             timeout=httpx.Timeout(90.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
         )
@@ -425,8 +505,10 @@ async def _detect_implicit_correction(text: str, faultline_url: str, user_id: st
         resp = httpx.post(
             f"{faultline_url}/evaluate-correction-pattern",
             json={"text": text, "user_id": user_id},
+            headers=_fl_headers_for(faultline_url),
             timeout=5.0,
         )
+        _fl_explain_401(resp)
         if resp.status_code != 200:
             return False, None
 
@@ -876,7 +958,7 @@ async def _call_extract_rewrite(
     if debug:
         print(f"[FaultLine Filter] _call_extract_rewrite START url={faultline_url[:40]}... text_len={len(text)}")
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, event_hooks=_FL_ASYNC_HOOKS) as client:
             response = await client.post(
                 f"{faultline_url}/extract/rewrite",
                 json={
@@ -1432,7 +1514,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
         if not valves.BACKEND_LLM_URL and user_uuid:
             request_data["chat_id"] = user_uuid
 
-        async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=valves.QWEN_TIMEOUT, event_hooks=_FL_ASYNC_HOOKS) as client:
             response = await client.post(
                 final_url,
                 json=request_data,
@@ -1800,6 +1882,11 @@ class Filter:
     """
 
     class Valves(BaseModel):
+        FAULTLINE_BACKEND_SECRET: str = Field(
+            default=os.environ.get("FAULTLINE_BACKEND_SECRET", ""),
+            description="FaultLine backend service secret (X-FaultLine-Backend-Secret). REQUIRED: the backend refuses calls without it, and OpenWebUI cannot read the value FaultLine auto-generates. Set FAULTLINE_BACKEND_SECRET to the SAME value on the FaultLine services and here."
+        )
+
         FAULTLINE_URL: str = Field(
             default="",
             description="FaultLine backend API endpoint (optional). If empty, Filter auto-detects via Docker service name, env var, or localhost. Override here to explicitly set custom URL (e.g., for reverse proxy deployments). Examples: http://faultline:8000 (Docker), http://my-domain.com/faultline, http://10.0.0.5:8000 (external port)"
@@ -2054,7 +2141,7 @@ class Filter:
 
     async def _fetch_entities(self, text: str, user_id: str) -> list[dict]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, event_hooks=_FL_ASYNC_HOOKS) as client:
                 resp = await client.post(
                     f"{self._get_faultline_url_cached()}/extract",
                     json={"text": text, "source": "preflight", "user_id": user_id},
@@ -2121,7 +2208,7 @@ Return valid JSON only. If no facts, return [].
             if user_uuid:
                 request_data["chat_id"] = user_uuid
 
-            async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS) as client:
+            async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS, event_hooks=_FL_ASYNC_HOOKS) as client:
                 resp = await client.post(
                     f"{url}{self.valves.LLM_CHAT_PATH}",
                     json=request_data,
@@ -2344,7 +2431,7 @@ Return valid JSON only. If no facts, return [].
         Returns facts formatted for inclusion in LLM prompts.
         """
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, event_hooks=_FL_ASYNC_HOOKS) as client:
                 resp = await client.post(
                     f"{self._get_faultline_url_cached()}/query",
                     json={"user_id": user_id, "text": "recent facts"},
@@ -2486,7 +2573,7 @@ GRANULAR EXAMPLES (using recent facts context):
             if user_uuid:
                 request_data["chat_id"] = user_uuid
 
-            async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS) as client:
+            async with httpx.AsyncClient(timeout=self.valves.LLM_TIMEOUT_SECS, event_hooks=_FL_ASYNC_HOOKS) as client:
                 resp = await client.post(
                     f"{url}{self.valves.LLM_CHAT_PATH}",
                     json=request_data,
@@ -3059,8 +3146,9 @@ GRANULAR EXAMPLES (using recent facts context):
         __event_emitter__: Optional[Callable] = None,
         __task__: Optional[str] = None,
     ) -> dict:
-        global _INLET_CALL_COUNTER
+        global _INLET_CALL_COUNTER, _FL_VALVE_SECRET
         _INLET_CALL_COUNTER += 1
+        _FL_VALVE_SECRET = (self.valves.FAULTLINE_BACKEND_SECRET or "").strip()
         print(f"[FaultLine Filter] inlet CALLED enabled={self.valves.ENABLED} debug={self.valves.ENABLE_DEBUG} call_count={_INLET_CALL_COUNTER} task={__task__}")
 
         # Skip background tasks (title generation, tags generation, autocomplete)
@@ -3089,8 +3177,10 @@ GRANULAR EXAMPLES (using recent facts context):
                 response = httpx.get(
                     f"{backend_url}/provisioning/status",
                     params={"user_id": user_id, "user_name": user_name},
+                    headers=_fl_headers_for(backend_url),
                     timeout=5.0
                 )
+                _fl_explain_401(response)
 
                 if response.status_code == 200:
                     result = response.json()
@@ -3242,7 +3332,7 @@ GRANULAR EXAMPLES (using recent facts context):
                 if _source_text:
                     _learn_payload["source_text"] = _source_text
                 try:
-                    async with httpx.AsyncClient(timeout=60.0) as _lc:
+                    async with httpx.AsyncClient(timeout=60.0, event_hooks=_FL_ASYNC_HOOKS) as _lc:
                         _lr = await _lc.post(
                             f"{faultline_url}/learn",
                             json=_learn_payload,

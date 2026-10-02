@@ -645,6 +645,36 @@ from src.wgm.gate import WGMValidationGate
 from src.ingest import document_structure as _docstruct
 
 FAULTLINE_API_URL = os.environ.get("FAULTLINE_API_URL", "http://localhost:8000").rstrip("/")
+
+
+def _backend_headers() -> dict:
+    """#117/#121: the backend service-secret header (X-FaultLine-Backend-Secret): the env
+    FAULTLINE_BACKEND_SECRET, else the value the backend auto-minted into the shared DB.
+    {} only when neither resolves (the backend then refuses the call: fail closed)."""
+    from src.api.backend_auth import backend_headers
+    return backend_headers()
+
+
+async def _inject_backend_secret(request: "httpx.Request") -> None:
+    """httpx request hook: add the service secret AT SEND TIME (the backend may mint it after
+    this client was built), and ONLY for requests to the backend's own origin, never to a
+    user-supplied URL."""
+    try:
+        from urllib.parse import urlsplit
+        base = urlsplit(FAULTLINE_API_URL)
+        if (request.url.host, request.url.port or (443 if request.url.scheme == "https" else 80)) != \
+                (base.hostname, base.port or (443 if base.scheme == "https" else 80)):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    for k, v in _backend_headers().items():
+        if k not in request.headers:
+            request.headers[k] = v
+
+
+def _backend_client_kwargs() -> dict:
+    """kwargs for every httpx.AsyncClient that talks to the backend."""
+    return {"event_hooks": {"request": [_inject_backend_secret]}}
 # FAULTLINE_USER_ID is the SINGLE-USER / DEV fallback ONLY. It is consulted only when
 # no caller-supplied identity is present (see bind_tenant / resolve_effective_user_id).
 # It MUST be unset in any multi-user deploy, else it would mask real per-user identity.
@@ -908,7 +938,7 @@ def _client() -> "TurnBoundedClient":
     global _http_client, _lazy_http_client
     c = _http_client
     if c is None:
-        c = TurnBoundedClient(httpx.AsyncClient(timeout=30.0))  # same shape as the transports
+        c = TurnBoundedClient(httpx.AsyncClient(timeout=30.0, **_backend_client_kwargs()))  # same shape as the transports
         _http_client = c
         _lazy_http_client = c
         _log("http_client.lazy_created: shared backend client created OUTSIDE a transport "
@@ -960,7 +990,7 @@ async def _post(url: str, **kwargs) -> httpx.Response:
     try:
         return await _client().post(url, **kwargs)
     except (httpx.ConnectError, httpx.RemoteProtocolError):
-        async with httpx.AsyncClient(timeout=30.0) as fresh:
+        async with httpx.AsyncClient(timeout=30.0, **_backend_client_kwargs()) as fresh:
             return await fresh.post(url, **kwargs)
 
 
@@ -969,7 +999,7 @@ async def _get(url: str, **kwargs) -> httpx.Response:
     try:
         return await _client().get(url, **kwargs)
     except (httpx.ConnectError, httpx.RemoteProtocolError):
-        async with httpx.AsyncClient(timeout=30.0) as fresh:
+        async with httpx.AsyncClient(timeout=30.0, **_backend_client_kwargs()) as fresh:
             return await fresh.get(url, **kwargs)
 
 
@@ -2183,7 +2213,7 @@ async def _learn_via_llm(
                     timeout=120.0,
                 )
             except Exception:
-                async with httpx.AsyncClient(timeout=120.0) as fresh:
+                async with httpx.AsyncClient(timeout=120.0, **_backend_client_kwargs()) as fresh:
                     resp = await fresh.post(f"{FAULTLINE_API_URL}/learn", json=body)
             _log(f"expand_complete topic={topic!r} status={resp.status_code} body={resp.text[:120]}")
         except Exception as e:
@@ -6081,7 +6111,7 @@ async def retract_fact_tool(
     # graceful non-500 result: the correction was not applied (the user can restate), but the request
     # does not crash. SUCCESS PATH UNCHANGED: a 200 flows straight through to `data` below.
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=90.0, **_backend_client_kwargs()) as client:
             resp = await client.post(
                 f"{FAULTLINE_API_URL}/retract/correct",
                 # attested (authorship): True = the model EXPLICITLY chose this tool — its
@@ -6844,7 +6874,7 @@ async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int 
 async def run_mcp_server() -> None:
     """Run the MCP server on stdin/stdout using raw JSON-RPC protocol."""
     global _http_client, _initialized
-    _http_client = TurnBoundedClient(httpx.AsyncClient(timeout=30.0))  # round 17: wall-bounded
+    _http_client = TurnBoundedClient(httpx.AsyncClient(timeout=30.0, **_backend_client_kwargs()))  # round 17: wall-bounded
     try:
         _log("MCP server starting (raw stdio protocol)")
         _log(f"FaultLine API URL: {FAULTLINE_API_URL}")

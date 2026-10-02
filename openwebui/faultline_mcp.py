@@ -6,9 +6,72 @@ Store validated facts through the FaultLine WGM pipeline with user-facing status
 import json
 import os
 import re
+import sys
 from typing import Callable, Optional
 
 import httpx
+
+# ── Backend service secret (#125) ───────────────────────────────────────────────
+# The FaultLine backend (:8000) requires X-FaultLine-Backend-Secret on every API call.
+# OpenWebUI has no access to FaultLine's database, so it CANNOT read the auto-minted secret:
+# set FAULTLINE_BACKEND_SECRET explicitly on BOTH the FaultLine services and here (the
+# FAULTLINE_BACKEND_SECRET valve, or the env var of the OpenWebUI container).
+# The header is attached by an httpx request hook ONLY to the FaultLine backend origin,
+# never to the LLM endpoint.
+FAULTLINE_BACKEND_SECRET_HEADER = "X-FaultLine-Backend-Secret"
+_FL_VALVE_SECRET: str = ""
+_FL_BACKEND_ORIGINS: set = set()
+
+
+def _origin(url: str):
+    from urllib.parse import urlsplit
+    u = urlsplit(url if "://" in url else "http://" + url)
+    return (u.hostname, u.port or (443 if u.scheme == "https" else 80))
+
+
+def _fl_register_backend(url: str) -> None:
+    try:
+        _FL_BACKEND_ORIGINS.add(_origin(url))
+    except Exception:
+        pass
+
+
+def _fl_backend_secret() -> str:
+    return (_FL_VALVE_SECRET or os.environ.get("FAULTLINE_BACKEND_SECRET", "")).strip()
+
+
+def _fl_is_backend(url) -> bool:
+    try:
+        return (url.host, url.port or (443 if url.scheme == "https" else 80)) in _FL_BACKEND_ORIGINS
+    except Exception:
+        return False
+
+
+def _fl_add_secret(request) -> None:
+    secret = _fl_backend_secret()
+    if secret and _fl_is_backend(request.url) and FAULTLINE_BACKEND_SECRET_HEADER not in request.headers:
+        request.headers[FAULTLINE_BACKEND_SECRET_HEADER] = secret
+
+
+def _fl_explain_401(response) -> None:
+    if response.status_code == 401 and _fl_is_backend(response.request.url):
+        print("[FaultLine] ERROR: the FaultLine backend answered 401 (backend service "
+              "credential required). Set FAULTLINE_BACKEND_SECRET to the SAME value on the "
+              "FaultLine services and in this function's FAULTLINE_BACKEND_SECRET valve "
+              "(OpenWebUI cannot read FaultLine's auto-generated secret).",
+              file=sys.stderr, flush=True)
+
+
+async def _fl_add_secret_async(request) -> None:
+    _fl_add_secret(request)
+
+
+async def _fl_explain_401_async(response) -> None:
+    _fl_explain_401(response)
+
+
+_FL_SYNC_HOOKS = {"request": [_fl_add_secret], "response": [_fl_explain_401]}
+_FL_ASYNC_HOOKS = {"request": [_fl_add_secret_async], "response": [_fl_explain_401_async]}
 from pydantic import BaseModel
 
 
@@ -148,6 +211,7 @@ class Function:
         """Configuration valves for FaultLine integration."""
 
         FAULTLINE_URL: str = "http://faultline:8000"
+        FAULTLINE_BACKEND_SECRET: str = os.environ.get("FAULTLINE_BACKEND_SECRET", "")  # FaultLine backend service secret (X-FaultLine-Backend-Secret). REQUIRED: the backend refuses calls without it, and OpenWebUI cannot read the value FaultLine auto-generates. Set FAULTLINE_BACKEND_SECRET to the SAME value on the FaultLine services and here.
         FAULTLINE_TIMEOUT: int = 20
         QWEN_URL: str = os.getenv("QWEN_URL", "http://localhost:11434/v1/chat/completions")
         QWEN_MODEL: str = "qwen/qwen3.5-9b"
@@ -159,6 +223,15 @@ class Function:
 
     def __init__(self):
         self.valves = self.Valves()
+
+    def _fl_backend_client(self) -> dict:
+        """httpx.AsyncClient kwargs for a backend call: registers the backend origin and the
+        valve secret so the request hook attaches X-FaultLine-Backend-Secret (and explains a
+        401)."""
+        global _FL_VALVE_SECRET
+        _FL_VALVE_SECRET = (self.valves.FAULTLINE_BACKEND_SECRET or "").strip()
+        _fl_register_backend(self.valves.FAULTLINE_URL)
+        return {"event_hooks": _FL_ASYNC_HOOKS}
 
     async def _emit(
         self, __event_emitter__: Optional[Callable], status: str
@@ -223,7 +296,7 @@ class Function:
         Used by retraction extraction to resolve entities.
         """
         try:
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT, **self._fl_backend_client()) as client:
                 resp = await client.get(
                     f"{self.valves.FAULTLINE_URL}/user/{user_id}/recent-facts?limit={limit}",
                     timeout=self.valves.FAULTLINE_TIMEOUT,
@@ -270,7 +343,7 @@ class Function:
         user_id = __user__.get("id", "anonymous") if __user__ else "anonymous"
 
         try:
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT, **self._fl_backend_client()) as client:
                 resp = await client.post(
                     f"{self.valves.FAULTLINE_URL}/extract/rewrite",
                     json={"text": text, "user_id": user_id},
@@ -365,7 +438,7 @@ class Function:
         await self._emit(__event_emitter__, "Validating facts...")
 
         try:
-            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=self.valves.FAULTLINE_TIMEOUT, **self._fl_backend_client()) as client:
                 response = await client.post(
                     f"{self.valves.FAULTLINE_URL}/ingest", json=payload
                 )

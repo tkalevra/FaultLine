@@ -204,6 +204,13 @@ curl http://localhost:8000/health
 
 Re-run the connectivity check anytime with `python3 quickstart.py --validate`.
 
+> **Ports.** `:8002` (MCP) is the only network-facing service; secure it with `MCP_API_KEY`.
+> The backend `:8000` (API + operator console) is published on `127.0.0.1` only, because it
+> trusts the caller's `user_id`. Reach the console from another machine with
+> `ssh -L 8000:localhost:8000 <host>`. Its API also requires a service secret that the MCP
+> server and the re-embedder send automatically. The secret is auto-generated on first boot
+> (zero config), or you can pin it with `FAULTLINE_BACKEND_SECRET` (see `.env.example`).
+
 FaultLine hooks into an LLM you already run — it doesn't host one. (If you *don't* have a model handy, `docker compose --profile ollama up -d` starts a bundled Ollama alongside the stack.)
 
 The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no GPU or CUDA required). Takes 3–5 minutes.
@@ -253,6 +260,7 @@ OpenWebUI reads `/openapi.json` and surfaces all six tools — `recall_memory`, 
 **Tool firing (weak models).** As of v0.10.0, OpenWebUI defaults every model to **Native** function calling (the old "Default" mode is renamed **"Legacy"** and is unsupported). Native works for most 2024+ models; if a smaller model (Qwen, Llama, Mistral, Phi) won't reliably call the tools, switch **Chat Controls → Advanced Params → Function Calling → Legacy** (or set it per-model / globally under **Model Parameters**).
 
 > **Legacy alternative:** the inlet/outlet Filter (`openwebui/faultline_function.py`, Workspace → Functions) still exists for automatic injection, but the tool-server paths above are the supported ones.
+> The Filter and the legacy `openwebui/faultline_mcp.py` Function call the backend `:8000` directly, so they must send its service secret. OpenWebUI cannot read the secret FaultLine auto-generates, because it has no access to FaultLine's database. For these paths, set `FAULTLINE_BACKEND_SECRET` explicitly to the SAME value on the FaultLine services (`.env`) and in the function's `FAULTLINE_BACKEND_SECRET` valve (or the OpenWebUI container's env). In a zero-config install, an operator can copy the current value from `GET /api/dashboard/backend-secret` (operator token required). A missing or wrong secret shows up in the OpenWebUI logs as a "backend answered 401" error.
 
 ---
 

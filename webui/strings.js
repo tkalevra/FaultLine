@@ -97,6 +97,8 @@
     "help.correct": "Corrections & retractions",
     "help.connect": "Connect a model",
 
+    "seats.reseat.placeholder": "optional: existing user_id to re-seat",
+    "seats.reseat.title": "Re-mint a seat for a revoked or pre-seat user_id to restore access to its memory",
     "cmp.title": "FOSS vs SaaS",
     "cmp.title.note": "honest · side by side",
     "cmp.intro": "The same engine, two ways to run it. This is factual, not salesy — pick what fits.",

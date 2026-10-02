@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+from src.api.backend_auth import backend_headers as _backend_auth_headers  # #121: every backend call carries the service secret
 from src.api import errors as _errors  # THE ONE ERROR SEAM — persisted error columns are rendered bodies
 
 import httpx
@@ -2163,7 +2164,7 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
             resp = httpx.post(
                 f"{backend_url}/harvest-spans",
                 json={"text": raw_text, "user_id": user_id},
-                headers=_lane_headers,
+                headers={**_lane_headers, **_backend_auth_headers()},
                 # NOT a bare literal. Prod diagnosis 2026-07-31: the reextract path is the lane
                 # that actually times out (183 stall minutes overlapped 98.4% with
                 # `reextract_*: timed out`), and it still carried 60.0 while the DOC lane was
@@ -2230,7 +2231,7 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
         resp = httpx.post(
             f"{backend_url}/extract/rewrite",
             json={"text": raw_text, "user_id": user_id},
-            headers=_lane_headers,
+            headers={**_lane_headers, **_backend_auth_headers()},
             timeout=_DOC_INGEST_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
@@ -2865,6 +2866,7 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                         # to any live ingest of the same turn.
                         headers={
                             **_BACKEND_LANE_HEADERS,
+                            **_backend_auth_headers(),
                             _ingest_transport.REPLAY_MARKER_HEADER:
                                 _ingest_transport.REPLAY_MARKER_VALUE,
                             _ingest_transport.REPLAY_LANE_HEADER:
@@ -3641,7 +3643,7 @@ def _document_chunk_edges(chunk: str, user_id: str, backend_url: str,
                 _sresp = httpx.post(
                     f"{backend_url}/harvest-spans",
                     json=_sbody,
-                    headers=_BACKEND_LANE_HEADERS,
+                    headers={**_BACKEND_LANE_HEADERS, **_backend_auth_headers()},
                     timeout=_DOC_CHUNK_HTTP_TIMEOUT,
                 )
                 _sresp.raise_for_status()
@@ -3677,7 +3679,7 @@ def _document_chunk_edges(chunk: str, user_id: str, backend_url: str,
         resp = httpx.post(
             f"{backend_url}/extract/rewrite",
             json={"text": chunk, "user_id": user_id, "force_relation_extraction": True},
-            headers=_BACKEND_LANE_HEADERS,
+            headers={**_BACKEND_LANE_HEADERS, **_backend_auth_headers()},
             timeout=_DOC_CHUNK_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
@@ -3784,6 +3786,7 @@ def _process_document_chunk(chunk, *, idx, doc_id, user_id: str, backend_url: st
             json={"user_id": user_id, "raw_text": chunk,
                   "source": "document", "source_ref": source_ref,
                   "intent": None, "extracted_fact_count": None},
+            headers=_backend_auth_headers(),
             timeout=5.0,
         )
     except Exception:
@@ -3809,7 +3812,7 @@ def _process_document_chunk(chunk, *, idx, doc_id, user_id: str, backend_url: st
                         f"{backend_url}/ingest",
                         json={"text": text, "user_id": user_id, "edges": _salvage,
                               "source": source, "source_ref": source_ref},
-                        headers=_BACKEND_LANE_HEADERS,
+                        headers={**_BACKEND_LANE_HEADERS, **_backend_auth_headers()},
                         timeout=_DOC_INGEST_HTTP_TIMEOUT,
                     ).raise_for_status()
                 except Exception as _se:
@@ -3823,7 +3826,7 @@ def _process_document_chunk(chunk, *, idx, doc_id, user_id: str, backend_url: st
                 f"{backend_url}/ingest",
                 json={"text": text, "user_id": user_id, "edges": _edges,
                       "source": source, "source_ref": source_ref},
-                headers=_BACKEND_LANE_HEADERS,
+                headers={**_BACKEND_LANE_HEADERS, **_backend_auth_headers()},
                 timeout=_DOC_INGEST_HTTP_TIMEOUT,
             )
         except Exception as _ie:
@@ -13125,7 +13128,7 @@ def main():
             reextract_route = "rewrite"
             if ingest_enabled and reextract_enabled:
                 try:
-                    _route_resp = httpx.get(f"{backend_api_url}/internal/ingest-route", timeout=5.0)
+                    _route_resp = httpx.get(f"{backend_api_url}/internal/ingest-route", headers=_backend_auth_headers(), timeout=5.0)
                     _route_resp.raise_for_status()
                     _route = (_route_resp.json().get("statement_extractor") or "rewrite").strip().lower()
                     reextract_route = _route if _route in ("spine", "rewrite") else "rewrite"
@@ -14325,6 +14328,7 @@ def main():
                         _r = httpx.post(
                             "http://faultline:8000/internal/refresh-intent-pattern-caches",
                             json=_refresh_body,
+                            headers=_backend_auth_headers(),
                             timeout=5.0,
                         )
                         if _r.status_code == 200:
@@ -14579,6 +14583,7 @@ def main():
                     try:
                         refresh_resp = httpx.post(
                             f"http://faultline:8000/internal/refresh-intent-pattern-caches",
+                            headers=_backend_auth_headers(),
                             timeout=5.0
                         )
                         if refresh_resp.status_code == 200:
