@@ -120,7 +120,7 @@ def _log(msg: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _mcp._http_client = _mcp.TurnBoundedClient(httpx.AsyncClient(timeout=30.0))  # round 17: every request honours the turn wall
+    _mcp._http_client = _mcp.TurnBoundedClient(httpx.AsyncClient(timeout=30.0, **_mcp._backend_client_kwargs()))  # round 17: every request honours the turn wall
     _log(f"HTTP transport started. FaultLine API: {_mcp.FAULTLINE_API_URL}")
     if MCP_API_KEY:
         _log(f"Auth ENABLED — MCP_API_KEY set ({len(MCP_API_KEY)} chars)")
@@ -298,8 +298,10 @@ def _any_dashboard_credential_configured() -> bool:
     # before the callee's `try`, so its documented "any error -> None, never hard-fails"
     # fail-safe never gets the chance to run. Every credential-less request then 500s inside
     # require_auth — which is the DEFAULT posture for a fresh self-hosted install.
+    # #120: a seat EVER minted (revoked rows count) closes the anonymous posture for good;
+    # revoking the last seat must not re-open it.
     return _dashboard_lookup(
-        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1", ()
+        "SELECT 1 FROM public.dashboard_seats LIMIT 1", ()
     ) is not None or _dashboard_lookup(
         "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
     ) is not None
@@ -330,7 +332,8 @@ def _resolve_principal(credentials: str | None) -> str | None:
         return "shared"
     # 3. Env MCP_API_KEY.
     if MCP_API_KEY:
-        if credentials is not None and hmac.compare_digest(credentials, MCP_API_KEY):
+        from src.api.backend_auth import safe_equals
+        if credentials is not None and safe_equals(credentials, MCP_API_KEY):
             return "shared"
         return None
     # 4. Anonymous dev mode — only when nothing is configured AND nothing was
@@ -338,6 +341,48 @@ def _resolve_principal(credentials: str | None) -> str | None:
     if credentials is None and not _any_dashboard_credential_configured():
         return "anonymous"
     return None
+
+
+class _SeatGateRefusal(str):
+    """A truthy refusal message that also carries the HTTP status to answer with."""
+
+    status_code: int = 403
+
+    def __new__(cls, message: str, status_code: int = 403):
+        obj = super().__new__(cls, message)
+        obj.status_code = status_code
+        return obj
+
+
+def _seat_cap_refusal(user_id: str, principal: str | None) -> Optional[str]:
+    """MCP front door for the FOSS seat cap; returns the refusal message or None.
+
+    A per-seat token is its own active seat row, so it is always admitted. For the
+    shared key / anonymous dev posture (src.provisioning.provisioning_status.seat_refusal):
+    once ANY seat is active the claimed user_id must hold an active seat — for an existing
+    tenant too (#119: a revoked seat or a pre-seat tenant gets 403 "seat required"; nothing
+    is deleted, re-minting a seat for that user_id restores access). In the open posture a
+    NEW tenant is admitted only under the FOSS_MAX_SEATS cap (the backend enforces that
+    atomically at tenant birth; this makes it a clean 403 here). Checked per request, so a
+    revoke takes effect on the next call. Read-only.
+
+    FAILS CLOSED (#122): no seat store configured, or the store erroring, refuses with 503
+    (reason logged) and never admits an unverifiable user_id.
+    """
+    if principal and _mcp._TENANT_UUID_RE.match(principal.strip().lower()):
+        return None
+    dsn = _dashboard_dsn()
+    if not dsn:
+        _log("seat gate FAIL-CLOSED: POSTGRES_DSN is not set on the MCP service (seat store unreachable)")
+        return _SeatGateRefusal("seat store unavailable: the MCP server cannot verify seats", 503)
+    try:
+        from src.provisioning.provisioning_status import seat_admission_refusal
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            reason = seat_admission_refusal(cur, user_id)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"seat gate FAIL-CLOSED: seat store error {type(exc).__name__}: {str(exc)[:160]}")
+        return _SeatGateRefusal("seat store unavailable: the MCP server cannot verify seats", 503)
+    return _SeatGateRefusal(reason, 403) if reason else None
 
 
 def require_auth(
@@ -425,11 +470,17 @@ def _resolve_rest_user_id(request: Request, body_user_id: str, principal: str | 
         return principal.strip().lower()
     claimed = request.headers.get("X-OpenWebUI-User-Id", "") or body_user_id
     try:
-        return _mcp.bind_tenant(principal, claimed)
+        user_id = _mcp.bind_tenant(principal, claimed)
     except _mcp.TenantSpoofError as exc:
         client = request.client.host if request.client else "unknown"
         _log(f"REST {exc.status_code} from {client} — {exc.message}")
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    refusal = _seat_cap_refusal(user_id, principal)
+    if refusal:
+        code = getattr(refusal, "status_code", 403)
+        _log(f"REST {code} seat gate — user_id={user_id[:8]}... {refusal}")
+        raise HTTPException(status_code=code, detail=str(refusal))
+    return user_id
 
 
 @app.post(
@@ -828,6 +879,11 @@ async def mcp_endpoint(
                     _jsonrpc_error(req_id, -32602, exc.message),
                     status_code=exc.status_code,
                 )
+            refusal = _seat_cap_refusal(resolved_user_id, _principal)
+            if refusal:
+                _log(f"tools/call name={tool_name!r} REJECT seat cap: {refusal}")
+                return JSONResponse(_jsonrpc_error(req_id, -32602, str(refusal)),
+                                    status_code=getattr(refusal, "status_code", 403))
         arguments = {**arguments, "user_id": resolved_user_id}
         _log(f"tools/call name={tool_name!r} user_id={resolved_user_id[:8]}...")
         result = await _mcp._call_tool(tool_name, arguments)

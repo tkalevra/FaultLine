@@ -36,10 +36,12 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _open_core_env(monkeypatch):
-    """Auth off for every test in this package (mirrors tests/mcp/conftest)."""
+    """Auth off for every test in this package (mirrors tests/mcp/conftest, including the
+    seat-gate stub: the gate fails closed without a seat store and is pinned elsewhere)."""
     monkeypatch.delenv("MCP_API_KEY", raising=False)
     import src.mcp.http_server as h
     monkeypatch.setattr(h, "MCP_API_KEY", "")
+    monkeypatch.setattr(h, "_seat_cap_refusal", lambda user_id, principal: None)
 
 
 # ── server/discover ──────────────────────────────────────────────────────────────

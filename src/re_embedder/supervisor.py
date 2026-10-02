@@ -241,7 +241,8 @@ def _resolve_statement_route(backend_api_url: str) -> str:
     ``GET /internal/ingest-route``). Fail-safe → ``"rewrite"``. Cheap (local backend)."""
     try:
         import httpx
-        r = httpx.get(f"{backend_api_url}/internal/ingest-route", timeout=5.0)
+        from src.api.backend_auth import backend_headers
+        r = httpx.get(f"{backend_api_url}/internal/ingest-route", headers=backend_headers(), timeout=5.0)
         r.raise_for_status()
         route = (r.json().get("statement_extractor") or "rewrite").strip().lower()
         return route if route in ("spine", "rewrite") else "rewrite"

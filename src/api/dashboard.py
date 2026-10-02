@@ -23,7 +23,6 @@ advisory lock, so two concurrent mints cannot both pass count=4.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import os
 import secrets
 import time
@@ -97,7 +96,8 @@ def require_operator(
             detail="Unauthorized",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not hmac.compare_digest(presented, expected):
+    from src.api.backend_auth import safe_equals
+    if not safe_equals(presented, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
@@ -266,6 +266,9 @@ def _read_filter_script() -> str:
 
 class SeatMintRequest(BaseModel):
     label: Optional[str] = Field(None, max_length=120)
+    # Re-mint: seat an EXISTING user_id (a revoked seat, or a tenant created before the
+    # first seat) so its memory is reachable again. Omitted → a fresh random user_id.
+    user_id: Optional[str] = Field(None, max_length=36)
 
 
 class LLMConfigUpdate(BaseModel):
@@ -362,7 +365,13 @@ def dashboard_seat_mint(body: SeatMintRequest, _op: str = Depends(require_operat
     """
     _check_rate("operator:mint")
     label = (body.label or "").strip()[:120]
-    user_id = str(uuid.uuid4())
+    if body.user_id:
+        try:
+            user_id = str(uuid.UUID(body.user_id.strip()))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="malformed user_id")
+    else:
+        user_id = str(uuid.uuid4())
     token = secrets.token_urlsafe(32)
     token_hash = _sha256_hex(token)
 
@@ -386,8 +395,19 @@ def dashboard_seat_mint(body: SeatMintRequest, _op: str = Depends(require_operat
                         "limit": FOSS_MAX_SEATS,
                     },
                 )
+            cur.execute("SELECT active FROM public.dashboard_seats WHERE user_id = %s", (user_id,))
+            existing = cur.fetchone()
+            if existing and existing[0]:
+                conn.rollback()
+                return JSONResponse(status_code=status.HTTP_409_CONFLICT,
+                                    content={"detail": "seat already active for this user_id"})
+            # Re-mint reactivates the tombstone with a NEW token (the old one stays dead);
+            # a fresh or never-seated user_id gets a new row.
             cur.execute(
-                "INSERT INTO public.dashboard_seats (user_id, label, token_hash) VALUES (%s, %s, %s)",
+                "INSERT INTO public.dashboard_seats (user_id, label, token_hash) VALUES (%s, %s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
+                "label = COALESCE(NULLIF(EXCLUDED.label, ''), public.dashboard_seats.label), "
+                "active = TRUE, revoked_at = NULL",
                 (user_id, label, token_hash),
             )
         conn.commit()
@@ -545,6 +565,26 @@ def dashboard_openwebui_rotate_key(_op: str = Depends(require_operator)) -> JSON
         raise HTTPException(status_code=503, detail="key rotation failed")
     _log_action("rotate_key")
     return JSONResponse(status_code=200, content={"api_key": new_key, "created_at": _now_iso()})
+
+
+@router.get("/backend-secret")
+def dashboard_backend_secret(_op: str = Depends(require_operator)) -> JSONResponse:
+    """Reveal the backend service secret to the OPERATOR (#125).
+
+    Needed when a client that cannot read FaultLine's database (the OpenWebUI Filter /
+    legacy Function) must call the backend: in the zero-config setup the secret was
+    auto-minted, so the operator copies it from here and sets FAULTLINE_BACKEND_SECRET on
+    both sides. Operator-gated, rate-limited, never logged (the action log records only
+    that a reveal happened), and served no-store."""
+    _check_rate("operator:reveal")
+    from src.api.backend_auth import backend_secret, BACKEND_SECRET_ENV
+    value = backend_secret()
+    if not value:
+        raise HTTPException(status_code=503, detail="backend secret not resolvable")
+    source = "env" if (os.environ.get(BACKEND_SECRET_ENV) or "").strip() else "auto"
+    _log_action("reveal_backend_secret", detail={"source": source})
+    return JSONResponse({"secret": value, "source": source, "header": "X-FaultLine-Backend-Secret"},
+                        headers={"Cache-Control": "no-store"})
 
 
 # ─── Operator action log (additive; surfaced for curl / future webui) ─────────

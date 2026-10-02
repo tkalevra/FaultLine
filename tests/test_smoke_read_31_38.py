@@ -310,6 +310,9 @@ def client():
             patch.object(LC, "_llm_http_client", _FakeClient()), \
             patch.object(LC, "call_llm_with_retry_async", _fake_call_llm_async):
         with TestClient(M.app) as c:
+            # #121: the backend requires its service secret (auto-minted at lifespan boot).
+            from src.api.backend_auth import backend_headers
+            c.headers.update(backend_headers())
             from src.extraction import linguistics as _L
             t0 = time.time()
             while _L._nlp is None and time.time() - t0 < 180:

@@ -53,6 +53,14 @@ function esc(s) {
 var I18N_KEEP = '.pill-note, .console-tag';
 
 function applyI18n(root) {
+  /* Attribute strings (an <input> has no text content, so data-i18n cannot reach its
+     placeholder/title): data-i18n-placeholder / data-i18n-title name the key. */
+  qsa('[data-i18n-placeholder]', root || document).forEach(function (n) {
+    n.setAttribute('placeholder', t(n.getAttribute('data-i18n-placeholder')));
+  });
+  qsa('[data-i18n-title]', root || document).forEach(function (n) {
+    n.setAttribute('title', t(n.getAttribute('data-i18n-title')));
+  });
   qsa('[data-i18n]', root || document).forEach(function (n) {
     var val = t(n.getAttribute('data-i18n'));
     var kept = qsa(I18N_KEEP, n);
@@ -453,8 +461,12 @@ function showSeatWire(uid) {
 
 function mintSeat() {
   var label = ($('seat-label').value || '').trim();
+  var reseat = (($('seat-reseat-uid') || {}).value || '').trim();
+  var body = {};
+  if (label) body.label = label;
+  if (reseat) body.user_id = reseat;
   setMsg('seat-mint-msg', '', '');
-  callApi('POST', '/api/dashboard/seats', label ? { label: label } : {}).then(function (r) {
+  callApi('POST', '/api/dashboard/seats', body).then(function (r) {
     if (r.pending) { setMsg('seat-mint-msg', 'warn', t('err.pending')); return; }
     if (!r.ok) {
       if (r.err && r.err.status === 409) {
@@ -466,6 +478,7 @@ function mintSeat() {
       setMsg('seat-mint-msg', 'err', friendly(r.err)); return;
     }
     $('seat-label').value = '';
+    if ($('seat-reseat-uid')) $('seat-reseat-uid').value = '';
     var d = r.data || {};
     revealSecret('token', d.token, t('reveal.token.title'), t('reveal.token.warn'));
     setMsg('seat-mint-msg', 'ok', 'seat minted.');

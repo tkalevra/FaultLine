@@ -54,6 +54,23 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
 - Use external volumes for PostgreSQL and Qdrant data persistence.
 - Set `MCP_API_KEY` to a secret token (the MCP HTTP transport on `:8002` is
   network-accessible — leaving it blank is dev-only).
+- **The backend `:8000` is not a network service.** It trusts the `user_id` its caller
+  sends (the MCP server authenticates people and resolves the tenant), so
+  `docker-compose.yml` publishes it on `127.0.0.1` only. The operator console
+  (`http://localhost:8000/`) and `curl localhost:8000/health` work on the host; from
+  another machine use `ssh -L 8000:localhost:8000 <host>`. Do not change the binding to
+  `0.0.0.0` or put `:8000` behind a public proxy.
+- Defence in depth: every backend API request must carry `X-FaultLine-Backend-Secret`.
+  Exempt: `/health`, `/api/dashboard/*`, the console files and the operator bearer. No
+  source address is trusted, loopback included. The MCP server, the re-embedder and the
+  backend's own self-calls send it automatically. With `FAULTLINE_BACKEND_SECRET` unset, the
+  backend generates the secret on first boot and stores it in the shared database
+  (`public.backend_service_secret`), so the MCP service needs `POSTGRES_DSN`, which every
+  compose file sets. Set the variable to pin a value of your own. If neither resolves, the
+  API refuses (fail closed). The MCP seat gate also fails closed (503) when the seat store
+  is unreachable.
+- Every `/admin/*` and operator `/internal/*` route requires the operator bearer
+  `FAULTLINE_ADMIN_TOKEN` (auto-generated and printed once at first boot if unset).
 - Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
 - Monitor `/health` for dependency status.
 

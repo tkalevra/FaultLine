@@ -69,6 +69,11 @@ def _ling_is_neg(tok) -> bool:
 
 
 from src.fact_store.store import FactStoreManager
+from src.provisioning.provisioning_status import SeatLimitError, SEAT_LIMIT_MESSAGE  # FOSS seat cap (admission gate)
+from src.api.dashboard import require_operator  # THE operator credential (FAULTLINE_ADMIN_TOKEN bearer, fail-closed)
+from src.api.backend_auth import require_service  # service-to-service /internal routes (MCP, re-embedder)
+from src.api.backend_auth import backend_headers as _backend_auth_headers  # #121: self-calls carry the service secret
+from src.api.backend_auth import safe_equals as _safe_equals  # constant-time, never raises on non-ASCII
 from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.api.qdrant_partition import (
     resolve_partition as qp_resolve_partition,
@@ -16021,6 +16026,48 @@ async def lifespan(app: FastAPI):
 
     # dprompt-41: validate startup config (fail fast)
     _validate_startup_config()
+
+    # FOSS control plane: apply the persisted LLM Brain override (written by the
+    # webui) BEFORE the chat URL is resolved, so a config saved from the console
+    # is authoritative across restarts. Idempotent + fail-safe.
+    try:
+        from src.api.dashboard import apply_persisted_llm_override
+        apply_persisted_llm_override()
+    except Exception as e:  # noqa: BLE001 — must never block startup
+        log.warning("startup.llm_override_apply_failed", error=str(e)[:160])
+
+    # #121: ensure the backend service secret exists (env FAULTLINE_BACKEND_SECRET, else
+    # auto-mint ONE random value into public.backend_service_secret, readable by the MCP and
+    # the in-container re-embedder via the shared DB). The value is never logged.
+    try:
+        from src.api.backend_auth import ensure_backend_secret
+        if ensure_backend_secret():
+            log.info("startup.backend_secret_ready")
+        else:
+            log_crit(log, "startup.backend_secret_unavailable",
+                     detail="no FAULTLINE_BACKEND_SECRET and the secret store is unreachable; "
+                            "every non-exempt API request will be refused until it resolves")
+    except Exception as e:  # noqa: BLE001
+        log.warning("startup.backend_secret_failed", error=str(e)[:160])
+
+    # FOSS control plane: ensure an operator bearer exists. If FAULTLINE_ADMIN_TOKEN
+    # is unset, mint a random one for this process and print it ONCE (the webui's
+    # login help documents this first-boot behaviour). It gates /api/dashboard/* AND
+    # every /admin/* and operator /internal/* route below (require_operator).
+    if not (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip():
+        import secrets as _secrets
+        os.environ["FAULTLINE_ADMIN_TOKEN"] = _secrets.token_urlsafe(32)
+        print(
+            "====================================================================\n"
+            "FAULTLINE_ADMIN_TOKEN (auto-generated for this instance):\n"
+            f"  {os.environ['FAULTLINE_ADMIN_TOKEN']}\n"
+            "Paste this into the control-plane webui sign-in. To pin a known\n"
+            "token, set FAULTLINE_ADMIN_TOKEN in the environment and restart.\n"
+            "====================================================================",
+            flush=True,
+        )
+        log.info("startup.admin_token_auto_minted")
+
     _LLM_URL = _get_llm_url()
 
     # Initialize persistent HTTP clients for pooled connections
@@ -16944,6 +16991,21 @@ app = FastAPI(
 
 
 @app.middleware("http")
+async def backend_service_auth(request: Request, call_next):
+    """#117/#121: every API request must carry the backend service secret (env-set or
+    auto-minted at boot into public.backend_service_secret) or the operator bearer.
+    Exempt: /health, /api/dashboard/*, console files. No address-based trust; fails closed
+    when no secret is resolvable. See src/api/backend_auth.py."""
+    from src.api.backend_auth import caller_is_trusted
+    host = request.client.host if request.client else None
+    if not caller_is_trusted(request.url.path, host, request.headers,
+                             static_files=globals().get("_WEBUI_FILES", frozenset())):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"detail": "backend service credential required"}, status_code=401)
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def llm_lane_from_request_header(request: Request, call_next):
     """THE LANE CROSSES HTTP (src/api/llm_lane.py).
 
@@ -16962,7 +17024,7 @@ async def llm_lane_from_request_header(request: Request, call_next):
 
 
 @app.post("/internal/refresh-intent-pattern-caches")
-async def refresh_intent_pattern_caches(request: Request):
+async def refresh_intent_pattern_caches(request: Request, _svc: str = Depends(require_service)):
     """
     Internal endpoint: Refresh pattern caches at runtime.
 
@@ -17685,7 +17747,7 @@ async def health():
 
 
 @app.get("/internal/ingest-route")
-def ingest_route_config():
+def ingest_route_config(_svc: str = Depends(require_service)):
     """Brain-side STATEMENT-ingest routing decision (transport-parity, D1).
 
     The choice of WHICH extractor a STATEMENT goes through is a BRAIN decision, not a transport
@@ -17757,7 +17819,10 @@ def provisioning_status_endpoint(user_id: str, user_name: str = ""):
         if result.get("status") == "not_found":
             user_slug = derive_user_slug_from_uuid(user_id)
             # Pass user_name to ensure_user_provisioned for proper display_name
-            is_ready = ensure_user_provisioned(user_id, user_slug, None, user_name=user_name)
+            try:
+                is_ready = ensure_user_provisioned(user_id, user_slug, None, user_name=user_name)
+            except SeatLimitError as e:
+                raise _seat_limit_403(e)
 
             if is_ready:
                 return {"status": "ready", "user_id": user_id}
@@ -17765,6 +17830,8 @@ def provisioning_status_endpoint(user_id: str, user_name: str = ""):
                 return {"status": "provisioning", "user_id": user_id}
 
         return result
+    except HTTPException:
+        raise  # the seat-cap 403 is an answer, not a probe failure
     except Exception as e:
         log_crit(
             log,
@@ -17780,7 +17847,7 @@ def provisioning_status_endpoint(user_id: str, user_name: str = ""):
 
 
 @app.post("/admin/logging/level")
-async def set_logging_level(level: str):
+async def set_logging_level(level: str, _op: str = Depends(require_operator)):
     """
     Set global logging level (CRIT | WARN | INFO | DEBUG).
     Callable from OpenWebUI valve for runtime control.
@@ -17811,7 +17878,7 @@ async def set_logging_level(level: str):
 
 
 @app.get("/admin/logging/level")
-async def get_logging_level_endpoint():
+async def get_logging_level_endpoint(_op: str = Depends(require_operator)):
     """Get current logging level."""
     return {
         "current_level": str(get_log_level()),
@@ -17820,22 +17887,18 @@ async def get_logging_level_endpoint():
 
 
 @app.post("/admin/cache/clear-embeddings")
-async def clear_embedding_cache_endpoint(api_key: str):
-    """Emergency endpoint to clear embedding cache (requires admin key).
+async def clear_embedding_cache_endpoint(_op: str = Depends(require_operator)):
+    """Emergency endpoint to clear embedding cache (operator bearer: FAULTLINE_ADMIN_TOKEN).
 
     dprompt-121: Use ONLY if rel_types were renamed/deleted or embedding model was upgraded.
     Cache will auto-repopulate on next eval cycle.
 
     Args:
-        api_key: Must match ADMIN_API_KEY environment variable
+        (auth) Authorization: Bearer <FAULTLINE_ADMIN_TOKEN> — the ONE operator credential.
 
     Returns:
         Status and count of entries deleted
     """
-    admin_key = os.getenv("ADMIN_API_KEY")
-    if not admin_key or api_key != admin_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
-
     # Import here to avoid circular dependency
     try:
         from src.re_embedder.embedder import _embedding_cache
@@ -17871,8 +17934,8 @@ def _ontology_operator_key_ok(authorization: Optional[str]) -> bool:
     """True iff the request carries the OPERATOR credential as an ``Authorization: Bearer``.
 
     Bearer parse + ``hmac.compare_digest`` — a PURE ENV READ. The credential is
-    ``ADMIN_API_KEY``, the one ``main.py`` already uses for its own admin route
-    (``/admin/cache/clear-embeddings``); no new scheme is invented.
+    ``FAULTLINE_ADMIN_TOKEN``, the ONE operator credential (dashboard + every /admin and
+    operator /internal route); no second scheme exists.
 
     FAIL-CLOSED IN BOTH DIRECTIONS, and this is the load-bearing property: an UNSET key can
     never authorise, because the comparison is guarded by ``configured and ...``. "No key is
@@ -17888,9 +17951,9 @@ def _ontology_operator_key_ok(authorization: Optional[str]) -> bool:
     presented = parts[1].strip()
     if not presented:
         return False
-    for _env_name in ("ADMIN_API_KEY",):
+    for _env_name in ("FAULTLINE_ADMIN_TOKEN",):
         configured = (os.environ.get(_env_name) or "").strip()
-        if configured and hmac.compare_digest(presented, configured):
+        if configured and _safe_equals(presented, configured):
             return True
     return False
 
@@ -18933,6 +18996,19 @@ def _provisioning_retry_503() -> HTTPException:
     )
 
 
+def _seat_limit_403(exc: "SeatLimitError") -> HTTPException:
+    """FOSS seat cap refused a NEW tenant — a decision, never a retry signal."""
+    return HTTPException(
+        status_code=403,
+        detail={
+            "status": getattr(exc, "kind", "seat_limit"),
+            "message": str(exc),
+            "reason": exc.detail,
+            "committed": 0,
+        },
+    )
+
+
 async def _ensure_tenant_ready(user_id: str, endpoint: str) -> None:
     """ASYNC block-until-provisioned guard for tenant-schema endpoints.
 
@@ -18973,6 +19049,8 @@ async def _ensure_tenant_ready(user_id: str, endpoint: str) -> None:
         is_ready = await asyncio.to_thread(_ensure_and_wait)
     except HTTPException:
         raise
+    except SeatLimitError as e:
+        raise _seat_limit_403(e)
     except Exception as e:
         log_crit(log, "ensure_tenant_ready.error", endpoint=endpoint, user_id=user_id[:8], error=str(e))
         raise _provisioning_retry_503()
@@ -19030,6 +19108,8 @@ def _ensure_tenant_ready_sync(user_id: str, endpoint: str) -> None:
                 pass
     except HTTPException:
         raise
+    except SeatLimitError as e:
+        raise _seat_limit_403(e)
     except Exception as e:
         log_crit(log, "ensure_tenant_ready_sync.error", endpoint=endpoint, user_id=user_id[:8], error=str(e))
         raise _provisioning_retry_503()
@@ -19061,7 +19141,7 @@ def _note_intent_layer(user_id, layer: str, intent: str) -> None:
 
 
 @app.get("/internal/intent-layer-stats")
-def intent_layer_stats():
+def intent_layer_stats(_op: str = Depends(require_operator)):
     """Per-seat counts of which intent layer DECIDED each turn (observability only).
 
     Layers (in evaluation order): input_invalid, spacy_interrogative, spacy_cue_tier1,
@@ -28468,18 +28548,28 @@ async def wait_for_schema_ready(
                     schema_name = derive_schema_name(user_slug)
 
                     try:
+                        # FOSS seat cap: this fallback INSERT births a tenant too — same
+                        # atomic admission as ensure_user_provisioned (advisory lock).
+                        from src.provisioning.provisioning_status import admit_new_tenant
+                        db.commit()
+                        admit_new_tenant(cur, user_id)
                         cur.execute(
                             "INSERT INTO public.user_provisioning (user_id, schema_name, status) "
                             "VALUES (%s, %s, 'provisioning') ON CONFLICT (user_id) DO NOTHING",
                             (user_id, schema_name)
                         )
                         db.commit()
+                    except SeatLimitError:
+                        db.rollback()
+                        raise
                     except Exception as e:
                         log.warning("wait_for_schema_ready.record_creation_failed",
                                    user_id=user_id[:8],
                                    error=str(e))
                         db.rollback()
 
+        except SeatLimitError:
+            raise  # #123: a seat-cap refusal is a decision, never a transient to poll through
         except Exception as e:
             log.error("wait_for_schema_ready.query_failed",
                      user_id=user_id[:8],
@@ -29321,6 +29411,9 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
         except HTTPException:
             # Re-raise HTTP exceptions (timeout, etc.)
             raise
+        except SeatLimitError as e:
+            # Never degrade a seat-cap refusal to the anonymous fallback below.
+            raise _seat_limit_403(e)
         except Exception as e:
             log.warning("ingest.provisioning_failed", user_id=user_id[:8], error=str(e))
             # Fallback to anonymous (graceful degradation)
@@ -29759,7 +29852,8 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                     # to INTERACTIVE here and its fallback LLM call could fail open (the
                     # uncapped-fire shape). Forwarding current_lane() preserves whatever
                     # the inbound request was bound to; interactive-forwarding is a no-op.
-                    headers={_llm_lane_mod.LANE_HEADER: _llm_lane_mod.current_lane()},
+                    headers={_llm_lane_mod.LANE_HEADER: _llm_lane_mod.current_lane(),
+                             **_backend_auth_headers()},
                     timeout=30,
                 )
                 log.info("ingest.llm_extraction_called",
@@ -62835,13 +62929,13 @@ class DocLaneControlRequest(_PydBaseModel):
 
 
 @app.get("/internal/doc-lane/control")
-def doc_lane_control_get():
+def doc_lane_control_get(_op: str = Depends(require_operator)):
     """Operator: current document-CPU-lane state (paused, admission, workers, load)."""
     return _cpu_lane.snapshot()
 
 
 @app.post("/internal/doc-lane/control")
-def doc_lane_control_post(req: DocLaneControlRequest):
+def doc_lane_control_post(req: DocLaneControlRequest, _op: str = Depends(require_operator)):
     """Operator: pause/resume the document CPU lane and/or resize its admission cap."""
     return _cpu_lane.set_control(paused=req.paused, admission=req.admission)
 
@@ -64777,3 +64871,32 @@ async def learn_topic(req: LearnTopicRequest):
         return {"status": "error", "topic": topic,
                 "detail": _errors.public_detail(e, where="learn_topic.ingest", what="learn ingest failed"),
                 "committed": 0, "staged": 0, "total": 0}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FOSS control plane — dashboard API + webui static mount. MUST STAY LAST.
+#
+# The dashboard router (/api/dashboard/*) is operator-bearer-authed and drives
+# the running stack: seats+tokens, the LLM Brain, MCP key rotation, health. The
+# webui/ static assets are mounted at "/" LAST so every explicit route is matched
+# before the catch-all static serve. (This wiring was lost from the FOSS line; with
+# it gone no seat could be minted and the seat cap was unreachable.)
+# ──────────────────────────────────────────────────────────────────────────────
+from src.api.dashboard import router as _dashboard_router  # noqa: E402
+
+app.include_router(_dashboard_router)
+
+_WEBUI_DIR = next(
+    (p for p in (
+        os.path.join(os.getcwd(), "webui"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "webui"),
+        "/app/webui",
+    ) if os.path.isfile(os.path.join(p, "index.html"))),
+    None,
+)
+_WEBUI_FILES: frozenset = frozenset(os.listdir(_WEBUI_DIR)) if _WEBUI_DIR else frozenset()
+if _WEBUI_DIR:
+    from fastapi.staticfiles import StaticFiles  # noqa: E402
+    app.mount("/", StaticFiles(directory=_WEBUI_DIR, html=True), name="foss-webui")
+else:
+    log.warning("startup.webui_dir_not_found")
