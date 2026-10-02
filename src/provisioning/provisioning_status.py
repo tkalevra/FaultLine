@@ -23,6 +23,19 @@ log = structlog.get_logger()
 SEAT_LIMIT_MESSAGE = "seat limit — mint a seat in the dashboard"
 SEAT_REQUIRED_MESSAGE = "seat required — this user_id holds no active seat; mint a seat for it in the dashboard (re-minting restores access)"
 
+# #148: the refusal reaches the end user (an OpenWebUI chat shows the tool error) and the
+# operator, so it says exactly how to fix it. Every OpenWebUI user, and every other client on
+# the shared MCP key, is its own user_id and occupies one seat.
+SEAT_HOWTO = (
+    "Every OpenWebUI user (and any client on the shared MCP key) needs its own seat once any "
+    "seat exists. Operator: open the console (http://localhost:8000/ on the FaultLine host) → "
+    "OpenWebUI tab → 'OpenWebUI users & seats' → seat, or Seats & Tokens → mint with this "
+    "user_id. Seating keeps the user's existing memory. FOSS allows up to {cap} seats."
+)
+
+# Bound on public.dashboard_seat_requests: only the most recent refused user_ids are kept.
+SEAT_REQUESTS_KEEP = 25
+
 
 class SeatLimitError(Exception):
     """A tenant was refused by the FOSS seat cap (maps to HTTP 403).
@@ -32,9 +45,9 @@ class SeatLimitError(Exception):
 
     status_code = 403
 
-    def __init__(self, detail: str, kind: str = "seat_limit") -> None:
+    def __init__(self, detail: str, kind: str = "seat_limit", howto: str = "") -> None:
         base = SEAT_REQUIRED_MESSAGE if kind == "seat_required" else SEAT_LIMIT_MESSAGE
-        super().__init__(f"{base} ({detail})")
+        super().__init__(f"{base} ({detail})" + (f" {howto}" if howto else ""))
         self.detail = detail
         self.kind = kind
         self.message = str(self)
@@ -65,15 +78,41 @@ def seat_refusal(cur, user_id: str) -> Optional[SeatLimitError]:
     )
     seats_in_use, is_seat = cur.fetchone()
     if seats_in_use:
-        return None if is_seat else SeatLimitError("seats have been minted on this instance", kind="seat_required")
+        if is_seat:
+            return None
+        return SeatLimitError(f"user_id {uid} — seats have been minted on this instance",
+                              kind="seat_required", howto=SEAT_HOWTO.format(cap=cap))
     cur.execute("SELECT 1 FROM public.user_provisioning WHERE user_id::text = %s", (uid,))
     if cur.fetchone():
         return None
     cur.execute("SELECT COUNT(*) FROM public.user_provisioning")
     n = cur.fetchone()[0]
     if n >= cap:
-        return SeatLimitError(f"{n} of {cap} tenants already exist and no seat is minted")
+        return SeatLimitError(
+            f"user_id {uid} — {n} of {cap} tenants already exist and no seat is minted",
+            howto=(f"FOSS allows at most {cap} users. Operator: mint seats in the console for the "
+                   "users who should keep access; once any seat exists, only seated users are "
+                   "admitted."))
     return None
+
+
+def record_seat_request(cur, user_id: str) -> None:
+    """Remember a user_id the seat gate refused for lack of a seat (#148), for the console.
+
+    Upsert on the user_id, then trim to the SEAT_REQUESTS_KEEP most recent rows so a flood of
+    distinct ids cannot grow the table. Stores the id only. The caller commits."""
+    uid = str(user_id or "").strip().lower()
+    cur.execute(
+        "INSERT INTO public.dashboard_seat_requests (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW(), "
+        "attempts = public.dashboard_seat_requests.attempts + 1",
+        (uid,),
+    )
+    cur.execute(
+        "DELETE FROM public.dashboard_seat_requests WHERE user_id NOT IN ("
+        "SELECT user_id FROM public.dashboard_seat_requests ORDER BY last_seen DESC LIMIT %s)",
+        (SEAT_REQUESTS_KEEP,),
+    )
 
 
 def seat_admission_refusal(cur, user_id: str) -> Optional[str]:

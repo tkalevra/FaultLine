@@ -870,6 +870,11 @@ def hash_vector(text: str, size: int = 768) -> list[float]:
     return vector
 
 
+# #154: after a 409 on create, how long to wait for the winning creator's collection to appear.
+_RACE_RECHECK_ATTEMPTS = 20
+_RACE_RECHECK_DELAY_S = 0.5
+
+
 def ensure_collection(collection: str, qdrant_url: str) -> bool:
     """
     Check if Qdrant collection exists with the correct anonymous vector schema, create or
@@ -903,6 +908,29 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
             if shared_mode():
                 ensure_tenant_index(collection, qdrant_url)
             return True
+        if create_response.status_code == 409:
+            # Lost a create race (#154): the API lifespan and the re-embedder process start
+            # together and both create the collection on a fresh install. "Already exists"
+            # is success once the winner's collection is confirmed to have our schema. The
+            # winner's create can still be in flight when our 409 arrives (measured on a fresh
+            # install: the immediate GET answered 500), so poll briefly.
+            vectors_cfg = None
+            for _attempt in range(_RACE_RECHECK_ATTEMPTS):
+                try:
+                    check = httpx.get(f"{qdrant_url}/collections/{collection}",
+                                      headers=qdrant_headers(), timeout=10.0)
+                    if check.status_code == 200:
+                        vectors_cfg = (check.json().get("result", {}).get("config", {})
+                                       .get("params", {}).get("vectors", None))
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(_RACE_RECHECK_DELAY_S)
+            if isinstance(vectors_cfg, dict) and vectors_cfg.get("size") == _EXPECTED_DIM:
+                log.info(f"re_embedder.collection_already_exists collection={collection}")
+                if shared_mode():
+                    ensure_tenant_index(collection, qdrant_url)
+                return True
         log.error(
             f"re_embedder.collection_create_failed collection={collection} "
             f"status={create_response.status_code}"

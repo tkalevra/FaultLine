@@ -748,7 +748,7 @@ def bind_tenant(principal: str | None, claimed_user_id: str) -> str:
     Precedence: caller-supplied identity WINS; ``FAULTLINE_USER_ID`` is consulted ONLY
     as a single-user/dev fallback when the caller supplies nothing.
 
-    Spoof-guard (DEV/SECURITY-multiuser-tenant-isolation.md RP-3):
+    Spoof-guard:
 
     * Option A (FUTURE — per-user tokens): when ``principal`` itself carries a bound
       user_id (i.e. ``_resolve_principal`` returns a UUID instead of "shared"/"anonymous"),
@@ -6849,7 +6849,7 @@ async def _call_tool(tool_name: str, arguments: dict, progress_token: str | int 
     # Resolve effective user_id: CALLER-SUPPLIED identity WINS; FAULTLINE_USER_ID is
     # consulted ONLY as a single-user/dev fallback when the caller supplies nothing.
     # (Previously the pin unconditionally overrode the caller, collapsing every tenant
-    # onto one schema — DEV/SECURITY-multiuser-tenant-isolation.md F1a.)
+    # onto one schema.)
     # Both transports already resolve identity via bind_tenant() before dispatch, so
     # arguments["user_id"] is authoritative here; this fallback covers any direct/stdio
     # caller that bypassed the HTTP transports.

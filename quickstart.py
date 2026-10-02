@@ -108,7 +108,7 @@ def check_prereqs():
     try:
         out = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, timeout=15)
         print(green("  ✓ docker compose (v2) available") if out.returncode == 0
-              else yellow("  ! `docker compose` not available — you need Compose v2+."))
+              else yellow("  ! `docker compose` not available — you need Compose v2.24+."))
     except Exception:
         print(yellow("  ! could not run `docker compose version` (is the Docker daemon running?)"))
 
@@ -201,6 +201,28 @@ _BACKENDS = [
 ]
 
 
+def _existing_env_value(key):
+    """The value of ``key`` in an existing .env ('' when absent). Used so a re-run keeps
+    credentials by default instead of silently rotating them (#151)."""
+    if not os.path.exists(ENV_PATH):
+        return ""
+    val = ""
+    for line in open(ENV_PATH, encoding="utf-8"):
+        s = line.strip()
+        if s.startswith(f"{key}="):
+            val = s.split("=", 1)[1].strip()
+    return val
+
+
+def _ask_api_key(prompt, backend):
+    """Ask for an LLM API key; on a re-run for the same backend, Enter keeps the .env key."""
+    existing = _existing_env_value("LLM_API_KEY")
+    if existing and _existing_env_value("LLM_BACKEND_TYPE") == backend:
+        val = ask(f"{prompt} (Enter = keep the key already in .env)", "")
+        return val or existing
+    return ask(prompt, "")
+
+
 def _prompt_connection(backend):
     """Gather URL (+ key) with per-backend guidance. Returns (url, key)."""
     if backend == "lm_studio":
@@ -221,18 +243,18 @@ def _prompt_connection(backend):
         print(dim("  2. Your key: Profile (bottom-left) → Settings → Account → API Keys →"))
         print(dim("     'Generate New API Key'. Copy it now — it's shown only once."))
         print(dim("  Base URL = host:port only (container port is usually 8080; host-published often 3000)."))
-        return ask("OpenWebUI base URL", "http://open-webui:8080"), ask("OpenWebUI API key (sk-...)", "")
+        return ask("OpenWebUI base URL", "http://open-webui:8080"), _ask_api_key("OpenWebUI API key (sk-...)", backend)
 
     if backend == "openai":
         print(dim("\n  Any OpenAI-compatible /v1 endpoint (OpenAI, vLLM, LiteLLM, Together, ...)."))
         print(dim("  URL = host root, no /v1 path (it's appended)."))
-        return ask("Base URL", "https://api.openai.com"), ask("API key", "")
+        return ask("Base URL", "https://api.openai.com"), _ask_api_key("API key", backend)
 
     if backend == "anthropic":
         print(dim("\n  Anthropic Claude API. Get a key at https://console.anthropic.com/."))
-        return ask("Base URL", "https://api.anthropic.com"), ask("Anthropic API key (sk-ant-...)", "")
+        return ask("Base URL", "https://api.anthropic.com"), _ask_api_key("Anthropic API key (sk-ant-...)", backend)
 
-    return ask("Base URL", ""), ask("API key", "")
+    return ask("Base URL", ""), _ask_api_key("API key", backend)
 
 
 _DEFAULT_MODEL = {
@@ -498,6 +520,9 @@ def configure_naming():
         "SCHEMA_NAME_PREFIX": prefix,
         "QDRANT_COLLECTION": coll,
         "POSTGRES_DSN": _rewrite_dsn_db(base_dsn, db),
+        # #149: the postgres service creates POSTGRES_DB; it must match the DSN's database,
+        # or a custom name points the backend at a database that was never created.
+        "POSTGRES_DB": db,
     }
     print(green(f"  ✓ schema prefix: {prefix}   db: {db}   collection: {coll}"))
     print(dim(f"    Postgres DSN: {ov['POSTGRES_DSN']}  (compose host preserved)"))
@@ -515,16 +540,46 @@ def _host_for_container(url):
     return url
 
 
+def _write_private(path, text):
+    """Write a file only its owner can read (0600): .env and .env.bak hold LLM_API_KEY and
+    MCP_API_KEY. os.open sets the mode on creation; the chmod also tightens a file that
+    already existed with a looser mode. (Windows ignores POSIX modes; NTFS ACLs apply.)"""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _parse_env_text(text):
+    """Active KEY=value lines of a .env (comments and blanks ignored); last one wins."""
+    out = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k.strip()):
+            out[k.strip()] = v
+    return out
+
+
 def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
     if not os.path.exists(ENV_EXAMPLE):
         print(red(f"  ✗ {ENV_EXAMPLE} not found — run this from the FaultLine repo root."))
         sys.exit(1)
+    previous = {}
     if os.path.exists(ENV_PATH):
         if not ask_yes(".env already exists — overwrite? (a backup is made)", default_yes=False):
             print(yellow("  Kept existing .env. Nothing written."))
             return
-        shutil.copy(ENV_PATH, ENV_PATH + ".bak")
-        print(dim("  backed up existing .env → .env.bak"))
+        with open(ENV_PATH, encoding="utf-8") as f:
+            text = f.read()
+        _write_private(ENV_PATH + ".bak", text)
+        print(dim("  backed up existing .env → .env.bak (owner-only, 0600)"))
+        previous = _parse_env_text(text)
 
     to_set = {
         "LLM_BACKEND_TYPE": cfg["LLM_BACKEND_TYPE"],
@@ -541,6 +596,14 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
         to_set[k] = v
     if mcp_key:
         to_set["MCP_API_KEY"] = mcp_key
+    # #163: a re-run keeps every key the operator set that this wizard does not manage
+    # (FAULTLINE_PREFIX, the port keys, a pinned FAULTLINE_ADMIN_TOKEN, ...). The wizard's own
+    # answers win for the keys it asked about.
+    kept = {k: v for k, v in previous.items() if k not in to_set}
+    for k, v in kept.items():
+        to_set[k] = v
+    if kept:
+        print(dim(f"  kept {len(kept)} setting(s) from the existing .env: {', '.join(sorted(kept))}"))
 
     lines = open(ENV_EXAMPLE, encoding="utf-8").readlines()
     seen, out = set(), []
@@ -559,9 +622,33 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
         if k not in seen:
             out.append(f"{k}={v}\n")
 
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(out)
-    print(green(f"  ✓ wrote {ENV_PATH}"))
+    _write_private(ENV_PATH, "".join(out))
+    print(green(f"  ✓ wrote {ENV_PATH}") + dim("  (owner-only, 0600: it holds your keys)"))
+
+
+def configure_mcp_key():
+    """Resolve MCP_API_KEY. A re-run KEEPS the key already in .env by default (#151):
+    rotating it breaks every connected client (OpenWebUI, Claude Desktop, Cursor)."""
+    existing = _existing_env_value("MCP_API_KEY")
+    if existing:
+        mode = choose("An MCP_API_KEY is already set in .env:", [
+            ("keep", "Keep it            (connected clients keep working)"),
+            ("new",  "Generate a new one (every connected client must be updated)"),
+            ("manual", "Enter one"),
+        ])
+        if mode == "keep":
+            print(green("  ✓ keeping the existing MCP_API_KEY"))
+            return existing
+        if mode == "manual":
+            return ask("Enter an MCP_API_KEY (blank = leave open, dev only)", "")
+        mcp_key = secrets.token_urlsafe(32)
+        print(green(f"  ✓ generated: {mcp_key}"))
+        return mcp_key
+    if ask_yes("Generate a strong MCP_API_KEY for you now?", default_yes=True):
+        mcp_key = secrets.token_urlsafe(32)
+        print(green(f"  ✓ generated: {mcp_key}"))
+        return mcp_key
+    return ask("Enter an MCP_API_KEY (blank = leave open, dev only)", "")
 
 
 # ── next steps ────────────────────────────────────────────────────────────────
@@ -574,6 +661,14 @@ def print_next_steps(mcp_key):
     print(f"  3. The live integration path is the MCP server on {bold(':8002')}.")
     if mcp_key:
         print(f"       Secured with your MCP_API_KEY — send {cyan('Authorization: Bearer <key>')}.")
+    print(f"  4. Open the operator console:  {cyan('http://localhost:8000/')}")
+    print(f"       sign in with the operator token. It is printed ONCE, on the backend's first boot:")
+    print(f"       {cyan('docker compose logs faultline | grep -A1 FAULTLINE_ADMIN_TOKEN')}")
+    print(f"       Not there (container recreated, logs rotated) or lost? Mint a new one:")
+    print(f"       {cyan('docker compose exec faultline python -m src.api.operator_token --rotate')}")
+    print(f"  5. Seats: FOSS allows up to {bold('5')}. Mint one per person (Seats & Tokens); its token,")
+    print(f"       shown once, is that client's Bearer on :8002. Once any seat exists, the shared")
+    print(f"       MCP_API_KEY only admits seated users; seat OpenWebUI users on the OpenWebUI tab.")
     print()
     print(dim("  Troubleshooting:"))
     print(dim("    docker compose logs faultline          # backend startup / errors"))
@@ -583,9 +678,12 @@ def print_next_steps(mcp_key):
     hr()
 
 
-def _poll_health(timeout=80):
-    """Poll the backend /health after a build so the user sees it actually came up."""
-    print(dim("  waiting for the backend to come up (~60s on first boot)..."))
+def _poll_health(timeout=240):
+    """Poll the backend /health after a build so the user sees it actually came up.
+
+    The first boot applies every migration and loads the models: measured at about two
+    minutes on a fresh install, so 80 s reported 'not healthy yet' for a healthy stack."""
+    print(dim("  waiting for the backend to come up (first boot takes ~2 minutes)..."))
     for _ in range(max(1, timeout // 5)):
         try:
             _, body = _http_get("http://localhost:8000/health", timeout=4)
@@ -639,8 +737,13 @@ def print_integration_guide(mcp_key, user_id):
         ("all",    "Show all / not sure"),
     ])
 
+    def seat_note():
+        print(dim("  Use a SEAT TOKEN as the Bearer (operator console → Seats & Tokens → mint seat)."))
+        print(dim("  The shared MCP_API_KEY shown here works only until the first seat is minted."))
+
     def claude_block():
         print(bold("\n  Claude Desktop"))
+        seat_note()
         print(dim(f"  Edit your config file:  {_claude_config_path()}   (create it if missing)"))
         print(dim("  Add this (host = " + host_note + "):"))
         print(cyan(f"""  {{
@@ -662,9 +765,11 @@ def print_integration_guide(mcp_key, user_id):
               dim("   (if OWUI is in the same compose network; else ") + cyan(f"http://{host}:8002") + dim(")"))
         print(dim("   • Auth: Bearer  →  ") + cyan(key))
         print(dim("   • The modal may pre-fill https:// — change it to http:// for a local server, then hit refresh."))
-        print(dim("  OWUI reads /openapi.json and exposes recall_memory / remember_facts / retract_fact."))
+        print(dim("  OWUI reads /openapi.json and exposes every FaultLine tool (recall_memory, remember_facts, ...)."))
         print(dim("  Also set  ") + bold("ENABLE_FORWARD_USER_INFO_HEADERS=true") + dim("  on OWUI so per-user memory works"))
         print(dim("  (forwards the X-OpenWebUI-User-Id header FaultLine scopes on)."))
+        print(dim("  Each OpenWebUI user occupies one of the 5 seats once any seat exists: seat them in"))
+        print(dim("  the operator console → OpenWebUI tab (refused users are listed there)."))
         print(dim("  Native MCP (Admin Settings → External Tools → + → MCP (Streamable HTTP), ") + cyan(f"http://{host}:8002/mcp") + dim(")"))
         print(dim("  also works, but does NOT forward the user-id header yet (open-webui#21134) —"))
         print(dim("  use the OpenAPI path above for per-user memory, or pin FAULTLINE_USER_ID for single-user."))
@@ -673,12 +778,14 @@ def print_integration_guide(mcp_key, user_id):
 
     def mcp_block():
         print(bold("\n  Cursor / other MCP client"))
+        seat_note()
         print(dim("  Add an HTTP (streamable-http) MCP server:"))
         print(dim("   • URL:    ") + cyan(f"http://{host}:8002/mcp"))
         print(dim("   • Header: ") + cyan(f"Authorization: Bearer {key}"))
 
     def curl_block():
         print(bold("\n  Direct API (curl / scripts)"))
+        seat_note()
         print(cyan(f"""  curl -X POST http://{host}:8002/recall_memory \\
     -H "Authorization: Bearer {key}" \\
     -H "X-OpenWebUI-User-Id: {uid}" \\
@@ -885,11 +992,7 @@ def main():
 
     hr()
     print(bold("MCP API key") + dim("  (secures the MCP server on :8002 — recommended)"))
-    if ask_yes("Generate a strong MCP_API_KEY for you now?", default_yes=True):
-        mcp_key = secrets.token_urlsafe(32)
-        print(green(f"  ✓ generated: {mcp_key}"))
-    else:
-        mcp_key = ask("Enter an MCP_API_KEY (blank = leave open, dev only)", "")
+    mcp_key = configure_mcp_key()
 
     hr()
     faultline_user_id = configure_identity()
@@ -903,11 +1006,19 @@ def main():
 
     print()
     if ask_yes("Build + start the stack now (docker compose up -d --build)?", default_yes=False):
+        # #152: a failed build/start must not be followed by an 80 s health poll and a
+        # client guide for a stack that does not exist, and must exit non-zero.
         try:
-            subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=HERE, check=False)
-            _poll_health()
+            rc = subprocess.run(["docker", "compose", "up", "-d", "--build"], cwd=HERE, check=False).returncode
         except Exception as e:
-            print(red(f"  could not launch docker compose: {e}"))
+            print(red(f"  ✗ could not launch docker compose: {e}"))
+            sys.exit(1)
+        if rc != 0:
+            print(red(f"  ✗ docker compose up --build failed (exit {rc}) — scroll up for the error."))
+            print(dim("    Fix it, then re-run:  docker compose up -d --build"))
+            print(dim("    Your .env is written; re-running this wizard is not needed."))
+            sys.exit(1)
+        _poll_health()
 
     print_integration_guide(mcp_key, faultline_user_id)
 

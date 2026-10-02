@@ -17,8 +17,10 @@
 # Verify:  curl http://localhost:8000/health
 # MCP:     http://localhost:8002/mcp        (Claude Desktop or any MCP client)
 #
-# Exposure: :8002 (MCP) is the network front door. The backend :8000 trusts the
-# user_id its caller sends, so it is published on 127.0.0.1 ONLY — the operator
+# Exposure: :8002 (MCP) is the ONLY port published on the network. Qdrant and the
+# optional Ollama are published on 127.0.0.1 only; postgres and redis not at all.
+# The backend :8000 trusts the user_id its caller sends, so it is published on
+# 127.0.0.1 ONLY — the operator
 # console (http://localhost:8000/) and the health check work on this host; from
 # another machine use an SSH tunnel:  ssh -L 8000:localhost:8000 <host>
 # Defence in depth: the backend API also requires a service secret, auto-generated on
@@ -26,6 +28,12 @@
 #
 # Per-client setup lives in the README "Connecting a client" table — the only
 # thing that changes between OpenWebUI / LM Studio / Claude is these env values.
+#
+# Several stacks on one host (#143): container names and host ports are env-overridable
+# (defaults unchanged). For a second stack, set in its .env, e.g.
+#   FAULTLINE_PREFIX=faultline2  FAULTLINE_IMAGE=faultline2:latest
+#   FAULTLINE_MCP_PORT=8012      FAULTLINE_API_PORT=8010
+# and run it with its own project name: docker compose -p faultline2 up -d --build
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -47,11 +55,21 @@ services:
         # text; it does not make the chains correct for that language. Portable in principle
         # (the UD features they key on exist in these models), UNMEASURED in practice.
         SPACY_MODEL: ${SPACY_MODEL:-es_core_news_md}
-    image: faultline:latest
-    container_name: faultline-api
+    image: ${FAULTLINE_IMAGE:-faultline:latest}
+    # Built locally, never pulled: without this, `up` first tries to pull faultline:latest
+    # from a registry and prints "pull access denied", which reads as a failure (#156).
+    pull_policy: never
+    container_name: ${FAULTLINE_PREFIX:-faultline}-api
     ports:
       # Loopback only (#117): never expose the backend to the network.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${FAULTLINE_API_PORT:-8000}:8000"
+    # Every key in .env reaches the BACKEND container (#149): .env.example documents ~60 settings
+    # (timeouts, embeddings, schema prefix, pipeline flags) the code reads. The
+    # `environment:` block below still wins for the keys it lists. Optional, so a bare
+    # `docker compose up` without a .env still starts. Needs Docker Compose v2.24+.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # INSTALL LANGUAGE — set by quickstart.py's language gate; both EMPTY for English, which
       # makes the entrypoint's collation guard a total no-op (not one query issued).
@@ -83,21 +101,27 @@ services:
 
       # FaultLine self-reference + tuning
       FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
-      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-10}
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-60}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-100}
       FAULTLINE_LOG_LEVEL: ${FAULTLINE_LOG_LEVEL:-INFO}
 
       # ── FOSS control plane (operator webui on :8000/) ────────────────────────
       # Operator bearer for /api/dashboard/* (seats, tokens, LLM Brain, MCP key).
-      # Unset → the backend auto-mints a random one and prints it once to the logs
-      # (look for the FAULTLINE_ADMIN_TOKEN line). Set it here to pin a known value.
+      # Unset → the backend mints one on FIRST boot, stores its hash in the DB and prints
+      # it once to the logs (look for the FAULTLINE_ADMIN_TOKEN line); it survives restarts.
+      # Set it here to pin a known value.
       FAULTLINE_ADMIN_TOKEN: ${FAULTLINE_ADMIN_TOKEN:-}
       # Backend service secret. Unset = auto-generated on first boot into the shared DB
       # (zero config). Set it to pin a value; use the same value on faultline-mcp.
       FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
       # Optional friendly MCP URL shown in the OpenWebUI tab (defaults derived).
       MCP_EXTERNAL_URL: ${MCP_EXTERNAL_URL:-}
+      # The console's OpenWebUI tab reports which MCP key is in force; it reads the same
+      # value faultline-mcp is given. The backend itself never authenticates with it.
+      MCP_API_KEY: ${MCP_API_KEY:-}
+      # The host port faultline-mcp is published on, so the console shows the right URL.
+      FAULTLINE_MCP_PORT: ${FAULTLINE_MCP_PORT:-8002}
     extra_hosts:
       # Lets the container reach an LLM running on the Docker host.
       - "host.docker.internal:host-gateway"
@@ -121,20 +145,27 @@ services:
 
   # ── MCP server — same memory, exposed to Claude Desktop / any MCP client ─────
   faultline-mcp:
-    image: faultline:latest
-    container_name: faultline-mcp
+    image: ${FAULTLINE_IMAGE:-faultline:latest}
+    pull_policy: never   # the image the faultline service builds
+    container_name: ${FAULTLINE_PREFIX:-faultline}-mcp
     entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
-      - "8002:8002"
+      - "${FAULTLINE_MCP_PORT:-8002}:8002"
+    # NO env_file here (#165): this is the one network-facing container, so it gets only the
+    # keys it reads, never LLM_API_KEY, a pinned FAULTLINE_ADMIN_TOKEN or other .env secrets.
     environment:
       FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
       FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
+      SHORT_TERM_MEMORY: ${SHORT_TERM_MEMORY:-true}
+      RECALL_INTENT_ROUTING: ${RECALL_INTENT_ROUTING:-true}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       # Shared postgres — lets the MCP server validate per-seat tokens minted
       # from the control-plane webui AND honour rotated MCP keys immediately
-      # (dashboard_seats / dashboard_mcp_keys tables, public schema). Falls back
-      # to MCP_API_KEY env when the tables are empty or the DB is unreachable.
+      # (dashboard_seats / dashboard_mcp_keys tables, public schema). MCP_API_KEY
+      # above is accepted until the key is rotated in the console; after that only
+      # the rotated key works (the .env value is superseded).
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
     depends_on:
       - faultline
@@ -145,7 +176,7 @@ services:
   # ── PostgreSQL — fact storage (migrations run from the API entrypoint) ───────
   postgres:
     image: postgres:16-alpine
-    container_name: faultline-postgres
+    container_name: ${FAULTLINE_PREFIX:-faultline}-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-faultline}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
@@ -180,11 +211,13 @@ services:
     restart: unless-stopped
 
   # ── Qdrant — vector index ────────────────────────────────────────────────────
+  # Loopback only (#144): Qdrant has no API key here and the backend reaches it as
+  # qdrant:6333 on faultline-net. Published on 127.0.0.1 for local inspection only.
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: faultline-qdrant
+    container_name: ${FAULTLINE_PREFIX:-faultline}-qdrant
     ports:
-      - "6333:6333"
+      - "127.0.0.1:${FAULTLINE_QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -194,7 +227,7 @@ services:
   # ── Redis — inlet dedup cache ────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: faultline-redis
+    container_name: ${FAULTLINE_PREFIX:-faultline}-redis
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
@@ -210,12 +243,13 @@ services:
   # ── Optional bundled LLM — enable with `--profile ollama` ────────────────────
   # Only for users who don't already run a model. When enabled, set
   # LLM_BACKEND_TYPE=ollama and LLM_BASE_URL=http://ollama:11434.
+  # Loopback only (#144): Ollama has no auth; FaultLine reaches it as ollama:11434.
   ollama:
     image: ollama/ollama:latest
-    container_name: faultline-ollama
+    container_name: ${FAULTLINE_PREFIX:-faultline}-ollama
     profiles: ["ollama"]
     ports:
-      - "11434:11434"
+      - "127.0.0.1:${FAULTLINE_OLLAMA_PORT:-11434}:11434"
     volumes:
       - ollama_data:/root/.ollama
     networks:
@@ -230,4 +264,10 @@ volumes:
 
 networks:
   faultline-net:
+    # A FIXED name (#157), so OpenWebUI (or any other stack) can join it predictably:
+    #   networks: { faultline-net: { external: true } }   or
+    #   docker network connect faultline-net <openwebui-container>
+    # Without it compose names it <project>_faultline-net. A second stack gets its own
+    # network through its own FAULTLINE_PREFIX.
+    name: ${FAULTLINE_PREFIX:-faultline}-net
     driver: bridge

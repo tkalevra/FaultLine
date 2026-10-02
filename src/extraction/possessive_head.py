@@ -1,6 +1,6 @@
 """Possessive-head object resolver — the INGEST mirror of the query-side possessive helpers.
 
-PART of the LongMemEval Q1 unlock (DEV/DESIGN-ingest-spine-and-temporal-recall.md). Both
+PART of the LongMemEval Q1 unlock (the ingest spine). Both
 extractors (`/harvest-spans` GLiNER2/verb-lift AND the LLM `/extract/rewrite`) extract the gold
 clause "I had an issue with my car's GPS system" as
 

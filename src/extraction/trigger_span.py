@@ -1,6 +1,6 @@
 """Trigger-span detection — find fact-bearing spans, hand them to GLiNER2 (the strong extractor).
 
-The detection layer of DEV/DESIGN-trigger-span-gliner2-extraction.md. This module is PURE
+The detection layer of the trigger-span → GLiNER2 extraction design. This module is PURE
 (regex only, no LLM, no GLiNER2, <1ms): it loads `category='trigger'` SIGNAL regexes from the
 `extraction_patterns` table and returns the sentences of a message that look fact-bearing. The
 caller (main.extract_rewrite) hands those spans to `gliner_model.extract_relations()`.

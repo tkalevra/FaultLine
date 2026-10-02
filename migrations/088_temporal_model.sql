@@ -1,7 +1,7 @@
 -- Migration 088: temporal model — temporal_status + event_date on facts & staged_facts
 -- Date: 2026-06-14
 -- Purpose: SCHEMA FOUNDATION for temporal reasoning.
---          See DEV/DESIGN-hierarchy-ladder-and-growth.md §"Temporal model — tense + event-time".
+--          (tense + event-time).
 --
 -- WHAT
 -- ----

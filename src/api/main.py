@@ -16050,23 +16050,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         log.warning("startup.backend_secret_failed", error=str(e)[:160])
 
-    # FOSS control plane: ensure an operator bearer exists. If FAULTLINE_ADMIN_TOKEN
-    # is unset, mint a random one for this process and print it ONCE (the webui's
-    # login help documents this first-boot behaviour). It gates /api/dashboard/* AND
-    # every /admin/* and operator /internal/* route below (require_operator).
-    if not (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip():
-        import secrets as _secrets
-        os.environ["FAULTLINE_ADMIN_TOKEN"] = _secrets.token_urlsafe(32)
-        print(
-            "====================================================================\n"
-            "FAULTLINE_ADMIN_TOKEN (auto-generated for this instance):\n"
-            f"  {os.environ['FAULTLINE_ADMIN_TOKEN']}\n"
-            "Paste this into the control-plane webui sign-in. To pin a known\n"
-            "token, set FAULTLINE_ADMIN_TOKEN in the environment and restart.\n"
-            "====================================================================",
-            flush=True,
-        )
-        log.info("startup.admin_token_auto_minted")
+    # FOSS control plane: ensure an operator bearer exists (#145). FAULTLINE_ADMIN_TOKEN in the
+    # env wins; otherwise the FIRST boot mints one, stores only its hash in
+    # public.operator_admin_token and prints the plaintext ONCE. Later boots find the row and
+    # print nothing, so the token survives restarts. It gates /api/dashboard/* AND every
+    # /admin/* and operator /internal/* route below (require_operator).
+    try:
+        from src.api.operator_token import ensure_operator_token
+        _op_outcome = ensure_operator_token()
+        if _op_outcome == "unavailable":
+            log_crit(log, "startup.admin_token_unavailable",
+                     detail="no FAULTLINE_ADMIN_TOKEN and the token store is unreachable; "
+                            "operator routes refuse until it resolves")
+        else:
+            log.info("startup.admin_token_ready", source=_op_outcome)
+    except Exception as e:  # noqa: BLE001 — never block startup; operator routes fail closed
+        log.warning("startup.admin_token_failed", error=str(e)[:160])
 
     _LLM_URL = _get_llm_url()
 
@@ -17933,16 +17932,15 @@ _PROTECTED_REL_TYPE_SOURCES = ("wikidata", "builtin")
 def _ontology_operator_key_ok(authorization: Optional[str]) -> bool:
     """True iff the request carries the OPERATOR credential as an ``Authorization: Bearer``.
 
-    Bearer parse + ``hmac.compare_digest`` — a PURE ENV READ. The credential is
-    ``FAULTLINE_ADMIN_TOKEN``, the ONE operator credential (dashboard + every /admin and
+    Bearer parse + constant-time compare via ``operator_token_ok``. The credential is
+    ``FAULTLINE_ADMIN_TOKEN`` (env, else the hashed first-boot token), the ONE operator credential (dashboard + every /admin and
     operator /internal route); no second scheme exists.
 
     FAIL-CLOSED IN BOTH DIRECTIONS, and this is the load-bearing property: an UNSET key can
-    never authorise, because the comparison is guarded by ``configured and ...``. "No key is
+    never authorise (``operator_token_ok`` is False when nothing is configured). "No key is
     configured" therefore means REFUSE, not "open" — the failure mode that turned this
     endpoint into an unauthenticated write in the first place.
     """
-    import hmac
     if not authorization:
         return False
     parts = authorization.split(None, 1)
@@ -17951,11 +17949,8 @@ def _ontology_operator_key_ok(authorization: Optional[str]) -> bool:
     presented = parts[1].strip()
     if not presented:
         return False
-    for _env_name in ("FAULTLINE_ADMIN_TOKEN",):
-        configured = (os.environ.get(_env_name) or "").strip()
-        if configured and _safe_equals(presented, configured):
-            return True
-    return False
+    from src.api.operator_token import operator_token_ok
+    return operator_token_ok(presented)
 
 
 @app.post("/ontology/rel_types")

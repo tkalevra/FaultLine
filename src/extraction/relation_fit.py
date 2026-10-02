@@ -1,6 +1,6 @@
 """Relation-fit guardrail — the junk-predicate filter for the ingest spine.
 
-PART 1 of DEV/DESIGN-ingest-spine-and-temporal-recall.md (item 3). Every triple candidate,
+Part of the ingest spine (item 3). Every triple candidate,
 *regardless of which extractor proposed it* (the GLiNER2 scorer, deterministic verb-lift, OR
 the LLM `/extract/rewrite` path), must pass through here before it is allowed to reach the
 WGM gate / `/ingest`. A predicate that cannot ground to a classifiable rel_type is dropped

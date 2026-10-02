@@ -6,7 +6,7 @@
 -- Migration 110 minted `has_state` as a SCALAR predicate (tail_types={SCALAR},
 -- storage_target='entity_attributes'): an intransitive state ("My car's GPS broke last week")
 -- was stored as a freeform STRING memory leaf, never typed, never reusable. The owner REJECTED
--- that as "noise" (DEV/bugs/strength-passing-recursion/DESIGN-state-typing.md). The replacement
+-- that as "noise". The replacement
 -- decision: a STATE ("broken"/"break") is the structural TWIN of a FEELING ("worried") — an
 -- associative edge to a TYPED, SELF-BUILDING hierarchy NODE, never a scalar leaf. A GPS, a
 -- server and a leg all point to the SAME `break` node, and the is-a ladder over it self-builds

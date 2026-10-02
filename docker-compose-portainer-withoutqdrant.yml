@@ -156,7 +156,8 @@ services:
     container_name: faultline-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Loopback only (#144): redis has no auth.
+      - "127.0.0.1:6379:6379"
     logging:
       driver: json-file
       options:

@@ -17,7 +17,9 @@
     "entry_point": "server/faultline_proxy.py",
     "mcp_config": {
       "command": "python",
-      "args": ["${__dirname}/server/faultline_proxy.py"],
+      "args": [
+        "${__dirname}/server/faultline_proxy.py"
+      ],
       "env": {
         "FAULTLINE_API_URL": "${user_config.api_url}",
         "FAULTLINE_USER_ID": "${user_config.user_id}",
@@ -53,19 +55,23 @@
     },
     "user_id": {
       "type": "string",
-      "title": "User ID",
-      "description": "Your FaultLine user UUID. This isolates your memory from other users. Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx. Generate one with: python -c \"import uuid; print(uuid.uuid4())\". If you also use OpenWebUI, use the same UUID from OpenWebUI Settings > Account so both clients share one memory store.",
-      "required": true
+      "title": "User ID (optional)",
+      "description": "Leave blank when you use a seat token: the token identifies you. Only needed with the shared MCP_API_KEY before any seat exists (then a UUID, e.g. python -c \"import uuid; print(uuid.uuid4())\").",
+      "required": false
     },
     "mcp_api_key": {
       "type": "string",
-      "title": "MCP API Key",
-      "description": "Bearer token for MCP authentication. Must match the MCP_API_KEY value in your Docker .env file.",
+      "title": "Seat token",
+      "description": "Your FaultLine seat token: operator console (http://localhost:8000/ on the FaultLine host) → Seats & Tokens → mint seat. It is shown once and identifies you. The shared MCP_API_KEY from .env also works, but only until the first seat is minted.",
       "sensitive": true,
       "required": true
     }
   },
   "compatibility": {
-    "platforms": ["win32", "darwin", "linux"]
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ]
   }
 }

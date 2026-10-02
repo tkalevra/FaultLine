@@ -125,13 +125,13 @@ def backend_headers() -> dict:
 
 
 def _operator_bearer_ok(authorization: Optional[str]) -> bool:
-    expected = (os.environ.get("FAULTLINE_ADMIN_TOKEN") or "").strip()
-    if not expected or not authorization:
+    if not authorization:
         return False
     parts = authorization.split(None, 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return False
-    return safe_equals(parts[1].strip(), expected)
+    from src.api.operator_token import operator_token_ok
+    return operator_token_ok(parts[1].strip())
 
 
 @lru_cache(maxsize=1)
