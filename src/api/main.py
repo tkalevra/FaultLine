@@ -4575,7 +4575,17 @@ def _retraction_semantic_fallback(
         None -- if Qdrant unavailable, embedding fails, or no results above threshold
     """
     try:
+        # #218: user memory lives in Postgres. Qdrant is consulted ONLY on the legacy
+        # vector lane AND with a configured endpoint; otherwise the candidates come from a
+        # Postgres search over facts/staged_facts (_retraction_pg_candidates).
         qdrant_url = qp_configured_qdrant_url()
+        if not (USER_MEMORY_VECTOR_LANE and qdrant_url):
+            candidate_facts = _retraction_pg_candidates(text, db, log)
+            if not candidate_facts:
+                log.info("retraction_semantic_fallback.no_pg_candidates", user_id=user_id[:8])
+                return None
+            return _retraction_render_candidates(candidate_facts, user_id, db, log)
+
         collection, _tflt = qp_resolve_partition(user_id, "memory")
         qp_require_tenant(_tflt, op="search", collection=collection)
 
@@ -4651,6 +4661,83 @@ def _retraction_semantic_fallback(
 
         if not candidate_facts:
             return None
+        return _retraction_render_candidates(candidate_facts, user_id, db, log)
+
+    except Exception as e:
+        log.warning("retraction_semantic_fallback.unexpected_error", error=str(e))
+        return None
+
+
+_RETRACTION_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _retraction_pg_candidates(text: str, db, log, limit: int = 8) -> list:
+    """#218: Postgres candidate search for the retraction fallback (no vector store).
+
+    Subject-agnostic: every 1-3 word span of the user's own text is looked up against the
+    tenant's grown entity_aliases (exact, case-folded), and the live facts / unpromoted
+    staged_facts touching those entities are the candidates, highest confidence first.
+    No word lists: the tenant's own alias table decides what counts as a mention.
+    """
+    words = re.findall(r"[\w'-]+", (text or "").lower())
+    spans = set()
+    for n in (1, 2, 3):
+        for i in range(len(words) - n + 1):
+            spans.add(" ".join(words[i:i + n]))
+    spans = [w for w in spans if len(w) >= 2]
+    if not spans:
+        return []
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT entity_id FROM entity_aliases WHERE lower(alias) = ANY(%s)",
+                (spans,),
+            )
+            ids = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+            if not ids:
+                return []
+            cur.execute(
+                """
+                SELECT subject_id, rel_type, object_id, fact_class, confidence FROM (
+                    SELECT subject_id::text AS subject_id, rel_type, object_id::text AS object_id,
+                           fact_class, confidence
+                      FROM facts
+                     WHERE (subject_id::text = ANY(%s) OR object_id::text = ANY(%s))
+                       AND superseded_at IS NULL AND archived_at IS NULL
+                       AND deleted_at IS NULL
+                    UNION ALL
+                    SELECT subject_id::text, rel_type, object_id::text, fact_class, confidence
+                      FROM staged_facts
+                     WHERE (subject_id::text = ANY(%s) OR object_id::text = ANY(%s))
+                       AND promoted_at IS NULL AND deleted_at IS NULL
+                ) c
+                ORDER BY confidence DESC NULLS LAST
+                LIMIT %s
+                """,
+                (ids, ids, ids, ids, int(limit)),
+            )
+            rows = cur.fetchall()
+    except Exception as _pg_err:  # noqa: BLE001 — the fallback never raises
+        log.warning("retraction_semantic_fallback.pg_search_failed", error=str(_pg_err)[:160])
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+    return [{"subject": r[0], "rel_type": r[1] or "", "object": r[2],
+             "fact_class": r[3] or "?", "score": float(r[4] or 0.0)} for r in rows]
+
+
+def _retraction_render_candidates(candidate_facts: list, user_id: str, db, log) -> Optional[str]:
+    """SF-2..SF-4 of the retraction fallback: names, type hints and the summary string."""
+    _uuid_re = _RETRACTION_UUID_RE
+    try:
+        entity_uuids = set()
+        for f in candidate_facts:
+            for k in ("subject", "object"):
+                if f.get(k):
+                    entity_uuids.add(f[k])
 
         # SF-2: Resolve UUIDs to display names (batch query)
         uuid_to_name = {}
