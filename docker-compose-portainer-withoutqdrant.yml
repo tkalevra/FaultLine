@@ -56,6 +56,14 @@ version: "3.8"
 # - Bearer token (LLM_API_KEY) invalid or missing
 # - OpenWebUI endpoint unreachable or returning 401/400 errors
 
+# Bounded container logs (#210): every service uses this anchor. Override in Portainer's
+# environment variables with FAULTLINE_LOG_MAX_SIZE / FAULTLINE_LOG_MAX_FILE.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${FAULTLINE_LOG_MAX_SIZE:-10m}"
+    max-file: "${FAULTLINE_LOG_MAX_FILE:-3}"
+
 services:
 
   faultline:
@@ -92,11 +100,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
       - rag-ai-qdrant_default
@@ -118,11 +122,7 @@ services:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
     depends_on:
       - faultline
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 
@@ -143,11 +143,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 
@@ -158,11 +154,7 @@ services:
     ports:
       # Loopback only (#144): redis has no auth.
       - "127.0.0.1:6379:6379"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 

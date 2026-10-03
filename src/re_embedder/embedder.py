@@ -3397,6 +3397,49 @@ def _backend_is_reachable(backend_url: str) -> bool:
     return _backend_state(backend_url) == BACKEND_READY
 
 
+class _CycleLogSummary:
+    """Aggregate per-entity / per-tenant warnings into ONE summary line per sweep cycle (#210).
+
+    Several re-embedder passes used to log one line per entity or per tenant on EVERY cycle
+    (suspect_preferred_name, ghost_tenant_skipped, pending_placement_backlog_undrainable), an
+    identical census that grew the container log without bound. Call sites now `add()` their
+    counts here and keep the per-item detail at DEBUG; the main loop calls `flush()` once per
+    cycle, which emits a single WARNING naming each event with its tenant and item counts.
+    Counters are process-local and reset on every flush.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict = {}
+
+    def add(self, event: str, schema: str = "", **counts: int) -> None:
+        ev = self._events.setdefault(event, {"tenants": set(), "counts": {}})
+        if schema:
+            ev["tenants"].add(schema)
+        for k, v in counts.items():
+            ev["counts"][k] = ev["counts"].get(k, 0) + int(v or 0)
+
+    def snapshot(self) -> dict:
+        return {e: {"tenants": len(v["tenants"]), **v["counts"]} for e, v in self._events.items()}
+
+    def render(self) -> str:
+        parts = []
+        for event, fields in sorted(self.snapshot().items()):
+            parts.append(event + "(" + " ".join(f"{k}={v}" for k, v in fields.items()) + ")")
+        return " ".join(parts)
+
+    def flush(self, logger=None) -> Optional[str]:
+        if not self._events:
+            return None
+        line = "re_embedder.cycle_warning_summary " + self.render() + \
+            " (per-item detail at DEBUG)"
+        (logger or log).warning(line)
+        self._events = {}
+        return line
+
+
+_cycle_summary = _CycleLogSummary()
+
+
 def _backend_is_reachable_legacy(backend_url: str) -> bool:
     """Superseded by _backend_state; retained only so the old shape is greppable."""
     try:
@@ -9557,22 +9600,25 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
             stats["unplaceable_rels"] = int(_row[0] or 0)
             stats["unplaceable_facts"] = int(_row[1] or 0)
             if stats["unplaceable_rels"] > 0:
-                # `_doc_log_crit` is this module's ONLY CRITICAL renderer, and it is not
-                # document-specific despite the name: `log` here is a STDLIB logger, so
-                # src.api.logging_config.log_crit's kwargs-passthrough shape raises
-                # TypeError (see its docstring at :3360). Renaming it is out of scope.
-                _doc_log_crit(
-                    "re_embedder.pending_placement_backlog_undrainable",
-                    schema=schema_name,
-                    scanned=stats["scanned"], reconciled=stats["reconciled"],
+                # Was a per-tenant CRITICAL line on every cycle (#210). The counts now go into
+                # the ONE per-cycle summary line; the full per-tenant detail stays at DEBUG.
+                # Meaning of the detail: pending rels carrying REAL facts that no drain can
+                # place. This morphology fold only matches a SEEDED canonical, and a
+                # semantically novel predicate matches none. Their facts are stored but
+                # INVISIBLE to scoped recall (never enter rel_types_defining_group, so
+                # allowed_rels can never admit them). reconciled=0 here means the predicate
+                # did not match, NOT that the lane is dark.
+                _cycle_summary.add(
+                    "pending_placement_backlog_undrainable", schema_name,
                     unplaceable_rels=stats["unplaceable_rels"],
                     unplaceable_facts=stats["unplaceable_facts"],
-                    note="pending rels carrying REAL facts that no drain can place: this "
-                         "morphology fold only matches a SEEDED canonical, and a semantically "
-                         "novel predicate matches none. Their facts are stored but INVISIBLE "
-                         "to scoped recall (never enter rel_types_defining_group, so "
-                         "allowed_rels can never admit them). reconciled=0 here means the "
-                         "predicate did not match — NOT that the lane is dark.",
+                )
+                log.debug(
+                    "re_embedder.pending_placement_backlog_undrainable "
+                    f"schema={schema_name} scanned={stats['scanned']} "
+                    f"reconciled={stats['reconciled']} "
+                    f"unplaceable_rels={stats['unplaceable_rels']} "
+                    f"unplaceable_facts={stats['unplaceable_facts']}"
                 )
     except Exception as _ble:  # noqa: BLE001 — observability must never break the sweep
         try:
@@ -11187,7 +11233,9 @@ def flag_suspect_preferred_names(db_conn) -> dict:
             suspects = cur.fetchall()
         for entity_id, alias, source in suspects:
             stats["flagged"] += 1
-            log.warning(
+            # DEBUG, not WARNING (#210): one line per suspect per seat per cycle was the
+            # largest log-volume source. The count goes into the per-cycle summary.
+            log.debug(
                 "re_embedder.suspect_preferred_name "
                 f"entity_id={str(entity_id)[:16]} alias={alias} preference_source={source} "
                 "reason=preferred_alias_never_user_chosen (flag-only, see ALIAS-PROVENANCE-DESIGN)"
@@ -13205,7 +13253,8 @@ def main():
                                 _live_schemas.append((_hu, _hs))
                             else:
                                 _ghost_count += 1
-                                log.error(
+                                _cycle_summary.add("ghost_tenant_skipped", _hs, count=1)
+                                log.debug(
                                     f"re_embedder.ghost_tenant_skipped schema={_hs} "
                                     f"user_id={str(_hu)[:8]} "
                                     f"reason=schema_dropped_or_no_staged_facts_table "
@@ -13213,7 +13262,8 @@ def main():
                                     f"— orphan row; ops cleanup owed)"
                                 )
                     if _ghost_count:
-                        log.error(
+                        # Counted into the one per-cycle summary line (#210).
+                        log.debug(
                             f"re_embedder.ghost_tenants_skipped_total count={_ghost_count} "
                             f"live={len(_live_schemas)} — cycle continues on live tenants only"
                         )
@@ -14554,7 +14604,9 @@ def main():
                                 suspect_stats = (flag_suspect_preferred_names(_gw_db)
                                                  if _sw_run else {"flagged": 0})
                                 if suspect_stats["flagged"] > 0:
-                                    log.info(
+                                    _cycle_summary.add("suspect_preferred_name", _gw_schema,
+                                                       count=suspect_stats["flagged"])
+                                    log.debug(
                                         f"re_embedder.suspect_preferred_names_flagged "
                                         f"schema={_gw_schema} "
                                         f"count={suspect_stats['flagged']}"
@@ -14868,6 +14920,12 @@ def main():
 
         except Exception as e:
             log.error(f"re_embedder.loop_error: {e}")
+
+        # One aggregated line for this cycle's repeating warnings (#210). Never raises.
+        try:
+            _cycle_summary.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
         time.sleep(interval)
 

@@ -56,6 +56,8 @@ it to `.env` and edit. Every value here has a plain-English description there.
 | `DB_POOL_SIZE` | `10` | Connection-pool size — tune to expected concurrency. |
 | `RATE_LIMIT_PER_MIN` | `100` | Per-user request ceiling. |
 | `FAULTLINE_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL`. |
+| `FAULTLINE_LOG_MAX_SIZE` / `FAULTLINE_LOG_MAX_FILE` | `10m` / `3` | Docker log rotation applied to every compose service (json-file driver). Takes effect on container re-create. |
+| `QDRANT_LOG_LEVEL` | `WARN` | Qdrant's own log level. `INFO` logs every REST request. |
 | `HTTPX_TIMEOUT` / `DB_TIMEOUT` / `QDRANT_TIMEOUT` | `30` / `30` / `10` | Transport timeouts (seconds). |
 
 See [`.env.example`](../.env.example) for the complete annotated list, including

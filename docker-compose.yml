@@ -36,6 +36,17 @@
 # and run it with its own project name: docker compose -p faultline2 up -d --build
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Bounded container logs (#210) ────────────────────────────────────────────
+# Docker's default json-file driver keeps every line forever; an unattended install filled
+# its host disk and Postgres PANICked on the shutdown checkpoint. Every service below uses
+# this anchor: at most FAULTLINE_LOG_MAX_FILE files of FAULTLINE_LOG_MAX_SIZE each
+# (default 3 x 10m = 30 MB per container). Override both in .env.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${FAULTLINE_LOG_MAX_SIZE:-10m}"
+    max-file: "${FAULTLINE_LOG_MAX_FILE:-3}"
+
 services:
 
   # ── FaultLine backend API ───────────────────────────────────────────────────
@@ -135,6 +146,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
@@ -172,6 +184,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── PostgreSQL — fact storage (migrations run from the API entrypoint) ───────
   postgres:
@@ -209,6 +222,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── Qdrant — vector index ────────────────────────────────────────────────────
   # Loopback only (#144): Qdrant has no API key here and the backend reaches it as
@@ -218,11 +232,16 @@ services:
     container_name: ${FAULTLINE_PREFIX:-faultline}-qdrant
     ports:
       - "127.0.0.1:${FAULTLINE_QDRANT_PORT:-6333}:6333"
+    environment:
+      # Qdrant logs every REST request at INFO, and the backend polls it every ~30s (#210).
+      # WARN keeps errors; set QDRANT_LOG_LEVEL=INFO in .env to see requests while debugging.
+      QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-WARN}
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── Redis — inlet dedup cache ────────────────────────────────────────────────
   redis:
@@ -239,6 +258,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── Optional bundled LLM — enable with `--profile ollama` ────────────────────
   # Only for users who don't already run a model. When enabled, set
@@ -255,6 +275,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres_data:
