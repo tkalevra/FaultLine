@@ -282,14 +282,14 @@ FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWeb
 **Option A — OpenAPI tool server (recommended):**
 
 1. **Settings → Tools → `+`** (Manage Tool Servers). For an instance-wide server, use **Admin Settings → Tools** instead.
-2. **URL:** `http://faultline-mcp:8002` (OpenWebUI attached to the `faultline-net` Docker network, see below) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
+2. **URL:** `http://faultline-mcp:8002` (OpenWebUI attached to the `faultline-it-net` Docker network, see below) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
 3. **Auth:** `Bearer` → your `MCP_API_KEY`.
 4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them. It forwards the `X-OpenWebUI-User-Id` header FaultLine keys on (also `-User-Name`/`-Email`/`-Role`) — without it, per-user memory won't work.
 5. **Seats.** Every OpenWebUI user is its own memory store and occupies one of the instance's seats (FOSS: up to 5). Until the first seat is minted, OpenWebUI users are admitted automatically, up to 5 users. Once any seat exists (for example one you minted for Claude Desktop), only seated users are admitted: a user without a seat gets `403 seat required` naming their user_id. Seat them in the operator console (`http://localhost:8000/`) → **OpenWebUI** tab → **OpenWebUI users & seats**: refused users and users who already hold memory are listed there with a **seat** button, or paste a user id. Seating keeps the user's existing memory; OpenWebUI users keep using the MCP key, they don't need the seat token.
 
 OpenWebUI reads `/openapi.json` and surfaces every FaultLine tool — `recall_memory`, `remember_facts`, `ingest_document`, `ingest_file`, `document_status`, `review_structure`, `retry_document`, `learn_facts`, `retract_fact`, `forget_fact` — in every conversation.
 
-**Running OpenWebUI next to FaultLine (Docker).** `http://faultline-mcp:8002` only resolves when the OpenWebUI container is on FaultLine's Docker network. That network has a fixed name, **`faultline-net`** (`<FAULTLINE_PREFIX>-net` if you changed the prefix). Attach OpenWebUI to it once, either in OpenWebUI's compose file:
+**Running OpenWebUI next to FaultLine (Docker).** `http://faultline-mcp:8002` only resolves when the OpenWebUI container is on FaultLine's Docker network. That network has a fixed name, **`faultline-it-net`** (`<FAULTLINE_PREFIX>-net` if you changed the prefix). Attach OpenWebUI to it once, either in OpenWebUI's compose file:
 
 ```yaml
 services:
@@ -297,13 +297,13 @@ services:
     # ...your existing service...
     environment:
       ENABLE_FORWARD_USER_INFO_HEADERS: "true"
-    networks: [default, faultline-net]
+    networks: [default, faultline-it-net]
 networks:
-  faultline-net:
+  faultline-it-net:
     external: true
 ```
 
-or on a running container: `docker network connect faultline-net open-webui`. Then use these URLs from OpenWebUI:
+or on a running container: `docker network connect faultline-it-net open-webui`. Then use these URLs from OpenWebUI:
 
 | What | URL from OpenWebUI | Auth |
 |---|---|---|

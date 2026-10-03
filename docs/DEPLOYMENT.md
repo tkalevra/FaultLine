@@ -169,15 +169,15 @@ docker compose logs faultline | grep "ERROR\|CRITICAL\|Exception"
 ### Docker network
 
 The shipped `docker-compose.yml` puts every service on one bridge network with a fixed
-name, `faultline-net` (`<FAULTLINE_PREFIX>-net` when you change the prefix). Another stack,
+name, `faultline-it-net` (`<FAULTLINE_PREFIX>-net` when you change the prefix). Another stack,
 such as OpenWebUI, joins it as an external network:
 
 ```yaml
 services:
   open-webui:
-    networks: [default, faultline-net]
+    networks: [default, faultline-it-net]
 networks:
-  faultline-net:
+  faultline-it-net:
     external: true
 ```
 

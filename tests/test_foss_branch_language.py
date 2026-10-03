@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-BRANCH_LANG = "en"   # main = en; set per language branch (es, it)
+BRANCH_LANG = "it"   # main = en; set per language branch (es, it)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _COMPOSE = yaml.safe_load((_ROOT / "docker-compose.yml").read_text())

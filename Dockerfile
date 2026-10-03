@@ -32,7 +32,8 @@ RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(os.
 # packages into /venv, carried over by the venv COPY below. spaCy itself comes from pyproject
 # (spacy>=3.7,<3.9 → 3.8.x). If this model is ever missing/unset, linguistics.py no-ops.
 # Override at build with `--build-arg SPACY_MODEL=en_core_web_md` (re-tune chains first).
-ARG SPACY_MODEL=en_core_web_sm
+# [it branch] Default it_core_news_sm (#216) — MUST match the install language.
+ARG SPACY_MODEL=it_core_news_sm
 ARG SPACY_MODEL_VERSION=3.8.0
 ENV SPACY_MODEL=${SPACY_MODEL}
 RUN pip install --no-cache-dir \
@@ -75,7 +76,8 @@ ENV FASTEMBED_CACHE_PATH=/root/.cache/fastembed
 # (caused a 9/10→2/10 regression). Re-declare the config-layer ARG defaults + propagate as ENV
 # so linguistics.py / embedder.py / llm_output_validator.py (which read these env vars — NO code
 # literals) resolve at runtime. Override via --build-arg or the compose `environment:` block.
-ARG SPACY_MODEL=en_core_web_sm
+# [it branch] Default it_core_news_sm (#216) — MUST match the install language.
+ARG SPACY_MODEL=it_core_news_sm
 ENV SPACY_MODEL=${SPACY_MODEL}
 ARG FASTEMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
 ENV FASTEMBED_MODEL=${FASTEMBED_MODEL}

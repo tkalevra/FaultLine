@@ -973,7 +973,7 @@ _LANGUAGES = {
            "spacy_model": "es_core_news_sm",
            "ts_config": "spanish"},
 }
-_DEFAULT_LANG = "en"
+_DEFAULT_LANG = "it"   # this branch's language (#216): Enter at the gate keeps it
 
 
 def chosen_language():

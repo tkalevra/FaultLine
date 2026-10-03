@@ -34,7 +34,7 @@ What is published where (host ports are overridable, see `.env.example` "STACK N
 |---|---|---|
 | `faultline-mcp` | **`0.0.0.0:8002`** — the only network-facing port | MCP server, the live integration path (every FaultLine tool) |
 | `faultline` | `127.0.0.1:8000` | Backend API + operator console (`/`), `/health` |
-| `postgres` | not published (`postgres:5432` on `faultline-net`) | PostgreSQL — authoritative fact storage (per-tenant schemas) |
+| `postgres` | not published (`postgres:5432` on `faultline-it-net`) | PostgreSQL — authoritative fact storage (per-tenant schemas) |
 | `redis` | not published | Coordination / dedup cache |
 | `ollama` (profile) | `127.0.0.1:11434` | Optional bundled LLM |
 
@@ -128,7 +128,7 @@ docker volume rm <project>_qdrant_data    # optional: reclaim its disk once you 
 ```
 
 To keep using an existing Qdrant for the legacy `USER_MEMORY_VECTOR_LANE=true`, run it yourself
-on the `faultline-net` network and set `QDRANT_URL` explicitly in `.env`, for example
+on the `faultline-it-net` network and set `QDRANT_URL` explicitly in `.env`, for example
 `QDRANT_URL=http://faultline-qdrant:6333`. With `QDRANT_URL` unset, FaultLine makes no Qdrant
 calls and `/health` reports `"qdrant": "not_configured"` with an `ok` status.
 
@@ -208,7 +208,7 @@ refuses to stop, `docker compose kill redis` is safe: it holds no data FaultLine
 docker compose ps                           # every service Up (healthy)
 curl -s http://localhost:8000/health        # status ok, "disk": {"status": "ok", ...}, "ingest_writes": "accepted"
 docker compose logs --tail 50 faultline     # no errors after startup
-docker inspect -f '{{.HostConfig.LogConfig}}' faultline-api   # {json-file map[max-file:3 max-size:10m]}
+docker inspect -f '{{.HostConfig.LogConfig}}' faultline-it-api   # {json-file map[max-file:3 max-size:10m]}
 ```
 
 Then recall something you stored before the outage to confirm the data is intact.

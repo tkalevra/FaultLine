@@ -39,6 +39,10 @@
 # and run it with its own project name: docker compose -p faultline2 up -d --build
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Language branch (#217): this stack's defaults are its own, so it never reuses or
+# overwrites an English install on the same host: image faultline-it:latest, containers
+# faultline-it-api/-mcp/-postgres/-redis, network faultline-it-net.
+
 # ── Bounded container logs (#210) ────────────────────────────────────────────
 # Docker's default json-file driver keeps every line forever; an unattended install filled
 # its host disk and Postgres PANICked on the shutdown checkpoint. Every service below uses
@@ -68,12 +72,14 @@ services:
         # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
         # text; it does not make the chains correct for that language. Portable in principle
         # (the UD features they key on exist in these models), UNMEASURED in practice.
-        SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
-    image: ${FAULTLINE_IMAGE:-faultline:latest}
+        # [it branch] Italian by default (#216): it_core_news_sm is the model this branch is
+        # measured and tested on (LEGGIMI-it.md, linguistics.py notes).
+        SPACY_MODEL: ${SPACY_MODEL:-it_core_news_sm}
+    image: ${FAULTLINE_IMAGE:-faultline-it:latest}
     # Built locally, never pulled: without this, `up` first tries to pull faultline:latest
     # from a registry and prints "pull access denied", which reads as a failure (#156).
     pull_policy: never
-    container_name: ${FAULTLINE_PREFIX:-faultline}-api
+    container_name: ${FAULTLINE_PREFIX:-faultline-it}-api
     ports:
       # Loopback only (#117): never expose the backend to the network.
       - "127.0.0.1:${FAULTLINE_API_PORT:-8000}:8000"
@@ -89,7 +95,8 @@ services:
       # makes the entrypoint's collation guard a total no-op (not one query issued).
       # FAULTLINE_DB_ICU_LOCALE is what that guard compares the live database against; it must
       # stay in lockstep with the --icu-locale in POSTGRES_INITDB_ARGS on the postgres service.
-      FAULTLINE_LANGUAGE: ${FAULTLINE_LANGUAGE:-}
+      # [it branch] it by default (#216): a bare `docker compose up` here is an Italian install.
+      FAULTLINE_LANGUAGE: ${FAULTLINE_LANGUAGE:-it}
       FAULTLINE_DB_ICU_LOCALE: ${FAULTLINE_DB_ICU_LOCALE:-}
       # Escape hatch for the guard — run anyway on a mismatched database. Wrong text ordering,
       # but storage and case-folding are unaffected. Deliberately opt-in.
@@ -160,9 +167,9 @@ services:
 
   # ── MCP server — same memory, exposed to Claude Desktop / any MCP client ─────
   faultline-mcp:
-    image: ${FAULTLINE_IMAGE:-faultline:latest}
+    image: ${FAULTLINE_IMAGE:-faultline-it:latest}
     pull_policy: never   # the image the faultline service builds
-    container_name: ${FAULTLINE_PREFIX:-faultline}-mcp
+    container_name: ${FAULTLINE_PREFIX:-faultline-it}-mcp
     entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "${FAULTLINE_MCP_PORT:-8002}:8002"
@@ -192,7 +199,7 @@ services:
   # ── PostgreSQL — fact storage (migrations run from the API entrypoint) ───────
   postgres:
     image: postgres:16-alpine
-    container_name: ${FAULTLINE_PREFIX:-faultline}-postgres
+    container_name: ${FAULTLINE_PREFIX:-faultline-it}-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-faultline}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
@@ -239,7 +246,7 @@ services:
   # exit") until the kill timeout. Nothing to save means shutdown cannot block.
   redis:
     image: redis:7-alpine
-    container_name: ${FAULTLINE_PREFIX:-faultline}-redis
+    container_name: ${FAULTLINE_PREFIX:-faultline-it}-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     stop_grace_period: 10s
     healthcheck:
@@ -258,7 +265,7 @@ services:
   # Loopback only (#144): Ollama has no auth; FaultLine reaches it as ollama:11434.
   ollama:
     image: ollama/ollama:latest
-    container_name: ${FAULTLINE_PREFIX:-faultline}-ollama
+    container_name: ${FAULTLINE_PREFIX:-faultline-it}-ollama
     profiles: ["ollama"]
     ports:
       - "127.0.0.1:${FAULTLINE_OLLAMA_PORT:-11434}:11434"
@@ -276,9 +283,9 @@ volumes:
 networks:
   faultline-net:
     # A FIXED name (#157), so OpenWebUI (or any other stack) can join it predictably:
-    #   networks: { faultline-net: { external: true } }   or
-    #   docker network connect faultline-net <openwebui-container>
+    #   networks: { faultline-it-net: { external: true } }   or
+    #   docker network connect faultline-it-net <openwebui-container>
     # Without it compose names it <project>_faultline-net. A second stack gets its own
     # network through its own FAULTLINE_PREFIX.
-    name: ${FAULTLINE_PREFIX:-faultline}-net
+    name: ${FAULTLINE_PREFIX:-faultline-it}-net
     driver: bridge
