@@ -57,6 +57,9 @@ it to `.env` and edit. Every value here has a plain-English description there.
 | `RATE_LIMIT_PER_MIN` | `100` | Per-user request ceiling. |
 | `FAULTLINE_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL`. |
 | `FAULTLINE_LOG_MAX_SIZE` / `FAULTLINE_LOG_MAX_FILE` | `10m` / `3` | Docker log rotation applied to every compose service (json-file driver). Takes effect on container re-create. |
+| `FAULTLINE_DISK_PATHS` | `/` | Paths whose free space the backend watches (comma-separated). The tightest one decides. |
+| `FAULTLINE_DISK_DEGRADE_PCT` | `10` | Below this % free: `/health` status `degraded`, console banner. |
+| `FAULTLINE_DISK_REFUSE_PCT` | `3` | Below this % free: ingest writes refused with HTTP 507; recall keeps working. |
 | `HTTPX_TIMEOUT` / `DB_TIMEOUT` / `QDRANT_TIMEOUT` | `30` / `30` / `10` | Transport timeouts (seconds). |
 
 See [`.env.example`](../.env.example) for the complete annotated list, including

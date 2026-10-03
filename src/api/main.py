@@ -17068,6 +17068,21 @@ app = FastAPI(
 
 
 @app.middleware("http")
+async def disk_pressure_guard(request: Request, call_next):
+    """#211: below FAULTLINE_DISK_REFUSE_PCT free, refuse ingest WRITES with 507 Insufficient
+    Storage instead of letting Postgres hit ENOSPC mid-write. Reads (/query, /health, the
+    console) are never refused. Declared before backend_service_auth, so auth runs first."""
+    from src.api import disk_guard as _dg
+    if _dg.is_ingest_write(request.method, request.url.path) and _dg.writes_refused():
+        from fastapi.responses import JSONResponse as _JR
+        _state = _dg.disk_status()
+        log.error("ingest.refused_disk_critical", path=request.url.path,
+                  min_free_pct=_state.get("min_free_pct"), refuse_pct=_state.get("refuse_pct"))
+        return _JR(_dg.refusal_detail(_state), status_code=507)
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def backend_service_auth(request: Request, call_next):
     """#117/#121: every API request must carry the backend service secret (env-set or
     auto-minted at boot into public.backend_service_secret) or the operator bearer.
@@ -17796,7 +17811,7 @@ async def health():
     _now = _time.time()
 
     if _health_cache and (_now - _health_cache_ts) < _HEALTH_TTL_S:
-        return _health_cache
+        return _with_disk(_health_cache)
 
     if _health_cache:
         # STALE-BUT-INSTANT. Single-flight: only one refresh thread may exist at a time —
@@ -17811,7 +17826,7 @@ async def health():
                 _health_refresh_lock.release()
         _stale = dict(_health_cache)
         _stale["age_s"] = round(_now - _health_cache_ts, 1)
-        return _stale
+        return _with_disk(_stale)
 
     # COLD START — no cache has ever been built. Bounded synchronous probe so the very
     # first caller after boot gets a real answer, but never an unbounded hang. It rides
@@ -17825,7 +17840,27 @@ async def health():
             pass
         return _health_cache or {"status": "degraded", "timestamp": _time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_now)), "model_loaded": False, "age_s": 0.0}
-    return await asyncio.to_thread(_cold)
+    return _with_disk(await asyncio.to_thread(_cold))
+
+
+def _with_disk(payload: dict) -> dict:
+    """#211: overlay the LIVE disk state on a (possibly cached) health payload.
+
+    Measured on every call (a cached statvfs, microseconds), never taken from the health
+    cache, so a filling disk shows up immediately. degraded/critical disk → status degraded,
+    unless the payload is already worse (unhealthy). Never raises."""
+    try:
+        from src.api import disk_guard as _dg
+        disk = _dg.disk_status()
+    except Exception:  # noqa: BLE001
+        return payload
+    out = dict(payload or {})
+    out["disk"] = disk
+    if disk.get("status") in (_dg.STATUS_DEGRADED, _dg.STATUS_CRITICAL) \
+            and out.get("status") == "ok":
+        out["status"] = "degraded"
+    out["ingest_writes"] = "refused" if disk.get("status") == _dg.STATUS_CRITICAL else "accepted"
+    return out
 
 
 @app.get("/internal/ingest-route")

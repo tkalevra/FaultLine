@@ -48,6 +48,10 @@
     "tab.compare":"FOSS vs SaaS",
 
     "dash.health": "Stato dello stack",
+    "disk.label": "disco",
+    "disk.degraded": "Spazio su disco scarso",
+    "disk.critical": "Disco quasi pieno — i nuovi ricordi vengono rifiutati",
+    "disk.detail": "liberi sul volume dei dati. Libera spazio prima che Postgres lo esaurisca (DEPLOYMENT.md, \"Disk full\"). Il richiamo funziona ancora.",
     "dash.summary":"Riepilogo dell'istanza",
     "dash.seats":  "Postazioni",
     "dash.brain":  "Cervello",

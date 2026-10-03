@@ -302,6 +302,17 @@ function healthPill(name, sum) {
     '</div>';
 }
 
+function renderDiskBanner(disk) {
+  var b = $('disk-banner');
+  if (!b) return;
+  var st = disk && disk.status;
+  if (st !== 'degraded' && st !== 'critical') { b.classList.add('hidden'); b.innerHTML = ''; return; }
+  b.classList.remove('hidden');
+  b.classList.toggle('critical', st === 'critical');
+  b.innerHTML = '<strong>' + esc(t(st === 'critical' ? 'disk.critical' : 'disk.degraded')) + ':</strong> ' +
+    esc(String(disk.min_free_pct) + '% ' + t('disk.detail'));
+}
+
 function loadHealth() {
   var active = (S.view === 'dashboard');
   return callApi('GET', '/api/dashboard/health').then(function (r) {
@@ -323,10 +334,25 @@ function loadHealth() {
     var html = '';
     [['database','database'], ['qdrant','qdrant'], ['llm','llm'],
      ['re_embedder','re-embedder'], ['llm_config','llm config']].forEach(function (pair) {
+      /* #219: no vector store is the default; do not show an empty qdrant card for it */
+      if (pair[0] === 'qdrant' && d.qdrant === 'not_configured') return;
       var sum = healthSummary(d[pair[0]]);
       mark(sum.state);
       html += healthPill(pair[1], sum);
     });
+    /* #211: disk pressure — a card plus a banner on every tab while it lasts */
+    var disk = (d.disk && typeof d.disk === 'object') ? d.disk : null;
+    if (disk) {
+      var ds = String(disk.status || '');
+      var dsum = { state: ds === 'critical' ? 'down' : ds,
+                   detail: disk.min_free_pct != null ? (disk.min_free_pct + '% free') : '',
+                   full: (disk.paths || []).map(function (p) {
+                     return p.path + ' ' + (p.free_pct != null ? p.free_pct + '% free' : (p.error || '?'));
+                   }).join('\n') };
+      mark(dsum.state);
+      html += healthPill(t('disk.label'), dsum);
+    }
+    renderDiskBanner(disk);
     box.innerHTML = html;
     dotState(anyDown ? 'down' : (anyWarn ? 'warn' : 'online'));
     $('sb-mode').textContent = anyDown ? 'degraded' : (anyWarn ? 'degraded' : t('sb.mode.online'));
