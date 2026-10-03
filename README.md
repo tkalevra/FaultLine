@@ -407,6 +407,13 @@ Pick the one that matches your model, copy the prompt block, and paste it into y
 
 ---
 
+## Disk full
+
+If the host disk fills, Postgres can PANIC on its shutdown checkpoint. The stack now rotates
+its logs, keeps Redis off disk, reports disk pressure in `/health` and refuses new writes below
+3% free. The recovery procedure (diagnose with `docker system df`, safe cleanup, restart
+Postgres first so it replays its WAL, verify) is in [DEPLOYMENT.md, "Disk full"](DEPLOYMENT.md#disk-full).
+
 ## Environment variables
 
 ```env

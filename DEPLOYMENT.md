@@ -139,3 +139,76 @@ docker compose logs faultline
 docker compose restart faultline     # the operator token survives this (stored hashed)
 docker compose exec postgres psql -U faultline -d faultline -c "SELECT 1"
 ```
+
+## Disk full
+
+Symptoms: Postgres logs `PANIC: could not write to file ...: No space left on device` (often
+on the shutdown checkpoint) and `database system was not properly shut down`; Redis on older
+stacks logs `Error trying to save the DB, can't exit`; `docker compose stop` hangs.
+
+Since #210/#211/#212 the stack defends itself: container logs rotate (10m x 3 per service),
+Redis keeps nothing on disk, and below 10% free `/health` reads `degraded` with a console
+banner, below 3% new memories are refused with HTTP 507 while recall keeps working. Thresholds:
+`FAULTLINE_DISK_DEGRADE_PCT`, `FAULTLINE_DISK_REFUSE_PCT`, `FAULTLINE_DISK_PATHS`.
+
+### 1. Diagnose: what is using the space
+
+```bash
+df -h /var/lib/docker                       # the disk Docker and its volumes live on
+docker system df                            # images, containers, volumes, build cache
+docker system df -v | grep -E 'postgres_data|VOLUME NAME'
+# per-container json logs (the usual culprit on stacks without log rotation)
+sudo sh -c 'du -h /var/lib/docker/containers/*/*-json.log | sort -h | tail'
+# map a log file back to its container
+docker ps -a --format '{{.ID}} {{.Names}}' | grep faultline
+# Postgres data size from inside, when it is up
+docker compose exec postgres psql -U faultline -d faultline \
+  -c "SELECT pg_size_pretty(pg_database_size(current_database()))"
+```
+
+### 2. Free space safely
+
+Safe, nothing of yours is lost:
+
+```bash
+docker builder prune -f                     # build cache, often several GB after rebuilds
+docker image prune -f                       # dangling images
+# truncate oversized container logs IN PLACE (never rm a log Docker has open)
+sudo sh -c 'truncate -s 0 /var/lib/docker/containers/<id>/<id>-json.log'
+```
+
+Then apply log rotation to every container: it only takes effect when a container is
+re-created, so after you have space run `docker compose up -d --force-recreate` once.
+
+Never delete files inside the Postgres volume (`pg_wal`, `base/`, ...) to make room: that
+corrupts the database. `docker compose down -v` and `docker volume rm *_postgres_data` delete
+all stored memory.
+
+### 3. Restart in order
+
+With space free again, start Postgres FIRST and let it recover. It replays its WAL from the
+last checkpoint, which repairs the unclean shutdown on its own:
+
+```bash
+docker compose stop                         # if anything is still half-running
+docker compose up -d postgres
+docker compose logs -f postgres             # wait for: database system is ready to accept connections
+docker compose up -d redis
+docker compose up -d faultline              # backend: migrations, models (~2 min first boot)
+docker compose up -d faultline-mcp
+```
+
+If Postgres keeps failing with `No space left on device`, there is still not enough room for
+the WAL replay: free more, then start it again. If a Redis container from an older release
+refuses to stop, `docker compose kill redis` is safe: it holds no data FaultLine needs.
+
+### 4. Verify
+
+```bash
+docker compose ps                           # every service Up (healthy)
+curl -s http://localhost:8000/health        # status ok, "disk": {"status": "ok", ...}, "ingest_writes": "accepted"
+docker compose logs --tail 50 faultline     # no errors after startup
+docker inspect -f '{{.HostConfig.LogConfig}}' faultline-api   # {json-file map[max-file:3 max-size:10m]}
+```
+
+Then recall something you stored before the outage to confirm the data is intact.
