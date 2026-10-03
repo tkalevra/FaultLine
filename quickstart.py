@@ -1046,8 +1046,11 @@ def language_gate():
     prints a note and continues in the current branch's language, never crashes."""
     if os.environ.get("_FL_LANG_SWITCHED"):
         return  # re-exec after a branch switch — language already chosen, don't re-prompt.
+    # This branch's own language is listed FIRST, so pressing Enter keeps the checkout you are
+    # in (#216): on a language branch the old order made Enter switch to English main.
     lang = choose("Language / Lingua / Idioma",
-                  [(k, v["label"]) for k, v in _LANGUAGES.items()])
+                  [(k, v["label"]) for k, v in
+                   sorted(_LANGUAGES.items(), key=lambda kv: kv[0] != _DEFAULT_LANG)])
     # Record BEFORE any switch: _switch_branch_and_reexec replaces this process, and on the far
     # side the early-return above fires, so the environment is the only carrier of the choice.
     os.environ["_FL_LANG"] = lang
