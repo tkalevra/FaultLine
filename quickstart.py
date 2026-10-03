@@ -528,6 +528,122 @@ def configure_naming():
     return ov
 
 
+# ── existing FaultLine stacks on this host (#217) ───────────────────────────────
+# A second checkout (another language branch, an old clone) gets its own compose project
+# (named after its directory) and therefore a SECOND Postgres/Redis set, silently. Detect a
+# stack or data volume that belongs to another project and ask what to do with it.
+_STACK_SUFFIXES = ("-api", "-mcp", "-postgres", "-redis", "-qdrant", "-ollama")
+
+
+def _docker_lines(args):
+    """stdout lines of a docker CLI call; [] when docker is missing or the call fails."""
+    try:
+        out = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return []
+        return [ln for ln in str(out.stdout or "").splitlines() if ln.strip()]
+    except Exception:  # noqa: BLE001 — detection is advisory, never fatal
+        return []
+
+
+def _compose_project_name():
+    """The compose project this checkout runs as: COMPOSE_PROJECT_NAME (env or .env), else
+    the directory name normalised the way compose does it."""
+    name = os.environ.get("COMPOSE_PROJECT_NAME") or _existing_env_value("COMPOSE_PROJECT_NAME")
+    if not name:
+        name = re.sub(r"[^a-z0-9_-]", "", os.path.basename(HERE).lower())
+    return name
+
+
+def detect_other_stacks():
+    """{project: {"dir", "containers", "volumes"}} for FaultLine stacks NOT owned by this
+    checkout. A FaultLine stack = a compose project with a container named <prefix>-api /
+    -postgres / ... whose image or name says faultline, or a <project>_postgres_data volume."""
+    mine = _compose_project_name()
+    found = {}
+    fmt = ('{{.Names}}\t{{.Label "com.docker.compose.project"}}\t'
+           '{{.Label "com.docker.compose.project.working_dir"}}\t{{.Image}}\t{{.State}}')
+    for ln in _docker_lines(["ps", "-a", "--format", fmt]):
+        parts = (ln.split("\t") + [""] * 5)[:5]
+        name, proj, wdir, image, state = parts
+        if not proj or not name.endswith(_STACK_SUFFIXES):
+            continue
+        if "faultline" not in (name + " " + image).lower():
+            continue
+        if proj == mine or (wdir and os.path.realpath(wdir) == os.path.realpath(HERE)):
+            continue
+        st = found.setdefault(proj, {"dir": wdir, "containers": [], "volumes": []})
+        st["containers"].append(f"{name} ({state})")
+        st["dir"] = st["dir"] or wdir
+    for ln in _docker_lines(["volume", "ls", "--format",
+                             '{{.Name}}\t{{.Label "com.docker.compose.project"}}']):
+        vname, proj = (ln.split("\t") + [""])[:2]
+        if not vname.endswith("_postgres_data"):
+            continue
+        proj = proj or vname[: -len("_postgres_data")]
+        if proj == mine:
+            continue
+        st = found.get(proj)
+        if st is None and not proj.lower().startswith("faultline"):
+            continue  # an unrelated project's postgres volume
+        st = found.setdefault(proj, {"dir": "", "containers": [], "volumes": []})
+        st["volumes"].append(vname)
+    return found
+
+
+def _free_port(start):
+    p = start
+    while _port_open("localhost", p) and p < start + 100:
+        p += 1
+    return p
+
+
+def configure_existing_stacks():
+    """Ask reuse / replace / side-by-side when another FaultLine stack exists. Returns .env
+    overrides (possibly empty). Never runs a destructive docker command itself."""
+    stacks = detect_other_stacks()
+    if not stacks:
+        return {}
+    print(bold("Existing FaultLine stack found") + dim("  (from another checkout or language)"))
+    for proj, st in sorted(stacks.items()):
+        print(f"  project {bold(proj)}" + (dim(f"  dir: {st['dir']}") if st["dir"] else ""))
+        for c in st["containers"]:
+            print(dim(f"    container {c}"))
+        for v in st["volumes"]:
+            print(dim(f"    volume    {v}"))
+    print(dim("  Starting this checkout as-is would create a SECOND Postgres/Redis set next to it."))
+    proj = sorted(stacks)[0]
+    choice = choose("What should this install do?", [
+        ("reuse", f"Reuse it — run this checkout as project '{proj}' (same containers and data)"),
+        ("replace", "Replace it — show the commands to remove the old stack first"),
+        ("side", "Side by side — a separate stack with its own names, ports and data"),
+    ])
+    if choice == "reuse":
+        print(yellow("  ! The data is reused as-is. A database created for another language keeps"))
+        print(yellow("    that language's collation; the startup guard refuses a mismatch."))
+        return {"COMPOSE_PROJECT_NAME": proj}
+    if choice == "replace":
+        where = stacks[proj]["dir"] or "<the old checkout>"
+        print(bold("  Remove the old stack before starting this one:"))
+        print(f"    {cyan(f'cd {where} && docker compose down')}      # keeps its data volumes")
+        print(f"    {cyan(f'cd {where} && docker compose down -v')}   # ALSO deletes its data")
+        print(dim(f"    or, without the old checkout:  docker compose -p {proj} down [-v]"))
+        print(dim("  This wizard does not run them for you."))
+        return {}
+    mine = _compose_project_name()
+    prefix = re.sub(r"[^a-z0-9_-]", "", mine) or "faultline2"
+    if prefix in stacks or prefix == "faultline":
+        prefix = prefix + "2"
+    api, mcp = _free_port(8010), _free_port(8012)
+    if mcp == api:
+        mcp = _free_port(api + 1)
+    ov = {"COMPOSE_PROJECT_NAME": prefix, "FAULTLINE_PREFIX": prefix,
+          "FAULTLINE_IMAGE": f"{prefix}:latest",
+          "FAULTLINE_API_PORT": str(api), "FAULTLINE_MCP_PORT": str(mcp)}
+    print(green(f"  ✓ side by side as '{prefix}': API 127.0.0.1:{api}, MCP :{mcp}"))
+    return ov
+
+
 # ── .env writing ──────────────────────────────────────────────────────────────
 def _host_for_container(url):
     """localhost → host.docker.internal so the container can reach a host-local LLM."""
@@ -995,6 +1111,8 @@ def main():
 
     hr()
     naming_overrides = configure_naming()
+    stack_overrides = configure_existing_stacks()
+    naming_overrides = {**naming_overrides, **stack_overrides}
 
     hr()
     write_env(cfg, mcp_key, faultline_user_id, {**(embed_overrides or {}), **naming_overrides})

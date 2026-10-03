@@ -97,6 +97,24 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
 - Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
 - Monitor `/health` for dependency status.
 
+## Another FaultLine stack on this host
+
+Compose names a project after its directory, so a second checkout (a language branch, an old
+clone) starts a second Postgres/Redis set unless told otherwise. `quickstart.py` detects a
+FaultLine stack or `*_postgres_data` volume that belongs to another project and asks:
+
+- **Reuse**: writes `COMPOSE_PROJECT_NAME=<that project>` to `.env`, so this checkout runs the
+  same containers and data. A database created for another language keeps its collation; the
+  startup guard refuses a mismatch.
+- **Replace**: prints the commands to remove the old stack first. The wizard never runs them:
+  `cd <old checkout> && docker compose down` keeps its data volumes, `docker compose down -v`
+  deletes them (or `docker compose -p <project> down [-v]` without the old checkout).
+- **Side by side**: its own `COMPOSE_PROJECT_NAME`, `FAULTLINE_PREFIX`, `FAULTLINE_IMAGE` and
+  free host ports.
+
+Find what is there with `docker ps -a --filter name=faultline` and
+`docker volume ls | grep postgres_data`.
+
 ## Upgrading from a stack that ran Qdrant
 
 Earlier releases shipped a `qdrant` service. It held no user memory (Postgres is the system of
