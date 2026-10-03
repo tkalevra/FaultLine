@@ -17,8 +17,11 @@
 # Verify:  curl http://localhost:8000/health
 # MCP:     http://localhost:8002/mcp        (Claude Desktop or any MCP client)
 #
-# Exposure: :8002 (MCP) is the ONLY port published on the network. Qdrant and the
-# optional Ollama are published on 127.0.0.1 only; postgres and redis not at all.
+# No vector store (#219): user memory lives in PostgreSQL. There is no Qdrant service;
+# QDRANT_URL is optional and only the legacy USER_MEMORY_VECTOR_LANE uses it.
+#
+# Exposure: :8002 (MCP) is the ONLY port published on the network. The optional
+# Ollama is published on 127.0.0.1 only; postgres and redis not at all.
 # The backend :8000 trusts the user_id its caller sends, so it is published on
 # 127.0.0.1 ONLY — the operator
 # console (http://localhost:8000/) and the health check work on this host; from
@@ -95,7 +98,9 @@ services:
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      # Optional (#219). Empty = no vector store, the default. Set it only to keep an
+      # existing external Qdrant attached for the legacy USER_MEMORY_VECTOR_LANE.
+      QDRANT_URL: ${QDRANT_URL:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-faultline-test}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
 
@@ -139,8 +144,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
       redis:
         condition: service_healthy
     networks:
@@ -224,25 +227,6 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
-  # ── Qdrant — vector index ────────────────────────────────────────────────────
-  # Loopback only (#144): Qdrant has no API key here and the backend reaches it as
-  # qdrant:6333 on faultline-net. Published on 127.0.0.1 for local inspection only.
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: ${FAULTLINE_PREFIX:-faultline}-qdrant
-    ports:
-      - "127.0.0.1:${FAULTLINE_QDRANT_PORT:-6333}:6333"
-    environment:
-      # Qdrant logs every REST request at INFO, and the backend polls it every ~30s (#210).
-      # WARN keeps errors; set QDRANT_LOG_LEVEL=INFO in .env to see requests while debugging.
-      QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-WARN}
-    volumes:
-      - qdrant_data:/qdrant/storage
-    networks:
-      - faultline-net
-    restart: unless-stopped
-    logging: *default-logging
-
   # ── Redis — inlet dedup cache ────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
@@ -279,7 +263,6 @@ services:
 
 volumes:
   postgres_data:
-  qdrant_data:
   redis_data:
   ollama_data:
 

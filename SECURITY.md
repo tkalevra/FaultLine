@@ -17,7 +17,7 @@ If you discover a security vulnerability in FaultLine, please email **security@f
 ### Data Protection
 
 - **PostgreSQL:** Use strong credentials and enable SSL/TLS for production. Restrict network access to database via firewall rules.
-- **Qdrant:** The vector tier is **retired for user memory** and holds no user facts. If the service runs in your stack, still protect it with authentication and network isolation.
+- **Qdrant:** Not shipped and not needed; user memory lives in PostgreSQL. If you attach your own Qdrant for the legacy vector lane, protect it with authentication and network isolation.
 - **Redis:** Used for rate limiting and event queues. Configure password authentication and disable SAVE/BGSAVE in production if using ephemeral queues.
 - **Entity UUIDs:** UUIDs are v5 surrogates derived from display names, not cryptographic identifiers. Do not rely on UUID uniqueness for security purposes.
 

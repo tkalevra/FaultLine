@@ -18,7 +18,6 @@ the production path — do not treat its being off as a fault.
 client (Claude Desktop / OpenWebUI MCP) ──MCP──▶ faultline-mcp :8002 ──▶ backend :8000
                                                                             │
                                           PostgreSQL :5432 (authoritative, per-tenant — ALL user memory)
-                                                  + Qdrant :6333 (present in the stack; holds no user memory)
 ```
 
 The backend orchestrates the complete ingest pipeline — extraction, the WGM
@@ -32,7 +31,7 @@ scattered into the client.
 
 ### Prerequisites
 - Docker & Docker Compose v2+
-- PostgreSQL 16+ (Qdrant also comes up via the compose file, but the vector tier is retired for user memory and holds no user facts)
+- PostgreSQL 16+ (no vector store is needed; the stack has no Qdrant service)
 - An LLM backend you already run
 
 ### Steps
@@ -47,7 +46,7 @@ scattered into the client.
 2. **Verify the backend:**
    ```bash
    curl http://localhost:8000/health
-   # → {"status": "ok", "database": "ok", "qdrant": "ok", "llm": "ok"}
+   # → {"status": "ok", "database": "ok", "qdrant": "not_configured", "llm": "ok", ...}
    ```
 
 3. **Connect a client over MCP** — see [`MCP-SETUP.md`](MCP-SETUP.md) for the
@@ -77,7 +76,7 @@ in [`ENV-REFERENCE.md`](ENV-REFERENCE.md). The essentials:
 | `WGM_LLM_MODEL` | Model name as it appears on your backend. |
 | `MCP_API_KEY` | Bearer token enforced on the MCP transport (`:8002`). **Set this for any networked deploy.** |
 | `FAULTLINE_USER_ID` | Single-user fallback for MCP; omit in multi-user. |
-| `QDRANT_URL` | Vector index endpoint (retired for user memory; the service may remain in the stack but holds no user facts). |
+| `QDRANT_URL` | Optional, empty by default: no vector store is needed. Only the legacy `USER_MEMORY_VECTOR_LANE=true` uses it. |
 | `REEMBED_INTERVAL` | Re-embedder poll interval (seconds). |
 
 Set LLM configuration through environment variables (compose `environment:` or
@@ -188,7 +187,7 @@ backend is `http://faultline:8000` (the backend is published on the host's `127.
 ### Hardening checklist
 
 - [ ] `curl http://localhost:8000/health` returns `ok`
-- [ ] PostgreSQL + Qdrant running with external volumes
+- [ ] PostgreSQL running with an external volume
 - [ ] `MCP_API_KEY` set to a strong secret (and used by clients)
 - [ ] `LLM_BACKEND_TYPE` / `LLM_BASE_URL` / `WGM_LLM_MODEL` correct for your backend
 - [ ] `FAULTLINE_LOG_LEVEL=INFO`

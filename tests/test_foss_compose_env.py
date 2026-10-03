@@ -93,7 +93,7 @@ def _resolve(value: str, env: dict) -> str:
 
 
 _DEFAULT_NAMES = {"faultline": "faultline-api", "faultline-mcp": "faultline-mcp",
-                  "postgres": "faultline-postgres", "qdrant": "faultline-qdrant",
+                  "postgres": "faultline-postgres",
                   "redis": "faultline-redis", "ollama": "faultline-ollama"}
 
 

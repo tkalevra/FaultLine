@@ -1137,6 +1137,9 @@ def _qdrant_delete_fact_point(qdrant_url: str, user_id, source_table: str, fact_
     from another tenant; an unbound seat THROWS (require_tenant). Fail-safe: best-effort at
     the call sites (they wrap in try/except), so this returns the response or raises for the
     unbound-tenant poison case (a bug, surfaced loud)."""
+    if not qdrant_url or not _USER_MEMORY_VECTOR_LANE:
+        # #218/#219: no vector lane or no Qdrant configured → no point exists to delete.
+        return None
     from src.api.qdrant_partition import (
         resolve_partition, require_tenant, build_delete_body, resolve_point_id, qdrant_headers,
     )
@@ -12943,44 +12946,45 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
                     total_deleted += len(deleted_ids)
 
                     # Best-effort Qdrant cleanup for deleted rows (partition choke-point).
-                    try:
-                        from src.api.qdrant_partition import (
-                            resolve_partition as _qp_resolve, require_tenant as _qp_require,
-                            build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
-                            qdrant_headers as _qp_hdr,
-                        )
-                        collection, _tflt = _qp_resolve(user_id, "memory")
-                        _qp_require(_tflt, op="delete", collection=collection)
-                        for _did in deleted_ids:
+                    if qdrant_url and _USER_MEMORY_VECTOR_LANE:
+                        try:
+                            from src.api.qdrant_partition import (
+                                resolve_partition as _qp_resolve, require_tenant as _qp_require,
+                                build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
+                                qdrant_headers as _qp_hdr,
+                            )
+                            collection, _tflt = _qp_resolve(user_id, "memory")
+                            _qp_require(_tflt, op="delete", collection=collection)
+                            for _did in deleted_ids:
+                                _http_client.post(
+                                    f"{qdrant_url}/collections/{collection}/points/delete",
+                                    json=_qp_delbody(_tflt, must=[
+                                        {"key": "source_table", "match": {"value": "staged_facts"}},
+                                        {"key": "fact_id",     "match": {"value": _did}},
+                                    ]),
+                                    headers=_qp_hdr(),
+                                    timeout=5.0,
+                                )
+                            # Fallback by derived point ID (new-scheme points). The filtered
+                            # delete above already covers payload-tagged points; this removes
+                            # the deterministic (source_table, fact_id) point even if its
+                            # source_table payload were somehow absent. Legacy bare-int points
+                            # are handled by reconcile / collection re-sync.
+                            # POST /points/delete with a points-selector body; httpx .delete()
+                            # takes no body kwarg (json/content) and would raise.
                             _http_client.post(
                                 f"{qdrant_url}/collections/{collection}/points/delete",
-                                json=_qp_delbody(_tflt, must=[
-                                    {"key": "source_table", "match": {"value": "staged_facts"}},
-                                    {"key": "fact_id",     "match": {"value": _did}},
+                                json=_qp_delbody(_tflt, point_ids=[
+                                    _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
                                 ]),
                                 headers=_qp_hdr(),
                                 timeout=5.0,
                             )
-                        # Fallback by derived point ID (new-scheme points). The filtered
-                        # delete above already covers payload-tagged points; this removes
-                        # the deterministic (source_table, fact_id) point even if its
-                        # source_table payload were somehow absent. Legacy bare-int points
-                        # are handled by reconcile / collection re-sync.
-                        # POST /points/delete with a points-selector body; httpx .delete()
-                        # takes no body kwarg (json/content) and would raise.
-                        _http_client.post(
-                            f"{qdrant_url}/collections/{collection}/points/delete",
-                            json=_qp_delbody(_tflt, point_ids=[
-                                _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
-                            ]),
-                            headers=_qp_hdr(),
-                            timeout=5.0,
-                        )
-                    except Exception as qe:
-                        log.warning(
-                            f"re_embedder.inverted_sweep.qdrant_failed "
-                            f"user_id={user_id[:8]} error={qe}"
-                        )
+                        except Exception as qe:
+                            log.warning(
+                                f"re_embedder.inverted_sweep.qdrant_failed "
+                                f"user_id={user_id[:8]} error={qe}"
+                            )
 
         except Exception as e:
             log.error(
@@ -13064,7 +13068,14 @@ def main():
     })
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
-    qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+    # #219: Qdrant is optional (FOSS ships without it). The vector lane is active only when
+    # USER_MEMORY_VECTOR_LANE is on AND QDRANT_URL is set; otherwise qdrant_url is '' and no
+    # collection ensure / upsert / reconcile / delete is attempted anywhere in this loop.
+    from src.api.qdrant_partition import configured_qdrant_url as _configured_qdrant_url
+    qdrant_url = _configured_qdrant_url()
+    _vector_lane_on = bool(_USER_MEMORY_VECTOR_LANE and qdrant_url)
+    if not _vector_lane_on:
+        qdrant_url = ""
     from src.api.llm_client import (
         get_backend_endpoint,
         get_endpoint_list as _get_llm_endpoint_list,
@@ -13130,7 +13141,7 @@ def main():
             daemon=True, name="doc-drain",
         ).start()
 
-    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
+    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url or '(off)'} confidence_threshold={confidence_threshold} loglevel=INFO")
     log.info("re_embedder.entering_main_loop")
 
     # One-time startup sweep: remove pre-existing inverted staged_facts hierarchy rows
@@ -13139,7 +13150,7 @@ def main():
     # 60-second poll cycle.
     if ingest_enabled:
         try:
-            _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url)
+            _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url if _vector_lane_on else "")
         except Exception as _sweep_err:
             # Never block startup — sweep failure is non-fatal.
             log.warning(f"re_embedder.inverted_sweep.startup_error error={_sweep_err}")
@@ -13215,7 +13226,8 @@ def main():
             # collection exists. This recovers a deleted collection within one loop
             # cycle regardless of whether there are any unsynced rows.
             default_collection = os.getenv("QDRANT_COLLECTION", "faultline-test")
-            ensure_collection(default_collection, qdrant_url)
+            if _vector_lane_on:
+                ensure_collection(default_collection, qdrant_url)
 
             # PHASE 2: Get list of all ready user schemas to process independently
             with psycopg2.connect(postgres_dsn) as admin_db:
@@ -13493,7 +13505,7 @@ def main():
                         # already drops any A/B Qdrant result (VECTOR_CLASS_C_ONLY in main.py),
                         # so leaving A/B out of the vector is safe and shrinks the C catch-all
                         # toward zero as more grounds into A/B. Flag off → legacy: sync both.
-                        if not _USER_MEMORY_VECTOR_LANE:
+                        if not _vector_lane_on:
                             # LANE GATE (interactive-latency round 2): user-memory vector tier
                             # RETIRED — mirror the staged-row treatment one screen below: mark
                             # unsynced `facts` rows synced WITHOUT embedding so this loop stops
@@ -13551,7 +13563,7 @@ def main():
 
                         # Fetch and embed unsynced staged facts for this user
                         staged_rows = fetch_unsynced_staged(db_per_user, user_id)
-                        if staged_rows and not _USER_MEMORY_VECTOR_LANE:
+                        if staged_rows and not _vector_lane_on:
                             # User-memory vector lane RETIRED: mark these Class-C rows synced WITHOUT
                             # embedding so the idle-probe stops firing and no Qdrant write happens. C
                             # remains queryable from staged_facts (Postgres).
@@ -14906,7 +14918,7 @@ def main():
                     _active_tenants_this_cycle > 0
                     or (_now_mono - _last_reconcile_at) >= reconcile_max_interval
                 )
-                if _reconcile_due:
+                if _reconcile_due and _vector_lane_on:
                     stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
                     _last_reconcile_at = _now_mono
                     if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
@@ -15119,7 +15131,9 @@ if __name__ == "__main__":
         import asyncio
         from src.re_embedder.supervisor import run_supervisor
         _sup_postgres_dsn = os.getenv("POSTGRES_DSN")
-        _sup_qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+        # #219: '' unless the vector lane is on AND Qdrant is configured.
+        from src.api.qdrant_partition import configured_qdrant_url as _cq
+        _sup_qdrant_url = _cq() if _USER_MEMORY_VECTOR_LANE else ""
         _sup_backend_api_url = os.getenv("FAULTLINE_API_URL", "http://faultline:8000").rstrip("/")
         asyncio.run(run_supervisor(_sup_postgres_dsn, _sup_backend_api_url, _sup_qdrant_url))
     else:

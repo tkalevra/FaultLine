@@ -23,7 +23,7 @@ docker compose up -d --build
 
 # Verify the backend
 curl http://localhost:8000/health
-# {"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}
+# {"status":"ok","database":"ok","qdrant":"not_configured","llm":"ok",...}
 ```
 
 ## Services & ports
@@ -34,7 +34,6 @@ What is published where (host ports are overridable, see `.env.example` "STACK N
 |---|---|---|
 | `faultline-mcp` | **`0.0.0.0:8002`** — the only network-facing port | MCP server, the live integration path (every FaultLine tool) |
 | `faultline` | `127.0.0.1:8000` | Backend API + operator console (`/`), `/health` |
-| `qdrant` | `127.0.0.1:6333` | Qdrant — present in the stack; retired for user memory (holds no user facts) |
 | `postgres` | not published (`postgres:5432` on `faultline-net`) | PostgreSQL — authoritative fact storage (per-tenant schemas) |
 | `redis` | not published | Coordination / dedup cache |
 | `ollama` (profile) | `127.0.0.1:11434` | Optional bundled LLM |
@@ -68,7 +67,9 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
 
 ## Production notes
 
-- Use external volumes for PostgreSQL and Qdrant data persistence.
+- Use external volumes for PostgreSQL data persistence.
+- **No vector store is needed.** User memory lives in PostgreSQL; the stack has no Qdrant
+  service and `QDRANT_URL` is optional (see "Upgrading from a stack that ran Qdrant" below).
 - Set `MCP_API_KEY` to a secret token (the MCP HTTP transport on `:8002` is
   network-accessible — leaving it blank is dev-only). Rotating the key in the operator
   console supersedes it: from then on only the rotated key is accepted and the `.env` value
@@ -95,6 +96,23 @@ See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary an
   python -m src.api.operator_token --rotate` prints a replacement.
 - Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
 - Monitor `/health` for dependency status.
+
+## Upgrading from a stack that ran Qdrant
+
+Earlier releases shipped a `qdrant` service. It held no user memory (Postgres is the system of
+record and the user-memory vector lane is off by default), so it was removed (#219). After you
+pull this release:
+
+```bash
+docker compose up -d --remove-orphans     # stops and removes the old faultline-qdrant container
+docker volume ls | grep qdrant_data       # the old volume is left in place
+docker volume rm <project>_qdrant_data    # optional: reclaim its disk once you are sure
+```
+
+To keep using an existing Qdrant for the legacy `USER_MEMORY_VECTOR_LANE=true`, run it yourself
+on the `faultline-net` network and set `QDRANT_URL` explicitly in `.env`, for example
+`QDRANT_URL=http://faultline-qdrant:6333`. With `QDRANT_URL` unset, FaultLine makes no Qdrant
+calls and `/health` reports `"qdrant": "not_configured"` with an `ok` status.
 
 ## Troubleshooting
 

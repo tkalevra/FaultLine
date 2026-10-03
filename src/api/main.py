@@ -55,6 +55,7 @@ from src.api.backend_auth import backend_headers as _backend_auth_headers  # #12
 from src.api.backend_auth import safe_equals as _safe_equals  # constant-time, never raises on non-ASCII
 from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id, embed_text, ensure_collection, mark_synced, upsert_to_qdrant
 from src.api.qdrant_partition import (
+    configured_qdrant_url as qp_configured_qdrant_url,
     resolve_partition as qp_resolve_partition,
     require_tenant as qp_require_tenant,
     apply_tenant_filter as qp_apply_tenant_filter,
@@ -4574,7 +4575,7 @@ def _retraction_semantic_fallback(
         None -- if Qdrant unavailable, embedding fails, or no results above threshold
     """
     try:
-        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+        qdrant_url = qp_configured_qdrant_url()
         collection, _tflt = qp_resolve_partition(user_id, "memory")
         qp_require_tenant(_tflt, op="search", collection=collection)
 
@@ -9387,9 +9388,9 @@ def _immediate_sync_class_c_staged(db_conn, user_id: str, limit: int = 50) -> in
     # are no Class-C points to keep fresh and no collection to ensure. Skipping here also
     # keeps the LOCAL fastembed embed_text + the Qdrant POST off the caller's thread
     # (this helper runs inside ingest-side commit paths).
-    if not USER_MEMORY_VECTOR_LANE:
+    if not _vector_lane_active():
         return 0
-    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qdrant_url = qp_configured_qdrant_url()
     upserted = 0
     try:
         with db_conn.cursor() as cur:
@@ -9620,9 +9621,9 @@ def _purge_conflicting_staged_hierarchy_facts(
     # LANE GATE (interactive-latency round 2): with the user-memory vector tier retired
     # (USER_MEMORY_VECTOR_LANE default false) there are no staged points to purge — each
     # deleted id was a 5s-timeout POST to a nonexistent host on a worker thread.
-    if deleted_ids and user_id and USER_MEMORY_VECTOR_LANE:
+    if deleted_ids and user_id and _vector_lane_active():
         try:
-            _qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+            _qdrant_url = qp_configured_qdrant_url()
             collection, _tflt = qp_resolve_partition(user_id, "memory")
             qp_require_tenant(_tflt, op="delete", collection=collection)
             # Filtered delete (new points with source_table payload field)
@@ -12476,7 +12477,6 @@ def _validate_startup_config() -> dict:
 
     required = {
         "POSTGRES_DSN": os.environ.get("POSTGRES_DSN"),
-        "QDRANT_URL": os.environ.get("QDRANT_URL", "http://qdrant:6333"),
         "LLM_URL": llm_url,
     }
     missing = [k for k, v in required.items() if not v]
@@ -12486,7 +12486,8 @@ def _validate_startup_config() -> dict:
 
     config = {
         "postgres_dsn": "***",  # sanitized
-        "qdrant_url": required["QDRANT_URL"],
+        # #219: optional. Unset = no vector store (the FOSS default).
+        "qdrant_url": qp_configured_qdrant_url() or "(not configured)",
         "llm_url": required["LLM_URL"],
         "httpx_timeout": int(os.environ.get("HTTPX_TIMEOUT", "10")),
         "db_timeout": int(os.environ.get("DB_TIMEOUT", "30")),
@@ -12567,7 +12568,7 @@ def _health_probes_bounded(deadline_s: float) -> dict:
                 _health_probe_pool = _cf.ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="health-probe")
     dsn = os.environ.get("POSTGRES_DSN", "")
-    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qdrant_url = qp_configured_qdrant_url()
     # Component states: True/False = the probe ANSWERED; None = deadline exceeded (no
     # answer) — the caller keeps the LAST KNOWN state for None (docstring contract) and
     # only reports 'unreachable' on a real negative answer or a cold boot.
@@ -12577,7 +12578,8 @@ def _health_probes_bounded(deadline_s: float) -> dict:
     try:
         _p = _health_probe_pool
         _fdb = _p.submit(_check_db_health, dsn) if dsn else None
-        _fq = _p.submit(_check_qdrant_health, qdrant_url)
+        # #219: Qdrant is optional. Not configured → no probe at all (never a guessed host).
+        _fq = _p.submit(_check_qdrant_health, qdrant_url) if qdrant_url else None
 
         def _remaining() -> float:
             # ONE shared wall-clock budget for BOTH probes — two sequential
@@ -12593,7 +12595,8 @@ def _health_probes_bounded(deadline_s: float) -> dict:
         except Exception:
             db_state = False  # the probe ran and failed (or raised): a real negative
         try:
-            qdrant_state = bool(_fq.result(timeout=_remaining()))
+            if _fq is not None:
+                qdrant_state = bool(_fq.result(timeout=_remaining()))
         except _cf.TimeoutError:
             qdrant_state = None
         except Exception:
@@ -12701,6 +12704,19 @@ VECTOR_CLASS_C_ONLY = os.environ.get("VECTOR_CLASS_C_ONLY", "true").strip().lowe
 # re-embedder stops writing it. Default OFF — the vector tier is retired for user memory out-of-box;
 # set USER_MEMORY_VECTOR_LANE=true to re-activate the legacy lane (back-compat only).
 USER_MEMORY_VECTOR_LANE = os.environ.get("USER_MEMORY_VECTOR_LANE", "false").strip().lower() not in ("false", "0", "no")
+
+
+class _VectorLaneOff(Exception):
+    """Internal control flow: skip a best-effort Qdrant step when the vector lane is off."""
+
+
+def _vector_lane_active() -> bool:
+    """True only when the legacy user-memory vector lane is ON *and* Qdrant is configured.
+
+    #218/#219: Postgres is the system of record. FOSS ships without Qdrant, so with the
+    defaults (lane off, QDRANT_URL unset) no user-memory path may make a Qdrant HTTP call:
+    no upsert, no search, no delete, no collection ensure."""
+    return bool(USER_MEMORY_VECTOR_LANE and qp_configured_qdrant_url())
 
 # When the deterministic typed multi-hop walk DEFERS (no authoritative A/B answer for a
 # decomposable chain), fall through to the legacy scope path so the Class-C / Qdrant
@@ -16156,13 +16172,18 @@ async def lifespan(app: FastAPI):
     log.info("startup.provisioning_reaper_started")
 
 
-    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qdrant_url = qp_configured_qdrant_url()
     default_collection = os.environ.get("QDRANT_COLLECTION", "faultline-test")
-    log.info("startup.qdrant_collection_check", collection=default_collection)
-    if ensure_collection(default_collection, qdrant_url):
-        log.info("startup.qdrant_collection_ready", collection=default_collection)
+    if not _vector_lane_active():
+        # #218/#219: Postgres holds user memory; no vector store to prepare.
+        log.info("startup.qdrant_skipped", qdrant_configured=bool(qdrant_url),
+                 user_memory_vector_lane=USER_MEMORY_VECTOR_LANE)
     else:
-        log.error("startup.qdrant_collection_failed", collection=default_collection)
+        log.info("startup.qdrant_collection_check", collection=default_collection)
+        if ensure_collection(default_collection, qdrant_url):
+            log.info("startup.qdrant_collection_ready", collection=default_collection)
+        else:
+            log.error("startup.qdrant_collection_failed", collection=default_collection)
 
     dsn = os.environ.get("POSTGRES_DSN")
     if dsn:
@@ -17634,9 +17655,13 @@ def _health_refresh_sync(bounded: bool = True) -> None:
         qdrant_ok = _probed["qdrant"] if _probed["qdrant"] is not None else (_prev.get("qdrant") == "ok")
     else:
         dsn = os.environ.get("POSTGRES_DSN", "")
-        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+        qdrant_url = qp_configured_qdrant_url()
         db_ok = _check_db_health(dsn) if dsn else False
-        qdrant_ok = _check_qdrant_health(qdrant_url)
+        qdrant_ok = _check_qdrant_health(qdrant_url) if qdrant_url else True
+    # #219: an unconfigured Qdrant is the FOSS default, not a fault. It never degrades status.
+    _qdrant_configured = bool(qp_configured_qdrant_url())
+    if not _qdrant_configured:
+        qdrant_ok = True
     qwen_url = _LLM_URL
 
     llm_ok = _check_llm_health(qwen_url)
@@ -17652,7 +17677,8 @@ def _health_refresh_sync(bounded: bool = True) -> None:
         "status": status,
         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_now)),
         "database": "ok" if db_ok else "unreachable",
-        "qdrant": "ok" if qdrant_ok else "unreachable",
+        "qdrant": ("not_configured" if not _qdrant_configured
+                   else ("ok" if qdrant_ok else "unreachable")),
         "llm": llm_label,
         "re_embedder": _embedder_stats,
         "model_loaded": True,
@@ -28059,8 +28085,8 @@ def _delete_from_qdrant(
     pass is conjunctive on (fact_id, source_table), so an id that exists in only
     one table matches nothing under the other label and is never wrong-deleted.
     """
-    if not fact_ids:
-        return
+    if not fact_ids or not _vector_lane_active() or not qdrant_url:
+        return  # #218/#219: no vector lane or no Qdrant configured → nothing to delete
     # Partition scope: in shared_payload mode every delete is AND-ed with the seat's
     # tenant filter (require_tenant throws if unresolved). None in collection_per_seat →
     # byte-for-byte the legacy per-seat delete shapes.
@@ -35711,12 +35737,12 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                         # host that does not exist — which is what stalled /query AND /health AND
                         # the 404 control together (critic-measured p95 5.1s / 4.8s / max 30s).
                         # Retired lane ⇒ there are no user-memory points to keep fresh: skip.
-                        if not USER_MEMORY_VECTOR_LANE:
+                        if not _vector_lane_active():
                             log.debug("ingest.immediate_qdrant_sync_skipped reason=user_memory_vector_lane_off",
                                       user_id=req.user_id)
                         else:
                           try:
-                            qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+                            qdrant_url = qp_configured_qdrant_url()
                             qwen_api_url = _LLM_URL
                             upserted = 0
                             with db.cursor() as cur:
@@ -35821,68 +35847,69 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                         # that is vector-indexed (VECTOR_CLASS_C_ONLY). The SELECT filters
                         # fact_class = 'C' so a Class B staged row co-resident in staged_facts can
                         # never leak into the vector. Mirrors the re_embedder C-only embed rule.
-                        try:
-                            qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-                            qwen_api_url = _LLM_URL
-                            upserted_c = 0
-                            with db.cursor() as cur:
-                                cur.execute(
-                                    "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class, source_ref FROM staged_facts "
-                                    "WHERE qdrant_synced = false AND promoted_at IS NULL AND expires_at > now() "
-                                    "AND fact_class = 'C' "
-                                    "ORDER BY id DESC LIMIT %s",
-                                    (len(class_c_rows),)
-                                )
-                                staged_fresh = cur.fetchall()
-                                if staged_fresh:
-                                    collection, _ = qp_resolve_partition(req.user_id, "memory")
-                                    ensure_collection(collection, qdrant_url)
-                                    for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in staged_fresh:
-                                        text = f"{sf_subj} {sf_rel} {sf_obj}"
-                                        vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
-                                        if vector is None:
-                                            continue
-                                        # EP-SYNTHETIC (emitter-provenance-honesty r2):
-                                        # WRITE-path Qdrant mirror of staged Class-C rows
-                                        # this request just committed -- not a read
-                                        # emitter; the SELECT enforces Class C and the
-                                        # payload carries each row own stored
-                                        # provenance/confidence. Lane dark for user
-                                        # memory (USER_MEMORY_VECTOR_LANE=false).
-                                        s_row = {
-                                            "id": sf_id,
-                                            "user_id": req.user_id,
-                                            "subject_id": sf_subj,
-                                            "subject_display": sf_subj,
-                                            "object_id": sf_obj,
-                                            "object_display": sf_obj,
-                                            "rel_type": sf_rel,
-                                            "provenance": sf_prov,
-                                            "confidence": float(sf_conf) if sf_conf else 0.4,
-                                            "confirmed_count": 0,
-                                            "last_seen_at": None,
-                                            "contradicted_by": None,
-                                            # Class C only (the SELECT enforces it); pass it through.
-                                            "fact_class": sf_class or "C",
-                                            # Citable provenance (migration 128) — carried into the Qdrant payload.
-                                            "source_ref": sf_source_ref,
-                                        }
-                                        if upsert_to_qdrant(s_row, vector, collection, qdrant_url, source_table="staged_facts"):
-                                            with db.cursor() as _mark:
-                                                _mark.execute(
-                                                    "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
-                                                    (sf_id,)
-                                                )
-                                            upserted_c += 1
-                                    if upserted_c > 0:
-                                        log.info("ingest.immediate_qdrant_sync_staged", user_id=req.user_id, synced=upserted_c, fact_class="C")
-                        except Exception as _sync_err:
-                            # INTENTIONAL: Graceful degradation — PostgreSQL staged_facts are authoritative.
-                            # If Qdrant is unavailable, skip sync and let re_embedder retry later.
-                            log.warning("ingest.immediate_qdrant_sync_staged_failed",
-                                       error_type=type(_sync_err).__name__,
-                                       error=str(_sync_err),
-                                       note="Staged facts committed; Qdrant sync will retry in re_embedder poll")
+                        if _vector_lane_active():
+                            try:
+                                qdrant_url = qp_configured_qdrant_url()
+                                qwen_api_url = _LLM_URL
+                                upserted_c = 0
+                                with db.cursor() as cur:
+                                    cur.execute(
+                                        "SELECT id, subject_id, object_id, rel_type, provenance, confidence, fact_class, source_ref FROM staged_facts "
+                                        "WHERE qdrant_synced = false AND promoted_at IS NULL AND expires_at > now() "
+                                        "AND fact_class = 'C' "
+                                        "ORDER BY id DESC LIMIT %s",
+                                        (len(class_c_rows),)
+                                    )
+                                    staged_fresh = cur.fetchall()
+                                    if staged_fresh:
+                                        collection, _ = qp_resolve_partition(req.user_id, "memory")
+                                        ensure_collection(collection, qdrant_url)
+                                        for sf_id, sf_subj, sf_obj, sf_rel, sf_prov, sf_conf, sf_class, sf_source_ref in staged_fresh:
+                                            text = f"{sf_subj} {sf_rel} {sf_obj}"
+                                            vector = embed_text(text, qwen_api_url, timeout=10.0, fallback=True, embedding_url=_EMBEDDING_API_URL)
+                                            if vector is None:
+                                                continue
+                                            # EP-SYNTHETIC (emitter-provenance-honesty r2):
+                                            # WRITE-path Qdrant mirror of staged Class-C rows
+                                            # this request just committed -- not a read
+                                            # emitter; the SELECT enforces Class C and the
+                                            # payload carries each row own stored
+                                            # provenance/confidence. Lane dark for user
+                                            # memory (USER_MEMORY_VECTOR_LANE=false).
+                                            s_row = {
+                                                "id": sf_id,
+                                                "user_id": req.user_id,
+                                                "subject_id": sf_subj,
+                                                "subject_display": sf_subj,
+                                                "object_id": sf_obj,
+                                                "object_display": sf_obj,
+                                                "rel_type": sf_rel,
+                                                "provenance": sf_prov,
+                                                "confidence": float(sf_conf) if sf_conf else 0.4,
+                                                "confirmed_count": 0,
+                                                "last_seen_at": None,
+                                                "contradicted_by": None,
+                                                # Class C only (the SELECT enforces it); pass it through.
+                                                "fact_class": sf_class or "C",
+                                                # Citable provenance (migration 128) — carried into the Qdrant payload.
+                                                "source_ref": sf_source_ref,
+                                            }
+                                            if upsert_to_qdrant(s_row, vector, collection, qdrant_url, source_table="staged_facts"):
+                                                with db.cursor() as _mark:
+                                                    _mark.execute(
+                                                        "UPDATE staged_facts SET qdrant_synced = true WHERE id = %s",
+                                                        (sf_id,)
+                                                    )
+                                                upserted_c += 1
+                                        if upserted_c > 0:
+                                            log.info("ingest.immediate_qdrant_sync_staged", user_id=req.user_id, synced=upserted_c, fact_class="C")
+                            except Exception as _sync_err:
+                                # INTENTIONAL: Graceful degradation — PostgreSQL staged_facts are authoritative.
+                                # If Qdrant is unavailable, skip sync and let re_embedder retry later.
+                                log.warning("ingest.immediate_qdrant_sync_staged_failed",
+                                           error_type=type(_sync_err).__name__,
+                                           error=str(_sync_err),
+                                           note="Staged facts committed; Qdrant sync will retry in re_embedder poll")
 
                     # Use class_a_rows for downstream corrections processing
                     resolved_rows = class_a_rows
@@ -52332,7 +52359,7 @@ def qdrant_semantic_search(
     query_text: str,
     conversation_history: list[dict] = None,
     user_id: str = "anonymous",
-    qdrant_url: str = "http://qdrant:6333",
+    qdrant_url: str = "",
     qwen_api_url: str = None,
     score_threshold: float = 0.3,
     limit: int = 10,
@@ -52349,7 +52376,7 @@ def qdrant_semantic_search(
         query_text: Current user query
         conversation_history: Recent conversation messages (last 3 for context)
         user_id: User identifier (required for collection naming)
-        qdrant_url: Qdrant base URL (default http://qdrant:6333)
+        qdrant_url: Qdrant base URL; empty = not configured (#219), returns []
         qwen_api_url: LLM endpoint for embedding (required for embed_text)
         score_threshold: Minimum cosine similarity score (default 0.3)
         limit: Max facts to return (default 10)
@@ -52369,6 +52396,8 @@ def qdrant_semantic_search(
         - Qdrant down → return empty list
         - Missing conversation history → use query_text only
     """
+    if not qdrant_url:
+        return []  # #219: no vector store configured
     if conversation_history is None:
         conversation_history = []
 
@@ -55341,7 +55370,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
     query_text = request.text
     conversation_history = request.conversation_history or []
     min_confidence = float(os.environ.get("MIN_INJECT_CONFIDENCE", 0.4))
-    qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+    qdrant_url = qp_configured_qdrant_url()
 
     db = None
     try:
@@ -56381,7 +56410,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # PostgreSQL is authoritative for A+B; Qdrant adds associative context for C.
         # D3: ALWAYS runs (no skip) so Class C is always part of full scope.
         qdrant_facts = []
-        if USER_MEMORY_VECTOR_LANE:
+        if _vector_lane_active():
             try:
                 llm_url = _get_llm_url()
                 if llm_url:
@@ -60514,40 +60543,39 @@ def correct_fact(req: FactCorrectionRequest):
                                                 staged_ids=_orphan_ids,
                                             )
                                             # Best-effort Qdrant cleanup for orphaned staged rows
-                                            try:
-                                                _orphan_qdrant_url = os.environ.get(
-                                                    "QDRANT_URL", "http://qdrant:6333"
-                                                )
-                                                _orphan_collection, _orphan_tflt = qp_resolve_partition(req.user_id, "memory")
-                                                qp_require_tenant(_orphan_tflt, op="delete", collection=_orphan_collection)
-                                                for _oid in _orphan_ids:
+                                            if _vector_lane_active():
+                                                try:
+                                                    _orphan_qdrant_url = qp_configured_qdrant_url()
+                                                    _orphan_collection, _orphan_tflt = qp_resolve_partition(req.user_id, "memory")
+                                                    qp_require_tenant(_orphan_tflt, op="delete", collection=_orphan_collection)
+                                                    for _oid in _orphan_ids:
+                                                        _http_client_sync.post(
+                                                            f"{_orphan_qdrant_url}/collections/"
+                                                            f"{_orphan_collection}/points/delete",
+                                                            json=qp_build_delete_body(_orphan_tflt, must=[
+                                                                {"key": "source_table", "match": {"value": "staged_facts"}},
+                                                                {"key": "fact_id", "match": {"value": _oid}},
+                                                            ]),
+                                                            headers=qp_qdrant_headers(),
+                                                            timeout=5.0,
+                                                        )
+                                                    # POST /points/delete — httpx .delete() takes no body kwarg.
                                                     _http_client_sync.post(
                                                         f"{_orphan_qdrant_url}/collections/"
                                                         f"{_orphan_collection}/points/delete",
-                                                        json=qp_build_delete_body(_orphan_tflt, must=[
-                                                            {"key": "source_table", "match": {"value": "staged_facts"}},
-                                                            {"key": "fact_id", "match": {"value": _oid}},
+                                                        json=qp_build_delete_body(_orphan_tflt, point_ids=[
+                                                            qp_resolve_point_id(req.user_id, "staged_facts", _oid, "memory")
+                                                            for _oid in _orphan_ids
                                                         ]),
                                                         headers=qp_qdrant_headers(),
                                                         timeout=5.0,
                                                     )
-                                                # POST /points/delete — httpx .delete() takes no body kwarg.
-                                                _http_client_sync.post(
-                                                    f"{_orphan_qdrant_url}/collections/"
-                                                    f"{_orphan_collection}/points/delete",
-                                                    json=qp_build_delete_body(_orphan_tflt, point_ids=[
-                                                        qp_resolve_point_id(req.user_id, "staged_facts", _oid, "memory")
-                                                        for _oid in _orphan_ids
-                                                    ]),
-                                                    headers=qp_qdrant_headers(),
-                                                    timeout=5.0,
-                                                )
-                                            except Exception as _orphan_qdrant_err:
-                                                log.warning(
-                                                    "correct_fact.orphan_staged_qdrant_failed",
-                                                    user_id=req.user_id[:8],
-                                                    error=str(_orphan_qdrant_err),
-                                                )
+                                                except Exception as _orphan_qdrant_err:
+                                                    log.warning(
+                                                        "correct_fact.orphan_staged_qdrant_failed",
+                                                        user_id=req.user_id[:8],
+                                                        error=str(_orphan_qdrant_err),
+                                                    )
                                 finally:
                                     try:
                                         _orphan_db.close()
@@ -61302,9 +61330,9 @@ def correct_fact(req: FactCorrectionRequest):
         # Old Qdrant points (synced before this fix) lack source_table in their payload — the
         # filtered delete matches nothing for those points, which is safe; re_embedder reconciliation
         # will clean them up.
-        if affected_ids:
+        if affected_ids and _vector_lane_active():
             try:
-                _qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+                _qdrant_url = qp_configured_qdrant_url()
                 _collection, _tflt = qp_resolve_partition(req.user_id, "memory")
                 qp_require_tenant(_tflt, op="delete", collection=_collection)
                 _src_table = "staged_facts" if (found_via is not None and "_staged" in found_via) else "facts"
@@ -61470,10 +61498,12 @@ def correct_fact(req: FactCorrectionRequest):
                             # Delete corresponding Qdrant points for purged staged_facts rows.
                             # Two-pass: filtered delete (new points with source_table payload)
                             # then fallback point-ID delete (old points without source_table).
-                            _sf_qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-                            _sf_collection, _sf_tflt = qp_resolve_partition(req.user_id, "memory")
-                            qp_require_tenant(_sf_tflt, op="delete", collection=_sf_collection)
+                            _sf_qdrant_url = qp_configured_qdrant_url()
                             try:
+                                if not _vector_lane_active():
+                                    raise _VectorLaneOff()
+                                _sf_collection, _sf_tflt = qp_resolve_partition(req.user_id, "memory")
+                                qp_require_tenant(_sf_tflt, op="delete", collection=_sf_collection)
                                 # Pass 1: filtered delete by source_table + fact_id (new points)
                                 for _sf_id in _deleted_sf_ids:
                                     _http_client_sync.post(
@@ -61501,6 +61531,8 @@ def correct_fact(req: FactCorrectionRequest):
                                          user_id=req.user_id[:8],
                                          staged_ids=_deleted_sf_ids,
                                          collection=_sf_collection)
+                            except _VectorLaneOff:
+                                pass  # #219: no vector store, nothing to clean
                             except Exception as _sf_qdrant_err:
                                 log.warning("correct_fact.staged_facts_qdrant_cleanup_failed",
                                             user_id=req.user_id[:8],
@@ -61759,7 +61791,7 @@ def retract_fact(req: RetractRequest):
 
         if affected_ids:
             collection, _ = qp_resolve_partition(req.user_id, "memory")
-            qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+            qdrant_url = qp_configured_qdrant_url()
             # Collision-safe: pass the source_table so Qdrant cleanup filters by
             # (source_table, fact_id), not bare point ids (facts/staged_facts share ids).
             _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table, user_id=req.user_id)
@@ -62072,7 +62104,7 @@ def forget_fact(req: RetractRequest):
 
         if affected_ids:
             collection, _ = qp_resolve_partition(req.user_id, "memory")
-            qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+            qdrant_url = qp_configured_qdrant_url()
             # Collision-safe Qdrant cleanup: filter by (source_table, fact_id).
             _delete_from_qdrant(affected_ids, collection, qdrant_url, affected_source_table, user_id=req.user_id)
 
@@ -63301,11 +63333,11 @@ def store_context(req: StoreContextRequest):
         # (it is a verbatim prose blob), so when the lane is OFF we defer the text to episodic_log
         # (the verbatim re-mineable substrate) instead of writing to a Qdrant collection that is no
         # longer read. The text is retained; it is re-mined by reextract_episodic as the ontology grows.
-        if not USER_MEMORY_VECTOR_LANE:
+        if not _vector_lane_active():
             log.info("store_context.deferred_to_episodic_vector_lane_retired", user_id=req.user_id)
             return _defer_context_to_episodic(req, "vector_lane_retired")
 
-        qdrant_url = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+        qdrant_url = qp_configured_qdrant_url()
         qwen_api_url = _LLM_URL
 
         collection, _tflt = qp_resolve_partition(req.user_id, "memory")

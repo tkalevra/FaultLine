@@ -19,8 +19,8 @@ What it does:
   4. Offers to generate a secret MCP_API_KEY.
   5. Resolves your tenant id (FAULTLINE_USER_ID): generate, reuse, enter
      manually, or leave blank for OpenWebUI multi-user.
-  6. Names the deployment's resources (Postgres DB, per-tenant schema prefix,
-     Qdrant collection) — one "faultline for all" fast-path, or set each (validated).
+  6. Names the deployment's resources (Postgres DB, per-tenant schema prefix) — one
+     "faultline for all" fast-path, or set each (validated).
   7. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
   8. Prints the exact next steps.
 
@@ -378,8 +378,6 @@ def configure_embeddings(llm_cfg):
             ov = _external_embed_overrides(e_backend, e_url, e_key, llm_key, model)
             print(green(f"  ✓ embedding model: {model}"))
             print(dim(f"    endpoint: {ov['EMBEDDING_API_URL']}  (built-in local embedder disabled)"))
-            print(dim("    if this model's vector size differs from nomic (768), start with a fresh"))
-            print(dim("    Qdrant volume — mixing vector dimensions in one collection will error."))
             return ov
 
         print(red(f"  ✗ could not connect — {detail}"))
@@ -501,30 +499,29 @@ def _port_open(host, port, timeout=1.0):
 def configure_naming():
     """
     Name the deployment's resources — Postgres DB (the db segment of POSTGRES_DSN),
-    per-tenant SCHEMA_NAME_PREFIX, and QDRANT_COLLECTION. Each defaults to 'faultline'.
+    and per-tenant SCHEMA_NAME_PREFIX. Each defaults to 'faultline'. There is no vector
+    store to name (#219): user memory lives in Postgres.
     Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
     DB that isn't up yet (the stack may not be built).
     """
-    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix, Qdrant collection)"))
+    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix)"))
     print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
     base_dsn = _default_dsn()
 
     if ask_yes("Use 'faultline' for all resource names (recommended)?", default_yes=True):
-        prefix = db = coll = "faultline"
+        prefix = db = "faultline"
     else:
         prefix = _ask_name("Per-tenant schema prefix", "faultline", _IDENT_RE, "schema prefix")
         db = _ask_name("Postgres database name", "faultline", _IDENT_RE, "database name")
-        coll = _ask_name("Qdrant collection name", "faultline", _COLL_RE, "collection name")
 
     ov = {
         "SCHEMA_NAME_PREFIX": prefix,
-        "QDRANT_COLLECTION": coll,
         "POSTGRES_DSN": _rewrite_dsn_db(base_dsn, db),
         # #149: the postgres service creates POSTGRES_DB; it must match the DSN's database,
         # or a custom name points the backend at a database that was never created.
         "POSTGRES_DB": db,
     }
-    print(green(f"  ✓ schema prefix: {prefix}   db: {db}   collection: {coll}"))
+    print(green(f"  ✓ schema prefix: {prefix}   db: {db}"))
     print(dim(f"    Postgres DSN: {ov['POSTGRES_DSN']}  (compose host preserved)"))
     if _port_open("localhost", 5432):
         print(dim("    (a Postgres is reachable on localhost:5432 — the db is created on first boot)"))
@@ -657,7 +654,7 @@ def print_next_steps(mcp_key):
     print(bold("You're set. Next steps:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
     print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
-    print(f"       expect: {dim(chr(34) + 'database:ok, qdrant:ok, llm:ok' + chr(34))}")
+    print(f"       expect: {dim(chr(34) + 'database:ok, llm:ok' + chr(34))}")
     print(f"  3. The live integration path is the MCP server on {bold(':8002')}.")
     if mcp_key:
         print(f"       Secured with your MCP_API_KEY — send {cyan('Authorization: Bearer <key>')}.")
@@ -688,8 +685,7 @@ def _poll_health(timeout=240):
         try:
             _, body = _http_get("http://localhost:8000/health", timeout=4)
             d = json.loads(body)
-            print(green(f"  ✓ backend up — database:{d.get('database')} "
-                        f"qdrant:{d.get('qdrant')} llm:{d.get('llm')}"))
+            print(green(f"  ✓ backend up — database:{d.get('database')} llm:{d.get('llm')}"))
             if d.get("llm") != "ok":
                 print(yellow("    (llm not ok — check LLM_BASE_URL and that your model is loaded/pulled)"))
             return

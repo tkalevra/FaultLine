@@ -2,8 +2,9 @@ version: "3.8"
 
 # FaultLine WGM — Portainer Stack (WITHOUT Qdrant)
 #
-# This compose file assumes you already have Qdrant running in a separate stack.
-# It will connect to your existing Qdrant instance via the shared network.
+# FaultLine needs no vector store (#219): user memory lives in PostgreSQL. QDRANT_URL is
+# optional; set it (and attach a network that reaches it) only for the legacy
+# USER_MEMORY_VECTOR_LANE.
 #
 # IMPORTANT: This compose file references a PRE-BUILT Docker image.
 # Before deploying this stack in Portainer, build the image on your Docker host:
@@ -12,10 +13,7 @@ version: "3.8"
 #   docker build -t faultline-wgm:latest .
 #
 # PREREQUISITES:
-#   ✓ Qdrant already running (e.g., in rag-ai-qdrant stack)
-#   ✓ Qdrant network name: rag-ai-qdrant_default
-#   ✓ Qdrant hostname: qdrant
-#   ✓ Qdrant port: 6333
+#   ✓ OpenWebUI network: openweb_ui_default
 #
 # DEPLOYMENT OPTIONS:
 #   Option 1: Web Editor (Portainer UI)
@@ -80,8 +78,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
       FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: faultline-test
+      QDRANT_URL: ${QDRANT_URL:-}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REEMBED_INTERVAL: ${REEMBED_INTERVAL:-300}
       SHORT_TERM_MEMORY: ${SHORT_TERM_MEMORY:-true}
@@ -103,7 +100,6 @@ services:
     logging: *default-logging
     networks:
       - openweb_ui_default
-      - rag-ai-qdrant_default
 
   faultline-mcp:
     image: faultline-wgm:latest
@@ -167,8 +163,3 @@ networks:
   openweb_ui_default:
     external: true
     name: openweb_ui_default
-
-  # Reference to existing Qdrant network
-  rag-ai-qdrant_default:
-    external: true
-    name: rag-ai-qdrant_default

@@ -78,12 +78,6 @@ def test_control_unbounded_service_is_detected():
     assert len(bad) == 2 and bad[0].startswith("brand-new-sidecar")
 
 
-def test_qdrant_defaults_to_warn():
-    services = yaml.safe_load((_ROOT / "docker-compose.yml").read_text())["services"]
-    lvl = services["qdrant"]["environment"]["QDRANT__LOG_LEVEL"]
-    assert _default(lvl) == "WARN" and "QDRANT_LOG_LEVEL" in lvl
-
-
 # ── re-embedder aggregation ──────────────────────────────────────────────────
 
 emb = pytest.importorskip("src.re_embedder.embedder")
