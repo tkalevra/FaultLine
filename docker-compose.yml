@@ -217,6 +217,9 @@ services:
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Let the shutdown checkpoint finish instead of Docker's 10s SIGKILL (#212). A killed
+    # postgres is still safe (it replays WAL on the next start), but a clean stop is faster.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline}"]
       interval: 5s
@@ -227,13 +230,18 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
-  # ── Redis — inlet dedup cache ────────────────────────────────────────────────
+  # ── Redis — coordination cache, NOT a store (#212) ───────────────────────────
+  # Redis holds only re-derivable state: the idempotency dedup cache, embedding cache,
+  # cross-process rate-budget counters, telemetry events and ingest work-queue CLAIMS
+  # (Postgres is the ledger; an expired claim is reclaimed from documents.chunk_state).
+  # So it runs WITHOUT persistence: no RDB snapshots, no AOF, no volume. With
+  # `--appendonly yes` a full disk made shutdown hang ("Error trying to save the DB, can't
+  # exit") until the kill timeout. Nothing to save means shutdown cannot block.
   redis:
     image: redis:7-alpine
     container_name: ${FAULTLINE_PREFIX:-faultline}-redis
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    stop_grace_period: 10s
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -263,7 +271,6 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
   ollama_data:
 
 networks:

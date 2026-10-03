@@ -134,6 +134,9 @@ services:
       POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
       - pg-data:/var/lib/postgresql/data
+    # Let the shutdown checkpoint finish instead of Docker's 10s SIGKILL (#212). A killed
+    # postgres is still safe (it replays WAL on the next start), but a clean stop is faster.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test"]
       interval: 5s
@@ -147,6 +150,10 @@ services:
     image: redis:7-alpine
     container_name: faultline-redis
     restart: unless-stopped
+    # Coordination cache only, never a store (#212): no RDB snapshots, no AOF, so a full
+    # disk can never block shutdown. The image's default config snapshots to /data.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    stop_grace_period: 10s
     ports:
       # Loopback only (#144): redis has no auth.
       - "127.0.0.1:6379:6379"
