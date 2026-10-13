@@ -9,11 +9,23 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --upgrade pip
 
 COPY pyproject.toml .
+# CPU-ONLY torch, FIRST and from PyTorch's CPU index. gliner2==1.3.2 depends on peft, which
+# depends on torch UNPINNED — on Linux the default PyPI resolve picks the CUDA build and drags
+# in ~2 GB of nvidia-*/triton wheels (~7 GB installed) for a CPU-only workload. Pre-installing
+# the pinned +cpu wheel satisfies peft's torch constraint so the CUDA stack never enters the
+# resolve (measured: 108 packages / ~2.3 GB wheels -> 80 packages / ~0.3 GB). Do NOT remove:
+# the CUDA stack comes back silently on the next fresh resolve. Bumping torch? Re-validate
+# GLiNER2 entity typing and use a +cpu wheel from https://download.pytorch.org/whl/cpu.
+RUN pip install --no-cache-dir "torch==2.6.0+cpu" --index-url https://download.pytorch.org/whl/cpu
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 
-# Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
-RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
+# Pre-download the GLiNER2 model while gliner2 is on PATH via the venv. PARAMETRIZED (no
+# hardcoded literal in the RUN line) — config owns it; must stay in lockstep with the runtime
+# stage ARG below and main.py's default, or from_pretrained() fails closed under HF_HUB_OFFLINE=1.
+ARG GLINER_MODEL=fastino/gliner2-base-v1
+ENV GLINER_MODEL=${GLINER_MODEL}
+RUN python -c "import os; from gliner2 import GLiNER2; GLiNER2.from_pretrained(os.environ['GLINER_MODEL']); print('GLiNER2', os.environ['GLINER_MODEL'], 'baked OK')"
 
 # Pre-download the fastembed model for local CPU embeddings (avoids hitting external LLM).
 # Model id is PARAMETRIZED (no hardcoded literal) — config owns it; ENV propagates to runtime
@@ -79,6 +91,11 @@ ARG SPACY_MODEL=en_core_web_sm
 ENV SPACY_MODEL=${SPACY_MODEL}
 ARG FASTEMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
 ENV FASTEMBED_MODEL=${FASTEMBED_MODEL}
+# GLiNER2 entity-typing weights (main.py reads GLINER_MODEL). Re-declared here for the same
+# reason as SPACY_MODEL: builder ENVs do not carry into this stage, and the model is baked —
+# from_pretrained() fails closed under HF_HUB_OFFLINE=1 if they ever disagree.
+ARG GLINER_MODEL=fastino/gliner2-base-v1
+ENV GLINER_MODEL=${GLINER_MODEL}
 ARG EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5
 ENV EMBEDDING_MODEL=${EMBEDDING_MODEL}
 ARG EMBEDDING_MODEL_VERSION=nomic-v1.5
