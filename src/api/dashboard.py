@@ -305,6 +305,10 @@ async def dashboard_health(_op: str = Depends(require_operator)) -> dict:
         return {"database": "unreachable", "qdrant": "unreachable",
                 "llm": "unreachable", "re_embedder": "unknown", "llm_config": "unknown"}
     return {
+        # #211: overall status + disk pressure, for the console's disk card and banner.
+        "status": health.get("status", "unknown"),
+        "disk": health.get("disk", "unknown"),
+        "ingest_writes": health.get("ingest_writes", "unknown"),
         "database": health.get("database", "unknown"),
         "qdrant": health.get("qdrant", "unknown"),
         "llm": health.get("llm", "unknown"),

@@ -70,6 +70,7 @@ def _drive_main(qs, monkeypatch, inputs=None, build_rc=None):
     monkeypatch.setattr(qs, "configure_embeddings", lambda cfg: {})
     monkeypatch.setattr(qs, "configure_identity", lambda: "")
     monkeypatch.setattr(qs, "configure_naming", lambda: {})
+    monkeypatch.setattr(qs, "configure_existing_stacks", lambda: {})
     monkeypatch.setattr(qs, "write_env", lambda cfg, key, uid, ov: captured.setdefault("mcp_key", key))
     monkeypatch.setattr(qs, "print_next_steps", lambda key: None)
     monkeypatch.setattr(qs, "_poll_health", lambda *a, **k: captured.setdefault("polled", True))

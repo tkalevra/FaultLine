@@ -5,7 +5,7 @@ authoritative, fully-commented source is [`.env.example`](../.env.example) — c
 it to `.env` and edit. Every value here has a plain-English description there.
 
 > Ports are canonical: **backend `:8000`**, **MCP server `:8002`**. PostgreSQL is
-> `:5432`, Qdrant is `:6333`.
+> `:5432`. There is no vector store (Qdrant is optional and not shipped).
 
 ## Required
 
@@ -28,8 +28,8 @@ it to `.env` and edit. Every value here has a plain-English description there.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QDRANT_URL` | `http://qdrant:6333` | Qdrant endpoint. The vector tier is **retired for user memory** — all user facts (A/B/C) live in PostgreSQL. The service may remain in the stack but holds no user facts (see [ARCHITECTURE.md](ARCHITECTURE.md)). |
-| `QDRANT_COLLECTION` | `faultline-test` | Base collection name. Per-user collections are derived automatically (`faultline-{user_id}`). |
+| `QDRANT_URL` | *(empty)* | Optional. Empty = no vector store, the default: all user facts (A/B/C) live in PostgreSQL and no Qdrant call is made. Set it only to keep an existing Qdrant for the legacy `USER_MEMORY_VECTOR_LANE=true`. |
+| `QDRANT_COLLECTION` | `faultline-test` | Legacy lane only (with `QDRANT_URL` set). Kept at its historical value so an existing Qdrant keeps its collection. |
 | `SHORT_TERM_MEMORY` | `true` | When extraction yields no structured triples, stash the text as a Class C context fact. |
 | `REEMBED_INTERVAL` | `60` | Re-embedder poll interval (seconds) — promotion, expiry. |
 
@@ -56,6 +56,10 @@ it to `.env` and edit. Every value here has a plain-English description there.
 | `DB_POOL_SIZE` | `10` | Connection-pool size — tune to expected concurrency. |
 | `RATE_LIMIT_PER_MIN` | `100` | Per-user request ceiling. |
 | `FAULTLINE_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL`. |
+| `FAULTLINE_LOG_MAX_SIZE` / `FAULTLINE_LOG_MAX_FILE` | `10m` / `3` | Docker log rotation applied to every compose service (json-file driver). Takes effect on container re-create. |
+| `FAULTLINE_DISK_PATHS` | `/` | Paths whose free space the backend watches (comma-separated). The tightest one decides. |
+| `FAULTLINE_DISK_DEGRADE_PCT` | `10` | Below this % free: `/health` status `degraded`, console banner. |
+| `FAULTLINE_DISK_REFUSE_PCT` | `3` | Below this % free: ingest writes refused with HTTP 507; recall keeps working. |
 | `HTTPX_TIMEOUT` / `DB_TIMEOUT` / `QDRANT_TIMEOUT` | `30` / `30` / `10` | Transport timeouts (seconds). |
 
 See [`.env.example`](../.env.example) for the complete annotated list, including

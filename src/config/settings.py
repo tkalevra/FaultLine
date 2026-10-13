@@ -88,11 +88,12 @@ class Settings:
     def QDRANT_URL(self) -> str:
         """URL of the Qdrant vector database server.
 
-        Used for semantic search and fact retrieval.
+        OPTIONAL (#219): FOSS ships without Qdrant; Postgres is the system of record for
+        user memory. Only the legacy USER_MEMORY_VECTOR_LANE uses it.
         Format: http://hostname:6333
-        Default: http://qdrant:6333 (Docker service name)
+        Default: '' (not configured)
         """
-        return os.environ.get("QDRANT_URL", "http://qdrant:6333")
+        return (os.environ.get("QDRANT_URL") or "").strip()
 
     @property
     def QDRANT_COLLECTION(self) -> str:

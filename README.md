@@ -208,7 +208,7 @@ Re-run the connectivity check anytime with `python3 quickstart.py --validate`.
 > `.env.bak` backup owner-only (`0600`); if you create it by hand, run `chmod 600 .env`.
 
 > **Ports.** `:8002` (MCP) is the only network-facing service; secure it with `MCP_API_KEY`.
-> Qdrant (`:6333`) is published on `127.0.0.1` only; Postgres and Redis are not published.
+> Postgres and Redis are not published. There is no vector store: user memory lives in Postgres.
 > The backend `:8000` (API + operator console) is published on `127.0.0.1` only, because it
 > trusts the caller's `user_id`. Reach the console from another machine with
 > `ssh -L 8000:localhost:8000 <host>`. Its API also requires a service secret that the MCP
@@ -407,6 +407,13 @@ Pick the one that matches your model, copy the prompt block, and paste it into y
 
 ---
 
+## Disk full
+
+If the host disk fills, Postgres can PANIC on its shutdown checkpoint. The stack now rotates
+its logs, keeps Redis off disk, reports disk pressure in `/health` and refuses new writes below
+3% free. The recovery procedure (diagnose with `docker system df`, safe cleanup, restart
+Postgres first so it replays its WAL, verify) is in [DEPLOYMENT.md, "Disk full"](DEPLOYMENT.md#disk-full).
+
 ## Environment variables
 
 ```env
@@ -418,7 +425,7 @@ LLM_API_KEY=                                    # blank for local servers; token
 
 # Storage
 POSTGRES_DSN=postgresql://faultline:faultline@postgres:5432/faultline
-QDRANT_URL=http://qdrant:6333
+# QDRANT_URL is optional and empty by default: no vector store is needed.
 
 # MCP server
 MCP_API_KEY=          # leave blank for no auth, or set a secret token
@@ -443,7 +450,7 @@ See [`.env.example`](.env.example) for the full list with descriptions.
 
 ## Built with
 
-[PostgreSQL](https://www.postgresql.org/) · [Qdrant](https://qdrant.tech/) · [Redis](https://redis.io/) · [FastAPI](https://fastapi.tiangolo.com/) · [GLiNER2](https://github.com/fastino-ai/GLiNER2) · [nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) · [OpenWebUI](https://openwebui.com/)
+[PostgreSQL](https://www.postgresql.org/) · [Redis](https://redis.io/) · [FastAPI](https://fastapi.tiangolo.com/) · [GLiNER2](https://github.com/fastino-ai/GLiNER2) · [nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) · [OpenWebUI](https://openwebui.com/)
 
 ---
 

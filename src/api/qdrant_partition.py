@@ -61,6 +61,23 @@ class UnboundTenantError(RuntimeError):
     """
 
 
+# ── is Qdrant configured at all? (#219) ──────────────────────────────────────────────────
+def configured_qdrant_url() -> str:
+    """The Qdrant endpoint, or '' when none is configured.
+
+    FOSS ships WITHOUT Qdrant (#219): Postgres is the system of record for user memory and the
+    user-memory vector lane is retired (USER_MEMORY_VECTOR_LANE defaults false). An unset or
+    blank QDRANT_URL therefore means "no vector store": callers must skip collection
+    ensure/reconcile/delete instead of falling back to a guessed http://qdrant:6333 that no
+    longer exists. An install that still runs its old Qdrant sets QDRANT_URL explicitly.
+    """
+    return (os.environ.get("QDRANT_URL") or "").strip().rstrip("/")
+
+
+def qdrant_configured() -> bool:
+    return bool(configured_qdrant_url())
+
+
 # ── mode + auth ──────────────────────────────────────────────────────────────────────────
 def partition_mode() -> str:
     """Resolve the active partition mode from env (default ``collection_per_seat``).
