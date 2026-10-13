@@ -84,6 +84,23 @@ def test_quickstart_defaults_to_the_branch_language(monkeypatch):
     assert seen["first"] == BRANCH_LANG
 
 
+def test_gliner2_default_is_multilingual():
+    """GLiNER2 entity typing must be NATIVE to the branch language (#217).
+
+    `fastino/gliner2-base-v1` is tagged `en` only on HuggingFace, so shipping it as the
+    default on the it branch typed Italian entities with English weights. The default must
+    be `fastino/gliner2-multi-v1` (Apache-2.0, en/es/fr/de/it/pt, same GLiNER2 API) at ALL
+    THREE default sites: the Dockerfile builder ARG, the runtime-stage ARG, and main.py's
+    fallback — if they ever disagree, from_pretrained() fails closed under HF_HUB_OFFLINE=1.
+    """
+    expected = "fastino/gliner2-multi-v1"
+    dockerfile_args = re.findall(r"^ARG GLINER_MODEL=(\S+)", (_ROOT / "Dockerfile").read_text(), re.M)
+    assert dockerfile_args == [expected, expected], dockerfile_args
+    main_py = (_ROOT / "src" / "api" / "main.py").read_text()
+    fallback = re.findall(r'_gliner2_name = .*?or "([^"]+)"', main_py)
+    assert fallback == [expected], fallback
+
+
 def test_stack_names_are_the_branch_own():
     prefix = "faultline" if BRANCH_LANG == "en" else f"faultline-{BRANCH_LANG}"
     for svc in ("faultline", "faultline-mcp"):

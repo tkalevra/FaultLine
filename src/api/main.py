@@ -16322,7 +16322,12 @@ async def lifespan(app: FastAPI):
         # PURE CONFIG, like SPACY_MODEL - env-resolvable, never a bare code literal, so a baked
         # variant (Dockerfile ARG GLINER_MODEL) is what actually loads. HF_HUB_OFFLINE=1 in the
         # runtime image, so any override must be BAKED at build, not set in .env alone.
-        _gliner2_name = (os.environ.get("GLINER_MODEL") or "").strip() or "fastino/gliner2-base-v1"
+        # [it branch] MULTILINGUAL weights. This is the load site that actually runs — the
+        # former default typed Italian entities with English weights (`fastino/gliner2-base-v1`
+        # is tagged `en` on HuggingFace). `gliner2-multi-v1` is the same GLiNER2 API and covers
+        # en/es/fr/de/it/pt (Apache-2.0). Must stay in lockstep with both Dockerfile ARGs or
+        # from_pretrained() fails closed under HF_HUB_OFFLINE=1.
+        _gliner2_name = (os.environ.get("GLINER_MODEL") or "").strip() or "fastino/gliner2-multi-v1"
         _gliner2_model = GLiNER2.from_pretrained(_gliner2_name)
         log.info("startup.gliner2_ready", model=_gliner2_name)
     except Exception as e:

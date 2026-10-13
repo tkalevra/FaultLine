@@ -23,7 +23,11 @@ RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 # Pre-download the GLiNER2 model while gliner2 is on PATH via the venv. PARAMETRIZED (no
 # hardcoded literal in the RUN line) - config owns it; must stay in lockstep with the runtime
 # stage ARG below and main.py's default, or from_pretrained() fails closed under HF_HUB_OFFLINE=1.
-ARG GLINER_MODEL=fastino/gliner2-base-v1
+# [it branch] MULTILINGUAL weights — `gliner2-base-v1` is tagged `en` only on HuggingFace, so it
+# typed Italian entities with English weights. `gliner2-multi-v1` (Apache-2.0, en/es/fr/de/it/pt)
+# is the same GLiNER2 API and the same load call. This MUST be baked: the runtime stage sets
+# HF_HUB_OFFLINE=1, so an unbaked model cannot be fetched at startup — it would just fail to load.
+ARG GLINER_MODEL=fastino/gliner2-multi-v1
 ENV GLINER_MODEL=${GLINER_MODEL}
 RUN python -c "import os; from gliner2 import GLiNER2; GLiNER2.from_pretrained(os.environ['GLINER_MODEL']); print('GLiNER2 baked OK', os.environ['GLINER_MODEL'])"
 
@@ -96,7 +100,11 @@ ENV FASTEMBED_MODEL=${FASTEMBED_MODEL}
 # GLiNER2 entity-typing weights (main.py reads GLINER_MODEL). Re-declared here for the same
 # reason as SPACY_MODEL: builder ENVs do not carry into this stage, and the model is baked -
 # from_pretrained() fails closed under HF_HUB_OFFLINE=1 if they ever disagree.
-ARG GLINER_MODEL=fastino/gliner2-base-v1
+# [it branch] MULTILINGUAL weights (see the builder-stage ARG above): `gliner2-base-v1` is
+# tagged `en` only on HuggingFace; `gliner2-multi-v1` (Apache-2.0, en/es/fr/de/it/pt) types
+# Italian natively with the same GLiNER2 API. Must stay in lockstep with the builder ARG and
+# main.py's default, or from_pretrained() fails closed under HF_HUB_OFFLINE=1.
+ARG GLINER_MODEL=fastino/gliner2-multi-v1
 ENV GLINER_MODEL=${GLINER_MODEL}
 ARG EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5
 ENV EMBEDDING_MODEL=${EMBEDDING_MODEL}
