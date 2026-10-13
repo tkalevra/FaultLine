@@ -2,8 +2,9 @@ version: "3.8"
 
 # FaultLine WGM — Portainer Stack (WITHOUT Qdrant)
 #
-# This compose file assumes you already have Qdrant running in a separate stack.
-# It will connect to your existing Qdrant instance via the shared network.
+# FaultLine needs no vector store (#219): user memory lives in PostgreSQL. QDRANT_URL is
+# optional; set it (and attach a network that reaches it) only for the legacy
+# USER_MEMORY_VECTOR_LANE.
 #
 # IMPORTANT: This compose file references a PRE-BUILT Docker image.
 # Before deploying this stack in Portainer, build the image on your Docker host:
@@ -12,10 +13,7 @@ version: "3.8"
 #   docker build -t faultline-wgm:latest .
 #
 # PREREQUISITES:
-#   ✓ Qdrant already running (e.g., in rag-ai-qdrant stack)
-#   ✓ Qdrant network name: rag-ai-qdrant_default
-#   ✓ Qdrant hostname: qdrant
-#   ✓ Qdrant port: 6333
+#   ✓ OpenWebUI network: openweb_ui_default
 #
 # DEPLOYMENT OPTIONS:
 #   Option 1: Web Editor (Portainer UI)
@@ -56,6 +54,14 @@ version: "3.8"
 # - Bearer token (LLM_API_KEY) invalid or missing
 # - OpenWebUI endpoint unreachable or returning 401/400 errors
 
+# Bounded container logs (#210): every service uses this anchor. Override in Portainer's
+# environment variables with FAULTLINE_LOG_MAX_SIZE / FAULTLINE_LOG_MAX_FILE.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${FAULTLINE_LOG_MAX_SIZE:-10m}"
+    max-file: "${FAULTLINE_LOG_MAX_FILE:-3}"
+
 services:
 
   faultline:
@@ -72,8 +78,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       FAULTLINE_URL: ${FAULTLINE_URL:-http://faultline:8000}
       FAULTLINE_BACKEND_SECRET: ${FAULTLINE_BACKEND_SECRET:-}
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: faultline-test
+      QDRANT_URL: ${QDRANT_URL:-}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REEMBED_INTERVAL: ${REEMBED_INTERVAL:-300}
       SHORT_TERM_MEMORY: ${SHORT_TERM_MEMORY:-true}
@@ -92,14 +97,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
-      - rag-ai-qdrant_default
 
   faultline-mcp:
     image: faultline-wgm:latest
@@ -118,11 +118,7 @@ services:
       POSTGRES_DSN: postgresql://faultline:${POSTGRES_PASSWORD}@postgres:5432/faultline_test
     depends_on:
       - faultline
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 
@@ -138,16 +134,15 @@ services:
       POSTGRES_SHARED_BUFFERS: "256MB"
     volumes:
       - pg-data:/var/lib/postgresql/data
+    # Let the shutdown checkpoint finish instead of Docker's 10s SIGKILL (#212). A killed
+    # postgres is still safe (it replays WAL on the next start), but a clean stop is faster.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U faultline -d faultline_test"]
       interval: 5s
       timeout: 3s
       retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 
@@ -155,14 +150,14 @@ services:
     image: redis:7-alpine
     container_name: faultline-redis
     restart: unless-stopped
+    # Coordination cache only, never a store (#212): no RDB snapshots, no AOF, so a full
+    # disk can never block shutdown. The image's default config snapshots to /data.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    stop_grace_period: 10s
     ports:
       # Loopback only (#144): redis has no auth.
       - "127.0.0.1:6379:6379"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - openweb_ui_default
 
@@ -175,8 +170,3 @@ networks:
   openweb_ui_default:
     external: true
     name: openweb_ui_default
-
-  # Reference to existing Qdrant network
-  rag-ai-qdrant_default:
-    external: true
-    name: rag-ai-qdrant_default

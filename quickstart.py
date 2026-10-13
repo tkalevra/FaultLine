@@ -19,8 +19,8 @@ What it does:
   4. Offers to generate a secret MCP_API_KEY.
   5. Resolves your tenant id (FAULTLINE_USER_ID): generate, reuse, enter
      manually, or leave blank for OpenWebUI multi-user.
-  6. Names the deployment's resources (Postgres DB, per-tenant schema prefix,
-     Qdrant collection) — one "faultline for all" fast-path, or set each (validated).
+  6. Names the deployment's resources (Postgres DB, per-tenant schema prefix) — one
+     "faultline for all" fast-path, or set each (validated).
   7. Writes a ready-to-use .env (keeping the correct Docker Compose Postgres host).
   8. Prints the exact next steps.
 
@@ -378,8 +378,6 @@ def configure_embeddings(llm_cfg):
             ov = _external_embed_overrides(e_backend, e_url, e_key, llm_key, model)
             print(green(f"  ✓ embedding model: {model}"))
             print(dim(f"    endpoint: {ov['EMBEDDING_API_URL']}  (built-in local embedder disabled)"))
-            print(dim("    if this model's vector size differs from nomic (768), start with a fresh"))
-            print(dim("    Qdrant volume — mixing vector dimensions in one collection will error."))
             return ov
 
         print(red(f"  ✗ could not connect — {detail}"))
@@ -501,33 +499,148 @@ def _port_open(host, port, timeout=1.0):
 def configure_naming():
     """
     Name the deployment's resources — Postgres DB (the db segment of POSTGRES_DSN),
-    per-tenant SCHEMA_NAME_PREFIX, and QDRANT_COLLECTION. Each defaults to 'faultline'.
+    and per-tenant SCHEMA_NAME_PREFIX. Each defaults to 'faultline'. There is no vector
+    store to name (#219): user memory lives in Postgres.
     Returns a dict of env overrides. Validation is stdlib-only and never blocks on a
     DB that isn't up yet (the stack may not be built).
     """
-    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix, Qdrant collection)"))
+    print(bold("Resource names") + dim("  (Postgres DB, per-tenant schema prefix)"))
     print(dim("  Defaults to 'faultline' everywhere — fine for a single deployment."))
     base_dsn = _default_dsn()
 
     if ask_yes("Use 'faultline' for all resource names (recommended)?", default_yes=True):
-        prefix = db = coll = "faultline"
+        prefix = db = "faultline"
     else:
         prefix = _ask_name("Per-tenant schema prefix", "faultline", _IDENT_RE, "schema prefix")
         db = _ask_name("Postgres database name", "faultline", _IDENT_RE, "database name")
-        coll = _ask_name("Qdrant collection name", "faultline", _COLL_RE, "collection name")
 
     ov = {
         "SCHEMA_NAME_PREFIX": prefix,
-        "QDRANT_COLLECTION": coll,
         "POSTGRES_DSN": _rewrite_dsn_db(base_dsn, db),
         # #149: the postgres service creates POSTGRES_DB; it must match the DSN's database,
         # or a custom name points the backend at a database that was never created.
         "POSTGRES_DB": db,
     }
-    print(green(f"  ✓ schema prefix: {prefix}   db: {db}   collection: {coll}"))
+    print(green(f"  ✓ schema prefix: {prefix}   db: {db}"))
     print(dim(f"    Postgres DSN: {ov['POSTGRES_DSN']}  (compose host preserved)"))
     if _port_open("localhost", 5432):
         print(dim("    (a Postgres is reachable on localhost:5432 — the db is created on first boot)"))
+    return ov
+
+
+# ── existing FaultLine stacks on this host (#217) ───────────────────────────────
+# A second checkout (another language branch, an old clone) gets its own compose project
+# (named after its directory) and therefore a SECOND Postgres/Redis set, silently. Detect a
+# stack or data volume that belongs to another project and ask what to do with it.
+_STACK_SUFFIXES = ("-api", "-mcp", "-postgres", "-redis", "-qdrant", "-ollama")
+
+
+def _docker_lines(args):
+    """stdout lines of a docker CLI call; [] when docker is missing or the call fails."""
+    try:
+        out = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return []
+        return [ln for ln in str(out.stdout or "").splitlines() if ln.strip()]
+    except Exception:  # noqa: BLE001 — detection is advisory, never fatal
+        return []
+
+
+def _compose_project_name():
+    """The compose project this checkout runs as: COMPOSE_PROJECT_NAME (env or .env), else
+    the directory name normalised the way compose does it."""
+    name = os.environ.get("COMPOSE_PROJECT_NAME") or _existing_env_value("COMPOSE_PROJECT_NAME")
+    if not name:
+        name = re.sub(r"[^a-z0-9_-]", "", os.path.basename(HERE).lower())
+    return name
+
+
+def detect_other_stacks():
+    """{project: {"dir", "containers", "volumes"}} for FaultLine stacks NOT owned by this
+    checkout. A FaultLine stack = a compose project with a container named <prefix>-api /
+    -postgres / ... whose image or name says faultline, or a <project>_postgres_data volume."""
+    mine = _compose_project_name()
+    found = {}
+    fmt = ('{{.Names}}\t{{.Label "com.docker.compose.project"}}\t'
+           '{{.Label "com.docker.compose.project.working_dir"}}\t{{.Image}}\t{{.State}}')
+    for ln in _docker_lines(["ps", "-a", "--format", fmt]):
+        parts = (ln.split("\t") + [""] * 5)[:5]
+        name, proj, wdir, image, state = parts
+        if not proj or not name.endswith(_STACK_SUFFIXES):
+            continue
+        if "faultline" not in (name + " " + image).lower():
+            continue
+        if proj == mine or (wdir and os.path.realpath(wdir) == os.path.realpath(HERE)):
+            continue
+        st = found.setdefault(proj, {"dir": wdir, "containers": [], "volumes": []})
+        st["containers"].append(f"{name} ({state})")
+        st["dir"] = st["dir"] or wdir
+    for ln in _docker_lines(["volume", "ls", "--format",
+                             '{{.Name}}\t{{.Label "com.docker.compose.project"}}']):
+        vname, proj = (ln.split("\t") + [""])[:2]
+        if not vname.endswith("_postgres_data"):
+            continue
+        proj = proj or vname[: -len("_postgres_data")]
+        if proj == mine:
+            continue
+        st = found.get(proj)
+        if st is None and not proj.lower().startswith("faultline"):
+            continue  # an unrelated project's postgres volume
+        st = found.setdefault(proj, {"dir": "", "containers": [], "volumes": []})
+        st["volumes"].append(vname)
+    return found
+
+
+def _free_port(start):
+    p = start
+    while _port_open("localhost", p) and p < start + 100:
+        p += 1
+    return p
+
+
+def configure_existing_stacks():
+    """Ask reuse / replace / side-by-side when another FaultLine stack exists. Returns .env
+    overrides (possibly empty). Never runs a destructive docker command itself."""
+    stacks = detect_other_stacks()
+    if not stacks:
+        return {}
+    print(bold("Existing FaultLine stack found") + dim("  (from another checkout or language)"))
+    for proj, st in sorted(stacks.items()):
+        print(f"  project {bold(proj)}" + (dim(f"  dir: {st['dir']}") if st["dir"] else ""))
+        for c in st["containers"]:
+            print(dim(f"    container {c}"))
+        for v in st["volumes"]:
+            print(dim(f"    volume    {v}"))
+    print(dim("  Starting this checkout as-is would create a SECOND Postgres/Redis set next to it."))
+    proj = sorted(stacks)[0]
+    choice = choose("What should this install do?", [
+        ("reuse", f"Reuse it — run this checkout as project '{proj}' (same containers and data)"),
+        ("replace", "Replace it — show the commands to remove the old stack first"),
+        ("side", "Side by side — a separate stack with its own names, ports and data"),
+    ])
+    if choice == "reuse":
+        print(yellow("  ! The data is reused as-is. A database created for another language keeps"))
+        print(yellow("    that language's collation; the startup guard refuses a mismatch."))
+        return {"COMPOSE_PROJECT_NAME": proj}
+    if choice == "replace":
+        where = stacks[proj]["dir"] or "<the old checkout>"
+        print(bold("  Remove the old stack before starting this one:"))
+        print(f"    {cyan(f'cd {where} && docker compose down')}      # keeps its data volumes")
+        print(f"    {cyan(f'cd {where} && docker compose down -v')}   # ALSO deletes its data")
+        print(dim(f"    or, without the old checkout:  docker compose -p {proj} down [-v]"))
+        print(dim("  This wizard does not run them for you."))
+        return {}
+    mine = _compose_project_name()
+    prefix = re.sub(r"[^a-z0-9_-]", "", mine) or "faultline2"
+    if prefix in stacks or prefix == "faultline":
+        prefix = prefix + "2"
+    api, mcp = _free_port(8010), _free_port(8012)
+    if mcp == api:
+        mcp = _free_port(api + 1)
+    ov = {"COMPOSE_PROJECT_NAME": prefix, "FAULTLINE_PREFIX": prefix,
+          "FAULTLINE_IMAGE": f"{prefix}:latest",
+          "FAULTLINE_API_PORT": str(api), "FAULTLINE_MCP_PORT": str(mcp)}
+    print(green(f"  ✓ side by side as '{prefix}': API 127.0.0.1:{api}, MCP :{mcp}"))
     return ov
 
 
@@ -657,7 +770,7 @@ def print_next_steps(mcp_key):
     print(bold("You're set. Next steps:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
     print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
-    print(f"       expect: {dim(chr(34) + 'database:ok, qdrant:ok, llm:ok' + chr(34))}")
+    print(f"       expect: {dim(chr(34) + 'database:ok, llm:ok' + chr(34))}")
     print(f"  3. The live integration path is the MCP server on {bold(':8002')}.")
     if mcp_key:
         print(f"       Secured with your MCP_API_KEY — send {cyan('Authorization: Bearer <key>')}.")
@@ -688,8 +801,7 @@ def _poll_health(timeout=240):
         try:
             _, body = _http_get("http://localhost:8000/health", timeout=4)
             d = json.loads(body)
-            print(green(f"  ✓ backend up — database:{d.get('database')} "
-                        f"qdrant:{d.get('qdrant')} llm:{d.get('llm')}"))
+            print(green(f"  ✓ backend up — database:{d.get('database')} llm:{d.get('llm')}"))
             if d.get("llm") != "ok":
                 print(yellow("    (llm not ok — check LLM_BASE_URL and that your model is loaded/pulled)"))
             return
@@ -861,7 +973,7 @@ _LANGUAGES = {
            "spacy_model": "es_core_news_sm",
            "ts_config": "spanish"},
 }
-_DEFAULT_LANG = "en"
+_DEFAULT_LANG = "es"   # this branch's language (#216): Enter at the gate keeps it
 
 
 def chosen_language():
@@ -934,8 +1046,11 @@ def language_gate():
     prints a note and continues in the current branch's language, never crashes."""
     if os.environ.get("_FL_LANG_SWITCHED"):
         return  # re-exec after a branch switch — language already chosen, don't re-prompt.
+    # This branch's own language is listed FIRST, so pressing Enter keeps the checkout you are
+    # in (#216): on a language branch the old order made Enter switch to English main.
     lang = choose("Language / Lingua / Idioma",
-                  [(k, v["label"]) for k, v in _LANGUAGES.items()])
+                  [(k, v["label"]) for k, v in
+                   sorted(_LANGUAGES.items(), key=lambda kv: kv[0] != _DEFAULT_LANG)])
     # Record BEFORE any switch: _switch_branch_and_reexec replaces this process, and on the far
     # side the early-return above fires, so the environment is the only carrier of the choice.
     os.environ["_FL_LANG"] = lang
@@ -999,6 +1114,8 @@ def main():
 
     hr()
     naming_overrides = configure_naming()
+    stack_overrides = configure_existing_stacks()
+    naming_overrides = {**naming_overrides, **stack_overrides}
 
     hr()
     write_env(cfg, mcp_key, faultline_user_id, {**(embed_overrides or {}), **naming_overrides})

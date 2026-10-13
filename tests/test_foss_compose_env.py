@@ -92,9 +92,9 @@ def _resolve(value: str, env: dict) -> str:
     return re.sub(r"\$\{([A-Z0-9_]+):-([^}]*)\}", lambda m: env.get(m.group(1)) or m.group(2), str(value))
 
 
-_DEFAULT_NAMES = {"faultline": "faultline-api", "faultline-mcp": "faultline-mcp",
-                  "postgres": "faultline-postgres", "qdrant": "faultline-qdrant",
-                  "redis": "faultline-redis", "ollama": "faultline-ollama"}
+_DEFAULT_NAMES = {"faultline": "faultline-es-api", "faultline-mcp": "faultline-es-mcp",
+                  "postgres": "faultline-es-postgres",
+                  "redis": "faultline-es-redis", "ollama": "faultline-es-ollama"}
 
 
 def test_container_names_are_overridable_with_unchanged_defaults():
@@ -116,7 +116,7 @@ def test_published_host_ports_are_overridable_with_unchanged_defaults():
 def test_image_tag_is_overridable():
     for svc in ("faultline", "faultline-mcp"):
         raw = SERVICES[svc]["image"]
-        assert _resolve(raw, {}) == "faultline:latest" and "${" in raw
+        assert _resolve(raw, {}) == "faultline-es:latest" and "${" in raw
 
 
 # ── #144: only the MCP server is published on the network ───────────────────
@@ -136,13 +136,13 @@ def test_only_mcp_is_network_facing():
 
 def test_network_has_a_fixed_overridable_name():
     net = COMPOSE["networks"]["faultline-net"]
-    assert _resolve(net.get("name", ""), {}) == "faultline-net"
+    assert _resolve(net.get("name", ""), {}) == "faultline-es-net"
     assert "FAULTLINE_PREFIX" in net["name"], "a second stack must get its own network"
 
 
 def test_readme_documents_joining_the_network():
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "external: true" in readme and "docker network connect faultline-net" in readme
+    assert "external: true" in readme and "docker network connect faultline-es-net" in readme
 
 
 

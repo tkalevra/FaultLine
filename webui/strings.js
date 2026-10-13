@@ -44,6 +44,10 @@
     "tab.compare":"FOSS vs SaaS",
 
     "dash.health": "Stack health",
+    "disk.label": "disk",
+    "disk.degraded": "Disk space low",
+    "disk.critical": "Disk almost full — new memories are being refused",
+    "disk.detail": "free on the data volume. Free space before Postgres runs out (DEPLOYMENT.md, \"Disk full\"). Recall still works.",
     "dash.summary":"Instance summary",
     "dash.seats":  "Seats",
     "dash.brain":  "Brain",

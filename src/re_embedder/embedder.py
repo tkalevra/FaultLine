@@ -1137,6 +1137,9 @@ def _qdrant_delete_fact_point(qdrant_url: str, user_id, source_table: str, fact_
     from another tenant; an unbound seat THROWS (require_tenant). Fail-safe: best-effort at
     the call sites (they wrap in try/except), so this returns the response or raises for the
     unbound-tenant poison case (a bug, surfaced loud)."""
+    if not qdrant_url or not _USER_MEMORY_VECTOR_LANE:
+        # #218/#219: no vector lane or no Qdrant configured → no point exists to delete.
+        return None
     from src.api.qdrant_partition import (
         resolve_partition, require_tenant, build_delete_body, resolve_point_id, qdrant_headers,
     )
@@ -3395,6 +3398,49 @@ def _backend_is_reachable(backend_url: str) -> bool:
     a document claimed in a healthy window can still burn chunks mid-flight. This mitigates; it does
     not make the doc lane safe against a blocked loop."""
     return _backend_state(backend_url) == BACKEND_READY
+
+
+class _CycleLogSummary:
+    """Aggregate per-entity / per-tenant warnings into ONE summary line per sweep cycle (#210).
+
+    Several re-embedder passes used to log one line per entity or per tenant on EVERY cycle
+    (suspect_preferred_name, ghost_tenant_skipped, pending_placement_backlog_undrainable), an
+    identical census that grew the container log without bound. Call sites now `add()` their
+    counts here and keep the per-item detail at DEBUG; the main loop calls `flush()` once per
+    cycle, which emits a single WARNING naming each event with its tenant and item counts.
+    Counters are process-local and reset on every flush.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict = {}
+
+    def add(self, event: str, schema: str = "", **counts: int) -> None:
+        ev = self._events.setdefault(event, {"tenants": set(), "counts": {}})
+        if schema:
+            ev["tenants"].add(schema)
+        for k, v in counts.items():
+            ev["counts"][k] = ev["counts"].get(k, 0) + int(v or 0)
+
+    def snapshot(self) -> dict:
+        return {e: {"tenants": len(v["tenants"]), **v["counts"]} for e, v in self._events.items()}
+
+    def render(self) -> str:
+        parts = []
+        for event, fields in sorted(self.snapshot().items()):
+            parts.append(event + "(" + " ".join(f"{k}={v}" for k, v in fields.items()) + ")")
+        return " ".join(parts)
+
+    def flush(self, logger=None) -> Optional[str]:
+        if not self._events:
+            return None
+        line = "re_embedder.cycle_warning_summary " + self.render() + \
+            " (per-item detail at DEBUG)"
+        (logger or log).warning(line)
+        self._events = {}
+        return line
+
+
+_cycle_summary = _CycleLogSummary()
 
 
 def _backend_is_reachable_legacy(backend_url: str) -> bool:
@@ -9557,22 +9603,25 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
             stats["unplaceable_rels"] = int(_row[0] or 0)
             stats["unplaceable_facts"] = int(_row[1] or 0)
             if stats["unplaceable_rels"] > 0:
-                # `_doc_log_crit` is this module's ONLY CRITICAL renderer, and it is not
-                # document-specific despite the name: `log` here is a STDLIB logger, so
-                # src.api.logging_config.log_crit's kwargs-passthrough shape raises
-                # TypeError (see its docstring at :3360). Renaming it is out of scope.
-                _doc_log_crit(
-                    "re_embedder.pending_placement_backlog_undrainable",
-                    schema=schema_name,
-                    scanned=stats["scanned"], reconciled=stats["reconciled"],
+                # Was a per-tenant CRITICAL line on every cycle (#210). The counts now go into
+                # the ONE per-cycle summary line; the full per-tenant detail stays at DEBUG.
+                # Meaning of the detail: pending rels carrying REAL facts that no drain can
+                # place. This morphology fold only matches a SEEDED canonical, and a
+                # semantically novel predicate matches none. Their facts are stored but
+                # INVISIBLE to scoped recall (never enter rel_types_defining_group, so
+                # allowed_rels can never admit them). reconciled=0 here means the predicate
+                # did not match, NOT that the lane is dark.
+                _cycle_summary.add(
+                    "pending_placement_backlog_undrainable", schema_name,
                     unplaceable_rels=stats["unplaceable_rels"],
                     unplaceable_facts=stats["unplaceable_facts"],
-                    note="pending rels carrying REAL facts that no drain can place: this "
-                         "morphology fold only matches a SEEDED canonical, and a semantically "
-                         "novel predicate matches none. Their facts are stored but INVISIBLE "
-                         "to scoped recall (never enter rel_types_defining_group, so "
-                         "allowed_rels can never admit them). reconciled=0 here means the "
-                         "predicate did not match — NOT that the lane is dark.",
+                )
+                log.debug(
+                    "re_embedder.pending_placement_backlog_undrainable "
+                    f"schema={schema_name} scanned={stats['scanned']} "
+                    f"reconciled={stats['reconciled']} "
+                    f"unplaceable_rels={stats['unplaceable_rels']} "
+                    f"unplaceable_facts={stats['unplaceable_facts']}"
                 )
     except Exception as _ble:  # noqa: BLE001 — observability must never break the sweep
         try:
@@ -11187,7 +11236,9 @@ def flag_suspect_preferred_names(db_conn) -> dict:
             suspects = cur.fetchall()
         for entity_id, alias, source in suspects:
             stats["flagged"] += 1
-            log.warning(
+            # DEBUG, not WARNING (#210): one line per suspect per seat per cycle was the
+            # largest log-volume source. The count goes into the per-cycle summary.
+            log.debug(
                 "re_embedder.suspect_preferred_name "
                 f"entity_id={str(entity_id)[:16]} alias={alias} preference_source={source} "
                 "reason=preferred_alias_never_user_chosen (flag-only, see ALIAS-PROVENANCE-DESIGN)"
@@ -12895,44 +12946,45 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
                     total_deleted += len(deleted_ids)
 
                     # Best-effort Qdrant cleanup for deleted rows (partition choke-point).
-                    try:
-                        from src.api.qdrant_partition import (
-                            resolve_partition as _qp_resolve, require_tenant as _qp_require,
-                            build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
-                            qdrant_headers as _qp_hdr,
-                        )
-                        collection, _tflt = _qp_resolve(user_id, "memory")
-                        _qp_require(_tflt, op="delete", collection=collection)
-                        for _did in deleted_ids:
+                    if qdrant_url and _USER_MEMORY_VECTOR_LANE:
+                        try:
+                            from src.api.qdrant_partition import (
+                                resolve_partition as _qp_resolve, require_tenant as _qp_require,
+                                build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
+                                qdrant_headers as _qp_hdr,
+                            )
+                            collection, _tflt = _qp_resolve(user_id, "memory")
+                            _qp_require(_tflt, op="delete", collection=collection)
+                            for _did in deleted_ids:
+                                _http_client.post(
+                                    f"{qdrant_url}/collections/{collection}/points/delete",
+                                    json=_qp_delbody(_tflt, must=[
+                                        {"key": "source_table", "match": {"value": "staged_facts"}},
+                                        {"key": "fact_id",     "match": {"value": _did}},
+                                    ]),
+                                    headers=_qp_hdr(),
+                                    timeout=5.0,
+                                )
+                            # Fallback by derived point ID (new-scheme points). The filtered
+                            # delete above already covers payload-tagged points; this removes
+                            # the deterministic (source_table, fact_id) point even if its
+                            # source_table payload were somehow absent. Legacy bare-int points
+                            # are handled by reconcile / collection re-sync.
+                            # POST /points/delete with a points-selector body; httpx .delete()
+                            # takes no body kwarg (json/content) and would raise.
                             _http_client.post(
                                 f"{qdrant_url}/collections/{collection}/points/delete",
-                                json=_qp_delbody(_tflt, must=[
-                                    {"key": "source_table", "match": {"value": "staged_facts"}},
-                                    {"key": "fact_id",     "match": {"value": _did}},
+                                json=_qp_delbody(_tflt, point_ids=[
+                                    _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
                                 ]),
                                 headers=_qp_hdr(),
                                 timeout=5.0,
                             )
-                        # Fallback by derived point ID (new-scheme points). The filtered
-                        # delete above already covers payload-tagged points; this removes
-                        # the deterministic (source_table, fact_id) point even if its
-                        # source_table payload were somehow absent. Legacy bare-int points
-                        # are handled by reconcile / collection re-sync.
-                        # POST /points/delete with a points-selector body; httpx .delete()
-                        # takes no body kwarg (json/content) and would raise.
-                        _http_client.post(
-                            f"{qdrant_url}/collections/{collection}/points/delete",
-                            json=_qp_delbody(_tflt, point_ids=[
-                                _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
-                            ]),
-                            headers=_qp_hdr(),
-                            timeout=5.0,
-                        )
-                    except Exception as qe:
-                        log.warning(
-                            f"re_embedder.inverted_sweep.qdrant_failed "
-                            f"user_id={user_id[:8]} error={qe}"
-                        )
+                        except Exception as qe:
+                            log.warning(
+                                f"re_embedder.inverted_sweep.qdrant_failed "
+                                f"user_id={user_id[:8]} error={qe}"
+                            )
 
         except Exception as e:
             log.error(
@@ -13016,7 +13068,14 @@ def main():
     })
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
-    qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+    # #219: Qdrant is optional (FOSS ships without it). The vector lane is active only when
+    # USER_MEMORY_VECTOR_LANE is on AND QDRANT_URL is set; otherwise qdrant_url is '' and no
+    # collection ensure / upsert / reconcile / delete is attempted anywhere in this loop.
+    from src.api.qdrant_partition import configured_qdrant_url as _configured_qdrant_url
+    qdrant_url = _configured_qdrant_url()
+    _vector_lane_on = bool(_USER_MEMORY_VECTOR_LANE and qdrant_url)
+    if not _vector_lane_on:
+        qdrant_url = ""
     from src.api.llm_client import (
         get_backend_endpoint,
         get_endpoint_list as _get_llm_endpoint_list,
@@ -13082,7 +13141,7 @@ def main():
             daemon=True, name="doc-drain",
         ).start()
 
-    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
+    log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url or '(off)'} confidence_threshold={confidence_threshold} loglevel=INFO")
     log.info("re_embedder.entering_main_loop")
 
     # One-time startup sweep: remove pre-existing inverted staged_facts hierarchy rows
@@ -13091,7 +13150,7 @@ def main():
     # 60-second poll cycle.
     if ingest_enabled:
         try:
-            _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url)
+            _sweep_inverted_staged_hierarchy_rows(postgres_dsn, qdrant_url if _vector_lane_on else "")
         except Exception as _sweep_err:
             # Never block startup — sweep failure is non-fatal.
             log.warning(f"re_embedder.inverted_sweep.startup_error error={_sweep_err}")
@@ -13167,7 +13226,8 @@ def main():
             # collection exists. This recovers a deleted collection within one loop
             # cycle regardless of whether there are any unsynced rows.
             default_collection = os.getenv("QDRANT_COLLECTION", "faultline-test")
-            ensure_collection(default_collection, qdrant_url)
+            if _vector_lane_on:
+                ensure_collection(default_collection, qdrant_url)
 
             # PHASE 2: Get list of all ready user schemas to process independently
             with psycopg2.connect(postgres_dsn) as admin_db:
@@ -13205,7 +13265,8 @@ def main():
                                 _live_schemas.append((_hu, _hs))
                             else:
                                 _ghost_count += 1
-                                log.error(
+                                _cycle_summary.add("ghost_tenant_skipped", _hs, count=1)
+                                log.debug(
                                     f"re_embedder.ghost_tenant_skipped schema={_hs} "
                                     f"user_id={str(_hu)[:8]} "
                                     f"reason=schema_dropped_or_no_staged_facts_table "
@@ -13213,7 +13274,8 @@ def main():
                                     f"— orphan row; ops cleanup owed)"
                                 )
                     if _ghost_count:
-                        log.error(
+                        # Counted into the one per-cycle summary line (#210).
+                        log.debug(
                             f"re_embedder.ghost_tenants_skipped_total count={_ghost_count} "
                             f"live={len(_live_schemas)} — cycle continues on live tenants only"
                         )
@@ -13443,7 +13505,7 @@ def main():
                         # already drops any A/B Qdrant result (VECTOR_CLASS_C_ONLY in main.py),
                         # so leaving A/B out of the vector is safe and shrinks the C catch-all
                         # toward zero as more grounds into A/B. Flag off → legacy: sync both.
-                        if not _USER_MEMORY_VECTOR_LANE:
+                        if not _vector_lane_on:
                             # LANE GATE (interactive-latency round 2): user-memory vector tier
                             # RETIRED — mirror the staged-row treatment one screen below: mark
                             # unsynced `facts` rows synced WITHOUT embedding so this loop stops
@@ -13501,7 +13563,7 @@ def main():
 
                         # Fetch and embed unsynced staged facts for this user
                         staged_rows = fetch_unsynced_staged(db_per_user, user_id)
-                        if staged_rows and not _USER_MEMORY_VECTOR_LANE:
+                        if staged_rows and not _vector_lane_on:
                             # User-memory vector lane RETIRED: mark these Class-C rows synced WITHOUT
                             # embedding so the idle-probe stops firing and no Qdrant write happens. C
                             # remains queryable from staged_facts (Postgres).
@@ -14554,7 +14616,9 @@ def main():
                                 suspect_stats = (flag_suspect_preferred_names(_gw_db)
                                                  if _sw_run else {"flagged": 0})
                                 if suspect_stats["flagged"] > 0:
-                                    log.info(
+                                    _cycle_summary.add("suspect_preferred_name", _gw_schema,
+                                                       count=suspect_stats["flagged"])
+                                    log.debug(
                                         f"re_embedder.suspect_preferred_names_flagged "
                                         f"schema={_gw_schema} "
                                         f"count={suspect_stats['flagged']}"
@@ -14854,7 +14918,7 @@ def main():
                     _active_tenants_this_cycle > 0
                     or (_now_mono - _last_reconcile_at) >= reconcile_max_interval
                 )
-                if _reconcile_due:
+                if _reconcile_due and _vector_lane_on:
                     stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
                     _last_reconcile_at = _now_mono
                     if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
@@ -14868,6 +14932,12 @@ def main():
 
         except Exception as e:
             log.error(f"re_embedder.loop_error: {e}")
+
+        # One aggregated line for this cycle's repeating warnings (#210). Never raises.
+        try:
+            _cycle_summary.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
         time.sleep(interval)
 
@@ -15061,7 +15131,9 @@ if __name__ == "__main__":
         import asyncio
         from src.re_embedder.supervisor import run_supervisor
         _sup_postgres_dsn = os.getenv("POSTGRES_DSN")
-        _sup_qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+        # #219: '' unless the vector lane is on AND Qdrant is configured.
+        from src.api.qdrant_partition import configured_qdrant_url as _cq
+        _sup_qdrant_url = _cq() if _USER_MEMORY_VECTOR_LANE else ""
         _sup_backend_api_url = os.getenv("FAULTLINE_API_URL", "http://faultline:8000").rstrip("/")
         asyncio.run(run_supervisor(_sup_postgres_dsn, _sup_backend_api_url, _sup_qdrant_url))
     else:

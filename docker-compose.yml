@@ -17,8 +17,11 @@
 # Verify:  curl http://localhost:8000/health
 # MCP:     http://localhost:8002/mcp        (Claude Desktop or any MCP client)
 #
-# Exposure: :8002 (MCP) is the ONLY port published on the network. Qdrant and the
-# optional Ollama are published on 127.0.0.1 only; postgres and redis not at all.
+# No vector store (#219): user memory lives in PostgreSQL. There is no Qdrant service;
+# QDRANT_URL is optional and only the legacy USER_MEMORY_VECTOR_LANE uses it.
+#
+# Exposure: :8002 (MCP) is the ONLY port published on the network. The optional
+# Ollama is published on 127.0.0.1 only; postgres and redis not at all.
 # The backend :8000 trusts the user_id its caller sends, so it is published on
 # 127.0.0.1 ONLY — the operator
 # console (http://localhost:8000/) and the health check work on this host; from
@@ -35,6 +38,21 @@
 #   FAULTLINE_MCP_PORT=8012      FAULTLINE_API_PORT=8010
 # and run it with its own project name: docker compose -p faultline2 up -d --build
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Language branch (#217): this stack's defaults are its own, so it never reuses or
+# overwrites an English install on the same host: image faultline-es:latest, containers
+# faultline-es-api/-mcp/-postgres/-redis, network faultline-es-net.
+
+# ── Bounded container logs (#210) ────────────────────────────────────────────
+# Docker's default json-file driver keeps every line forever; an unattended install filled
+# its host disk and Postgres PANICked on the shutdown checkpoint. Every service below uses
+# this anchor: at most FAULTLINE_LOG_MAX_FILE files of FAULTLINE_LOG_MAX_SIZE each
+# (default 3 x 10m = 30 MB per container). Override both in .env.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${FAULTLINE_LOG_MAX_SIZE:-10m}"
+    max-file: "${FAULTLINE_LOG_MAX_FILE:-3}"
 
 services:
 
@@ -55,11 +73,11 @@ services:
         # text; it does not make the chains correct for that language. Portable in principle
         # (the UD features they key on exist in these models), UNMEASURED in practice.
         SPACY_MODEL: ${SPACY_MODEL:-es_core_news_md}
-    image: ${FAULTLINE_IMAGE:-faultline:latest}
+    image: ${FAULTLINE_IMAGE:-faultline-es:latest}
     # Built locally, never pulled: without this, `up` first tries to pull faultline:latest
     # from a registry and prints "pull access denied", which reads as a failure (#156).
     pull_policy: never
-    container_name: ${FAULTLINE_PREFIX:-faultline}-api
+    container_name: ${FAULTLINE_PREFIX:-faultline-es}-api
     ports:
       # Loopback only (#117): never expose the backend to the network.
       - "127.0.0.1:${FAULTLINE_API_PORT:-8000}:8000"
@@ -84,7 +102,9 @@ services:
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      # Optional (#219). Empty = no vector store, the default. Set it only to keep an
+      # existing external Qdrant attached for the legacy USER_MEMORY_VECTOR_LANE.
+      QDRANT_URL: ${QDRANT_URL:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-faultline-test}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
 
@@ -128,13 +148,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
       redis:
         condition: service_healthy
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
@@ -145,9 +164,9 @@ services:
 
   # ── MCP server — same memory, exposed to Claude Desktop / any MCP client ─────
   faultline-mcp:
-    image: ${FAULTLINE_IMAGE:-faultline:latest}
+    image: ${FAULTLINE_IMAGE:-faultline-es:latest}
     pull_policy: never   # the image the faultline service builds
-    container_name: ${FAULTLINE_PREFIX:-faultline}-mcp
+    container_name: ${FAULTLINE_PREFIX:-faultline-es}-mcp
     entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "${FAULTLINE_MCP_PORT:-8002}:8002"
@@ -172,11 +191,12 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── PostgreSQL — fact storage (migrations run from the API entrypoint) ───────
   postgres:
     image: postgres:16-alpine
-    container_name: ${FAULTLINE_PREFIX:-faultline}-postgres
+    container_name: ${FAULTLINE_PREFIX:-faultline-es}-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-faultline}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faultline}
@@ -201,6 +221,9 @@ services:
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Let the shutdown checkpoint finish instead of Docker's 10s SIGKILL (#212). A killed
+    # postgres is still safe (it replays WAL on the next start), but a clean stop is faster.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-faultline} -d ${POSTGRES_DB:-faultline}"]
       interval: 5s
@@ -209,28 +232,20 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
-  # ── Qdrant — vector index ────────────────────────────────────────────────────
-  # Loopback only (#144): Qdrant has no API key here and the backend reaches it as
-  # qdrant:6333 on faultline-net. Published on 127.0.0.1 for local inspection only.
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: ${FAULTLINE_PREFIX:-faultline}-qdrant
-    ports:
-      - "127.0.0.1:${FAULTLINE_QDRANT_PORT:-6333}:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    networks:
-      - faultline-net
-    restart: unless-stopped
-
-  # ── Redis — inlet dedup cache ────────────────────────────────────────────────
+  # ── Redis — coordination cache, NOT a store (#212) ───────────────────────────
+  # Redis holds only re-derivable state: the idempotency dedup cache, embedding cache,
+  # cross-process rate-budget counters, telemetry events and ingest work-queue CLAIMS
+  # (Postgres is the ledger; an expired claim is reclaimed from documents.chunk_state).
+  # So it runs WITHOUT persistence: no RDB snapshots, no AOF, no volume. With
+  # `--appendonly yes` a full disk made shutdown hang ("Error trying to save the DB, can't
+  # exit") until the kill timeout. Nothing to save means shutdown cannot block.
   redis:
     image: redis:7-alpine
-    container_name: ${FAULTLINE_PREFIX:-faultline}-redis
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
+    container_name: ${FAULTLINE_PREFIX:-faultline-es}-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    stop_grace_period: 10s
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -239,6 +254,7 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
   # ── Optional bundled LLM — enable with `--profile ollama` ────────────────────
   # Only for users who don't already run a model. When enabled, set
@@ -246,7 +262,7 @@ services:
   # Loopback only (#144): Ollama has no auth; FaultLine reaches it as ollama:11434.
   ollama:
     image: ollama/ollama:latest
-    container_name: ${FAULTLINE_PREFIX:-faultline}-ollama
+    container_name: ${FAULTLINE_PREFIX:-faultline-es}-ollama
     profiles: ["ollama"]
     ports:
       - "127.0.0.1:${FAULTLINE_OLLAMA_PORT:-11434}:11434"
@@ -255,19 +271,18 @@ services:
     networks:
       - faultline-net
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres_data:
-  qdrant_data:
-  redis_data:
   ollama_data:
 
 networks:
   faultline-net:
     # A FIXED name (#157), so OpenWebUI (or any other stack) can join it predictably:
-    #   networks: { faultline-net: { external: true } }   or
-    #   docker network connect faultline-net <openwebui-container>
+    #   networks: { faultline-es-net: { external: true } }   or
+    #   docker network connect faultline-es-net <openwebui-container>
     # Without it compose names it <project>_faultline-net. A second stack gets its own
     # network through its own FAULTLINE_PREFIX.
-    name: ${FAULTLINE_PREFIX:-faultline}-net
+    name: ${FAULTLINE_PREFIX:-faultline-es}-net
     driver: bridge

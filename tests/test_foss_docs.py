@@ -40,7 +40,9 @@ def test_manual_path_builds_the_image():
 
 def test_deployment_ports_table_matches_compose():
     dep = _read("DEPLOYMENT.md")
-    assert "127.0.0.1:6333" in dep and "0.0.0.0:8002" in dep
+    assert "0.0.0.0:8002" in dep
+    assert "6333" not in dep.split("## Services & ports")[1].split("\n## ")[0], \
+        "#219: no qdrant service is shipped, so none is listed"
     assert "| `postgres` | 5432 |" not in dep, "postgres is not published"
 
 

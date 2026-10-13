@@ -376,6 +376,14 @@ footer {
 }
 .pending-banner strong { color: var(--warn); }
 
+/* ── disk pressure banner (#211) ────────────────────────────── */
+.disk-banner {
+  border: 1px solid var(--warn); color: var(--warn); padding: 10px 14px;
+  font-size: 12px; margin: 0 0 14px;
+}
+.disk-banner.critical { border-color: var(--down, #e5484d); color: var(--down, #e5484d); }
+.disk-banner strong { color: inherit; }
+
 @media (max-width: 640px) {
   main { padding: 10px 14px 18px; }
   nav.tabs button { padding: 10px 12px; }
