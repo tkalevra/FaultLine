@@ -16233,7 +16233,7 @@ async def lifespan(app: FastAPI):
     try:
         from gliner2 import GLiNER2
         # [es branch] MULTILINGUAL weights. This is the load site that actually runs — the
-        # `load_default_model()` helper in src/gli_ner/extractor.py has NO callers, so its
+        # the former `load_default_model()` helper in src/gli_ner/ (module deleted: dead code)
         # multilingual default was dead code and every entity typed here went through
         # English-only weights (`fastino/gliner2-base-v1` is tagged `en` on HuggingFace).
         # `gliner2-multi-v1` is the same GLiNER2 API and covers en/es/fr/de/it/pt (Apache-2.0).

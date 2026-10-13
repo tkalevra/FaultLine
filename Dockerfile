@@ -9,6 +9,14 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --upgrade pip
 
 COPY pyproject.toml .
+# CPU-ONLY torch, FIRST and from PyTorch's CPU index. gliner2==1.3.2 depends on peft, which
+# depends on torch UNPINNED - on Linux the default PyPI resolve picks the CUDA build and drags
+# in ~2 GB of nvidia-*/triton wheels (~7 GB installed) for a CPU-only workload. Pre-installing
+# the pinned +cpu wheel satisfies peft's torch constraint so the CUDA stack never enters the
+# resolve (measured: 108 packages / ~2.3 GB wheels -> 80 packages / ~0.3 GB). Do NOT remove:
+# the CUDA stack comes back silently on the next fresh resolve. Bumping torch? Re-validate
+# GLiNER2 entity typing and use a +cpu wheel from https://download.pytorch.org/whl/cpu.
+RUN pip install --no-cache-dir "torch==2.6.0+cpu" --index-url https://download.pytorch.org/whl/cpu
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
 
