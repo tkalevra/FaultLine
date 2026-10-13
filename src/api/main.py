@@ -16319,8 +16319,12 @@ async def lifespan(app: FastAPI):
     global _gliner2_model
     try:
         from gliner2 import GLiNER2
-        _gliner2_model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-        log.info("startup.gliner2_ready")
+        # PURE CONFIG, like SPACY_MODEL - env-resolvable, never a bare code literal, so a baked
+        # variant (Dockerfile ARG GLINER_MODEL) is what actually loads. HF_HUB_OFFLINE=1 in the
+        # runtime image, so any override must be BAKED at build, not set in .env alone.
+        _gliner2_name = (os.environ.get("GLINER_MODEL") or "").strip() or "fastino/gliner2-base-v1"
+        _gliner2_model = GLiNER2.from_pretrained(_gliner2_name)
+        log.info("startup.gliner2_ready", model=_gliner2_name)
     except Exception as e:
         log.error("startup.gliner2_failed", error=str(e))
 
