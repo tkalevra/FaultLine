@@ -6,11 +6,14 @@ English/lexical and the neg-scope ensemble only engages STATEMENT/QUERY leans), 
 /retract/correct lane failed honestly ("old fact not found") and STILL minted the
 affirmative edge (user, usar, puerto) — recall then asserted "You use Puerto".
 
-The es classification side fixed here: a gate-passed destructive GLiNER2 lean whose ONLY
-negation is SENTENTIAL (verbal predicate — not the nominal/two-pole structural denial
-the ensemble/CORRECTION lane own) and which carries NO explicit removal/repair cue is
-vetoed to STATEMENT with polarity preserved — en's classification outcome for the same
-shape. The decision logic is PURE (`_sentential_negation_blocks_destructive` in
+The es classification side fixed here: a destructive GLiNER2 lean (gate-PASSED or
+SUB-GATE escalation-decided) whose ONLY negation is SENTENTIAL (verbal predicate — not
+the nominal/two-pole structural denial the ensemble/CORRECTION lane own) and which
+carries NO explicit removal/repair cue is vetoed to STATEMENT with polarity preserved —
+en's classification outcome for the same shape. The veto is hoisted ABOVE gate/escalation
+routing because the LIVE es stack scored the bug sentence SUB-GATE (CORRECTION@0.52-0.63
+< gate 0.70) and the INTENT_ADJUDICATION escalation routed it "exactly as if GLiNER2
+emitted it confidently" — a gate-passed-only veto never saw that turn. The decision logic is PURE (`_sentential_negation_blocks_destructive` in
 src/api/main.py — no parsing), so the decision pins run without a model; the endpoint
 pins drive the REAL /classify-intent with a fake GLiNER2 model and hand-built grammar
 facts (simulating the es-md parse). The failed-lane atomicity guard (a failed
@@ -286,4 +289,76 @@ def test_veto_flag_off_restores_the_legacy_route(_routed, monkeypatch):
     resp = _classify(_BUG_SENTENCE, _RETRACTION_DESC, 0.93,
                      [_sentential_scope()], _plain_statement_directive(), monkeypatch)
     assert resp == {"intent": "RETRACTION", "confidence": 0.93}
+
+# ── RE-CRITIC DEFECT 2: the veto must bind the SUB-GATE escalation route too ────
+
+
+def _escalation_recorder(monkeypatch, route="CORRECTION"):
+    """Replace the INTENT_ADJUDICATION LLM with a recorder that answers like the live
+    es stack did (escalation_resolved adjudicated_route=CORRECTION). LLMModels.get
+    fails LOUD (raise) when no model env var is set — and that raise happens while
+    EVALUATING the call arguments, before the LLM function is ever consulted — so the
+    pin must resolve the model name first or the escalation fail-opens before the
+    recorder can observe anything."""
+    import src.api.llm_calls as llm_calls
+    monkeypatch.setenv("LLM_MODEL_INTENT_ADJUDICATION", "test-adjudicator")
+    calls = []
+
+    async def _recorder(**kwargs):
+        calls.append(kwargs)
+        return {"route": route}
+
+    monkeypatch.setattr(llm_calls, "call_llm_with_retry_async", _recorder)
+    return calls
+
+
+@pytest.mark.parametrize("label_desc,conf", [
+    (_CORRECTION_DESC, 0.63),   # the live-measured band: CORRECTION@0.524-0.630
+    (_RETRACTION_DESC, 0.60),   # sub-gate destructive lean, other label
+])
+def test_subgate_bug_sentence_is_vetoed_statement_before_escalation(
+        _routed, monkeypatch, label_desc, conf):
+    """THE live contradiction: sub-gate (conf < 0.70) + sentential-only negation must
+    come back STATEMENT WITHOUT reaching the INTENT_ADJUDICATION escalation — a veto
+    wired only inside the gate-passed branch can never see this path."""
+    calls = _escalation_recorder(monkeypatch)
+    resp = _classify(_BUG_SENTENCE, label_desc, conf,
+                     [_sentential_scope()], _plain_statement_directive(), monkeypatch)
+    assert resp == {"intent": "STATEMENT", "confidence": 0.95}, (
+        f"the sub-gate negated statement was routed destructive via escalation: {resp}"
+    )
+    assert calls == [], (
+        f"the veto must bind BEFORE the escalation LLM is paid for: {len(calls)} call(s)"
+    )
+    assert main._INTENT_LAYER_STATS.get("test-use", {}).get("negated_statement_veto", 0) >= 1
+    assert main._INTENT_LAYER_STATS.get("test-use", {}).get("llm_adjudication") is None
+
+
+def test_subgate_structural_denial_still_escalates_to_the_correction_lane(
+        _routed, monkeypatch):
+    """The hoist must not cannibalize the escalation lane: a sub-gate destructive lean
+    whose negation is the NOMINAL/two-pole denial shape (not the veto's) still routes
+    through INTENT_ADJUDICATION exactly as before."""
+    calls = _escalation_recorder(monkeypatch)
+    resp = _classify("Mi gata no es Fraggle.", _CORRECTION_DESC, 0.63,
+                     [_structural_denial_scope()], _plain_statement_directive(), monkeypatch)
+    assert resp["intent"] == "CORRECTION", (
+        f"the escalation lane changed for non-veto shapes: {resp}"
+    )
+    assert len(calls) == 1, f"escalation must still be consulted exactly once: {calls}"
+    assert main._INTENT_LAYER_STATS.get("test-use", {}).get("llm_adjudication", 0) >= 1
+
+
+def test_subgate_affirmative_correction_lean_still_escalates(_routed, monkeypatch):
+    """No negation at all → the veto never engages; the escalation owns the sub-gate
+    band exactly as before. (That the LIVE es GLiNER2 leans CORRECTION on this
+    affirmative at all is the destructive-lean weakness filed as FOSS-012 — a
+    different lane; this pin only freezes the routing contract this fix must not
+    disturb.)"""
+    calls = _escalation_recorder(monkeypatch)
+    resp = _classify("Uso el puerto 9004.", _CORRECTION_DESC, 0.63,
+                     [], _plain_statement_directive(), monkeypatch)
+    assert resp["intent"] == "CORRECTION", resp
+    assert len(calls) == 1, f"escalation must still be consulted exactly once: {calls}"
+
 
