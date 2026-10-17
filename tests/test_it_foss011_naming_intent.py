@@ -636,7 +636,202 @@ def test_unregistered_floors_stay_empty():
     assert OV.RETRACTION_VERB_CATEGORY in OV._BOOTSTRAP_BY_CATEGORY
 
 
-# 8. FLAGS + THE EN STATEMENT-LANE FIXTURE (the parity anchor)
+
+
+# 9. FOSS-015 PRO-DROP BEARER GROUNDING (critic round 3): the split-turn rename LANDS
+
+class _GroundCur:
+    """Scripted cursor: maps a discriminator substring of the SQL to fixed rows (or a
+    callable of the params). Everything unmatched returns []."""
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+        self._last = []
+
+    def execute(self, sql, params=None):
+        self.calls.append(sql)
+        self._last = []
+        for sub, val in self.routes:
+            if sub in sql:
+                self._last = val(params) if callable(val) else val
+                return
+
+    def fetchall(self):
+        return self._last
+
+    def fetchone(self):
+        return self._last[0] if self._last else None
+
+
+_E1, _E2 = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+
+
+def _ground(monkeypatch, frames, routes, **kw):
+    "Drive _ground_prodrop_bearer with scripted frames + a scripted cursor."
+    import src.api.main as M
+    monkeypatch.setattr(L, "licensed_naming_frames", lambda _t: frames)
+    return M._ground_prodrop_bearer(_GroundCur(routes), "u1", kw.pop("text", "anzi si chiama"), **kw)
+
+
+def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
+    """THE FLAGSHIP PIN: b2 "Anzi, si chiama DevBox." (pro-drop frame, bearer empty) grounds
+    to the UNIQUE holder of the naming rel - the bearer the rename targets. With the bearer,
+    the existing SCALAR pref_name/also_known_as lane flips apollo -> devbox ON THE SAME
+    ENTITY (recall shows DevBox) instead of parking at "Old fact not found for subject
+    change: pref_name"."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("DISTINCT subject_id FROM facts", [(_E1,)]),
+        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
+        ("ORDER BY is_preferred DESC", [("apollo",)]),
+    ])
+    assert got and got["entity_id"] == _E1, got
+    assert got["rel"] == "pref_name", got
+    assert got["old_name"] == "apollo" and got["name"] == "devbox", got
+
+
+def test_prodrop_correction_declines_on_two_holders(monkeypatch):
+    """Two entities hold naming rels -> rival referents -> None (today's clarification path;
+    ambiguity is never resolved by guessing)."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("DISTINCT subject_id FROM facts", [(_E1,), (_E2,)]),
+    ])
+    assert got is None
+
+
+def test_agreement_gate_declines_when_old_value_not_held(monkeypatch):
+    """The turn says what the bearer is called TODAY: an extracted old value that is an
+    alias of a DIFFERENT entity contradicts the naming-rel holder -> the intersection is
+    empty -> None (the agreement gate always binds)."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("DISTINCT subject_id FROM facts", [(_E1,)]),
+        ("DISTINCT entity_id FROM entity_aliases WHERE alias = %s", [(_E2,)]),
+    ], old_value="apollo")
+    assert got is None
+
+
+def test_agreement_gate_accepts_when_old_value_is_held(monkeypatch):
+    """The agreeing case: old_value is an alias OF the holder -> grounding proceeds."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("DISTINCT subject_id FROM facts", [(_E1,)]),
+        ("DISTINCT entity_id FROM entity_aliases WHERE alias = %s", [(_E1,)]),
+        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
+        ("ORDER BY is_preferred DESC", [("apollo",)]),
+    ], old_value="apollo")
+    assert got and got["entity_id"] == _E1
+
+
+def test_rival_probes_decline(monkeypatch):
+    """Alias content names one entity, the naming-rel holder is a DIFFERENT one -> rival
+    referents -> None (never guess between them)."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", [(_E1,)]),
+        ("DISTINCT subject_id FROM facts", [(_E2,)]),
+    ])
+    assert got is None
+
+
+def test_no_held_naming_rel_declines(monkeypatch):
+    """A candidate with NO naming edge has no label to supersede - that shape is a first
+    mention (the FOSS-011 guard's territory), never a silent mint here."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", [(_E1,)]),
+        ("DISTINCT rel_type FROM facts", []),
+    ])
+    assert got is None
+
+
+def test_english_frames_never_open_the_door(monkeypatch):
+    """No licensed naming frame (every English parse) -> None without touching the DB -
+    en/es installs are byte-identical (the door is structurally it-only)."""
+    cur = _GroundCur([])
+    got = _ground(monkeypatch, (), [], text="actually it is called devbox")
+    assert got is None
+    assert cur.calls == []
+
+
+def test_retraction_arm_grounds_via_alias_overlap(monkeypatch):
+    """The pro-drop retraction ("dimentica che ho una gatta che si chiama Fraggle.")
+    grounds its bearer by the turn's naming content: the forgotten name IS a stored alias of
+    the gatta entity. The door hands the bearer to the caller, which clarifies NAMING it (the
+    FOSS-015 doc's accepted landing) instead of a generic who-is-this."""
+    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+        ("alias = ANY", [(_E1,)]),
+        ("DISTINCT rel_type FROM facts", [("also_known_as",)]),
+        ("ORDER BY is_preferred DESC", [("gatta",)]),
+    ], is_retraction=True, object_to_negate="fraggle",
+       text="dimentica che ho una gatta che si chiama fraggle")
+    assert got and got["entity_id"] == _E1, got
+    assert got["rel"] == "also_known_as" and got["name"] == "fraggle", got
+
+
+def test_overt_bearer_np_is_a_first_class_key(monkeypatch):
+    """Mechanism (a): the grammar's own in-turn bearer NP ("il mio server ...") grounds the
+    turn directly through the alias cache - no holder probe needed when the text names it."""
+    got = _ground(monkeypatch, (("server", "devbox"),), [
+        # two separate alias-ANY probes run (naming keys, then bearer NPs): route on PARAMS
+        ("alias = ANY", lambda p: [(_E1,)] if "server" in (p[0] or []) else []),
+        ("ORDER BY is_preferred DESC", [("apollo",)]),
+        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
+    ], text="il mio server si chiama DevBox")
+    # the bearer-key probe runs with 'server' in the params and hits E1
+    assert got and got["entity_id"] == _E1, got
+    assert got["bearer_np"] == "server", got
+
+
+def test_bearer_grounding_flag_defaults_on():
+    """The kill-switch ships ON (FOSS-015 is the documented fix direction); OFF = round-2
+    behaviour byte-for-byte."""
+    import src.api.main as M
+    assert M.PRODROP_BEARER_GROUNDING is True
+
+
+def test_grounding_door_sits_before_the_null_subject_clarification():
+    """Position pin: the grounding door runs BEFORE the endpoint's generic null-subject
+    clarification - otherwise the turn would park exactly as before the fix."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        lines = fh.read().splitlines()
+    door = next(i for i, l in enumerate(lines, 1)
+                if "if PRODROP_BEARER_GROUNDING and not subject_uuid:" in l)
+    clarify = next(i for i, l in enumerate(lines, 1)
+                   if "correct_fact.null_subject_extracted" in l)
+    assert door < clarify, (door, clarify)
+
+
+def test_correction_arm_forces_the_label_lane(monkeypatch):
+    """The door's write-safety hinge, pinned at the source: the CORRECTION arm forces the
+    extraction onto the SCALAR label lane (a naming clause licenses a LABEL write) - the
+    LLM's SUBJECT-axis guess would move the edge to a minted entity and split the rename all
+    over again. The forced assignment must sit INSIDE the door (below it, before the ladder)."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        lines = fh.read().splitlines()
+    door = next(i for i, l in enumerate(lines, 1)
+                if "if PRODROP_BEARER_GROUNDING and not subject_uuid:" in l)
+    force = next(i for i, l in enumerate(lines, 1)
+                 if i > door and 'extraction["dimension"] = "SCALAR"' in l)
+    ladder = next(i for i, l in enumerate(lines, 1)
+                  if "correct_fact.null_subject_extracted" in l)
+    assert door < force < ladder, (door, force, ladder)
+
+
+@needs_it
+def test_split_turn_b2_frames_feed_the_grounding_door():
+    """End-to-end grammar half on the REAL it parse: the b2 turn's pro-drop frame is exactly
+    the door's input shape (one asserted name, empty bearer), and b1's frame carries the
+    in-turn bearer - so b1 captures as a statement and b2 grounds through the holder probe."""
+    b1, b2 = _it_frames(
+        "Il mio server si chiama Apollo.",
+        "Anzi, si chiama DevBox.")
+    assert b1 and b1[0][0] and b1[0][1] == "apollo", b1
+    assert b2 and b2[0] == ("", "devbox"), b2
+
+
+# 10. FLAGS + THE EN STATEMENT-LANE FIXTURE (the parity anchor)
 
 def test_preroute_and_guard_flags_default_on():
     """Both kill-switches ship ON (bisectable OFF = byte-for-byte legacy)."""

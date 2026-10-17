@@ -14779,6 +14779,22 @@ NAME_FIRST_MENTION_GUARD: bool = os.environ.get(
     "NAME_FIRST_MENTION_GUARD", "true"
 ).strip().lower() not in ("0", "false", "no")
 
+# ── FOSS-015 PRO-DROP BEARER GROUNDING (critic round 3) ──────────────────────────────
+# A pro-drop it naming correction/retraction ("Anzi, si chiama DevBox." / "dimentica che ho
+# una gatta che si chiama Fraggle.") has a DISCOURSE-given bearer: the LLM extractor returns
+# subject=null and the turn parked (corrections at "Old fact not found for subject change:
+# pref_name"; retractions at a generic clarification). This flag gates the lookup-only bearer
+# grounding in /retract/correct (_ground_prodrop_bearer): grammar-gated on the licensed UD
+# naming frames (an English parse can never produce one — en/es installs byte-identical),
+# agreement-gated (an extracted old value must be an alias of the candidate; the bearer must
+# actually hold a naming rel), uniqueness-gated (exactly ONE candidate or today's path).
+# NEVER mints: every probe is indexed and read-only; corrections aim the EXISTING tested
+# SCALAR pref_name/also_known_as lane at the bearer; retractions clarify NAMING the bearer.
+# Flag OFF → byte-for-byte round-2 behaviour.
+PRODROP_BEARER_GROUNDING: bool = os.environ.get(
+    "PRODROP_BEARER_GROUNDING", "true"
+).strip().lower() not in ("0", "false", "no")
+
 
 # ── SPEAKER-RENAME REFUSAL: a correction that names a THIRD PARTY never lands on the first person ─
 # THE DEFECT THIS CLOSES (measured on a fresh tenant): "actually my sister's name is thorne, not
@@ -15624,6 +15640,116 @@ def _first_mention_naming_correction(text: str, cur) -> bool:
         log.warning("first_mention_naming.alias_probe_failed", error=str(e)[:160])
         return False
     return True
+
+
+def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
+                           new_value=None, object_to_negate=None,
+                           is_retraction: bool = False):
+    """FOSS-015 PRO-DROP BEARER GROUNDING: ground a null-subject naming turn to the entity
+    it is about, LOOKUP-ONLY — never mint, never guess into a write.
+
+    The FOSS-011 round-2 fix made pro-drop correction/retraction turns SAFE (they decline the
+    preroute and reach the ladder), but the corrector's LLM still returns subject=null on them
+    (the bearer is discourse-given, absent from the text): the split-turn rename parked at
+    "Old fact not found for subject change: pref_name" and the pro-drop retraction parked at a
+    generic clarification. This door grounds the bearer per the FOSS-015 fix direction
+    (mechanism (b), plus the grammar's own in-turn bearer NPs as a mechanism-(a) hint):
+
+      • GRAMMAR GATE — `licensed_naming_frames(text)` must hold EXACTLY ONE distinct asserted
+        name (an English parse returns () → this door never opens; en/es installs are
+        byte-identical). The frame's own BEARER NPs ("il mio server …") are first-class
+        grounding keys — the grammar's referent hint.
+      • CANDIDATES — lookup-only: (a) entities stored under the turn's naming content (the
+        asserted name, the extracted old value, the retraction's object); (b) for CORRECTIONS,
+        the holders of the naming rels (pref_name / also_known_as — the naming chains' own
+        output; an active label IS the rename target). When two probes return DIFFERENT,
+        non-intersecting entities, they are rival referents → refuse.
+      • AGREEMENT GATE — an extracted old value must be an alias of the candidate (the turn
+        says what the bearer is called TODAY); the entity must actually HOLD a naming rel
+        (there must be a label to supersede — a first mention is the FOSS-011 guard's
+        territory, never a silent mint).
+      • UNIQUENESS — exactly ONE candidate survives, else None (0 or >1 → today's
+        clarification path; ambiguity is never resolved by guessing).
+
+    Returns ``{entity_id, rel, old_name, name, bearer_np}`` (``rel`` = the naming rel the
+    bearer holds, pref_name preferred) or ``None``. Read-only: indexed alias/fact probes
+    only. Caller (POST /retract/correct) uses the result to aim the EXISTING tested write
+    lanes — the SCALAR pref_name/also_known_as branch for corrections; a bearer-naming
+    clarification for retractions."""
+    if not text or not text.strip():
+        return None
+    try:
+        from src.extraction.linguistics import licensed_naming_frames as _lnf_pd
+        frames = _lnf_pd(text)
+    except Exception:  # noqa: BLE001 — a grammar miss never breaks the lane
+        return None
+    if not frames:
+        return None  # no licensed naming frame (incl. every English parse)
+    names: list[str] = []
+    for _b, _n in frames:
+        if _n not in names:
+            names.append(_n)
+    if len(names) != 1:
+        return None  # the replacive-in-one-turn shape is the ladder's, not this door's
+    _name = names[0]
+    try:
+        _keys = {_name}
+        for _v in (old_value, object_to_negate):
+            if _v and str(_v).strip():
+                _keys.add(str(_v).strip().lower())
+        _bearer_keys = {_b.strip().lower() for _b, _n in frames if _b and _b.strip()}
+        cands: set = set()
+        if _keys:
+            cur.execute(
+                "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ANY(%s)",
+                (sorted(_keys),))
+            cands.update(r[0] for r in cur.fetchall() if r[0])
+        if _bearer_keys:
+            cur.execute(
+                "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = ANY(%s)",
+                (sorted(_bearer_keys),))
+            _bearer_hits = {r[0] for r in cur.fetchall() if r[0]}
+            if cands and _bearer_hits and not (cands & _bearer_hits):
+                return None  # rival referents: the name content and the bearer disagree
+            cands |= _bearer_hits
+        if not is_retraction:
+            cur.execute(
+                "SELECT DISTINCT subject_id FROM facts "
+                "WHERE rel_type IN ('pref_name', 'also_known_as') "
+                "AND superseded_at IS NULL AND archived_at IS NULL", ())
+            _holders = {r[0] for r in cur.fetchall() if r[0]}
+            if cands and _holders and not (cands & _holders):
+                return None  # rival referents: alias content vs the naming-rel holder
+            cands |= _holders
+            # AGREEMENT GATE: an extracted old value must be an alias of the candidate.
+            if old_value and str(old_value).strip() and cands:
+                cur.execute(
+                    "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = %s",
+                    (str(old_value).strip().lower(),))
+                _agree = {r[0] for r in cur.fetchall() if r[0]}
+                cands &= _agree
+        if len(cands) != 1:
+            return None  # 0 or >1 candidates: ambiguity is never resolved by guessing
+        entity_id = next(iter(cands))
+        cur.execute(
+            "SELECT DISTINCT rel_type FROM facts "
+            "WHERE subject_id = %s AND rel_type IN ('pref_name', 'also_known_as') "
+            "AND superseded_at IS NULL AND archived_at IS NULL", (entity_id,))
+        _held = {r[0] for r in cur.fetchall() if r[0]}
+        if not _held:
+            return None  # no label to supersede: a first mention is the FOSS-011 guard's
+        rel = "pref_name" if "pref_name" in _held else "also_known_as"
+        cur.execute(
+            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+            "ORDER BY is_preferred DESC LIMIT 1", (entity_id,))
+        _row = cur.fetchone()
+        return {"entity_id": entity_id,
+                "rel": rel,
+                "old_name": (_row[0] if _row and _row[0] else None),
+                "name": _name,
+                "bearer_np": next((_b for _b, _n in frames if _b), "")}
+    except Exception:  # noqa: BLE001 — a probe failure leaves today's path byte-identical
+        return None
 
 
 def _detect_name_repair_correction(text: str, cur, user_id: str | None = None, db=None):
@@ -59486,6 +59612,72 @@ def correct_fact(req: FactCorrectionRequest):
                                       "subject guess")
             except Exception as _we:  # noqa: BLE001 — fail-safe: the LLM path proceeds unchanged
                 log.warning("correct_fact.referent_walk_fallback_failed", error=str(_we)[:160])
+
+        # ── FOSS-015 PRO-DROP BEARER GROUNDING (critic round 3) ─────────────────────
+        # The FOSS-011 round-2 fix made pro-drop naming turns SAFE (they can no longer
+        # pre-route or silently corrupt), but their bearer is discourse-given — absent from
+        # the text — so the corrector's LLM returns subject=null and the turn parked:
+        # corrections at "Old fact not found for subject change: pref_name", retractions at
+        # a generic clarification. Ground the bearer here (lookup-only; the gate keeps the
+        # grammar, agreement and uniqueness; see _ground_prodrop_bearer), then:
+        #   • CORRECTIONS aim the EXISTING tested SCALAR pref_name/also_known_as lane at the
+        #     bearer — the same forced-dimension discipline as the name-repair intercept
+        #     (a naming clause licenses a LABEL write, so the LLM's SUBJECT-axis guess is
+        #     discarded; leaving it would move the edge to a minted entity and split the
+        #     rename all over again). _name_repair_probed_referent is set: a graph probe
+        #     already singled this bearer, so the referent guard's LABEL step must not
+        #     re-litigate it (its BEARER test still runs — it suppresses only the LABEL step).
+        #   • RETRACTIONS take the FOSS-015 doc's accepted landing: clarify NAMING the bearer
+        #     (its current label + the name being forgotten). Forgetting a NON-preferred
+        #     alias is not the demote lane's write, and a wrong guess into a destructive
+        #     write is exactly what this branch must never do.
+        # Fail-safe: flag OFF / grammar miss / 0-or->1 candidates / any probe error →
+        # subject stays None → today's ladder (clarification / staged intent) unchanged.
+        if PRODROP_BEARER_GROUNDING and not subject_uuid:
+            _pd = None
+            try:
+                with db.cursor() as _pd_cur:
+                    _pd = _ground_prodrop_bearer(
+                        _pd_cur, req.user_id, req.text,
+                        old_value=old_value, new_value=new_value,
+                        object_to_negate=(object_to_negate if is_retraction else None),
+                        is_retraction=is_retraction)
+            except Exception as _pd_err:  # noqa: BLE001 — a grounding miss never breaks
+                log.warning("correct_fact.prodrop_ground_failed", error=str(_pd_err)[:160])
+                _pd = None
+            if _pd and not is_retraction:
+                subject_uuid = _pd["entity_id"]
+                _name_repair_probed_referent = True
+                old_rel_type = _pd["rel"]
+                new_rel_type = _pd["rel"]
+                old_value = _pd["old_name"] or old_value
+                new_value = new_value or _pd["name"]
+                extraction["dimension"] = "SCALAR"
+                subject_name = _pd["old_name"] or _pd["name"]
+                extraction["subject_name"] = subject_name
+                log.info("correct_fact.prodrop_bearer_grounded",
+                         user_id=req.user_id[:8],
+                         bearer=str(subject_uuid)[:8], rel=_pd["rel"],
+                         old_name=_pd["old_name"], new_name=_pd["name"],
+                         bearer_np=_pd.get("bearer_np") or "",
+                         note="pro-drop naming turn grounded to the unique naming-rel "
+                              "holder; the label flip lands on the SAME entity via the "
+                              "existing SCALAR pref_name/also_known_as lane")
+            elif _pd and is_retraction:
+                _pd_label = _pd.get("old_name") or _pd.get("name") or "that entity"
+                log.info("correct_fact.prodrop_retraction_bearer_named",
+                         user_id=req.user_id[:8],
+                         bearer=str(_pd["entity_id"])[:8], label=_pd_label,
+                         name=_pd.get("name") or "",
+                         note="pro-drop retraction grounded: clarifying WITH the bearer "
+                              "named (forgetting a non-preferred alias is not the demote "
+                              "lane's write; a wrong destructive guess is never taken)")
+                return FactCorrectionResponse(
+                    status="clarification_needed",
+                    message=(f"I found it: \"{_pd.get('name')}\" is a name of "
+                             f"\"{_pd_label}\". Should I forget that name? "
+                             "Confirm and I'll remove it."),
+                )
 
         # Resolve subject name → UUID via the STANDARD discovery resolver.
         # ── REWIRE (subject → standard discovery) ────────────────────────────────
