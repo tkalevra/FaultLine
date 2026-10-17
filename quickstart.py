@@ -1011,7 +1011,12 @@ _LANGUAGES = {
     "es": {"label": "Español  (experimental)",
            "branches": ("es",),
            "icu_locale": "es-ES",
-           "spacy_model": "es_core_news_sm",
+           # FOSS-002: the measured branch default is MD, not sm — .env.example's own comment
+           # block documents sm's failure modes (sentence-initial 1sg preterite verbs mis-tag
+           # PROPN, possessive DETs mis-parse as flat names). Keep in lockstep with
+           # .env.example SPACY_MODEL / Dockerfile ARG SPACY_MODEL / the compose default
+           # (pinned by tests/test_foss_es_model_parity.py).
+           "spacy_model": "es_core_news_md",
            "ts_config": "spanish"},
 }
 _DEFAULT_LANG = "es"   # this branch's language (#216): Enter at the gate keeps it
