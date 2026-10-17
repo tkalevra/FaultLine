@@ -485,7 +485,6 @@ def e2e(backend_secret):
     conn.autocommit = True
     with conn.cursor() as cur:
         cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        cur.execute(f'DROP SCHEMA IF EXISTS "flagent_{user_id.replace("-", "_")}" CASCADE')
         cur.execute("DELETE FROM public.user_provisioning WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM public.users WHERE user_id = %s", (user_id,))
     conn.close()

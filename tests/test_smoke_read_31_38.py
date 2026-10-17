@@ -226,7 +226,7 @@ def seat(monkeypatch):
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            for _sch in (schema, "flagent_" + user_id.replace("-", "_")):
+            for _sch in (schema,):
                 try:
                     cur.execute("SELECT format('DROP SCHEMA IF EXISTS %I CASCADE', %s)", (_sch,))
                     _drop = cur.fetchone()
