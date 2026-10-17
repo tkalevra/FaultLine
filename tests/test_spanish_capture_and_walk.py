@@ -50,10 +50,16 @@ def test_spanish_copular_predicate_is_the_ud_head():
 
 
 def test_spanish_pronominal_naming_binds_the_name():
-    """'se llama' — UD expl:pv (inherently reflexive verb) -> also_known_as edge."""
+    """'se llama' — UD expl:pv (inherently reflexive verb) -> pref_name edge.
+
+    FOSS-009: the naming construction ASSERTS the display label, so the name rides
+    pref_name (preferred_label) — the alias registers PREFERRED and the recall display
+    resolver names the entity Rex instead of the type noun "Perro"."""
     facts = _facts("Mi perro se llama Rex.")
-    aka = _find(facts, "also_known_as")
-    assert aka is not None and aka.subject == "perro" and aka.object == "rex", f"{facts}"
+    pref = _find(facts, "pref_name")
+    assert pref is not None and pref.subject == "perro" and pref.object == "rex", f"{facts}"
+    assert getattr(pref, "preferred_label", False), f"name not a preferred label: {facts}"
+    assert _find(facts, "also_known_as") is None, f"name twin-filed as aka: {facts}"
 
 
 def test_spanish_dative_experiencer_is_the_speaker():
@@ -321,8 +327,9 @@ def test_spanish_relative_pronoun_binds_the_antecedent():
     it (critic's D); the es arm of _is_relative_pronoun (morphology, NO word list) now
     resolves it like EN 'that'."""
     facts = _facts("Tengo un perro que se llama Rex.")
-    aka = [f for f in facts if f.rel_type == "also_known_as"]
-    assert len(aka) == 1 and aka[0].subject == "perro" and aka[0].object == "rex", f"{facts}"
+    naming = [f for f in facts if f.rel_type in ("pref_name", "also_known_as")]
+    assert len(naming) == 1 and naming[0].rel_type == "pref_name" \
+        and naming[0].subject == "perro" and naming[0].object == "rex", f"{facts}"
     assert not any(f.subject == "que" or f.object == "que" for f in facts), f"que minted: {facts}"
 
 

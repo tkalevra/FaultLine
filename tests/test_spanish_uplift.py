@@ -38,10 +38,12 @@ def test_kin_naming_fresh_domain_control():
     assert not any(s == "hija" for s, _r, _o in f), f
 
 
-def test_non_kin_pronominal_naming_keeps_alias_edge():
-    """A named THING (not a person role) keeps its naming edge."""
+def test_non_kin_pronominal_naming_keeps_name_edge():
+    """A named THING (not a person role) keeps its naming edge — as the PREFERRED label
+    (FOSS-009: "se llama X" asserts the display label; recall must render Rex, never the
+    type noun "Perro")."""
     f = _facts("Mi perro se llama Rex.")
-    assert ("perro", "also_known_as", "rex") in f, f
+    assert ("perro", "pref_name", "rex") in f, f
 
 
 # ── Target 2: finite verb read back from subject agreement ─────────────────────

@@ -25031,7 +25031,19 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # hermana?" then anchored on that role-noun ghost (alias 'hermana') and walked to
             # nothing while the residence sat on the real person.
             if not _kin_bound:
-                _emit(subject, "also_known_as", proper, verb_tok=tok, obj_tok=name_tok, subj_tok=subj_tok)
+                # FOSS-009: the naming construction ASSERTS the display label, so the name
+                # rides pref_name (the SKOS prefLabel thread the English "is called/named
+                # N" arm uses with preferred_label=True). Filed as a plain also_known_as
+                # the alias registered NON-preferred and the recall display resolver
+                # (preferred-alias-first, dead-name prevention) kept rendering the TYPE
+                # NOUN ("Gata tiene 3 anos") — the registered name never surfaced, so
+                # "¿Cómo se llama mi gata?" was unanswerable from a store that HELD the
+                # answer. pref_name ⇒ ingest registers the alias PREFERRED (is_pref=True,
+                # user_stated source, the registry's own rank arbitration) and every
+                # recall lane names the entity Fraggle. THE HARD LINE unchanged: the name
+                # is FILED on the entity in the alias layer, never classified into L4.
+                _emit(subject, "pref_name", proper, verb_tok=tok, obj_tok=name_tok,
+                      subj_tok=subj_tok, preferred_label=True)
             _claim(tok, name_tok)
             _svo_es_measure_suppress.add(tok.i)
 

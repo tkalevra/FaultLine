@@ -56,6 +56,10 @@ def test_degree_adjective_wordnet_never_consulted_on_spanish(monkeypatch):
 
 @_es
 def test_spanish_pronominal_naming_gets_no_english_pref_name_arm():
+    """The ENGLISH passive "is called/named N" arm stays inert on a Spanish parse — the
+    ES pronominal-naming chain owns the construction (FOSS-009: it now files the name
+    itself, as the pref_name prefLabel). Exactly ONE naming edge, from the es chain."""
     f = [(x.subject, x.rel_type, x.object)
          for x in m.derive_sentence_facts("Mi perro se llama Rex.", _REF, None)]
-    assert not any(r == "pref_name" for _s, r, _o in f), f
+    naming = [(s, r, o) for s, r, o in f if r in ("pref_name", "also_known_as")]
+    assert naming == [("perro", "pref_name", "rex")], f
