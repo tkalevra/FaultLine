@@ -27339,13 +27339,25 @@ def analyze_negation_scopes(text: str) -> list[NegationScope] | None:
     try:
         scopes: list[NegationScope] = []
         for cue in doc:
-            # [es branch] DELIBERATELY Penn-``neg``-only, NOT _is_neg: these scopes are the negscope /
-            # depwalk VOTERS of the intent ensemble's DESTRUCTIVE correction/retraction bypass. A UD
-            # Spanish "no" (advmod) is left out until that routing is measured on Spanish turns — with
-            # no voter the ensemble falls back to GLiNER2 (non-destructive), the fail-safe direction.
-            # Same choice the es branch made for analyze_directive's contrastive-negation probe.
+            # CUE ACCEPTANCE, two arms:
+            #   • Penn arm (en models): the ``neg`` arc — unchanged, byte-identical.
+            #   • UD SENTENTIAL-NEGATOR arm (the es branch hole this lane shipped with —
+            #     closed FOSS-005 round 3): under the shipped es models the negator ("no",
+            #     "nunca", "tampoco", …) is an ADV attached advmod/obl DIRECTLY to the verb
+            #     it negates — Penn "neg" never occurs (measured live on es_core_news_sm:
+            #     "No uso el puerto 9004 en ningún servidor." → no/ADV/advmod→uso/VERB,
+            #     scopes=[]). Accept it by TAG/DEP + SYNTACTIC GOVERNOR ONLY: the cue must
+            #     carry a closed-class negator lemma (_is_neg — the same class the ingest
+            #     polarity reader already trusts) AND modify a VERB/AUX predicate, so
+            #     determiner negation ("ningún puerto" — det on a noun) and every
+            #     non-sentential shape stay out, the en twin is untouched ("not" rides the
+            #     Penn neg arm above; no en parse shape regresses), and the scope extent
+            #     below is the SAME _terminated_scope_tokens verb-phrase boundary body the
+            #     en scopes use. No language gate, no surface list beyond the closed class.
             if cue.dep_ != "neg":
-                continue
+                if not (cue.dep_ in ("advmod", "obl") and _is_neg(cue)
+                        and cue.head.pos_ in _PREDICATE_POS):
+                    continue
             head = cue.head
             # Predicate the negation scopes over: the head when it IS the clause
             # predicate; else the nearest predicate parent (advmod "no longer" → ROOT;

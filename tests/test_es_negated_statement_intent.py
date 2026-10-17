@@ -28,6 +28,7 @@ import types
 import pytest
 
 import src.api.main as main
+import src.extraction.linguistics as ling_mod
 from src.api.main import _sentential_negation_blocks_destructive
 from src.extraction.linguistics import (
     DirectiveAnalysis,
@@ -35,6 +36,25 @@ from src.extraction.linguistics import (
     analyze_directive,
     analyze_negation_scopes,
     linguistics_available,
+)
+
+
+def _es_model_ready() -> bool:
+    """True only when a SHIPPED ES model is the loaded spaCy layer (SPACY_MODEL=
+    es_core_news_md — the FOSS-002 measured default — or es_core_news_sm)."""
+    try:
+        return bool(linguistics_available()) and (ling_mod._SPACY_MODEL or "").startswith("es_core")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# WORK-ORDER (round 3, item 2): the REAL-parse es pins run ONLY under the shipped es
+# model — the same skip-if-unavailable convention as every other model pin. The
+# hand-built-doc pins further down carry the same proofs on the MEASURED sm parse
+# shape, so the suite is green (and red-checkable) in a no-es-model env too.
+_es_real = pytest.mark.skipif(
+    not _es_model_ready(),
+    reason="needs SPACY_MODEL=es_core_news_md/sm loaded (no es model downloadable here)",
 )
 
 # ── fixtures: the grammar facts the es-md parse yields for the bug sentence ───
@@ -360,5 +380,176 @@ def test_subgate_affirmative_correction_lean_still_escalates(_routed, monkeypatc
                      [], _plain_statement_directive(), monkeypatch)
     assert resp["intent"] == "CORRECTION", resp
     assert len(calls) == 1, f"escalation must still be consulted exactly once: {calls}"
+
+
+
+
+# ── ROUND 3 (re-critic): the grammar layer itself — REAL es parses, no fake scopes ──
+# The round-2 reds could never catch the live-inert veto: every pin faked the scopes
+# (unit) or the GLiNER2 model (endpoint), and the only real-parse pin was the EN twin.
+# Measured live on es_core_news_sm (critic, image 2f99d05f): analyze_negation_scopes
+# ("No uso el puerto 9004 en ningun servidor.") returned scopes=[] because the cue-
+# acceptance was Penn-neg-only while the shipped es models attach the negator as
+# ADV/advmod DIRECTLY on the verb. The UD sentential-negator arm in
+# analyze_negation_scopes closes that; these pins bind it.
+
+_BUG_SURFACES = [
+    "No uso el puerto 9004 en ningun servidor.",   # the unaccented live surface
+    "No uso el puerto 9004 en ningún servidor.",   # the accented work-order surface
+]
+
+
+def _hand_es_bug_doc():
+    """The MEASURED es_core_news_sm UD parse of the bug sentence (round-3 critic), hand-
+    built on a blank es vocab (the test_es_inc1 technique — no model file needed):
+    no/ADV/advmod→uso, uso/VERB/ROOT, puerto/obj, servidor/obl. On sm this exact shape
+    yielded scopes=[] pre-fix; analyze_directive on the same parse also reads
+    imperative_root_lemma='uso' (negated), clause_initial_markers={'no'} and
+    cessation_advmod={'no'} — NONE of which is a removal/repair cue (the veto decision
+    intersects cessation/marker lemmas with the bounded ENGLISH cue sets), so the veto
+    must fire on it. md (the FOSS-002 default) parses the same ADV/advmod-on-verb shape."""
+    import spacy
+    from spacy.tokens import Doc
+    vocab = spacy.blank("es").vocab
+    words = ["No", "uso", "el", "puerto", "9004", "en", "ningun", "servidor", "."]
+    pos = ["ADV", "VERB", "DET", "NOUN", "NUM", "ADP", "DET", "NOUN", "PUNCT"]
+    deps = ["advmod", "ROOT", "det", "obj", "nummod", "case", "det", "obl", "punct"]
+    heads = [1, 1, 3, 1, 3, 7, 7, 1, 1]
+    doc = Doc(vocab, words=words, pos=pos)
+    doc[0].is_sent_start = True
+    for i, (d, h) in enumerate(zip(deps, heads)):
+        doc[i].dep_ = d
+        doc[i].head = doc[h]
+    return doc
+
+
+@pytest.fixture()
+def _transport_only(monkeypatch):
+    """Transport/queue stubs ONLY — the grammar layer runs FOR REAL (real parse, or the
+    hand-built measured parse via the _nlp seam). No grammar fact is faked."""
+    monkeypatch.delenv("POSTGRES_DSN", raising=False)
+    monkeypatch.setattr(main, "_ensure_tenant_ready", _async_noop)
+    # TIER1/TIER2 cue preroute: an English cue-lemma preroute cannot fire on this Spanish
+    # sentence (the closed sets hold no es negators); stubbing avoids a redundant parse.
+    monkeypatch.setattr(main, "_spacy_cue_route", lambda text, user_id=None: (None, None))
+    return monkeypatch
+
+
+# ---- (a) REAL-PARSE scope pins: under SPACY_MODEL=es_core_news_md (FOSS-002 default) ----
+
+
+@_es_real
+@pytest.mark.parametrize("surface", _BUG_SURFACES)
+def test_es_real_parse_yields_a_sentential_negation_scope(surface):
+    """THE round-3 defect, pinned at the grammar layer: analyze_negation_scopes on the bug
+    sentence must be NON-empty and mark VERBAL SENTENTIAL scope (no nominal complement,
+    no two referential poles — the veto's exact precondition), with the negator "no" as
+    the cue and the object inside the scope (verb-phrase extent). scopes=[] here means
+    the veto is live-inert again."""
+    scopes = analyze_negation_scopes(surface)
+    assert scopes, (
+        "the es grammar layer emitted NO negation scope for " + repr(surface)
+        + " — the veto is live-inert (round-3 defect)")
+    s = scopes[0]
+    assert (s.cue_text or "").lower() == "no", "cue: " + repr(s.cue_text)
+    assert s.predicates_nominal is False and s.two_referential_poles is False, (
+        "not the sentential shape: " + repr(s))
+    assert "puerto" in (s.scope_text or "").lower(), (
+        "object outside the scope: " + repr(s.scope_text))
+
+
+@_es_real
+def test_es_real_parse_subgate_bug_sentence_routes_statement_via_veto(
+        _transport_only, monkeypatch):
+    """WORK-ORDER PIN (round 3, item 2b), END-TO-END on the REAL es parse: real
+    classify_intent (no grammar monkeypatch), fake GLiNER2 at the measured sub-gate
+    CORRECTION@0.63 → STATEMENT@0.95 through the veto, the INTENT_ADJUDICATION LLM never
+    consulted, /retract/correct never reached. Runs on md (the FOSS-002 default); the
+    documented sm delta (mis-read imperative_root_lemma on a 1sg finite,
+    cessation_advmod={'no'}, clause_initial_markers={'no'}) is decision-neutral: none
+    intersects a removal/repair cue set."""
+    calls = _escalation_recorder(monkeypatch)
+    resp = asyncio.run(main.classify_intent(
+        {"text": _BUG_SENTENCE}, user_id="test-user-0001",
+        model=_fake_gliner(_CORRECTION_DESC, 0.63)))
+    assert resp == {"intent": "STATEMENT", "confidence": 0.95}, (
+        "the real-parse bug sentence was routed destructive: " + repr(resp))
+    assert calls == [], "escalation must not be consulted: " + str(len(calls)) + " call(s)"
+    assert main._INTENT_LAYER_STATS.get("test-use", {}).get("negated_statement_veto", 0) >= 1
+
+
+@_es_real
+def test_es_real_parse_affirmative_control_still_escalates(_transport_only, monkeypatch):
+    """WORK-ORDER PIN (round 3, item 2c): the AFFIRMATIVE control on the real es parse has
+    no negation → no scope → no veto → the escalation still owns the sub-gate band
+    (contract frozen around FOSS-012)."""
+    calls = _escalation_recorder(monkeypatch)
+    resp = asyncio.run(main.classify_intent(
+        {"text": "Uso el puerto 9004 en el servidor principal."}, user_id="test-user-0001",
+        model=_fake_gliner(_CORRECTION_DESC, 0.63)))
+    assert resp["intent"] == "CORRECTION", (
+        "the affirmative control changed route: " + repr(resp))
+    assert len(calls) == 1, "escalation must still be consulted exactly once: " + repr(calls)
+
+
+# ---- the same proofs on the MEASURED sm parse shape, hand-built (green/red-checkable
+# ---- in a no-es-model env; the REAL analyzer + REAL decision + REAL endpoint run) ----
+
+
+def test_hand_es_measured_parse_yields_a_sentential_negation_scope(monkeypatch):
+    """The measured sm UD shape through the REAL analyzer: exactly one scope, cue "no",
+    predicate "uso", full verb-phrase extent, SENTENTIAL (never the structural-denial
+    shape). Red pre-fix: scopes=[]."""
+    monkeypatch.setattr(ling_mod, "_SPACY_MODEL", "es_core_news_sm")
+    monkeypatch.setattr(ling_mod, "_nlp", lambda text: _hand_es_bug_doc())
+    scopes = analyze_negation_scopes(_BUG_SENTENCE)
+    assert scopes and len(scopes) == 1, "scopes=" + repr(scopes)
+    s = scopes[0]
+    assert (s.cue_text or "").lower() == "no" and s.predicate_text.lower() == "uso", repr(s)
+    assert s.predicates_nominal is False and s.two_referential_poles is False, repr(s)
+    assert "puerto" in (s.scope_text or "").lower(), (
+        "object outside the scope: " + repr(s.scope_text))
+
+
+def test_hand_es_measured_parse_veto_decision_is_true(monkeypatch):
+    """The veto DECISION on the measured parse's REAL grammar facts: scopes + directive
+    both from the real analyzers (the sm artifacts — imperative_root_lemma on the 1sg
+    finite, cessation_advmod={'no'}, clause_initial_markers={'no'} — must NOT block: none
+    intersects a removal/repair cue set)."""
+    monkeypatch.setattr(ling_mod, "_SPACY_MODEL", "es_core_news_sm")
+    monkeypatch.setattr(ling_mod, "_nlp", lambda text: _hand_es_bug_doc())
+    scopes = analyze_negation_scopes(_BUG_SENTENCE)
+    directive = analyze_directive(_BUG_SENTENCE)
+    assert _sentential_negation_blocks_destructive(scopes, directive) is True
+
+
+def test_hand_es_measured_parse_subgate_routes_statement_via_veto(
+        _transport_only, monkeypatch):
+    """END-TO-END on the measured parse shape: sub-gate CORRECTION@0.63 → STATEMENT@0.95
+    via the veto, escalation never consulted. Red pre-fix: the sentence fell through the
+    empty-scope fail-safe into the sub-gate escalation (the live contradiction)."""
+    monkeypatch.setattr(ling_mod, "_SPACY_MODEL", "es_core_news_sm")
+    monkeypatch.setattr(ling_mod, "_nlp", lambda text: _hand_es_bug_doc())
+    calls = _escalation_recorder(monkeypatch)
+    resp = asyncio.run(main.classify_intent(
+        {"text": _BUG_SENTENCE}, user_id="test-user-0001",
+        model=_fake_gliner(_CORRECTION_DESC, 0.63)))
+    assert resp == {"intent": "STATEMENT", "confidence": 0.95}, (
+        "the measured-parse bug sentence was routed destructive: " + repr(resp))
+    assert calls == [], "escalation must not be consulted: " + str(len(calls)) + " call(s)"
+
+
+def test_en_twin_real_parse_scope_is_byte_identical_across_the_ud_arm():
+    """The UD arm must not move the EN twin: "not" carries the Penn neg arc (fires in the
+    unchanged arm); no token of the twin parse satisfies the UD arm (advmod/obl + closed-
+    class negator lemma + verb governor), so the twin's scope facts are the pre-arm facts.
+    Skips without a model — the twin's no-model coverage lives in the decision pins."""
+    if not linguistics_available():
+        pytest.skip("SPACY_MODEL unset — en twin covered by the no-model pins")
+    scopes = analyze_negation_scopes(_EN_TWIN)
+    assert scopes, "the en twin lost its Penn-neg scope"
+    assert all(s.cue_text.lower() == "not" for s in scopes), repr(scopes)
+    assert all(not (s.predicates_nominal or s.two_referential_poles) for s in scopes)
+
 
 
