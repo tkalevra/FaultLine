@@ -14847,6 +14847,89 @@ def _attribute_leg_outcome(cur, subject_uuid, stated_new_value, since):
     return None
 
 
+# ── FOSS-008: SUBJECT-SENTENCE AGREEMENT GATE (plain-language retraction) ──────────────────
+# The measured FOSS-008 wound: "olvida que tengo una gata que se llama Fraggle" resolved
+# its subject to the WRONG entity (the server) and the retraction retired the SERVER's
+# attributes while the cat survived — wrong-entity destruction from one LLM guess.
+# Language models disagree about WHICH entity a sentence names; the sentence itself never
+# does. Before any destructive write, the resolved subject must be GROUNDED IN THE USER'S
+# OWN WORDS — deterministic string/alias overlap, no LLM opinion:
+#   grounded(alias)  := the alias appears in the sentence at word boundaries, or every
+#                       meaningful token (len >= 3) of the alias appears in it;
+#   subject grounded := ANY stored alias of the subject is grounded (an entity is named by
+#                       the alias the user used, never by all of them);
+#   verdict          := "no_match"  — the subject grounds nowhere in the sentence (refuse;
+#                                    write NOTHING; name the resolved subject either way);
+#                        "ambiguous" — MORE THAN ONE non-speaker entity grounds in the
+#                                    sentence (return the candidates, retire nothing);
+#                        None        — the subject is the sentence's unique non-speaker
+#                                    entity: proceed.
+# The speaker's own entity (user_id) is exempt: first-person retractions resolve to the
+# speaker by identity, and the speaker is presupposed in every one of their sentences.
+# Probe failure fails CLOSED: an agreement probe that cannot run never admits a
+# destructive write (the same discipline as the replay-retirement freeze — a lookup
+# failure never un-retires).
+_AGREEMENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_AGREEMENT_MIN_TOKEN = 3
+
+
+def _agreement_tokens(s: str) -> set:
+    return {t for t in _AGREEMENT_TOKEN_RE.findall(str(s or "").lower())}
+
+
+def _alias_grounded(alias: str, sentence_norm: str, sentence_tokens: set) -> bool:
+    a = str(alias or "").lower().strip()
+    if len(a) < 2:
+        return False
+    # word-boundary containment first — the alias as a NAME in the sentence
+    pat = r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])"
+    if re.search(pat, sentence_norm):
+        return True
+    # then full coverage of the alias's meaningful tokens
+    toks = {t for t in _agreement_tokens(a) if len(t) >= _AGREEMENT_MIN_TOKEN}
+    return bool(toks) and toks <= sentence_tokens
+
+
+def _retraction_subject_agreement(cur, text, subject_uuid, user_id):
+    """Deterministic subject↔sentence agreement for plain-language retractions.
+    Returns (verdict, candidates, subject_aliases): verdict None = pass; candidates are
+    [{'entity_id', 'alias'}] for every non-speaker entity the sentence grounds."""
+    if not subject_uuid or subject_uuid == user_id:
+        return None, [], []
+    sentence_norm = " ".join(str(text or "").split()).lower()
+    sentence_tokens = _agreement_tokens(sentence_norm)
+    try:
+        cur.execute(
+            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+            "ORDER BY is_preferred DESC, alias",
+            (subject_uuid,))
+        subject_aliases = [r[0] for r in cur.fetchall() if r[0]]
+        cur.execute("SELECT entity_id, alias FROM entity_aliases")
+        all_rows = [(r[0], r[1]) for r in cur.fetchall() if r[0] and r[1]]
+    except Exception as e:  # noqa: BLE001 — fail CLOSED: no probe, no destructive write
+        log.warning("retract.agreement_probe_failed", error=str(e)[:120])
+        return "no_match", [], []
+    subject_grounded = any(
+        _alias_grounded(a, sentence_norm, sentence_tokens) for a in subject_aliases)
+    grounded: dict = {}
+    for ent, alias in all_rows:
+        if ent == user_id:
+            continue  # the speaker is presupposed in their own sentences
+        if _alias_grounded(alias, sentence_norm, sentence_tokens):
+            grounded.setdefault(ent, alias)
+    if not subject_grounded:
+        return "no_match", [
+            {"entity_id": ent, "alias": alias} for ent, alias in grounded.items()], \
+            subject_aliases
+    if any(ent != subject_uuid for ent in grounded):
+        cands = [{"entity_id": ent, "alias": alias} for ent, alias in grounded.items()]
+        if not any(c["entity_id"] == subject_uuid for c in cands):
+            cands.append({"entity_id": subject_uuid,
+                          "alias": (subject_aliases[0] if subject_aliases else "")})
+        return "ambiguous", cands, subject_aliases
+    return None, [], subject_aliases
+
+
 # ── NAME-REPAIR CORRECTION: the GRAMMAR owns the subject, not the LLM's guess ─────────────────────
 # THE DEFECT THIS CLOSES (measured end-to-end on a fresh tenant, through the MCP door):
 #   1. "My sister Nora lives in Toronto."           → (user, sibling_of, nora); Nora is her own
@@ -60125,6 +60208,48 @@ def correct_fact(req: FactCorrectionRequest):
                     status="failed",
                     message=f"Could not resolve entity '{subject_name}' — retraction intent noted for review"
                 )
+
+        # ── FOSS-008: SUBJECT-SENTENCE AGREEMENT GATE (plain-language retractions) ─────
+        # Before ANY destructive write: the resolved subject must be grounded in the
+        # user's own words. Deterministic alias/string overlap — no LLM opinion. Mismatch
+        # → refuse (no_match), write NOTHING, name the resolved subject; several plausible
+        # entities → return the candidates (ambiguous), retire nothing. (Full contract on
+        # _retraction_subject_agreement.)
+        if is_retraction and subject_uuid:
+            try:
+                with db.cursor() as _ag_cur:
+                    (_ag_verdict, _ag_cands,
+                     _ag_aliases) = _retraction_subject_agreement(
+                        _ag_cur, req.text, subject_uuid, user_id)
+            except Exception as _ag_err:  # noqa: BLE001 — fail CLOSED (see helper)
+                log.warning("correct_fact.agreement_gate_failed", error=str(_ag_err)[:120])
+                _ag_verdict, _ag_cands, _ag_aliases = "no_match", [], []
+            if _ag_verdict:
+                _ag_subject_label = _correction_subject_label(
+                    db, subject_uuid, user_id, None, None, fallback=subject_name)
+                _cand_txt = ", ".join(
+                    f"'{c.get('alias')}'" for c in (_ag_cands or [])) or "nothing in your sentence"
+                if _ag_verdict == "no_match":
+                    _ag_msg = (f"I can't tell from your sentence that you mean "
+                               f"'{_ag_subject_label}' — that name doesn't appear in what "
+                               f"you wrote (your sentence names: {_cand_txt}). Nothing was "
+                               "deleted. Rephrase naming the thing you want forgotten.")
+                else:
+                    _ag_msg = (f"More than one thing in your sentence could be the one to "
+                               f"forget ({_cand_txt}) and I won't guess. Nothing was "
+                               "deleted. Name the specific one.")
+                log.warning("correct_fact.subject_agreement_refused",
+                            verdict=_ag_verdict,
+                            subject=subject_uuid,
+                            subject_aliases=_ag_aliases,
+                            candidates=_ag_cands,
+                            user_id=user_id[:8])
+                return FactCorrectionResponse(
+                    status=_ag_verdict,
+                    subject_uuid=subject_uuid,
+                    subject_name=_ag_subject_label,
+                    candidates=_ag_cands,
+                    message=_ag_msg)
 
         if not old_rel_type:
             log.warning("correct_fact.extraction_incomplete",

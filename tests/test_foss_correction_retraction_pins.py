@@ -711,3 +711,78 @@ def test_stored_old_preferred_over_extractor(monkeypatch):
     assert out.get("facts_superseded") == 1, out
     assert "10.0.1.9" in str(out.get("message")), (
         "the disagreement must be surfaced, not swallowed")
+
+
+# =============================================================================
+# FOSS-008 - the subject-sentence agreement gate: a plain-language retraction may
+# only retire what the USER'S OWN WORDS ground.
+# =============================================================================
+
+def _gata_age_tenant():
+    t = _default_tenant()
+    t.attributes.append(_attr(GATA, "age", "3"))
+    t.attributes.append(_attr(SERVIDOR, "has_ip", "10.0.1.5"))
+    return t
+
+
+def test_agreement_pin_retract_naming_gata_never_mutates_servidor(monkeypatch):
+    """The FOSS-008 wound: the extractor resolves the subject of the CAT sentence to
+    the SERVER and the lane retires the server's attributes. The resolved subject must
+    be grounded in the user's own words; a mismatch refuses with no_match and writes
+    NOTHING. The response still names the resolved subject and the candidates."""
+    t = _gata_age_tenant()
+    counts = (t.entity_count(), t.live_fact_count(), t.live_attr_count())
+    extraction = {"subject": "servidor", "rel_type": "has_ip",
+                  "object": "10.0.1.5", "action": "remove",
+                  "dimension": "SCALAR", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("olvida que tengo una gata que se llama Fraggle")
+
+    assert out["status"] == "no_match", out
+    assert out.get("subject_uuid") == SERVIDOR, out   # resolved subject, named either way
+    assert out.get("subject_name"), out
+    live_ip = [a for a in t.attributes
+               if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
+               and not a["superseded_at"]]
+    assert live_ip, "the un-grounded entity must survive untouched"
+    assert (t.entity_count(), t.live_fact_count(),
+            t.live_attr_count()) == counts, "a refused retraction writes nothing"
+    assert not t.history, t.history
+
+
+def test_agreement_positive_control_devbox_ip_still_retires(monkeypatch):
+    """Doc pin (iii): a retraction whose subject IS grounded still retires normally."""
+    t = _gata_age_tenant()
+    extraction = {"subject": "devbox", "rel_type": "has_ip",
+                  "object": "10.0.1.5", "action": "remove",
+                  "dimension": "SCALAR", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("olvida la IP de DevBox")
+
+    assert out["status"] == "corrected", out
+    live_ip = [a for a in t.attributes
+               if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
+               and not a["superseded_at"]]
+    assert not live_ip, "the grounded retraction must retire the named value"
+    assert any(h["attribute"] == "has_ip" and h["action"] == "retired"
+               for h in t.history), t.history
+
+
+def test_agreement_ambiguous_returns_candidates_retires_nothing(monkeypatch):
+    """Two entities grounded by one sentence: the lane refuses to guess, returns the
+    candidates, and retires nothing."""
+    t = _gata_age_tenant()
+    extraction = {"subject": "gata", "rel_type": "age",
+                  "object": "3", "action": "remove",
+                  "dimension": "SCALAR", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("la gata y el servidor")
+
+    assert out["status"] == "ambiguous", out
+    live_age = [a for a in t.attributes
+                if a["entity_id"] == GATA and a["attribute"] == "age"
+                and not a["superseded_at"]]
+    assert live_age, "an ambiguous retraction must retire nothing"
+    assert out.get("candidates"), out
+    cands = str(out["candidates"])
+    assert GATA in cands and SERVIDOR in cands, out
