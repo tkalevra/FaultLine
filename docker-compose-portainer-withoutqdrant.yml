@@ -91,7 +91,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 90s
+      # First boot loads the baked models: 5-15 min on commodity CPUs (FOSS-007).
+      start_period: 15m
     depends_on:
       postgres:
         condition: service_healthy
@@ -142,6 +143,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+      # A first boot runs initdb before pg_isready can answer anything.
+      start_period: 120s
     logging: *default-logging
     networks:
       - openweb_ui_default
