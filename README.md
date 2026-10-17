@@ -227,6 +227,8 @@ FaultLine hooks into an LLM you already run — it doesn't host one. (If you *do
 
 **No model downloads at first start.** The GLiNER2 extraction model, the local nomic embedding model and the spaCy linguistic model are downloaded once, during `docker compose build`, and baked into the image — the runtime then starts with `HF_HUB_OFFLINE=1` and cannot download anything. The first **start** only loads the baked weights from the image's cache, which is the one slow step of the install (see the next note).
 
+> **⏱ First boot is slow — that's normal.** Loading the baked models takes **5–15 minutes** on commodity CPUs (single-core, little log output); a warm restart is back in **1–2 minutes**. `docker compose ps` can report the API as `(unhealthy)` during the first minutes of a first boot — the healthcheck's `start_period` covers the window. Watch it work: `docker compose logs -f faultline`.
+
 ### First login and seats
 
 FaultLine (FOSS) is one instance with **up to 5 seats**. A seat is one person's private memory

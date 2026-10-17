@@ -156,7 +156,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      # First boot loads the baked models: 5-15 min on commodity CPUs (FOSS-007). Give the
+      # container that whole window before "unhealthy" starts; warm restarts answer in
+      # 1-2 min and the 30 s interval keeps those sharp.
+      start_period: 15m
 
   # ── MCP server — same memory, exposed to Claude Desktop / any MCP client ─────
   faultline-mcp:
@@ -225,6 +228,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+      # A first boot runs initdb before pg_isready can answer anything.
+      start_period: 120s
     networks:
       - faultline-net
     restart: unless-stopped
@@ -247,6 +252,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 60s
     networks:
       - faultline-net
     restart: unless-stopped

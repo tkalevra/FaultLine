@@ -800,7 +800,8 @@ def print_next_steps(mcp_key):
     hr()
     print(bold("You're set. Next steps:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
-    print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
+    print(f"  2. First boot loads the baked models: expect {bold('5-15 min')} on commodity CPUs")
+    print(f"     (warm restart 1-2 min). Then check:  {cyan('curl http://localhost:8000/health')}")
     print(f"       expect: {dim(chr(34) + 'database:ok, llm:ok' + chr(34))}")
     print(f"  3. The live integration path is the MCP server on {bold(':8002')}.")
     if mcp_key:
@@ -822,13 +823,18 @@ def print_next_steps(mcp_key):
     hr()
 
 
-def _poll_health(timeout=240):
+def _poll_health(timeout=900):
     """Poll the backend /health after a build so the user sees it actually came up.
 
-    The first boot applies every migration and loads the models: measured at about two
-    minutes on a fresh install, so 80 s reported 'not healthy yet' for a healthy stack."""
-    print(dim("  waiting for the backend to come up (first boot takes ~2 minutes)..."))
-    for _ in range(max(1, timeout // 5)):
+    The first boot applies every migration and loads the baked models: measured at
+    5-15 minutes on commodity CPUs (warm restarts 1-2 minutes), so the wait covers the
+    whole first-boot window and prints a progress line every minute — the old 240 s
+    budget just gave up on a healthy stack while it was still loading (FOSS-007)."""
+    print(dim("  waiting for the backend to come up (first boot 5-15 min on commodity CPUs, warm restart 1-2 min)..."))
+    start = time.monotonic()
+    deadline = start + timeout
+    next_progress = 60
+    while time.monotonic() < deadline:
         try:
             _, body = _http_get("http://localhost:8000/health", timeout=4)
             d = json.loads(body)
@@ -837,6 +843,10 @@ def _poll_health(timeout=240):
                 print(yellow("    (llm not ok — check LLM_BASE_URL and that your model is loaded/pulled)"))
             return
         except Exception:
+            elapsed = time.monotonic() - start
+            if elapsed >= next_progress:
+                print(dim(f"  still loading models ({int(elapsed)}s)..."))
+                next_progress += 60
             time.sleep(5)
     print(yellow("  ! not healthy yet within the wait — check: docker compose logs faultline"))
 
