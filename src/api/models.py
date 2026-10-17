@@ -341,6 +341,9 @@ class FactCorrectionResponse(BaseModel):
     confidence: float = 0.0
     facts_superseded: int = 0
     hierarchies_modified: list[str] = []
+    # FOSS-008: when a plain-language retraction is refused, the OTHER entities the
+    # sentence grounds ([{'entity_id', 'alias'}]) - the ask-again candidates.
+    candidates: Optional[list[dict]] = None
     message: Optional[str] = None
     error: Optional[str] = None
 
