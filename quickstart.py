@@ -114,8 +114,18 @@ def check_prereqs():
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
+# One User-Agent for EVERY outbound call (FOSS-001). Gateways with bot filtering
+# (Cerebras, Cloudflare-class edges) 403 urllib's default "Python-urllib/3.x" while the
+# same key+endpoint answers 200 to a named client — so the wizard told people with valid
+# keys that their auth failed. Set HERE, once: call sites pass only their auth headers
+# and can never forget (or override with) a default-UA request.
+USER_AGENT = "FaultLine-Quickstart/1.0 (+https://github.com/tkalevra/FaultLine)"
+
+
 def _http_get(url, headers=None, timeout=8):
-    req = urllib.request.Request(url, headers=headers or {})
+    merged = {"User-Agent": USER_AGENT}
+    merged.update(headers or {})
+    req = urllib.request.Request(url, headers=merged)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
@@ -168,9 +178,30 @@ def probe_models(backend, base_url, key):
             return True, [i for i in ids if i], f"HTTP {status}, {len(ids)} model(s)"
 
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, [], f"HTTP {e.code} — auth failed (check your API key)"
-        return False, [], f"HTTP {e.code} — endpoint error"
+        body = ""
+        try:
+            body = e.read(300).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        # "auth failed" is reserved for endpoints whose own body says so (FOSS-001):
+        # a bare 403 from a gateway is usually its bot filter (Cerebras/Cloudflare reject
+        # default Python user agents), not a bad key.
+        provider_says_auth = bool(re.search(
+            r"invalid.*key|api[_ -]?key|unauthorized|authentication|permission denied|forbidden",
+            body, re.I))
+        if e.code == 401 or (e.code == 403 and provider_says_auth):
+            hint = f"HTTP {e.code} — auth failed (check your API key)"
+            if body:
+                hint += f" — endpoint said: {body}"
+            return False, [], hint
+        if e.code == 403:
+            return False, [], (
+                "HTTP 403 — the endpoint refused the request. Some gateways (Cerebras,"
+                " Cloudflare-class bot filters) block default Python user agents; this wizard"
+                " sends its own User-Agent, so if the key works elsewhere (e.g. curl) the"
+                " gateway is still filtering it — 'type the model id' gets you past this."
+                + (f" Endpoint said: {body}" if body else ""))
+        return False, [], f"HTTP {e.code} — endpoint error" + (f" — {body}" if body else "")
     except Exception as e:
         return False, [], f"{type(e).__name__}: {e}"
     return False, [], "unsupported backend"
