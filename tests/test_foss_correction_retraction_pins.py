@@ -623,3 +623,91 @@ def test_honest_fail_pin_true_no_match_writes_nothing(monkeypatch):
     assert (t.entity_count(), t.live_fact_count(), t.live_attr_count(),
             t.live_staged_count()) == counts
     assert not t.history, t.history
+
+
+# =============================================================================
+# FOSS-010 - the reported old value comes from STORAGE, never from the
+# correction-extractor's re-derivation.
+# =============================================================================
+
+def test_fabrication_pin_no_prior_row_reports_no_fabricated_old(monkeypatch):
+    """The en/it wound: no prior row existed anywhere, yet the response announced
+    lives_at=10.0.1.9 (a value never stored) and facts_superseded=1. A first-value
+    INSERT is not a supersede: old=None, facts_superseded=0, status says stored."""
+    t = _default_tenant()   # DevBox holds NO attribute at all
+    extraction = {"subject_name": "DevBox", "old_rel_type": "lives_at",
+                  "old_value": "10.0.1.9", "new_rel_type": "lives_at",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox ahora es 10.0.1.10.")
+
+    assert out.get("old_value") is None, out          # NEVER the fabricated 10.0.1.9
+    assert out.get("facts_superseded") == 0, out      # first-value INSERT is not a supersede
+    assert "10.0.1.9" not in str(out), out            # the fabrication must appear nowhere
+    assert out["status"] in ("stored", "corrected"), out
+    # the value DID land (a first value recorded)
+    live = [a for a in t.attributes
+            if a["entity_id"] == SERVIDOR and a["attribute"] == "lives_at"]
+    assert live and live[0]["value_text"] == "10.0.1.10", t.attributes
+    assert not t.history, "a first-value INSERT must not write a supersede history row"
+
+
+def test_stored_old_preferred_over_extractor(monkeypatch):
+    """A real prior row (10.0.1.5) plus an extractor that re-derives 10.0.1.9: the
+    response reports the STORED prior and says it preferred storage."""
+    t = _devbox_ip_tenant()   # has_ip = 10.0.1.5, live
+    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
+                  "old_value": "10.0.1.9", "new_rel_type": "has_ip",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox cambio: ahora es 10.0.1.10.")
+
+    assert out["status"] == "corrected", out
+    assert out.get("old_value") == "10.0.1.5", out    # STORED prior, not the extractor's 10.0.1.9
+    assert out.get("new_value") == "10.0.1.10", out
+    assert out.get("facts_superseded") == 1, out
+    assert "10.0.1.9" in str(out.get("message")), (
+        "the disagreement must be surfaced, not swallowed")
+
+
+# =============================================================================
+# FOSS-010 - the reported old value comes from STORAGE, never from the
+# correction-extractor's re-derivation.
+# =============================================================================
+
+def test_fabrication_pin_no_prior_row_reports_no_fabricated_old(monkeypatch):
+    t = _default_tenant()
+    extraction = {"subject_name": "DevBox", "old_rel_type": "lives_at",
+                  "old_value": "10.0.1.9", "new_rel_type": "lives_at",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox ahora es 10.0.1.10.")
+
+    assert out.get("old_value") is None, out
+    assert out.get("facts_superseded") == 0, out
+    assert "10.0.1.9" not in str(out), out
+    assert out["status"] in ("stored", "corrected"), out
+    live = [a for a in t.attributes
+            if a["entity_id"] == SERVIDOR and a["attribute"] == "lives_at"]
+    assert live and live[0]["value_text"] == "10.0.1.10", t.attributes
+    assert not t.history, "a first-value INSERT must not write a supersede history row"
+
+
+def test_stored_old_preferred_over_extractor(monkeypatch):
+    t = _devbox_ip_tenant()
+    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
+                  "old_value": "10.0.1.9", "new_rel_type": "has_ip",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox cambio: ahora es 10.0.1.10.")
+
+    assert out["status"] == "corrected", out
+    assert out.get("old_value") == "10.0.1.5", out
+    assert out.get("new_value") == "10.0.1.10", out
+    assert out.get("facts_superseded") == 1, out
+    assert "10.0.1.9" in str(out.get("message")), (
+        "the disagreement must be surfaced, not swallowed")

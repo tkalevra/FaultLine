@@ -59721,6 +59721,13 @@ def correct_fact(req: FactCorrectionRequest):
             # extractor's guess onto the entity's real stored attribute. Reported back so the
             # response describes the ROW, not the guess — see the response construction.
             _pinned_scalar_attr = None
+            # ── FOSS-010: the response's OLD VALUE comes from STORAGE, never from the ────
+            # extractor's re-derivation. These carry what the scalar leg actually read:
+            _stored_old_display = None       # the prior row's stored value (None = no prior)
+            _scalar_prior_known = False      # a prior row existed for this slot
+            _extractor_old_disagreed = False # the extractor's old contradicted the stored one
+            _scalar_leg_ran = False          # the scalar/alias leg is the leg that landed
+            _scalar_leg_status = "corrected" # corrected (supersede) | stored (first value / re-assert)
 
             # ── Break C-a (rel-type pin — user-is-truth) ──────────────────────────────
             # PIN the LLM's extracted old_rel_type to a rel the SUBJECT ACTUALLY HOLDS before any
@@ -59984,6 +59991,25 @@ def correct_fact(req: FactCorrectionRequest):
                     # the old name still resolves), it is simply no longer the PREFERRED label. The
                     # new name becomes preferred below. This supersedes the old naming fact without
                     # losing it (mirrors entity_name_conflicts "all names preserved").
+                    # ── FOSS-010: the demoted alias IS the stored old name — read it before the
+                    # demote so the response names the STORED prior, never the extractor's guess.
+                    _scalar_leg_ran = True
+                    try:
+                        cur.execute(
+                            "SELECT alias FROM entity_aliases "
+                            "WHERE entity_id = %s AND is_preferred = true "
+                            "ORDER BY is_preferred DESC LIMIT 1", (subject_uuid,))
+                        _demoted = cur.fetchone()
+                        if _demoted and _demoted[0]:
+                            _stored_old_display = str(_demoted[0])
+                            _scalar_prior_known = True
+                            if (old_value and str(old_value).strip()
+                                    and str(old_value).strip().lower()
+                                    != _stored_old_display.lower()):
+                                _extractor_old_disagreed = True
+                    except Exception as _demote_e:  # noqa: BLE001 — reporting only
+                        log.warning("correct_fact.pref_name_prior_read_failed",
+                                    error=str(_demote_e)[:120])
                     cur.execute("""
                         UPDATE entity_aliases
                         SET is_preferred = false
@@ -60240,6 +60266,29 @@ def correct_fact(req: FactCorrectionRequest):
                              WHERE entity_id = %s AND attribute = %s
                         """, (subject_uuid, _pinned_attr))
                         _corr_prior_row = cur.fetchone()
+                        # ── FOSS-010: the OLD VALUE the response reports is read HERE, from ──
+                        # the stored prior row — never re-derived by the extractor. A prior
+                        # row absent means FIRST VALUE, and a first-value INSERT is not a
+                        # supersede (facts_superseded stays 0 and no history row is written).
+                        _stored_old_texts = (
+                            _scalar_value_texts(_corr_prior_row[0], _corr_prior_row[1],
+                                                _corr_prior_row[2], _corr_prior_row[3])
+                            if _corr_prior_row is not None else [])
+                        _scalar_prior_known = bool(_stored_old_texts)
+                        _stored_old_display = _stored_old_texts[0] if _stored_old_texts else None
+                        _scalar_leg_ran = True
+                        if (_scalar_prior_known and old_value
+                                and str(old_value).strip()
+                                and str(old_value).strip().lower()
+                                not in [t.lower() for t in _stored_old_texts]):
+                            _extractor_old_disagreed = True
+                            log.info("correct_fact.stored_old_preferred",
+                                     entity=subject_uuid, attribute=_pinned_attr,
+                                     extractor_old=str(old_value),
+                                     stored_old=_stored_old_display,
+                                     note="the correction-extractor re-derived an old "
+                                          "value that disagrees with storage; the stored "
+                                          "prior is what the response reports")
                         _corr_value_changed = _corr_prior_row is not None and (
                             _corr_prior_row[0] != value_text
                             or _corr_prior_row[1] != value_int
@@ -60344,10 +60393,16 @@ def correct_fact(req: FactCorrectionRequest):
                             log.error("correct_fact.scalar_upsert_no_row",
                                       entity=subject_uuid, attribute=_pinned_attr, new_value=new_value)
                         else:
-                            # The upsert overwrote the entity's single-valued attribute by identity
-                            # — the prior value was superseded in place. Count it so a successful
-                            # scalar correction reports facts_superseded >= 1 (user-is-truth landed).
-                            _scalar_superseded = max(_scalar_superseded, 1)
+                            # The upsert overwrote the entity's single-valued attribute by identity.
+                            # ── FOSS-010: only a REAL supersede counts. A first-value INSERT (no
+                            # prior row) and a same-value re-assert (the SS2 un-retire) are
+                            # WRITES, not supersedes — facts_superseded stays 0 and the response
+                            # status says stored, never claiming a supersede that never happened.
+                            if _corr_value_changed:
+                                _scalar_superseded = max(_scalar_superseded, 1)
+                                _scalar_leg_status = "corrected"
+                            else:
+                                _scalar_leg_status = "stored"
                             # ...and the same slot held RELATIONALLY (a pre-#52 negated quantity
                             # minted as an entity) is retired too — one slot, one live value.
                             _retire_scalar_slot_relational_twins(db, subject_uuid, _pinned_attr)
@@ -61923,6 +61978,31 @@ def correct_fact(req: FactCorrectionRequest):
                      note="response reports the attribute actually written, not the "
                           "correction-extractor's guess")
 
+        # ── FOSS-010: the reported OLD VALUE is the STORED prior row's value. The extractor's
+        # re-derived old value is fiction the moment it disagrees with storage (measured en/it:
+        # the DB had no prior row and no history row, yet the message reported
+        # lives_at=10.0.1.9 → lives_at=10.0.1.10 — a value that never existed anywhere).
+        # No prior row → old=None and the message says the first value was recorded; a
+        # disagreement → the stored value wins and the message says so.
+        _resp_old_value = old_value
+        _resp_status = "corrected"
+        _old_note = ""
+        if _scalar_leg_ran:
+            _resp_old_value = _stored_old_display
+            _resp_status = _scalar_leg_status
+            if not _scalar_prior_known:
+                _old_note = (f" (no prior value was stored — {_reported_old_rel} is now "
+                             f"{new_value}; first value recorded, nothing superseded)")
+            elif _extractor_old_disagreed:
+                _old_note = (f" (the extractor claimed the old value was {old_value}; "
+                             f"the stored prior was {_stored_old_display} — reported "
+                             "from storage)")
+            if _resp_status != "corrected":
+                log.info("correct_fact.scalar_leg_stored_not_superseded",
+                         attribute=_pinned_scalar_attr, old=_resp_old_value,
+                         note="a first-value INSERT or same-value re-assert landed; "
+                              "facts_superseded stays 0")
+
         log.info("correct_fact.success",
                 user_id=req.user_id,
                 subject=subject_uuid,
@@ -61938,11 +62018,11 @@ def correct_fact(req: FactCorrectionRequest):
             db, subject_uuid, req.user_id, old_value, new_value,
             fallback=extraction.get("subject_name"))
         response = FactCorrectionResponse(
-            status="corrected",
+            status=_resp_status,
             subject_uuid=subject_uuid,
             subject_name=_subject_label,
             old_rel_type=_reported_old_rel,
-            old_value=old_value,
+            old_value=_resp_old_value,
             new_rel_type=_reported_new_rel,
             new_value=new_value,
             dimension=dimension,
@@ -61950,7 +62030,8 @@ def correct_fact(req: FactCorrectionRequest):
             facts_superseded=_superseded_count,
             hierarchies_modified=[],
             message=(f"✓ {_subject_label}: "
-                     f"{_reported_old_rel}={old_value} → {_reported_new_rel}={new_value}")
+                     f"{_reported_old_rel}={_resp_old_value if _scalar_leg_ran else old_value} "
+                     f"→ {_reported_new_rel}={new_value}" + _old_note)
         )
 
         # Cache result for idempotency
