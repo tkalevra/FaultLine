@@ -50470,7 +50470,7 @@ def fetch_facts_from_anchor(
                         # event_date/granularity so a when-ask answered through the inverse
                         # lane can render the date (the row's own columns — no reasoning).
                         inverse_query = """
-                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, fact_provenance, event_date, event_date_granularity
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, fact_provenance, event_date, event_date_granularity, temporal_status, polarity
                             FROM facts
                             WHERE object_id = %s
                               AND rel_type = ANY(%s)
@@ -50482,7 +50482,7 @@ def fetch_facts_from_anchor(
                         cur.execute(inverse_query, (anchor_uuid, _inverse_scope_rels))
                     else:
                         inverse_query = """
-                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, fact_provenance, event_date, event_date_granularity
+                            SELECT subject_id, object_id, rel_type, confidence, fact_class, valid_from, valid_until, fact_provenance, event_date, event_date_granularity, temporal_status, polarity
                             FROM facts
                             WHERE object_id = %s
                               AND superseded_at IS NULL
@@ -50498,7 +50498,7 @@ def fetch_facts_from_anchor(
                         # when of the predication is a property of the ROW, not its direction.
                         (subject_id, object_id, rel_type_orig, confidence, fact_class,
                          valid_from, valid_until, _inv_fprov,
-                         _inv_edate, _inv_egran) = row
+                         _inv_edate, _inv_egran, _inv_ts, _inv_pol) = row
 
                         # Check metadata to determine if rel_type needs inversion
                         rel_type_lower = rel_type_orig.lower() if rel_type_orig else ""
@@ -50526,6 +50526,17 @@ def fetch_facts_from_anchor(
                                 "fact_provenance": _inv_fprov,
                                 "event_date": (_inv_edate.isoformat() if _inv_edate else None),
                                 "event_date_granularity": _inv_egran,
+                                # FOSS-013: the inverse lane IS the narrow walk shape (spine-grown
+                                # rels land here — a spine rel has no inverse metadata and takes
+                                # the fallback dict below, and the row is only reachable as
+                                # object_id = anchor). Project the ROW'S OWN temporal layer +
+                                # assertion polarity so the prose renderer negates a negated state
+                                # exactly like the legacy direct lane (same field names). Without
+                                # polarity here, recall of "Uso el puerto 9004?" anchored on the
+                                # PORT rendered "You use Puerto" from a stored polarity='negated'
+                                # row — the read side asserting the opposite of what was said.
+                                "temporal_status": _inv_ts or "now",
+                                "polarity": _inv_pol or "affirmed",
                                 "category": _get_rel_type_category(inverse_rel_type)
                             })
                         elif is_symmetric:
@@ -50543,6 +50554,9 @@ def fetch_facts_from_anchor(
                                 "fact_provenance": _inv_fprov,
                                 "event_date": (_inv_edate.isoformat() if _inv_edate else None),
                                 "event_date_granularity": _inv_egran,
+                                # FOSS-013: same narrow-lane projection as the full-invert dict.
+                                "temporal_status": _inv_ts or "now",
+                                "polarity": _inv_pol or "affirmed",
                                 "category": _get_rel_type_category(rel_type_final)
                             })
                         else:
@@ -50562,6 +50576,13 @@ def fetch_facts_from_anchor(
                                 "fact_provenance": _inv_fprov,
                                 "event_date": (_inv_edate.isoformat() if _inv_edate else None),
                                 "event_date_granularity": _inv_egran,
+                                # FOSS-013: THE wound dict — a spine-grown rel ("usar") carries no
+                                # inverse metadata, so the (user, usar, puerto) row reaches recall
+                                # through THIS fallback with the original direction preserved
+                                # ("You use Puerto"). Project the row's temporal layer + polarity
+                                # so the renderer negates it exactly like the legacy direct lane.
+                                "temporal_status": _inv_ts or "now",
+                                "polarity": _inv_pol or "affirmed",
                                 "category": _get_rel_type_category(rel_type_orig)
                             })
 
