@@ -60,6 +60,14 @@ elif mode == "morph":
 elif mode == "fp_poss":
     from src.api.main import _query_has_first_person_possessive
     out = [bool(_query_has_first_person_possessive(q)) for q in items]
+elif mode == "names":
+    # FOSS-011: the UD naming frames' asserted names per sentence (licensed_naming_names).
+    # None (layer down) is distinguishable from () (no frame) so a pin never confuses a
+    # skip-worthy environment with a grammar verdict.
+    from src.extraction import linguistics as m
+    for s in items:
+        names = m.licensed_naming_names(s)
+        out.append(None if names is None else list(names))
 elif mode == "walk":
     import uuid
     import psycopg2

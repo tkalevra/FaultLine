@@ -13597,6 +13597,56 @@ def _is_source_goal_transition_statement(text: str) -> bool:
         return False
 
 
+def _is_first_mention_naming_statement(text: str) -> bool:
+    """Deterministic PRE-GLINER2 guard: a declarative FIRST-MENTION NAMING turn.
+
+    [FOSS-011, it branch] "Il mio server principale si chiama DevBox, il suo IP è 10.0.1.5." is a
+    naming STATEMENT ("X is called Y" — the thing gets its prefLabel; measured on es
+    ("se llama") and en ("is called"): the same shape classifies STATEMENT there), yet on it
+    GLiNER2's verbose CORRECTION label scores it above the gate DETERMINISTICALLY, so
+    remember_facts diverted it to /retract/correct: the lane minted a subject, flipped
+    pref_name, and the owns edge, the alias and the IP were never captured. Mirror the
+    source→goal transition guard: when the turn's grammar IS a licensed naming frame asserting
+    exactly ONE name (linguistics.licensed_naming_names — the UD reflexive-clitic frame; an
+    English parse can never produce it, so en installs are byte-identical), route STATEMENT
+    deterministically BEFORE GLiNER2 (kept pure, no label edits — Pitfall 11).
+
+    TWO declines keep every real correction on today's ladder:
+      • the REPLACIVE shape — two DISTINCT names asserted in one turn
+        ("il mio server si chiama Apollo … anzi, si chiama DevBox") — is a rename conflict,
+        never a first mention;
+      • ANY correction/retraction cue (`_spacy_cue_route`) — a marked or contrastive turn
+        defers to the correction dual-gate exactly as the transition guard does.
+
+    Grammar/morphology only — no word list, no DB. Fail-safe: layer unavailable / parse miss /
+    any error → False (fall through to GLiNER2, never a silent drop)."""
+
+    try:
+        from src.extraction.linguistics import (
+            licensed_naming_names as _lnn,
+            is_interrogative_clause as _is_interro_nm,
+            linguistics_available as _ling_ok_nm,
+        )
+        if not _ling_ok_nm():
+            return False
+        # A real question is never a naming statement — leave it for GLiNER2 / the QUERY route.
+        if _is_interro_nm(text) is True:
+            return False
+        # Exactly ONE asserted name = first mention; 0 = no naming frame here, >= 2 = the
+        # replacive ("X … anzi, Y") shape the correction lane owns.
+        names = _lnn(text)
+        if not names or len(names) != 1:
+            return False
+        # Defer to the correction dual-gate for any repair/removal cue (same discipline as the
+        # transition guard above: if the cue detector has an opinion, it wins).
+        cue, _tier = _spacy_cue_route(text)
+        if cue is not None:
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — fail-safe: never block GLiNER2 on a parse miss
+        return False
+
+
 def _pin_scalar_attribute_to_known(cur, entity_id: str, corrected_attr: str,
                                    dsn: str = None, schema: str = None,
                                    old_value: str = None) -> str:
@@ -14649,6 +14699,23 @@ NAME_REPAIR_CORRECTION: bool = os.environ.get(
     "NAME_REPAIR_CORRECTION", "true"
 ).strip().lower() not in ("0", "false", "no")
 
+# ── FIRST-MENTION NAMING GUARD (FOSS-011, it branch) ─────────────────────────────────────────
+# On the it install, a FIRST-MENTION naming turn ("Il mio server principale si chiama DevBox,
+# il suo IP è 10.0.1.5.") classifies CORRECTION deterministically (GLiNER2's verbose label; the
+# same shape is STATEMENT on es "se llama" and en "is called"). The correction lane then had no
+# prior to protect and no replacive frame to read — it MINTED a "server" subject, flipped
+# pref_name server→devbox, and the owns edge / alias / IP were never captured (status
+# "corrected", committed=0). This guard lets /retract/correct DECLINE exactly that turn:
+# naming edges present + one name per subject + NO stored bearer (nothing to supersede) + no
+# correction cue → respond first_mention_naming so the MCP routes the turn back through the
+# STATEMENT path, where the naming chains capture owns + alias (+ the IP scalar) in one call.
+# A stored bearer (a plausible rename), a two-name replacive turn, or ANY cue → today's path
+# byte-identical. Read-only (parse + cue + indexed alias probe), flag OFF → byte-for-byte
+# legacy. Fail-safe at every step → False (today's path). Default ON.
+NAME_FIRST_MENTION_GUARD: bool = os.environ.get(
+    "NAME_FIRST_MENTION_GUARD", "true"
+).strip().lower() not in ("0", "false", "no")
+
 
 # ── SPEAKER-RENAME REFUSAL: a correction that names a THIRD PARTY never lands on the first person ─
 # THE DEFECT THIS CLOSES (measured on a fresh tenant): "actually my sister's name is thorne, not
@@ -15419,6 +15486,73 @@ def _dosage_correction_frame_floor(text: str):
         return None
     except Exception:  # noqa: BLE001 — fail-safe: floor decline → today's path
         return None
+
+
+def _first_mention_naming_correction(text: str, cur) -> bool:
+    """FOSS-011 FIRST-MENTION GUARD: is this CORRECTION-classified turn actually a naming
+    statement with NOTHING to supersede?
+
+    True ONLY when ALL of these hold (any miss → False = today's path, byte-identical):
+      • the grammar layer is up, and the turn carries NO correction/retraction cue
+        (`_spacy_cue_route` — a marked or contrastive repair defers to the live ladder);
+      • the deterministic deriver files naming edges for the turn (pref_name / also_known_as —
+        the naming chains' own output, both schemes), and NO subject asserts TWO distinct
+        names in one turn ("si chiama X … anzi, si chiama Y" — the REPLACIVE shape stays a
+        correction);
+      • LOOKUP-ONLY (the same discipline as `_detect_name_repair_correction`): NO entity is
+        stored under any naming-edge subject — a stored bearer is a plausible rename/correction
+        target, so today's lane owns it; nothing stored = nothing to supersede, i.e. the
+        correction lane would MINT (the FOSS-011 wound: "server" minted + pref_name flipped,
+        owns/alias/IP lost).
+
+    Read-only: one parse, one cue probe, one indexed alias probe per subject. No LLM, no
+    cosine, no write. Caller (POST /retract/correct) uses True to decline the destructive
+    correction and hand the turn back to the statement path."""
+    if not text or not text.strip():
+        return False
+    try:
+        from src.extraction.linguistics import (
+            derive_sentence_facts as _dsf_fm,
+            linguistics_available as _ling_ok_fm,
+        )
+        if not _ling_ok_fm():
+            return False
+        # Any correction/retraction cue → a marked repair keeps today's path.
+        _cue, _tier = _spacy_cue_route(text)
+        if _cue is not None:
+            return False
+        # Marker-stripped text + the session reference, exactly as the name-repair lane does.
+        _ref_fm, _clean_fm = _compute_ingest_reference_and_text(text)
+        _facts_fm = _dsf_fm(_clean_fm, _ref_fm) or []
+    except Exception as e:  # noqa: BLE001 — fail-safe: a parse miss is never a first mention
+        log.warning("first_mention_naming.derive_failed", error=str(e)[:160])
+        return False
+    _naming_fm = [f for f in _facts_fm
+                  if (getattr(f, "rel_type", "") or "").strip().lower()
+                  in ("pref_name", "also_known_as")]
+    if not _naming_fm:
+        return False
+    _per_subject_fm: dict[str, set[str]] = {}
+    for f in _naming_fm:
+        s = (getattr(f, "subject", "") or "").strip().lower()
+        o = (getattr(f, "object", "") or "").strip().lower()
+        if not s or not o:
+            return False  # malformed edge — decline the guard, today's path
+        _per_subject_fm.setdefault(s, set()).add(o)
+    # Replacive shape: one subject asserted two names in one turn → a rename conflict.
+    if any(len(v) > 1 for v in _per_subject_fm.values()):
+        return False
+    # LOOKUP-ONLY: the naming subject must be stored NOWHERE — else something real could be
+    # superseded and today's correction lane is the right owner.
+    try:
+        for _subj_fm in _per_subject_fm:
+            cur.execute("SELECT 1 FROM entity_aliases WHERE alias = %s LIMIT 1", (_subj_fm,))
+            if cur.fetchone():
+                return False
+    except Exception as e:  # noqa: BLE001 — a lookup failure must never route the guard
+        log.warning("first_mention_naming.alias_probe_failed", error=str(e)[:160])
+        return False
+    return True
 
 
 def _detect_name_repair_correction(text: str, cur, user_id: str | None = None, db=None):
@@ -19628,6 +19762,36 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
             log.debug("classify_intent.transition_preroute_failed",
                       user_id=user_id[:8], error=str(_tr_err)[:120])
 
+    # === PRE-GLINER2 FIRST-MENTION NAMING ROUTE (FOSS-011, it branch) ===
+    # A declarative naming a thing for the FIRST time ("il mio server principale si chiama
+    # DevBox, il suo IP è 10.0.1.5." — "X is called Y") is mis-scored CORRECTION by GLiNER2's
+    # "replacing a previously stated value" label on the it install DETERMINISTICALLY, so
+    # remember_facts diverted the turn to /retract/correct: the lane minted a subject, flipped
+    # pref_name, and the owns edge, the alias and the IP never landed — while the measured
+    # es ("se llama") and en ("is called") behavior for the same shape is STATEMENT. Mirror the
+    # transition preroute above: route STATEMENT deterministically BEFORE GLiNER2 (kept pure,
+    # no label edits — Pitfall 11) when the grammar holds a licensed UD naming frame asserting
+    # exactly ONE name and the correction dual-gate has NO opinion (the replacive two-name
+    # turn "X … anzi, si chiama Y" and every cued turn stay on the correction ladder). The
+    # frame needs a UD reflexive clitic, which an English parse can never produce — en
+    # installs are byte-identical. Runs AFTER the correction bypass gate, so a genuine
+    # correction still routes correctly. Fail-safe: layer unavailable / parse miss / any
+    # error → fall through to GLiNER2 (never a drop).
+    if NAMING_STATEMENT_PREROUTE:
+        try:
+            if await asyncio.to_thread(_is_first_mention_naming_statement, text):  # OFF-LOOP (spaCy)
+                log.info("classify_intent.naming_statement_preroute",
+                         user_id=user_id[:8],
+                         note="first-mention naming frame → STATEMENT (GLiNER2 skipped, kept "
+                              "pure); naming a NEW thing is a stated fact, not a correction")
+                print("[/classify-intent] NAMING PRE-ROUTE: → STATEMENT "
+                      "(first-mention naming frame; GLiNER2 skipped)", flush=True)
+                _note_intent_layer(user_id, "spacy_naming_statement", "STATEMENT")
+                return {"intent": "STATEMENT", "confidence": 0.95}
+        except Exception as _nm_err:  # noqa: BLE001 — fail-safe: never block GLiNER2
+            log.debug("classify_intent.naming_preroute_failed",
+                      user_id=user_id[:8], error=str(_nm_err)[:120])
+
     try:
         # ENHANCEMENT: Build semantic-rich intent descriptions from DB patterns
         # GLiNER2 performs better with natural language descriptions that include
@@ -22326,6 +22490,17 @@ LEAD_IN_IMMUNITY = os.getenv("LEAD_IN_IMMUNITY", "true").lower() not in ("0", "f
 # correction directive (no overt subject) is EXCLUDED, so real corrections still
 # route correctly. Fail-safe → GLiNER2. Default ON.
 TRANSITION_STATEMENT_PREROUTE = os.getenv("TRANSITION_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
+# NAMING-STATEMENT PRE-ROUTE (FOSS-011, it branch): a declarative FIRST-MENTION NAMING turn
+# ("il mio server principale si chiama DevBox, il suo IP è 10.0.1.5." — "X is called Y") is
+# mis-scored CORRECTION by GLiNER2's verbose label on the it install DETERMINISTICALLY (the
+# correction lane then mints a subject, flips pref_name, and loses the owns edge / alias /
+# IP), while the measured es/en behavior for the same shape is STATEMENT. Route STATEMENT
+# deterministically BEFORE GLiNER2 (kept pure, no label edits — Pitfall 11) when the grammar
+# holds a licensed UD naming frame asserting exactly ONE name and NO correction cue
+# (_is_first_mention_naming_statement; the replacive two-name turn and every cued turn stay
+# on the correction ladder). The frame is a UD reflexive clitic, which an English parse can
+# never produce — en installs are byte-identical. Fail-safe → GLiNER2. Default ON.
+NAMING_STATEMENT_PREROUTE = os.getenv("NAMING_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
 
 # === PRE-GLINER2 INTERROGATIVE (QUERY) ROUTE (…-to-Y question misroute fix) ===
 # A grammatically INTERROGATIVE turn ("What programming language did I switch to?",
@@ -58925,6 +59100,42 @@ def correct_fact(req: FactCorrectionRequest):
                     return result
                 # _applied False (e.g. taxonomy row vanished) → fall through to the
                 # existing correction handling rather than failing the request.
+
+        # ── FIRST-MENTION NAMING GUARD (FOSS-011, it branch) ─────────────────────
+        # A CORRECTION-classified turn that is really a FIRST naming ("Il mio server
+        # principale si chiama DevBox, il suo IP è 10.0.1.5." — measured es/en behavior:
+        # "se llama" / "is called" classify STATEMENT) has NOTHING to supersede: the lane
+        # below would MINT a subject and flip pref_name (the measured wound: status
+        # "corrected", committed=0, owns/alias/IP lost). Decline it BEFORE the LLM
+        # extraction with a "first_mention_naming" response; the MCP
+        # (remember_facts_tool) reads that status and routes the turn back through the
+        # STATEMENT path, where the naming chains capture owns + alias (+ the IP scalar)
+        # in one call. Everything that IS a correction — a stored bearer (rename), a
+        # two-name replacive turn ("si chiama X … anzi, si chiama Y"), any repair cue —
+        # fails the guard here and takes today's path byte-for-byte. Read-only
+        # (parse + cue + indexed alias probe); flag OFF → byte-for-byte legacy.
+        if NAME_FIRST_MENTION_GUARD and not is_retraction:
+            try:
+                with db.cursor() as _fm_cur:
+                    _fm_first = _first_mention_naming_correction(req.text, _fm_cur)
+            except Exception as _fm_err:  # noqa: BLE001 — never break the endpoint
+                log.warning("correct_fact.first_mention_guard_failed", error=str(_fm_err)[:160])
+                _fm_first = False
+            if _fm_first:
+                log.info(
+                    "correct_fact.first_mention_naming_declined",
+                    user_id=req.user_id[:8],
+                    note="naming first mention with nothing to supersede — declined the "
+                         "destructive correction; the MCP routes the turn back through the "
+                         "statement path")
+                return FactCorrectionResponse(
+                    status="first_mention_naming",
+                    message=(
+                        "Nothing to correct yet — this introduces a new name rather than "
+                        "changing one, so no stored value was overwritten. The statement "
+                        "was handed back to be stored normally."
+                    ),
+                )
 
         # Idempotency check: deduplicate retried correction requests (uses global _idempotency_mgr from startup)
         if req.idempotency_key and _idempotency_mgr:

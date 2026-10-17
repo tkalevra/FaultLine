@@ -4682,7 +4682,21 @@ async def _remember_facts_tool_impl(text: str, user_id: str, *, attested: bool =
         return {"status": "query_detected", "message": "Use recall_memory for queries"}
 
     if intent in ("RETRACTION", "CORRECTION"):
-        return await retract_fact_tool(text, user_id, classified_intent=intent, attested=attested)
+        _retract_res = await retract_fact_tool(text, user_id, classified_intent=intent, attested=attested)
+        # ── FIRST-MENTION NAMING HANDOFF (FOSS-011, it branch) ──────────────────
+        # The backend declined the correction: the turn is a naming FIRST MENTION with
+        # nothing to supersede ("Il mio server principale si chiama DevBox, il suo IP è
+        # 10.0.1.5." classified CORRECTION on it — measured es/en behavior: STATEMENT), so
+        # the destructive supersede was refused and NOTHING was written. Data preservation
+        # wins: fall through to the STATEMENT pipeline below, where the naming chains
+        # capture owns + alias (+ the IP scalar) in one call. NO LOOP: this branch is only
+        # reachable with a classified intent, and the statement path below never re-enters
+        # the retract lane — one classification, one declined POST, then ingest.
+        if isinstance(_retract_res, dict) and _retract_res.get("status") == "first_mention_naming":
+            _log("remember_facts: backend first_mention_naming handoff — routing the turn "
+                 "back through the STATEMENT path")
+        else:
+            return _retract_res
 
     # intent == "STATEMENT" — proceed with ingest pipeline.
 
@@ -6667,6 +6681,12 @@ _NOT_A_FAILURE = frozenset({
     # actually comes through, and a behavioural test drives each of these rather than trusting a
     # static scan, which cannot see a status this repository never writes down.
     "corrected", "success",
+    # From /retract/correct via the FOSS-011 first-mention guard: the endpoint DECLINED the
+    # correction (a naming first mention with nothing to supersede) and wrote NOTHING — a
+    # routing answer, the same class as query_detected, never a fault. remember_facts_tool
+    # consumes it and re-routes the turn through the STATEMENT path; a model-invoked
+    # retract_fact sees the explanatory message instead.
+    "first_mention_naming",
     # From /store_context, via store_context_tool's verbatim pass-through. `deferred` means the
     # text WAS retained (to episodic_log) rather than vector-stored — a degraded save, not a
     # failed one — and `disabled` is the freeze MODE, the same class as ingest_disabled. Both

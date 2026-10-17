@@ -2812,6 +2812,82 @@ def _proper_name_span(tok) -> str:
         return (getattr(tok, "text", "") or "").strip().lower()
 
 
+def licensed_naming_names(text: str):
+    """The DISTINCT lower-cased names the turn's UD PRONOMINAL naming frames assert, or the
+    machinery's two honest negatives.
+
+    Returns ``None`` when the grammar layer is unavailable (caller fails safe - a parse miss
+    must never route), ``()`` when the parse holds no licensed naming frame, and otherwise the
+    tuple of distinct name surfaces, one per naming frame ("si chiama" / "mi chiamo" /
+    relative-clause naming), in sentence order.
+
+    [it branch - FOSS-011] The intent classifier reads this as a FIRST-MENTION NAMING signal:
+    a declarative that asserts exactly ONE name is a naming STATEMENT (measured es/en behavior:
+    "se llama" / "is called" classify STATEMENT), while TWO distinct names asserted in one turn
+    ("il mio server si chiama Apollo ... anzi, si chiama DevBox") is the REPLACIVE shape the
+    correction lane owns - the caller counts the tuple and declines at != 1.
+
+    Scope is the UD CLITIC frame ONLY (`_ud_reflexive_naming_clitic` - the clitic, not the
+    complement label, is what makes the clause a naming frame; an active "chiama Anna" is plain
+    calling). English (Penn) parses are STRUCTURALLY INERT here - `_doc_is_ud` is False, so an
+    English install classifies byte-for-byte as before; the frame cannot occur on that scheme.
+    Negation is declined (`_predicate_negated`: "non si chiama" is absence, never a name).
+    Grammar/morphology only - no verb list (the verb names only inside the licensed frame), no
+    DB read (the intent hot path pays one parse, not a cue-class lookup). Fail-safe: any error
+    -> ``None``.
+    """
+    if not text or not text.strip():
+        return ()
+    nlp = _get_nlp()
+    if nlp is None:
+        return None
+    try:
+        doc = nlp(text)
+    except Exception as e:  # noqa: BLE001 - never crash the intent path
+        log.warning("linguistics.licensed_naming_names_parse_failed", error=str(e)[:160])
+        return None
+    try:
+        if not _doc_is_ud(doc):
+            return ()  # English scheme: the reflexive-clitic naming frame cannot occur
+        names: list[str] = []
+        seen: set[str] = set()
+        for tok in doc:
+            if tok.pos_ != "VERB":
+                continue
+            # The CLITIC is the frame licence: a reflexive clitic filling the object slot is
+            # what makes "chiama" name ("si chiama" / "mi chiamo") rather than call.
+            if _ud_reflexive_naming_clitic(tok) is None:
+                continue
+            # Negated naming ("Mio fratello non si chiama Luca") is absence - parity with the
+            # sibling chains: it asserts no name.
+            if _predicate_negated(tok):
+                continue
+            # The NAME: the predicative PROPN complement (xcomp on the it parse), or - the
+            # "Mi chiamo Marco" shape - the PROPN that took the subject slot when the clitic
+            # took `expl` (it_core_news_sm measured parse; the naming chain's 1sg arm uses
+            # the same fallback).
+            nm = _naming_name_complement(tok)
+            if nm is None:
+                nm = next((c for c in tok.children
+                           if c.dep_ in ("nsubj", "nsubj:pass", "nsubjpass")
+                           and c.pos_ == "PROPN"), None)
+            if nm is None:
+                continue
+            # A determiner-introduced nominal is a TYPE, not a name (the naming chains' own
+            # gate): a colour word with an article is an attribute, never a label.
+            if any(d.dep_ == "det" for d in nm.children):
+                continue
+            surface = _proper_name_span(nm)
+            if not surface or surface in seen:
+                continue
+            seen.add(surface)
+            names.append(surface)
+        return tuple(names)
+    except Exception as e:  # noqa: BLE001 - fail-safe: no parse, no opinion
+        log.warning("linguistics.licensed_naming_names_failed", error=str(e)[:160])
+        return None
+
+
 def _is_second_person_personal_pronoun(tok) -> bool:
     """True iff ``tok`` is a GENUINE 2nd-person *personal* pronoun ("you") — the deictic addressee.
 
