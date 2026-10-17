@@ -15,6 +15,8 @@ import pytest
 USER = "11111111-1111-4111-8111-111111111111"
 GATA = "22222222-2222-4222-8222-222222222222"
 SERVIDOR = "33333333-3333-4333-8333-333333333333"
+SPOT = "55555555-5555-4555-8555-555555555555"
+JUNK = "99999999-9999-4999-8999-999999999999"   # harvest capture-debris entity
 SCHEMA = "faultline_unit"
 
 
@@ -238,6 +240,13 @@ class _Cur:
                         and not f["superseded_at"]}
                 self._rows = [(r,) for r in rels]
                 return
+            if s.startswith("select id, subject_id from facts") and \
+                    "object_id = %s and rel_type = %s" in s:
+                # DUTY F round-2: step 4's object-side probe reads the FACT'S SUBJECT.
+                self._rows = [(f["id"], f["subject_id"]) for f in t.facts
+                              if f["object_id"] == P[0] and f["rel_type"] == P[1]
+                              and not f["superseded_at"]][:1]
+                return
             if s.startswith("select"):
                 hits = []
                 for f in t.facts:
@@ -275,6 +284,15 @@ class _Cur:
 
         # ---- staged_facts ----
         if "from staged_facts" in s:
+            # DUTY F round-2: the staged object-side swap probe reads the STAGED FACT'S
+            # SUBJECT (step 5's "SELECT id, subject_id ... WHERE object_id = %s ...").
+            if s.startswith("select id, subject_id from staged_facts") and \
+                    "object_id = %s and rel_type = %s" in s:
+                self._rows = [
+                    (sf["id"], sf["subject_id"]) for sf in t.staged
+                    if not sf["deleted_at"] and not sf.get("promoted_at")
+                    and sf["object_id"] == P[0] and sf["rel_type"] == P[1]][:1]
+                return
             if s.startswith("select distinct rel_type"):
                 self._rows = []
                 return
@@ -977,3 +995,263 @@ def test_lane_mint_detection_uses_pre_mint_set(monkeypatch):
     gata_aliases = [a for a, ent in t.aliases.items() if ent == GATA]
     assert set(gata_aliases) == {"gata", "fraggle"}, t.aliases
     assert t.mint_calls == [], t.mint_calls
+
+
+# =============================================================================
+# Critic round 2 - DUTY F: the post-gate SUBJECT swaps bind to the user's words
+# =============================================================================
+
+def _inverted_capture_tenant(inverse_row=True):
+    """GATA was captured INVERTED: (gata, pet_of, user) instead of (user, has_pet,
+    gata). The gate-checked subject (user) holds ZERO forward has_pet rows."""
+    t = _default_tenant()
+    if inverse_row:
+        t.facts.append({"id": 4001, "subject_id": GATA, "rel_type": "pet_of",
+                        "object_id": USER, "superseded_at": None})
+    return t
+
+
+def test_inverse_swap_ungrounded_subject_refused(monkeypatch):
+    """DUTY F step 2: the inverse swap moves the destructive write onto object_uuid
+    AFTER the agreement gate. When the sentence never names the swapped-in subject,
+    the lane refuses - nothing is written. Live shape: the user's sentence is pure
+    first-person; the extraction's object surface ('gata') came from the extractor,
+    not the words."""
+    t = _inverted_capture_tenant()
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": "gata", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    env.mp.setattr(env.M, "_REL_TYPE_META",
+                   {"has_pet": {"inverse_rel_type": "pet_of"}})
+    out = env.post("Forget that I have a pet.")
+
+    assert out["status"] == "no_match", out
+    assert t.facts[0]["superseded_at"] is None, \
+        "the inverted row must never be superseded by an ungrounded swap"
+    assert not t.staged, t.staged
+
+
+def test_inverse_swap_grounded_subject_lands(monkeypatch):
+    """DUTY F step 2 positive control: when the sentence DOES name the swapped-in
+    subject, the inverse swap is exactly right and lands."""
+    t = _inverted_capture_tenant()
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": "gata", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    env.mp.setattr(env.M, "_REL_TYPE_META",
+                   {"has_pet": {"inverse_rel_type": "pet_of"}})
+    out = env.post("olvida que gata es mi mascota")
+
+    assert out["status"] == "corrected", out
+    assert t.facts[0]["superseded_at"] is not None, "the inverted row retires"
+    assert not t.staged, t.staged
+
+
+def test_object_side_swap_ungrounded_subject_refused(monkeypatch):
+    """DUTY F step 4: the object-side lookup swaps the subject onto the FACT'S REAL
+    SUBJECT after the gate. (gata, has_pet, spot) stored; 'Forget Spot is our pet.'
+    names Spot only - the swap would put GATA's edge on the block. Refuse, write
+    nothing."""
+    t = _default_tenant()
+    t.add_entity(SPOT, "Animal", ["spot"])
+    t.facts.append({"id": 4002, "subject_id": GATA, "rel_type": "has_pet",
+                    "object_id": SPOT, "superseded_at": None})
+    extraction = {"subject": "spot", "rel_type": "has_pet",
+                  "object": None, "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget Spot is our pet.")
+
+    assert out["status"] == "no_match", out
+    assert t.facts[0]["superseded_at"] is None, "gata's edge must survive"
+    assert not t.staged, t.staged
+
+
+def test_object_side_swap_speaker_lands(monkeypatch):
+    """DUTY F step 4 positive control: the canonical (user, has_pet, spot) capture
+    swaps the subject onto the SPEAKER - exempt by identity - and lands exactly as
+    it always has."""
+    t = _default_tenant()
+    t.add_entity(SPOT, "Animal", ["spot"])
+    t.facts.append({"id": 3001, "subject_id": USER, "rel_type": "has_pet",
+                    "object_id": GATA, "superseded_at": None})
+    t.facts.append({"id": 4003, "subject_id": USER, "rel_type": "has_pet",
+                    "object_id": SPOT, "superseded_at": None})
+    extraction = {"subject": "spot", "rel_type": "has_pet",
+                  "object": None, "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget Spot is our pet.")
+
+    assert out["status"] == "corrected", out
+    live = [f["object_id"] for f in t.facts
+            if f["subject_id"] == USER and f["rel_type"] == "has_pet"
+            and not f["superseded_at"]]
+    assert live == [GATA], f"spot's edge retires; gata's survives: {live}"
+
+
+def test_staged_object_side_swap_ungrounded_refused(monkeypatch):
+    """DUTY F step 5: the staged twin of the object-side swap obeys the same
+    discipline."""
+    t = _default_tenant()
+    t.add_entity(SPOT, "Animal", ["spot"])
+    t.staged.append({"id": 501, "subject_id": GATA, "rel_type": "has_pet",
+                     "object_id": SPOT, "deleted_at": None,
+                     "promoted_at": None, "expires_at": None})
+    extraction = {"subject": "spot", "rel_type": "has_pet",
+                  "object": None, "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget Spot is our pet.")
+
+    assert out["status"] == "no_match", out
+    assert t.staged and t.staged[0]["deleted_at"] is None, \
+        "the staged row must survive untouched"
+
+
+# =============================================================================
+# Critic round 2 - the stopword-alias lockout (both ends)
+# =============================================================================
+
+def test_stopword_alias_does_not_lock_out_agreement(monkeypatch):
+    """Moderate (a): a junk capture-debris entity aliased 'that' grounded in EVERY
+    sentence containing the word, keeping the agreement gate in permanent ambiguous
+    refusal on such a seat. The stopword screen drops it; the real subject resolves."""
+    t = _devbox_ip_tenant()
+    t.add_entity(JUNK, "Concept", ["that"])
+    extraction = {"subject": "devbox", "rel_type": "has_ip",
+                  "object": None, "action": "remove",
+                  "dimension": "SCALAR", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget that DevBox has an IP.")
+
+    assert out["status"] == "corrected", out
+    rows = [a for a in t.attributes
+            if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
+            and not a["superseded_at"]]
+    assert not rows, "the has_ip attribute retires"
+
+
+def test_capture_never_mints_stopword_aliases(monkeypatch):
+    """Moderate (b): the REAL registry refuses to mint a pure function-word surface -
+    the measured wound is a harvest debris entity aliased 'that'. Naming frames keep
+    their opt-out (the #23 family shape); register_alias refuses the debris shape."""
+    from src.entity_registry.registry import (
+        EntityRegistry, StopwordSurfaceError, _stopword_surface_refused)
+
+    class _RCur:
+        def __init__(self):
+            self.rows = []
+            self.rowcount = 0
+
+        def execute(self, s, p=None):
+            self.rows.append(" ".join(str(s).split()).lower())
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _RDB:
+        def __init__(self):
+            self.cur = _RCur()
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    db = _RDB()
+    reg = EntityRegistry(db, schema_name="foss_pins_tenant")
+    uid = USER
+
+    # the module screen itself (the shared closed-class list, en + es)
+    assert _stopword_surface_refused("that")
+    assert _stopword_surface_refused("que y")
+    assert not _stopword_surface_refused("gata")
+    assert not _stopword_surface_refused("after the network change"), \
+        "multiword debris WITH content tokens is not the stopword class"
+
+    # the mint seam: a bare stopword surface never mints
+    with pytest.raises(StopwordSurfaceError):
+        reg.resolve(uid, "that")
+    writes = [s for s in db.cur.rows
+              if s.startswith("insert into entities")
+              or s.startswith("insert into entity_aliases")]
+    assert not writes, "a stopword surface must never mint"
+
+    # the naming-frame opt-out survives (issue #23 family shape)
+    out = reg.resolve(uid, "that", name_intent=True)
+    assert out, "a genuine naming frame keeps its lane"
+
+    # register_alias: the debris shape is refused without writing (the naming-frame
+    # mint above legitimately wrote, so assert no NEW alias insert follows)
+    _n0 = len([s for s in db.cur.rows
+               if s.startswith("insert into entity_aliases")])
+    r = reg.register_alias(GATA, "that", is_preferred=False)
+    assert r.get("written") is False and r.get("refused") is True, r
+    _n1 = len([s for s in db.cur.rows
+               if s.startswith("insert into entity_aliases")])
+    assert _n1 == _n0, "the refused registration must write nothing"
+
+
+# =============================================================================
+# Critic round 2 - the turn-window wording
+# =============================================================================
+
+def _window_history_fixture(t, minutes_ago):
+    """Faithful harvest model: the single (entity, attribute) row is UPDATED in
+    place and one history row records the supersede."""
+    t.attributes[0]["value_text"] = "10.0.1.10"
+    t.history.append({
+        "entity_id": SERVIDOR, "attribute": "has_ip",
+        "prior_value_text": "10.0.1.5", "prior_value_int": None,
+        "prior_value_float": None, "prior_value_date": None,
+        "new_value_text": "10.0.1.10", "new_value_int": None,
+        "action": "superseded", "cause": "ingest_restate",
+        "created_at": datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)})
+
+
+def test_recent_correction_wording_not_this_turn(monkeypatch):
+    """Minor: a supersede INSIDE the 3-minute window but from the PREVIOUS turn must
+    not be claimed as 'this correction turn' - it reads 'a recent correction'."""
+    t = _devbox_ip_tenant()
+    _window_history_fixture(t, minutes_ago=1)
+    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
+                  "old_value": "10.0.1.5", "new_rel_type": "has_ip",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox es 10.0.1.10.")
+
+    assert out["status"] == "corrected", out
+    assert "a recent correction" in out["message"], out["message"]
+    assert "this correction turn" not in out["message"], out["message"]
+
+
+def test_this_turn_supersede_wording_kept(monkeypatch):
+    """Minor: a supersede PROVABLY from this turn keeps the precise wording."""
+    t = _devbox_ip_tenant()
+    _window_history_fixture(t, minutes_ago=-5)   # created AFTER the request began
+    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
+                  "old_value": "10.0.1.5", "new_rel_type": "has_ip",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox es 10.0.1.10.")
+
+    assert out["status"] == "corrected", out
+    assert "this correction turn" in out["message"], out["message"]

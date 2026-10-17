@@ -25,6 +25,7 @@ from src.api import errors as _errors  # THE ONE ERROR SEAM — no exception tex
 from src.api.db_read import release_read_transaction, end_read_txn_if_pure
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry, preference_is_warranted
+from src.entity_registry.registry import _STOPWORD_ALIASES
 from src.entity_registry import weld_guard
 from src.entity_registry.weld_guard import is_growth_claim as _is_growth_claim_source
 from src.extraction import abbreviation
@@ -14850,10 +14851,13 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
 def _recent_scalar_supersession(cur, entity_id, attribute, since):
     """FOSS-004: the most recent supersede/restate event at one (entity, attribute) slot
     within ``since`` (the correction turn's window — the intent-independent harvest runs
-    moments BEFORE /retract/correct). Returns (prior_value_display, action) or (None, None).
+    moments BEFORE /retract/correct). Returns (prior_value_display, action, created_at)
+    or (None, None, None); ``created_at`` lets the caller say PROVABLY-THIS-TURN vs only
+    'a recent correction' (critic round 2 minor — the 3-minute window can reach back to
+    the previous turn, and the message must not claim this turn without proof).
     Read-only, fail-safe."""
     if not entity_id or not attribute or since is None:
-        return None, None
+        return None, None, None
     try:
         cur.execute(
             "SELECT attribute, prior_value_text, prior_value_int, prior_value_float,"
@@ -14866,11 +14870,11 @@ def _recent_scalar_supersession(cur, entity_id, attribute, since):
         r = cur.fetchone()
     except Exception as e:  # noqa: BLE001
         log.warning("scalar_leg.history_probe_failed", error=str(e)[:120])
-        return None, None
+        return None, None, None
     if not r:
-        return None, None
+        return None, None, None
     _texts = _scalar_value_texts(r[1], r[2], r[3], r[4])
-    return (_texts[0] if _texts else None), r[5]
+    return (_texts[0] if _texts else None), r[5], r[8]
 
 
 def _attribute_leg_outcome(cur, subject_uuid, stated_new_value, since):
@@ -14944,6 +14948,13 @@ def _alias_grounded(alias: str, sentence_norm: str, sentence_tokens: set) -> boo
     a = str(alias or "").lower().strip()
     if len(a) < 2:
         return False
+    # ── critic round 2 (moderate): a PURE FUNCTION-WORD alias ('that' — the measured
+    # harvest capture-debris mint) grounds in EVERY sentence containing the word; it
+    # must never count as grounding. Stopword screen, not a content vocabulary: the
+    # closed-class set lives in registry.py (shared with the mint-side screen).
+    _a_all = set(_agreement_tokens(a))
+    if _a_all and _a_all <= _STOPWORD_ALIASES:
+        return False
     # word-boundary containment first — the alias as a NAME in the sentence
     pat = r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])"
     if re.search(pat, sentence_norm):
@@ -14951,6 +14962,30 @@ def _alias_grounded(alias: str, sentence_norm: str, sentence_tokens: set) -> boo
     # then full coverage of the alias's meaningful tokens
     toks = {t for t in _agreement_tokens(a) if len(t) >= _AGREEMENT_MIN_TOKEN}
     return bool(toks) and toks <= sentence_tokens
+
+
+def _swapped_subject_grounded(cur, text, ent, user_id) -> bool:
+    """DUTY F (critic round 2): the post-gate SUBJECT SWAPS on the retraction path —
+    step 2 (inverse: subject ← object_uuid), steps 4/5 (object-side: subject ← the
+    fact's real subject) — move the destructive write onto an entity the AGREEMENT GATE
+    never saw. The gate binds the gate-time subject; the swap must re-derive the
+    grounding for the FINAL subject, exactly as steps 3/6 already bind the object:
+    the speaker is exempt (first-person identity), any other swapped-in subject grounds
+    only by an alias the sentence carries. Probe failure → False (fail CLOSED: a
+    grounding probe that cannot run never admits a destructive write)."""
+    if not ent or ent == user_id:
+        return True  # the speaker is presupposed in their own sentences
+    try:
+        sentence_norm = " ".join(str(text or "").split()).lower()
+        stoks = _agreement_tokens(sentence_norm)
+        if not stoks:
+            return True  # degenerate: no sentence to bind
+        cur.execute(
+            "SELECT alias FROM entity_aliases WHERE entity_id = %s", (ent,))
+        aliases = [r[0] for r in cur.fetchall() if r[0]]
+        return any(_alias_grounded(a, sentence_norm, stoks) for a in aliases)
+    except Exception:  # noqa: BLE001 — fail CLOSED
+        return False
 
 
 def _retraction_object_grounded(cur, text, object_ref) -> bool:
@@ -59585,6 +59620,10 @@ def correct_fact(req: FactCorrectionRequest):
             # (minutes away) falls outside. The probe stays attribute-scoped and
             # value-agreement-guarded, so a narrow window can only ever UNDER-report.
             _lane_t0 = _lane_dt.now(_lane_tz.utc) - _lane_td(minutes=3)
+            # the REQUEST's own start: a history row at/after THIS instant is provably
+            # this turn's write; inside the window but earlier is only 'a recent
+            # correction' (critic round 2 minor — never claim this turn without proof).
+            _lane_req_t0 = _lane_dt.now(_lane_tz.utc)
             # ── FOSS-005 (atomicity): this lane's OWN mint, compensated on refusal ────────
             # registry.resolve(name_intent=True) commits the minted subject (entity +
             # alias) INTERNALLY, so a later rollback can never undo it. _lane_minted
@@ -61137,16 +61176,26 @@ def correct_fact(req: FactCorrectionRequest):
                         # Say which — with the REAL stored values — never 'not found'.
                         if (_corr_prior_row is not None and not _corr_value_changed
                                 and _corr_prior_row[6] is None):
-                            _hist_prior, _hist_action = _recent_scalar_supersession(
+                            _hist_prior, _hist_action, _hist_at = _recent_scalar_supersession(
                                 cur, subject_uuid, _pinned_attr, _lane_t0)
                             _live_display = _scalar_value_texts(
                                 _corr_prior_row[0], _corr_prior_row[1],
                                 _corr_prior_row[2], _corr_prior_row[3])
                             _live_val = _live_display[0] if _live_display else None
                             if _hist_prior is not None:
+                                # ── critic round 2 minor: say THIS TURN only when the history
+                                # row is provably from THIS request; inside the window but
+                                # before the request started → 'a recent correction'.
+                                _provably_this_turn = (
+                                    _hist_at is not None and _lane_req_t0 is not None
+                                    and _hist_at >= _lane_req_t0)
+                                _when_txt = ("superseded earlier in this correction turn"
+                                             if _provably_this_turn else
+                                             "superseded by a recent correction")
                                 log.info("correct_fact.scalar_leg_turn_window_superseded",
                                          entity=subject_uuid, attribute=_pinned_attr,
-                                         old=_hist_prior, new=_live_val, action=_hist_action)
+                                         old=_hist_prior, new=_live_val, action=_hist_action,
+                                         provably_this_turn=_provably_this_turn)
                                 return FactCorrectionResponse(
                                     status="corrected", dimension="SCALAR",
                                     subject_uuid=subject_uuid,
@@ -61157,8 +61206,7 @@ def correct_fact(req: FactCorrectionRequest):
                                     new_rel_type=_pinned_attr, new_value=_live_val,
                                     confidence=confidence, facts_superseded=1,
                                     message=(f"✓ corrected: {_pinned_attr} was {_hist_prior} "
-                                             f"→ now {_live_val} (superseded earlier in this "
-                                             "correction turn)"))
+                                             f"→ now {_live_val} ({_when_txt})"))
                             log.info("correct_fact.scalar_already_current",
                                      entity=subject_uuid, attribute=_pinned_attr,
                                      value=_live_val)
@@ -61380,6 +61428,25 @@ def correct_fact(req: FactCorrectionRequest):
                         """, (object_uuid, subject_uuid, inverse_rel_type))
                         old_fact_row = cur.fetchone()
                         if old_fact_row:
+                            # ── DUTY F (critic round 2): the swap moves the destructive write
+                            # onto object_uuid AFTER the gate. Bind it to the user's own
+                            # words, exactly like steps 3/6: the swapped-in subject grounds
+                            # by its aliases (the speaker is exempt). Ungrounded → refuse.
+                            if not _swapped_subject_grounded(
+                                    cur, req.text, object_uuid, user_id):
+                                _inv_label = _correction_subject_label(
+                                    db, object_uuid, req.user_id, None, None,
+                                    fallback=subject_name)
+                                log.warning("correct_fact.inverse_swap_ungrounded_refused",
+                                            subject=object_uuid, rel=inverse_rel_type,
+                                            user_id=req.user_id[:8])
+                                return _refuse(
+                                    status="no_match",
+                                    subject_uuid=object_uuid,
+                                    subject_name=_inv_label,
+                                    message=(f"I can't tell from your sentence that this "
+                                             f"is about '{_inv_label}' — nothing in what "
+                                             "you wrote names it. Nothing was deleted."))
                             found_via = f"inverse({inverse_rel_type})"
                             # Swap for retraction: we'll supersede the inverse fact
                             subject_uuid = object_uuid
@@ -61473,6 +61540,23 @@ def correct_fact(req: FactCorrectionRequest):
                     """, (subject_uuid, old_rel_type))
                     row = cur.fetchone()
                     if row:
+                        # ── DUTY F (critic round 2): the swap moves the destructive write
+                        # onto the FACT'S REAL SUBJECT after the gate. Bind it to the
+                        # user's own words (the speaker is exempt). Ungrounded → refuse.
+                        if not _swapped_subject_grounded(cur, req.text, row[1], user_id):
+                            _os_label = _correction_subject_label(
+                                db, row[1], req.user_id, None, None,
+                                fallback=subject_name)
+                            log.warning("correct_fact.object_side_swap_ungrounded_refused",
+                                        subject=row[1], rel=old_rel_type,
+                                        user_id=req.user_id[:8])
+                            return _refuse(
+                                status="no_match",
+                                subject_uuid=row[1],
+                                subject_name=_os_label,
+                                message=(f"I can't tell from your sentence that this is "
+                                         f"about '{_os_label}' — nothing in what you "
+                                         "wrote names it. Nothing was deleted."))
                         old_fact_row = (row[0], subject_uuid)
                         found_via = f"object_side({old_rel_type})"
                         subject_uuid = row[1]
@@ -61488,6 +61572,21 @@ def correct_fact(req: FactCorrectionRequest):
                     """, (subject_uuid, old_rel_type))
                     row = cur.fetchone()
                     if row:
+                        # ── DUTY F: same discipline on the staged twin of step 4.
+                        if not _swapped_subject_grounded(cur, req.text, row[1], user_id):
+                            _os_label = _correction_subject_label(
+                                db, row[1], req.user_id, None, None,
+                                fallback=subject_name)
+                            log.warning("correct_fact.staged_swap_ungrounded_refused",
+                                        subject=row[1], rel=old_rel_type,
+                                        user_id=req.user_id[:8])
+                            return _refuse(
+                                status="no_match",
+                                subject_uuid=row[1],
+                                subject_name=_os_label,
+                                message=(f"I can't tell from your sentence that this is "
+                                         f"about '{_os_label}' — nothing in what you "
+                                         "wrote names it. Nothing was deleted."))
                         old_fact_row = (row[0], subject_uuid)
                         found_via = f"object_side_staged({old_rel_type})"
                         subject_uuid = row[1]
