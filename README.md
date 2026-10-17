@@ -169,6 +169,7 @@ Each schema contained **only** its own entities and hierarchy — zero cross-ten
 - Docker and Docker Compose v2.24 or newer (`docker compose version`)
 - An LLM backend — [Ollama](https://ollama.ai/), [LM Studio](https://lmstudio.ai/), [OpenWebUI](https://openwebui.com/), or a hosted API (OpenAI, Anthropic, Groq)
 - About 4 GB of RAM free for the stack (it uses ~3 GB after boot); 8 GB recommended. A local LLM needs its own memory on top.
+- Launcher: `./setup.sh` needs only a POSIX `/bin/sh` — bash is **not** required (minimal Docker hosts often ship none). On any platform you can skip it and run `python3 quickstart.py` directly.
 
 ---
 
