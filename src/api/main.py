@@ -14398,7 +14398,7 @@ def _scalar_value_numeric_key(v) -> tuple | None:
 
 def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                            dsn: str = None, schema: str = None, text: str = None,
-                           new_value=None):
+                           new_value=None, is_retraction: bool = False):
     """SS4: resolve the (entity, attribute) ROW a scalar correction/retraction actually
     targets, pinning the extractor's guess onto STORED data. The live wound (PHASE1-REPRO
     WOUND 2): the extractor said (6719a70e, 'member_count') while the row is
@@ -14438,6 +14438,58 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
     if not subject_uuid or not old_rel_type:
         return subject_uuid, old_rel_type, None
     attr = (old_rel_type or "").strip().lower()
+    _orig_subject, _orig_attr = subject_uuid, attr
+
+    # ── FOSS-008 / critic round 1, DEFECT A: a RETRACTION's re-target must bind the ──
+    # FINAL (subject, attribute) to the user's own words. Measured live: "Please forget
+    # that I have a cat named Fraggle." resolved its subject to the SPEAKER (the gate
+    # exempts the speaker), and then rung 2.5's shared-head rename (has_pet → has_ip)
+    # plus rung 3's tenant-unique holder RE-TARGETED the destructive write onto
+    # (devbox, has_ip) AFTER the gate. The gate binds the gate-time subject; every rung
+    # below that moves the target must re-derive the sentence grounding for the FINAL
+    # target: the subject grounds only by alias (the FOSS-008 discipline), the
+    # attribute by its own tokens, the guessed name's tokens, or a stated VALUE the
+    # sentence carries (a value-anchored re-target binds by value). Ungrounded → the
+    # sentinel via="retarget_ungrounded" and the caller refuses — nothing is written.
+    def _retarget_grounded(ent, attribute) -> bool:
+        try:
+            sentence_norm = " ".join(str(text or "").split()).lower()
+            stoks = _agreement_tokens(sentence_norm)
+            if not stoks:
+                return True  # degenerate sentence: nothing to bind, do not invent a veto
+            if ent and ent != _orig_subject:
+                cur.execute(
+                    "SELECT alias FROM entity_aliases WHERE entity_id = %s", (ent,))
+                _aliases = [r[0] for r in cur.fetchall() if r[0]]
+                if not any(_alias_grounded(a, sentence_norm, stoks) for a in _aliases):
+                    return False
+            if attribute and attribute != _orig_attr:
+                _atok = {t for t in re.split(r"[^a-z0-9]+", str(attribute).lower())
+                         if len(t) >= 2}
+                _gotok = {t for t in re.split(r"[^a-z0-9]+", str(_orig_attr or "").lower())
+                          if len(t) >= 2}
+                _val_ok = (
+                    (old_value and str(old_value).strip().lower()
+                     and str(old_value).strip().lower() in sentence_norm)
+                    or (new_value and str(new_value).strip().lower()
+                        and str(new_value).strip().lower() in sentence_norm))
+                if not ((_atok & stoks) or (_gotok & stoks) or _val_ok):
+                    return False
+            return True
+        except Exception:  # noqa: BLE001 — probe failure must never WIDEN the write
+            return False
+
+    def _guard_retarget(ent, attribute, via):
+        if not is_retraction or (ent == _orig_subject and attribute == _orig_attr):
+            return ent, attribute, via
+        if _retarget_grounded(ent, attribute):
+            return ent, attribute, via
+        log.warning("address_scalar_target.retarget_ungrounded",
+                    requested=_orig_attr, subject=str(_orig_subject)[:8],
+                    retarget_subject=str(ent)[:8], retarget_attribute=attribute,
+                    note="a retraction's re-target must bind to the user's own words; "
+                         "refusing (FOSS-008, critic DEFECT A)")
+        return _orig_subject, _orig_attr, "retarget_ungrounded"
 
     def _holds(entity, attribute):
         cur.execute(
@@ -14453,7 +14505,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
         pinned = _pin_scalar_attribute_to_known(
             cur, subject_uuid, attr, dsn, schema, old_value=old_value)
         if pinned and pinned != attr and _holds(subject_uuid, pinned):
-            return subject_uuid, pinned, "pin_subject"
+            return _guard_retarget(subject_uuid, pinned, "pin_subject")
         # rung 2.5 — TENANT-WIDE name normalization. Measured live (PHASE1-REPRO WOUND 2,
         # battery S1): the extractor said 'member_count' while the STORED attribute is
         # 'member_of' — same head token, different tail — and every subject-scoped rung
@@ -14495,8 +14547,19 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
             # Re-pin the guess onto the stored name; the pre-repin pinned value (the
             # unchanged guess) must NOT be re-scanned tenant-wide below — it is no longer
             # the name anything is stored under.
-            attr = _name_cands[0]
-            pinned = _name_cands[0]
+            # ── DEFECT A: for a RETRACTION the rename itself is a re-target — has_pet →
+            # has_ip (shared head 'has') must be licensed by the user's own words (the
+            # renamed name's tokens, the guess's tokens, or a stated value). An ungrounded
+            # rename is what enabled the measured cat→devbox wound; skip it so the rungs
+            # below keep scanning the name the user's words actually carried.
+            if is_retraction and not _retarget_grounded(subject_uuid, _name_cands[0]):
+                log.warning("address_scalar_target.rename_ungrounded",
+                            guessed=_orig_attr, renamed=_name_cands[0],
+                            note="a retraction's attribute rename must bind to the "
+                                 "user's words; keeping the guess")
+            else:
+                attr = _name_cands[0]
+                pinned = _name_cands[0]
         # rung 3 — tenant-wide unique holder of the pinned/exact attribute name
         for cand in dict.fromkeys([pinned if pinned and pinned != attr else None, attr]):
             if not cand:
@@ -14526,7 +14589,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                                 and (not _ov_key[1] or not _vv_key[1]
                                      or _ov_key[1] == _vv_key[1])):
                             continue  # value mismatch — not the row the user named
-                return ent, cand, "unique_holder"
+                return _guard_retarget(ent, cand, "unique_holder")
         # rung 4 — DOSAGE-FAMILY MAPPING (issue #18). Fires ONLY after every name/value
         # rung declined (admission-only). Membership and the canonical come from the
         # tenant's `dosage_noun` cue class (floor ∪ tenant) — never a word list.
@@ -14573,7 +14636,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                              basis="guess" if _guess_fam else "correction-text",
                              note="the dosage-family cue class names the stored row the "
                                   "user's words address")
-                    return subject_uuid, _fam_cands[0][0], "family"
+                    return _guard_retarget(subject_uuid, _fam_cands[0][0], "family")
                 if not _fam_cands and old_value and str(old_value).strip():
                     # Subject-scoped: the addressed subject holds NO family row — the
                     # measured deploy-#9 flatten (subject='user', the row lives on the
@@ -14601,7 +14664,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                                      note="the correction's subject holds no dosage row; "
                                           "exactly one family attribute in the tenant "
                                           "carries the old value the user named")
-                            return _fam_hits[0][0], _fam_hits[0][1], "family_value"
+                            return _guard_retarget(_fam_hits[0][0], _fam_hits[0][1], "family_value")
 
         # ── rungs 6/7 — VALUE-ANCHORED (entity, attribute) resolution (FOSS-004) ────────
         # Every NAME rung declined: the extractor's attribute guess matches no stored name
@@ -14644,7 +14707,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                              attribute=_m6[0],
                              note="name rungs missed; the grounded STATED OLD value "
                                   "identifies the stored row")
-                    return subject_uuid, _m6[0], "stated_old_holder"
+                    return _guard_retarget(subject_uuid, _m6[0], "stated_old_holder")
             if _nv_grounded and len(_live_rows) == 1:
                 _only_attr, _only_txts = _live_rows[0]
                 if not any(t.lower() == _nv.lower() for t in _only_txts):
@@ -14653,7 +14716,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                              attribute=_only_attr,
                              note="name rungs missed; the subject's sole live attribute "
                                   "is the only slot the stated new value can address")
-                    return subject_uuid, _only_attr, "sole_attribute"
+                    return _guard_retarget(subject_uuid, _only_attr, "sole_attribute")
             if _nv_grounded:
                 _m7 = list(dict.fromkeys(
                     a for a, txts in _live_rows
@@ -14665,7 +14728,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                              note="the asserted new value already lives at exactly one "
                                   "attribute of the subject — the supersede this turn "
                                   "already landed; address it to report honestly")
-                    return subject_uuid, _m7[0], "asserted_value_holder"
+                    return _guard_retarget(subject_uuid, _m7[0], "asserted_value_holder")
     except Exception as e:  # noqa: BLE001 — fail-safe: unchanged inputs, today's behaviour
         log.warning("address_scalar_target.failed", error=str(e)[:160])
     return subject_uuid, old_rel_type, None
@@ -14775,6 +14838,35 @@ def _alias_grounded(alias: str, sentence_norm: str, sentence_tokens: set) -> boo
     # then full coverage of the alias's meaningful tokens
     toks = {t for t in _agreement_tokens(a) if len(t) >= _AGREEMENT_MIN_TOKEN}
     return bool(toks) and toks <= sentence_tokens
+
+
+def _retraction_object_grounded(cur, text, object_ref) -> bool:
+    """FOSS-008 / critic round 1 DEFECT B: a RELATIONAL retraction may only retire an
+    edge whose OBJECT the user's own words ground. Measured wound: "Forget that my
+    unicorn has wings." matched (user, has_pet, fraggle) on (subject, rel) alone — zero
+    sentence-token grounding of the object — and superseded the LIVE edge. ``object_ref``
+    is the matched row's object (entity uuid or literal): it grounds when IT (or any
+    alias of it as an entity) appears in the sentence at word boundaries or by full
+    token coverage — the same discipline as the subject gate. Fail-safe: a probe error
+    NEVER widens the write (returns False → refuse)."""
+    try:
+        sentence_norm = " ".join(str(text or "").split()).lower()
+        stoks = _agreement_tokens(sentence_norm)
+        if not stoks:
+            return True  # degenerate: no sentence to bind
+        cands = []
+        if object_ref:
+            cands.append(str(object_ref).strip())
+            try:
+                cur.execute(
+                    "SELECT alias FROM entity_aliases WHERE entity_id = %s",
+                    (object_ref,))
+                cands.extend(str(r[0]) for r in cur.fetchall() if r[0])
+            except Exception:  # noqa: BLE001 — the literal candidate above still counts
+                pass
+        return any(_alias_grounded(c, sentence_norm, stoks) for c in cands)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _retraction_subject_agreement(cur, text, subject_uuid, user_id):
@@ -59058,10 +59150,17 @@ def correct_fact(req: FactCorrectionRequest):
             # FOSS-004: the correction TURN's window starts here. The intent-independent
             # harvest runs moments BEFORE this request (it supersedes entity_attributes
             # with cause=ingest_restate), and its attribute leg must be REPORTABLE — the
-            # bounded lookback below is generous enough for harvest + classify + retry,
-            # small enough that last week's unrelated supersede is never attributed here.
+            # bounded lookback below covers one turn's classify + retry + harvest, and
+            # never reaches back to a previous turn.
             from datetime import datetime as _lane_dt, timedelta as _lane_td, timezone as _lane_tz
-            _lane_t0 = _lane_dt.now(_lane_tz.utc) - _lane_td(minutes=15)
+            # ── critic round 1 minor (1): 15 minutes is LONG enough to misattribute a
+            # PREVIOUS turn's supersede on a value-identical re-correction (the window's
+            # own honesty rule: attribute only what THIS turn's harvest wrote). 3 minutes
+            # still covers classify+retry+harvest inside one turn — the same turn's
+            # harvest runs moments BEFORE this request — while a last turn's supersede
+            # (minutes away) falls outside. The probe stays attribute-scoped and
+            # value-agreement-guarded, so a narrow window can only ever UNDER-report.
+            _lane_t0 = _lane_dt.now(_lane_tz.utc) - _lane_td(minutes=3)
             # ── FOSS-005 (atomicity): this lane's OWN mint, compensated on refusal ────────
             # registry.resolve(name_intent=True) commits the minted subject (entity +
             # alias) INTERNALLY, so a later rollback can never undo it. _lane_minted
@@ -59656,16 +59755,25 @@ def correct_fact(req: FactCorrectionRequest):
                     # does not refuse a name a correction explicitly asserts.
                     # ── FOSS-005 (atomicity): resolve() COMMITS the mint internally, so a
                     # refusal later in this lane could never roll it back. Detect the mint
-                    # (lookup missed, then resolve returned) and compensate on every
-                    # refusal/failure return (see _refuse / _compensate_lane_mint).
+                    # by PRE-MINT ENTITY-ID SET MEMBERSHIP (critic round 1 minor 2):
+                    # resolve() can also succeed by REDIRECTING to an existing entity
+                    # (measurement-family compound paths resolve_lookup lacks) — a uuid
+                    # inequality there flags a PRE-EXISTING entity lane-minted and the
+                    # refusal would try to delete a real entity (FK failure). Membership
+                    # is exact: the lane minted iff its id was absent before resolve().
+                    # Read failure → do NOT flag (compensation is best-effort; never
+                    # compensate on a blind guess).
                     try:
-                        _pre_mint_uuid = registry.resolve_lookup(req.user_id, subject_name)
+                        with db.cursor() as _pm_cur:
+                            _pm_cur.execute("SELECT id FROM entities")
+                        _pre_mint_ids = {r[0] for r in _pm_cur.fetchall() if r[0]}
                     except Exception:
-                        _pre_mint_uuid = None
+                        _pre_mint_ids = None
                     subject_uuid = registry.resolve(req.user_id, subject_name,
                                                     name_intent=True)
-                    if subject_uuid and subject_uuid != _pre_mint_uuid \
-                            and subject_uuid != user_id:
+                    if subject_uuid and subject_uuid != user_id and (
+                            _pre_mint_ids is not None
+                            and subject_uuid not in _pre_mint_ids):
                         _lane_minted[0] = subject_uuid
                         log.info("correct_fact.lane_mint_detected",
                                  subject_name=subject_name, entity=subject_uuid,
@@ -59746,7 +59854,9 @@ def correct_fact(req: FactCorrectionRequest):
                             subject_aliases=_ag_aliases,
                             candidates=_ag_cands,
                             user_id=user_id[:8])
-                return FactCorrectionResponse(
+                # critic round 1 minor (3): the refusal goes through _refuse like every
+                # other failure return, so a lane mint never survives it.
+                return _refuse(
                     status=_ag_verdict,
                     subject_uuid=subject_uuid,
                     subject_name=_ag_subject_label,
@@ -59962,7 +60072,27 @@ def correct_fact(req: FactCorrectionRequest):
                         _addr_subj, _addr_attr, _scalar_addr_via = _address_scalar_target(
                             _sc_cur, subject_uuid, old_rel_type, old_value, req.user_id,
                             dsn=os.getenv("POSTGRES_DSN"), schema=schema_name,
-                            text=req.text, new_value=new_value)
+                            text=req.text, new_value=new_value,
+                            is_retraction=is_retraction)
+                    if _scalar_addr_via == "retarget_ungrounded":
+                        # FOSS-008 / critic round 1 DEFECT A: the rungs wanted to move a
+                        # retraction's destructive write onto a target the user's own words
+                        # never name (measured: has_pet→has_ip head-rename then the tenant-
+                        # unique holder → devbox.has_ip retired for a CAT sentence). Refuse —
+                        # nothing written.
+                        _rtg_label = _correction_subject_label(
+                            db, subject_uuid, req.user_id, None, None,
+                            fallback=subject_name)
+                        log.warning("correct_fact.retarget_ungrounded_refused",
+                                    subject=subject_uuid, requested=old_rel_type,
+                                    user_id=req.user_id[:8])
+                        return _refuse(
+                            status="no_match",
+                            subject_uuid=subject_uuid,
+                            subject_name=_rtg_label,
+                            message=(f"I can't tell from your sentence that you mean "
+                                     f"'{_rtg_label}' or its '{old_rel_type}' — nothing in "
+                                     "what you wrote names that. Nothing was deleted."))
                     _has_scalar_attr = _scalar_addr_via is not None
                 except Exception as _sc_err:  # noqa: BLE001 — fail-safe: keep LLM dimension
                     log.warning("correct_fact.scalar_axis_probe_failed", error=str(_sc_err)[:120])
@@ -60255,7 +60385,25 @@ def correct_fact(req: FactCorrectionRequest):
                     _addr_subj, _pinned_attr, _addr_via = _address_scalar_target(
                         cur, subject_uuid, old_rel_type, old_value, req.user_id,
                         dsn=os.getenv("POSTGRES_DSN"), schema=schema_name,
-                        text=req.text, new_value=new_value)
+                        text=req.text, new_value=new_value,
+                        is_retraction=is_retraction)
+                    if _addr_via == "retarget_ungrounded":
+                        # FOSS-008 / critic DEFECT A (same sentinel as the axis probe): a
+                        # retraction's re-target the sentence never names → refuse, write
+                        # nothing.
+                        _rtg_label2 = _correction_subject_label(
+                            db, subject_uuid, req.user_id, None, None,
+                            fallback=subject_name)
+                        log.warning("correct_fact.retarget_ungrounded_refused",
+                                    subject=subject_uuid, requested=old_rel_type,
+                                    user_id=req.user_id[:8])
+                        return _refuse(
+                            status="no_match",
+                            subject_uuid=subject_uuid,
+                            subject_name=_rtg_label2,
+                            message=(f"I can't tell from your sentence that you mean "
+                                     f"'{_rtg_label2}' or its '{old_rel_type}' — nothing in "
+                                     "what you wrote names that. Nothing was deleted."))
                     if not _addr_via and not is_retraction:
                         # STATED-VALUE HOLDER (issue #52): the extractor's attribute name is held
                         # nowhere on the subject, but the correction's own stated measure already
@@ -60726,6 +60874,33 @@ def correct_fact(req: FactCorrectionRequest):
                           AND superseded_at IS NULL
                     """, (subject_uuid, old_rel_type))
                     _sub_rows = cur.fetchall()
+                    # ── FOSS-008 / critic round 1 DEFECT B: ground the OBJECT. A broad
+                    # subject-only retraction match is only as good as the user's words:
+                    # filter the candidates to objects the sentence actually names. ALL
+                    # ungrounded → no_match refusal (the sentence names something —
+                    # 'unicorn', 'wings' — that matches nothing stored); SOME grounded →
+                    # the filter IS the disambiguation the words provide.
+                    if is_retraction and _sub_rows:
+                        _gr_rows = [r for r in _sub_rows
+                                    if _retraction_object_grounded(cur, req.text, r[1])]
+                        if len(_gr_rows) < len(_sub_rows):
+                            log.info("correct_fact.subject_only_grounding_filtered",
+                                     subject=subject_uuid, rel_type=old_rel_type,
+                                     before=len(_sub_rows), after=len(_gr_rows),
+                                     note="a retraction's object must ground in the "
+                                          "user's own words (critic DEFECT B)")
+                        if _sub_rows and not _gr_rows:
+                            _ng_label = _correction_subject_label(
+                                db, subject_uuid, req.user_id, None, None,
+                                fallback=subject_name)
+                            return _refuse(
+                                status="no_match",
+                                subject_uuid=subject_uuid,
+                                subject_name=_ng_label,
+                                message=(f"Nothing you named matches what I have stored "
+                                         f"for '{old_rel_type}' — nothing was deleted. "
+                                         "Name the specific thing you want forgotten."))
+                        _sub_rows = _gr_rows
                     # HARVEST-RACE EXCLUSION (correction-only): drop the just-asserted new
                     # value's row so the harvest-added "red" cannot masquerade as a second
                     # OLD-value candidate and force a false >1 ambiguity that supersedes
@@ -60797,6 +60972,17 @@ def correct_fact(req: FactCorrectionRequest):
                         LIMIT 1
                     """, (subject_uuid, old_rel_type))
                     old_fact_row = cur.fetchone()
+                    if old_fact_row and is_retraction and not _retraction_object_grounded(
+                            cur, req.text, old_fact_row[1]):
+                        # DEFECT B discipline on the staged twin of step 3: the sentence
+                        # must name the object. Not grounded → leave unmatched (the honest
+                        # not-found path below); no refusal here — staged rows are
+                        # short-term Class C and the facts-table step already refused
+                        # when it held the ungrounded candidates.
+                        log.info("correct_fact.subject_staged_ungrounded_skipped",
+                                 subject=subject_uuid, rel_type=old_rel_type,
+                                 note="a retraction's object must ground in the user's words")
+                        old_fact_row = None
                     if old_fact_row:
                         found_via = f"subject_staged({old_rel_type})"
 
