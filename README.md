@@ -170,6 +170,7 @@ Each schema contained **only** its own entities and hierarchy — zero cross-ten
 - An LLM backend — [Ollama](https://ollama.ai/), [LM Studio](https://lmstudio.ai/), [OpenWebUI](https://openwebui.com/), or a hosted API (OpenAI, Anthropic, Groq)
 - About 4 GB of RAM free for the stack (it uses ~3 GB after boot); 8 GB recommended. A local LLM needs its own memory on top.
 - Launcher: `./setup.sh` needs only a POSIX `/bin/sh` — bash is **not** required (minimal Docker hosts often ship none). On any platform you can skip it and run `python3 quickstart.py` directly.
+- Disk: about **16 GB** free for the first build + boot. Measured fresh install under Docker: images ~2.9 GB + build cache ~4.5 GB; ~3 GB steady state after `docker builder prune`.
 
 ---
 
@@ -224,7 +225,7 @@ Re-run the connectivity check anytime with `python3 quickstart.py --validate`.
 
 FaultLine hooks into an LLM you already run — it doesn't host one. (If you *don't* have a model handy, `docker compose --profile ollama up -d` starts a bundled Ollama alongside the stack.)
 
-The first start downloads the GLiNER2 extraction model (~500 MB, CPU-only — no GPU or CUDA required). Takes 3–5 minutes.
+**No model downloads at first start.** The GLiNER2 extraction model, the local nomic embedding model and the spaCy linguistic model are downloaded once, during `docker compose build`, and baked into the image — the runtime then starts with `HF_HUB_OFFLINE=1` and cannot download anything. The first **start** only loads the baked weights from the image's cache, which is the one slow step of the install (see the next note).
 
 ### First login and seats
 
