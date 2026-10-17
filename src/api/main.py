@@ -15905,9 +15905,19 @@ def _dosage_correction_frame_floor(text: str):
         return None
 
 
-def _first_mention_naming_correction(text: str, cur) -> bool:
+def _first_mention_naming_correction(text: str, cur, subject_name=None) -> bool:
     """FOSS-011 FIRST-MENTION GUARD: is this CORRECTION-classified turn actually a naming
     statement with NOTHING to supersede?
+
+    ``subject_name`` (round 4, C×D-it collision): the turn's extracted correction subject,
+    when the caller already has it. A naming edge whose subject is DISJOINT from that
+    subject is DERIVER NOISE — an es turn parsed on an en model mints junk like
+    ``also_known_as('realidad', 'se mudo')`` while the correction is about DevBox — and
+    must never trigger the decline. A genuine first-mention naming turn has the naming
+    edge's subject = the turn's subject, which still declines exactly as before. A
+    first-person/absent subject is NOT disjoint evidence (a pro-drop naming turn
+    legitimately flattens its subject to the speaker), so the decline discipline stands
+    there.
 
     True ONLY when ALL of these hold (any miss → False = today's path, byte-identical):
       • the grammar layer is up, and the turn carries NO correction/retraction cue
@@ -15967,6 +15977,21 @@ def _first_mention_naming_correction(text: str, cur) -> bool:
     # Replacive shape: one subject asserted two names in one turn → a rename conflict.
     if any(len(v) > 1 for v in _per_subject_fm.values()):
         return False
+    # C×D-IT COLLISION RUNG (round 4): the naming edge must be ABOUT the turn's subject.
+    # When the extraction names a CONCRETE subject that no naming edge shares, the edge is
+    # parse noise (a wrong-model deriver minting a label for a clause it mis-split), not
+    # naming intent — declining here would misroute a genuine correction (measured: the es
+    # fixtures' also_known_as('realidad','se mudo') vs the turn's real subject DevBox).
+    if subject_name:
+        _sn_fm = str(subject_name).strip().lower()
+        if _sn_fm and _sn_fm not in ("user", "me", "i") and _sn_fm not in _per_subject_fm:
+            log.info("first_mention_naming.disjoint_subject_noise",
+                     subject=_sn_fm,
+                     naming_subjects=sorted(_per_subject_fm),
+                     note="naming-edge subject is disjoint from the turn's extracted "
+                          "correction subject — deriver noise, not naming intent; the "
+                          "correction lane owns the turn")
+            return False
     # LOOKUP-ONLY: the naming subject must be stored NOWHERE — else something real could be
     # superseded and today's correction lane is the right owner.
     try:
@@ -15982,38 +16007,49 @@ def _first_mention_naming_correction(text: str, cur) -> bool:
 
 def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
                            new_value=None, object_to_negate=None,
-                           is_retraction: bool = False):
-    """FOSS-015 PRO-DROP BEARER GROUNDING: ground a null-subject naming turn to the entity
-    it is about, LOOKUP-ONLY — never mint, never guess into a write.
+                           is_retraction: bool = False,
+                           require_prodrop_frames: bool = False):
+    """FOSS-015 PRO-DROP BEARER GROUNDING: ground a null-subject (or speaker-flattened)
+    naming turn to the entity it is about, LOOKUP-ONLY — never mint, never guess into a
+    write.
 
     The FOSS-011 round-2 fix made pro-drop correction/retraction turns SAFE (they decline the
     preroute and reach the ladder), but the corrector's LLM still returns subject=null on them
-    (the bearer is discourse-given, absent from the text): the split-turn rename parked at
-    "Old fact not found for subject change: pref_name" and the pro-drop retraction parked at a
-    generic clarification. This door grounds the bearer per the FOSS-015 fix direction
-    (mechanism (b), plus the grammar's own in-turn bearer NPs as a mechanism-(a) hint):
+    — or flattens the discourse-given subject to the SPEAKER (the live it shape: the SUBJECT
+    lane then dies at "Old fact not found for subject change: pref_name"). This door grounds
+    the bearer per the FOSS-015 fix direction (mechanism (b), plus the grammar's own in-turn
+    bearer NPs as the mechanism-(a) hint):
 
       • GRAMMAR GATE — `licensed_naming_frames(text)` must hold EXACTLY ONE distinct asserted
         name (an English parse returns () → this door never opens; en/es installs are
         byte-identical). The frame's own BEARER NPs ("il mio server …") are first-class
-        grounding keys — the grammar's referent hint.
-      • CANDIDATES — lookup-only: (a) entities stored under the turn's naming content (the
-        asserted name, the extracted old value, the retraction's object); (b) for CORRECTIONS,
-        the holders of the naming rels (pref_name / also_known_as — the naming chains' own
-        output; an active label IS the rename target). When two probes return DIFFERENT,
-        non-intersecting entities, they are rival referents → refuse.
+        grounding keys. With ``require_prodrop_frames`` (the speaker-flattened door) the
+        frames must ALSO be bearer-EMPTY — the strict pro-drop signature: a turn that names
+        its bearer in the text is a grounding job for the bearer-NP probe, never a licence
+        to override a speaker-bound subject.
+      • CANDIDATES — lookup-only, keyed on entity_aliases (THE LABEL TABLE THIS STACK
+        WRITES — critic round 3: it ingest files naming labels ONLY as alias rows, zero
+        pref_name/also_known_as FACTS rows exist on any it seat): (a) entities stored under
+        the turn's naming content (the asserted name, the extracted old value, the
+        retraction's object) and the frame bearer NPs; (b) the naming bearers proper —
+        entities holding a `preference_source = 'user_stated'` alias row (measured live:
+        every GIVEN name lands user_stated — apollo/devbox/fraggle — while head nouns, L4
+        type labels and provisioning rows are unspecified/inferred/rel_default/provisioned).
+        When two probes return DIFFERENT, non-intersecting entities, they are rival
+        referents → refuse.
       • AGREEMENT GATE — an extracted old value must be an alias of the candidate (the turn
-        says what the bearer is called TODAY); the entity must actually HOLD a naming rel
-        (there must be a label to supersede — a first mention is the FOSS-011 guard's
-        territory, never a silent mint).
+        says what the bearer is called TODAY), and the bearer must hold a user_stated label
+        (there must be a GIVEN name to supersede — an entity known only by its head noun is
+        a first mention, the FOSS-011 guard's territory, never a silent mint).
       • UNIQUENESS — exactly ONE candidate survives, else None (0 or >1 → today's
         clarification path; ambiguity is never resolved by guessing).
 
-    Returns ``{entity_id, rel, old_name, name, bearer_np}`` (``rel`` = the naming rel the
-    bearer holds, pref_name preferred) or ``None``. Read-only: indexed alias/fact probes
-    only. Caller (POST /retract/correct) uses the result to aim the EXISTING tested write
-    lanes — the SCALAR pref_name/also_known_as branch for corrections; a bearer-naming
-    clarification for retractions."""
+    Returns ``{entity_id, rel, old_name, name, bearer_np}`` (``rel`` = pref_name when the
+    bearer's user_stated label is preferred, else also_known_as — the alias bridge's own
+    rule) or ``None``. Read-only: indexed entity_aliases probes only. Caller (POST
+    /retract/correct) uses the result to aim the EXISTING tested write lanes — the SCALAR
+    pref_name/also_known_as branch for corrections; a bearer-naming clarification for
+    retractions."""
     if not text or not text.strip():
         return None
     try:
@@ -16029,6 +16065,8 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             names.append(_n)
     if len(names) != 1:
         return None  # the replacive-in-one-turn shape is the ladder's, not this door's
+    if require_prodrop_frames and any(_b and _b.strip() for _b, _n in frames):
+        return None  # the bearer is IN the text: the speaker binding may be right — not ours
     _name = names[0]
     try:
         _keys = {_name}
@@ -16050,40 +16088,39 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             if cands and _bearer_hits and not (cands & _bearer_hits):
                 return None  # rival referents: the name content and the bearer disagree
             cands |= _bearer_hits
-        if not is_retraction:
+        # The naming bearers proper: entities holding a USER-STATED alias row — a given
+        # name this seat's user actually spoke (the alias-model label; see the docstring).
+        cur.execute(
+            "SELECT DISTINCT entity_id FROM entity_aliases "
+            "WHERE preference_source = 'user_stated'", ())
+        _holders = {r[0] for r in cur.fetchall() if r[0]}
+        if cands and _holders and not (cands & _holders):
+            return None  # rival referents: the alias content and the given-name holder
+        cands |= _holders
+        # AGREEMENT GATE (corrections): an extracted old value must be an alias of the
+        # candidate.
+        if not is_retraction and old_value and str(old_value).strip() and cands:
             cur.execute(
-                "SELECT DISTINCT subject_id FROM facts "
-                "WHERE rel_type IN ('pref_name', 'also_known_as') "
-                "AND superseded_at IS NULL AND archived_at IS NULL", ())
-            _holders = {r[0] for r in cur.fetchall() if r[0]}
-            if cands and _holders and not (cands & _holders):
-                return None  # rival referents: alias content vs the naming-rel holder
-            cands |= _holders
-            # AGREEMENT GATE: an extracted old value must be an alias of the candidate.
-            if old_value and str(old_value).strip() and cands:
-                cur.execute(
-                    "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = %s",
-                    (str(old_value).strip().lower(),))
-                _agree = {r[0] for r in cur.fetchall() if r[0]}
-                cands &= _agree
+                "SELECT DISTINCT entity_id FROM entity_aliases WHERE alias = %s",
+                (str(old_value).strip().lower(),))
+            _agree = {r[0] for r in cur.fetchall() if r[0]}
+            cands &= _agree
         if len(cands) != 1:
             return None  # 0 or >1 candidates: ambiguity is never resolved by guessing
         entity_id = next(iter(cands))
+        # The label to supersede must be a GIVEN name (user_stated) — an entity known only
+        # by its head noun has nothing real to rename (a first mention: decline).
         cur.execute(
-            "SELECT DISTINCT rel_type FROM facts "
-            "WHERE subject_id = %s AND rel_type IN ('pref_name', 'also_known_as') "
-            "AND superseded_at IS NULL AND archived_at IS NULL", (entity_id,))
-        _held = {r[0] for r in cur.fetchall() if r[0]}
-        if not _held:
-            return None  # no label to supersede: a first mention is the FOSS-011 guard's
-        rel = "pref_name" if "pref_name" in _held else "also_known_as"
-        cur.execute(
-            "SELECT alias FROM entity_aliases WHERE entity_id = %s "
+            "SELECT alias, is_preferred FROM entity_aliases "
+            "WHERE entity_id = %s AND preference_source = 'user_stated' "
             "ORDER BY is_preferred DESC LIMIT 1", (entity_id,))
         _row = cur.fetchone()
+        if not _row or not _row[0]:
+            return None  # no given-name label to supersede
+        rel = "pref_name" if _row[1] else "also_known_as"
         return {"entity_id": entity_id,
                 "rel": rel,
-                "old_name": (_row[0] if _row and _row[0] else None),
+                "old_name": _row[0],
                 "name": _name,
                 "bearer_np": next((_b for _b, _n in frames if _b), "")}
     except Exception:  # noqa: BLE001 — a probe failure leaves today's path byte-identical
@@ -59758,45 +59795,6 @@ def correct_fact(req: FactCorrectionRequest):
         # Trust semantic classification. Do NOT override with hardcoded keywords (reduces accuracy 80%→65%)
         is_retraction = (req.intent == "RETRACTION") if req.intent else False
 
-        # ── FIRST-MENTION NAMING GUARD (FOSS-011, it branch) ─────────────────────
-        # A CORRECTION-classified turn that is really a FIRST naming ("Il mio server
-        # principale si chiama DevBox, il suo IP è 10.0.1.5." — measured es/en behavior:
-        # "se llama" / "is called" classify STATEMENT) has NOTHING to supersede: the lane
-        # below would MINT a subject and flip pref_name (the measured wound: status
-        # "corrected", committed=0, owns/alias/IP lost). Decline it BEFORE the LLM
-        # extraction with a "first_mention_naming" response; the MCP
-        # (remember_facts_tool) reads that status and routes the turn back through the
-        # STATEMENT path, where the naming chains capture owns + alias (+ the IP scalar)
-        # in one call. Everything that IS a correction — a stored bearer (rename), a
-        # two-name replacive turn ("si chiama X … anzi, si chiama Y"), any repair or
-        # retraction cue (it seeds: anzi, in realtà, dimentica, …) — fails the guard
-        # here and takes today's path byte-for-byte. Read-only (parse + cue + indexed
-        # alias probe); flag OFF → byte-for-byte legacy. Sits BELOW the is_retraction
-        # assignment on purpose: the guard only ever narrows the CORRECTION arm
-        # (critic round 1: an earlier placement above this assignment read the
-        # variable unbound and 500'd every correction and retraction).
-        if NAME_FIRST_MENTION_GUARD and not is_retraction:
-            try:
-                with db.cursor() as _fm_cur:
-                    _fm_first = _first_mention_naming_correction(req.text, _fm_cur)
-            except Exception as _fm_err:  # noqa: BLE001 — never break the endpoint
-                log.warning("correct_fact.first_mention_guard_failed", error=str(_fm_err)[:160])
-                _fm_first = False
-            if _fm_first:
-                log.info(
-                    "correct_fact.first_mention_naming_declined",
-                    user_id=req.user_id[:8],
-                    note="naming first mention with nothing to supersede — declined the "
-                         "destructive correction; the MCP routes the turn back through the "
-                         "statement path")
-                return FactCorrectionResponse(
-                    status="first_mention_naming",
-                    message=(
-                        "Nothing to correct yet — this introduces a new name rather than "
-                        "changing one, so no stored value was overwritten. The statement "
-                        "was handed back to be stored normally."
-                    ),
-                )
 
         # Stage 2: LLM extraction (metadata-driven)
         # Per dprompt-143: Extract semantic intent (subject, rel_type, object, action, dimension)
@@ -59877,6 +59875,53 @@ def correct_fact(req: FactCorrectionRequest):
         )
         subject_uuid = None
         confidence = extraction.get("confidence", 0.0)
+
+        # ── FIRST-MENTION NAMING GUARD (FOSS-011, it branch; round 4: post-extraction) ─
+        # A CORRECTION-classified turn that is really a FIRST naming ("Il mio server
+        # principale si chiama DevBox, il suo IP è 10.0.1.5." — measured es/en behavior:
+        # "se llama" / "is called" classify STATEMENT) has NOTHING to supersede: the lane
+        # below would MINT a subject and flip pref_name (the measured wound: status
+        # "corrected", committed=0, owns/alias/IP lost). The guard answers
+        # "first_mention_naming" and the MCP (remember_facts_tool) routes the turn back
+        # through the STATEMENT path, where the naming chains capture owns + alias (+ the
+        # IP scalar) in one call. Everything that IS a correction — a stored bearer
+        # (rename), a two-name replacive turn ("si chiama X … anzi, si chiama Y"), any
+        # repair or retraction cue (it seeds: anzi, in realtà, dimentica, …) — fails the
+        # guard and takes today's path byte-for-byte. Read-only (parse + cue + indexed
+        # alias probe); flag OFF → byte-for-byte legacy. PLACEMENT (round 4, C×D-it
+        # collision): the guard runs AFTER the LLM extraction and receives its subject —
+        # the disjoint-subject rung needs the turn's REAL subject to recognise a deriver-
+        # NOISE naming edge (an es fixture parsed on an en model mints
+        # also_known_as('realidad','se mudo') while the correction is about DevBox; a
+        # genuine first mention has naming-edge subject == turn subject and still
+        # declines). A declined turn therefore pays one extraction call — the honest
+        # price of not misrouting real corrections; the guard still fires BEFORE any
+        # write. Sits BELOW the is_retraction assignment (the guard only ever narrows the
+        # CORRECTION arm — critic round 1: an earlier placement above that assignment
+        # read the variable unbound and 500'd every correction and retraction).
+        if NAME_FIRST_MENTION_GUARD and not is_retraction:
+            try:
+                with db.cursor() as _fm_cur:
+                    _fm_first = _first_mention_naming_correction(
+                        req.text, _fm_cur, subject_name=subject_name)
+            except Exception as _fm_err:  # noqa: BLE001 — never break the endpoint
+                log.warning("correct_fact.first_mention_guard_failed", error=str(_fm_err)[:160])
+                _fm_first = False
+            if _fm_first:
+                log.info(
+                    "correct_fact.first_mention_naming_declined",
+                    user_id=req.user_id[:8],
+                    note="naming first mention with nothing to supersede — declined the "
+                         "destructive correction; the MCP routes the turn back through the "
+                         "statement path")
+                return FactCorrectionResponse(
+                    status="first_mention_naming",
+                    message=(
+                        "Nothing to correct yet — this introduces a new name rather than "
+                        "changing one, so no stored value was overwritten. The statement "
+                        "was handed back to be stored normally."
+                    ),
+                )
 
         # RETRACTION vs CORRECTION: extract different fields
         if is_retraction:
@@ -60078,9 +60123,10 @@ def correct_fact(req: FactCorrectionRequest):
                          bearer=str(subject_uuid)[:8], rel=_pd["rel"],
                          old_name=_pd["old_name"], new_name=_pd["name"],
                          bearer_np=_pd.get("bearer_np") or "",
-                         note="pro-drop naming turn grounded to the unique naming-rel "
-                              "holder; the label flip lands on the SAME entity via the "
-                              "existing SCALAR pref_name/also_known_as lane")
+                         note="pro-drop naming turn grounded to the unique given-name "
+                              "holder (entity_aliases, user_stated row); the label flip "
+                              "lands on the SAME entity via the existing SCALAR "
+                              "pref_name/also_known_as lane")
             elif _pd and is_retraction:
                 _pd_label = _pd.get("old_name") or _pd.get("name") or "that entity"
                 log.info("correct_fact.prodrop_retraction_bearer_named",
@@ -60536,6 +60582,70 @@ def correct_fact(req: FactCorrectionRequest):
                 message=f"Field '{old_rel_type}' is immutable and cannot be corrected. "
                         f"Identity facts like birth date and birthplace cannot be changed once established."
             )
+
+        # ── FOSS-015 DOOR B: the SPEAKER-FLATTENED pro-drop shape (critic round 4) ─────
+        # Door A above catches the null-subject shape BEFORE the subject ladder. The LIVE
+        # it shape (critic round 3) is different: the extractor flattens the discourse-
+        # given subject to the SPEAKER, the ladder binds it to the user, and the turn dies
+        # in the SUBJECT lane ("Old fact not found for subject change: pref_name") or the
+        # entity lane answers a no-op "corrected". When the ladder bound the subject to
+        # the SPEAKER on a licensed pro-drop naming turn, the speaker is NOT the bearer —
+        # that flattening IS the pro-drop signature — so ground the bearer through the
+        # alias table here, BEFORE the dimension dispatch, and the naming shape never
+        # reaches the SUBJECT lane. Corrections require the STRICT pro-drop frames
+        # (bearer-empty): a turn that names its bearer in the text ("il mio nome è X")
+        # may legitimately be about the speaker, and the door declines. RETRACTIONS accept
+        # any single-name naming frame (the naming content itself is the grounding key)
+        # and land on the same bearer-naming clarification as door A. Same gates as door
+        # A: lookup-only (entity_aliases probes), never mint, agreement, uniqueness;
+        # flag OFF / no unique bearer → today's lanes unchanged.
+        if PRODROP_BEARER_GROUNDING and subject_uuid and subject_uuid == req.user_id:
+            _pd2 = None
+            try:
+                with db.cursor() as _pd_cur2:
+                    _pd2 = _ground_prodrop_bearer(
+                        _pd_cur2, req.user_id, req.text,
+                        old_value=old_value, new_value=new_value,
+                        object_to_negate=(object_to_negate if is_retraction else None),
+                        is_retraction=is_retraction,
+                        require_prodrop_frames=not is_retraction)
+            except Exception as _pd2_err:  # noqa: BLE001 — a grounding miss never breaks
+                log.warning("correct_fact.prodrop_ground_failed_speaker",
+                            error=str(_pd2_err)[:160])
+                _pd2 = None
+            if _pd2 and not is_retraction:
+                subject_uuid = _pd2["entity_id"]
+                _name_repair_probed_referent = True
+                old_rel_type = _pd2["rel"]
+                new_rel_type = _pd2["rel"]
+                old_value = _pd2["old_name"] or old_value
+                new_value = new_value or _pd2["name"]
+                extraction["dimension"] = "SCALAR"
+                subject_name = _pd2["old_name"] or _pd2["name"]
+                extraction["subject_name"] = subject_name
+                log.info("correct_fact.prodrop_speaker_flattening_grounded",
+                         user_id=req.user_id[:8],
+                         bearer=str(subject_uuid)[:8], rel=_pd2["rel"],
+                         old_name=_pd2["old_name"], new_name=_pd2["name"],
+                         note="speaker-flattened pro-drop naming turn: the ladder bound "
+                              "the discourse-given subject to the user; the alias-table "
+                              "probe grounds the real bearer and the label flip lands on "
+                              "the SAME entity via the SCALAR pref_name/also_known_as "
+                              "lane — the SUBJECT lane is never reached")
+            elif _pd2 and is_retraction:
+                _pd2_label = _pd2.get("old_name") or _pd2.get("name") or "that entity"
+                log.info("correct_fact.prodrop_retraction_bearer_named_speaker",
+                         user_id=req.user_id[:8],
+                         bearer=str(_pd2["entity_id"])[:8], label=_pd2_label,
+                         name=_pd2.get("name") or "",
+                         note="speaker-bound pro-drop retraction grounded: clarifying "
+                              "WITH the bearer named (nothing affirmative is written)")
+                return FactCorrectionResponse(
+                    status="clarification_needed",
+                    message=(f"I found it: \"{_pd2.get('name')}\" is a name of "
+                             f"\"{_pd2_label}\". Should I forget that name? "
+                             "Confirm and I'll remove it."),
+                )
 
         # Stage 2: ATOMIC TRANSACTION (dimension-aware execution)
         with db.cursor() as cur:

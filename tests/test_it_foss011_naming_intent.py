@@ -32,6 +32,7 @@ re-runs them for real.
 """
 import asyncio
 import os
+import re
 import subprocess
 import sys
 
@@ -673,17 +674,25 @@ def _ground(monkeypatch, frames, routes, **kw):
     return M._ground_prodrop_bearer(_GroundCur(routes), "u1", kw.pop("text", "anzi si chiama"), **kw)
 
 
+# Round-4 route discriminators (the door is keyed on entity_aliases, the label table
+# this stack writes - critic round 3: zero pref_name/also_known_as FACTS rows on any it
+# seat):
+#   keys probe        SELECT DISTINCT entity_id ... WHERE alias = ANY(%s)   -> "alias = ANY"
+#   holders           SELECT DISTINCT entity_id ... WHERE preference_source = 'user_stated'
+#   held label        SELECT alias, is_preferred ... AND preference_source = 'user_stated'
+#   agreement         SELECT DISTINCT entity_id ... WHERE alias = %s
+
 def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
     """THE FLAGSHIP PIN: b2 "Anzi, si chiama DevBox." (pro-drop frame, bearer empty) grounds
-    to the UNIQUE holder of the naming rel - the bearer the rename targets. With the bearer,
-    the existing SCALAR pref_name/also_known_as lane flips apollo -> devbox ON THE SAME
-    ENTITY (recall shows DevBox) instead of parking at "Old fact not found for subject
-    change: pref_name"."""
+    to the UNIQUE given-name holder - the entity holding the seat's one user_stated alias
+    row (measured live: apollo/devbox/fraggle all land user_stated; head nouns and
+    provisioning rows never do). With the bearer, the existing SCALAR
+    pref_name/also_known_as lane flips apollo -> devbox ON THE SAME ENTITY (recall shows
+    DevBox) instead of parking at "Old fact not found for subject change: pref_name"."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("DISTINCT subject_id FROM facts", [(_E1,)]),
-        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
-        ("ORDER BY is_preferred DESC", [("apollo",)]),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
     ])
     assert got and got["entity_id"] == _E1, got
     assert got["rel"] == "pref_name", got
@@ -691,23 +700,23 @@ def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
 
 
 def test_prodrop_correction_declines_on_two_holders(monkeypatch):
-    """Two entities hold naming rels -> rival referents -> None (today's clarification path;
-    ambiguity is never resolved by guessing)."""
+    """Two entities hold given names -> rival referents -> None (today's clarification
+    path; ambiguity is never resolved by guessing)."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("DISTINCT subject_id FROM facts", [(_E1,), (_E2,)]),
+        ("WHERE preference_source = 'user_stated'", [(_E1,), (_E2,)]),
     ])
     assert got is None
 
 
 def test_agreement_gate_declines_when_old_value_not_held(monkeypatch):
     """The turn says what the bearer is called TODAY: an extracted old value that is an
-    alias of a DIFFERENT entity contradicts the naming-rel holder -> the intersection is
+    alias of a DIFFERENT entity contradicts the given-name holder -> the intersection is
     empty -> None (the agreement gate always binds)."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("DISTINCT subject_id FROM facts", [(_E1,)]),
-        ("DISTINCT entity_id FROM entity_aliases WHERE alias = %s", [(_E2,)]),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("WHERE alias = %s", [(_E2,)]),
     ], old_value="apollo")
     assert got is None
 
@@ -716,30 +725,30 @@ def test_agreement_gate_accepts_when_old_value_is_held(monkeypatch):
     """The agreeing case: old_value is an alias OF the holder -> grounding proceeds."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("DISTINCT subject_id FROM facts", [(_E1,)]),
-        ("DISTINCT entity_id FROM entity_aliases WHERE alias = %s", [(_E1,)]),
-        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
-        ("ORDER BY is_preferred DESC", [("apollo",)]),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("WHERE alias = %s", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
     ], old_value="apollo")
     assert got and got["entity_id"] == _E1
 
 
 def test_rival_probes_decline(monkeypatch):
-    """Alias content names one entity, the naming-rel holder is a DIFFERENT one -> rival
+    """Alias content names one entity, the given-name holder is a DIFFERENT one -> rival
     referents -> None (never guess between them)."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", [(_E1,)]),
-        ("DISTINCT subject_id FROM facts", [(_E2,)]),
+        ("WHERE preference_source = 'user_stated'", [(_E2,)]),
     ])
     assert got is None
 
 
-def test_no_held_naming_rel_declines(monkeypatch):
-    """A candidate with NO naming edge has no label to supersede - that shape is a first
-    mention (the FOSS-011 guard's territory), never a silent mint here."""
+def test_no_given_name_label_declines(monkeypatch):
+    """A candidate with NO user_stated alias (known only by its head noun, or a garbage
+    rel_default row like the wound residue anzi|devbox) has no GIVEN name to supersede -
+    that shape is a first mention (the FOSS-011 guard's territory), never a silent mint."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", [(_E1,)]),
-        ("DISTINCT rel_type FROM facts", []),
+        ("AND preference_source = 'user_stated'", []),
     ])
     assert got is None
 
@@ -756,12 +765,13 @@ def test_english_frames_never_open_the_door(monkeypatch):
 def test_retraction_arm_grounds_via_alias_overlap(monkeypatch):
     """The pro-drop retraction ("dimentica che ho una gatta che si chiama Fraggle.")
     grounds its bearer by the turn's naming content: the forgotten name IS a stored alias of
-    the gatta entity. The door hands the bearer to the caller, which clarifies NAMING it (the
-    FOSS-015 doc's accepted landing) instead of a generic who-is-this."""
+    the gatta entity (fraggle|user_stated, measured live). The door hands the bearer to the
+    caller, which clarifies NAMING it (the FOSS-015 doc's accepted landing) instead of the
+    ENTITY lane's no-op "corrected, facts_superseded=0"."""
     got = _ground(monkeypatch, (("gatta", "fraggle"),), [
         ("alias = ANY", [(_E1,)]),
-        ("DISTINCT rel_type FROM facts", [("also_known_as",)]),
-        ("ORDER BY is_preferred DESC", [("gatta",)]),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("fraggle", False)]),
     ], is_retraction=True, object_to_negate="fraggle",
        text="dimentica che ho una gatta che si chiama fraggle")
     assert got and got["entity_id"] == _E1, got
@@ -774,12 +784,88 @@ def test_overt_bearer_np_is_a_first_class_key(monkeypatch):
     got = _ground(monkeypatch, (("server", "devbox"),), [
         # two separate alias-ANY probes run (naming keys, then bearer NPs): route on PARAMS
         ("alias = ANY", lambda p: [(_E1,)] if "server" in (p[0] or []) else []),
-        ("ORDER BY is_preferred DESC", [("apollo",)]),
-        ("DISTINCT rel_type FROM facts", [("pref_name",)]),
+        ("WHERE preference_source = 'user_stated'", []),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
     ], text="il mio server si chiama DevBox")
     # the bearer-key probe runs with 'server' in the params and hits E1
     assert got and got["entity_id"] == _E1, got
     assert got["bearer_np"] == "server", got
+
+
+# 9b. ROUND 4 (critic round 3 root cause): alias-table keying + the speaker-flattened door
+
+def test_holder_gate_is_keyed_on_the_alias_table_not_facts(monkeypatch):
+    """THE ROUND-3 ROOT CAUSE, pinned: the door's holder gate must read entity_aliases
+    (the label table it ingest writes) - never the facts table, where this stack files ZERO
+    naming rows. Source-level: the helper body carries no `FROM facts` at all."""
+    import inspect
+    import src.api.main as M
+    src_text = inspect.getsource(M._ground_prodrop_bearer)
+    assert "FROM facts" not in src_text, "the door still reads the empty facts lane"
+    assert "preference_source = 'user_stated'" in src_text
+
+
+def test_speaker_flattened_door_requires_strict_prodrop_frames(monkeypatch):
+    """Door B's grammar half: a turn that NAMES its bearer in the text ("il mio nome e
+    X" / "Marco si chiama..") may legitimately BE about the speaker - the strict pro-drop
+    gate (bearer-EMPTY frames) declines, and the speaker binding stands."""
+    got = _ground(monkeypatch, (("server", "devbox"),), [
+        ("alias = ANY", []),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+    ], require_prodrop_frames=True,
+       text="il mio server si chiama DevBox")
+    assert got is None
+
+
+def test_strict_prodrop_frames_still_ground(monkeypatch):
+    """The same gate accepts the REAL b2 shape (bearer-empty frames) - the flattened door
+    fires exactly on the pro-drop signature."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+    ], require_prodrop_frames=True)
+    assert got and got["entity_id"] == _E1, got
+
+
+def test_speaker_door_sits_between_the_ladder_and_the_dispatch():
+    """Door B must run AFTER the subject ladder (it fires on the SPEAKER-bound shape)
+    and BEFORE the dimension dispatch - so the SUBJECT lane (the one that dies at "Old fact
+    not found for subject change: pref_name") never sees the naming shape."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        lines = fh.read().splitlines()
+    doorb = next(i for i, l in enumerate(lines, 1)
+                 if "if PRODROP_BEARER_GROUNDING and subject_uuid and subject_uuid == req.user_id:" in l)
+    dispatch = next(i for i, l in enumerate(lines, 1)
+                    if 'dimension = extraction.get("dimension", "RELATIONAL").upper()' in l)
+    assert doorb < dispatch, (doorb, dispatch)
+
+
+def test_alias_schema_invariant_the_door_reads_what_ingest_writes():
+    """THE SCHEMA-INVARIANT PIN (not a scripted row in sight): the provisioning template -
+    the DDL every tenant is minted from - must define the entity_aliases columns the door's
+    gates query (entity_id / alias / is_preferred / preference_source). A future lane shift
+    (dropping preference_source, moving labels to another table) strands the door exactly
+    the way the facts-table keying did in round 3 - this pin makes that loud at test time."""
+    import src.api.main as M
+    tpl = os.path.join(os.path.dirname(M.__file__), os.pardir, os.pardir,
+                       "src", "provisioning", "templates", "user_schema.sql")
+    with open(tpl) as fh:
+        ddl = fh.read()
+    start = ddl.index("CREATE TABLE IF NOT EXISTS entity_aliases")
+    end = ddl.index(");", start)
+    block = ddl[start:end]
+    for col in ("entity_id", "alias", "is_preferred", "preference_source"):
+        assert re.search(rf"^\s*{col}\s+", block, re.M), (col, block[-400:])
+    # and the door must key on THAT table, by name, in its holder/held gates - and read
+    # the user_stated trust marker the SCALAR alias lane stamps (the ingest write seam's
+    # own given-name signal), never the empty facts-table naming rows
+    import inspect
+    src_text = inspect.getsource(M._ground_prodrop_bearer)
+    assert src_text.count("entity_aliases") >= 3, src_text
+    assert "preference_source = 'user_stated'" in src_text, src_text[-600:]
 
 
 def test_bearer_grounding_flag_defaults_on():
@@ -829,6 +915,97 @@ def test_split_turn_b2_frames_feed_the_grounding_door():
         "Anzi, si chiama DevBox.")
     assert b1 and b1[0][0] and b1[0][1] == "apollo", b1
     assert b2 and b2[0] == ("", "devbox"), b2
+
+
+
+
+# 9c. ROUND 4, ITEM A - the C×D-it collision rung: a naming edge whose subject is
+# DISJOINT from the turn's extracted correction subject is DERIVER NOISE, never naming
+# intent (the es fixtures on an en parse mint also_known_as('realidad','se mudo') while the
+# correction is about DevBox - the guard's decline then misroutes a genuine correction).
+
+class _F:
+    "Minimal deriver edge (subject, rel_type, object)."
+    def __init__(self, s, r, o):
+        self.subject, self.rel_type, self.object = s, r, o
+
+
+def _guard(monkeypatch, edges, subject_name=None, cue_hit=False, it_cue=False,
+           stored=()):
+    "Drive _first_mention_naming_correction with a stubbed deriver + alias probe."
+    import src.api.main as M
+    from src.extraction import linguistics as _L
+
+    monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: it_cue)
+    monkeypatch.setattr(_L, "derive_sentence_facts", lambda _t, _r, **k: list(edges))
+    monkeypatch.setattr(_L, "linguistics_available", lambda: True)
+    return M._first_mention_naming_correction(
+        "turn text", _FakeCur(stored=stored), subject_name=subject_name)
+
+
+def test_guard_disjoint_naming_subject_is_deriver_noise(monkeypatch):
+    """THE C×D-IT PIN: a garbage naming edge (subject 'realidad') vs the turn's real
+    correction subject 'devbox' - the disjoint-subject rung vetoes the decline, the
+    correction lane owns the turn. Before round 4 the guard declined (status=
+    first_mention_naming) and 3 lane-C pins went red on the port-worker environment."""
+    assert _guard(
+        monkeypatch, [_F("realidad", "also_known_as", "se mudo")],
+        subject_name="DevBox") is False
+
+
+def test_guard_same_subject_still_declines(monkeypatch):
+    """A genuine first mention: the naming edge's subject IS the turn's subject -> the
+    decline discipline stands (the rung only ever vetoes DISJOINT edges)."""
+    assert _guard(
+        monkeypatch, [_F("realidad", "also_known_as", "se mudo")],
+        subject_name="Realidad") is True
+
+
+def test_guard_disjoint_rung_ignores_first_person_subject(monkeypatch):
+    """A first-person extraction subject is NOT disjoint evidence - a pro-drop naming turn
+    legitimately flattens its subject to the speaker, so the decline stands (conservative)."""
+    assert _guard(
+        monkeypatch, [_F("realidad", "also_known_as", "se mudo")],
+        subject_name="user") is True
+    assert _guard(
+        monkeypatch, [_F("server", "pref_name", "apollo")],
+        subject_name=None) is True
+
+
+def test_guard_passes_the_extracted_subject_from_the_endpoint():
+    """The endpoint call site must hand the guard the extraction's subject (the rung's
+    input) - a call without it silently re-opens the C×D-it wound."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        src_text = fh.read()
+    assert ("req.text, _fm_cur, subject_name=subject_name" in src_text), \
+        "the endpoint guard call lost the extraction subject"
+
+
+def test_first_mention_guard_runs_after_the_extraction():
+    """Position pin (round 4): the guard sits BELOW the LLM extraction - the disjoint
+    rung needs the turn's real subject. A declined turn pays one extraction call; the guard
+    still fires before ANY write."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        lines = fh.read().splitlines()
+    extract = next(i for i, l in enumerate(lines, 1)
+                   if "correct_fact.extraction_start" in l)
+    guard = next(i for i, l in enumerate(lines, 1)
+                 if "if NAME_FIRST_MENTION_GUARD and not is_retraction:" in l)
+    assert extract < guard, (extract, guard)
+
+
+@needs_it
+def test_es_fixture_parse_still_mints_the_noise_edge():
+    """The collision's grammar half, on the REAL en parse of the es fixture: the deriver
+    really does emit the disjoint garbage edge (also_known_as('realidad','se mudo')) -
+    documenting WHY the semantic rung exists: the edge cannot be prevented at the parse,
+    only discounted at the decision."""
+    names = _it_names("En realidad DevBox se mudo a 10.0.1.10 despues del cambio de red.")
+    garbage = [n for n in names if n and n[0] == "realidad" and n[1] == "also_known_as"]
+    assert garbage, names
 
 
 # 10. FLAGS + THE EN STATEMENT-LANE FIXTURE (the parity anchor)
