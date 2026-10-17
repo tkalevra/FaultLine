@@ -18826,8 +18826,68 @@ NEG_ENSEMBLE_W_PATTERN = float(os.getenv("NEG_ENSEMBLE_W_PATTERN", "0.25"))
 _GAP_RAW = float(os.getenv("NEG_ENSEMBLE_GAP", "0.65"))
 NEG_ENSEMBLE_GAP = max(0.61, min(0.73, _GAP_RAW))
 
+# ── SENTENTIAL-NEGATION DESTRUCTIVE-LEAN VETO (FOSS-005) ──────────────────────────
+# THE HOLE: a gate-passed GLiNER2 lean is returned UNOPPOSED when its label is
+# RETRACTION/CORRECTION — the neg-scope ensemble above engages only on
+# STATEMENT/QUERY leans, and every upstream guard fires only on EXPLICIT lexical
+# cues. On Spanish zero-shot text GLiNER2 scores a plain sentential negation
+# ("No uso el puerto 9004 en ningún servidor." — a brand-new NEGATIVE fact, the
+# exact shape en scores STATEMENT) as RETRACTION; the MCP routes it to
+# /retract/correct, and the failed retraction minted an AFFIRMATIVE edge — the
+# store asserting the OPPOSITE of what the user said. The veto applies the SAME
+# shape vocabulary the ensemble already owns to the DESTRUCTIVE leans: when the
+# only negation on the turn is SENTENTIAL (a scope over a VERBAL predicate — not
+# the nominal/two-pole structural denial the ensemble and the CORRECTION lane
+# legitimately route) and analyze_directive() finds NO explicit removal/repair
+# cue (imperative delete verb, cessation adverbial, contrastive negation, repair
+# marker, "I meant"), the destructive lean is vetoed to STATEMENT with polarity
+# preserved (ingest keeps the negation — the UD-aware _is_neg) — exactly en's
+# classification outcome for this shape. GLiNER2 stays frozen (Pitfall 11): its
+# label simply stops being decisive on this one shape. Grammar only, no word
+# list. Fail-safe: any layer error → the label stands (today's path).
+SENTENTIAL_NEGATION_VETO = os.getenv("SENTENTIAL_NEGATION_VETO", "true").lower() not in ("0", "false", "no")
 
-def _fire_intent_confidence_feedback(user_id: str, confidence: float) -> None:
+
+def _sentential_negation_blocks_destructive(scopes, directive) -> bool:
+    """True when a gate-passed destructive GLiNER2 lean must be vetoed to STATEMENT.
+
+    ``scopes``: analyze_negation_scopes() facts (list[NegationScope] | None).
+    ``directive``: analyze_directive() facts (DirectiveAnalysis | None). PURE —
+    no parsing here, so it is unit-pinnable without a model.
+
+    Veto = a negation scope exists AND every scope is SENTENTIAL (no nominal
+    complement, no two-referential poles — those are the structural-denial
+    shapes the ensemble / CORRECTION lane own) AND the directive carries NO
+    explicit removal/repair cue. Any doubt (no scopes, no directive, an explicit
+    cue) → False: today's route stands.
+    """
+    if not scopes:
+        return False
+    if directive is None:
+        # Layer unavailable / parse miss → never veto on missing grammar facts.
+        return False
+    # EXPLICIT removal/repair cues route destructively upstream, or are a
+    # legitimate correction shape: never veto them.
+    if (directive.imperative_root_lemma in _RETRACTION_CUE_LEMMAS
+            and not directive.imperative_root_negated):
+        return False
+    if directive.cessation_advmod_lemmas & _CESSATION_ADVMOD_LEMMAS:
+        return False
+    if directive.has_contrastive_negation:
+        return False
+    if directive.clause_initial_markers & _CORRECTION_MARKER_LEMMAS:
+        return False
+    if directive.root_verb_lemma in _CORRECTION_VERB_LEMMAS and directive.root_subject_is_self:
+        return False
+    # SENTENTIAL only: a nominal-complement or two-pole negation is the
+    # structural-denial shape ("mi gata no es Fraggle", "mis mascotas no son
+    # parte de mi familia") the ensemble / CORRECTION lane own.
+    if any(s.predicates_nominal or s.two_referential_poles for s in scopes):
+        return False
+    return True
+
+
+async def _fire_intent_confidence_feedback(user_id: str, confidence: float) -> None:
     """Fire-and-forget auto_classification feedback for an ensemble-decided turn.
 
     The ensemble returns EARLY from /classify-intent, skipping the feedback write at the
@@ -19289,6 +19349,8 @@ def intent_layer_stats(_op: str = Depends(require_operator)):
 
     Layers (in evaluation order): input_invalid, spacy_interrogative, spacy_cue_tier1,
     spacy_cue_tier2_llm_agreement, spacy_affective, spacy_declarative, spacy_transition,
+    negated_statement_veto (FOSS-005: a gate-passed destructive GLiNER2 lean whose only
+    negation is sentential, with no removal/repair cue → STATEMENT),
     gliner2_native (GLiNER2 classify_text ≥ the per-user adaptive gate),
     neg_ensemble_voters / neg_ensemble_llm_adjudication / neg_ensemble_failopen
     (negation-scope three-voter ensemble — fires only on gate-passed STATEMENT/QUERY
@@ -19804,6 +19866,61 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         if confidence >= user_gate_threshold:
             log.debug("classify_intent.gate_passed", intent=intent, confidence=round(confidence, 2), gate=round(user_gate_threshold, 2))
             # Still record the decision for re_embedder feedback (fire-and-forget below)
+
+            # === SENTENTIAL-NEGATION DESTRUCTIVE-LEAN VETO (FOSS-005) ===
+            # A gate-passed GLiNER2 RETRACTION/CORRECTION lean whose ONLY negation is
+            # SENTENTIAL and which carries no explicit removal/repair cue is a plain
+            # negative STATEMENT ("No uso el puerto 9004 en ningún servidor.") —
+            # en scores this exact shape STATEMENT; on es the destructive lean routed
+            # the turn to /retract/correct and the failed retraction minted an
+            # affirmative edge. Veto to STATEMENT (polarity preserved at ingest). The
+            # structural-denial shapes stay with the ensemble/CORRECTION lane; the
+            # decision lives in _sentential_negation_blocks_destructive (above, pure).
+            # Fail-safe: layer unavailable / parse miss / any error → the label stands.
+            if SENTENTIAL_NEGATION_VETO and intent in ("RETRACTION", "CORRECTION"):
+                try:
+                    from src.extraction.linguistics import (
+                        analyze_directive as _veto_ad,
+                        analyze_negation_scopes as _veto_ans,
+                        is_interrogative_clause as _veto_interro,
+                        linguistics_available as _veto_ling_ok,
+                    )
+
+                    # OFF-LOOP (first-touch-cold-path discipline): two spaCy parses as
+                    # ONE threaded unit; a question is never vetoed here (the
+                    # interrogative pre-route owns questions — a destructive lean on
+                    # one is a parse miss, re-checked like the ensemble re-checks).
+                    def _veto_facts_sync():
+                        if not _veto_ling_ok():
+                            return None
+                        try:
+                            if _veto_interro(text) is True:
+                                return None
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return _veto_ans(text), _veto_ad(text)
+
+                    _veto_facts = await asyncio.to_thread(_veto_facts_sync)
+                    if _veto_facts is not None:
+                        _v_scopes, _v_directive = _veto_facts
+                        if _sentential_negation_blocks_destructive(_v_scopes, _v_directive):
+                            log.info(
+                                "classify_intent.negated_statement_veto",
+                                user_id=user_id[:8],
+                                gliner2_label=intent,
+                                gliner2_confidence=round(float(confidence), 3),
+                                note="sentential negation with no removal/repair cue → "
+                                     "STATEMENT (polarity preserved at ingest); a negative "
+                                     "statement is a fact, not a deletion",
+                            )
+                            print(f"[/classify-intent] NEGATED-STATEMENT VETO: GLiNER2 "
+                                  f"{intent}@{float(confidence):.3f} → STATEMENT "
+                                  f"(sentential negation, no removal/repair cue)", flush=True)
+                            _note_intent_layer(user_id, "negated_statement_veto", "STATEMENT")
+                            return {"intent": "STATEMENT", "confidence": 0.95}
+                except Exception as _veto_err:  # noqa: BLE001 — fail-safe: label stands
+                    log.debug("classify_intent.negation_veto_unavailable",
+                              user_id=user_id[:8], error=str(_veto_err)[:120])
 
             # === NEGATION-SCOPE THREE-VOTER ENSEMBLE (the single-decider fall-through
             # REPLACED on negation-scoped turns only): a confident GLiNER2 STATEMENT/QUERY
