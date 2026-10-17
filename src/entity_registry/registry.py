@@ -139,6 +139,68 @@ class MeasurementFamilySurfaceError(ValueError):
     """
 
 
+class StopwordSurfaceError(ValueError):
+    """A PURE FUNCTION-WORD surface was refused as an entity referent (critic round 2,
+    the #23/#30 default-deny family extended to the stopword class).
+
+    Measured live: the harvest's 'after the network change' capture debris minted a junk
+    fragment entity whose alias is the literal 'that'. A stopword alias grounds in EVERY
+    sentence containing the word, so the FOSS-008 agreement gate then counted the junk
+    entity as a grounded candidate in nearly any English retraction — a persistent
+    ambiguous-refusal LOCKOUT (safe direction, but a lockout), and the destructive lanes
+    could bind to the nothing-entity through it.
+
+    Same ValueError-subclass drop discipline as :class:`MeasurementFamilySurfaceError`
+    (loud, recorded, turn retained); same DEFAULT-DENY shape: the alias probe above
+    returns FIRST for any REGISTERED name, so a surface already deliberately filed (the
+    naming frames, ``register_alias`` with is_preferred=True) still resolves forever
+    after — the guard refuses only the MINT of a new pure-stopword alias, never the
+    recall of a registered one. The screen is a STOPWORD screen, not a content
+    vocabulary: a small closed-class list (en + the es battery's function words), never
+    grown per-subject.
+    """
+
+
+# The closed-class screen. Deliberately SMALL and closed: this is a function-word
+# screen (grammar), never a domain/content vocabulary (that would be a cue-class rail).
+# A surface whose every token is in this set carries no referential content.
+_STOPWORD_ALIASES = frozenset({
+    # English closed-class
+    "a", "an", "the", "that", "this", "these", "those", "it", "its",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "of", "to", "in", "on", "at", "for", "with", "and", "or", "but",
+    "if", "then", "than", "so", "as", "by", "from", "up", "down",
+    "i", "me", "my", "mine", "myself", "we", "us", "our", "ours",
+    "you", "your", "yours", "he", "him", "his", "she", "her", "hers",
+    "they", "them", "their", "theirs",
+    "have", "has", "had", "do", "does", "did", "done",
+    "not", "no", "yes", "very", "just", "also", "too",
+    "there", "here", "what", "which", "who", "whom", "when", "where",
+    "why", "how", "after", "before", "about", "over", "under", "out",
+    "off", "again", "once",
+    # Spanish closed-class (the es battery shares the same seams)
+    "que", "de", "la", "el", "los", "las", "un", "una", "unos", "unas",
+    "y", "o", "pero", "si", "sí", "mi", "mis", "tu", "tus", "su",
+    "sus", "lo", "al", "en", "con", "por", "para", "como", "muy",
+    "ya", "es", "son", "era", "ser", "esta", "este", "estos", "estas",
+})
+
+
+def _stopword_surface_refused(name: str) -> bool:
+    """True when EVERY token of the surface is a closed-class function word — the
+    surface carries no referential content ('that', 'the of', 'que y'). A multiword
+    surface with at least one content token ('after the network change') is NOT
+    refused here; its debris, if any, is the deriver's to clean."""
+    try:
+        _norm = " ".join(str(name or "").strip().lower().split())
+        if not _norm:
+            return False
+        _toks = [t for t in re.split(r"[^a-z0-9ñáéíóúü]+", _norm) if t]
+        return bool(_toks) and all(t in _STOPWORD_ALIASES for t in _toks)
+    except Exception:  # noqa: BLE001 — fail-safe: the screen never blocks a real name
+        return False
+
+
 class IndefiniteAnaphorSurfaceError(ValueError):
     """An INDEFINITE-ANAPHOR surface was refused as an entity referent (issue #30 — the #23
     default-deny family extended to the anaphor class).
@@ -789,6 +851,24 @@ class EntityRegistry:
                     f"over a plural set), not an entity referent (issue #30 default-deny mint "
                     f"guard; declare name_intent=True only from a genuine naming frame)")
 
+            # STOPWORD SURFACE REFUSAL — DEFAULT-DENY (critic round 2, the #23/#30 family
+            # extended to the stopword class): a pure function-word surface ('that') has NO
+            # referential content. The measured wound: harvest capture debris minted a junk
+            # entity aliased 'that', whose alias then grounded in EVERY sentence containing
+            # the word — a persistent ambiguous-refusal lockout at the FOSS-008 gate. The
+            # alias probe above returns FIRST for registered names, so a deliberately filed
+            # surface (naming frames) is untouched; this refuses only the MINT.
+            if _stopword_surface_refused(name) and not name_intent:
+                log.warning("entity_registry.stopword_surface_refused",
+                            surface=name, user_id=user_id,
+                            note="the surface is a pure function word — no referential "
+                                 "content, nothing to file it under — DEFAULT-DENY mint "
+                                 "refusal (critic round 2 stopword screen)")
+                raise StopwordSurfaceError(
+                    f"the surface '{name}' is a pure function word, not an entity referent "
+                    f"(critic round 2 stopword mint guard; declare name_intent=True only "
+                    f"from a genuine naming frame)")
+
             # Unknown — generate UUID v5 surrogate and register (per-user schema, no user_id column)
             surrogate = _make_surrogate(user_id, name)
             log.info("entity_registry.resolve_generating_surrogate", name=name, surrogate=surrogate, surrogate_has_dashes=surrogate.count('-'))
@@ -866,6 +946,24 @@ class EntityRegistry:
                 alias_prefix=alias[:20],
             )
             alias = alias[:_ENTITY_NAME_MAX_LEN]
+
+        # ── STOPWORD ALIAS SCREEN (critic round 2): the capture-side half of the
+        # stopword discipline. A NON-PREFERRED alias that is a pure function word
+        # ('that') is capture debris — the measured harvest wound ('after the network
+        # change' → junk entity aliased 'that') — and a stopword alias grounds in every
+        # sentence containing the word, poisoning the FOSS-008 agreement gate. Refuse
+        # the registration for the debris lanes; the NAMING frames (is_preferred=True —
+        # a genuine 'my cat is named That') keep their lane, and an already-registered
+        # alias still resolves via the probe. Identity-honesty result shape: a refused
+        # registration is NOT a write, so /ingest never counts it.
+        if not is_preferred and _stopword_surface_refused(alias):
+            log.warning("entity_registry.stopword_alias_refused",
+                        alias=alias, canonical=str(canonical)[:8],
+                        preference_source=preference_source,
+                        note="a pure function word is not an alias — capture-debris "
+                             "screen (critic round 2)")
+            return {"written": False, "refused": True, "preferred": False,
+                    "preference_source": preference_source}
 
         # THE BIND on entry. `_get_valid_entity_types` re-binds after any rollback it performs, so
         # the write cursor below is bound whichever path the type probe took.
