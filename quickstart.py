@@ -114,8 +114,18 @@ def check_prereqs():
 
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
+# One User-Agent for EVERY outbound call (FOSS-001). Gateways with bot filtering
+# (Cerebras, Cloudflare-class edges) 403 urllib's default "Python-urllib/3.x" while the
+# same key+endpoint answers 200 to a named client — so the wizard told people with valid
+# keys that their auth failed. Set HERE, once: call sites pass only their auth headers
+# and can never forget (or override with) a default-UA request.
+USER_AGENT = "FaultLine-Quickstart/1.0 (+https://github.com/tkalevra/FaultLine)"
+
+
 def _http_get(url, headers=None, timeout=8):
-    req = urllib.request.Request(url, headers=headers or {})
+    merged = {"User-Agent": USER_AGENT}
+    merged.update(headers or {})
+    req = urllib.request.Request(url, headers=merged)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode("utf-8", "replace")
 
@@ -168,9 +178,30 @@ def probe_models(backend, base_url, key):
             return True, [i for i in ids if i], f"HTTP {status}, {len(ids)} model(s)"
 
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, [], f"HTTP {e.code} — auth failed (check your API key)"
-        return False, [], f"HTTP {e.code} — endpoint error"
+        body = ""
+        try:
+            body = e.read(300).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        # "auth failed" is reserved for endpoints whose own body says so (FOSS-001):
+        # a bare 403 from a gateway is usually its bot filter (Cerebras/Cloudflare reject
+        # default Python user agents), not a bad key.
+        provider_says_auth = bool(re.search(
+            r"invalid.*key|api[_ -]?key|unauthorized|authentication|permission denied|forbidden",
+            body, re.I))
+        if e.code == 401 or (e.code == 403 and provider_says_auth):
+            hint = f"HTTP {e.code} — auth failed (check your API key)"
+            if body:
+                hint += f" — endpoint said: {body}"
+            return False, [], hint
+        if e.code == 403:
+            return False, [], (
+                "HTTP 403 — the endpoint refused the request. Some gateways (Cerebras,"
+                " Cloudflare-class bot filters) block default Python user agents; this wizard"
+                " sends its own User-Agent, so if the key works elsewhere (e.g. curl) the"
+                " gateway is still filtering it — 'type the model id' gets you past this."
+                + (f" Endpoint said: {body}" if body else ""))
+        return False, [], f"HTTP {e.code} — endpoint error" + (f" — {body}" if body else "")
     except Exception as e:
         return False, [], f"{type(e).__name__}: {e}"
     return False, [], "unsupported backend"
@@ -769,7 +800,8 @@ def print_next_steps(mcp_key):
     hr()
     print(bold("You're set. Next steps:\n"))
     print(f"  1. Build + start the stack:   {cyan('docker compose up -d --build')}")
-    print(f"  2. Wait ~60s, then check:     {cyan('curl http://localhost:8000/health')}")
+    print(f"  2. First boot loads the baked models: expect {bold('5-15 min')} on commodity CPUs")
+    print(f"     (warm restart 1-2 min). Then check:  {cyan('curl http://localhost:8000/health')}")
     print(f"       expect: {dim(chr(34) + 'database:ok, llm:ok' + chr(34))}")
     print(f"  3. The live integration path is the MCP server on {bold(':8002')}.")
     if mcp_key:
@@ -791,13 +823,18 @@ def print_next_steps(mcp_key):
     hr()
 
 
-def _poll_health(timeout=240):
+def _poll_health(timeout=900):
     """Poll the backend /health after a build so the user sees it actually came up.
 
-    The first boot applies every migration and loads the models: measured at about two
-    minutes on a fresh install, so 80 s reported 'not healthy yet' for a healthy stack."""
-    print(dim("  waiting for the backend to come up (first boot takes ~2 minutes)..."))
-    for _ in range(max(1, timeout // 5)):
+    The first boot applies every migration and loads the baked models: measured at
+    5-15 minutes on commodity CPUs (warm restarts 1-2 minutes), so the wait covers the
+    whole first-boot window and prints a progress line every minute — the old 240 s
+    budget just gave up on a healthy stack while it was still loading (FOSS-007)."""
+    print(dim("  waiting for the backend to come up (first boot 5-15 min on commodity CPUs, warm restart 1-2 min)..."))
+    start = time.monotonic()
+    deadline = start + timeout
+    next_progress = 60
+    while time.monotonic() < deadline:
         try:
             _, body = _http_get("http://localhost:8000/health", timeout=4)
             d = json.loads(body)
@@ -806,6 +843,10 @@ def _poll_health(timeout=240):
                 print(yellow("    (llm not ok — check LLM_BASE_URL and that your model is loaded/pulled)"))
             return
         except Exception:
+            elapsed = time.monotonic() - start
+            if elapsed >= next_progress:
+                print(dim(f"  still loading models ({int(elapsed)}s)..."))
+                next_progress += 60
             time.sleep(5)
     print(yellow("  ! not healthy yet within the wait — check: docker compose logs faultline"))
 
