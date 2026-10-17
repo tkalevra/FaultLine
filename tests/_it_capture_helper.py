@@ -68,6 +68,16 @@ elif mode == "names":
     for s in items:
         names = m.licensed_naming_names(s)
         out.append(None if names is None else list(names))
+elif mode == "frames":
+    # FOSS-011 critic round 1: the (BEARER, NAME) pairs per sentence
+    # (licensed_naming_frames). The BEARER is the in-turn referent the frame names
+    # ("server", "user", the relative antecedent) or "" — pro-drop, no in-turn referent,
+    # the split-turn discriminator. None vs () distinguishes layer-down from no-frame as
+    # in the names mode.
+    from src.extraction import linguistics as m
+    for s in items:
+        frames = m.licensed_naming_frames(s)
+        out.append(None if frames is None else [list(p) for p in frames])
 elif mode == "walk":
     import uuid
     import psycopg2

@@ -13597,7 +13597,34 @@ def _is_source_goal_transition_statement(text: str) -> bool:
         return False
 
 
-def _is_first_mention_naming_statement(text: str) -> bool:
+def _it_repair_or_retraction_cue(text: str, dsn: str = None) -> bool:
+    """True when the turn carries a DB-seeded Italian REPAIR marker or RETRACTION verb
+    (migration 283: anzi, in realtà, a dire il vero, dimentica, cancella, … — the classes the
+    FOSS-011 critic found missing: the bootstrap cue seed `_spacy_cue_route` reads is
+    English-only, so a split-turn "Anzi, si chiama DevBox." or a plain-language forget in
+    Italian reached no decline at all). Matched as lowercased SUBSTRINGS (phrase semantics —
+    "a dire il vero" is four tokens; the legacy correction_patterns discipline). A match is
+    ALWAYS the conservative direction: the caller DEFERS to the full ladder. Empty/unreadable
+    sets (pre-migration tenant, no DSN) → False — the stored-bearer and pro-drop gates still
+    protect the turn; never a crash."""
+    try:
+        _dsn = dsn or os.getenv("POSTGRES_DSN") or ""
+        if not _dsn or not text or not text.strip():
+            return False
+        from src.api.linguistic_cue_overlay import (
+            resolve_repair_markers as _rrm,
+            resolve_retraction_verbs as _rrv,
+        )
+        markers = _rrm(_dsn)
+        verbs = _rrv(_dsn)
+        t = text.strip().lower()
+        return (any(m and m in t for m in markers)
+                or any(v and v in t for v in verbs))
+    except Exception:  # noqa: BLE001 — a screen read must never break classify
+        return False
+
+
+def _is_first_mention_naming_statement(text: str, cur=None) -> bool:
     """Deterministic PRE-GLINER2 guard: a declarative FIRST-MENTION NAMING turn.
 
     [FOSS-011, it branch] "Il mio server principale si chiama DevBox, il suo IP è 10.0.1.5." is a
@@ -13607,23 +13634,34 @@ def _is_first_mention_naming_statement(text: str) -> bool:
     remember_facts diverted it to /retract/correct: the lane minted a subject, flipped
     pref_name, and the owns edge, the alias and the IP were never captured. Mirror the
     source→goal transition guard: when the turn's grammar IS a licensed naming frame asserting
-    exactly ONE name (linguistics.licensed_naming_names — the UD reflexive-clitic frame; an
-    English parse can never produce it, so en installs are byte-identical), route STATEMENT
-    deterministically BEFORE GLiNER2 (kept pure, no label edits — Pitfall 11).
+    exactly ONE name with an IN-TURN bearer (linguistics.licensed_naming_frames — the UD
+    reflexive-clitic frame; an English parse can never produce it, so en installs are
+    byte-identical), route STATEMENT deterministically BEFORE GLiNER2 (kept pure, no label
+    edits — Pitfall 11).
 
-    TWO declines keep every real correction on today's ladder:
+    FOUR declines keep every real correction/retraction on today's ladder (critic round 1):
+      • NO IN-TURN BEARER — a pro-drop naming clause ("(Anzi,) si chiama DevBox.") names
+        whoever the DISCOURSE supplies; the chains themselves refuse to guess that referent,
+        so the preroute must never first-mention-route one (the live wound: b1 "Il mio server
+        si chiama Apollo." then b2 split apollo/devbox across two entities);
       • the REPLACIVE shape — two DISTINCT names asserted in one turn
         ("il mio server si chiama Apollo … anzi, si chiama DevBox") — is a rename conflict,
         never a first mention;
-      • ANY correction/retraction cue (`_spacy_cue_route`) — a marked or contrastive turn
-        defers to the correction dual-gate exactly as the transition guard does.
+      • ANY correction/retraction cue — the bootstrap `_spacy_cue_route` seed (English) AND
+        the migration-283 Italian repair/retraction screens (`_it_repair_or_retraction_cue`;
+        dimentica che … is a plain-language forget, never a naming statement);
+      • NO MEMORY READ — the guard is FIRST-MENTION: a turn whose bearer is already a stored
+        alias defers to the correction ladder ("Il mio server si chiama DevBox." said after
+        the server exists is the ladder's rename). The bearer probe is the SAME indexed
+        lookup-only entity_aliases read the /retract/correct guard performs; without a cursor
+        (DB unavailable) the decision CANNOT be made → False, never a guessed STATEMENT.
 
-    Grammar/morphology only — no word list, no DB. Fail-safe: layer unavailable / parse miss /
-    any error → False (fall through to GLiNER2, never a silent drop)."""
+    Fail-safe: layer unavailable / parse miss / any error → False (fall through to GLiNER2,
+    never a silent drop)."""
 
     try:
         from src.extraction.linguistics import (
-            licensed_naming_names as _lnn,
+            licensed_naming_frames as _lnf,
             is_interrogative_clause as _is_interro_nm,
             linguistics_available as _ling_ok_nm,
         )
@@ -13632,16 +13670,41 @@ def _is_first_mention_naming_statement(text: str) -> bool:
         # A real question is never a naming statement — leave it for GLiNER2 / the QUERY route.
         if _is_interro_nm(text) is True:
             return False
+        frames = _lnf(text)
+        if not frames:
+            return False
         # Exactly ONE asserted name = first mention; 0 = no naming frame here, >= 2 = the
         # replacive ("X … anzi, Y") shape the correction lane owns.
-        names = _lnn(text)
-        if not names or len(names) != 1:
+        names = []
+        for _bearer, name in frames:
+            if name not in names:
+                names.append(name)
+        if len(names) != 1:
+            return False
+        # Pro-drop protection (critic round 1): every naming clause in the turn must carry an
+        # IN-TURN bearer. An empty bearer names a discourse-supplied referent the grammar
+        # refuses to guess — exactly the split-turn shape.
+        if any(not bearer for bearer, _name in frames):
             return False
         # Defer to the correction dual-gate for any repair/removal cue (same discipline as the
         # transition guard above: if the cue detector has an opinion, it wins).
         cue, _tier = _spacy_cue_route(text)
         if cue is not None:
             return False
+        # The Italian repair/retraction screens (migration-283 seeds): dimentica/anzi/etc.
+        # never first-mention-route.
+        if _it_repair_or_retraction_cue(text):
+            return False
+        # THE MEMORY GATE: first mention means the bearer is NOT yet stored. Same lookup-only
+        # discipline as the /retract/correct guard. No cursor → cannot prove first mention →
+        # decline.
+        if cur is None:
+            return False
+        for bearer, _name in frames:
+            cur.execute(
+                "SELECT 1 FROM entity_aliases WHERE alias = %s LIMIT 1", (bearer,))
+            if cur.fetchone() is not None:
+                return False
         return True
     except Exception:  # noqa: BLE001 — fail-safe: never block GLiNER2 on a parse miss
         return False
@@ -15520,6 +15583,14 @@ def _first_mention_naming_correction(text: str, cur) -> bool:
         # Any correction/retraction cue → a marked repair keeps today's path.
         _cue, _tier = _spacy_cue_route(text)
         if _cue is not None:
+            return False
+        # CRITIC ROUND 1 (FOSS-011) — defense in depth: the migration-283 Italian repair /
+        # retraction screens (anzi, in realtà, dimentica, cancella, …). The bootstrap cue
+        # probe above is English-only, so a marked Italian repair that GLiNER2 classified
+        # CORRECTION would otherwise reach this guard with nothing stored and be handed back
+        # as a first mention — the exact hole the critic proved live. A cued turn is the
+        # ladder's owner, never a first mention.
+        if _it_repair_or_retraction_cue(text):
             return False
         # Marker-stripped text + the session reference, exactly as the name-repair lane does.
         _ref_fm, _clean_fm = _compute_ingest_reference_and_text(text)
@@ -19778,8 +19849,28 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     # correction still routes correctly. Fail-safe: layer unavailable / parse miss / any
     # error → fall through to GLiNER2 (never a drop).
     if NAMING_STATEMENT_PREROUTE:
+        # CRITIC ROUND 1 (FOSS-011): the preroute decides FIRST-MENTION, and first mention is
+        # a MEMORY question, not only a grammar question — the turn's bearer must NOT already
+        # be stored ("Il mio server si chiama DevBox." after the server exists is the ladder's
+        # rename). Open a SHORT tenant-bound read-only cursor for the decider's indexed
+        # entity_aliases probe (the same lookup-only read the /retract/correct guard performs;
+        # classify can afford the lightweight read — candidates only: grammar-gated turns).
+        # Any failure → cur=None → the decider CANNOT prove first mention → declines →
+        # GLiNER2 (byte-for-byte pre-FOSS-011 behavior), never a guessed STATEMENT.
+        _nm_cur = None
+        _nm_conn = None
         try:
-            if await asyncio.to_thread(_is_first_mention_naming_statement, text):  # OFF-LOOP (spaCy)
+            _nm_dsn = os.getenv("POSTGRES_DSN")
+            if _nm_dsn:
+                _nm_conn = psycopg2.connect(_nm_dsn)
+                get_user_schema_context(user_id, _nm_conn)  # binds SET search_path; validates ready
+                _nm_cur = _nm_conn.cursor()
+        except Exception as _nm_db_err:  # noqa: BLE001 — probe is best-effort, never fatal
+            log.debug("classify_intent.naming_preroute_db_unavailable",
+                      user_id=user_id[:8], error=str(_nm_db_err)[:120])
+            _nm_cur = None
+        try:
+            if await asyncio.to_thread(_is_first_mention_naming_statement, text, _nm_cur):  # OFF-LOOP (spaCy)
                 log.info("classify_intent.naming_statement_preroute",
                          user_id=user_id[:8],
                          note="first-mention naming frame → STATEMENT (GLiNER2 skipped, kept "
@@ -19791,6 +19882,12 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         except Exception as _nm_err:  # noqa: BLE001 — fail-safe: never block GLiNER2
             log.debug("classify_intent.naming_preroute_failed",
                       user_id=user_id[:8], error=str(_nm_err)[:120])
+        finally:
+            try:
+                if _nm_conn is not None:
+                    _nm_conn.close()  # cursors die with the connection
+            except Exception:  # noqa: BLE001
+                pass
 
     try:
         # ENHANCEMENT: Build semantic-rich intent descriptions from DB patterns
@@ -59101,6 +59198,22 @@ def correct_fact(req: FactCorrectionRequest):
                 # _applied False (e.g. taxonomy row vanished) → fall through to the
                 # existing correction handling rather than failing the request.
 
+        # Idempotency check: deduplicate retried correction requests (uses global _idempotency_mgr from startup)
+        if req.idempotency_key and _idempotency_mgr:
+            try:
+                if _idempotency_mgr.is_duplicate(req.idempotency_key):
+                    cached = _idempotency_mgr.get_cached_response(req.idempotency_key)
+                    if cached:
+                        log.info("correct_fact.idempotent_cached", idempotency_key=req.idempotency_key)
+                        return FactCorrectionResponse(**cached) if isinstance(cached, dict) else cached
+            except Exception as e:
+                log.warning("correct_fact.idempotency_check_failed", error=str(e))
+                # Continue without idempotency if cache fails
+
+        # Stage 1: Intent classified by GLiNER2 (Filter inlet), passed via request
+        # Trust semantic classification. Do NOT override with hardcoded keywords (reduces accuracy 80%→65%)
+        is_retraction = (req.intent == "RETRACTION") if req.intent else False
+
         # ── FIRST-MENTION NAMING GUARD (FOSS-011, it branch) ─────────────────────
         # A CORRECTION-classified turn that is really a FIRST naming ("Il mio server
         # principale si chiama DevBox, il suo IP è 10.0.1.5." — measured es/en behavior:
@@ -59111,9 +59224,13 @@ def correct_fact(req: FactCorrectionRequest):
         # (remember_facts_tool) reads that status and routes the turn back through the
         # STATEMENT path, where the naming chains capture owns + alias (+ the IP scalar)
         # in one call. Everything that IS a correction — a stored bearer (rename), a
-        # two-name replacive turn ("si chiama X … anzi, si chiama Y"), any repair cue —
-        # fails the guard here and takes today's path byte-for-byte. Read-only
-        # (parse + cue + indexed alias probe); flag OFF → byte-for-byte legacy.
+        # two-name replacive turn ("si chiama X … anzi, si chiama Y"), any repair or
+        # retraction cue (it seeds: anzi, in realtà, dimentica, …) — fails the guard
+        # here and takes today's path byte-for-byte. Read-only (parse + cue + indexed
+        # alias probe); flag OFF → byte-for-byte legacy. Sits BELOW the is_retraction
+        # assignment on purpose: the guard only ever narrows the CORRECTION arm
+        # (critic round 1: an earlier placement above this assignment read the
+        # variable unbound and 500'd every correction and retraction).
         if NAME_FIRST_MENTION_GUARD and not is_retraction:
             try:
                 with db.cursor() as _fm_cur:
@@ -59136,22 +59253,6 @@ def correct_fact(req: FactCorrectionRequest):
                         "was handed back to be stored normally."
                     ),
                 )
-
-        # Idempotency check: deduplicate retried correction requests (uses global _idempotency_mgr from startup)
-        if req.idempotency_key and _idempotency_mgr:
-            try:
-                if _idempotency_mgr.is_duplicate(req.idempotency_key):
-                    cached = _idempotency_mgr.get_cached_response(req.idempotency_key)
-                    if cached:
-                        log.info("correct_fact.idempotent_cached", idempotency_key=req.idempotency_key)
-                        return FactCorrectionResponse(**cached) if isinstance(cached, dict) else cached
-            except Exception as e:
-                log.warning("correct_fact.idempotency_check_failed", error=str(e))
-                # Continue without idempotency if cache fails
-
-        # Stage 1: Intent classified by GLiNER2 (Filter inlet), passed via request
-        # Trust semantic classification. Do NOT override with hardcoded keywords (reduces accuracy 80%→65%)
-        is_retraction = (req.intent == "RETRACTION") if req.intent else False
 
         # Stage 2: LLM extraction (metadata-driven)
         # Per dprompt-143: Extract semantic intent (subject, rel_type, object, action, dimension)

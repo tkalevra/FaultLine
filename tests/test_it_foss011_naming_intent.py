@@ -70,50 +70,152 @@ def _it_names(*sentences):
     return [tuple(x) if x is not None else None for x in data]
 
 
+def _it_frames(*sentences):
+    "Run licensed_naming_frames per sentence in ONE child process (the (BEARER, NAME) pairs)."
+    p = subprocess.run([sys.executable, _HELPER, "frames", *sentences],
+                       capture_output=True, text=True, timeout=600)
+    path = (p.stdout or "").strip().splitlines()[-1] if p.stdout.strip() else ""
+    assert path and os.path.exists(path), f"helper failed: rc={p.returncode} err={p.stderr[-2000:]}"
+    import json
+    with open(path) as fh:
+        data = json.load(fh)
+    os.unlink(path)
+    return [None if x is None else tuple(tuple(pair) for pair in x) for x in data]
+
+
+class _FakeCur:
+    """A cursor standing in for the entity_aliases probe: `stored` = aliases that exist."""
+    def __init__(self, stored=()):
+        self.stored = set(stored)
+        self.probes = []
+
+    def execute(self, sql, params=None):
+        self.probes.append((sql, (params or ())[0] if params else None))
+
+    def fetchone(self):
+        return ("row",) if self.stored else None
+
+
 # 1. THE DECISION TABLE (no model needed - the classifier seam, deterministic)
 
-def _decide(monkeypatch, names, cue=None):
-    "Drive _is_first_mention_naming_statement with scripted naming frames + cue probe."
+def _decide(monkeypatch, frames, cue=None, stored=()):
+    "Drive _is_first_mention_naming_statement with scripted naming frames + cue + alias state."
     import src.api.main as M
-    monkeypatch.setattr(L, "licensed_naming_names", lambda _t: names)
+    monkeypatch.setattr(L, "licensed_naming_frames", lambda _t: frames)
     monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (cue, "confident" if cue else None))
-    return M._is_first_mention_naming_statement("il mio server principale si chiama DevBox")
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: False)
+    return M._is_first_mention_naming_statement(
+        "il mio server principale si chiama DevBox", _FakeCur(stored))
 
 
 def test_first_mention_naming_classifies_statement(monkeypatch):
     """THE RED PIN: the battery sentence must classify STATEMENT (or capture owns+alias+IP in
-    one call - the STATEMENT route the preroute feeds). One asserted name, no correction cue.
-    Before FOSS-011 this helper did not exist and the turn routed CORRECTION on it."""
-    assert _decide(monkeypatch, ("devbox",)) is True
+    one call - the STATEMENT route the preroute feeds). One asserted name, an in-turn bearer,
+    nothing stored, no correction cue. Before FOSS-011 this helper did not exist and the turn
+    routed CORRECTION on it."""
+    assert _decide(monkeypatch, (("server", "devbox"),)) is True
 
 
 def test_replacive_two_name_turn_never_preroutes(monkeypatch):
     """A TRUE it naming correction ("il mio server si chiama Apollo ... anzi, si chiama DevBox")
     asserts TWO distinct names - the replacive shape stays on the correction ladder, so the
     preroute can never steal it."""
-    assert _decide(monkeypatch, ("apollo", "devbox")) is False
+    assert _decide(monkeypatch, (("server", "apollo"), ("", "devbox"))) is False
 
 
 def test_cued_turn_defers_to_the_correction_dual_gate(monkeypatch):
     """Any correction/retraction cue (marker, contrastive negation, "I meant") wins over the
     naming reading - same deference as the source-to-goal transition guard."""
-    assert _decide(monkeypatch, ("devbox",), cue="CORRECTION") is False
+    assert _decide(monkeypatch, (("server", "devbox"),), cue="CORRECTION") is False
 
 
-@pytest.mark.parametrize("names", [(), None])
-def test_no_frame_or_layer_down_falls_through(monkeypatch, names):
+@pytest.mark.parametrize("frames", [(), None])
+def test_no_frame_or_layer_down_falls_through(monkeypatch, frames):
     """No naming frame (or the layer unavailable) -> False: GLiNER2 keeps the turn - never a
     silent drop, never a preroute without evidence."""
-    assert _decide(monkeypatch, names) is False
+    assert _decide(monkeypatch, frames) is False
 
 
 def test_interrogative_never_preroutes(monkeypatch):
     """A question is never a naming statement, whatever it mentions."""
     import src.api.main as M
-    monkeypatch.setattr(L, "licensed_naming_names", lambda _t: ("devbox",))
+    monkeypatch.setattr(L, "licensed_naming_frames", lambda _t: (("server", "devbox"),))
     monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
     monkeypatch.setattr(L, "is_interrogative_clause", lambda _t: True)
-    assert M._is_first_mention_naming_statement("Come si chiama il mio server?") is False
+    assert M._is_first_mention_naming_statement(
+        "Come si chiama il mio server?", _FakeCur()) is False
+
+
+# 1b. THE CRITIC-ROUND-1 DECLINES (split turns: pro-drop, memory, it cue screens)
+
+def test_prodrop_naming_never_preroutes(monkeypatch):
+    """THE SPLIT-TURN DEFECT, pinned at the decision seam: a naming clause with NO in-turn
+    bearer ("(Anzi,) si chiama DevBox.") names whoever the DISCOURSE supplies - the chains
+    refuse to guess that referent, so the preroute must never first-mention-route one. Before
+    the fix the empty-bearer frame prerouted STATEMENT and the true rename split across two
+    entities."""
+    assert _decide(monkeypatch, (("", "devbox"),)) is False
+
+
+def test_memory_gate_stored_bearer_defers(monkeypatch):
+    """First mention is a MEMORY question: a turn whose bearer is ALREADY stored is the
+    ladder's rename, not a first mention. The probe is the same lookup-only entity_aliases
+    read the /retract/correct guard performs."""
+    assert _decide(monkeypatch, (("server", "devbox"),), stored={"server"}) is False
+
+
+def test_preroute_without_a_cursor_declines(monkeypatch):
+    """No DB -> the first-mention decision CANNOT be made -> False (GLiNER2 keeps the turn),
+    never a guessed STATEMENT off a grammar-only read."""
+    import src.api.main as M
+    monkeypatch.setattr(L, "licensed_naming_frames", lambda _t: (("server", "devbox"),))
+    monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: False)
+    assert M._is_first_mention_naming_statement("Il mio server si chiama DevBox.") is False
+
+
+def test_it_repair_marker_declines_the_preroute(monkeypatch):
+    """The migration-283 Italian repair screen: "Anzi, si chiama DevBox." must never
+    first-mention-route, whatever its grammar says (the bootstrap cue seed is English-only -
+    this screen is the it branch's)."""
+    import src.api.main as M
+    monkeypatch.setattr(L, "licensed_naming_frames", lambda _t: (("", "devbox"),))
+    monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: True)
+    assert M._is_first_mention_naming_statement(
+        "Anzi, si chiama DevBox.", _FakeCur()) is False
+
+
+def test_it_retraction_verb_declines_the_preroute(monkeypatch):
+    """The migration-283 Italian retraction screen: "dimentica che ho una gatta che si chiama
+    Fraggle" is a plain-language FORGET (grammatically a perfect first-mention naming frame:
+    gatta -> fraggle, one name, in-turn bearer) - the verb screen must defer it to the
+    retraction ladder."""
+    import src.api.main as M
+    monkeypatch.setattr(L, "licensed_naming_frames",
+                        lambda _t: (("gatta", "fraggle"),))
+    monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: True)
+    assert M._is_first_mention_naming_statement(
+        "dimentica che ho una gatta che si chiama Fraggle", _FakeCur()) is False
+
+
+def test_repair_screen_helper_matches_db_seeded_phrases(monkeypatch):
+    """The screen helper: substring semantics over the overlay sets; empty sets (no DSN,
+    pre-migration tenant) read False and never crash."""
+    import src.api.main as M
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://fake")
+    import src.api.linguistic_cue_overlay as OV
+    monkeypatch.setattr(OV, "resolve_repair_markers",
+                        lambda _d: frozenset({"a dire il vero"}))
+    monkeypatch.setattr(OV, "resolve_retraction_verbs",
+                        lambda _d: frozenset({"dimentica"}))
+    assert M._it_repair_or_retraction_cue(
+        "A dire il vero il server si chiama DevBox.") is True
+    assert M._it_repair_or_retraction_cue(
+        "dimentica che ho una gatta") is True
+    assert M._it_repair_or_retraction_cue(
+        "Il mio server si chiama DevBox.") is False
 
 
 # 2. EN INERTNESS (real en_core_web_sm - an English install is byte-identical)
@@ -203,20 +305,61 @@ def test_decider_gate_maps_battery_to_statement_on_the_it_parse():
     assert replacive is not None and len(set(replacive)) != 1, replacive
 
 
+@needs_it
+def test_split_turn_b2_prodrop_frame_carries_no_bearer():
+    """THE SPLIT-TURN CORRECTION PIN (grammar half, critic round 1): b1 "Il mio server si
+    chiama Apollo." carries an IN-TURN bearer (the server NP) - a legal first mention; b2
+    "Anzi, si chiama DevBox." is PRO-DROP: its naming frame carries an EMPTY bearer, which is
+    the decider's hard decline (a discourse-supplied referent is never first-mention-routed).
+    With the fix the b2 turn falls through to GLiNER2 + the correction ladder and supersedes
+    apollo -> devbox on the SAME entity; before the fix it pre-routed STATEMENT and split the
+    rename across two entities. (The full b2 decline is double-gated: empty bearer AND the
+    anzi repair screen.)"""
+    b1, b2 = _it_frames(
+        "Il mio server si chiama Apollo.",
+        "Anzi, si chiama DevBox.")
+    assert b1 is not None and len(b1) == 1, b1
+    assert b1[0][1] == "apollo", b1
+    assert b1[0][0] and "server" in b1[0][0].split(), b1
+    assert b2 is not None and len(b2) == 1, b2
+    assert b2[0][1] == "devbox", b2
+    assert b2[0][0] == "", b2  # PRO-DROP: no in-turn referent -> the decider declines
+
+
+@needs_it
+def test_retraction_turn_is_grammatically_a_naming_frame():
+    """THE SPLIT-TURN RETRACTION PIN (grammar half): "dimentica che ho una gatta che si
+    chiama Fraggle" parses as a PERFECT first-mention naming frame (relative-clause naming:
+    bearer = the antecedent gatta, name = fraggle, one name) - grammar alone CANNOT save it;
+    only the retraction screen (dimentica) can. The decider half of this pin is
+    test_it_retraction_verb_declines_the_preroute; end to end, the live turn must RETRACT,
+    never affirmatively write also_known_as."""
+    (frames,) = _it_frames(
+        "dimentica che ho una gatta che si chiama Fraggle")
+    assert frames is not None and len(frames) == 1, frames
+    assert frames[0][1] == "fraggle", frames
+    assert frames[0][0] and "gatta" in frames[0][0].split(), frames
+
+
+@needs_it
+def test_relative_clause_naming_bearer_is_the_antecedent():
+    """The relative-clause arm's bearer is the ANTECEDENT NP ("una figlia che si chiama
+    Anna" -> figlia), so the memory gate probes the thing that could already be stored."""
+    (frames,) = _it_frames("Ho una figlia che si chiama Anna")
+    assert frames is not None and len(frames) == 1, frames
+    assert frames[0] == ("figlia", "anna"), frames
+
+
+@needs_it
+def test_self_naming_bearer_is_the_user():
+    """1sg self-naming ("Mi chiamo Marco") binds the speaking subject: bearer "user" -
+    the known referent, so the memory gate probes it like any other."""
+    (frames,) = _it_frames("Mi chiamo Marco")
+    assert frames is not None and len(frames) == 1, frames
+    assert frames[0] == ("user", "marco"), frames
+
+
 # 4. THE CORRECTION-LANE FIRST-MENTION GUARD (real en deriver + a scripted alias probe)
-
-class _FakeCur:
-    """A cursor standing in for the entity_aliases probe: `stored` = aliases that exist."""
-    def __init__(self, stored=()):
-        self.stored = set(stored)
-        self.last_sql = ""
-
-    def execute(self, sql, params=None):
-        self.last_sql = sql
-
-    def fetchone(self):
-        return ("row",) if self.stored else None
-
 
 @_en
 def test_guard_fires_on_a_first_mention_naming_turn():
@@ -242,6 +385,28 @@ def test_guard_declines_the_cued_repair():
     import src.api.main as M
     assert M._first_mention_naming_correction(
         "Actually my sister's name is Thorne, not Wrenna.", _FakeCur()) is False
+
+
+def test_endpoint_guard_declines_the_marked_it_repair(monkeypatch):
+    """DEFENSE IN DEPTH (critic round 1): the endpoint guard runs the SAME migration-283 it
+    screens as the preroute. A marked Italian repair/retraction turn that GLiNER2 classified
+    CORRECTION must NEVER be handed back as a first mention even when nothing is stored -
+    every other gate here is stubbed to 'perfect first mention' so the screen alone decides."""
+    import src.api.main as M
+    from src.extraction import linguistics as _L
+
+    class _F:
+        def __init__(self, s, r, o):
+            self.subject, self.rel_type, self.object = s, r, o
+
+    monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
+    monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: True)
+    monkeypatch.setattr(_L, "derive_sentence_facts", lambda _t, _r, **k: [
+        _F("gatta", "pref_name", "fraggle"),
+    ])
+    monkeypatch.setattr(_L, "linguistics_available", lambda: True)
+    assert M._first_mention_naming_correction(
+        "dimentica che ho una gatta che si chiama Fraggle", _FakeCur()) is False
 
 
 def test_guard_declines_a_two_name_replacive_turn(monkeypatch):
@@ -363,7 +528,115 @@ def test_handoff_status_is_not_a_failure():
     assert S.status_is_failure("first_mention_naming") is False
 
 
-# 6. FLAGS + THE EN STATEMENT-LANE FIXTURE (the parity anchor)
+
+
+# 7. CRITIC-ROUND-1 REGRESSION PINS: the is_retraction order + the migration seeds
+
+def _correct_fact_ast():
+    "Parse src.api.main and return the correct_fact AST node."
+    import ast
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "correct_fact":
+            return node
+    raise AssertionError("correct_fact not found in src/api/main.py")
+
+
+def test_is_retraction_is_never_read_before_its_store():
+    """THE ORDER PIN (critic round 1, BLOCKER): the first-mention guard read `is_retraction`
+    before the variable was assigned - every POST /retract/correct 500'd with
+    UnboundLocalError (ALL corrections AND retractions) while the guard flag shipped ON.
+    AST-pinned the same way the critic verified it: inside correct_fact, EVERY Load of
+    `is_retraction` must sit BELOW its single Store. Fails red on any future reorder that
+    re-creates the unbound read."""
+    import ast
+    fn = _correct_fact_ast()
+    store_lines = []
+    load_lines = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "is_retraction":
+                    store_lines.append(node.lineno)
+        elif isinstance(node, ast.Name) and node.id == "is_retraction" \
+                and isinstance(node.ctx, ast.Load):
+            load_lines.append(node.lineno)
+    assert store_lines, "is_retraction is never assigned in correct_fact"
+    if load_lines:
+        assert min(load_lines) > min(store_lines), (
+            f"is_retraction LOAD at line(s) {load_lines} precedes its FIRST STORE at "
+            f"{min(store_lines)} - the UnboundLocalError regression")
+
+
+def test_first_mention_guard_sits_below_the_is_retraction_assignment():
+    """Position half of the same pin: the guard's `if NAME_FIRST_MENTION_GUARD and not
+    is_retraction:` block must sit AFTER the `is_retraction = ...` assignment in the source
+    (the guard narrows the CORRECTION arm only, so it belongs below Stage 1)."""
+    import src.api.main as M
+    with open(M.__file__) as fh:
+        lines = fh.read().splitlines()
+    guard_line = next(i for i, l in enumerate(lines, 1)
+                      if "if NAME_FIRST_MENTION_GUARD and not is_retraction:" in l)
+    store_line = next(i for i, l in enumerate(lines, 1)
+                      if l.strip().startswith('is_retraction = (req.intent == "RETRACTION"'))
+    assert guard_line > store_line, (guard_line, store_line)
+
+
+def test_migration_283_ships_the_it_repair_and_retraction_seeds():
+    """The it-branch repair/retraction screens are DB-SEEDED, not in-code (the floors
+    doctrine): migration 283 must ship both categories with the members the critic's live
+    repro needs - anzi (split-turn correction) and dimentica (plain-language forget) - plus
+    the per-tenant back-fill loop so WARM tenants get them without reprovisioning."""
+    import src.api.main as M  # noqa: F401 - repo anchored
+    mig = os.path.join(os.path.dirname(M.__file__), os.pardir, os.pardir,
+                       "migrations", "283_linguistic_cues_italian_repair_cues.sql")
+    with open(mig) as fh:
+        sql = fh.read()
+    for member in ("'anzi'", "'in realtà'", "'in realta'", "'a dire il vero'",
+                   "'volevo dire'", "'dimentica'", "'dimentichi'", "'cancella'",
+                   "'rimuovi'"):
+        assert member in sql, f"migration 283 missing cue member {member}"
+    assert "repair_marker" in sql and "retraction_verb" in sql
+    assert "seed_repair_marker_it" in sql and "seed_retraction_verb_it" in sql
+    assert "faultline\\_%" in sql  # the Part-2 per-tenant back-fill loop
+    assert "ON CONFLICT (cue, category) DO NOTHING" in sql  # idempotent
+
+
+_needs_dsn = pytest.mark.skipif(
+    not os.environ.get("POSTGRES_DSN"),
+    reason="POSTGRES_DSN not set - the DB-seeded cue rows resolve only against a live stack")
+
+
+@_needs_dsn
+def test_migration_283_rows_resolve_through_the_overlay():
+    """LIVE-STACK PIN: with a DSN, the overlay resolvers return the migration-283 members
+    (public seed; tenant-bound reads see them after provisioning/back-fill). The preroute and
+    the endpoint guard decline through these sets."""
+    import src.api.linguistic_cue_overlay as OV
+    dsn = os.environ["POSTGRES_DSN"]
+    markers = OV.resolve_repair_markers(dsn)
+    verbs = OV.resolve_retraction_verbs(dsn)
+    assert "anzi" in markers, sorted(markers)[:8]
+    assert "a dire il vero" in markers, sorted(markers)[:8]
+    assert "dimentica" in verbs, sorted(verbs)[:8]
+    assert "cancella" in verbs, sorted(verbs)[:8]
+
+
+@_needs_dsn
+def test_unregistered_floors_stay_empty():
+    """The two new categories carry DELIBERATELY EMPTY in-code floors (the members are
+    DB content): a DB-down read resolves EMPTY - never the naming-verb fallback that
+    unregistered categories would borrow."""
+    import src.api.linguistic_cue_overlay as OV
+    assert OV._bootstrap_for(OV.REPAIR_MARKER_CATEGORY) == frozenset()
+    assert OV._bootstrap_for(OV.RETRACTION_VERB_CATEGORY) == frozenset()
+    assert OV.REPAIR_MARKER_CATEGORY in OV._BOOTSTRAP_BY_CATEGORY
+    assert OV.RETRACTION_VERB_CATEGORY in OV._BOOTSTRAP_BY_CATEGORY
+
+
+# 8. FLAGS + THE EN STATEMENT-LANE FIXTURE (the parity anchor)
 
 def test_preroute_and_guard_flags_default_on():
     """Both kill-switches ship ON (bisectable OFF = byte-for-byte legacy)."""

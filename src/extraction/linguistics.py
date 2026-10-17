@@ -2812,20 +2812,27 @@ def _proper_name_span(tok) -> str:
         return (getattr(tok, "text", "") or "").strip().lower()
 
 
-def licensed_naming_names(text: str):
-    """The DISTINCT lower-cased names the turn's UD PRONOMINAL naming frames assert, or the
+def licensed_naming_frames(text: str):
+    """The (BEARER, NAME) pairs the turn's UD PRONOMINAL naming frames assert, or the
     machinery's two honest negatives.
 
     Returns ``None`` when the grammar layer is unavailable (caller fails safe - a parse miss
-    must never route), ``()`` when the parse holds no licensed naming frame, and otherwise the
-    tuple of distinct name surfaces, one per naming frame ("si chiama" / "mi chiamo" /
-    relative-clause naming), in sentence order.
+    must never route), ``()`` when the parse holds no licensed naming frame, and otherwise one
+    (bearer, name) pair per naming frame ("si chiama" / "mi chiamo" / relative-clause
+    naming), in sentence order. The NAME is the asserted proper name (lower-cased); the BEARER
+    is the IN-TURN referent the frame names, lower-cased:
 
-    [it branch - FOSS-011] The intent classifier reads this as a FIRST-MENTION NAMING signal:
-    a declarative that asserts exactly ONE name is a naming STATEMENT (measured es/en behavior:
-    "se llama" / "is called" classify STATEMENT), while TWO distinct names asserted in one turn
-    ("il mio server si chiama Apollo ... anzi, si chiama DevBox") is the REPLACIVE shape the
-    correction lane owns - the caller counts the tuple and declines at != 1.
+    - 1sg clitic ("mi chiamo Marco")  -> "user" (the speaking subject, the known referent)
+    - overt nominal nsubj ("il mio server si chiama DevBox") -> the full NP ("server")
+    - relative clause ("una figlia che si chiama Anna") -> the antecedent NP ("figlia")
+    - PRO-DROP ("(anzi,) si chiama DevBox") -> "" — NO in-turn referent.
+
+    [it branch - FOSS-011, critic round 1] The bearer is the FIRST-MENTION discriminator: a
+    pro-drop naming clause names WHOEVER the discourse supplies — the chains themselves refuse
+    to guess that referent ("never infer a subject from context"), so the intent preroute
+    must never first-mention-route one either (the live wound: b1 "Il mio server si chiama
+    Apollo." then b2 "Anzi, si chiama DevBox." split apollo/devbox across two entities). The
+    empty bearer tells the caller to defer the turn to the full ladder.
 
     Scope is the UD CLITIC frame ONLY (`_ud_reflexive_naming_clitic` - the clitic, not the
     complement label, is what makes the clause a naming frame; an active "chiama Anna" is plain
@@ -2833,8 +2840,7 @@ def licensed_naming_names(text: str):
     English install classifies byte-for-byte as before; the frame cannot occur on that scheme.
     Negation is declined (`_predicate_negated`: "non si chiama" is absence, never a name).
     Grammar/morphology only - no verb list (the verb names only inside the licensed frame), no
-    DB read (the intent hot path pays one parse, not a cue-class lookup). Fail-safe: any error
-    -> ``None``.
+    DB read. Fail-safe: any error -> ``None``.
     """
     if not text or not text.strip():
         return ()
@@ -2844,19 +2850,20 @@ def licensed_naming_names(text: str):
     try:
         doc = nlp(text)
     except Exception as e:  # noqa: BLE001 - never crash the intent path
-        log.warning("linguistics.licensed_naming_names_parse_failed", error=str(e)[:160])
+        log.warning("linguistics.licensed_naming_frames_parse_failed", error=str(e)[:160])
         return None
     try:
         if not _doc_is_ud(doc):
             return ()  # English scheme: the reflexive-clitic naming frame cannot occur
-        names: list[str] = []
+        frames: list[tuple[str, str]] = []
         seen: set[str] = set()
         for tok in doc:
             if tok.pos_ != "VERB":
                 continue
             # The CLITIC is the frame licence: a reflexive clitic filling the object slot is
             # what makes "chiama" name ("si chiama" / "mi chiamo") rather than call.
-            if _ud_reflexive_naming_clitic(tok) is None:
+            clitic = _ud_reflexive_naming_clitic(tok)
+            if clitic is None:
                 continue
             # Negated naming ("Mio fratello non si chiama Luca") is absence - parity with the
             # sibling chains: it asserts no name.
@@ -2881,11 +2888,51 @@ def licensed_naming_names(text: str):
             if not surface or surface in seen:
                 continue
             seen.add(surface)
-            names.append(surface)
-        return tuple(names)
+            # The BEARER — the in-turn referent the frame names, or "" (pro-drop):
+            try:
+                if "1" in (clitic.morph.get("Person") or []):
+                    bearer = "user"  # 1sg self-naming: the speaking subject, always known
+                else:
+                    bearer = ""
+                    subj = next((c for c in tok.children
+                                 if c.dep_ in ("nsubj", "nsubj:pass", "nsubjpass")
+                                 and c.pos_ in ("NOUN", "PROPN")
+                                 and c is not nm), None)
+                    if subj is not None:
+                        bearer = _np_phrase(subj) or (subj.text or "").strip().lower()
+                    elif tok.dep_ == "acl:relcl" and tok.head is not None \
+                            and tok.head.pos_ == "NOUN":
+                        # relative-clause naming: the antecedent NP is the bearer
+                        bearer = _np_phrase(tok.head) or (tok.head.text or "").strip().lower()
+                    # a PROPN nsubj that IS the name ("Marco si chiama Marco") is the NAME,
+                    # not a bearer - the `c is not nm` filter above already skips it.
+            except Exception:  # noqa: BLE001 - bearer is advisory; the name still counts
+                bearer = ""
+            frames.append((bearer, surface))
+        return tuple(frames)
     except Exception as e:  # noqa: BLE001 - fail-safe: no parse, no opinion
-        log.warning("linguistics.licensed_naming_names_failed", error=str(e)[:160])
+        log.warning("linguistics.licensed_naming_frames_failed", error=str(e)[:160])
         return None
+
+
+def licensed_naming_names(text: str):
+    """The DISTINCT lower-cased names the turn's UD PRONOMINAL naming frames assert, or the
+    machinery's two honest negatives (``None`` layer-down, ``()`` no licensed frame).
+
+    [it branch - FOSS-011] The intent classifier reads this as the REPLACIVE-shape signal:
+    TWO distinct names asserted in one turn ("il mio server si chiama Apollo ... anzi, si
+    chiama DevBox") is a correction the correction lane owns - the caller counts the tuple and
+    declines at != 1. FIRST-MENTION detection is `licensed_naming_frames`' job (it also
+    resolves the in-turn BEARER, which this name-only view deliberately hides).
+    """
+    frames = licensed_naming_frames(text)
+    if frames is None:
+        return None
+    seen: list[str] = []
+    for _bearer, name in frames:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 def _is_second_person_personal_pronoun(tok) -> bool:

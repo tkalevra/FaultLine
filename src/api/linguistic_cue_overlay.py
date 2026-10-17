@@ -957,6 +957,19 @@ OFFSPRING_NOUN_CATEGORY = "offspring_noun"
 _BOOTSTRAP_FIRST_PERSON_POSSESSIVES: frozenset[str] = frozenset()
 FIRST_PERSON_POSSESSIVE_CATEGORY = "first_person_possessive"
 
+# IT-BRANCH FOSS-011 REPAIR/RETRACTION SCREENS (critic round 1). Deliberately EMPTY in-code
+# floors: the members are it-branch CONTENT (anzi, in realtà, a dire il vero, dimentica,
+# cancella, …) and live in the DB ONLY — migration 283 seeds public.linguistic_cues and
+# back-fills existing tenants; provisioning copies them into every new tenant. An in-code
+# floor would be exactly the transliteration zoo the floors doctrine forbids. Consumers (the
+# FOSS-011 naming preroute + the /retract/correct first-mention guard) treat a MATCH as
+# "this is a repair/retraction turn" and DEFER to the full ladder; an EMPTY read (pre-migration
+# tenant, DB-down) leaves the grammar + stored-bearer gates in charge.
+_BOOTSTRAP_REPAIR_MARKERS: frozenset[str] = frozenset()
+REPAIR_MARKER_CATEGORY = "repair_marker"
+_BOOTSTRAP_RETRACTION_VERBS: frozenset[str] = frozenset()
+RETRACTION_VERB_CATEGORY = "retraction_verb"
+
 # Per-category DB-DOWN fallback seed. resolve_cues consults this when a category resolves empty / the
 # read fails, so EVERY category fails safe to its own evidenced floor (never the wrong class, never
 # empty). naming_verb keeps its dedicated bootstrap for back-compat with resolve_naming_verbs.
@@ -996,6 +1009,11 @@ _BOOTSTRAP_BY_CATEGORY: dict[str, frozenset[str]] = {
     MEASURE_NOUN_CATEGORY: _BOOTSTRAP_MEASURE_NOUNS,
     # MUST be registered even though the floor is EMPTY (same reason as attribute_noun).
     FIRST_PERSON_POSSESSIVE_CATEGORY: _BOOTSTRAP_FIRST_PERSON_POSSESSIVES,
+    # FOSS-011 it repair/retraction screens — registered with DELIBERATELY EMPTY floors so a
+    # cold/DB-down read resolves EMPTY (never the naming-verb fallback); the members are
+    # migration 283's it-branch seed.
+    REPAIR_MARKER_CATEGORY: _BOOTSTRAP_REPAIR_MARKERS,
+    RETRACTION_VERB_CATEGORY: _BOOTSTRAP_RETRACTION_VERBS,
     # THIN_TYPE_CATEGORY is intentionally NOT here: it is a keyed-value (surface→type) class resolved
     # by resolve_thin_type() into a dict, not a flat cue set. Its DB-DOWN fallback is
     # _BOOTSTRAP_THIN_TYPE_MAP, applied in resolve_thin_type().
@@ -1147,6 +1165,31 @@ def resolve_naming_verbs(dsn: str) -> frozenset[str]:
 def resolve_current(dsn: str) -> frozenset[str]:
     """Alias for `resolve_naming_verbs` mirroring the sibling overlays' `resolve_current` contract."""
     return resolve_naming_verbs(dsn)
+
+
+def resolve_repair_markers(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE Italian REPAIR-MARKER set (anzi, in realtà, a dire il vero,
+    anzi no, …) for the ContextVar-bound current request schema, via the SAME binding as the
+    naming/lvc/cessative resolvers. FOSS-011 critic round 1: the members are it-branch content
+    seeded by migration 283 (public template + per-tenant back-fill); the floor here is
+    DELIBERATELY EMPTY (registered — never the naming-verb fallback). Consumers match these as
+    lowercased SUBSTRINGS of the turn (phrase semantics — "a dire il vero" is four tokens),
+    the legacy correction_patterns discipline; the decline direction is conservative (defer to
+    the full ladder).
+    """
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), REPAIR_MARKER_CATEGORY)
+
+
+def resolve_retraction_verbs(dsn: str) -> frozenset[str]:
+    """Resolve the per-tenant ACTIVE Italian RETRACTION-VERB set (dimentica, dimentichi,
+    cancella, rimuovi, …) for the ContextVar-bound current request schema, via the SAME binding
+    as the naming/cessative resolvers. FOSS-011 critic round 1: it-branch content seeded by
+    migration 283; DELIBERATELY EMPTY floor (registered). Directive/retraction verb members are
+    matched as lowercased substrings of the turn (so the inflected imperative surfaces the
+    it lemmatizer mangles still match); a match DEFERS the turn to the full ladder — never
+    fires a first-mention route over a possible plain-language forget.
+    """
+    return resolve_cues(dsn, rel_type_overlay.get_current_schema(), RETRACTION_VERB_CATEGORY)
 
 
 def resolve_lvc_support_verbs(dsn: str) -> frozenset[str]:
