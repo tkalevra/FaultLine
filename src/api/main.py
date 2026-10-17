@@ -14510,7 +14510,8 @@ def _scalar_value_numeric_key(v) -> tuple | None:
 
 
 def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
-                           dsn: str = None, schema: str = None, text: str = None):
+                           dsn: str = None, schema: str = None, text: str = None,
+                           new_value=None):
     """SS4: resolve the (entity, attribute) ROW a scalar correction/retraction actually
     targets, pinning the extractor's guess onto STORED data. The live wound (PHASE1-REPRO
     WOUND 2): the extractor said (6719a70e, 'member_count') while the row is
@@ -14714,9 +14715,136 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
                                           "exactly one family attribute in the tenant "
                                           "carries the old value the user named")
                             return _fam_hits[0][0], _fam_hits[0][1], "family_value"
+
+        # ── rungs 6/7 — VALUE-ANCHORED (entity, attribute) resolution (FOSS-004) ────────
+        # Every NAME rung declined: the extractor's attribute guess matches no stored name
+        # anywhere (measured es battery: the correction says "DevBox se mudó a 10.0.1.10"
+        # and the extractor guesses rel 'located_in' while the row is (devbox, has_ip)).
+        # The user's own WORDS still identify the row: the values they state are grounded in
+        # the sentence, and the subject's live attribute rows are enumerable. Deterministic
+        # value anchoring — never an LLM opinion, never a name invention:
+        #   rung 6  — the row still holding the STATED OLD value (grounded in the sentence,
+        #             unique) is the row the correction supersedes;
+        #   rung 6b — the subject holds EXACTLY ONE live attribute and the stated NEW value
+        #             is grounded and not that row's value: a sole-slot entity (the measured
+        #             DevBox case) leaves no second candidate to confuse;
+        #   rung 7  — the row already holding the asserted NEW value: the supersede ALREADY
+        #             happened this turn (the intent-independent harvest ingests the asserted
+        #             value before /retract/correct looks — measured: history action=
+        #             superseded, cause=ingest_restate) and the lane must find the slot to
+        #             report it honestly instead of 'Old relational fact not found'.
+        # Declines on ambiguity (0 or >1 candidates) exactly like every earlier rung.
+        if text:
+            _txt = " ".join(str(text).split()).lower()
+            cur.execute(
+                "SELECT attribute, value_text, value_int, value_float, value_date"
+                "  FROM entity_attributes WHERE entity_id = %s AND superseded_at IS NULL",
+                (subject_uuid,))
+            _live_rows = [
+                (r[0], _scalar_value_texts(r[1], r[2], r[3], r[4]))
+                for r in cur.fetchall() if r[0]]
+            _nv = str(new_value).strip() if new_value is not None else ""
+            _ov = str(old_value).strip() if old_value else ""
+            _nv_grounded = bool(_nv) and _nv.lower() in _txt
+            _ov_grounded = bool(_ov) and _ov.lower() in _txt
+            if _ov_grounded:
+                _m6 = list(dict.fromkeys(
+                    a for a, txts in _live_rows
+                    for t in txts if t.lower() == _ov.lower()))
+                if len(_m6) == 1:
+                    log.info("address_scalar_target.stated_old_holder",
+                             guessed=old_rel_type, subject=str(subject_uuid)[:8],
+                             attribute=_m6[0],
+                             note="name rungs missed; the grounded STATED OLD value "
+                                  "identifies the stored row")
+                    return subject_uuid, _m6[0], "stated_old_holder"
+            if _nv_grounded and len(_live_rows) == 1:
+                _only_attr, _only_txts = _live_rows[0]
+                if not any(t.lower() == _nv.lower() for t in _only_txts):
+                    log.info("address_scalar_target.sole_attribute",
+                             guessed=old_rel_type, subject=str(subject_uuid)[:8],
+                             attribute=_only_attr,
+                             note="name rungs missed; the subject's sole live attribute "
+                                  "is the only slot the stated new value can address")
+                    return subject_uuid, _only_attr, "sole_attribute"
+            if _nv_grounded:
+                _m7 = list(dict.fromkeys(
+                    a for a, txts in _live_rows
+                    for t in txts if t.lower() == _nv.lower()))
+                if len(_m7) == 1:
+                    log.info("address_scalar_target.asserted_value_holder",
+                             guessed=old_rel_type, subject=str(subject_uuid)[:8],
+                             attribute=_m7[0],
+                             note="the asserted new value already lives at exactly one "
+                                  "attribute of the subject — the supersede this turn "
+                                  "already landed; address it to report honestly")
+                    return subject_uuid, _m7[0], "asserted_value_holder"
     except Exception as e:  # noqa: BLE001 — fail-safe: unchanged inputs, today's behaviour
         log.warning("address_scalar_target.failed", error=str(e)[:160])
     return subject_uuid, old_rel_type, None
+
+
+def _recent_scalar_supersession(cur, entity_id, attribute, since):
+    """FOSS-004: the most recent supersede/restate event at one (entity, attribute) slot
+    within ``since`` (the correction turn's window — the intent-independent harvest runs
+    moments BEFORE /retract/correct). Returns (prior_value_display, action) or (None, None).
+    Read-only, fail-safe."""
+    if not entity_id or not attribute or since is None:
+        return None, None
+    try:
+        cur.execute(
+            "SELECT attribute, prior_value_text, prior_value_int, prior_value_float,"
+            "       prior_value_date, action, cause, new_value_text, created_at"
+            "  FROM entity_attributes_history"
+            " WHERE entity_id = %s AND attribute = %s AND created_at >= %s"
+            "   AND action IN ('superseded', 'restated')"
+            " ORDER BY created_at DESC LIMIT 1",
+            (entity_id, attribute, since))
+        r = cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        log.warning("scalar_leg.history_probe_failed", error=str(e)[:120])
+        return None, None
+    if not r:
+        return None, None
+    _texts = _scalar_value_texts(r[1], r[2], r[3], r[4])
+    return (_texts[0] if _texts else None), r[5]
+
+
+def _attribute_leg_outcome(cur, subject_uuid, stated_new_value, since):
+    """FOSS-004: did a supersede/retire of THIS subject's entity_attributes happen within
+    the correction turn's window (``since``)? The harvest lane writes cause=ingest_restate
+    history moments before /retract/correct runs; when the graph-axis lookup then misses,
+    the response must reflect the attribute leg that DID land instead of 'not found'.
+    Returns (attribute, old_display, new_display, action) for the row the correction's
+    words address — a stated new value must agree with the history row's new value — or
+    None when nothing in the window names this correction. Read-only, fail-safe."""
+    if not subject_uuid or since is None:
+        return None
+    try:
+        cur.execute(
+            "SELECT attribute, prior_value_text, prior_value_int, prior_value_float,"
+            "       prior_value_date, action, cause, new_value_text, created_at"
+            "  FROM entity_attributes_history"
+            " WHERE entity_id = %s AND created_at >= %s"
+            "   AND action IN ('superseded', 'retired')"
+            " ORDER BY created_at DESC",
+            (subject_uuid, since))
+        rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        log.warning("scalar_leg.outcome_probe_failed", error=str(e)[:120])
+        return None
+    for r in rows or []:
+        _prior_texts = _scalar_value_texts(r[1], r[2], r[3], r[4])
+        _new_texts = _scalar_value_texts(r[7], None, None, None)
+        if stated_new_value is not None and str(stated_new_value).strip():
+            _nv = str(stated_new_value).strip().lower()
+            if _nv not in [t.lower() for t in _new_texts]:
+                continue  # a this-turn write of a DIFFERENT value is not this correction's leg
+        return (r[0],
+                _prior_texts[0] if _prior_texts else None,
+                _new_texts[0] if _new_texts else None,
+                r[5])
+    return None
 
 
 # ── NAME-REPAIR CORRECTION: the GRAMMAR owns the subject, not the LLM's guess ─────────────────────
@@ -59268,6 +59396,13 @@ def correct_fact(req: FactCorrectionRequest):
             # path. Ingest/query bind this identically; the correction path must too. Reset in
             # finally. (taxonomy_overlay shares this same ContextVar binding.)
             _rt_schema_tok = rel_type_overlay.set_current_schema(schema_name)
+            # FOSS-004: the correction TURN's window starts here. The intent-independent
+            # harvest runs moments BEFORE this request (it supersedes entity_attributes
+            # with cause=ingest_restate), and its attribute leg must be REPORTABLE — the
+            # bounded lookback below is generous enough for harvest + classify + retry,
+            # small enough that last week's unrelated supersede is never attributed here.
+            from datetime import datetime as _lane_dt, timedelta as _lane_td, timezone as _lane_tz
+            _lane_t0 = _lane_dt.now(_lane_tz.utc) - _lane_td(minutes=15)
             log.info("correct_fact.schema_context_set", user_id=user_id[:8], schema=schema_name)
         except ValueError as e:
             log.warning("correct_fact.schema_context_failed", user_id=user_id, error=str(e))
@@ -60193,7 +60328,7 @@ def correct_fact(req: FactCorrectionRequest):
                         _addr_subj, _addr_attr, _scalar_addr_via = _address_scalar_target(
                             _sc_cur, subject_uuid, old_rel_type, old_value, req.user_id,
                             dsn=os.getenv("POSTGRES_DSN"), schema=schema_name,
-                            text=req.text)
+                            text=req.text, new_value=new_value)
                     _has_scalar_attr = _scalar_addr_via is not None
                 except Exception as _sc_err:  # noqa: BLE001 — fail-safe: keep LLM dimension
                     log.warning("correct_fact.scalar_axis_probe_failed", error=str(_sc_err)[:120])
@@ -60467,7 +60602,7 @@ def correct_fact(req: FactCorrectionRequest):
                     _addr_subj, _pinned_attr, _addr_via = _address_scalar_target(
                         cur, subject_uuid, old_rel_type, old_value, req.user_id,
                         dsn=os.getenv("POSTGRES_DSN"), schema=schema_name,
-                        text=req.text)
+                        text=req.text, new_value=new_value)
                     if not _addr_via and not is_retraction:
                         # STATED-VALUE HOLDER (issue #52): the extractor's attribute name is held
                         # nowhere on the subject, but the correction's own stated measure already
@@ -60640,6 +60775,50 @@ def correct_fact(req: FactCorrectionRequest):
                             or _corr_prior_row[1] != value_int
                             or _corr_prior_row[2] != value_float
                             or _corr_prior_row[3] != value_date)
+                        # ── FOSS-004: ALREADY-CURRENT / TURN-WINDOW RESOLUTION ───────────
+                        # The slot is LIVE and already holds the corrected value: either the
+                        # supersede landed moments ago (the intent-independent harvest runs
+                        # BEFORE this lane — measured es: history action=superseded,
+                        # cause=ingest_restate in the same turn) or nothing needs doing.
+                        # Say which — with the REAL stored values — never 'not found'.
+                        if (_corr_prior_row is not None and not _corr_value_changed
+                                and _corr_prior_row[6] is None):
+                            _hist_prior, _hist_action = _recent_scalar_supersession(
+                                cur, subject_uuid, _pinned_attr, _lane_t0)
+                            _live_display = _scalar_value_texts(
+                                _corr_prior_row[0], _corr_prior_row[1],
+                                _corr_prior_row[2], _corr_prior_row[3])
+                            _live_val = _live_display[0] if _live_display else None
+                            if _hist_prior is not None:
+                                log.info("correct_fact.scalar_leg_turn_window_superseded",
+                                         entity=subject_uuid, attribute=_pinned_attr,
+                                         old=_hist_prior, new=_live_val, action=_hist_action)
+                                return FactCorrectionResponse(
+                                    status="corrected", dimension="SCALAR",
+                                    subject_uuid=subject_uuid,
+                                    subject_name=_correction_subject_label(
+                                        db, subject_uuid, user_id, _hist_prior, _live_val,
+                                        fallback=subject_name),
+                                    old_rel_type=_pinned_attr, old_value=_hist_prior,
+                                    new_rel_type=_pinned_attr, new_value=_live_val,
+                                    confidence=confidence, facts_superseded=1,
+                                    message=(f"✓ corrected: {_pinned_attr} was {_hist_prior} "
+                                             f"→ now {_live_val} (superseded earlier in this "
+                                             "correction turn)"))
+                            log.info("correct_fact.scalar_already_current",
+                                     entity=subject_uuid, attribute=_pinned_attr,
+                                     value=_live_val)
+                            return FactCorrectionResponse(
+                                status="already_current", dimension="SCALAR",
+                                subject_uuid=subject_uuid,
+                                subject_name=_correction_subject_label(
+                                    db, subject_uuid, user_id, None, _live_val,
+                                    fallback=subject_name),
+                                old_rel_type=_pinned_attr, old_value=_live_val,
+                                new_rel_type=_pinned_attr, new_value=_live_val,
+                                confidence=confidence, facts_superseded=0,
+                                message=(f"{_pinned_attr} is already {_live_val} — "
+                                         "nothing to change."))
                         if _corr_value_changed:
                             _corr_prior = {
                                 "value_text": _corr_prior_row[0], "value_int": _corr_prior_row[1],
@@ -61052,6 +61231,45 @@ def correct_fact(req: FactCorrectionRequest):
                                      f"old value?"))
 
                 if not old_fact_row:
+                    # ── FOSS-004: ATTRIBUTE-LEG OUTCOME probe (admission-only) ─────────
+                    # The graph-axis lookup missed everything — but a supersede/retire of
+                    # THIS subject's entity_attributes may have landed within this turn's
+                    # window (the intent-independent harvest writes cause=ingest_restate
+                    # history moments before /retract/correct runs — measured es: the lane
+                    # answered 'Old relational fact not found: located_in' while has_ip had
+                    # already moved 10.0.1.5 → 10.0.1.10). When the window names this
+                    # correction, the response reflects the scalar leg that DID land.
+                    try:
+                        _leg = _attribute_leg_outcome(
+                            cur, subject_uuid,
+                            (None if is_retraction else new_value), _lane_t0)
+                    except Exception as _leg_err:  # noqa: BLE001 — probe is advisory
+                        log.warning("correct_fact.attribute_leg_probe_failed",
+                                    error=str(_leg_err)[:120])
+                        _leg = None
+                    if _leg:
+                        _leg_attr, _leg_old, _leg_new, _leg_action = _leg
+                        _leg_new_disp = _leg_new if _leg_new is not None else (
+                            (str(new_value).strip() if (new_value and not is_retraction) else None))
+                        log.info("correct_fact.attribute_leg_reported",
+                                 entity=subject_uuid, attribute=_leg_attr,
+                                 old=_leg_old, new=_leg_new_disp, action=_leg_action,
+                                 is_retraction=is_retraction,
+                                 note="graph axis missed; the scalar leg's supersede "
+                                      "this turn is the real outcome")
+                        return FactCorrectionResponse(
+                            status="corrected", dimension="SCALAR",
+                            subject_uuid=subject_uuid,
+                            subject_name=_correction_subject_label(
+                                db, subject_uuid, user_id, _leg_old, _leg_new_disp,
+                                fallback=subject_name),
+                            old_rel_type=_leg_attr, old_value=_leg_old,
+                            new_rel_type=_leg_attr, new_value=_leg_new_disp,
+                            confidence=confidence, facts_superseded=1,
+                            message=(f"✓ corrected: {_leg_attr} was {_leg_old}" + (
+                                f" → now {_leg_new_disp}" if _leg_new_disp
+                                else " (value retired)")))
+
                     # Semantic fallback for retractions — when all 6 pattern-match steps
                     # find nothing, try Qdrant similarity search to surface candidate facts.
                     # Only for retractions: corrections that can't find a fact should fail with an error.

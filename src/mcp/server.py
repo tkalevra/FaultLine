@@ -6687,6 +6687,10 @@ _NOT_A_FAILURE = frozenset({
     # consumes it and re-routes the turn through the STATEMENT path; a model-invoked
     # retract_fact sees the explanatory message instead.
     "first_mention_naming",
+    # From /retract/correct (FOSS-004): `already_current` is the endpoint's honest "your
+    # truth already holds — nothing needed changing" answer to a value-identical
+    # re-correction. Nothing was superseded because nothing NEEDED to be; the model should
+    # relay that calmly, not treat it as a fault and re-issue the same correction.
     # From /store_context, via store_context_tool's verbatim pass-through. `deferred` means the
     # text WAS retained (to episodic_log) rather than vector-stored — a degraded save, not a
     # failed one — and `disabled` is the freeze MODE, the same class as ingest_disabled. Both
