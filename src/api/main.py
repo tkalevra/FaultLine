@@ -59486,11 +59486,52 @@ def correct_fact(req: FactCorrectionRequest):
             # small enough that last week's unrelated supersede is never attributed here.
             from datetime import datetime as _lane_dt, timedelta as _lane_td, timezone as _lane_tz
             _lane_t0 = _lane_dt.now(_lane_tz.utc) - _lane_td(minutes=15)
+            # ── FOSS-005 (atomicity): this lane's OWN mint, compensated on refusal ────────
+            # registry.resolve(name_intent=True) commits the minted subject (entity +
+            # alias) INTERNALLY, so a later rollback can never undo it. _lane_minted
+            # carries the surrogate when THIS lane minted it; every refusal/failure
+            # return goes through _refuse → _compensate_lane_mint, which rolls back the
+            # open transaction, deletes the minted rows, and commits. A correction that
+            # LANDS keeps the mint (issue #23: a named subject is intentional user
+            # content). Net: a failed retraction/correction leaves entity and fact
+            # counts exactly as it found them.
+            _lane_minted = [None]
+
+            def _compensate_lane_mint():
+                if not _lane_minted[0]:
+                    return
+                try:
+                    try:
+                        db.rollback()
+                    except Exception:  # noqa: BLE001 — the delete below must still run
+                        pass
+                    with db.cursor() as _mc:
+                        _mc.execute("DELETE FROM entity_aliases WHERE entity_id = %s",
+                                    (_lane_minted[0],))
+                        _mc.execute("DELETE FROM entities WHERE id = %s",
+                                    (_lane_minted[0],))
+                    db.commit()
+                    log.info("correct_fact.lane_mint_compensated",
+                             entity=_lane_minted[0],
+                             note="the lane's own subject mint removed on refusal — a "
+                                  "failed correction writes nothing")
+                except Exception as _cmp_err:
+                    log.warning("correct_fact.lane_mint_compensate_failed",
+                                entity=_lane_minted[0], error=str(_cmp_err)[:120])
+                finally:
+                    _lane_minted[0] = None
+
+            def _refuse(**kw):
+                _compensate_lane_mint()
+                return FactCorrectionResponse(**kw)
             log.info("correct_fact.schema_context_set", user_id=user_id[:8], schema=schema_name)
         except ValueError as e:
             log.warning("correct_fact.schema_context_failed", user_id=user_id, error=str(e))
             from src.provisioning.provisioning_status import check_provisioning_status
             prov_status = check_provisioning_status(user_id)
+            # NOTE: deliberately FactCorrectionResponse, NOT _refuse — this handler can fire
+            # before _refuse is bound (nothing can have minted yet: the mint is in subject
+            # resolution, far below). Nothing to compensate.
             return FactCorrectionResponse(
                 status="failed",
                 message=_errors.public_detail(e, where="correct_fact.schema_context",
@@ -60060,7 +60101,7 @@ def correct_fact(req: FactCorrectionRequest):
                     log.warning("correct_fact.pronoun_coref_unresolved",
                                 pronoun=subject_name, old_value=old_value,
                                 old_rel_type=old_rel_type)
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="clarification_needed",
                         message=("I couldn't tell which one you're correcting. Could you name "
                                  "the specific person or thing (instead of 'it'/'his'/'their')?"))
@@ -60143,8 +60184,23 @@ def correct_fact(req: FactCorrectionRequest):
                     # name_intent=True (issue #23): a correction NAMING a subject is
                     # intentional user content (user-is-truth) — the default-deny mint guard
                     # does not refuse a name a correction explicitly asserts.
+                    # ── FOSS-005 (atomicity): resolve() COMMITS the mint internally, so a
+                    # refusal later in this lane could never roll it back. Detect the mint
+                    # (lookup missed, then resolve returned) and compensate on every
+                    # refusal/failure return (see _refuse / _compensate_lane_mint).
+                    try:
+                        _pre_mint_uuid = registry.resolve_lookup(req.user_id, subject_name)
+                    except Exception:
+                        _pre_mint_uuid = None
                     subject_uuid = registry.resolve(req.user_id, subject_name,
                                                     name_intent=True)
+                    if subject_uuid and subject_uuid != _pre_mint_uuid \
+                            and subject_uuid != user_id:
+                        _lane_minted[0] = subject_uuid
+                        log.info("correct_fact.lane_mint_detected",
+                                 subject_name=subject_name, entity=subject_uuid,
+                                 note="compensated if this lane refuses; kept when the "
+                                      "correction lands (issue #23 preserved)")
                     log.info("correct_fact.entity_resolved_via_registry",
                              subject_name=subject_name,
                              subject_uuid=subject_uuid)
@@ -60167,46 +60223,22 @@ def correct_fact(req: FactCorrectionRequest):
                 log.warning("correct_fact.null_subject_extracted",
                            is_retraction=is_retraction,
                            text_preview=req.text[:80])
-                return FactCorrectionResponse(
+                return _refuse(
                     status="clarification_needed",
                     message="I couldn't identify which entity you're trying to remove. Could you rephrase with the specific person or thing? For example: 'forget that [name] [relationship]'"
                 )
             else:
-                # Subject name extracted but entity not yet in graph — stage intent as
-                # Class C so re_embedder can evaluate once the entity exists.
+                # Subject name extracted but the entity is not in the graph. FOSS-005
+                # (atomicity): the old 'retraction_intent' staged_facts note was a WRITE
+                # on a failed retraction — a failed destructive op must not write
+                # ANYTHING (entity, fact or staged count must be unchanged). Fail
+                # honestly, write nothing.
                 log.warning("correct_fact.subject_unresolvable",
                            subject_name=subject_name,
                            is_retraction=is_retraction)
-                try:
-                    with db.cursor() as _stg_cur:
-                        _stg_cur.execute("""
-                            INSERT INTO staged_facts (
-                                user_id, subject_id, rel_type, object_id,
-                                fact_class, confidence, provenance,
-                                first_seen_at, last_seen_at,
-                                expires_at, qdrant_synced
-                            ) VALUES (
-                                %s, %s, 'retraction_intent', %s,
-                                'C', 0.4, 'retraction_null_entity',
-                                now(), now(),
-                                now() + interval '7 days', false
-                            )
-                        """, (
-                            req.user_id,
-                            req.user_id,
-                            req.text[:240],
-                        ))
-                    db.commit()
-                    log.info("correct_fact.retraction_intent_staged",
-                            user_id=req.user_id,
-                            subject_name=subject_name,
-                            text_preview=req.text[:80])
-                except Exception as _stg_e:
-                    log.warning("correct_fact.retraction_intent_stage_failed",
-                               error=str(_stg_e))
-                return FactCorrectionResponse(
+                return _refuse(
                     status="failed",
-                    message=f"Could not resolve entity '{subject_name}' — retraction intent noted for review"
+                    message=f"Could not resolve entity '{subject_name}' — nothing was stored"
                 )
 
         # ── FOSS-008: SUBJECT-SENTENCE AGREEMENT GATE (plain-language retractions) ─────
@@ -60256,7 +60288,7 @@ def correct_fact(req: FactCorrectionRequest):
                        subject_name=subject_name,
                        old_rel_type=old_rel_type,
                        is_retraction=is_retraction)
-            return FactCorrectionResponse(
+            return _refuse(
                 status="failed",
                 message=f"Incomplete {'retraction' if is_retraction else 'correction'} — relationship type not identified"
             )
@@ -60281,7 +60313,7 @@ def correct_fact(req: FactCorrectionRequest):
                 log.warning("correct_fact.correction_incomplete",
                            subject_name=subject_name,
                            new_rel_type=new_rel_type)
-                return FactCorrectionResponse(
+                return _refuse(
                     status="failed",
                     message="Correction requires both old and new relationship details"
                 )
@@ -60338,7 +60370,7 @@ def correct_fact(req: FactCorrectionRequest):
                     note="the turn's naming clause names one referent and subject resolution "
                          "landed on another — writing here would file one referent's name onto a "
                          "different one (THE HARD LINE). Refused; nothing written.")
-                return FactCorrectionResponse(
+                return _refuse(
                     status="clarification_needed",
                     message=("I want to make sure I put that on the right person — whose name "
                              "is changing? Naming them directly will let me update the right "
@@ -60350,7 +60382,7 @@ def correct_fact(req: FactCorrectionRequest):
             log.info("correct_fact.immutable_rejected",
                     user_id=req.user_id,
                     rel_type=old_rel_type)
-            return FactCorrectionResponse(
+            return _refuse(
                 status="rejected",
                 message=f"Field '{old_rel_type}' is immutable and cannot be corrected. "
                         f"Identity facts like birth date and birthplace cannot be changed once established."
@@ -60552,7 +60584,7 @@ def correct_fact(req: FactCorrectionRequest):
                         if not _del_term:
                             log.warning("correct_fact.synonym_delete_no_term",
                                         entity=subject_uuid)
-                            return FactCorrectionResponse(
+                            return _refuse(
                                 status="clarification_needed",
                                 message="Which nickname would you like me to stop using? "
                                         "For example: 'forget the nickname [word]'.")
@@ -60570,7 +60602,7 @@ def correct_fact(req: FactCorrectionRequest):
                         if not _rl_term:
                             log.warning("correct_fact.synonym_correct_no_term",
                                         entity=subject_uuid, old=old_value, new=new_value)
-                            return FactCorrectionResponse(
+                            return _refuse(
                                 status="clarification_needed",
                                 message="Which nickname are you correcting? For example: "
                                         "'my [word] is [name] not [name]'.")
@@ -60600,7 +60632,7 @@ def correct_fact(req: FactCorrectionRequest):
                                 _new_entity_uuid = registry.resolve(req.user_id, new_value,
                                                                     name_intent=True)
                         if not _new_entity_uuid:
-                            return FactCorrectionResponse(
+                            return _refuse(
                                 status="clarification_needed",
                                 message=f"I couldn't identify who '{new_value}' is to relink "
                                         f"the nickname '{_rl_term}'. Could you clarify?")
@@ -61085,10 +61117,15 @@ def correct_fact(req: FactCorrectionRequest):
                 found_via = None
 
                 # For retractions, resolve object_value to UUID first (if provided)
+                # ── FOSS-005 (atomicity): LOOKUP-ONLY. The old value here is a MATCHING
+                # key, never a write target: a freshly minted entity can never match an
+                # existing fact, so the old resolve()'s mint was pure byproduct — and it
+                # COMMITTED inside the registry, surviving every later failure (the measured
+                # es wound: a failed retraction left a minted 'puerto' entity behind).
                 object_uuid = None
                 if old_value:
                     try:
-                        object_uuid = registry.resolve(req.user_id, old_value)
+                        object_uuid = registry.resolve_lookup(req.user_id, old_value)
                     except Exception as e:
                         log.warning("correct_fact.object_resolution_failed",
                                    old_value=old_value,
@@ -61239,7 +61276,7 @@ def correct_fact(req: FactCorrectionRequest):
                         log.warning("correct_fact.ambiguous_subject_only",
                                     subject=subject_uuid, rel_type=old_rel_type,
                                     candidates=len(_sub_rows))
-                        return FactCorrectionResponse(
+                        return _refuse(
                             status="clarification_needed",
                             message=(f"You have several '{old_rel_type}' facts and I "
                                      f"couldn't tell which one to correct. Could you name "
@@ -61345,7 +61382,7 @@ def correct_fact(req: FactCorrectionRequest):
                         log.warning("correct_fact.ambiguous_old_value_object",
                                     subject=subject_uuid, object=object_uuid,
                                     candidates=len(_ov_candidates))
-                        return FactCorrectionResponse(
+                        return _refuse(
                             status="clarification_needed",
                             message=(f"You have several facts with that value and I "
                                      f"couldn't tell which one to correct. Could you name "
@@ -61404,7 +61441,7 @@ def correct_fact(req: FactCorrectionRequest):
                         log.warning("correct_fact.asserted_value_exclude_ambiguous",
                                     subject=subject_uuid, rel_type=old_rel_type,
                                     candidates=len(_ae_candidates))
-                        return FactCorrectionResponse(
+                        return _refuse(
                             status="clarification_needed",
                             message=(f"You have several '{old_rel_type}' facts and I couldn't "
                                      f"tell which one to replace. Could you name the specific "
@@ -61507,7 +61544,7 @@ def correct_fact(req: FactCorrectionRequest):
                                 user_id=req.user_id,
                                 candidates=_semantic_candidates[:80],
                             )
-                            return FactCorrectionResponse(
+                            return _refuse(
                                 status="clarification_needed",
                                 message=(
                                     "I couldn't find an exact match for that retraction. "
@@ -61645,7 +61682,7 @@ def correct_fact(req: FactCorrectionRequest):
                                 )
                                 # Do NOT raise — orphan sweep failure must never fail the retraction.
 
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="failed",
                         message=f"Old {dimension.lower()} fact not found: {old_rel_type}"
                     )
@@ -61740,7 +61777,7 @@ def correct_fact(req: FactCorrectionRequest):
                     if not _kept_object_id:
                         log.warning("correct_fact.temporal_no_object",
                                     subject=subject_uuid, rel_type=old_rel_type)
-                        return FactCorrectionResponse(
+                        return _refuse(
                             status="failed",
                             message="Could not locate the dated fact to correct.")
                     # temporal_status recomputed deterministically from the corrected date
@@ -61871,7 +61908,7 @@ def correct_fact(req: FactCorrectionRequest):
                     log.warning("correct_fact.old_fact_not_found_subject_change",
                                subject=subject_uuid,
                                rel_type=old_rel_type)
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="failed",
                         message=f"Old fact not found for subject change: {old_rel_type}"
                     )
@@ -62026,7 +62063,8 @@ def correct_fact(req: FactCorrectionRequest):
                 if not old_fact_row and old_value:
                     _rt_obj_uuid = None
                     try:
-                        _rt_obj_uuid = registry.resolve(req.user_id, old_value)
+                        # FOSS-005: lookup-only — same matching key, never a mint.
+                        _rt_obj_uuid = registry.resolve_lookup(req.user_id, old_value)
                     except Exception as _rte:  # noqa: BLE001 — unresolvable → skip the anchor
                         log.warning("correct_fact.rel_type_old_value_resolution_failed",
                                     old_value=old_value, error=str(_rte)[:160])
@@ -62061,7 +62099,7 @@ def correct_fact(req: FactCorrectionRequest):
                             log.warning("correct_fact.rel_type_ambiguous_old_value_object",
                                         subject=subject_uuid, object=_rt_obj_uuid,
                                         candidates=len(_rt_cands))
-                            return FactCorrectionResponse(
+                            return _refuse(
                                 status="clarification_needed",
                                 message=("You have several facts with that value and I "
                                          "couldn't tell which one to correct. Could you name "
@@ -62070,7 +62108,7 @@ def correct_fact(req: FactCorrectionRequest):
                     log.warning("correct_fact.old_fact_not_found_rel_type_change",
                                subject=subject_uuid,
                                rel_type=old_rel_type)
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="failed",
                         message=f"Old fact not found for rel_type change: {old_rel_type}"
                     )
@@ -62152,7 +62190,7 @@ def correct_fact(req: FactCorrectionRequest):
                 if not entity_row:
                     log.warning("correct_fact.entity_not_found",
                                entity=subject_uuid)
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="failed",
                         message=f"Entity not found: {subject_uuid}"
                     )
@@ -62314,7 +62352,7 @@ def correct_fact(req: FactCorrectionRequest):
                 else:
                     log.warning("correct_fact.entity_correction_invalid",
                                entity=subject_uuid)
-                    return FactCorrectionResponse(
+                    return _refuse(
                         status="rejected",
                         message="Cannot correct an entire entity. Specify which fact about the entity needs correction."
                     )
@@ -62324,7 +62362,7 @@ def correct_fact(req: FactCorrectionRequest):
                 log.error("correct_fact.unknown_dimension",
                          dimension=dimension,
                          user_id=req.user_id)
-                return FactCorrectionResponse(
+                return _refuse(
                     status="failed",
                     message=f"Unknown dimension: {dimension}. Expected: SCALAR|RELATIONAL|HIERARCHICAL|SUBJECT|ENTITY"
                 )

@@ -547,6 +547,40 @@ class EntityRegistry:
         except Exception:  # noqa: BLE001 — fail-safe: the refusal never blocks the mint path
             return False
 
+    def resolve_lookup(self, user_id: str, name: str):
+        """Pure-read twin of :meth:`resolve` — alias probe, then uuid probe. NEVER mints,
+        NEVER writes, NEVER commits (no display-form heal, no surrogate registration).
+        FOSS-005 (atomicity): match-only callers — the /retract/correct lane resolving the
+        correction's OLD VALUE / object for its supersede lookups — must not leave a
+        freshly minted entity (type='unknown' + alias) behind when the supersede decision
+        then FAILS; the measured es wound. A name that resolves nowhere returns None and
+        the caller's cascade proceeds exactly as when the mint used to be useless."""
+        name = (name or "").lower().strip()
+        if len(name) > _ENTITY_NAME_MAX_LEN:
+            name = name[:_ENTITY_NAME_MAX_LEN]
+        if not name:
+            return None
+        # THE BIND — precedes the reads below, exactly like resolve().
+        self._bind_tenant_schema("resolve_lookup")
+        # First-person reference grounds to the requesting user — never a surrogate.
+        if name == "user" or name in _FIRST_PERSON_PRONOUNS:
+            return user_id if self._is_valid_uuid(user_id) else _make_surrogate(user_id, user_id)
+        with self.db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT entity_id FROM entity_aliases "
+                "WHERE alias = %s "
+                "ORDER BY CASE WHEN entity_id = %s THEN 0 ELSE 1 END, is_preferred DESC",
+                (name, user_id),
+            )
+            row = cur.fetchone()
+            if row and row[0] and (row[0].count("-") == 4 or row[0] == "user"):
+                return row[0]
+            cur.execute("SELECT id FROM entities WHERE id = %s", (name,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+        return None
+
     def resolve(self, user_id: str, name: str, name_intent: bool = False) -> str:
         """
         Resolve a name or alias to its canonical entity ID (UUID surrogate).
