@@ -344,6 +344,10 @@ class _Cur:
         if s.startswith("update entity_aliases"):
             self.rowcount = 0
             return
+        if s.startswith("select id from entities"):
+            # FOSS-005 pre-mint census: the full entity-id SET (no params).
+            self._rows = [(e,) for e in t.entities]
+            return
         if "from entities" in s and s.startswith("select"):
             eid = P[0]
             if eid in t.entities:
@@ -410,6 +414,13 @@ class _StubRegistry:
         hit = self._lookup(user_id, name)
         if hit:
             return hit
+        alias = str(name).lower().strip()
+        # critic round 1 minor (2) repro knob: the REAL resolve() can also succeed by
+        # REDIRECTING to an existing entity through paths resolve_lookup lacks
+        # (measurement-family compound redirect). t.resolve_redirect maps name -> uuid.
+        _redirect = getattr(self.db.t, "resolve_redirect", None)
+        if _redirect and alias in _redirect:
+            return _redirect[alias]
         _SURROGATE_N[0] += 1
         surrogate = "99999999-9999-4999-8999-" + str(100000000000 + _SURROGATE_N[0])[-12:]
         self.db.t.entities.setdefault(surrogate, "unknown")
@@ -631,53 +642,6 @@ def test_honest_fail_pin_true_no_match_writes_nothing(monkeypatch):
 # =============================================================================
 
 def test_fabrication_pin_no_prior_row_reports_no_fabricated_old(monkeypatch):
-    """The en/it wound: no prior row existed anywhere, yet the response announced
-    lives_at=10.0.1.9 (a value never stored) and facts_superseded=1. A first-value
-    INSERT is not a supersede: old=None, facts_superseded=0, status says stored."""
-    t = _default_tenant()   # DevBox holds NO attribute at all
-    extraction = {"subject_name": "DevBox", "old_rel_type": "lives_at",
-                  "old_value": "10.0.1.9", "new_rel_type": "lives_at",
-                  "new_value": "10.0.1.10", "dimension": "SCALAR",
-                  "confidence": 0.9}
-    env = Env(monkeypatch, t, extraction)
-    out = env.post("La IP de DevBox ahora es 10.0.1.10.")
-
-    assert out.get("old_value") is None, out          # NEVER the fabricated 10.0.1.9
-    assert out.get("facts_superseded") == 0, out      # first-value INSERT is not a supersede
-    assert "10.0.1.9" not in str(out), out            # the fabrication must appear nowhere
-    assert out["status"] in ("stored", "corrected"), out
-    # the value DID land (a first value recorded)
-    live = [a for a in t.attributes
-            if a["entity_id"] == SERVIDOR and a["attribute"] == "lives_at"]
-    assert live and live[0]["value_text"] == "10.0.1.10", t.attributes
-    assert not t.history, "a first-value INSERT must not write a supersede history row"
-
-
-def test_stored_old_preferred_over_extractor(monkeypatch):
-    """A real prior row (10.0.1.5) plus an extractor that re-derives 10.0.1.9: the
-    response reports the STORED prior and says it preferred storage."""
-    t = _devbox_ip_tenant()   # has_ip = 10.0.1.5, live
-    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
-                  "old_value": "10.0.1.9", "new_rel_type": "has_ip",
-                  "new_value": "10.0.1.10", "dimension": "SCALAR",
-                  "confidence": 0.9}
-    env = Env(monkeypatch, t, extraction)
-    out = env.post("La IP de DevBox cambio: ahora es 10.0.1.10.")
-
-    assert out["status"] == "corrected", out
-    assert out.get("old_value") == "10.0.1.5", out    # STORED prior, not the extractor's 10.0.1.9
-    assert out.get("new_value") == "10.0.1.10", out
-    assert out.get("facts_superseded") == 1, out
-    assert "10.0.1.9" in str(out.get("message")), (
-        "the disagreement must be surfaced, not swallowed")
-
-
-# =============================================================================
-# FOSS-010 - the reported old value comes from STORAGE, never from the
-# correction-extractor's re-derivation.
-# =============================================================================
-
-def test_fabrication_pin_no_prior_row_reports_no_fabricated_old(monkeypatch):
     t = _default_tenant()
     extraction = {"subject_name": "DevBox", "old_rel_type": "lives_at",
                   "old_value": "10.0.1.9", "new_rel_type": "lives_at",
@@ -862,3 +826,154 @@ def test_object_resolution_never_mints(monkeypatch):
     assert t2.entity_count() == before2, t2.mint_calls
     assert t2.mint_calls == [], t2.mint_calls
 
+
+
+# =============================================================================
+# CRITIC ROUND 1 — blocking defects A + B and minors 1 + 2.
+# =============================================================================
+
+def _two_entity_seat_with_pet():
+    """The live critic seat: the SPEAKER plus DevBox(10.0.1.10), and the speaker's
+    live (user, has_pet, gata['fraggle']) edge."""
+    t = _default_tenant()
+    t.attributes.append(_attr(SERVIDOR, "has_ip", "10.0.1.10"))
+    t.facts.append({"id": 3001, "subject_id": USER, "object_id": GATA,
+                    "rel_type": "has_pet", "superseded_at": None})
+    return t
+
+
+def test_agreement_binds_retargeted_final_target(monkeypatch):
+    """DEFECT A (live-measured): first-person cat sentence on a two-entity seat. The
+    gate exempts the speaker, then the SS4 axis rungs renamed has_pet -> has_ip (shared
+    head) and re-targeted the tenant-unique holder — retiring DevBox.has_ip for a CAT
+    sentence. The agreement discipline must bind the FINAL (subject, attribute): the
+    ungrounded rename/re-target refuses, and the sentence's REAL object (Fraggle, the
+    speaker's actual pet edge) is what retires."""
+    t = _two_entity_seat_with_pet()
+    # the live shape: NO stated object (the retraction-extractor gave subject+rel only)
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": None, "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Please forget that I have a cat named Fraggle.")
+
+    live_ip = [a for a in t.attributes
+               if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
+               and not a["superseded_at"]]
+    assert live_ip, f"DevBox.has_ip must survive a cat sentence: {out}"
+    live_pet = [f for f in t.facts
+                if f["subject_id"] == USER and f["rel_type"] == "has_pet"
+                and not f["superseded_at"]]
+    assert not live_pet, (
+        "the sentence DOES name Fraggle: the speaker's own has_pet edge is the intent "
+        "and must retire")
+    assert t.mint_calls == [], t.mint_calls
+
+
+def test_retarget_refusal_when_nothing_grounds(monkeypatch):
+    """DEFECT A, pure refusal shape: the same rung machinery, but a sentence that names
+    no stored thing at all — the re-target must refuse with no_match, writing nothing."""
+    t = _two_entity_seat_with_pet()
+    counts = (t.entity_count(), t.live_fact_count(), t.live_attr_count())
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": "unicorn", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget that my unicorn has wings.")
+
+    assert out["status"] == "no_match", out
+    assert (t.entity_count(), t.live_fact_count(),
+            t.live_attr_count()) == counts, "nothing may be written"
+    assert not t.history, t.history
+
+
+def test_relational_object_must_ground(monkeypatch):
+    """DEFECT B (live-measured): 'Forget that my unicorn has wings.' matched the live
+    (user, has_pet, fraggle) edge on (subject, rel) alone — zero sentence-token
+    grounding of the object — and superseded it. The relational leg must ground the
+    matched object: unicorn/wings ground nothing stored -> no_match, nothing written."""
+    t = _two_entity_seat_with_pet()
+    counts = (t.entity_count(), t.live_fact_count(), t.live_attr_count())
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": "unicorn", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("Forget that my unicorn has wings.")
+
+    assert out["status"] == "no_match", out
+    live_pet = [f for f in t.facts
+                if f["subject_id"] == USER and f["rel_type"] == "has_pet"
+                and not f["superseded_at"]]
+    assert live_pet, "the un-named live edge must survive"
+    assert (t.entity_count(), t.live_fact_count(),
+            t.live_attr_count()) == counts
+    assert not t.history, t.history
+
+
+def test_relational_object_grounding_disambiguates(monkeypatch):
+    """DEFECT B positive control: two pet edges, the sentence names ONE of them — the
+    grounding filter is the disambiguation, and exactly the named edge retires."""
+    t = _two_entity_seat_with_pet()
+    REX = "77777777-7777-4777-8777-777777777777"
+    t.add_entity(REX, "Animal", ["rex"])
+    t.facts.append({"id": 3002, "subject_id": USER, "object_id": REX,
+                    "rel_type": "has_pet", "superseded_at": None})
+    extraction = {"subject": "user", "rel_type": "has_pet",
+                  "object": "rex", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("olvida que tengo un gato que se llama Rex")
+
+    assert out["status"] == "corrected", out
+    live = [(f["object_id"]) for f in t.facts
+            if f["subject_id"] == USER and f["rel_type"] == "has_pet"
+            and not f["superseded_at"]]
+    assert live == [GATA], f"only Rex retires; Fraggle survives: {live}"
+
+
+def test_turn_window_boundary_14min(monkeypatch):
+    """Minor (1): the attribution window is now 3 minutes. A harvest supersede 14
+    minutes ago is a PREVIOUS turn — a value-identical re-correction must answer
+    already_current, never claim this turn's supersede."""
+    t = _devbox_ip_tenant()
+    # faithful harvest model: the single (entity, attribute) row is UPDATED in place
+    t.attributes[0]["value_text"] = "10.0.1.10"
+    t.history.append({
+        "entity_id": SERVIDOR, "attribute": "has_ip",
+        "prior_value_text": "10.0.1.5", "prior_value_int": None,
+        "prior_value_float": None, "prior_value_date": None,
+        "new_value_text": "10.0.1.10", "new_value_int": None,
+        "action": "superseded", "cause": "ingest_restate",
+        "created_at": datetime.now(timezone.utc) - timedelta(minutes=14)})
+    extraction = {"subject_name": "DevBox", "old_rel_type": "has_ip",
+                  "old_value": "10.0.1.5", "new_rel_type": "has_ip",
+                  "new_value": "10.0.1.10", "dimension": "SCALAR",
+                  "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("La IP de DevBox es 10.0.1.10.")
+
+    assert out["status"] == "already_current", out
+    assert out.get("facts_superseded") == 0, out
+
+
+def test_lane_mint_detection_uses_pre_mint_set(monkeypatch):
+    """Minor (2): resolve() REDIRECTING to an existing entity (a path resolve_lookup
+    lacks) must NOT be flagged as a lane mint — the old uuid-inequality detection
+    marked a pre-existing entity lane-minted and the refusal tried to delete it. The
+    pre-mint entity-id SET decides; a redirected refusal leaves the entity intact."""
+    t = _default_tenant()
+    t.resolve_redirect = {"mi peso": GATA}   # resolve() redirects; lookup misses
+    extraction = {"subject": "mi peso", "rel_type": "tiene",
+                  "object": "alas", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    # the sentence grounds gata (the redirect target), so the gate passes and the lane
+    # reaches its honest not-found _refuse - which must NOT compensate a pre-existing
+    # entity the lane never minted.
+    out = env.post("olvida el peso de la gata")
+
+    assert out["status"] == "failed", out
+    assert GATA in t.entities, "a pre-existing entity must survive a lane refusal"
+    gata_aliases = [a for a, ent in t.aliases.items() if ent == GATA]
+    assert set(gata_aliases) == {"gata", "fraggle"}, t.aliases
+    assert t.mint_calls == [], t.mint_calls
