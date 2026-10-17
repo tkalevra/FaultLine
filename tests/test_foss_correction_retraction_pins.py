@@ -786,3 +786,79 @@ def test_agreement_ambiguous_returns_candidates_retires_nothing(monkeypatch):
     assert out.get("candidates"), out
     cands = str(out["candidates"])
     assert GATA in cands and SERVIDOR in cands, out
+
+
+# =============================================================================
+# FOSS-005 - ATOMICITY: a failed retraction/correction leaves entity, fact and
+# attribute counts unchanged and mints NOTHING.
+# =============================================================================
+
+def test_atomicity_pin_negation_retraction_writes_nothing(monkeypatch):
+    """""No uso el puerto 9004...": a negation retraction whose (user, usar, puerto)
+    fact does not exist. The old object resolution MINTED 'puerto' (committed inside
+    the registry) even though the supersede then failed - entity count 3->4. Now:
+    lookup-only resolution, honest failed status, zero writes, zero mints."""
+    t = _default_tenant()
+    counts = (t.entity_count(), t.live_fact_count(), t.live_attr_count())
+    extraction = {"subject": "user", "rel_type": "usar",
+                  "object": "puerto", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("No uso el puerto 9004 para nada.")
+
+    assert out["status"] == "failed", out
+    assert (t.entity_count(), t.live_fact_count(),
+            t.live_attr_count()) == counts, (
+        f"counts changed on a failed retraction: "
+        f"{counts} -> {(t.entity_count(), t.live_fact_count(), t.live_attr_count())}")
+    assert t.mint_calls == [], t.mint_calls
+    assert not t.history, t.history
+    assert not t.staged, t.staged
+
+
+def test_lane_mint_kept_when_correction_lands_issue23(monkeypatch):
+    """Control (issue #23 preserved): a pref_name correction NAMING a subject not yet
+    in the graph mints it and LANDS - the mint is kept when the correction succeeds."""
+    t = _default_tenant()
+    before = t.entity_count()
+    extraction = {"subject": "Rex", "old_rel_type": "pref_name",
+                  "new_rel_type": "pref_name", "new_value": "reggie",
+                  "dimension": "SCALAR", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction)
+    out = env.post("Rex se llama reggie, no Rex.")
+
+    assert out["status"] == "corrected", out
+    assert t.entity_count() == before + 1, "the named-subject mint must be kept on success"
+    assert "rex" in t.mint_calls, t.mint_calls
+
+
+def test_object_resolution_never_mints(monkeypatch):
+    """The old-value object resolve is LOOKUP-ONLY now: whatever the lane decides
+    (the grounded value legitimately retires has_ip; a value nothing holds lands
+    nothing), the resolve itself must never leave a minted entity behind."""
+    t = _devbox_ip_tenant()
+    before = t.entity_count()
+    extraction = {"subject": "devbox", "rel_type": "usar",
+                  "object": "10.0.1.5", "action": "remove",
+                  "dimension": "RELATIONAL", "confidence": 0.9}
+    env = Env(monkeypatch, t, extraction, intent="RETRACTION")
+    out = env.post("olvida que DevBox usa 10.0.1.5")
+
+    assert t.entity_count() == before, "object resolve minted"
+    assert t.mint_calls == [], t.mint_calls
+    live_ip = [a for a in t.attributes
+               if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
+               and not a["superseded_at"]]
+    assert not live_ip, "the grounded value must still retire"
+
+    # and a value nothing holds: nothing lands, still zero mints
+    t2 = _devbox_ip_tenant()
+    before2 = t2.entity_count()
+    extraction2 = {"subject": "devbox", "rel_type": "usar",
+                   "object": "10.0.1.99", "action": "remove",
+                   "dimension": "RELATIONAL", "confidence": 0.9}
+    env2 = Env(monkeypatch, t2, extraction2, intent="RETRACTION")
+    out2 = env2.post("olvida que DevBox usa 10.0.1.99")
+    assert t2.entity_count() == before2, t2.mint_calls
+    assert t2.mint_calls == [], t2.mint_calls
+
