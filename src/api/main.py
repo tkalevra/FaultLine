@@ -11493,12 +11493,12 @@ def _is_grown_ontology_row(rel_type, provenance, fact_provenance=None,
     ``subclass_of`` clause above is a proxy for "the engine grew this", and it is exactly wrong
     on the rows it actually catches: an engine-grown rung is already caught by the provenance
     clause, so the only rows the relation clause could ever add are the ones an engine lane did
-    NOT mint — i.e. the user's own "a fraggle is a kind of puppet", silently deleted from every
+    NOT mint — i.e. the user's own "a luna is a kind of puppet", silently deleted from every
     reply. When the caller can supply fact_provenance, a user statement is never grown ontology.
 
     User-grounded leaf rows (user_stated ``instance_of``/``has_pet``/``part_of``/``owns`` …)
     are NOT grown-ontology and are returned normally — so a leaf reached THROUGH the ladder
-    (my family → pets → Fraggle) still surfaces. Deterministic; no domain literals.
+    (my family → pets → Luna) still surfaces. Deterministic; no domain literals.
 
     THE AUTHORSHIP CLAUSE (the one that closes the recorded ``instance_of`` residue). A type
     assertion is the person's memory only when the person made it. ``fact_provenance`` is the
@@ -14556,7 +14556,7 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
 
     # ── FOSS-008 / critic round 1, DEFECT A: a RETRACTION's re-target must bind the ──
     # FINAL (subject, attribute) to the user's own words. Measured live: "Please forget
-    # that I have a cat named Fraggle." resolved its subject to the SPEAKER (the gate
+    # that I have a cat named Luna." resolved its subject to the SPEAKER (the gate
     # exempts the speaker), and then rung 2.5's shared-head rename (has_pet → has_ip)
     # plus rung 3's tenant-unique holder RE-TARGETED the destructive write onto
     # (devbox, has_ip) AFTER the gate. The gate binds the gate-time subject; every rung
@@ -14915,7 +14915,7 @@ def _attribute_leg_outcome(cur, subject_uuid, stated_new_value, since):
 
 
 # ── FOSS-008: SUBJECT-SENTENCE AGREEMENT GATE (plain-language retraction) ──────────────────
-# The measured FOSS-008 wound: "olvida que tengo una gata que se llama Fraggle" resolved
+# The measured FOSS-008 wound: "olvida que tengo una gata que se llama Luna" resolved
 # its subject to the WRONG entity (the server) and the retraction retired the SERVER's
 # attributes while the cat survived — wrong-entity destruction from one LLM guess.
 # Language models disagree about WHICH entity a sentence names; the sentence itself never
@@ -14991,7 +14991,7 @@ def _swapped_subject_grounded(cur, text, ent, user_id) -> bool:
 def _retraction_object_grounded(cur, text, object_ref) -> bool:
     """FOSS-008 / critic round 1 DEFECT B: a RELATIONAL retraction may only retire an
     edge whose OBJECT the user's own words ground. Measured wound: "Forget that my
-    unicorn has wings." matched (user, has_pet, fraggle) on (subject, rel) alone — zero
+    unicorn has wings." matched (user, has_pet, luna) on (subject, rel) alone — zero
     sentence-token grounding of the object — and superseded the LIVE edge. ``object_ref``
     is the matched row's object (entity uuid or literal): it grounds when IT (or any
     alias of it as an entity) appears in the sentence at word boundaries or by full
@@ -15119,7 +15119,7 @@ NAME_FIRST_MENTION_GUARD: bool = os.environ.get(
 
 # ── FOSS-015 PRO-DROP BEARER GROUNDING (critic round 3) ──────────────────────────────
 # A pro-drop it naming correction/retraction ("Anzi, si chiama DevBox." / "dimentica che ho
-# una gatta che si chiama Fraggle.") has a DISCOURSE-given bearer: the LLM extractor returns
+# una gatta che si chiama Luna.") has a DISCOURSE-given bearer: the LLM extractor returns
 # subject=null and the turn parked (corrections at "Old fact not found for subject change:
 # pref_name"; retractions at a generic clarification). This flag gates the lookup-only bearer
 # grounding in /retract/correct (_ground_prodrop_bearer): grammar-gated on the licensed UD
@@ -16035,7 +16035,7 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         entities holding a naming alias row, preference_source IN ('user_stated',
         'rel_default') (round 4.2, measured live: the OWNED-DEFINITE given name lands
         user_stated — seat a's apollo — while the indefinite 'una gatta che si chiama
-        Fraggle' naming lands rel_default — seat b's fraggle; head nouns, L4 labels and
+        Luna' naming lands rel_default — seat b's luna; head nouns, L4 labels and
         provisioning rows are unspecified/inferred/provisioned and stay excluded).
         Alias-content hits that hold NO user_stated row are statement-lane ghosts (the
         MCP harvest's own pre-correct mint — see the drop site below), not rivals; a
@@ -16078,7 +16078,7 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         return None  # the bearer is IN the text: the speaker binding may be right — not ours
     _name = names[0]
     # The corrector LLM's SCHEMA PLACEHOLDER for an unnamed old value — measured live
-    # (extraction old='pref_name=old_name', seat 6e11d1a1, 2026-10-18). It is not user
+    # (extraction old='pref_name=old_name', seat see-dev-bug-docs, 2026-10-18). It is not user
     # content: treating it as a stated old value would key the probes with the literal
     # string and fail the agreement gate on every pro-drop turn.
     if old_value and str(old_value).strip().lower() in ("old_name", "old name"):
@@ -16106,8 +16106,8 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         # The naming bearers proper: entities holding a NAMING alias row — a name this
         # seat's user actually spoke. Two sources carry it (ALIAS-PROVENANCE-DESIGN):
         # user_stated (a preferred/preference-signalled given name) and rel_default (the
-        # naming chain's scalar-identity stamp — 'una gatta che si chiama Fraggle' writes
-        # fraggle|rel_default, measured live seat 6e11d1b2; only the OWNED-DEFINITE shape
+        # naming chain's scalar-identity stamp — 'una gatta che si chiama Luna' writes
+        # luna|rel_default, measured live seat see-dev-bug-docs; only the OWNED-DEFINITE shape
         # reaches user_stated). Head nouns are 'unspecified', L4 labels 'inferred',
         # provisioning rows 'provisioned' — none of those is a given name.
         cur.execute(
@@ -16119,10 +16119,10 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         # Statement-lane GHOSTS — identified STRUCTURALLY, not by preference_source: the
         # MCP's intent-independent harvest mints the turn's asserted name as a standalone
         # entity whose ONLY alias is the name itself (measured live 2026-10-18, seat
-        # 6e11d1a1: entity 51079beb, alias devbox|rel_default|not-preferred, zero facts,
+        # see-dev-bug-docs: entity see-dev-bug-docs, alias devbox|rel_default|not-preferred, zero facts,
         # minted by POST /ingest committed=0 moments before /retract/correct ran). A
-        # legitimate bearer always co-holds its head-noun/type aliases (seat 6e11d1b2's
-        # gatta holds {gatta, fraggle}), so an entity whose whole alias set is the asserted
+        # legitimate bearer always co-holds its head-noun/type aliases (seat see-dev-bug-docs's
+        # gatta holds {gatta, luna}), so an entity whose whole alias set is the asserted
         # name(s) — all rel_default, none preferred — is the double-write's own residue,
         # not a rival referent: drop it. A genuine rival is a different NAMING holder, and
         # two naming holders still refuse at the uniqueness count below; the bearer-NP
@@ -16164,9 +16164,9 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             # shut — the turn carries no signal to pick between them, and uniqueness
             # below never guesses.
             cands = _holders - _ghosts
-        # The bearer's HEAD-NOUN label (the non-name alias, e.g. gatta beside fraggle) -
+        # The bearer's HEAD-NOUN label (the non-name alias, e.g. gatta beside luna) -
         # the retraction clarification names THE BEARER, not the name twice (round 4.3:
-        # 'Fraggle is a name of Fraggle' read redundant). Filled from the audit rows the
+        # 'Luna is a name of Luna' read redundant). Filled from the audit rows the
         # ghost check already fetched; corrections never read it.
         _bearer_head = ""
         for _e, rows in _by_entity.items():
@@ -29648,7 +29648,7 @@ def _idempotency_cached_facts_present(schema_name: Optional[str], cached_respons
 
 # ── THE HARD LINE (ingest enforcement): a TYPE-word is not a NAME ────────────────
 # A common noun ("ticket", "issue", "refund", "address") is a TYPE — an L4 place, what a
-# thing IS. A NAME is a proper name / user-given label (Carol, Fraggle, "Capital One") — the
+# thing IS. A NAME is a proper name / user-given label (Carol, Luna, "Capital One") — the
 # naming layer (is_preferred alias). On the /extract/rewrite LLM path a dense multi-entity
 # sentence can emit relational edges whose subject/object is a bare common noun; the dumb
 # registry mints EVERY new entity surface is_preferred=true unconditionally (entity_registry/
@@ -29717,7 +29717,7 @@ def _surface_is_bare_common_type_noun(surface: str) -> bool:
     toks = [t for t in doc_pos if not t.is_space]
     if not toks:
         return False
-    # NAME signal 2: any proper-noun token (PROPN) — a proper name (e.g. "Fraggle").
+    # NAME signal 2: any proper-noun token (PROPN) — a proper name (e.g. "Luna").
     if any(t.pos_ == "PROPN" for t in toks):
         return False
     # TYPE signal: at least one common NOUN and every token is a common lexical class.
@@ -32874,7 +32874,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                     # ── THE HARD LINE: a bare common TYPE-noun object is not a NAME ──
                     # Only for RELATIONAL objects (scalar objects are STRING values, never
                     # entities). A bare common-noun object surface (incl. a type/class object of
-                    # instance_of) must not stand as a preferred NAME. Proper names (Fraggle,
+                    # instance_of) must not stand as a preferred NAME. Proper names (Luna,
                     # Carol, "Capital One") return False from the test and are left untouched.
                     if (not _is_scalar_rel_type(edge.rel_type)
                             and canonical_object and canonical_object != user_entity_id
@@ -38823,7 +38823,7 @@ def _decompose_query_steps(query_text: str, intent: dict | None = None) -> list[
     # chain itself. "what is X" / "what's X" / "tell me about X" / "whose X" /
     # "when is X's birthday" / "where is X's …". WHEN/WHERE are query-NLU scaffolding
     # (what is ASKED), not a fact word-list — stripping them lets the SAME possessive
-    # decomposition reach the entity's dated/scalar slot (bug: "when is Fraggle's
+    # decomposition reach the entity's dated/scalar slot (bug: "when is Luna's
     # birthday" left "when"/"is" as junk owner steps → the walk defers → recall misses).
     _lead = re.match(
         r"^(?:what(?:'s| is| are| was| were)?|who(?:'s| is)?|"
@@ -39712,7 +39712,7 @@ def resolve_typed_walk(
         # differently-typed rel (a birth date mis-stored as born_in, a provisioning
         # date, …). Surface that date fact and STOP; the render lane appends the
         # derived age. This is what makes "how old is Leo" (age slot empty, born
-        # date present) and "when is Fraggle's birthday" (stored under born_in, not
+        # date present) and "when is Luna's birthday" (stored under born_in, not
         # born_on) answer instead of defer. Keyed on the ASK class + the VALUE being a
         # date, never an attribute-name list. Fail-safe: no date scalar → fall through.
         if scalar_res in (_WALK_KNOWN_GAP, _WALK_NO_SLOT):
@@ -40080,7 +40080,7 @@ def _entity_is_l4_place(db, entity_id: str) -> bool:
       • it declares its own superclass — it is the SUBJECT of a P279 (``subclass_of``) rel.
 
     It is NOT a place when it is itself filed at one — SUBJECT of a P31 (``instance_of``):
-    a named instance is a MEMORY and wins the tie (``Fraggle instance_of dog`` → Fraggle is
+    a named instance is a MEMORY and wins the tie (``Luna instance_of dog`` → Luna is
     the memory, dog is the place).
 
     METADATA-DRIVEN: the classification rels come from ``rel_types.wikidata_pid`` ∈
@@ -47419,9 +47419,9 @@ def _collapse_instance_of_to_most_specific(facts: list[dict], db) -> list[dict]:
 
     When a named instance carries MULTIPLE ``instance_of`` types AND the laid-down L4
     ladder relates them (one type is a ``subclass_of`` DESCENDANT of another — e.g.
-    ``(fraggle, instance_of, dog)`` + ``(fraggle, instance_of, poodle)`` with
+    ``(luna, instance_of, dog)`` + ``(luna, instance_of, poodle)`` with
     ``poodle subclass_of dog`` grown by the ±6 backbone), the broader type is redundant
-    as a DIRECT classification: "Fraggle is a poodle" already entails "…is a dog". Drop
+    as a DIRECT classification: "Luna is a poodle" already entails "…is a dog". Drop
     the ANCESTOR ``instance_of`` edge so the render asserts the MOST-SPECIFIC type; the
     ancestor still surfaces as the parent CLASS via the subclass_of ladder ("poodle is a
     subclass of dog"), so no information is lost — only the duplicate broad assertion.
@@ -55524,7 +55524,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         and len(subject_name.split()) == 1):
                     _name_slots.append(subject_name)
                 # Object alias → titlecase ONLY a clean SINGLE-TOKEN entity NAME on a
-                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Goose). A
+                # NON-hierarchy, non-occurrence, non-STATE edge (Rex/Apollo/Miso). A
                 # hierarchy object is a TYPE word ("dog"/"animal"), a participated_in object
                 # is an occurrence TITLE/handle, and a STATE object is a state word ("down")
                 # — none are proper names, all read naturally lowercase and must NOT be titled
@@ -57259,7 +57259,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                     # engine-minted is-a rows) must NOT be RETURNED as the user's memory. Hold
                     # them out of the rendered set; the leaf instance rows (has_pet/part_of/
                     # instance_of user-grounded) are kept, so a leaf reached THROUGH the ladder
-                    # (family → pets → Fraggle) still surfaces.
+                    # (family → pets → Luna) still surfaces.
                     _before = len(_down_hier_facts) + len(_down_entity_facts)
                     _down_hier_facts = [
                         _f for _f in _down_hier_facts

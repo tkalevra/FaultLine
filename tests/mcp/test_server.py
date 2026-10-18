@@ -1239,7 +1239,7 @@ async def test_rejected_input_is_flagged_as_an_error():
     # FAULTLINE_USER_ID`), so whether it is rejected depends on whether some earlier test in the
     # session set that pin. An empty query is invalid unconditionally.
     result = await _call_tool(
-        "recall_memory", {"query": "", "user_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7"})
+        "recall_memory", {"query": "", "user_id": "11111111-2222-4333-8111-111111111111"})
     assert result["isError"] is True
     assert "Invalid query" in json.loads(result["content"][0]["text"])["error"]
 
@@ -1328,7 +1328,7 @@ async def test_faultline_user_id_pin_is_a_FALLBACK_never_an_override():
     it fills a VOID, it never overwrites a stated one.
     """
     captured_bodies = []
-    _caller = "7c9e6679-7425-40de-944b-e07fc1f90ae7"   # a real caller, a real UUID
+    _caller = "11111111-2222-4333-8111-111111111111"   # a real caller, a real UUID
 
     async def capture_post(url, **kwargs):
         captured_bodies.append(kwargs.get("json", {}))
@@ -1677,7 +1677,7 @@ async def test_non_empty_recall_appends_the_requery_hint(mock_http_client):
     query_response.json.return_value = {
         # NOTE the field is `definition`, not `prose` — the render loop builds each line
         # from fact["definition"] and SKIPS a fact whose definition is empty.
-        "facts": [{"definition": "You have a pet that is Fraggle",
+        "facts": [{"definition": "You have a pet that is Luna",
                    "fact_class": "A", "rel_type": "has_pet"}],
         "attributes": {},
     }

@@ -45,8 +45,8 @@ class TestNegateProse:
 
     def test_no_aux_falls_back_to_clause_negation(self):
         # No copula/aux → clause-level negation, never the bare positive.
-        out = _negate_prose("Fraggle barks")
-        assert "not" in out and out != "Fraggle barks"
+        out = _negate_prose("Luna barks")
+        assert "not" in out and out != "Luna barks"
 
     def test_empty_safe(self):
         assert _negate_prose("") == ""
@@ -62,7 +62,7 @@ class TestYouAgreementFixup:
         assert _you_agreement_fixup("you is the parent of Juniper") == "you are the parent of Juniper"
 
     def test_you_has_to_you_have(self):
-        assert _you_agreement_fixup("you has a pet that is Fraggle") == "you have a pet that is Fraggle"
+        assert _you_agreement_fixup("you has a pet that is Luna") == "you have a pet that is Luna"
 
     def test_you_was_to_you_were(self):
         assert _you_agreement_fixup("you was born in Northfield") == "you were born in Northfield"
@@ -155,8 +155,8 @@ class TestIdentitySet:
         ident = _build_identity_set(pet_uuid, user_id, db)  # anchor == pet
 
         assert pet_uuid.lower() not in ident
-        with patch("src.api.main.resolve_display_name", return_value="fraggle"):
-            assert _resolve_perspective_name(pet_uuid, ident, db) == "fraggle"
+        with patch("src.api.main.resolve_display_name", return_value="luna"):
+            assert _resolve_perspective_name(pet_uuid, ident, db) == "luna"
 
 
 class TestPerspectiveResolution:
@@ -697,8 +697,8 @@ class TestConvertToProseOccurrenceType:
 class TestConvertToProseNamedInstanceJoin:
     """STAGE A (lean-query rendering, generalized): a RELATIONAL fact whose object is a
     UUID-resolved NAMED INSTANCE that ALSO carries an (<object>, instance_of, <type>) edge now
-    renders the object slot as "<type> named <Name>" — "I have a dog named Fraggle" → "You have a
-    dog named Fraggle", not "…that is fraggle". Purely STRUCTURAL (object has a name + an
+    renders the object slot as "<type> named <Name>" — "I have a dog named Luna" → "You have a
+    dog named Luna", not "…that is luna". Purely STRUCTURAL (object has a name + an
     instance_of type); ZERO kind literals, NO rel allow-list (the only metadata read is
     is_hierarchy_rel, so instance_of/subclass_of are skipped). Subject-agnostic — the SAME path
     renders "your friend Diane" / "a server named Apollo". Name casing preserved verbatim
@@ -746,8 +746,8 @@ class TestConvertToProseNamedInstanceJoin:
             )
 
     def test_named_pet_composes_type_named_name(self):
-        """Headline: has_pet object 'fraggle' with instance_of 'dog' → 'a dog named fraggle',
-        NOT 'a pet that is fraggle'. Name token preserved; type 'dog' added."""
+        """Headline: has_pet object 'luna' with instance_of 'dog' → 'a dog named luna',
+        NOT 'a pet that is luna'. Name token preserved; type 'dog' added."""
         user_uuid = str(uuid4())
         pet_uuid = str(uuid4())
         type_uuid = str(uuid4())
@@ -757,17 +757,17 @@ class TestConvertToProseNamedInstanceJoin:
             {"subject_id": pet_uuid, "rel_type": "instance_of",
              "object_id": type_uuid, "fact_class": "A"},
         ]
-        pref = {pet_uuid: "fraggle", type_uuid: "dog"}
+        pref = {pet_uuid: "luna", type_uuid: "dog"}
         prose = self._run(facts, user_uuid, pref)
         joined = " || ".join(prose)
-        # The has_pet render now carries "dog named Fraggle" — the structure-driven
+        # The has_pet render now carries "dog named Luna" — the structure-driven
         # composer renders shape 1 and the titlecase POST-PASS titles the resolved
-        # single-token name slot (fraggle → Fraggle). Det-safe: the det-scorer is
+        # single-token name slot (luna → Luna). Det-safe: the det-scorer is
         # case-insensitive, so the NAME token still matches gold; type stays lowercase.
-        assert any("dog named Fraggle" in p for p in prose), \
+        assert any("dog named Luna" in p for p in prose), \
             f"named-instance join missing: {joined}"
         # Det-safety: the NAME token survives (case-insensitive — scorer lowercases).
-        assert any("fraggle" in p.lower() for p in prose), f"name token dropped: {joined}"
+        assert any("luna" in p.lower() for p in prose), f"name token dropped: {joined}"
 
     def test_name_casing_preserved_verbatim(self):
         """DET-SAFETY: the resolved name's casing is preserved (no force-titlecase); the type
@@ -781,13 +781,13 @@ class TestConvertToProseNamedInstanceJoin:
             {"subject_id": pet_uuid, "rel_type": "instance_of",
              "object_id": type_uuid, "fact_class": "A"},
         ]
-        pref = {pet_uuid: "Fraggle", type_uuid: "dog"}  # mixed-case name
+        pref = {pet_uuid: "Luna", type_uuid: "dog"}  # mixed-case name
         prose = self._run(facts, user_uuid, pref)
         joined = " || ".join(prose)
-        assert any("dog named Fraggle" in p for p in prose), \
+        assert any("dog named Luna" in p for p in prose), \
             f"casing not preserved / join missing: {joined}"
         # The capital-F name must survive exactly; not lowercased.
-        assert "fraggle named" not in joined.lower().replace("dog named fraggle", "")
+        assert "luna named" not in joined.lower().replace("dog named luna", "")
 
     def test_subject_agnostic_server_and_friend(self):
         """SUBJECT-AGNOSTIC proof: 'a server named Apollo' (owns) and 'a friend named Diane'
@@ -876,11 +876,11 @@ class TestConvertToProseNamedInstanceJoin:
             "subject_id": user_uuid, "rel_type": "has_pet",
             "object_id": pet_uuid, "fact_class": "A",
         }]
-        pref = {pet_uuid: "Fraggle", type_uuid: "dog"}
+        pref = {pet_uuid: "Luna", type_uuid: "dog"}
         # No instance_of edge in the set → index miss → DB fallback returns the type id.
         prose = self._run(facts, user_uuid, pref, fetchone_row=(type_uuid,))
         joined = " || ".join(prose)
-        assert any("dog named Fraggle" in p for p in prose), \
+        assert any("dog named Luna" in p for p in prose), \
             f"DB fallback type-join missing: {joined}"
 
     def test_object_is_user_not_joined(self):

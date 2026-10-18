@@ -162,7 +162,7 @@ RELATIONSHIP RULES (strictly enforced):
    age, height, weight.
    You may use other snake_case types if none of the above fit.
 4. also_known_as = nickname or alias ONLY (e.g. "Theo" for "Theodore").
-5. is_a = type or category (e.g. "morkie is_a dog breed").
+5. is_a = type or category (e.g. "terrier mix is_a dog breed").
 6. has_pet = person owns an animal (e.g. "we have a dog named Biskit").
 7. For "X is a Y" patterns use is_a. For "named X" patterns use also_known_as
    between the descriptor and the name.

@@ -100,9 +100,9 @@ class TestInvention:
         assert R._guardrail_ok(atom, src, msg) is False
 
     def test_invented_value_reject(self):
-        msg = "my dog is named fraggle"
-        src = "my dog is named fraggle"
-        atom = "my cat is named fraggle"   # "cat" never typed
+        msg = "my dog is named luna"
+        src = "my dog is named luna"
+        atom = "my cat is named luna"   # "cat" never typed
         assert R._guardrail_ok(atom, src, msg) is False
 
 
@@ -308,7 +308,7 @@ class TestSubjectDropFallbackTarget:
 # ENUMERATION-FIX RESTRUCTURE: Tier 3 now triggers ONLY on the ATOM TEXT dropping the subject (the
 # thing that flows downstream), NOT on the source span — because a correctly-split enumeration item
 # carries the subject in its atom text but cites a bare subjectless NP as its source ("a dog named
-# Fraggle"), and the old source-span check falsely rejected those GOOD atoms (the live merge bug).
+# Luna"), and the old source-span check falsely rejected those GOOD atoms (the live merge bug).
 # The source-subjectlessness now matters ONLY where the source is actually USED as downstream text
 # (the content/numeric verbatim fallback), so `_apply_guardrail` anchors a subjectless source to its
 # true containing sentence there. Net downstream behavior for this case is UNCHANGED (true sentence).
@@ -428,13 +428,13 @@ class TestTokenizer:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENUMERATION FIX — a correctly-split list item carries the shared subject in its ATOM TEXT
-# but cites a bare subjectless NP as its `source` ("a dog named Fraggle" out of "We have a cat …,
-# a dog named Fraggle, …"). The Tier-3 source-span check used to REJECT these GOOD atoms and
-# substitute the whole run-on sentence → the live Fraggle/Slinky entity-merge bug. The guardrail
+# but cites a bare subjectless NP as its `source` ("a dog named Luna" out of "We have a cat …,
+# a dog named Luna, …"). The Tier-3 source-span check used to REJECT these GOOD atoms and
+# substitute the whole run-on sentence → the live Luna/Slinky entity-merge bug. The guardrail
 # must now ACCEPT them (atom text has the subject), while still blocking genuine fabrication.
 # ──────────────────────────────────────────────────────────────────────────────
 
-_PET_MSG = ("We have a cat named Goose, a dog named Fraggle, he is a morkie, "
+_PET_MSG = ("We have a cat named Miso, a dog named Luna, he is a terrier mix, "
             "and a pet corn snake named Slinky")
 
 
@@ -442,29 +442,29 @@ class TestEnumerationSubjectlessSource:
     def test_enumeration_item_with_subjectless_source_is_accepted(self):
         _spacy_or_skip()
         # atom text keeps the shared subject "We"; source is the bare NP fragment.
-        assert R._guardrail_check("We have a dog named Fraggle.",
-                                  "a dog named Fraggle", _PET_MSG) == R._GR_OK
+        assert R._guardrail_check("We have a dog named Luna.",
+                                  "a dog named Luna", _PET_MSG) == R._GR_OK
 
     def test_enumeration_item_keeps_clean_statement_not_run_on(self):
         _spacy_or_skip()
         out = R._apply_guardrail(
-            [{"statement": "We have a dog named Fraggle.", "source": "a dog named Fraggle"}],
+            [{"statement": "We have a dog named Luna.", "source": "a dog named Luna"}],
             _PET_MSG)
         assert len(out) == 1
-        assert out[0].text == "We have a dog named Fraggle."   # the clean atom, NOT the whole turn
+        assert out[0].text == "We have a dog named Luna."   # the clean atom, NOT the whole turn
         assert out[0].rejected is False
 
     def test_coref_resolved_atom_is_accepted(self):
         _spacy_or_skip()
-        # "he is a morkie" → "Fraggle is a morkie": "Fraggle" appears earlier in the SAME message,
+        # "he is a terrier mix" → "Luna is a terrier mix": "Luna" appears earlier in the SAME message,
         # so Tier 1 (message-scoped) admits it, and the source has its own subject ("he").
-        assert R._guardrail_check("Fraggle is a morkie.", "he is a morkie", _PET_MSG) == R._GR_OK
+        assert R._guardrail_check("Luna is a terrier mix.", "he is a terrier mix", _PET_MSG) == R._GR_OK
 
     def test_fabricated_noun_still_blocked(self):
         _spacy_or_skip()
         # "labrador" is nowhere in the message → genuine invention → still rejected.
-        assert R._guardrail_check("We have a dog named Fraggle, a labrador.",
-                                  "a dog named Fraggle", _PET_MSG) == R._GR_CONTENT
+        assert R._guardrail_check("We have a dog named Luna, a labrador.",
+                                  "a dog named Luna", _PET_MSG) == R._GR_CONTENT
 
     def test_rejected_flag_false_when_source_equals_statement(self):
         # METRIC FIX: an OK atom whose model `source` equals its `statement` (the common single-fact

@@ -15,9 +15,9 @@ Two traps these tests exist to prevent regressing:
      already spent. It is not suppression and must never again be treated as the fallback.
   2. A provider will ACCEPT a suppression field it does not recognize and reason anyway. We
      sent Qwen/vLLM's ``enable_thinking`` to DeepSeek and got HTTP 200 with full reasoning.
-     So we key on the endpoint HOST (``backend_type="openai"`` covers DeepSeek, Cerebras,
+     So we key on the endpoint HOST (``backend_type="openai"`` covers DeepSeek, Some gateways,
      Groq, OpenRouter, xAI — all different), and we send NOTHING to an unrecognized host,
-     because an unsupported top-level field HTTP-400s on strict providers (the Cerebras
+     because an unsupported top-level field HTTP-400s on strict providers (the Some gateways
      ``chat_template_kwargs`` incident) and would break every call on that endpoint.
 """
 import pytest
@@ -89,7 +89,7 @@ def test_cannot_disable_is_reported_honestly(base_url, model):
 def test_payload_carries_suppression_and_not_the_vllm_field(monkeypatch):
     """The whole point: it must land in the PAYLOAD, and must not smuggle the vLLM field.
 
-    ``chat_template_kwargs`` is what Cerebras 400s on — it is only ever valid for
+    ``chat_template_kwargs`` is what Some gateways 400s on — it is only ever valid for
     self-hosted vLLM/OpenWebUI, never for a hosted OpenAI-compatible provider.
     """
     monkeypatch.setenv("LLM_BACKEND_TYPE", "openai")

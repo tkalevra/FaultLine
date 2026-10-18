@@ -189,16 +189,16 @@ def test_it_repair_marker_declines_the_preroute(monkeypatch):
 
 def test_it_retraction_verb_declines_the_preroute(monkeypatch):
     """The migration-283 Italian retraction screen: "dimentica che ho una gatta che si chiama
-    Fraggle" is a plain-language FORGET (grammatically a perfect first-mention naming frame:
-    gatta -> fraggle, one name, in-turn bearer) - the verb screen must defer it to the
+    Luna" is a plain-language FORGET (grammatically a perfect first-mention naming frame:
+    gatta -> luna, one name, in-turn bearer) - the verb screen must defer it to the
     retraction ladder."""
     import src.api.main as M
     monkeypatch.setattr(L, "licensed_naming_frames",
-                        lambda _t: (("gatta", "fraggle"),))
+                        lambda _t: (("gatta", "luna"),))
     monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
     monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: True)
     assert M._is_first_mention_naming_statement(
-        "dimentica che ho una gatta che si chiama Fraggle", _FakeCur()) is False
+        "dimentica che ho una gatta che si chiama Luna", _FakeCur()) is False
 
 
 def test_repair_screen_helper_matches_db_seeded_phrases(monkeypatch):
@@ -330,15 +330,15 @@ def test_split_turn_b2_prodrop_frame_carries_no_bearer():
 @needs_it
 def test_retraction_turn_is_grammatically_a_naming_frame():
     """THE SPLIT-TURN RETRACTION PIN (grammar half): "dimentica che ho una gatta che si
-    chiama Fraggle" parses as a PERFECT first-mention naming frame (relative-clause naming:
-    bearer = the antecedent gatta, name = fraggle, one name) - grammar alone CANNOT save it;
+    chiama Luna" parses as a PERFECT first-mention naming frame (relative-clause naming:
+    bearer = the antecedent gatta, name = luna, one name) - grammar alone CANNOT save it;
     only the retraction screen (dimentica) can. The decider half of this pin is
     test_it_retraction_verb_declines_the_preroute; end to end, the live turn must RETRACT,
     never affirmatively write also_known_as."""
     (frames,) = _it_frames(
-        "dimentica che ho una gatta che si chiama Fraggle")
+        "dimentica che ho una gatta che si chiama Luna")
     assert frames is not None and len(frames) == 1, frames
-    assert frames[0][1] == "fraggle", frames
+    assert frames[0][1] == "luna", frames
     assert frames[0][0] and "gatta" in frames[0][0].split(), frames
 
 
@@ -403,11 +403,11 @@ def test_endpoint_guard_declines_the_marked_it_repair(monkeypatch):
     monkeypatch.setattr(M, "_spacy_cue_route", lambda _t, _u=None: (None, None))
     monkeypatch.setattr(M, "_it_repair_or_retraction_cue", lambda _t, _d=None: True)
     monkeypatch.setattr(_L, "derive_sentence_facts", lambda _t, _r, **k: [
-        _F("gatta", "pref_name", "fraggle"),
+        _F("gatta", "pref_name", "luna"),
     ])
     monkeypatch.setattr(_L, "linguistics_available", lambda: True)
     assert M._first_mention_naming_correction(
-        "dimentica che ho una gatta che si chiama Fraggle", _FakeCur()) is False
+        "dimentica che ho una gatta che si chiama Luna", _FakeCur()) is False
 
 
 def test_guard_declines_a_two_name_replacive_turn(monkeypatch):
@@ -677,7 +677,7 @@ def _ground(monkeypatch, frames, routes, **kw):
 # Round-4 route discriminators (the door is keyed on entity_aliases, the label table
 # this stack writes - critic round 3: zero pref_name/also_known_as FACTS rows on any it
 # seat). Round 4.2: a GIVEN name arrives as user_stated (owned-definite shape, seat a's
-# apollo) OR rel_default (the naming chain's scalar-identity stamp, seat b's fraggle) -
+# apollo) OR rel_default (the naming chain's scalar-identity stamp, seat b's luna) -
 # both probes take the IN-pair; head nouns/L4 labels/provisioning stay excluded:
 #   keys probe        SELECT DISTINCT entity_id ... WHERE alias = ANY(%s)   -> "alias = ANY"
 #   holders           ... WHERE preference_source IN ('user_stated', 'rel_default')
@@ -688,7 +688,7 @@ def _ground(monkeypatch, frames, routes, **kw):
 def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
     """THE FLAGSHIP PIN: b2 "Anzi, si chiama DevBox." (pro-drop frame, bearer empty) grounds
     to the UNIQUE given-name holder - the entity holding the seat's one user_stated alias
-    row (measured live: apollo/devbox/fraggle all land user_stated; head nouns and
+    row (measured live: apollo/devbox/luna all land user_stated; head nouns and
     provisioning rows never do). With the bearer, the existing SCALAR
     pref_name/also_known_as lane flips apollo -> devbox ON THE SAME ENTITY (recall shows
     DevBox) instead of parking at "Old fact not found for subject change: pref_name"."""
@@ -738,7 +738,7 @@ def test_agreement_gate_accepts_when_old_value_is_held(monkeypatch):
 def test_rival_probes_decline(monkeypatch):
     """RIVAL means the turn's OWN two references disagree: the asserted name hits one
     entity while the in-turn BEARER NP resolves to a DIFFERENT one -> None (never guess
-    between them). Round 4.1 (live, seat 6e11d1a1): a name-content hit with NO user_stated
+    between them). Round 4.1 (live, seat see-dev-bug-docs): a name-content hit with NO user_stated
     row is NOT a rival - it is the MCP intent-independent harvest's own pre-correct mint
     (POST /ingest committed=0, entity + rel_default alias still written) - so that shape now
     GROUNDS to the holder (see the ghost pin); only bearer-NP rivalry still refuses here."""
@@ -749,7 +749,7 @@ def test_rival_probes_decline(monkeypatch):
 
 
 def test_statement_ghost_alias_hit_grounds_to_the_holder(monkeypatch):
-    """THE LIVE b2 ROUTE (seat 6e11d1a1, 2026-10-18): the MCP's intent-independent
+    """THE LIVE b2 ROUTE (seat see-dev-bug-docs, 2026-10-18): the MCP's intent-independent
     harvest mints the asserted name as a standalone entity (devbox|rel_default, zero facts)
     BEFORE /retract/correct, so the door's key probe hits a GHOST. The ghost is the
     double-write's own residue, not a rival referent: it is dropped and the turn grounds to
@@ -802,40 +802,40 @@ def test_english_frames_never_open_the_door(monkeypatch):
 
 
 def test_retraction_arm_grounds_via_alias_overlap(monkeypatch):
-    """The pro-drop retraction ("dimentica che ho una gatta che si chiama Fraggle.")
+    """The pro-drop retraction ("dimentica che ho una gatta che si chiama Luna.")
     grounds its bearer by the turn's naming content: the forgotten name IS a stored alias of
-    the gatta entity (fraggle|user_stated, measured live). The door hands the bearer to the
+    the gatta entity (luna|user_stated, measured live). The door hands the bearer to the
     caller, which clarifies NAMING it (the FOSS-015 doc's accepted landing) instead of the
     ENTITY lane's no-op "corrected, facts_superseded=0"."""
-    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+    got = _ground(monkeypatch, (("gatta", "luna"),), [
         ("alias = ANY", [(_E1,)]),
         ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
-        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
-    ], is_retraction=True, object_to_negate="fraggle",
-       text="dimentica che ho una gatta che si chiama fraggle")
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("luna", False)]),
+    ], is_retraction=True, object_to_negate="luna",
+       text="dimentica che ho una gatta che si chiama luna")
     assert got and got["entity_id"] == _E1, got
-    assert got["rel"] == "also_known_as" and got["name"] == "fraggle", got
+    assert got["rel"] == "also_known_as" and got["name"] == "luna", got
 
 
 def test_rel_default_naming_alias_is_a_given_name(monkeypatch):
-    """ROUND 4.2, THE LIVE SEAT-b SHAPE (6e11d1b2, 2026-10-18): the b1 statement
-    'ho una gatta che si chiama Fraggle.' registers the name as fraggle|rel_default (the
+    """ROUND 4.2, THE LIVE SEAT-b SHAPE (see-dev-bug-docs, 2026-10-18): the b1 statement
+    'ho una gatta che si chiama Luna.' registers the name as luna|rel_default (the
     naming chain's scalar-identity stamp - NOT user_stated; only the owned-definite shape
     reaches user_stated), so the round-4 user_stated-only gates declined the door and the
     plain-language forget fell to the ENTITY lane's no-op 'corrected, facts_superseded=0'.
     A rel_default naming alias IS a given name: the retraction grounds its bearer and the
     caller clarifies NAMING it. The bearer is kept because it co-holds its head noun
-    ({gatta, fraggle} - the structural ghost test never fires on it)."""
-    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+    ({gatta, luna} - the structural ghost test never fires on it)."""
+    got = _ground(monkeypatch, (("gatta", "luna"),), [
         ("alias = ANY", lambda p: [(_E1,)]),
         ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
         ("entity_id = ANY", [(_E1, "gatta", True, "unspecified"),
-                             (_E1, "fraggle", False, "rel_default")]),
-        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
-    ], is_retraction=True, object_to_negate="fraggle",
-       text="dimentica che ho una gatta che si chiama fraggle")
+                             (_E1, "luna", False, "rel_default")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("luna", False)]),
+    ], is_retraction=True, object_to_negate="luna",
+       text="dimentica che ho una gatta che si chiama luna")
     assert got and got["entity_id"] == _E1, got
-    assert got["rel"] == "also_known_as" and got["old_name"] == "fraggle", got
+    assert got["rel"] == "also_known_as" and got["old_name"] == "luna", got
     # round 4.3: the clarification names THE BEARER, not the name twice
     assert got["bearer_head"] == "gatta", got
 
@@ -963,19 +963,19 @@ def test_multientity_seat_turn_names_its_bearer(monkeypatch):
 
 def test_multientity_seat_other_entity_shape_unchanged(monkeypatch):
     """PIN (ii) — the OTHER named entity's shape on the same multi-entity seat: the
-    gatta/Fraggle retraction keeps grounding the gatta (its own content: the asserted
+    gatta/Luna retraction keeps grounding the gatta (its own content: the asserted
     name and the bearer NP both hit the gatta), byte-identical to its single-seat
     behavior."""
-    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+    got = _ground(monkeypatch, (("gatta", "luna"),), [
         ("alias = ANY", [(_E2,)]),
         ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
         ("entity_id = ANY", [(_E2, "gatta", True, "unspecified"),
-                             (_E2, "fraggle", False, "rel_default")]),
-        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
-    ], is_retraction=True, object_to_negate="fraggle",
-       text="dimentica che ho una gatta che si chiama fraggle")
+                             (_E2, "luna", False, "rel_default")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("luna", False)]),
+    ], is_retraction=True, object_to_negate="luna",
+       text="dimentica che ho una gatta che si chiama luna")
     assert got and got["entity_id"] == _E2, got
-    assert got["rel"] == "also_known_as" and got["old_name"] == "fraggle", got
+    assert got["rel"] == "also_known_as" and got["old_name"] == "luna", got
     assert got["bearer_head"] == "gatta", got
 
 

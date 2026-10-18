@@ -5,7 +5,7 @@
 -- critic's live repro: the preroute's only split-turn protection was the bootstrap cue seed,
 -- which is ENGLISH-ONLY ('forget'/'delete'/'actually'/'i meant' - zero Italian), so the true
 -- split-turn correction b2 "Anzi, si chiama DevBox." and the plain-language forget
--- "dimentica che ho una gatta che si chiama Fraggle" were both pre-routed STATEMENT and the
+-- "dimentica che ho una gatta che si chiama Luna" were both pre-routed STATEMENT and the
 -- turn never reached the correction/retraction ladder.
 --
 -- Rule (same rail as migration 282 / every cue migration): the CODE carries no Italian word
@@ -46,7 +46,7 @@ VALUES
   ('correzione:',     'repair_marker', 'Explicit correction label (colon form).',                     'Correzione: si chiama DevBox.',                            'seed_repair_marker_it', 0.88),
   ('non è vero',      'repair_marker', 'Truth-negation repair: what was said is not true.',           'Non è vero che si chiama Apollo.',                         'seed_repair_marker_it', 0.88),
   ('non e vero',      'repair_marker', 'Truth-negation repair (unaccented variant).',                 'non e vero che ho un cane',                                'seed_repair_marker_it', 0.85),
-  ('dimentica',       'retraction_verb', 'Retraction directive: forget (2sg; substring covers dimenticalo, dimenticarsi, dimenticato).', 'Dimentica che ho una gatta che si chiama Fraggle.', 'seed_retraction_verb_it', 0.95),
+  ('dimentica',       'retraction_verb', 'Retraction directive: forget (2sg; substring covers dimenticalo, dimenticarsi, dimenticato).', 'Dimentica che ho una gatta che si chiama Luna.', 'seed_retraction_verb_it', 0.95),
   ('dimentichi',      'retraction_verb', 'Retraction directive: forget (formal/polite).',             'Dimentichi il server Apollo.',                             'seed_retraction_verb_it', 0.92),
   ('dimentichiamo',   'retraction_verb', 'Retraction directive: let us forget.',                      'Dimentichiamoci Apollo.',                                  'seed_retraction_verb_it', 0.85),
   ('cancella',        'retraction_verb', 'Retraction directive: delete (substring covers cancellare).', 'Cancella il server Apollo.',                             'seed_retraction_verb_it', 0.92),
@@ -54,7 +54,7 @@ VALUES
   ('rimuovi',         'retraction_verb', 'Retraction directive: remove (2sg).',                       'Rimuovi Apollo.',                                          'seed_retraction_verb_it', 0.90),
   ('rimuovere',       'retraction_verb', 'Retraction verb: to remove (infinitive).',                  'Devi rimuovere Apollo.',                                   'seed_retraction_verb_it', 0.85),
   ('rimuova',         'retraction_verb', 'Retraction directive: remove (formal).',                    'Rimuova Apollo dal server.',                               'seed_retraction_verb_it', 0.88),
-  ('elimina',         'retraction_verb', 'Retraction directive: eliminate (substring covers eliminare).', 'Elimina la gatta Fraggle.',                             'seed_retraction_verb_it', 0.88),
+  ('elimina',         'retraction_verb', 'Retraction directive: eliminate (substring covers eliminare).', 'Elimina la gatta Luna.',                             'seed_retraction_verb_it', 0.88),
   ('elimini',         'retraction_verb', 'Retraction directive: eliminate (formal).',                 'Elimini Apollo.',                                          'seed_retraction_verb_it', 0.85),
   ('togli',           'retraction_verb', 'Retraction directive: take away / remove.',                 'Togli Apollo.',                                            'seed_retraction_verb_it', 0.85)
 ON CONFLICT (cue, category) DO NOTHING;

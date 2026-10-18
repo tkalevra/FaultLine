@@ -149,7 +149,7 @@ async def test_recall_answerable_returns_facts_not_abstention(mock_http_client):
         _query_resp({
             "facts": [{
                 "rel_type": "has_pet",
-                "definition": "You have a dog named Fraggle.",
+                "definition": "You have a dog named Luna.",
                 "fact_class": "A", "fact_provenance": "user_stated", "confidence": 1.0,
             }],
             "attributes": {},
@@ -158,7 +158,7 @@ async def test_recall_answerable_returns_facts_not_abstention(mock_http_client):
     mock_http_client.get = AsyncMock(return_value=_gate())
     with patch("src.mcp.server._http_client", mock_http_client):
         result = await recall_memory_tool("Tell me about my pets", "user-alice")
-    assert "Fraggle" in result["memory"]
+    assert "Luna" in result["memory"]
     assert "don't have any information" not in result["memory"]
     assert "haven't mentioned" not in result["memory"]
 

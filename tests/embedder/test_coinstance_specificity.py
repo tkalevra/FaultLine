@@ -2,8 +2,8 @@
 CO-INSTANCE SPECIFICITY (BREED6) — the ±6 must ground the more-SPECIFIC of two co-classifying
 types UNDER the more-general one, not leave them as SIBLINGS under a broad seeded root.
 
-THE GAP: "Fraggle is a poodle" + "Fraggle is a dog" captures `fraggle instance_of poodle` +
-`fraggle instance_of dog` correctly, but the eager leaf-anchor attaches BOTH types straight to
+THE GAP: "Luna is a poodle" + "Luna is a dog" captures `luna instance_of poodle` +
+`luna instance_of dog` correctly, but the eager leaf-anchor attaches BOTH types straight to
 the seeded backbone root — `poodle subclass_of animal` AND `dog subclass_of animal` (siblings).
 There is then no `poodle subclass_of dog` ancestor ladder, so the shipped most-specific recall
 collapse has nothing to act on and recall shows BOTH "instance of dog" and "instance of poodle".
@@ -46,7 +46,7 @@ pytestmark = pytest.mark.skipif(
 # taxonomy). 'animal' is a root, so `poodle subclass_of animal` is the too-direct sibling edge.
 _ROOTS = {"person", "animal", "organization", "location", "object", "concept"}
 
-_FRAGGLE = "11111111-0000-0000-0000-000000000001"
+_LUNA = "11111111-0000-0000-0000-000000000001"
 _POODLE = "22222222-0000-0000-0000-000000000002"
 _DOG = "33333333-0000-0000-0000-000000000003"
 _CANINE = "44444444-0000-0000-0000-000000000004"
@@ -74,18 +74,18 @@ def repro_schema():
         cur.execute(f"SET search_path TO \"{schema}\"")
         for t in ("entities", "entity_aliases", "facts", "staged_facts", "climb_state"):
             cur.execute(f'CREATE TABLE "{schema}".{t} (LIKE "{src}".{t} INCLUDING ALL)')
-        for eid in (_FRAGGLE, _POODLE, _DOG, _CANINE, _ANIMAL):
+        for eid in (_LUNA, _POODLE, _DOG, _CANINE, _ANIMAL):
             cur.execute(f'INSERT INTO "{schema}".entities (id) VALUES (%s)', (eid,))
-        for eid, alias in ((_FRAGGLE, "fraggle"), (_POODLE, "poodle"), (_DOG, "dog"),
+        for eid, alias in ((_LUNA, "luna"), (_POODLE, "poodle"), (_DOG, "dog"),
                            (_CANINE, "canine"), (_ANIMAL, "animal")):
             cur.execute(
                 f'INSERT INTO "{schema}".entity_aliases (entity_id, alias, is_preferred)'
                 " VALUES (%s, %s, true)", (eid, alias))
-        # fraggle instance_of poodle AND dog (the named instance, co-classified — Class A facts).
+        # luna instance_of poodle AND dog (the named instance, co-classified — Class A facts).
         for obj in (_POODLE, _DOG):
             cur.execute(
                 f'INSERT INTO "{schema}".facts (subject_id, object_id, rel_type, fact_class,'
-                " is_hierarchy_rel) VALUES (%s, %s, 'instance_of', 'A', true)", (_FRAGGLE, obj))
+                " is_hierarchy_rel) VALUES (%s, %s, 'instance_of', 'A', true)", (_LUNA, obj))
         # BROKEN sibling state: poodle ⊂ animal (too-direct) + dog ⊂ canine ⊂ animal.
         for subj, obj, cls in ((_POODLE, _ANIMAL, "C"), (_DOG, _CANINE, "B"),
                                (_CANINE, _ANIMAL, "B")):
@@ -144,8 +144,8 @@ def test_coinstance_grounds_specific_under_general(repro_schema, monkeypatch):
     assert "dog" in poodle_parents, poodle_parents
     assert "animal" not in poodle_parents, poodle_parents
 
-    # THE HARD LINE: the NAMED INSTANCE fraggle never receives a subclass_of.
-    assert _live_parent_names(conn, repro_schema, _FRAGGLE) == set()
+    # THE HARD LINE: the NAMED INSTANCE luna never receives a subclass_of.
+    assert _live_parent_names(conn, repro_schema, _LUNA) == set()
 
     # Idempotent: a second pass places nothing new (pair already ordered → no duplicate).
     out2 = embedder._ground_coinstance_specificity(conn, "http://mock", "breed6", _ROOTS)
