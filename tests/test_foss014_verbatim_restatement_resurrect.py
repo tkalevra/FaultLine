@@ -1,6 +1,6 @@
 """FOSS-014 — a VERBATIM re-statement after a retraction must RESURRECT.
 
-The wound (live-measured, lane-C critic, seat a4444444): after "Please forget that I
+The wound (live-measured, lane-C critic, seat see-dev-bug-docs): after "Please forget that I
 have a dog named Rex." retired (user, has_pet, rex) via /retract/correct, re-stating
 the IDENTICAL sentence returned committed=2 but NO live row — the turn deduped against
 the retired row — while a PARAPHRASE ("Rex is my dog and he owns me.") resurrected it.
@@ -20,7 +20,7 @@ Fix discipline (house doctrine):
   • at the store the replay marker decides: a fresh user_stated upsert UN-RETIRES
     (store.py CASE: superseded_at = NULL, confirmed_count continues — pre-existing),
     a MARKED X-FL-Deferred-Replay replay keeps the retirement freeze (the 2026-09-05
-    replay-resurrection wound, seat b3f8a2c4, stays closed);
+    replay-resurrection wound, seat see-dev-bug-docs, stays closed);
   • the staged lane's Phase-4 FREEZE TOMBSTONE (WHERE deleted_at IS NULL) skipped the
     UPDATE for a deleted row replay-or-not — the same silent-freeze class. It is now
     replay-aware: marked replay skips (freeze), fresh ingest reaches the DO UPDATE and
@@ -30,7 +30,7 @@ Pin conventions follow tests/test_reextract_replay_resurrection.py: the blocks u
 test are inline in ~58k-line main.py, so the suite pins by normalized-source/SQL
 assertions PLUS scripted-connection functional tests of the validator itself.
 
-Red-check at foss-main-local 68a20854 (the wound head), measured: 8 FAILED / 3 passed.
+Red-check at foss-main-local dev-ref (the wound head), measured: 8 FAILED / 3 passed.
 Every fix-shape pin is red there (no live filters in the validator, single filterless
 probe, old bust reason, blanket deleted_at tombstone, validator serves the retired-row
 cache hit, tombstone param absent) and green at the fix head. The 3 positive controls
@@ -103,7 +103,7 @@ def test_facts_side_case_guards_resurrect_on_fresh_freeze_on_replay():
     sql = _flat(_STORE_SRC)
     # a fresh (unmarked) upsert of a retired row un-retires it …
     assert "superseded_at = CASE WHEN facts.superseded_at IS NOT NULL AND %s THEN facts.superseded_at ELSE NULL END" in sql
-    # … and continues the count; a MARKED replay keeps both (the b3f8a2c4 freeze).
+    # … and continues the count; a MARKED replay keeps both (the see-dev-bug-docs freeze).
     assert "confirmed_count = CASE WHEN facts.superseded_at IS NOT NULL AND %s THEN facts.confirmed_count ELSE facts.confirmed_count + 1 END" in sql
     assert "bool(replay), bool(replay)" in sql  # both CASE params threaded, in order
 

@@ -10,7 +10,7 @@ THE MEASURED LOSS (2026-07-30, offline `derive_sentence_facts`, ref 2022-03-05):
         ['workshop','Effective','Time','Management','community','center'].
 
     Two markers were worse than lossy — they were DESTRUCTIVE, folding the marker INTO the object:
-    "I have several pets, such as a dog named Fraggle."  -> (user, have, "several pets AS dog")
+    "I have several pets, such as a dog named Luna."  -> (user, have, "several pets AS dog")
     "I visited many museums including the Louvre last April."
                                              -> (user, visit, "many museums INCLUDING louvre")
                                                 + the resolved 2022-04-05 orphaned
@@ -60,7 +60,7 @@ def _date_of(facts, triple):
     (WORKSHOP,
      ("user", "attend", "workshop on effective time management"),
      ("workshop on effective time management", "instance_of", "workshop")),
-    ("I have several pets, such as a dog named Fraggle.",
+    ("I have several pets, such as a dog named Luna.",
      ("user", "have", "dog"), ("dog", "instance_of", "pet")),
     ("I visited many museums including the Louvre last April.",
      ("user", "visit", "louvre"), ("louvre", "instance_of", "museum")),
@@ -93,7 +93,7 @@ def test_the_clause_date_rides_onto_the_exemplar(sentence, general, exemplar):
 
 
 @pytest.mark.parametrize("sentence,forbidden_fragment", [
-    ("I have several pets, such as a dog named Fraggle.", " as "),
+    ("I have several pets, such as a dog named Luna.", " as "),
     ("I visited many museums including the Louvre last April.", "including"),
 ])
 def test_the_marker_never_folds_into_an_object_surface(sentence, forbidden_fragment):
@@ -136,7 +136,7 @@ def test_a_manner_like_is_unchanged_by_the_fix(monkeypatch):
 # and what the flag actually promises, is that NONE of this chain's edges exist when it is off — plus
 # the in-process ON-vs-OFF identity check above for sentences the chain must not touch at all.
 @pytest.mark.parametrize("sentence,mine", [
-    ("I have several pets, such as a dog named Fraggle.",
+    ("I have several pets, such as a dog named Luna.",
      [("user", "have", "dog"), ("dog", "instance_of", "pet")]),
     ("I visited many museums including the Louvre last April.",
      [("user", "visit", "louvre"), ("louvre", "instance_of", "museum")]),

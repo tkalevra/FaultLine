@@ -1171,21 +1171,21 @@ REL_TYPE REFERENCE:
 - has_pet: person owns an animal (NEVER a person).
 
 HIERARCHY RELATIONSHIPS — extract these whenever you see type/classification/part-of patterns. They appear in every domain and are as important as family relationships:
-- instance_of: entity IS a specific type or breed ("Rex is a morkie" → rex instance_of morkie)
-- subclass_of: type IS a subclass of another ("a morkie is a kind of dog" → morkie subclass_of dog)
+- instance_of: entity IS a specific type or breed ("Rex is a terrier mix" → rex instance_of terrier mix)
+- subclass_of: type IS a subclass of another ("a terrier mix is a kind of dog" → terrier mix subclass_of dog)
 - member_of: entity belongs to a group or taxonomy ("my pets are family" → pets member_of family)
 - part_of: entity is a component of a larger whole ("Engineering dept of TechCorp" → engineering part_of techcorp)
 - is_a: type or category (deprecated; prefer instance_of or subclass_of).
 
 Hierarchy chains across domains (extract EVERY link in the chain):
-- Taxonomic: "I have a dog named Rex, a morkie" → rex instance_of morkie, morkie subclass_of dog, dog subclass_of animal
+- Taxonomic: "I have a dog named Rex, a terrier mix" → rex instance_of terrier mix, terrier mix subclass_of dog, dog subclass_of animal
 - Organizational: "Alice is an engineer in Engineering at TechCorp" → alice instance_of engineer, engineer member_of engineering, engineering part_of techcorp
 - Infrastructure: "Server 192.168.1.1 is in subnet 192.168.1.0/24 on the main network" → 192.168.1.1 part_of subnet_192_168_1, subnet_192_168_1 part_of network_main
 - Hardware: "Core 0 is in CPU 1 on motherboard A in server X" → core_0 instance_of cpu_core, cpu_core part_of cpu_1, cpu_1 part_of motherboard_a
 - Geographical: "Toronto is in Ontario, Canada" → toronto instance_of city, city part_of ontario, ontario part_of canada
 - Software: "The Logger module is in the Monitoring component of the System" → logger part_of monitoring, monitoring part_of system
 
-HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Rex, a morkie" → extract rex instance_of morkie AND user has_pet rex, but NOT user owns morkie. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
+HIERARCHY CONSTRAINT: When you extract instance_of/subclass_of/member_of/part_of for an entity, the OBJECT of that hierarchy relationship is a TYPE or CATEGORY — NOT a separate entity. Do NOT also extract owns/has_pet/works_for/lives_in for the type entity. Example: "I have a dog named Rex, a terrier mix" → extract rex instance_of terrier mix AND user has_pet rex, but NOT user owns terrier mix. Morkie is a breed, not a separate pet. Same principle applies across all domains — "engineer" is a role, not a person you work with; "Ontario" is a province container, not a separate location you live in.
 
 Common: spouse, parent_of, child_of, sibling_of, works_for, lives_at, likes, dislikes, owns, age, height, weight, born_on, anniversary_on, met_on, instance_of, subclass_of, member_of, part_of.
 - Use snake_case. Other types allowed if none fit.

@@ -20,7 +20,7 @@ Production evidence, a live deployment (`climb_state`, cap = 3):
     unplaceable | no_ordered_types        |           150 | f
 
 `a named instance`'s cached fingerprint was `e4:o507` — `e4` = its own four `instance_of` edges
-(morkie / morkie dog / dog / pet), `o507` = the tenant-global counter. 47 rows over cap and 2,372
+(terrier mix / terrier mix dog / dog / pet), `o507` = the tenant-global counter. 47 rows over cap and 2,372
 recorded attempts on ONE seat, each attempt spending LLM calls on a concept that cannot resolve
 (no classifier can order `dog` vs `pet` — `pet` is a role, not a taxonomic supertype).
 

@@ -4,7 +4,7 @@ Regression tests for the chat_template_kwargs injection gate in build_llm_payloa
 Bug: build_llm_payload unconditionally injected
 `chat_template_kwargs={"enable_thinking": False}` for every non-anthropic backend
 on the (false) assumption that unknown fields are silently ignored. Strict
-OpenAI-compatible providers (Cerebras, OpenAI, Groq, most hosted gateways)
+OpenAI-compatible providers (Some gateways, OpenAI, Groq, most hosted gateways)
 return HTTP 400 for unknown top-level fields, so LLM_BACKEND_TYPE=openai pointed
 at such a provider 400s on every call.
 

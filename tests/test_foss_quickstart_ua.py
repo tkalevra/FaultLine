@@ -1,6 +1,6 @@
 """FOSS-001 pins: the wizard's HTTP helper sends a real User-Agent on every outbound call.
 
-Cerebras' edge (Cloudflare-class bot filtering) 403s urllib's default "Python-urllib/3.x"
+Some gateways' edge (Cloudflare-class bot filtering) 403s urllib's default "Python-urllib/3.x"
 while the same key+endpoint answers 200 to a named client — so the wizard told people with
 valid keys that their auth failed. Stdlib-only: a local stub server stands in for the
 gateway; no external network, no heavy imports."""

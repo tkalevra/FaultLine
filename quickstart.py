@@ -115,7 +115,7 @@ def check_prereqs():
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 # One User-Agent for EVERY outbound call (FOSS-001). Gateways with bot filtering
-# (Cerebras, Cloudflare-class edges) 403 urllib's default "Python-urllib/3.x" while the
+# (Some gateways, Cloudflare-class edges) 403 urllib's default "Python-urllib/3.x" while the
 # same key+endpoint answers 200 to a named client — so the wizard told people with valid
 # keys that their auth failed. Set HERE, once: call sites pass only their auth headers
 # and can never forget (or override with) a default-UA request.
@@ -184,7 +184,7 @@ def probe_models(backend, base_url, key):
         except Exception:
             pass
         # "auth failed" is reserved for endpoints whose own body says so (FOSS-001):
-        # a bare 403 from a gateway is usually its bot filter (Cerebras/Cloudflare reject
+        # a bare 403 from a gateway is usually its bot filter (Some gateways/Cloudflare reject
         # default Python user agents), not a bad key.
         provider_says_auth = bool(re.search(
             r"invalid.*key|api[_ -]?key|unauthorized|authentication|permission denied|forbidden",
@@ -196,7 +196,7 @@ def probe_models(backend, base_url, key):
             return False, [], hint
         if e.code == 403:
             return False, [], (
-                "HTTP 403 — the endpoint refused the request. Some gateways (Cerebras,"
+                "HTTP 403 — the endpoint refused the request. Some gateways (Some gateways,"
                 " Cloudflare-class bot filters) block default Python user agents; this wizard"
                 " sends its own User-Agent, so if the key works elsewhere (e.g. curl) the"
                 " gateway is still filtering it — 'type the model id' gets you past this."

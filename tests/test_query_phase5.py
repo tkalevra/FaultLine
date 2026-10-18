@@ -531,7 +531,7 @@ def _leak_probe_response():
         facts=[
             _fact("You are married to Marla", "spouse"),
             _fact("Aurora is 12 years old", "age"),
-            _fact("Fraggle is a dog", "has_pet", fact_class="C", confidence=0.4),
+            _fact("Luna is a dog", "has_pet", fact_class="C", confidence=0.4),
         ],
         confidence_applied=True,
         staged_facts_count=1,
@@ -578,7 +578,7 @@ def test_staged_facts_visible_for_confirmation():
         anchor="user-uuid",
         facts=[
             _fact("Aurora likes art", "likes", fact_class="C", confidence=0.4),
-            _fact("Fraggle is shy", "has_state", fact_class="C", confidence=0.4),
+            _fact("Luna is shy", "has_state", fact_class="C", confidence=0.4),
         ],
         confidence_applied=True,
         staged_facts_count=2,

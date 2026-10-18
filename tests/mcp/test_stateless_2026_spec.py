@@ -25,7 +25,7 @@ from src.mcp import premise
 from src.mcp.http_server import app
 
 # A well-formed tenant UUID (bind_tenant requires one even in tests).
-TEST_USER_ID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+TEST_USER_ID = "11111111-2222-4333-8111-111111111111"
 
 
 @pytest.fixture

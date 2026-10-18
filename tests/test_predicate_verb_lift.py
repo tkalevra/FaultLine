@@ -78,7 +78,7 @@ class TestLiftPredicateFailSafe:
 
     def test_no_verb_between_pair_returns_none(self):
         # adjacency with only a determiner/pronoun → no real predicate to mint.
-        assert P.lift_predicate("my dog Fraggle", "dog", "fraggle") is None
+        assert P.lift_predicate("my dog Luna", "dog", "luna") is None
 
     def test_pure_copula_returns_none(self):
         # "the" between the pair — pure connector, no verb.

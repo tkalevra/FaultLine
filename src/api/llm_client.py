@@ -245,7 +245,7 @@ def _thinking_kwarg_backends() -> set[str]:
 
     This is NOT universally safe. Strict OpenAI-compatible providers reject
     unknown top-level fields with an HTTP 400 rather than silently ignoring
-    them — e.g. Cerebras returns 400 ("chat_template_kwargs ... is unsupported",
+    them — e.g. Some gateways returns 400 ("chat_template_kwargs ... is unsupported",
     code=wrong_api_format), and OpenAI / Groq / most hosted gateways behave the
     same way. Injecting the field unconditionally 400s EVERY LLM call for those
     users. So we gate the injection to the OpenWebUI/vLLM family (default just
@@ -260,7 +260,7 @@ def _thinking_kwarg_backends() -> set[str]:
 
 # ── Reasoning / "thinking" suppression, keyed by ENDPOINT HOST ────────────────────────
 # WHY HOST-KEYED AND NOT backend_type: ``backend_type="openai"`` is what a tenant picks for
-# EVERY OpenAI-compatible provider — DeepSeek, Cerebras, Groq, OpenRouter, xAI, LM Studio —
+# EVERY OpenAI-compatible provider — DeepSeek, Some gateways, Groq, OpenRouter, xAI, LM Studio —
 # and each has a DIFFERENT (or absent) reasoning switch. "OpenAI-compatible" describes the
 # transport, not the parameter vocabulary. Keying on backend_type is therefore structurally
 # unable to get this right; we key on the host, exactly as ``resolve_provider_limits`` does.
@@ -277,7 +277,7 @@ def _thinking_kwarg_backends() -> set[str]:
 # We sent Qwen/vLLM's ``enable_thinking`` to DeepSeek and got HTTP 200 with full reasoning —
 # no error to retry on. A 400-retry strategy catches the strict providers and misses exactly
 # the ones that quietly ignore you. So: an explicit per-host allowlist, and NO field at all
-# for an unrecognized host (guessing there risks a hard 400 on every call — the Cerebras
+# for an unrecognized host (guessing there risks a hard 400 on every call — the Some gateways
 # ``chat_template_kwargs`` incident).
 #
 # ``can_disable=False`` is recorded HONESTLY: several providers cannot turn reasoning off at
@@ -291,7 +291,7 @@ def _thinking_kwarg_backends() -> set[str]:
 # https://console.groq.com/docs/reasoning · DashScope
 # https://www.alibabacloud.com/help/en/model-studio/deep-thinking · Mistral
 # https://docs.mistral.ai/capabilities/reasoning/ · xAI https://docs.x.ai/docs/guides/reasoning ·
-# OpenRouter https://openrouter.ai/docs/use-cases/reasoning-tokens · Cerebras
+# OpenRouter https://openrouter.ai/docs/use-cases/reasoning-tokens · Some gateways
 # https://inference-docs.cerebras.ai/capabilities/reasoning
 #
 # Each entry: ``models`` = ordered (substring, spec) pairs, first match wins; ``default`` =
@@ -391,7 +391,7 @@ _REASONING_CONTROLS: dict[str, dict] = {
         "models": [],
         "default": {"fields": {"reasoning": {"effort": "none"}}, "can_disable": True},
     },
-    # Cerebras — zai-glm accepts "none"; gpt-oss/gemma have no off value. The boolean
+    # Some gateways — zai-glm accepts "none"; gpt-oss/gemma have no off value. The boolean
     # `disable_reasoning` is deprecated (2026-07-21) — do NOT build on it.
     "api.cerebras.ai": {
         "models": [
@@ -592,7 +592,7 @@ def build_llm_payload(
     #
     # This field is NOT universally safe: strict OpenAI-compatible providers
     # reject unknown top-level fields with an HTTP 400 instead of ignoring them
-    # (Cerebras: "chat_template_kwargs ... is unsupported", code=wrong_api_format;
+    # (Some gateways: "chat_template_kwargs ... is unsupported", code=wrong_api_format;
     # OpenAI / Groq / most hosted gateways do the same). Injecting it
     # unconditionally 400s EVERY call for a user on such a provider. So gate the
     # injection to the OpenWebUI/vLLM family (default "openwebui", env-extensible

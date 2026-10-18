@@ -32,8 +32,8 @@ cardinal ``nummod`` cannot host a name; a single-character "name" is an initial,
 appositive chain now stores the pair as the SCALAR it is instead of a phantom ``has_role``.
 
 ── DEFECT 5 — a COPULA TYPE-PREDICATE lost the type and minted a NOUN-AS-RELATION ───────────────
-"My dog Bracken is a morkie" bound the breed to nothing, and the attribute-scalar chain read the
-clause as a possessed-attribute literal → (user, "dog", "morkie"): the breed filed as the value of a
+"My dog Bracken is a terrier mix" bound the breed to nothing, and the attribute-scalar chain read the
+clause as a possessed-attribute literal → (user, "dog", "terrier mix"): the breed filed as the value of a
 "dog" attribute ON THE USER, the named instance never typed. FIX: binding branch (5) binds the
 determiner-introduced predicate nominal to the subject NP's name, and the attribute-scalar chain
 steps aside for exactly that shape — NARROWLY, so a real possessed scalar ("my address is 123 …",
@@ -155,8 +155,8 @@ def test_a_real_role_apposition_still_reads_as_a_role():
 # ── DEFECT 5 — a copula type-predicate types the NAMED INSTANCE, not the user ───────────────
 
 def test_copula_type_predicate_binds_the_breed_to_the_named_instance():
-    triples = _triples(m.derive_sentence_facts("My dog Bracken is a morkie.", _REF))
-    assert ("bracken", "instance_of", "morkie") in triples, triples
+    triples = _triples(m.derive_sentence_facts("My dog Bracken is a terrier mix.", _REF))
+    assert ("bracken", "instance_of", "terrier mix") in triples, triples
     # the noun-as-relation junk: the role noun must never become a RELATION on the user
     assert not [t for t in triples if t[0] == "user" and t[1] == "dog"], triples
 
@@ -174,9 +174,9 @@ def test_possessed_attribute_scalar_is_still_captured():
 def test_named_roster_binds_each_member_to_its_own_type():
     """The list shape that mis-filed one member's name under another member's type."""
     triples = _triples(m.derive_sentence_facts(
-        "We have a morkie dog named Bracken, a cat named Pepper, "
+        "We have a terrier mix dog named Bracken, a cat named Pepper, "
         "and a corn snake named Juniper.", _REF))
-    assert ("bracken", "instance_of", "morkie dog") in triples, triples
+    assert ("bracken", "instance_of", "terrier mix dog") in triples, triples
     assert ("pepper", "instance_of", "cat") in triples, triples
     assert ("juniper", "instance_of", "corn snake") in triples, triples
     # no cross-binding: no member is ever filed at another member's type

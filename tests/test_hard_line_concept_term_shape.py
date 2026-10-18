@@ -63,7 +63,7 @@ ENGINE_GROWN_TYPES = [
 
 # Ordinary user-surfaced types (multi-word, no snake_case). Also legitimate places.
 USER_SURFACED_TYPES = [
-    "corn snake", "morkie dog", "dog", "pet", "snake", "cat", "animal",
+    "corn snake", "terrier mix dog", "dog", "pet", "snake", "cat", "animal",
     "control plane", "agentic harness", "wireguard", "boundary", "card", "parts",
 ]
 
