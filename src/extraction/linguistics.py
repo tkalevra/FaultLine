@@ -27109,6 +27109,111 @@ def analyze_directive(text: str):
         return None
 
 
+# ── FIRST-PERSON PRESENT-TENSE DECLARATIVE SHAPE (FOSS-012 affirmative decline) ────
+# The es zero-shot intent set over-scores a DESTRUCTIVE lean on the plainest first-person
+# present-tense assertion there is ("Uso el puerto 9004 en el servidor principal." —
+# CORRECTION@0.845, gate-passed, /retract/correct, capture lost). The veto above
+# (FOSS-005) owns the NEGATED twin; this reports the grammar facts of the AFFIRMATIVE one.
+# Pure dependency+morphology reads — NO word-list, NO routing decision (module contract):
+# the caller (main.py intent gate) owns the cue screens and the demote verdict.
+@dataclass(frozen=True)
+class PersonTenseShape:
+    """Grammar facts of the main clause's finite predicate, read for the
+    first-person-present-declarative shape.
+
+    - root_verb_lemma: lemma of the finite predicate the shape was read from (the
+      ROOT VERB/AUX, or — for the Spanish pro-drop COPULAR clause, NGLE §33.4a-b — the
+      cop AUX child of a predicate ROOT). None when no finite predicate exists.
+    - root_is_finite_verb: the predicate is a VERB/AUX.
+    - root_person_first: Person=1 ON THE PREDICATE — the pro-drop agreement signal
+      ("uso", "tengo", "soy" carry the speaker with NO subject token; English has no
+      such construction, so on the en model this is False and the explicit-subject arm
+      below carries the person).
+    - root_tense_present: Tense=Pres on the predicate (UD "Pres" covers the Spanish
+      presente indicative and the English non-past VBP alike).
+    - subject_is_first_person: an EXPLICIT nsubj that is a 1st-person personal pronoun
+      (Person=1 ∧ PronType=Prs, no Poss — the same morphological contract
+      _is_first_person_personal_pronoun enforces). The English "I use ..." arm.
+    """
+
+    root_verb_lemma: str | None
+    root_is_finite_verb: bool
+    root_person_first: bool
+    root_tense_present: bool
+    subject_is_first_person: bool
+
+
+def analyze_first_person_present_statement(text: str):
+    """Grammar facts for the AFFIRMATIVE first-person present-tense declarative shape.
+
+    PersonTenseShape | None — None when the layer is unavailable, the parse misses, or
+    the clause has NO finite predicate to read (the caller fails SAFE to "no decline":
+    today's route stands). Reads the parse only — no cue word-list, no routing decision
+    (the caller owns both).
+
+    The predicate read, in order:
+      * the ROOT when it is a VERB/AUX ("uso el puerto", "tengo un perro", "I use port
+        9004"), else
+      * the cop AUX child of a non-verbal ROOT — the Spanish pro-drop copular clause
+        ("soy ingeniero": the ROOT is the predicate NOUN/ADJ and the person rides the
+        copula; the same read the copula chains make).
+    A clause whose ROOT is neither (e.g. a sentence-initial nominal frame — "Correction:
+    ...") yields None: there is no first-person assertion to demote on.
+    """
+    doc = _parse(text)
+    if doc is None:
+        return None
+    try:
+        root = next((t for t in doc if t.dep_ == "ROOT"), None)
+        if root is None:
+            return None
+        verb = root if root.pos_ in ("VERB", "AUX") else None
+        if verb is None:
+            # es pro-drop COPULAR: predicate root with a cop AUX child (NGLE §33.4a-b).
+            for c in (getattr(root, "children", None) or ()):
+                if c.dep_ == "cop" and c.pos_ == "AUX":
+                    verb = c
+                    break
+        if verb is None:
+            # es_core_news_sm ARTIFACT (measured live on the fl-eval-es stack,
+            # SPACY_MODEL=es_core_news_sm): a SENTENCE-INITIAL 1sg form that doubles
+            # as a noun tags PROPN — "Uso el puerto 9004 ..." roots on Uso/PROPN with
+            # no Person/Tense at all (while "Tengo un perro" tags VERB Person=1 and
+            # the negated twin's mid-sentence "uso" tags VERB). The es chains already
+            # re-lemmatize exactly such tokens (_reads_as_first_person_verb — the
+            # subject-agreement repair): when the ROOT re-lemmatizes as a finite
+            # 1st-person singular present verb, the shape facts ARE that agreement
+            # paradigm. Everything else (a genuine noun "el uso del puerto") fails
+            # the verb-index test → None → fail-safe, no decline.
+            if root is not None and _reads_as_first_person_verb(root):
+                return PersonTenseShape(
+                    root_verb_lemma=(root.lower_ or None),
+                    root_is_finite_verb=True,
+                    # the paradigm _reads_as_first_person_verb re-lemmatizes against:
+                    # Mood=Ind|Number=Sing|Person=1|Tense=Pres|VerbForm=Fin
+                    root_person_first=True,
+                    root_tense_present=True,
+                    subject_is_first_person=False,
+                )
+            return None
+        subject_is_self = any(
+            c.dep_ in ("nsubj", "nsubjpass") and _is_first_person_personal_pronoun(c)
+            for c in (getattr(verb, "children", None) or ())
+        )
+        morph = verb.morph
+        return PersonTenseShape(
+            root_verb_lemma=((verb.lemma_ or verb.text or "").strip().lower() or None),
+            root_is_finite_verb=verb.pos_ in ("VERB", "AUX"),
+            root_person_first="1" in morph.get("Person"),
+            root_tense_present="Pres" in morph.get("Tense"),
+            subject_is_first_person=subject_is_self,
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe: no facts, no decline
+        log.warning("linguistics.analyze_first_person_present_statement_failed",
+                    error=str(e)[:160])
+        return None
+
+
 # ── NEGATION-SCOPE FACTS (NegEx semantics over the dependency parse) ──────────────
 # THE WHY: a STRUCTURAL negation ("my pets are not part of my family", "aurora is not my
 # dog") is a plain PREDICATE negation in dependency terms (``neg`` hanging off the

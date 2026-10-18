@@ -369,17 +369,26 @@ def test_subgate_structural_denial_still_escalates_to_the_correction_lane(
     assert main._INTENT_LAYER_STATS.get("test-use", {}).get("llm_adjudication", 0) >= 1
 
 
-def test_subgate_affirmative_correction_lean_still_escalates(_routed, monkeypatch):
-    """No negation at all → the veto never engages; the escalation owns the sub-gate
-    band exactly as before. (That the LIVE es GLiNER2 leans CORRECTION on this
-    affirmative at all is the destructive-lean weakness filed as FOSS-012 — a
-    different lane; this pin only freezes the routing contract this fix must not
-    disturb.)"""
+def test_subgate_affirmative_correction_lean_declines_foss012(_routed, monkeypatch):
+    """⚠️ REVERSED BY FOSS-012 (was: test_subgate_affirmative_correction_lean_still_escalates,
+    which froze the escalation owning this band "until FOSS-012 lands"). The evidence-free
+    first-person present-tense affirmative shape now DEMOTES to STATEMENT below the
+    escalation — the shape facts arrive from the analyzer stub, the negation screens are
+    empty (no scope), and the INTENT_ADJUDICATION LLM is never paid for. A sub-gate
+    NON-affirmative destructive lean still escalates (pinned above)."""
+    from src.extraction.linguistics import PersonTenseShape
+    _shape = PersonTenseShape(
+        root_verb_lemma="usar", root_is_finite_verb=True, root_person_first=True,
+        root_tense_present=True, subject_is_first_person=False)
+    from src.extraction import linguistics as ling
+    monkeypatch.setattr(ling, "analyze_first_person_present_statement", lambda t: _shape)
     calls = _escalation_recorder(monkeypatch)
     resp = _classify("Uso el puerto 9004.", _CORRECTION_DESC, 0.63,
                      [], _plain_statement_directive(), monkeypatch)
-    assert resp["intent"] == "CORRECTION", resp
-    assert len(calls) == 1, f"escalation must still be consulted exactly once: {calls}"
+    assert resp == {"intent": "STATEMENT", "confidence": 0.95}, resp
+    assert calls == [], f"the FOSS-012 decline binds BEFORE the escalation: {calls}"
+    assert main._INTENT_LAYER_STATS.get("test-use", {}).get(
+        "affirmative_statement_decline", 0) >= 1
 
 
 
@@ -479,17 +488,21 @@ def test_es_real_parse_subgate_bug_sentence_routes_statement_via_veto(
 
 
 @_es_real
-def test_es_real_parse_affirmative_control_still_escalates(_transport_only, monkeypatch):
-    """WORK-ORDER PIN (round 3, item 2c): the AFFIRMATIVE control on the real es parse has
-    no negation → no scope → no veto → the escalation still owns the sub-gate band
-    (contract frozen around FOSS-012)."""
+def test_es_real_parse_affirmative_control_routes_statement_via_decline(
+        _transport_only, monkeypatch):
+    """⚠️ REVERSED BY FOSS-012 (was: test_es_real_parse_affirmative_control_still_escalates,
+    round 3, item 2c — which froze the escalation owning this band on the REAL parse).
+    On the real es parse the affirmative control is the evidence-free first-person
+    present-tense shape: the FOSS-012 decline demotes it to STATEMENT before the gate,
+    and the escalation is never consulted. The NEGATED twin keeps the veto's lane
+    (pinned above); the GENUINE correction keeps its own (FOSS-012 file)."""
     calls = _escalation_recorder(monkeypatch)
     resp = asyncio.run(main.classify_intent(
         {"text": "Uso el puerto 9004 en el servidor principal."}, user_id="test-user-0001",
         model=_fake_gliner(_CORRECTION_DESC, 0.63)))
-    assert resp["intent"] == "CORRECTION", (
+    assert resp == {"intent": "STATEMENT", "confidence": 0.95}, (
         "the affirmative control changed route: " + repr(resp))
-    assert len(calls) == 1, "escalation must still be consulted exactly once: " + repr(calls)
+    assert calls == [], "the FOSS-012 decline binds BEFORE the escalation: " + repr(calls)
 
 
 # ---- the same proofs on the MEASURED sm parse shape, hand-built (green/red-checkable

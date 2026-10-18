@@ -13523,6 +13523,49 @@ def _spacy_cue_route(text: str, user_id: str | None = None) -> tuple:
     return (None, None)
 
 
+def _turn_matches_grown_correction_cue(text: str, user_id: str | None) -> bool:
+    """True when the tenant's GROWN/seeded correction_signals hold a LITERAL that
+    matches the turn — the same literal screen ``_repair_frame`` reads (bordered
+    substring on the punctuation-stripped surface). DB-grown evidence beats the shape
+    prior: any grown-cue match keeps the turn in the destructive lane (the FOSS-012
+    affirmative decline never fires over grown evidence). Fail-safe: an unreadable
+    store → no hit (the decline then decides on the closed inventories alone — the
+    fail-safe direction is CAPTURE, never a destructive route)."""
+    try:
+        norm = " " + " ".join(re.sub(r"[^\w\s']", " ", (text or "").lower()).split()) + " "
+        for pattern, _ptype, _conf in _tenant_correction_signals(user_id):
+            p = (pattern or "").strip().lower()
+            if p and f" {p} " in norm:
+                return True
+    except Exception as e:  # noqa: BLE001 — fail-safe: grown cues never route the decline
+        log.warning("affirmative_decline.correction_signals_unreadable", error=str(e)[:160])
+    return False
+
+
+def _cessative_shape_admitted(d) -> bool:
+    """Read-only mirror of _spacy_cue_route's LEXICAL-cessation admission: True when
+    the directive's cessative ROOT lemma is a member of the per-tenant cessative_verb
+    cue class AND its complement shape is one the member's row ADMITS ("dejo de usar
+    el puerto" — a lexically-expressed removal — must NEVER demote to STATEMENT).
+    Same DB rail, same shape map, no routing decision. Fail-safe: any error → not
+    admitted (the decline may proceed — capture is the safe side)."""
+    if not (d is not None and getattr(d, "cessative_root_lemma", None)
+            and getattr(d, "cessative_complement_shape", None)):
+        return False
+    try:
+        _dsn = os.environ.get("POSTGRES_DSN", "")
+        if d.cessative_root_lemma in linguistic_cue_overlay.resolve_cessative_verbs(_dsn):
+            _shapes = (linguistic_cue_overlay.resolve_cessative_verb_shapes(_dsn)
+                       or {}).get(d.cessative_root_lemma, "")
+            return d.cessative_complement_shape in {
+                s.strip() for s in (_shapes or "").split("|") if s.strip()
+            }
+    except Exception as _ce:  # noqa: BLE001 — fail-safe: never demote on an error path
+        log.warning("affirmative_decline.cessative_resolve_failed", error=str(_ce)[:160])
+        return False
+    return False
+
+
 def _is_source_goal_transition_statement(text: str) -> bool:
     """Deterministic PRE-GLiNER2 guard: a declarative source→goal TRANSITION
     ("I switched from Python to Rust", "She moved from Toronto to Berlin") is a
@@ -19225,6 +19268,86 @@ def _sentential_negation_blocks_destructive(scopes, directive) -> bool:
     return True
 
 
+# ── AFFIRMATIVE-STATEMENT CORRECTION DECLINE (FOSS-012) ────────────────────────────
+# THE HOLE (sibling of the sentential-negation veto above): on the es zero-shot label
+# set a plain FIRST-PERSON PRESENT-TENSE AFFIRMATIVE statement scores the CORRECTION
+# label at gate-passing confidence ("Uso el puerto 9004 en el servidor principal." →
+# CORRECTION@0.845 > gate 0.70) — the turn answers as a FAILED correction ("Incomplete
+# correction — relationship type not identified") and the capture lands nothing
+# in-turn. The veto above owns the NEGATED twin (sentential negation, no removal cue);
+# this decline owns the AFFIRMATIVE one: a gate-passed CORRECTION lean (bound below the
+# veto, above gate + escalation routing, so BOTH routes see it) whose turn carries
+# ZERO correction-shape evidence AND is the first-person present-tense declarative
+# shape demotes to STATEMENT — exactly en's classification outcome for the same shape,
+# and exactly where a brand-new fact belongs (ingest, never supersede).
+#
+# ZERO CORRECTION-SHAPE EVIDENCE — the same closed screens + DB-grown cue stores every
+# destructive route here already requires (analyze_directive() facts; NO new word zoo):
+#   • no imperative removal-verb cue          (directive.imperative_root_lemma)
+#   • no temporal-cessation adverbial cue     (directive.cessation_advmod_lemmas)
+#   • no contrastive / old-vs-new negation    (directive.has_contrastive_negation)
+#   • no clause-initial repair marker         (directive.clause_initial_markers)
+#   • no 1st-person repair verb ("i meant")   (directive.root_verb_lemma + subject)
+#   • no repair FRAME ("correction: ...")     (_repair_frame — the dual-gate's screen)
+#   • no tenant-GROWN correction-cue literal  (correction_signals rows — DB, growable)
+#   • no lexically-expressed removal ADMITTED by the grown cessative_verb cue class
+#     (mirror of _spacy_cue_route's admission — "dejo de usar X" stays a removal)
+#   • NO negation scope anywhere (affirmative — the veto above owns the negated twin)
+# THE SHAPE (grammar only, language-neutral by morphology): a finite predicate with
+# Tense=Pres and Person=1 read ON THE PREDICATE (the Spanish pro-drop agreement —
+# "uso", "tengo", "soy") OR an explicit Person=1 PronType=Prs subject (English
+# "I use ..."); declarative (interrogatives are excluded before the decision).
+# GLiNER2 stays frozen (Pitfall 11): its label simply stops being decisive on this one
+# shape. Fail-safe: any layer error / missing facts → the label stands (today's path).
+AFFIRMATIVE_STATEMENT_DECLINE = os.getenv("AFFIRMATIVE_STATEMENT_DECLINE", "true").lower() not in ("0", "false", "no")
+
+
+def _affirmative_statement_declines_correction(directive, shape,
+                                               grown_literal_hit: bool,
+                                               repair_frame: bool,
+                                               cessative_admitted: bool) -> bool:
+    """True when a gate-passed CORRECTION lean must DEMOTE to STATEMENT (FOSS-012).
+
+    ``directive``: analyze_directive() facts. ``shape``: the
+    analyze_first_person_present_statement() facts. The two DB-grown screens arrive
+    PRE-RESOLVED (``grown_literal_hit`` — a tenant correction_signals literal matches
+    the turn; ``cessative_admitted`` — the directive's lexically-expressed cessation
+    is admitted by the grown cessative_verb cue class) so this decision stays PURE
+    and unit-pinnable without a model or a database.
+
+    Demote = EVERY screen negative (zero correction-shape evidence) AND the shape is
+    the first-person present-tense affirmative declarative. Any doubt → False:
+    today's route stands (fail-safe — never demote blind).
+    """
+    if directive is None or shape is None:
+        return False
+    if (directive.imperative_root_lemma in _RETRACTION_CUE_LEMMAS
+            and not directive.imperative_root_negated):
+        return False
+    if directive.cessation_advmod_lemmas & _CESSATION_ADVMOD_LEMMAS:
+        return False
+    if directive.has_contrastive_negation:
+        return False
+    if directive.clause_initial_markers & _CORRECTION_MARKER_LEMMAS:
+        return False
+    if directive.root_verb_lemma in _CORRECTION_VERB_LEMMAS and directive.root_subject_is_self:
+        return False
+    if repair_frame:
+        return False
+    if grown_literal_hit:
+        return False
+    if cessative_admitted:
+        return False
+    # THE SHAPE: present-tense + first-person (verbal pro-drop agreement OR explicit
+    # 1st-person subject). Declarativity is enforced by the caller (interrogatives
+    # are excluded before this decision — the same discipline as the veto above).
+    if not shape.root_tense_present:
+        return False
+    if not (shape.root_person_first or shape.subject_is_first_person):
+        return False
+    return True
+
+
 def _fire_intent_confidence_feedback(user_id: str, confidence: float) -> None:
     """Fire-and-forget auto_classification feedback for an ensemble-decided turn.
 
@@ -19690,6 +19813,10 @@ def intent_layer_stats(_op: str = Depends(require_operator)):
     negated_statement_veto (FOSS-005: a destructive GLiNER2 lean — gate-passed OR
     sub-gate escalation-decided — whose only negation is sentential, with no
     removal/repair cue → STATEMENT; hoisted above gate/escalation routing),
+    affirmative_statement_decline (FOSS-012: a gate-passed CORRECTION lean whose turn
+    is the first-person present-tense AFFIRMATIVE declarative shape with zero
+    correction-shape evidence — no marker/contrast/negation/removal cue, no grown
+    correction-cue literal — → STATEMENT; hoisted above gate/escalation routing),
     gliner2_native (GLiNER2 classify_text ≥ the per-user adaptive gate),
     neg_ensemble_voters / neg_ensemble_llm_adjudication / neg_ensemble_failopen
     (negation-scope three-voter ensemble — fires only on gate-passed STATEMENT/QUERY
@@ -20197,6 +20324,80 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
             except Exception as _veto_err:  # noqa: BLE001 — fail-safe: label stands
                 log.debug("classify_intent.negation_veto_unavailable",
                           user_id=user_id[:8], error=str(_veto_err)[:120])
+
+        # === AFFIRMATIVE-STATEMENT CORRECTION DECLINE (FOSS-012) ===
+        # A gate-passed (or sub-gate escalation-bound, per the veto's hoist discipline)
+        # GLiNER2 CORRECTION lean on the plainest first-person present-tense affirmative
+        # statement ("Uso el puerto 9004 en el servidor principal." → CORRECTION@0.845)
+        # answers as a FAILED correction and captures nothing in-turn. With ZERO
+        # correction-shape evidence (repair marker / contrastive old-vs-new / negation /
+        # removal cue — the same closed screens + DB-grown cue stores every destructive
+        # route here already requires) and the first-person present-tense declarative
+        # shape (grammar: Person=1 by verbal pro-drop agreement or explicit subject,
+        # Tense=Pres, non-interrogative), the turn is a brand-new fact: DEMOTE to
+        # STATEMENT and let ingest have it. Placement mirrors the veto above — bound
+        # BEFORE gate/escalation routing so both routes see it. Fail-safe: layer
+        # unavailable / parse miss / any error → the label stands.
+        if AFFIRMATIVE_STATEMENT_DECLINE and intent == "CORRECTION":
+            try:
+                from src.extraction.linguistics import (
+                    analyze_directive as _dec_ad,
+                    analyze_first_person_present_statement as _dec_fps,
+                    analyze_negation_scopes as _dec_ans,
+                    is_interrogative_clause as _dec_interro,
+                    linguistics_available as _dec_ling_ok,
+                )
+
+                # OFF-LOOP (first-touch-cold-path discipline): all parses + the two
+                # DB-grown screens as ONE threaded unit; the async decision stays on
+                # the loop.
+                def _decline_facts_sync():
+                    if not _dec_ling_ok():
+                        return None
+                    try:
+                        if _dec_interro(text) is True:
+                            return None
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _scopes = _dec_ans(text)
+                    if _scopes:
+                        # AFFIRMATIVE only — a negation anywhere is the veto's lane.
+                        return None
+                    _d = _dec_ad(text)
+                    _shape = _dec_fps(text)
+                    if _d is None or _shape is None:
+                        return None
+                    # bool(): _repair_frame returns None | (frame, tier) — normalize
+                    # truthiness, never identity (a False stub is "no frame" too).
+                    return (
+                        _d, _shape,
+                        _turn_matches_grown_correction_cue(text, user_id),
+                        bool(_repair_frame(text, user_id)),
+                        _cessative_shape_admitted(_d),
+                    )
+
+                _decline_facts = await asyncio.to_thread(_decline_facts_sync)
+                if _decline_facts is not None:
+                    _dec_d, _dec_shape, _dec_grown, _dec_frame, _dec_cess = _decline_facts
+                    if _affirmative_statement_declines_correction(
+                            _dec_d, _dec_shape, _dec_grown, _dec_frame, _dec_cess):
+                        log.info(
+                            "classify_intent.affirmative_statement_decline",
+                            user_id=user_id[:8],
+                            gliner2_label="CORRECTION",
+                            gliner2_confidence=round(float(confidence), 3),
+                            note="first-person present-tense affirmative declarative with "
+                                 "zero correction-shape evidence → STATEMENT (a brand-new "
+                                 "fact belongs to ingest, never to the supersede lane)",
+                        )
+                        print(f"[/classify-intent] AFFIRMATIVE-STATEMENT DECLINE: GLiNER2 "
+                              f"CORRECTION@{float(confidence):.3f} → STATEMENT "
+                              f"(no marker/contrast/negation/removal; Person=1+Pres)", flush=True)
+                        _note_intent_layer(user_id, "affirmative_statement_decline", "STATEMENT")
+                        return {"intent": "STATEMENT", "confidence": 0.95}
+            except Exception as _dec_err:  # noqa: BLE001 — fail-safe: label stands
+                log.debug("classify_intent.affirmative_decline_unavailable",
+                          user_id=user_id[:8], error=str(_dec_err)[:120])
         # WIRE #0: Adaptive Confidence Gate — Query per-user gate from re_embedder recommendations
         # Phase 2c of re_embedder computes per-user thresholds via intent_confidence_feedback analysis
         # This gate determines whether to accept GLiNER2 result or fall back to pattern matching
