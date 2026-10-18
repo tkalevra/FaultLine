@@ -183,20 +183,54 @@ _STOPWORD_ALIASES = frozenset({
     "y", "o", "pero", "si", "sí", "mi", "mis", "tu", "tus", "su",
     "sus", "lo", "al", "en", "con", "por", "para", "como", "muy",
     "ya", "es", "son", "era", "ser", "esta", "este", "estos", "estas",
+    # Italian closed-class (FOSS-016-it) — the NO-MODEL FLOOR only. The screen's
+    # primary verdict is the loaded model's own stop list (tok.is_stop — the model IS
+    # the language; the it branch runs it_core_news_sm, whose list closes the it hole
+    # natively). This hand section keeps the no-model path exact: without it the it
+    # stack's harvest could mint che/il/non as alias entities — the lane-C round-2
+    # wound, reopened for it. Closed-class function words: a CLOSED set.
+    "che", "non", "il", "lo", "la", "gli", "le", "un", "uno", "una",
+    "e", "od", "o", "ma", "però", "pero", "si", "anche", "come",
+    "per", "con", "questo", "questa", "questi", "queste", "quello",
+    "quella", "quelli", "quelle", "mio", "mia", "tuo", "suo",
+    "sono", "era", "essere", "ho", "hai", "ha", "abbiamo",
+    "molto", "già", "gia", "ne", "ci", "vi", "qui", "quindi",
 })
 
 
 def _stopword_surface_refused(name: str) -> bool:
     """True when EVERY token of the surface is a closed-class function word — the
-    surface carries no referential content ('that', 'the of', 'que y'). A multiword
-    surface with at least one content token ('after the network change') is NOT
-    refused here; its debris, if any, is the deriver's to clean."""
+    surface carries no referential content ('that', 'the of', 'que y', 'che il'). A
+    multiword surface with at least one content token ('after the network change',
+    'dopo il cambio di rete') is NOT refused here; its debris, if any, is the
+    deriver's to clean.
+
+    FOSS-016-it: the verdict is LANGUAGE-NATIVE by construction — the PRIMARY answer
+    is the loaded spaCy model's own stop list (``tok.is_stop`` is a lexical attribute,
+    so the tokenizer alone answers it; no parse needed). The loaded model IS the
+    language: the it branch runs it_core_news_sm, whose list closes the it hole
+    without an in-code zoo. The hand set above is the NO-MODEL FLOOR only (layer off
+    / spaCy absent / model missing). The tokenizer's token count may legitimately
+    differ from the regex split (hyphens, numerals); on any mismatch or model error
+    we fall through to the floor — the screen never blocks a real name on a tooling
+    disagreement."""
     try:
         _norm = " ".join(str(name or "").strip().lower().split())
         if not _norm:
             return False
-        _toks = [t for t in re.split(r"[^a-z0-9ñáéíóúü]+", _norm) if t]
-        return bool(_toks) and all(t in _STOPWORD_ALIASES for t in _toks)
+        _toks = [t for t in re.split(r"[^a-z0-9ñáéíóúüàèéìòù]+", _norm) if t]
+        if not _toks:
+            return False
+        try:
+            from src.extraction.linguistics import _get_nlp
+            _nlp = _get_nlp()
+            if _nlp is not None:
+                _stops = [bool(t.is_stop) for t in _nlp.tokenizer(_norm)]
+                if len(_stops) == len(_toks) and _stops and all(_stops):
+                    return True
+        except Exception:  # noqa: BLE001 — model down → the floor answers alone
+            pass
+        return all(t in _STOPWORD_ALIASES for t in _toks)
     except Exception:  # noqa: BLE001 — fail-safe: the screen never blocks a real name
         return False
 

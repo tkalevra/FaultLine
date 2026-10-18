@@ -1208,6 +1208,94 @@ def test_capture_never_mints_stopword_aliases(monkeypatch):
     assert _n1 == _n0, "the refused registration must write nothing"
 
 
+# ── FOSS-016-it: the stopword screen is LANGUAGE-NATIVE ────────────────────────────
+
+def _it_model_installed_foss016() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("it_core_news_sm") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def test_stopword_screen_covers_italian_at_mint_and_registration(monkeypatch):
+    """FOSS-016-it: 'che' (and the other it closed-class words) are refused by the
+    screen, at the MINT seam and at the NON-PREFERRED REGISTRATION seam - the lane-C
+    round-2 wound (a harvest-minted stopword alias ambiguity-locking retractions) is
+    closed for Italian. A content-bearing it surface still mints. en/es verdicts are
+    byte-identical (pinned by test_capture_never_mints_stopword_aliases above)."""
+    from src.entity_registry.registry import (
+        EntityRegistry, StopwordSurfaceError, _stopword_surface_refused)
+
+    # the screen: it closed-class refused, content-bearing it surface kept
+    assert _stopword_surface_refused("che"), "che must be refused (floor or model)"
+    assert _stopword_surface_refused("non")
+    assert _stopword_surface_refused("il")
+    assert not _stopword_surface_refused("gattino"), "content-bearing it surface"
+    assert not _stopword_surface_refused("server principale"), "multiword with content"
+
+    class _RCur:
+        def __init__(self):
+            self.rows = []
+        def execute(self, s, p=None):
+            self.rows.append(" ".join(str(s).split()).lower())
+        def fetchone(self):
+            return None
+        def fetchall(self):
+            return []
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    class _RDB:
+        def __init__(self):
+            self.cur = _RCur()
+        def cursor(self):
+            return self.cur
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+
+    db = _RDB()
+    reg = EntityRegistry(db, schema_name="foss016_it_tenant")
+
+    # the mint seam: 'che' never mints
+    with pytest.raises(StopwordSurfaceError):
+        reg.resolve(USER, "che")
+    writes = [s for s in db.cur.rows
+              if s.startswith("insert into entities")
+              or s.startswith("insert into entity_aliases")]
+    assert not writes, "an it stopword surface must never mint"
+
+    # the agreement lockout seam: 'che' cannot register as a non-preferred alias
+    r = reg.register_alias(GATA, "che", is_preferred=False)
+    assert r.get("written") is False and r.get("refused") is True, r
+
+    # the naming-frame opt-out survives (#23 family shape, same as en/es)
+    out = reg.resolve(USER, "che", name_intent=True)
+    assert out, "a genuine it naming frame keeps its lane"
+
+
+def test_stopword_primary_verdict_is_the_models_own_stop_list(monkeypatch):
+    """FOSS-016-it PRIMARY SHAPE: the screen's verdict is the LOADED model's
+    tok.is_stop (language-native; the model IS the language), with the hand set as the
+    NO-MODEL floor only. Pinned with a word the model's stop list carries but the hand
+    floor deliberately does not ('poi'): model up -> refused; model down -> not refused
+    (the floor answers alone, byte-exact to the hand set)."""
+    import src.extraction.linguistics as L
+    from src.entity_registry.registry import _stopword_surface_refused
+    if not _it_model_installed_foss016():
+        pytest.skip("it_core_news_sm not installed - the model-native verdict runs only on an it stack")
+    assert _stopword_surface_refused("poi"), "the model's stop list answers"
+    # the no-model path falls to the floor: 'poi' is NOT in the hand set
+    monkeypatch.setattr(L, "_get_nlp", lambda: None)
+    assert not _stopword_surface_refused("poi"), "the floor answers alone, exactly"
+    # ...but the floor still refuses the it closed-class words without a model
+    assert _stopword_surface_refused("che"), "the floor keeps the it hole closed"
+
+
 # =============================================================================
 # Critic round 2 - the turn-window wording
 # =============================================================================
