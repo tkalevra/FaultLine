@@ -16058,14 +16058,17 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
     except Exception:  # noqa: BLE001 — a grammar miss never breaks the lane
         return None
     if not frames:
+        log.info("correct_fact.prodrop_door_shut", reason="no_naming_frame")
         return None  # no licensed naming frame (incl. every English parse)
     names: list[str] = []
     for _b, _n in frames:
         if _n not in names:
             names.append(_n)
     if len(names) != 1:
+        log.info("correct_fact.prodrop_door_shut", reason="multi_name_replacive")
         return None  # the replacive-in-one-turn shape is the ladder's, not this door's
     if require_prodrop_frames and any(_b and _b.strip() for _b, _n in frames):
+        log.info("correct_fact.prodrop_door_shut", reason="overt_bearer_frames")
         return None  # the bearer is IN the text: the speaker binding may be right — not ours
     _name = names[0]
     try:
@@ -16106,6 +16109,10 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             _agree = {r[0] for r in cur.fetchall() if r[0]}
             cands &= _agree
         if len(cands) != 1:
+            log.info("correct_fact.prodrop_door_shut", reason="candidate_uniqueness",
+                     candidates=len(cands),
+                     holders=sorted(str(h)[:8] for h in _holders),
+                     alias_hits=sorted(str(h)[:8] for h in cands) if cands else [])
             return None  # 0 or >1 candidates: ambiguity is never resolved by guessing
         entity_id = next(iter(cands))
         # The label to supersede must be a GIVEN name (user_stated) — an entity known only
@@ -16116,6 +16123,8 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             "ORDER BY is_preferred DESC LIMIT 1", (entity_id,))
         _row = cur.fetchone()
         if not _row or not _row[0]:
+            log.info("correct_fact.prodrop_door_shut", reason="no_given_name_label",
+                     entity=str(entity_id)[:8])
             return None  # no given-name label to supersede
         rel = "pref_name" if _row[1] else "also_known_as"
         return {"entity_id": entity_id,
@@ -60097,6 +60106,7 @@ def correct_fact(req: FactCorrectionRequest):
         # Fail-safe: flag OFF / grammar miss / 0-or->1 candidates / any probe error →
         # subject stays None → today's ladder (clarification / staged intent) unchanged.
         if PRODROP_BEARER_GROUNDING and not subject_uuid:
+            log.info("correct_fact.prodrop_door_a_reached", subject_name=subject_name)
             _pd = None
             try:
                 with db.cursor() as _pd_cur:
@@ -60600,6 +60610,8 @@ def correct_fact(req: FactCorrectionRequest):
         # A: lookup-only (entity_aliases probes), never mint, agreement, uniqueness;
         # flag OFF / no unique bearer → today's lanes unchanged.
         if PRODROP_BEARER_GROUNDING and subject_uuid and subject_uuid == req.user_id:
+            log.info("correct_fact.prodrop_door_b_reached", subject=str(subject_uuid)[:8],
+                     is_retraction=is_retraction)
             _pd2 = None
             try:
                 with db.cursor() as _pd_cur2:
