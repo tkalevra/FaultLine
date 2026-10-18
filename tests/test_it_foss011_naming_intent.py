@@ -676,10 +676,13 @@ def _ground(monkeypatch, frames, routes, **kw):
 
 # Round-4 route discriminators (the door is keyed on entity_aliases, the label table
 # this stack writes - critic round 3: zero pref_name/also_known_as FACTS rows on any it
-# seat):
+# seat). Round 4.2: a GIVEN name arrives as user_stated (owned-definite shape, seat a's
+# apollo) OR rel_default (the naming chain's scalar-identity stamp, seat b's fraggle) -
+# both probes take the IN-pair; head nouns/L4 labels/provisioning stay excluded:
 #   keys probe        SELECT DISTINCT entity_id ... WHERE alias = ANY(%s)   -> "alias = ANY"
-#   holders           SELECT DISTINCT entity_id ... WHERE preference_source = 'user_stated'
-#   held label        SELECT alias, is_preferred ... AND preference_source = 'user_stated'
+#   holders           ... WHERE preference_source IN ('user_stated', 'rel_default')
+#   held label        ... AND preference_source IN ('user_stated', 'rel_default')
+#   ghost audit       SELECT entity_id, alias, ... WHERE entity_id = ANY(%s) -> "entity_id = ANY"
 #   agreement         SELECT DISTINCT entity_id ... WHERE alias = %s
 
 def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
@@ -691,8 +694,8 @@ def test_prodrop_correction_grounds_the_unique_naming_holder(monkeypatch):
     DevBox) instead of parking at "Old fact not found for subject change: pref_name"."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ])
     assert got and got["entity_id"] == _E1, got
     assert got["rel"] == "pref_name", got
@@ -704,7 +707,7 @@ def test_prodrop_correction_declines_on_two_holders(monkeypatch):
     path; ambiguity is never resolved by guessing)."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,), (_E2,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
     ])
     assert got is None
 
@@ -715,7 +718,7 @@ def test_agreement_gate_declines_when_old_value_not_held(monkeypatch):
     empty -> None (the agreement gate always binds)."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
         ("WHERE alias = %s", [(_E2,)]),
     ], old_value="apollo")
     assert got is None
@@ -725,9 +728,9 @@ def test_agreement_gate_accepts_when_old_value_is_held(monkeypatch):
     """The agreeing case: old_value is an alias OF the holder -> grounding proceeds."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
         ("WHERE alias = %s", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], old_value="apollo")
     assert got and got["entity_id"] == _E1
 
@@ -754,8 +757,11 @@ def test_statement_ghost_alias_hit_grounds_to_the_holder(monkeypatch):
     server entity instead of parking at 'Old fact not found for subject change'."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", [(_E1,)]),  # devbox -> the harvest's ghost entity
-        ("WHERE preference_source = 'user_stated'", [(_E2,)]),  # apollo's entity
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        # both E1 (ghost, rel_default) and E2 (apollo, user_stated) hold naming rows:
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
+        # the structural audit: E1's ONLY alias is the asserted name itself
+        ("entity_id = ANY", [(_E1, "devbox", False, "rel_default")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], old_value="old_name")  # the corrector LLM's schema placeholder, measured live
     assert got and got["entity_id"] == _E2, got
     assert got["rel"] == "pref_name" and got["old_name"] == "apollo", got
@@ -768,8 +774,8 @@ def test_placeholder_old_value_never_blocks_the_agreement(monkeypatch):
     probe alias='old_name' (always empty) and die at uniqueness."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], old_value="old_name")
     assert got and got["entity_id"] == _E1, got
 
@@ -780,7 +786,8 @@ def test_no_given_name_label_declines(monkeypatch):
     that shape is a first mention (the FOSS-011 guard's territory), never a silent mint."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", []),
+        ("entity_id = ANY", [(_E1, "wound_alias", False, "unspecified")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", []),
     ])
     assert got is None
 
@@ -802,12 +809,33 @@ def test_retraction_arm_grounds_via_alias_overlap(monkeypatch):
     ENTITY lane's no-op "corrected, facts_superseded=0"."""
     got = _ground(monkeypatch, (("gatta", "fraggle"),), [
         ("alias = ANY", [(_E1,)]),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("fraggle", False)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
     ], is_retraction=True, object_to_negate="fraggle",
        text="dimentica che ho una gatta che si chiama fraggle")
     assert got and got["entity_id"] == _E1, got
     assert got["rel"] == "also_known_as" and got["name"] == "fraggle", got
+
+
+def test_rel_default_naming_alias_is_a_given_name(monkeypatch):
+    """ROUND 4.2, THE LIVE SEAT-b SHAPE (6e11d1b2, 2026-10-18): the b1 statement
+    'ho una gatta che si chiama Fraggle.' registers the name as fraggle|rel_default (the
+    naming chain's scalar-identity stamp - NOT user_stated; only the owned-definite shape
+    reaches user_stated), so the round-4 user_stated-only gates declined the door and the
+    plain-language forget fell to the ENTITY lane's no-op 'corrected, facts_superseded=0'.
+    A rel_default naming alias IS a given name: the retraction grounds its bearer and the
+    caller clarifies NAMING it. The bearer is kept because it co-holds its head noun
+    ({gatta, fraggle} - the structural ghost test never fires on it)."""
+    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+        ("alias = ANY", lambda p: [(_E1,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("entity_id = ANY", [(_E1, "gatta", True, "unspecified"),
+                             (_E1, "fraggle", False, "rel_default")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
+    ], is_retraction=True, object_to_negate="fraggle",
+       text="dimentica che ho una gatta che si chiama fraggle")
+    assert got and got["entity_id"] == _E1, got
+    assert got["rel"] == "also_known_as" and got["old_name"] == "fraggle", got
 
 
 def test_overt_bearer_np_is_a_first_class_key(monkeypatch):
@@ -816,8 +844,8 @@ def test_overt_bearer_np_is_a_first_class_key(monkeypatch):
     got = _ground(monkeypatch, (("server", "devbox"),), [
         # two separate alias-ANY probes run (naming keys, then bearer NPs): route on PARAMS
         ("alias = ANY", lambda p: [(_E1,)] if "server" in (p[0] or []) else []),
-        ("WHERE preference_source = 'user_stated'", []),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", []),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], text="il mio server si chiama DevBox")
     # the bearer-key probe runs with 'server' in the params and hits E1
     assert got and got["entity_id"] == _E1, got
@@ -834,7 +862,7 @@ def test_holder_gate_is_keyed_on_the_alias_table_not_facts(monkeypatch):
     import src.api.main as M
     src_text = inspect.getsource(M._ground_prodrop_bearer)
     assert "FROM facts" not in src_text, "the door still reads the empty facts lane"
-    assert "preference_source = 'user_stated'" in src_text
+    assert "preference_source IN ('user_stated', 'rel_default')" in src_text
 
 
 def test_speaker_flattened_door_requires_strict_prodrop_frames(monkeypatch):
@@ -843,8 +871,8 @@ def test_speaker_flattened_door_requires_strict_prodrop_frames(monkeypatch):
     gate (bearer-EMPTY frames) declines, and the speaker binding stands."""
     got = _ground(monkeypatch, (("server", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], require_prodrop_frames=True,
        text="il mio server si chiama DevBox")
     assert got is None
@@ -855,8 +883,8 @@ def test_strict_prodrop_frames_still_ground(monkeypatch):
     fires exactly on the pro-drop signature."""
     got = _ground(monkeypatch, (("", "devbox"),), [
         ("alias = ANY", []),
-        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
-        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
     ], require_prodrop_frames=True)
     assert got and got["entity_id"] == _E1, got
 
@@ -892,12 +920,13 @@ def test_alias_schema_invariant_the_door_reads_what_ingest_writes():
     for col in ("entity_id", "alias", "is_preferred", "preference_source"):
         assert re.search(rf"^\s*{col}\s+", block, re.M), (col, block[-400:])
     # and the door must key on THAT table, by name, in its holder/held gates - and read
-    # the user_stated trust marker the SCALAR alias lane stamps (the ingest write seam's
-    # own given-name signal), never the empty facts-table naming rows
+    # the naming provenance pair the ingest write seam stamps (user_stated for the
+    # owned-definite given name, rel_default for the naming chain's scalar-identity
+    # stamp - round 4.2, measured live), never the empty facts-table naming rows
     import inspect
     src_text = inspect.getsource(M._ground_prodrop_bearer)
     assert src_text.count("entity_aliases") >= 3, src_text
-    assert "preference_source = 'user_stated'" in src_text, src_text[-600:]
+    assert "preference_source IN ('user_stated', 'rel_default')" in src_text, src_text[-600:]
 
 
 def test_bearer_grounding_flag_defaults_on():

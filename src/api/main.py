@@ -16032,9 +16032,11 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         pref_name/also_known_as FACTS rows exist on any it seat): (a) entities stored under
         the turn's naming content (the asserted name, the extracted old value, the
         retraction's object) and the frame bearer NPs; (b) the naming bearers proper —
-        entities holding a `preference_source = 'user_stated'` alias row (measured live:
-        every GIVEN name lands user_stated — apollo/devbox/fraggle — while head nouns, L4
-        type labels and provisioning rows are unspecified/inferred/rel_default/provisioned).
+        entities holding a naming alias row, preference_source IN ('user_stated',
+        'rel_default') (round 4.2, measured live: the OWNED-DEFINITE given name lands
+        user_stated — seat a's apollo — while the indefinite 'una gatta che si chiama
+        Fraggle' naming lands rel_default — seat b's fraggle; head nouns, L4 labels and
+        provisioning rows are unspecified/inferred/provisioned and stay excluded).
         Alias-content hits that hold NO user_stated row are statement-lane ghosts (the
         MCP harvest's own pre-correct mint — see the drop site below), not rivals; a
         rival is a DIFFERENT given-name holder (refused by uniqueness) or an in-turn
@@ -16042,14 +16044,14 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
       • AGREEMENT GATE — an extracted old value (when the turn really states one — the
         corrector's "old_name" schema placeholder is normalized to unstated) must be an
         alias of the candidate (the turn says what the bearer is called TODAY), and the
-        bearer must hold a user_stated label
-        (there must be a GIVEN name to supersede — an entity known only by its head noun is
-        a first mention, the FOSS-011 guard's territory, never a silent mint).
+        bearer must hold a naming label (user_stated or the naming chain's rel_default —
+        round 4.2; there must be a GIVEN name to supersede — an entity known only by its
+        head noun is a first mention, the FOSS-011 guard's territory, never a silent mint).
       • UNIQUENESS — exactly ONE candidate survives, else None (0 or >1 → today's
         clarification path; ambiguity is never resolved by guessing).
 
     Returns ``{entity_id, rel, old_name, name, bearer_np}`` (``rel`` = pref_name when the
-    bearer's user_stated label is preferred, else also_known_as — the alias bridge's own
+    bearer's naming label is preferred, else also_known_as — the alias bridge's own
     rule) or ``None``. Read-only: indexed entity_aliases probes only. Caller (POST
     /retract/correct) uses the result to aim the EXISTING tested write lanes — the SCALAR
     pref_name/also_known_as branch for corrections; a bearer-naming clarification for
@@ -16101,29 +16103,49 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             if cands and _bearer_hits and not (cands & _bearer_hits):
                 return None  # rival referents: the name content and the bearer disagree
             cands |= _bearer_hits
-        # The naming bearers proper: entities holding a USER-STATED alias row — a given
-        # name this seat's user actually spoke (the alias-model label; see the docstring).
+        # The naming bearers proper: entities holding a NAMING alias row — a name this
+        # seat's user actually spoke. Two sources carry it (ALIAS-PROVENANCE-DESIGN):
+        # user_stated (a preferred/preference-signalled given name) and rel_default (the
+        # naming chain's scalar-identity stamp — 'una gatta che si chiama Fraggle' writes
+        # fraggle|rel_default, measured live seat 6e11d1b2; only the OWNED-DEFINITE shape
+        # reaches user_stated). Head nouns are 'unspecified', L4 labels 'inferred',
+        # provisioning rows 'provisioned' — none of those is a given name.
         cur.execute(
             "SELECT DISTINCT entity_id FROM entity_aliases "
-            "WHERE preference_source = 'user_stated'", ())
+            "WHERE preference_source IN ('user_stated', 'rel_default')", ())
         _holders = {r[0] for r in cur.fetchall() if r[0]}
-        # Statement-lane GHOSTS: the MCP's intent-independent harvest mints the turn's
-        # asserted name as a STANDALONE entity (alias row rel_default/unspecified, zero
-        # committed facts) BEFORE /retract/correct runs — measured live 2026-10-18, seat
-        # 6e11d1a1: POST /ingest committed=0 (scalar-filtered) yet entity 51079beb with
-        # devbox|rel_default existed by the time the door ran. Such a hit is NOT a rival
-        # referent — it is the double-write's own residue. Drop it. A genuine rival is a
-        # DIFFERENT GIVEN-NAME holder, and two given-name holders still refuse at the
-        # uniqueness count below; the bearer-NP rivalry check above is untouched (an
-        # in-turn bearer NP that resolves elsewhere IS the turn naming another referent).
-        _ghosts = {c for c in cands if c not in _holders}
-        if _ghosts and _holders:
-            cands -= _ghosts
-            log.info("correct_fact.prodrop_statement_ghost_dropped",
-                     ghosts=sorted(str(g)[:8] for g in _ghosts),
-                     note="alias-content hits with no user_stated row are the MCP "
-                          "harvest's own pre-correct mint, not a rival referent")
+        _content_hits = set(cands)  # name-content hits only; bearer-NP hits are never ghosts
         cands |= _holders
+        # Statement-lane GHOSTS — identified STRUCTURALLY, not by preference_source: the
+        # MCP's intent-independent harvest mints the turn's asserted name as a standalone
+        # entity whose ONLY alias is the name itself (measured live 2026-10-18, seat
+        # 6e11d1a1: entity 51079beb, alias devbox|rel_default|not-preferred, zero facts,
+        # minted by POST /ingest committed=0 moments before /retract/correct ran). A
+        # legitimate bearer always co-holds its head-noun/type aliases (seat 6e11d1b2's
+        # gatta holds {gatta, fraggle}), so an entity whose whole alias set is the asserted
+        # name(s) — all rel_default, none preferred — is the double-write's own residue,
+        # not a rival referent: drop it. A genuine rival is a different NAMING holder, and
+        # two naming holders still refuse at the uniqueness count below; the bearer-NP
+        # rivalry check above is untouched (an in-turn bearer NP that resolves elsewhere
+        # IS the turn naming another referent).
+        if _content_hits:
+            cur.execute(
+                "SELECT entity_id, alias, is_preferred, preference_source FROM entity_aliases "
+                "WHERE entity_id = ANY(%s)", (sorted(_content_hits),))
+            _rows = cur.fetchall()
+            _by_entity: dict = {}
+            for _e, _a, _p, _s in _rows:
+                _by_entity.setdefault(_e, []).append((str(_a).lower(), bool(_p), _s))
+            _ghosts = {e for e, rows in _by_entity.items()
+                       if rows and all(a in {n.lower() for n in names} and not p
+                                       and s == "rel_default" for a, p, s in rows)}
+            if _ghosts:
+                cands -= _ghosts
+                log.info("correct_fact.prodrop_statement_ghost_dropped",
+                         ghosts=sorted(str(g)[:8] for g in _ghosts),
+                         note="alias-content hit whose only alias is the asserted name "
+                              "(rel_default, not preferred) is the MCP harvest's own "
+                              "pre-correct mint, not a rival referent")
         # AGREEMENT GATE (corrections): an extracted old value must be an alias of the
         # candidate.
         if not is_retraction and old_value and str(old_value).strip() and cands:
@@ -16143,7 +16165,7 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         # by its head noun has nothing real to rename (a first mention: decline).
         cur.execute(
             "SELECT alias, is_preferred FROM entity_aliases "
-            "WHERE entity_id = %s AND preference_source = 'user_stated' "
+            "WHERE entity_id = %s AND preference_source IN ('user_stated', 'rel_default') "
             "ORDER BY is_preferred DESC LIMIT 1", (entity_id,))
         _row = cur.fetchone()
         if not _row or not _row[0]:
