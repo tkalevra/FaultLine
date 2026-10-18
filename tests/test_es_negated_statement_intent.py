@@ -221,8 +221,16 @@ _ling = pytest.mark.skipif(
     reason="spaCy linguistic layer unavailable (SPACY_MODEL unset) — no real parse",
 )
 
+# FOSS-012 critic round 2: the EN-twin real-parse pins need an EN model — under an
+# es-model process parsing English they go RED, not skipped. Skip-with-reason.
+_en_real = pytest.mark.skipif(
+    not (linguistics_available() and (ling_mod._SPACY_MODEL or "").startswith("en_core")),
+    reason=("needs an en_core model loaded — an es-model process parsing English "
+            "does not carry the Penn negation arcs this pin reads (skip-with-reason)"),
+)
 
-@_ling
+
+@_en_real
 def test_en_twin_sentence_real_parse_carries_the_sentential_shape():
     """en scores "I do not use port 9004 on any server." STATEMENT — the target outcome.
     The REAL parser must agree the shape is sentential (no nominal-pole scope)."""
@@ -556,9 +564,10 @@ def test_en_twin_real_parse_scope_is_byte_identical_across_the_ud_arm():
     """The UD arm must not move the EN twin: "not" carries the Penn neg arc (fires in the
     unchanged arm); no token of the twin parse satisfies the UD arm (advmod/obl + closed-
     class negator lemma + verb governor), so the twin's scope facts are the pre-arm facts.
-    Skips without a model — the twin's no-model coverage lives in the decision pins."""
-    if not linguistics_available():
-        pytest.skip("SPACY_MODEL unset — en twin covered by the no-model pins")
+    Skips without a model AND under an es-model process — the twin's no-model
+    coverage lives in the decision pins."""
+    if not (linguistics_available() and (ling_mod._SPACY_MODEL or "").startswith("en_core")):
+        pytest.skip("needs an en_core model — en twin covered by the no-model pins")
     scopes = analyze_negation_scopes(_EN_TWIN)
     assert scopes, "the en twin lost its Penn-neg scope"
     assert all(s.cue_text.lower() == "not" for s in scopes), repr(scopes)

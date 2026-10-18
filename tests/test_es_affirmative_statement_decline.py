@@ -342,11 +342,18 @@ def test_hand_es_parse_nonverbal_frame_yields_none(monkeypatch):
     assert analyze_first_person_present_statement("Correction: uso el puerto.") is None
 
 
-@_ling
+_en_real = pytest.mark.skipif(
+    not (linguistics_available() and (ling_mod._SPACY_MODEL or "").startswith("en_core")),
+    reason=("needs an en_core model loaded — an es-model process parsing English "
+            "does not carry the Person=1 PronType=Prs subject morphology this pin "
+            "reads (skip-with-reason, never red)"))
+
+
+@_en_real
 def test_en_twin_real_parse_carries_the_subject_shape():
     """The en twin through the REAL parser: explicit "I" subject (Person=1 PronType=Prs)
-    + Tense=Pres root. Skips without a model — the twin's no-model coverage is the
-    hand-built _en_shape decision pin."""
+    + Tense=Pres root. Skips without a model AND under an es-model process — the
+    twin's no-model coverage is the hand-built _en_shape decision pin."""
     shape = analyze_first_person_present_statement(_EN_TWIN)
     assert shape is not None
     assert shape.subject_is_first_person is True, repr(shape)
@@ -400,8 +407,11 @@ def _classify(text, label_desc, confidence, scopes, directive, monkeypatch,
     from src.extraction import linguistics as ling
     monkeypatch.setattr(ling, "analyze_negation_scopes", lambda t: scopes)
     monkeypatch.setattr(ling, "analyze_directive", lambda t: directive)
-    if shape is not None:
-        monkeypatch.setattr(ling, "analyze_first_person_present_statement", lambda t: shape)
+    # UNCONDITIONAL: every decision pin pins the shape the decision sees — including
+    # shape=None. Conditional stubbing made test_no_shape_facts_* vacuous wherever a
+    # real es model loads (the REAL analyzer found a shape and the decline fired in
+    # the "no shape" pin). The real-parse pins below call classify_intent directly.
+    monkeypatch.setattr(ling, "analyze_first_person_present_statement", lambda t: shape)
     monkeypatch.setattr(main, "_turn_matches_grown_correction_cue",
                         lambda text, user_id=None: grown_hit)
     monkeypatch.setattr(main, "_repair_frame", lambda text, user_id=None: repair_frame)
@@ -621,7 +631,8 @@ def test_es_real_parse_negated_twin_still_vetoes_not_declines(
         {"text": "No uso el puerto 9004 en ningún servidor."}, user_id="foss012-user-01",
         model=_fake_gliner(_CORRECTION_DESC, 0.9)))
     assert resp == {"intent": "STATEMENT", "confidence": 0.95}, repr(resp)
-    stats = main._INTENT_LAYER_STATS.get("test-use", {})
+    # the classifier writes the layer counter under user_id[:8] — "foss012-" here.
+    stats = main._INTENT_LAYER_STATS.get("foss012-", {})
     assert stats.get("negated_statement_veto", 0) >= 1
     assert stats.get("affirmative_statement_decline", 0) == 0
 

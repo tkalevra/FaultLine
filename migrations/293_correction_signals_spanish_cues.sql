@@ -26,9 +26,20 @@
 --     SIL cessative-aspect class the en floor implements (Freed 1979; NGLE §37.3 for
 --     the deixar de + inf construction). Complement shapes ride the description column
 --     (the same one-value-per-row keyed-map convention migrations 117/272 use).
---     PARAR is DELIBERATELY NOT seeded: it is the polysemous es "stop" (NGLE records
---     the locative "parar en casa") and the en floor excludes "stop" for exactly that
---     polysemy — seeding it would trade the screen's precision for two fixtures.
+--     PARAR is DELIBERATELY NOT seeded (owner-visible note, FOSS-012 critic round 2):
+--     it is the polysemous es "stop" (NGLE records the locative "parar en casa").
+--     CORRECTION of an earlier claim here: the en floor does NOT exclude "stop" — it
+--     seeds stop with the xcomp_progressive-ONLY shape, so the polysemy is handled by
+--     SHAPE RESTRICTION ("stopped drinking" admits, "stopped the car" does not), not
+--     by exclusion. The shape rail CAN therefore disambiguate parar the same way
+--     ("paro de fumar" xcomp_progressive vs "paré el coche" direct_object), and seeding
+--     parar=xcomp_progressive is the stop-mirroring option. It is still not seeded
+--     HERE, on measured grounds: the es removal turns observed on this stack express
+--     cessation through dejar/abandonar/cesar, and the sm parser's unstable ROOT choice
+--     (measured live: "Uso la ip…" roots "servidor") makes an additional member pure
+--     surface risk with no observed removal to admit. Seeding parar=xcomp_progressive
+--     remains an OWNER CALL, not silently taken — the same discipline the en floor's
+--     stop row itself records.
 --
 -- Consumers (all LIVE on this branch): main.py::_turn_matches_grown_correction_cue and
 -- main.py::_cessative_shape_admitted (the FOSS-012 decline screens); _tenant_correction_signals
