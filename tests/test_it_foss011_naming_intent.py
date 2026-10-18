@@ -931,6 +931,95 @@ def test_alias_schema_invariant_the_door_reads_what_ingest_writes():
     assert "preference_source IN ('user_stated', 'rel_default')" in src_text, src_text[-600:]
 
 
+# ── ROUND 5: the door's candidates are scoped by THE TURN'S OWN CONTENT ────────────
+# The round-4 holders probe was SEAT-WIDE: on a seat with >=2 named entities the
+# cands-union-holders merged them and candidate_uniqueness refused EVERY pro-drop
+# naming turn (the critic's seat-B reach finding: the retraction fell to the ENTITY
+# lane's no-op 'corrected, facts_superseded=0'). Content binds; holders fill only the
+# pure-pro-drop vacuum, ghost-stripped, and only when they are UNIQUE.
+
+_E3 = "33333333-3333-3333-3333-333333333333"
+
+
+def test_multientity_seat_turn_names_its_bearer(monkeypatch):
+    """PIN (i) — THE CRITIC'S SEAT-B SHAPE: two named entities (DevBox-server E1 +
+    gatta E2) on one seat; the retraction 'dimentica che ho un server che si chiama
+    DevBox.' names ITS bearer through the frame's own content (the asserted name AND
+    the bearer NP both hit E1). The door OPENS (grounds E1 -> the caller clarifies
+    naming the bearer) instead of the ENTITY-lane no-op. RED at 05a485b8: the
+    seat-wide holders union merged E1+E2 and uniqueness refused."""
+    got = _ground(monkeypatch, (("server", "devbox"),), [
+        ("alias = ANY", [(_E1,)]),  # devbox key AND the 'server' bearer NP both hit E1
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
+        ("entity_id = ANY", [(_E1, "devbox", True, "user_stated"),
+                             (_E1, "server", False, "inferred")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("devbox", True)]),
+    ], is_retraction=True, object_to_negate="devbox",
+       text="dimentica che ho un server che si chiama devbox")
+    assert got and got["entity_id"] == _E1, got
+    assert got["rel"] == "pref_name" and got["old_name"] == "devbox", got
+    assert got["bearer_head"] == "server", got
+
+
+def test_multientity_seat_other_entity_shape_unchanged(monkeypatch):
+    """PIN (ii) — the OTHER named entity's shape on the same multi-entity seat: the
+    gatta/Fraggle retraction keeps grounding the gatta (its own content: the asserted
+    name and the bearer NP both hit the gatta), byte-identical to its single-seat
+    behavior."""
+    got = _ground(monkeypatch, (("gatta", "fraggle"),), [
+        ("alias = ANY", [(_E2,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
+        ("entity_id = ANY", [(_E2, "gatta", True, "unspecified"),
+                             (_E2, "fraggle", False, "rel_default")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("fraggle", False)]),
+    ], is_retraction=True, object_to_negate="fraggle",
+       text="dimentica che ho una gatta che si chiama fraggle")
+    assert got and got["entity_id"] == _E2, got
+    assert got["rel"] == "also_known_as" and got["old_name"] == "fraggle", got
+    assert got["bearer_head"] == "gatta", got
+
+
+def test_pure_prodrop_single_holder_still_grounds(monkeypatch):
+    """PIN (iii) — single-holder byte-identical: the pure pro-drop turn (content hits
+    NOTHING real) falls back to the seat's UNIQUE naming holder, exactly the round-4
+    flagship shape and route."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,)]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("apollo", True)]),
+    ], old_value="old_name")
+    assert got and got["entity_id"] == _E1, got
+    assert got["rel"] == "pref_name" and got["old_name"] == "apollo", got
+
+
+def test_pure_prodrop_two_holders_still_shut(monkeypatch):
+    """PIN (iii, negative arm) — a pure pro-drop turn on a TWO-named-entity seat
+    (content hits nothing real): the holders fallback finds TWO naming holders and
+    stays shut — the door never guesses across a multi-named seat."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
+    ], old_value="old_name")
+    assert got is None
+
+
+def test_inscope_ambiguity_still_refused(monkeypatch):
+    """PIN (iv) — genuine IN-SCOPE ambiguity: the turn's own content matches TWO
+    entities' aliases (both hold devbox). Content binds, uniqueness sees two, the door
+    stays shut — clarifies without guessing. (Guard pin: green at the parent too — the
+    refusal it pins is the behavior that must SURVIVE the scoping.)"""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", [(_E1,), (_E2,)]),
+        ("WHERE preference_source IN ('user_stated', 'rel_default')", [(_E1,), (_E2,)]),
+        ("entity_id = ANY", lambda p: [(_E1, "devbox", True, "user_stated"),
+                                       (_E1, "server", False, "inferred"),
+                                       (_E2, "devbox", False, "rel_default"),
+                                       (_E2, "gatta", True, "unspecified")]),
+        ("AND preference_source IN ('user_stated', 'rel_default')", [("devbox", True)]),
+    ])
+    assert got is None
+
+
 def test_bearer_grounding_flag_defaults_on():
     """The kill-switch ships ON (FOSS-015 is the documented fix direction); OFF = round-2
     behaviour byte-for-byte."""

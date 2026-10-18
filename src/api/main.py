@@ -16115,7 +16115,7 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             "WHERE preference_source IN ('user_stated', 'rel_default')", ())
         _holders = {r[0] for r in cur.fetchall() if r[0]}
         _content_hits = set(cands)  # name-content hits only; bearer-NP hits are never ghosts
-        cands |= _holders
+        _ghosts: set = set()
         # Statement-lane GHOSTS — identified STRUCTURALLY, not by preference_source: the
         # MCP's intent-independent harvest mints the turn's asserted name as a standalone
         # entity whose ONLY alias is the name itself (measured live 2026-10-18, seat
@@ -16139,12 +16139,31 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
                        if rows and all(a in {n.lower() for n in names} and not p
                                        and s == "rel_default" for a, p, s in rows)}
             if _ghosts:
-                cands -= _ghosts
                 log.info("correct_fact.prodrop_statement_ghost_dropped",
                          ghosts=sorted(str(g)[:8] for g in _ghosts),
                          note="alias-content hit whose only alias is the asserted name "
                               "(rel_default, not preferred) is the MCP harvest's own "
                               "pre-correct mint, not a rival referent")
+        # ROUND 5 (the reach finding): the candidate set is scoped by THE TURN'S OWN
+        # CONTENT. When the naming frame's asserted name, the old values / retraction
+        # objects or the frame's bearer NPs touch real entity/ies, THAT is the candidate
+        # set — the seat-wide naming holders DO NOT join. The union was the round-4
+        # single-seat convenience and the round-5 wound: on a seat with >=2 named
+        # entities it merged them and candidate_uniqueness refused EVERY pro-drop
+        # naming turn, dropping the retraction into the ENTITY lane's no-op. An entity
+        # the turn's content does not touch is not a candidate.
+        _content_kept = _content_hits - _ghosts
+        if _content_kept:
+            cands = _content_kept
+        else:
+            # PURE PRO-DROP: the turn's content hit nothing real (nothing at all, or
+            # only statement-lane ghosts — the harvest's own pre-correct mints). The
+            # discourse-given bearer may still be the seat's UNIQUE naming holder:
+            # holders join ONLY there, ghost-stripped. A single holder is unambiguous
+            # (byte-identical to the single-named-seat behavior); 0 or >=2 holders stay
+            # shut — the turn carries no signal to pick between them, and uniqueness
+            # below never guesses.
+            cands = _holders - _ghosts
         # The bearer's HEAD-NOUN label (the non-name alias, e.g. gatta beside fraggle) -
         # the retraction clarification names THE BEARER, not the name twice (round 4.3:
         # 'Fraggle is a name of Fraggle' read redundant). Filled from the audit rows the
