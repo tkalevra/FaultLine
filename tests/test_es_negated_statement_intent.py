@@ -93,12 +93,12 @@ def _plain_statement_directive():
 
 def _structural_denial_scope():
     """NegationScope over a NOMINAL complement with two referential poles —
-    "mi gata no es Fraggle": the ensemble/CORRECTION lane's shape, never vetoed."""
+    "mi gata no es Luna": the ensemble/CORRECTION lane's shape, never vetoed."""
     return NegationScope(
         cue_text="no",
         head_text="es",
         predicate_text="es",
-        scope_text="mi gata no es Fraggle",
+        scope_text="mi gata no es Luna",
         predicates_nominal=True,
         two_referential_poles=True,
         clause_terminated=False,
@@ -306,7 +306,7 @@ def test_affirmative_control_still_reaches_ingest_as_statement(_routed, monkeypa
 
 def test_structural_denial_lean_still_reaches_the_correction_lane(_routed, monkeypatch):
     """A nominal/two-pole denial keeps today's route — the veto only owns sentential."""
-    resp = _classify("Mi gata no es Fraggle.", _RETRACTION_DESC, 0.9,
+    resp = _classify("Mi gata no es Luna.", _RETRACTION_DESC, 0.9,
                      [_structural_denial_scope()], _plain_statement_directive(), monkeypatch)
     assert resp["intent"] == "RETRACTION", resp
 
@@ -368,7 +368,7 @@ def test_subgate_structural_denial_still_escalates_to_the_correction_lane(
     whose negation is the NOMINAL/two-pole denial shape (not the veto's) still routes
     through INTENT_ADJUDICATION exactly as before."""
     calls = _escalation_recorder(monkeypatch)
-    resp = _classify("Mi gata no es Fraggle.", _CORRECTION_DESC, 0.63,
+    resp = _classify("Mi gata no es Luna.", _CORRECTION_DESC, 0.63,
                      [_structural_denial_scope()], _plain_statement_directive(), monkeypatch)
     assert resp["intent"] == "CORRECTION", (
         f"the escalation lane changed for non-veto shapes: {resp}"
@@ -404,7 +404,7 @@ def test_subgate_affirmative_correction_lean_declines_foss012(_routed, monkeypat
 # ── ROUND 3 (re-critic): the grammar layer itself — REAL es parses, no fake scopes ──
 # The round-2 reds could never catch the live-inert veto: every pin faked the scopes
 # (unit) or the GLiNER2 model (endpoint), and the only real-parse pin was the EN twin.
-# Measured live on es_core_news_sm (critic, image 2f99d05f): analyze_negation_scopes
+# Measured live on es_core_news_sm (critic, image dev-ref): analyze_negation_scopes
 # ("No uso el puerto 9004 en ningun servidor.") returned scopes=[] because the cue-
 # acceptance was Penn-neg-only while the shipped es models attach the negator as
 # ADV/advmod DIRECTLY on the verb. The UD sentential-negator arm in

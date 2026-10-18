@@ -1,16 +1,16 @@
 """FOSS-009 es pin: a pet name files as the PREFERRED label and renders in recall.
 
-On es 761cf914, "Mi gata se llama Fraggle y tiene 3 anos." filed the name as a plain
+On the es release head, "Mi gata se llama Luna y tiene 3 anos." filed the name as a plain
 also_known_as (altLabel): the alias registered NON-preferred and the recall display
 resolver (preferred-alias-first, dead-name prevention) kept rendering the type noun
 ("Gata tiene 3 anos ... You have a pet that is Gata") - "Como se llama mi gata?" was
 unanswerable from a store that held the answer. en files the same construction as
-pref_name (preferred_label) and renders "your cat preferred name is fraggle".
+pref_name (preferred_label) and renders "your cat preferred name is luna".
 
 The fix aligns the es naming chain: the non-kin leg of _chain_es_pronominal_naming
 files (named-thing, pref_name, name, preferred_label=True) - ingest then registers the
 alias PREFERRED (pref_name => is_pref=True, user_stated source, registry rank) and
-every recall lane names the entity Fraggle.
+every recall lane names the entity Luna.
 
 Pins run WITHOUT an es model: the naming-chain pins drive the REAL chain through
 derive_sentence_facts on a hand-built UD es Doc (the test_es_inc1 technique - no
@@ -92,11 +92,11 @@ def _hand_es_doc(words, pos, deps, heads, lemmas=None):
     return doc
 
 
-def _build_es_fraggle_doc():
-    """Hand-built UD parse of "Mi gata se llama Fraggle y tiene 3 anos." (lang_ == es).
+def _build_es_luna_doc():
+    """Hand-built UD parse of "Mi gata se llama Luna y tiene 3 anos." (lang_ == es).
     The same construction the gauntlet battery drives through es_core_news_md."""
     return _hand_es_doc(
-        ["Mi", "gata", "se", "llama", "Fraggle", "y", "tiene", "3", "anos", "."],
+        ["Mi", "gata", "se", "llama", "Luna", "y", "tiene", "3", "anos", "."],
         ["DET", "NOUN", "PRON", "VERB", "PROPN", "CCONJ", "VERB", "NUM", "NOUN", "PUNCT"],
         ["det", "nsubj", "expl:pv", "ROOT", "obj", "cc", "conj", "nummod", "obj", "punct"],
         [1, 3, 3, 3, 3, 3, 3, 8, 6, 3],
@@ -106,18 +106,18 @@ def _build_es_fraggle_doc():
 
 @_spaCy
 def test_es_naming_chain_files_the_pet_name_as_pref_name(monkeypatch):
-    """THE fixture-equivalent capture pin: "Mi gata se llama Fraggle ..." derives
-    (gata, pref_name, fraggle) with preferred_label=True and NO also_known_as twin."""
+    """THE fixture-equivalent capture pin: "Mi gata se llama Luna ..." derives
+    (gata, pref_name, luna) with preferred_label=True and NO also_known_as twin."""
     monkeypatch.setattr(m, "_SPACY_MODEL", "es_core_news_md")
-    monkeypatch.setattr(m, "_nlp", lambda text: _build_es_fraggle_doc())
+    monkeypatch.setattr(m, "_nlp", lambda text: _build_es_luna_doc())
     monkeypatch.setattr(m, "_naming_verbs",
                         lambda: frozenset({"llamar", "llamarse", "llama"}))
     facts = m.derive_sentence_facts(
-        "Mi gata se llama Fraggle y tiene 3 anos.", _REF, None)
+        "Mi gata se llama Luna y tiene 3 anos.", _REF, None)
     naming = [(f.subject, f.rel_type, f.object) for f in facts
               if f.rel_type in ("pref_name", "also_known_as")]
-    assert ("gata", "pref_name", "fraggle") in naming, f"facts={facts}"
-    assert ("gata", "also_known_as", "fraggle") not in naming, f"facts={facts}"
+    assert ("gata", "pref_name", "luna") in naming, f"facts={facts}"
+    assert ("gata", "also_known_as", "luna") not in naming, f"facts={facts}"
     pref = [f for f in facts if f.rel_type == "pref_name"][0]
     assert getattr(pref, "preferred_label", False), f"name not the prefLabel: {facts}"
 
@@ -190,19 +190,19 @@ def test_preferred_alias_is_the_display_name():
     """The recall display resolver names the entity by its PREFERRED alias - the
     registry row the pref_name/preferred_label write produces."""
     from src.api.main import resolve_display_name, resolve_entity_display
-    db = _FakeDB([("fraggle", None)])
-    assert resolve_display_name(_UUID, db) == "fraggle"
-    assert resolve_entity_display(_UUID, set(), {_UUID: "fraggle"}, db) == "fraggle"
+    db = _FakeDB([("luna", None)])
+    assert resolve_display_name(_UUID, db) == "luna"
+    assert resolve_entity_display(_UUID, set(), {_UUID: "luna"}, db) == "luna"
 
 
-def test_rendered_recall_answer_contains_the_name_fraggle():
+def test_rendered_recall_answer_contains_the_name_luna():
     """THE work-order pin, at the render seam: the entity the walk reaches for
-    "Como se llama mi gata?" resolves to Fraggle once the name is the preferred
+    "Como se llama mi gata?" resolves to Luna once the name is the preferred
     alias (the type noun "Gata" only renders when NO preferred alias exists)."""
     from src.api.main import resolve_display_name
     # Preferred present (post-fix registry state): the name renders.
-    db_pref = _FakeDB([("fraggle", "Fraggle"), (False,)])
-    assert resolve_display_name(_UUID, db_pref) == "Fraggle"
+    db_pref = _FakeDB([("luna", "Luna"), (False,)])
+    assert resolve_display_name(_UUID, db_pref) == "Luna"
     # Regression mirror (pre-fix registry state): a NON-preferred-only entity still
     # falls back to the alias (documents the old hole was display, not storage).
     db_nonpref = _FakeDB([None, ("gata", None)])

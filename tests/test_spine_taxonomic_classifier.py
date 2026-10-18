@@ -82,9 +82,9 @@ def test_classifier_construction_builds_subclass_ladder(text, child, parent, cla
 # ── NEGATIVE: plain "X is a Y" (no classifier) stays the instance_of / naming path ──────────────
 
 def test_plain_named_instance_stays_instance_of():
-    facts = m.derive_sentence_facts("Fraggle is a dog.", _REF)
+    facts = m.derive_sentence_facts("Luna is a dog.", _REF)
     tr = _triples(facts)
-    assert ("fraggle", "instance_of", "dog") in tr, tr
+    assert ("luna", "instance_of", "dog") in tr, tr
     assert not any(f.rel_type == "subclass_of" for f in facts), tr
 
 

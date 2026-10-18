@@ -219,7 +219,7 @@ _CORRECTIVE_ALT_EXCLUDED_POS: frozenset = frozenset({
 # vocabulary proper name in that slot is tagged ADJ and attached ``acomp`` instead of PROPN/``attr``,
 # and the mis-tag tracks the NAME TOKEN, not the frame — "my {sister,mother,dog,colleague}'s name is
 # Marlow" is ``acomp``/ADJ in ALL FOUR while the same four with Caryl/Renata/Rex/Kate/Bob/Sarah/
-# Zephyrine/Nora/Priya/Susan/Fraggle are ``attr``/PROPN in all four; "my name is Marlow" is
+# Zephyrine/Nora/Priya/Susan/Luna are ``attr``/PROPN in all four; "my name is Marlow" is
 # ``acomp``/ADJ too. A complement scan filtered to attr/oprd/dobj/obj therefore drops the WHOLE
 # construction for those names — silently, with no error: the chain simply declines and every fact
 # in the turn is lost. (Live: "Actually my sister's name is Marlow, not Nora." derived ZERO edges.)
@@ -937,7 +937,7 @@ def _copular_name_complement(copula):
             #   3. COMPLEMENT POS == PROPN — refuses the adjectives but also refuses real names
             #      (Juniper/Rosalind/Ugo tag ADJ here), which is how the arm reached zero net gain.
             #   4. NEUTRAL-FRAME RE-PARSE ("They were very X yesterday.") — tags Marlow, Carol and
-            #      Fraggle ADJ as well; 3 of 9 real names lost.
+            #      Luna ADJ as well; 3 of 9 real names lost.
             #   5. THE REJECTED ALTERNATIVE'S POS — separates "Marlow, not Nora" from "Greek, not
             #      Roman", but collapses the moment the alternative is itself a name: in
             #      "…is Greek, not Wrenna." the adjective and the name are byte-identical in dep,
@@ -5994,8 +5994,8 @@ def analyze_naming_all(text: str) -> list:
     ``NamingAnalysis`` (possibly empty) — the multi-construction sibling of ``analyze_naming``.
 
     A comma-and enumeration ("I have a dog named Rex, a snake named Slinky, and a cat named
-    Goose") contains ONE naming verb ("named"/"called") per conjunct, each modifying its OWN head
-    noun. The single-result ``analyze_naming`` returned only the FIRST, dropping Slinky/Goose. This
+    Miso") contains ONE naming verb ("named"/"called") per conjunct, each modifying its OWN head
+    noun. The single-result ``analyze_naming`` returned only the FIRST, dropping Slinky/Miso. This
     walks the SAME per-verb grammar (identical recovery rules), collecting one (head-noun, proper-
     name) pair for every naming verb that yields a valid pair. Subject-agnostic — the KIND is whatever
     common noun the verb modifies; this function makes NO entity-typing or rel-type decision.
@@ -6553,8 +6553,8 @@ def _bound_name_for_type(type_tok, _naming):
       (4) INVERSE COPULA — the mirror of (3): the type is the POSSESSED ``attr``/``oprd`` and the NAME
                          is the ``nsubj`` ("Nora is my wife"). Gated on 1st-person possession.
       (5) COPULA TYPE-PREDICATE — a DETERMINER-introduced predicate nominal is a second, narrower TYPE
-                         for the instance the possessed subject NP already names ("My dog Fraggle is a
-                         morkie" → morkie binds to Fraggle).
+                         for the instance the possessed subject NP already names ("My dog Luna is a
+                         terrier mix" → terrier mix binds to Luna).
 
     A determiner-introduced common-noun complement is never a name (it's a type) in branches (1)–(4);
     branch (5) inverts that reading deliberately — there the determiner is what identifies the TYPE,
@@ -6637,7 +6637,7 @@ def _bound_name_for_type(type_tok, _naming):
     #     transitive naming construction "name/call/dub <X> <Name>" whose object complement spaCy tags
     #     ``oprd`` ("object predicate"; see spaCy glossary — https://github.com/explosion/spaCy glossary.py).
     #     CASING-ROBUST, mirroring the copula branch (3) below: en_core_web_sm tags a LOWERCASE name
-    #     ("apollo"/"fraggle"/"whiskers") as NOUN, not PROPN, so a PROPN-ONLY match silently dropped every
+    #     ("apollo"/"luna"/"whiskers") as NOUN, not PROPN, so a PROPN-ONLY match silently dropped every
     #     lowercase named instance on the possessed form ("I have a server named apollo") — the diagnosed
     #     drop. Accept a PROPN complement always, and a NOUN complement too: the naming construction leaves
     #     no ambiguity — the post-naming-verb object-predicate complement IS the name regardless of its POS
@@ -6759,11 +6759,11 @@ def _bound_name_for_type(type_tok, _naming):
                     except Exception:  # noqa: BLE001
                         pass
                     return c, "copula_inverse"
-    # (5) COPULA TYPE-PREDICATE ON AN ALREADY-NAMED SUBJECT — "My dog Fraggle is a morkie": the
+    # (5) COPULA TYPE-PREDICATE ON AN ALREADY-NAMED SUBJECT — "My dog Luna is a terrier mix": the
     #     predicate nominal is a SECOND, more specific type for the instance the subject NP already
     #     names. Without this the breed bound to NOTHING and the attribute-scalar chain read the whole
     #     clause as a possessed-attribute literal, minting the noun-as-relation junk (user, dog,
-    #     morkie) while the real (fraggle, instance_of, morkie) was never captured — the "a Cat named
+    #     terrier mix) while the real (luna, instance_of, terrier mix) was never captured — the "a Cat named
     #     <breed>" shape in the live store. The subject role must be 1st-person POSSESSED and carry the
     #     appositive PROPN NAME; the predicate nominal must be DETERMINER-INTRODUCED (that determiner
     #     is exactly what makes it a TYPE rather than a name — the inverse of branches (1)–(3)).
@@ -17979,10 +17979,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # per-noun rel like ticket_number). Step aside so only ONE has_reference_id edge is minted.
             if _identifier_context_binding(tok) is not None:
                 continue
-            # NAMED-INSTANCE TYPE-PREDICATE GUARD: "My dog Fraggle is a morkie" — "dog" is a bound
-            # TYPE (Fraggle is its appositive name), so the clause CLASSIFIES the named instance; it
+            # NAMED-INSTANCE TYPE-PREDICATE GUARD: "My dog Luna is a terrier mix" — "dog" is a bound
+            # TYPE (Luna is its appositive name), so the clause CLASSIFIES the named instance; it
             # is not a possessed-attribute literal keyed by the role noun. Without this the chain
-            # minted the noun-as-relation (user, dog, "morkie") — the breed filed as a value of a
+            # minted the noun-as-relation (user, dog, "terrier mix") — the breed filed as a value of a
             # "dog" attribute on the USER, while the named instance never received its type. The
             # named-instance chain owns it (``_bound_name_for_type`` branch (5) binds the predicate
             # nominal), so step aside — the established own-the-construction / suppress-twin pattern.
@@ -24478,7 +24478,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     def _chain_object_named_value(doc):
         # OBJECT NAMED-VALUE (G4 — LongMemEval dense-capture "the name is dropped"). A stated PROPER
         # NAME that identifies a common-noun THING — "a playlist called Summer Vibes", "a dog named
-        # Fraggle", "I named my project Phoenix", "my favorite restaurant is Nobu" — is the ANSWER to a
+        # Luna", "I named my project Phoenix", "my favorite restaurant is Nobu" — is the ANSWER to a
         # "what is the name of …" question, yet the SVO/possessive backbone keeps only the generic head
         # (playlist / dog / project / restaurant) and DROPS the name entirely. This chain recovers the
         # name and files it in the NAMING LAYER of the referent: (referent-type, also_known_as, Name).
@@ -24580,7 +24580,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     #   • "…attending various workshops and lectures, LIKE the workshop on 'Effective Time Management'
     #     at the local community center last Saturday." → the NAMED event VANISHED (only the two
     #     general edges survived; `derive_residue_uncovered` listed the lost tokens);
-    #   • "I have several pets, SUCH AS a dog named Fraggle."      → "several pets as dog"   (garbage)
+    #   • "I have several pets, SUCH AS a dog named Luna."      → "several pets as dog"   (garbage)
     #   • "I visited many museums INCLUDING the Louvre last April." → "many museums including louvre"
     # The corruption is ``_nominal_pp_complement`` folding the MARKER PP into the general NP's object
     # surface. The repair uses the SAME mechanism as the existing peeled-date exclusion: the marker
@@ -25040,7 +25040,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # "¿Cómo se llama mi gata?" was unanswerable from a store that HELD the
                 # answer. pref_name ⇒ ingest registers the alias PREFERRED (is_pref=True,
                 # user_stated source, the registry's own rank arbitration) and every
-                # recall lane names the entity Fraggle. THE HARD LINE unchanged: the name
+                # recall lane names the entity Luna. THE HARD LINE unchanged: the name
                 # is FILED on the entity in the alias layer, never classified into L4.
                 _emit(subject, "pref_name", proper, verb_tok=tok, obj_tok=name_tok,
                       subj_tok=subj_tok, preferred_label=True)
@@ -27175,7 +27175,7 @@ def analyze_first_person_present_statement(text: str):
                     verb = c
                     break
         if verb is None:
-            # es_core_news_sm ARTIFACT (measured live on the fl-eval-es stack,
+            # es_core_news_sm ARTIFACT (measured live on the the es eval stack stack,
             # SPACY_MODEL=es_core_news_sm): a SENTENCE-INITIAL 1sg form that doubles
             # as a noun tags PROPN — "Uso el puerto 9004 ..." roots on Uso/PROPN with
             # no Person/Tense at all (while "Tengo un perro" tags VERB Person=1 and

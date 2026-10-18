@@ -8,7 +8,7 @@
 -- One of those evidence screens is DB-GROWN (the house rail: the code carries no word
 -- list; lexical class members live in the database, public template -> copied into
 -- every tenant schema, grown per-tenant). The live read on the es eval stack
--- (fl-eval-es @ 74e03fd7, 2026-10-18) showed both stores below carry ENGLISH-ONLY
+-- (the es eval stack @ dev-ref, 2026-10-18) showed both stores below carry ENGLISH-ONLY
 -- seeds, so an es turn with a REAL correction marker had no row the screen could read:
 --
 --   • public.correction_signals: 12 rows, all en (migration 032). Seeded here with the

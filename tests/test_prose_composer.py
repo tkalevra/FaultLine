@@ -78,13 +78,13 @@ def test_named_instance_pet_you():
     out = _compose_object_clause(
         rel_type="has_pet",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"], "category": ""},
-        subject_name="you", object_name="fraggle",
+        subject_name="you", object_name="luna",
         object_id="11111111-1111-1111-1111-111111111111", object_is_uuid=True,
         named_type_name="dog",
         template="X has a pet that is Y", template_2p="You have a pet that is Y",
         subject_is_you=True,
     )
-    assert out == "you have a dog named fraggle"
+    assert out == "you have a dog named luna"
 
 
 def test_named_instance_server_you():
@@ -120,13 +120,13 @@ def test_bare_type_instance_of_drops_parenthetical():
     out = _compose_object_clause(
         rel_type="instance_of",
         rel_meta={"is_hierarchy_rel": True, "tail_types": ["ANY"], "category": ""},
-        subject_name="fraggle", object_name="dog",
+        subject_name="luna", object_name="dog",
         object_id="44444444-4444-4444-4444-444444444444", object_is_uuid=True,
         named_type_name=None,
         template="X is an instance of Y (type)", template_2p=None,
         subject_is_you=False,
     )
-    assert out == "fraggle is a dog"
+    assert out == "luna is a dog"
 
 
 def test_bare_type_instance_of_article_an():
@@ -460,26 +460,26 @@ def test_object_side_asymmetric_named_still_possessive():
         rel_type="has_pet",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"],
                   "category": "", "is_symmetric": False},
-        subject_name="you", object_name="fraggle",
+        subject_name="you", object_name="luna",
         object_id="cccccccc-cccc-cccc-cccc-cccccccccccc", object_is_uuid=True,
         named_type_name="dog",
         template="X has a pet that is Y", template_2p="You have a pet that is Y",
         subject_is_you=True,
     )
-    assert out == "you have a dog named fraggle"
+    assert out == "you have a dog named luna"
 
 
 # ── Post-pass (a): titlecase display slots ────────────────────────────────────
 def test_titlecase_names_only():
     out = _titlecase_display_slots(
-        "you have a dog named fraggle", ["fraggle"])
-    assert out == "you have a dog named Fraggle"
+        "you have a dog named luna", ["luna"])
+    assert out == "you have a dog named Luna"
 
 
 def test_titlecase_leaves_you_and_value():
     # "you" never in name_slots; scalar value not in name_slots → untouched.
     out = _titlecase_display_slots("you have a cat named goose", ["goose"])
-    assert out == "you have a cat named Goose"
+    assert out == "you have a cat named Miso"
     # multiple slots, longest-first (no partial corruption)
     out2 = _titlecase_display_slots(
         "sarah knows sarahjane", ["sarah", "sarahjane"])

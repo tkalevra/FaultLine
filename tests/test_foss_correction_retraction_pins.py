@@ -523,7 +523,7 @@ class Env:
 
 def _default_tenant():
     t = Tenant()
-    t.add_entity(GATA, "Animal", ["gata", "fraggle"])
+    t.add_entity(GATA, "Animal", ["gata", "luna"])
     t.add_entity(SERVIDOR, "Object", ["devbox", "servidor"])
     return t
 
@@ -718,7 +718,7 @@ def test_agreement_pin_retract_naming_gata_never_mutates_servidor(monkeypatch):
                   "object": "10.0.1.5", "action": "remove",
                   "dimension": "SCALAR", "confidence": 0.9}
     env = Env(monkeypatch, t, extraction, intent="RETRACTION")
-    out = env.post("olvida que tengo una gata que se llama Fraggle")
+    out = env.post("olvida que tengo una gata que se llama Luna")
 
     assert out["status"] == "no_match", out
     assert out.get("subject_uuid") == SERVIDOR, out   # resolved subject, named either way
@@ -852,7 +852,7 @@ def test_object_resolution_never_mints(monkeypatch):
 
 def _two_entity_seat_with_pet():
     """The live critic seat: the SPEAKER plus DevBox(10.0.1.10), and the speaker's
-    live (user, has_pet, gata['fraggle']) edge."""
+    live (user, has_pet, gata['luna']) edge."""
     t = _default_tenant()
     t.attributes.append(_attr(SERVIDOR, "has_ip", "10.0.1.10"))
     t.facts.append({"id": 3001, "subject_id": USER, "object_id": GATA,
@@ -865,7 +865,7 @@ def test_agreement_binds_retargeted_final_target(monkeypatch):
     gate exempts the speaker, then the SS4 axis rungs renamed has_pet -> has_ip (shared
     head) and re-targeted the tenant-unique holder — retiring DevBox.has_ip for a CAT
     sentence. The agreement discipline must bind the FINAL (subject, attribute): the
-    ungrounded rename/re-target refuses, and the sentence's REAL object (Fraggle, the
+    ungrounded rename/re-target refuses, and the sentence's REAL object (Luna, the
     speaker's actual pet edge) is what retires."""
     t = _two_entity_seat_with_pet()
     # the live shape: NO stated object (the retraction-extractor gave subject+rel only)
@@ -873,7 +873,7 @@ def test_agreement_binds_retargeted_final_target(monkeypatch):
                   "object": None, "action": "remove",
                   "dimension": "RELATIONAL", "confidence": 0.9}
     env = Env(monkeypatch, t, extraction, intent="RETRACTION")
-    out = env.post("Please forget that I have a cat named Fraggle.")
+    out = env.post("Please forget that I have a cat named Luna.")
 
     live_ip = [a for a in t.attributes
                if a["entity_id"] == SERVIDOR and a["attribute"] == "has_ip"
@@ -883,7 +883,7 @@ def test_agreement_binds_retargeted_final_target(monkeypatch):
                 if f["subject_id"] == USER and f["rel_type"] == "has_pet"
                 and not f["superseded_at"]]
     assert not live_pet, (
-        "the sentence DOES name Fraggle: the speaker's own has_pet edge is the intent "
+        "the sentence DOES name Luna: the speaker's own has_pet edge is the intent "
         "and must retire")
     assert t.mint_calls == [], t.mint_calls
 
@@ -907,7 +907,7 @@ def test_retarget_refusal_when_nothing_grounds(monkeypatch):
 
 def test_relational_object_must_ground(monkeypatch):
     """DEFECT B (live-measured): 'Forget that my unicorn has wings.' matched the live
-    (user, has_pet, fraggle) edge on (subject, rel) alone — zero sentence-token
+    (user, has_pet, luna) edge on (subject, rel) alone — zero sentence-token
     grounding of the object — and superseded it. The relational leg must ground the
     matched object: unicorn/wings ground nothing stored -> no_match, nothing written."""
     t = _two_entity_seat_with_pet()
@@ -946,7 +946,7 @@ def test_relational_object_grounding_disambiguates(monkeypatch):
     live = [(f["object_id"]) for f in t.facts
             if f["subject_id"] == USER and f["rel_type"] == "has_pet"
             and not f["superseded_at"]]
-    assert live == [GATA], f"only Rex retires; Fraggle survives: {live}"
+    assert live == [GATA], f"only Rex retires; Luna survives: {live}"
 
 
 def test_turn_window_boundary_14min(monkeypatch):
@@ -993,7 +993,7 @@ def test_lane_mint_detection_uses_pre_mint_set(monkeypatch):
     assert out["status"] == "failed", out
     assert GATA in t.entities, "a pre-existing entity must survive a lane refusal"
     gata_aliases = [a for a, ent in t.aliases.items() if ent == GATA]
-    assert set(gata_aliases) == {"gata", "fraggle"}, t.aliases
+    assert set(gata_aliases) == {"gata", "luna"}, t.aliases
     assert t.mint_calls == [], t.mint_calls
 
 

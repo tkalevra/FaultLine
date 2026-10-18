@@ -140,7 +140,7 @@ def test_bare_year_on_a_date_rel_still_derives_age():
     with patch.object(M, "_rel_meta", return_value={}):
         out2 = M._annotate_date_derivation(
             {"source": "attributes", "object": "2020-04-03", "rel_type": "born_in"},
-            "Fraggle was born in 2020-04-03")
+            "Luna was born in 2020-04-03")
     assert "(age " in out2, out2
 
 

@@ -1,12 +1,12 @@
 """FOSS-012 es pin: a plain first-person present-tense AFFIRMATIVE statement never
 enters the correction lane.
 
-On es 761cf914 (and base-identical on foss-fix/es 74e03fd7), remember_facts("Uso el
+On the es release head (and base-identical on the engine branch), remember_facts("Uso el
 puerto 9004 en el servidor principal.") classified CORRECTION@0.845 — GLiNER2-native,
 gate-PASSED (0.845 > 0.70), layer=gliner2_native — so the MCP drove /retract/correct,
 the failed-correction lane answered "Incomplete correction — relationship type not
 identified" (isError=true) and captured NOTHING in-turn. Re-measured end-to-end live on
-fl-eval-es @ 74e03fd7 (2026-10-18, seat c28d095f): the turn answers as a FAILED
+the es eval stack @ dev-ref (2026-10-18, seat see-dev-bug-docs): the turn answers as a FAILED
 correction, is retained verbatim in episodic_log (source=mcp, intent=CORRECTION) with
 ZERO queryable rows (facts=0, staged_facts=0), and recall of the port is empty for at
 least the 10-minute measured window — the only recovery path is the hourly
@@ -27,7 +27,7 @@ decline sits in classify_intent ABOVE gate + escalation routing (the veto's hois
 discipline) so both routes see it, and it is bound to CORRECTION only — a RETRACTION
 lean and every marked/contrastive/negated/removal shape keep today's route.
 
-Red-check: at 74e03fd7 this file fails at import (the decision, the analyzer, the
+Red-check: at dev-ref this file fails at import (the decision, the analyzer, the
 flag and the layer name do not exist).
 """
 from __future__ import annotations
@@ -129,7 +129,7 @@ def _clean_directive(lemma="usar"):
 
 def test_bug_sentence_facts_decline_the_correction_lean():
     """THE fix: zero evidence + Person=1 Present declarative → the CORRECTION lean
-    demotes to STATEMENT. Red at 74e03fd7 (the decision does not exist)."""
+    demotes to STATEMENT. Red at dev-ref (the decision does not exist)."""
     assert _affirmative_statement_declines_correction(
         _clean_directive(), _person1_pres_shape(), False, False, False) is True
 
@@ -426,7 +426,7 @@ def test_gatepassed_bug_sentence_declines_to_statement(_routed, monkeypatch):
     """THE bug, end-to-end at the classification seam: GLiNER2 CORRECTION@0.845
     (gate-passed, the live-measured score) on the affirmative statement comes back
     STATEMENT@0.95 — ingest gets the fact, /retract/correct never sees it. Red at
-    74e03fd7: the endpoint returned CORRECTION."""
+    dev-ref: the endpoint returned CORRECTION."""
     resp = _classify(_BUG_SENTENCE, _CORRECTION_DESC, 0.845,
                      [], _clean_directive(), monkeypatch, shape=_person1_pres_shape())
     assert resp == {"intent": "STATEMENT", "confidence": 0.95}, (
@@ -641,7 +641,7 @@ def test_es_real_parse_negated_twin_still_vetoes_not_declines(
 
 
 def test_hand_es_parse_initial_propon_artifact_rescues(monkeypatch):
-    """THE MEASURED sm ARTIFACT (fl-eval-es, SPACY_MODEL=es_core_news_sm): the battery
+    """THE MEASURED sm ARTIFACT (the es eval stack, SPACY_MODEL=es_core_news_sm): the battery
     sentence roots on Uso/PROPN — no Person/Tense. When _reads_as_first_person_verb
     re-lemmatizes the ROOT (the same rescue the subject-agreement repair uses), the
     shape facts are that 1sg-present paradigm. Stubbed here (no model in this env);

@@ -102,8 +102,8 @@ def test_product_released_common_noun_subject():
 
 @requires_model
 def test_pet_born_date_on_name():
-    f = _facts("My dog Fraggle was born in 2020.")
-    assert _find(f, "fraggle", "born") and _find(f, "fraggle", "born")[0][2] == "2020"
+    f = _facts("My dog Luna was born in 2020.")
+    assert _find(f, "luna", "born") and _find(f, "luna", "born")[0][2] == "2020"
 
 
 @requires_model
@@ -147,8 +147,8 @@ def test_possessive_predication_rejects_passive_participle_complement():
 @requires_model
 def test_genitive_copula_date_attribute_on_owner():
     # "<owner>'s <noun> is <date>" → a dated scalar named by the noun, on the owner (not the noun/month)
-    f = _facts("Fraggle's birthday is March 3, 2020.")
-    bd = _find(f, "fraggle", "birthday")
+    f = _facts("Luna's birthday is March 3, 2020.")
+    bd = _find(f, "luna", "birthday")
     assert bd and bd[0][2] == "2020-03-03" and bd[0][4] == "date"
     # NO month/day junk: "March" is never an entity, "3" is never an age
     assert not [x for x in f if x[0] == "march" or x[2] == "march"]
@@ -157,8 +157,8 @@ def test_genitive_copula_date_attribute_on_owner():
 
 @requires_model
 def test_have_noun_of_date_on_subject():
-    f = _facts("Fraggle has a birthday of March 3, 2020.")
-    assert any(s == "fraggle" and r == "birthday" and o == "2020-03-03"
+    f = _facts("Luna has a birthday of March 3, 2020.")
+    assert any(s == "luna" and r == "birthday" and o == "2020-03-03"
                for s, r, o, _e, _d in f)
 
 
@@ -181,7 +181,7 @@ def test_first_person_date_attribute_binds_to_user():
 @requires_model
 def test_dateless_attribute_reference_invents_nothing():
     # "X's birthday is a happy day" carries NO date → the date-value chain fires NOTHING (no fabrication)
-    f = _facts("Fraggle's birthday is a happy day.")
+    f = _facts("Luna's birthday is a happy day.")
     assert not any(d == "date" for _s, _r, _o, _e, d in f)  # no dated scalar emitted
 
 

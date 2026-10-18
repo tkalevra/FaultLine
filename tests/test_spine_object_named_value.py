@@ -1,7 +1,7 @@
 """Unit tests for the OBJECT NAMED-VALUE chain (G4 — LongMemEval dense-capture "the name is dropped").
 
 THE GAP (cluster ``dense-capture-single-fact``): a stated PROPER NAME that identifies a common-noun
-THING — "a playlist called Summer Vibes", "a dog named Fraggle", "my favorite restaurant is Nobu",
+THING — "a playlist called Summer Vibes", "a dog named Luna", "my favorite restaurant is Nobu",
 "I named my project Phoenix" — is the ANSWER to a "what is the name of …" question, yet the
 SVO/possessive backbone kept only the generic head (playlist / dog / restaurant / project) and DROPPED
 the name entirely. ``_chain_object_named_value`` recovers the name and files it in the NAMING LAYER of
@@ -57,7 +57,7 @@ def _name_captured(sentence, referent, name):
          "playlist", "summer vibes"),
         ("I created a playlist called Summer Vibes.", "playlist", "summer vibes"),
         # naming-verb "named" appositive — animal (a different domain, same construction).
-        ("I have a dog named Fraggle.", "dog", "fraggle"),
+        ("I have a dog named Luna.", "dog", "luna"),
         ("I adopted a cat named Whiskers.", "cat", "whiskers"),
         # copula identity — "my favorite <thing> is <PROPN>".
         ("My favorite restaurant is Nobu.", "favorite restaurant", "nobu"),
