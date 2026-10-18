@@ -16035,10 +16035,14 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         entities holding a `preference_source = 'user_stated'` alias row (measured live:
         every GIVEN name lands user_stated — apollo/devbox/fraggle — while head nouns, L4
         type labels and provisioning rows are unspecified/inferred/rel_default/provisioned).
-        When two probes return DIFFERENT, non-intersecting entities, they are rival
-        referents → refuse.
-      • AGREEMENT GATE — an extracted old value must be an alias of the candidate (the turn
-        says what the bearer is called TODAY), and the bearer must hold a user_stated label
+        Alias-content hits that hold NO user_stated row are statement-lane ghosts (the
+        MCP harvest's own pre-correct mint — see the drop site below), not rivals; a
+        rival is a DIFFERENT given-name holder (refused by uniqueness) or an in-turn
+        bearer NP resolving elsewhere (refused at the bearer probe).
+      • AGREEMENT GATE — an extracted old value (when the turn really states one — the
+        corrector's "old_name" schema placeholder is normalized to unstated) must be an
+        alias of the candidate (the turn says what the bearer is called TODAY), and the
+        bearer must hold a user_stated label
         (there must be a GIVEN name to supersede — an entity known only by its head noun is
         a first mention, the FOSS-011 guard's territory, never a silent mint).
       • UNIQUENESS — exactly ONE candidate survives, else None (0 or >1 → today's
@@ -16071,6 +16075,12 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         log.info("correct_fact.prodrop_door_shut", reason="overt_bearer_frames")
         return None  # the bearer is IN the text: the speaker binding may be right — not ours
     _name = names[0]
+    # The corrector LLM's SCHEMA PLACEHOLDER for an unnamed old value — measured live
+    # (extraction old='pref_name=old_name', seat 6e11d1a1, 2026-10-18). It is not user
+    # content: treating it as a stated old value would key the probes with the literal
+    # string and fail the agreement gate on every pro-drop turn.
+    if old_value and str(old_value).strip().lower() in ("old_name", "old name"):
+        old_value = None
     try:
         _keys = {_name}
         for _v in (old_value, object_to_negate):
@@ -16097,8 +16107,22 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
             "SELECT DISTINCT entity_id FROM entity_aliases "
             "WHERE preference_source = 'user_stated'", ())
         _holders = {r[0] for r in cur.fetchall() if r[0]}
-        if cands and _holders and not (cands & _holders):
-            return None  # rival referents: the alias content and the given-name holder
+        # Statement-lane GHOSTS: the MCP's intent-independent harvest mints the turn's
+        # asserted name as a STANDALONE entity (alias row rel_default/unspecified, zero
+        # committed facts) BEFORE /retract/correct runs — measured live 2026-10-18, seat
+        # 6e11d1a1: POST /ingest committed=0 (scalar-filtered) yet entity 51079beb with
+        # devbox|rel_default existed by the time the door ran. Such a hit is NOT a rival
+        # referent — it is the double-write's own residue. Drop it. A genuine rival is a
+        # DIFFERENT GIVEN-NAME holder, and two given-name holders still refuse at the
+        # uniqueness count below; the bearer-NP rivalry check above is untouched (an
+        # in-turn bearer NP that resolves elsewhere IS the turn naming another referent).
+        _ghosts = {c for c in cands if c not in _holders}
+        if _ghosts and _holders:
+            cands -= _ghosts
+            log.info("correct_fact.prodrop_statement_ghost_dropped",
+                     ghosts=sorted(str(g)[:8] for g in _ghosts),
+                     note="alias-content hits with no user_stated row are the MCP "
+                          "harvest's own pre-correct mint, not a rival referent")
         cands |= _holders
         # AGREEMENT GATE (corrections): an extracted old value must be an alias of the
         # candidate.

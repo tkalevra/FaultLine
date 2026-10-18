@@ -733,13 +733,45 @@ def test_agreement_gate_accepts_when_old_value_is_held(monkeypatch):
 
 
 def test_rival_probes_decline(monkeypatch):
-    """Alias content names one entity, the given-name holder is a DIFFERENT one -> rival
-    referents -> None (never guess between them)."""
-    got = _ground(monkeypatch, (("", "devbox"),), [
-        ("alias = ANY", [(_E1,)]),
-        ("WHERE preference_source = 'user_stated'", [(_E2,)]),
-    ])
+    """RIVAL means the turn's OWN two references disagree: the asserted name hits one
+    entity while the in-turn BEARER NP resolves to a DIFFERENT one -> None (never guess
+    between them). Round 4.1 (live, seat 6e11d1a1): a name-content hit with NO user_stated
+    row is NOT a rival - it is the MCP intent-independent harvest's own pre-correct mint
+    (POST /ingest committed=0, entity + rel_default alias still written) - so that shape now
+    GROUNDS to the holder (see the ghost pin); only bearer-NP rivalry still refuses here."""
+    got = _ground(monkeypatch, (("server", "devbox"),), [
+        ("alias = ANY", lambda p: [(_E1,)] if "devbox" in (p[0] or []) else [(_E2,)]),
+    ], text="il server si chiama devbox")
     assert got is None
+
+
+def test_statement_ghost_alias_hit_grounds_to_the_holder(monkeypatch):
+    """THE LIVE b2 ROUTE (seat 6e11d1a1, 2026-10-18): the MCP's intent-independent
+    harvest mints the asserted name as a standalone entity (devbox|rel_default, zero facts)
+    BEFORE /retract/correct, so the door's key probe hits a GHOST. The ghost is the
+    double-write's own residue, not a rival referent: it is dropped and the turn grounds to
+    the unique given-name holder (apollo|user_stated) - the supersede lands on the real
+    server entity instead of parking at 'Old fact not found for subject change'."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", [(_E1,)]),  # devbox -> the harvest's ghost entity
+        ("WHERE preference_source = 'user_stated'", [(_E2,)]),  # apollo's entity
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+    ], old_value="old_name")  # the corrector LLM's schema placeholder, measured live
+    assert got and got["entity_id"] == _E2, got
+    assert got["rel"] == "pref_name" and got["old_name"] == "apollo", got
+
+
+def test_placeholder_old_value_never_blocks_the_agreement(monkeypatch):
+    """The corrector LLM fills the old-value slot with its SCHEMA PLACEHOLDER ('old_name')
+    on every pro-drop turn (measured live: extraction old='pref_name=old_name'). The
+    placeholder is not user content: the agreement gate must treat it as unstated, not
+    probe alias='old_name' (always empty) and die at uniqueness."""
+    got = _ground(monkeypatch, (("", "devbox"),), [
+        ("alias = ANY", []),
+        ("WHERE preference_source = 'user_stated'", [(_E1,)]),
+        ("AND preference_source = 'user_stated'", [("apollo", True)]),
+    ], old_value="old_name")
+    assert got and got["entity_id"] == _E1, got
 
 
 def test_no_given_name_label_declines(monkeypatch):
