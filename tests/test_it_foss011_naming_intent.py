@@ -836,6 +836,8 @@ def test_rel_default_naming_alias_is_a_given_name(monkeypatch):
        text="dimentica che ho una gatta che si chiama fraggle")
     assert got and got["entity_id"] == _E1, got
     assert got["rel"] == "also_known_as" and got["old_name"] == "fraggle", got
+    # round 4.3: the clarification names THE BEARER, not the name twice
+    assert got["bearer_head"] == "gatta", got
 
 
 def test_overt_bearer_np_is_a_first_class_key(monkeypatch):

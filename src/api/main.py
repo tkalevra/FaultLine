@@ -16128,13 +16128,12 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
         # two naming holders still refuse at the uniqueness count below; the bearer-NP
         # rivalry check above is untouched (an in-turn bearer NP that resolves elsewhere
         # IS the turn naming another referent).
+        _by_entity: dict = {}  # alias rows per content-hit entity (empty when no audit ran)
         if _content_hits:
             cur.execute(
                 "SELECT entity_id, alias, is_preferred, preference_source FROM entity_aliases "
                 "WHERE entity_id = ANY(%s)", (sorted(_content_hits),))
-            _rows = cur.fetchall()
-            _by_entity: dict = {}
-            for _e, _a, _p, _s in _rows:
+            for _e, _a, _p, _s in cur.fetchall():
                 _by_entity.setdefault(_e, []).append((str(_a).lower(), bool(_p), _s))
             _ghosts = {e for e, rows in _by_entity.items()
                        if rows and all(a in {n.lower() for n in names} and not p
@@ -16146,6 +16145,14 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
                          note="alias-content hit whose only alias is the asserted name "
                               "(rel_default, not preferred) is the MCP harvest's own "
                               "pre-correct mint, not a rival referent")
+        # The bearer's HEAD-NOUN label (the non-name alias, e.g. gatta beside fraggle) -
+        # the retraction clarification names THE BEARER, not the name twice (round 4.3:
+        # 'Fraggle is a name of Fraggle' read redundant). Filled from the audit rows the
+        # ghost check already fetched; corrections never read it.
+        _bearer_head = ""
+        for _e, rows in _by_entity.items():
+            if cands and _e == next(iter(cands)):
+                _bearer_head = next((a for a, p, s in rows if a not in {n.lower() for n in names}), "")
         # AGREEMENT GATE (corrections): an extracted old value must be an alias of the
         # candidate.
         if not is_retraction and old_value and str(old_value).strip() and cands:
@@ -16177,7 +16184,8 @@ def _ground_prodrop_bearer(cur, user_id: str, text: str, *, old_value=None,
                 "rel": rel,
                 "old_name": _row[0],
                 "name": _name,
-                "bearer_np": next((_b for _b, _n in frames if _b), "")}
+                "bearer_np": next((_b for _b, _n in frames if _b), ""),
+                "bearer_head": _bearer_head}
     except Exception:  # noqa: BLE001 — a probe failure leaves today's path byte-identical
         return None
 
@@ -60184,7 +60192,7 @@ def correct_fact(req: FactCorrectionRequest):
                               "lands on the SAME entity via the existing SCALAR "
                               "pref_name/also_known_as lane")
             elif _pd and is_retraction:
-                _pd_label = _pd.get("old_name") or _pd.get("name") or "that entity"
+                _pd_label = _pd.get("bearer_head") or _pd.get("old_name") or _pd.get("name") or "that entity"
                 log.info("correct_fact.prodrop_retraction_bearer_named",
                          user_id=req.user_id[:8],
                          bearer=str(_pd["entity_id"])[:8], label=_pd_label,
@@ -60691,7 +60699,7 @@ def correct_fact(req: FactCorrectionRequest):
                               "the SAME entity via the SCALAR pref_name/also_known_as "
                               "lane — the SUBJECT lane is never reached")
             elif _pd2 and is_retraction:
-                _pd2_label = _pd2.get("old_name") or _pd2.get("name") or "that entity"
+                _pd2_label = _pd2.get("bearer_head") or _pd2.get("old_name") or _pd2.get("name") or "that entity"
                 log.info("correct_fact.prodrop_retraction_bearer_named_speaker",
                          user_id=req.user_id[:8],
                          bearer=str(_pd2["entity_id"])[:8], label=_pd2_label,
