@@ -9278,18 +9278,25 @@ def _commit_staged(
 
     replay (kwarg, deferred-replay guard): True ONLY when this upsert is a re-send of an
     already-attempted body (the X-FL-Deferred-Replay header read in main.py::ingest). The
-    staged lane has TWO retirement mechanisms and the replay guard covers the one the
-    pre-existing FREEZE TOMBSTONE (WHERE deleted_at IS NULL, Phase 4) does not:
-      • deleted_at (correction-lane supersede via CORRECTION_SPANS_STAGED) — already
-        guarded: the WHERE clause skips the whole UPDATE, replay or not;
+    staged lane has TWO retirement mechanisms and the replay guard covers both:
+      • deleted_at (correction-lane supersede via CORRECTION_SPANS_STAGED, retract-lane
+        tombstones) — Phase 4 skipped the whole UPDATE for a deleted row replay OR NOT,
+        which ALSO froze a genuine user re-statement (the FOSS-014 silent-freeze class:
+        the verbatim path deduped into the frozen class without carrying the marker).
+        Since FOSS-014 the tombstone WHERE is replay-aware: a MARKED replay skips the
+        UPDATE (retirement freeze holds, the 2026-09-05 replay-resurrection wound stays
+        closed), a FRESH user_stated ingest reaches the DO UPDATE and un-retires
+        (deleted_at = NULL, count bump, fresh 30d expiry) — the same discipline the
+        facts-side CASE applies to superseded_at;
       • expires_at in the past (ENTITY_TYPE classification expiry, and expire_staged_facts)
-        — UNGUARDED before this: a replay re-extended expires_at +30d (RESURRECTING the
-        contradicted row) and bumped confirmed_count, which the B→facts promotion SELECT
-        does NOT expiry-filter (embedder.py::promote_staged_facts), so a replay could push
-        a contradicted row over the promotion threshold. On replay, an EXPIRED row keeps
-        its count and its past expiry. A LIVE row still bumps/extends normally (replay
-        freeze is not a promotion freeze), and a genuine re-statement (no marker)
-        resurrects an expired row as before — user-is-truth untouched.
+        — UNGUARDED before the replay guard: a replay re-extended expires_at +30d
+        (RESURRECTING the contradicted row) and bumped confirmed_count, which the B→facts
+        promotion SELECT does NOT expiry-filter (embedder.py::promote_staged_facts), so a
+        replay could push a contradicted row over the promotion threshold. On replay, an
+        EXPIRED row keeps its count and its past expiry (CASE guard unchanged). A LIVE row
+        still bumps/extends normally (replay freeze is not a promotion freeze), and a
+        genuine re-statement (no marker) resurrects an expired row as before —
+        user-is-truth untouched.
 
     CRITICAL: Confirmation Tracking via PostgreSQL ON CONFLICT UPSERT
     ─────────────────────────────────────────────────────────────────
@@ -9369,15 +9376,15 @@ def _commit_staged(
                     " ON CONFLICT (subject_id, object_id, rel_type)"
                     " DO UPDATE SET"
                     # DEFERRED-REPLAY GUARD (staged half): freeze applies ONLY to a row
-                    # that is ALREADY retired (expires_at in the past — deleted rows never
-                    # reach the UPDATE thanks to the FREEZE TOMBSTONE WHERE below) AND
-                    # only when this upsert is a re-send (replay=). A replay then keeps
-                    # the retired row's count and its past expiry: no resurrection, no
-                    # reinforcement (the B-promotion SELECT does not expiry-filter, so an
-                    # unguarded +1 could advance promotion of a contradicted row). A LIVE
-                    # row still bumps/extends on replay, and a genuine re-statement (no
-                    # marker) resurrects as before. Mirror of the facts-side CASE guards
-                    # in store.py::commit.
+                    # that is ALREADY retired (expires_at in the past — and, since FOSS-014,
+                    # deleted rows on a MARKED replay never reach the UPDATE thanks to the
+                    # replay-aware TOMBSTONE WHERE below) AND only when this upsert is a
+                    # re-send (replay=). A replay then keeps the retired row's count and its
+                    # past expiry: no resurrection, no reinforcement (the B-promotion SELECT
+                    # does not expiry-filter, so an unguarded +1 could advance promotion of a
+                    # contradicted row). A LIVE row still bumps/extends on replay, and a
+                    # genuine re-statement (no marker) resurrects as before. Mirror of the
+                    # facts-side CASE guards in store.py::commit.
                     "   confirmed_count = CASE"
                     "       WHEN staged_facts.expires_at <= now() AND %s"
                     "       THEN staged_facts.confirmed_count"
@@ -9410,11 +9417,25 @@ def _commit_staged(
                     # polarity; a later affirmed re-ingest of the SAME triple flips it back to
                     # 'affirmed' (the latest assertion wins, mirroring temporal_status). EXCLUDED
                     # carries this ingest's polarity verbatim.
-                    "   polarity = EXCLUDED.polarity"
-                    # FREEZE TOMBSTONE (Phase 4): a tombstoned row must NOT be resurrected /
-                    # have its expiry+counters reset by a re-ingest hit. Skip the UPDATE for it.
-                    "   WHERE staged_facts.deleted_at IS NULL",
-                    (subject, obj, rel_type, fact_class, prov, fact_prov, confidence, definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity, source_ref, bool(replay), bool(replay)),
+                    "   polarity = EXCLUDED.polarity,"
+                    # FOSS-014 UN-RETIRE (fresh) / FREEZE (replay): the DO UPDATE is reached
+                    # for a tombstoned row ONLY when the upsert is NOT a marked replay (the
+                    # WHERE below), so a plain NULL is a no-op on live rows and un-retires
+                    # the deleted row on a genuine user re-statement — the same discipline
+                    # the facts-side CASE applies to superseded_at (user-is-truth; the
+                    # paraphrase path already resurrected, the verbatim path must too). A
+                    # MARKED X-FL-Deferred-Replay never reaches it for a tombstoned row:
+                    # its freeze IS the WHERE (infra replays keep the retirement, the
+                    # 2026-09-05 replay-resurrection wound stays closed).
+                    "   deleted_at = NULL"
+                    # REPLAY-AWARE TOMBSTONE (FOSS-014; supersedes the Phase-4 blanket skip):
+                    # the UPDATE is skipped for a tombstoned row ONLY on a marked replay —
+                    # an infra re-send must not resurrect what a correction/retraction
+                    # retired. A FRESH user_stated ingest (no X-FL-Deferred-Replay marker)
+                    # reaches the DO UPDATE and un-retires (deleted_at = NULL above, count
+                    # bump + fresh 30d expiry) exactly like the paraphrase path already did.
+                    "   WHERE staged_facts.deleted_at IS NULL OR NOT %s",
+                    (subject, obj, rel_type, fact_class, prov, fact_prov, confidence, definition, storage_type, is_hierarchy_rel, taxonomies, temporal_status, event_date, event_date_granularity, polarity, source_ref, bool(replay), bool(replay), bool(replay)),
                 )
 
                 # Log confirmation tracking via ON CONFLICT UPSERT
@@ -29060,9 +29081,23 @@ def _idempotency_cached_facts_present(schema_name: Optional[str], cached_respons
     still physically exist in the tenant's `facts`/`staged_facts` rows. Any missing row →
     tenant diverged (wipe / cross-version payload) → caller must re-ingest.
 
-    Row existence is checked WITHOUT an archived_at/superseded_at filter on purpose: a wipe
-    deletes the row entirely (→ re-ingest), whereas a correction soft-deletes it but keeps
-    the row (→ trust the cache, never resurrect a corrected fact).
+    Row corroboration requires a LIVE row (FOSS-014): a `facts` copy must have
+    superseded_at/archived_at/deleted_at NULL, a `staged_facts` copy must have
+    deleted_at/promoted_at NULL. The pre-FOSS-014 validator checked existence WITHOUT a
+    retirement filter on the theory that "a correction soft-deletes but keeps the row →
+    trust the cache, never resurrect a corrected fact". Measured live (seat a4444444), that
+    froze a genuine user RE-STATEMENT: the verbatim repeat (same text → same idempotency
+    key) deduped against its own /retract/correct retraction — cache hit, the retired row
+    counted as "present", committed=N served, the store stayed retracted — while a
+    PARAPHRASE (different key) took the fresh path and resurrected. House doctrine is the
+    opposite: a fresh (unmarked) user re-statement ALWAYS resurrects; the X-FL-Deferred-Replay
+    freeze is for infra replays and lives at the store (store.py::commit CASE,
+    _commit_staged), which the bust now reaches — the replay marker decides
+    resurrect-vs-freeze there.
+
+    A retired row and an absent row both bust the cache; the two causes are logged apart
+    (ingest.idempotency_cache_row_retired vs ingest.idempotency_cache_row_absent) so the
+    expected FOSS-014 re-statement bust is visible and the wipe phantom stays loud.
 
     Only relational facts (object is a UUID surrogate) are validated — scalar attributes are
     not carried in the response `facts` list and scalar-only ingests already re-process today
@@ -29101,6 +29136,31 @@ def _idempotency_cached_facts_present(schema_name: Optional[str], cached_respons
         with conn.cursor() as cur:
             cur.execute(f"SET search_path TO {schema_name}")
             for (subj, obj, rt) in rel_keys:
+                # FOSS-014: the live-row probe. Trust the cache ONLY when the row it
+                # vouches for is still live — a retired copy (superseded / archived /
+                # deleted / promoted-away) means the cached "already stored" no longer
+                # holds, and serving the hit would dedupe a genuine user re-statement
+                # against its own retraction (the measured silent freeze). The bust
+                # sends the turn down the real ingest path where the replay marker
+                # decides: a fresh user_stated upsert un-retires (store.py CASE:
+                # superseded_at = NULL, confirmed_count continues), a marked
+                # X-FL-Deferred-Replay replay keeps the retirement freeze.
+                cur.execute(
+                    "SELECT 1 FROM facts "
+                    "WHERE subject_id = %s AND object_id = %s AND rel_type = %s "
+                    "  AND superseded_at IS NULL AND archived_at IS NULL AND deleted_at IS NULL "
+                    "UNION ALL "
+                    "SELECT 1 FROM staged_facts "
+                    "WHERE subject_id = %s AND object_id = %s AND rel_type = %s "
+                    "  AND deleted_at IS NULL AND promoted_at IS NULL "
+                    "LIMIT 1",
+                    (subj, obj, rt, subj, obj, rt),
+                )
+                if cur.fetchone() is not None:
+                    continue
+                # Both bust causes re-ingest; log them apart so the EXPECTED
+                # re-statement bust (retired — self-heals via the un-retiring upsert)
+                # is distinguishable from the wipe/cross-version phantom (absent).
                 cur.execute(
                     "SELECT 1 FROM facts "
                     "WHERE subject_id = %s AND object_id = %s AND rel_type = %s "
@@ -29110,10 +29170,13 @@ def _idempotency_cached_facts_present(schema_name: Optional[str], cached_respons
                     "LIMIT 1",
                     (subj, obj, rt, subj, obj, rt),
                 )
-                if cur.fetchone() is None:
+                if cur.fetchone() is not None:
+                    log.info("ingest.idempotency_cache_row_retired",
+                             schema=schema_name, rel_type=rt)
+                else:
                     log.info("ingest.idempotency_cache_row_absent",
                              schema=schema_name, rel_type=rt)
-                    return False
+                return False
         return True
     except Exception as e:
         log.warning("ingest.idempotency_state_check_failed",
@@ -29898,13 +29961,16 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                         reason="previous attempt stored 0 relational facts, re-processing")
             elif not await asyncio.to_thread(_idempotency_cached_facts_present, schema_name, cached_response):
                 # The cache claims relational facts persisted, but the tenant no longer
-                # holds those rows — the tenant was wiped/re-provisioned underneath a
-                # still-live Redis key (or the payload is cross-version). Bust and
-                # re-ingest rather than phantom-block a legitimate write.
+                # holds those rows LIVE — wiped/re-provisioned underneath a still-live
+                # Redis key (row absent) or the user retracted/corrected the fact after
+                # the original turn (row retired; FOSS-014: serving the hit froze a
+                # genuine verbatim re-statement). Bust and re-ingest rather than
+                # phantom-block a legitimate write; the replay marker decides
+                # resurrect-vs-freeze at the store.
                 log.info("ingest.idempotency_cache_busted_stale",
                         key=idempotency_key[:12],
                         user_id=req.user_id,
-                        reason="cached facts absent from tenant DB (wipe/cross-version), re-processing")
+                        reason="cached facts absent-or-retired from tenant DB (wipe/correction/retraction), re-processing")
             else:
                 log.info("ingest.idempotency_cache_hit",
                         key=idempotency_key[:12],
