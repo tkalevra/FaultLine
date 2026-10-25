@@ -1089,6 +1089,171 @@ CREATE INDEX IF NOT EXISTS idx_entity_synonyms_entity
     ON {schema_name}.entity_synonyms (entity_id);
 
 -- ============================================================================
+-- documents — per-tenant ASYNC document-ingestion registry.
+--   The flagship `ingest_document` lane chunks a doc, writes ONE pending row here
+--   (chunks retained verbatim in JSONB), and returns FAST. The re_embedder poll
+--   loop drains pending rows, runs the per-chunk hybrid extraction (deterministic
+--   spine FIRST + tenant-brain LLM /extract/rewrite for the sentences the spine
+--   dropped) through the WGM gate (source="mcp" → user_stated, durable), and flips
+--   status → 'ready'/'error'. Recall surfaces an honest "still processing" line
+--   while a document is pending, without blocking recall of already-ready facts.
+--   The chunks JSONB is the per-document verbatim safety net.
+-- Per-tenant: search_path has NO public, so this table MUST exist in every tenant
+--   schema. NO public seed — document rows are inherently user-specific.
+-- (migration 301 backfills this table into existing provisioned schemas)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS {schema_name}.documents (
+    id               BIGSERIAL   PRIMARY KEY,
+    user_id          TEXT        NOT NULL,
+    source_ref       TEXT,
+    title            TEXT,
+    chunks           JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    chunk_count      INTEGER     NOT NULL DEFAULT 0,
+    status           TEXT        NOT NULL DEFAULT 'pending',
+    chunks_failed    INTEGER     NOT NULL DEFAULT 0,
+    facts_committed  INTEGER     NOT NULL DEFAULT 0,
+    facts_staged     INTEGER     NOT NULL DEFAULT 0,
+    context_stored   INTEGER     NOT NULL DEFAULT 0,
+    truncated        BOOLEAN     NOT NULL DEFAULT false,
+    -- DOCLOSS part accounting (migration 195): an over-cap document is SEGMENTED across
+    -- consecutive rows instead of having its tail discarded. These say which slice of the
+    -- original document this row carries. Defaults = a legacy single-part document.
+    part_index       INTEGER     NOT NULL DEFAULT 0,
+    part_count       INTEGER     NOT NULL DEFAULT 1,
+    total_chunks     INTEGER     NOT NULL DEFAULT 0,
+    -- Bounded at-least-once redelivery: a brain-level outage re-pends the whole document;
+    -- `attempts` stops a permanently-sick document re-pending forever (terminates 'error').
+    attempts         INTEGER     NOT NULL DEFAULT 0,
+    -- The deferral-episode WALL CLOCK (migration 264): set at the first non-paced
+    -- brain-unavailable defer, cleared only on PROGRESS (terminal finalize or a
+    -- PRODUCTIVE deadline requeue whose owed count decreased; an unproductive
+    -- requeue keeps/stamps it, bounding the owed lane by the same episode — a claim
+    -- does NOT clear it: a claim is a pure DB write that succeeds mid-outage).
+    -- The terminal verdict
+    -- for a document that cannot make progress is measured on THIS (one continuous
+    -- episode, DOC_BRAIN_DEFER_MAX_AGE = 30 days, the system's own horizon for
+    -- unprocessed user content), never on the attempt count — a count is outage
+    -- duration sized by the drain interval, which killed innocent uploads ~5 minutes
+    -- into hours-long outages (95fb517b measured; the decision was deferred then).
+    brain_deferred_since TIMESTAMPTZ DEFAULT NULL,
+    -- R5 PARSER SEAM (migration 298): which parser produced the text in `chunks` —
+    -- naive_v1 (pdfplumber line-walk / raw pasted text) or docling_v1 (Docling CPU
+    -- layout-aware markdown, DOC_PARSER=docling). One row is one parser's output:
+    -- the stamp covers every chunk in the row and is the re-parse selection key.
+    -- The default is HONEST for legacy rows: that is what parsed them.
+    parser_version      TEXT        NOT NULL DEFAULT 'naive_v1',
+    -- PARALLEL per-chunk terminal ledger (migration 205). Maps a chunk INDEX to its terminal
+    -- state: {"7": {"s":"done","c":4,"g":1}} / {"7": {"s":"failed","a":3,"e":"..."}}.
+    -- A chunk with NO entry has no terminal state and is therefore still OWED — that, not a
+    -- counter, is what the parallel drain re-queues on reclaim. It is what makes a failed
+    -- chunk RE-MINABLE instead of burned into a terminal 'partial'. '{}' = no parallel drain
+    -- has run (the legacy lane never writes it).
+    chunk_state      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- ONTOLOGY-REGROWTH RE-MINE MARKS (migration 298 — the episodic_log migration-197
+    -- analog, DOCUMENT lane). A document whose chunks produced ZERO committed edges, or
+    -- that terminated 'partial', is re-minable against a GROWN ontology: the drain's
+    -- re-mine pass (remine_documents_prepass, DOC_REMINE_ENABLED — default OFF) re-queues
+    -- it through the NORMAL pipeline under the X-FL-Deferred-Replay replay marker.
+    --   reextract_ontology_mark  walkable-place count (_tenant_walkable_place_count:
+    --                            non-pending_placement rel_types + entity_taxonomies rows)
+    --                            at the moment this document was stamped into the re-mine
+    --                            cohort or actually re-mined. NULL = never stamped.
+    --   reextract_attempts       how many times this document was QUEUED for a re-mine
+    --                            pass — the consolidation-churn bound
+    --                            (DOC_REMINE_MAX_ATTEMPTS, default 3): a document that is
+    --                            uncastable in any ontology cannot bill forever.
+    -- Provenance is NEVER elevated by a re-mine: source stays 'document' (llm_inferred /
+    -- staged B), and the replay marker keeps a retired value retired.
+    reextract_ontology_mark BIGINT  DEFAULT NULL,
+    reextract_attempts      INTEGER NOT NULL DEFAULT 0,
+    -- KEYWORD-SEARCHABLE AT THE ENQUEUE COMMIT (migration 299, plan W2.1). Generated
+    -- keyword-search vector over the stub: title weight A, source_ref weight B, the
+    -- verbatim chunks (the 'simple' jsonb overload walks every chunk string). Recomputed
+    -- by the INSERT itself — no trigger, no drain involvement — so a document becomes
+    -- keyword-findable the instant this row commits, hours before extraction. Purely
+    -- derived: a pure function of the row's own columns. A hit on a 'pending' row is
+    -- VERBATIM TEXT ONLY — surfaces label the hit with `status` and never count it as
+    -- facts_committed. Query side stays the literal dumb walk:
+    --   WHERE stub_tsv @@ websearch_to_tsquery('simple', :q)
+    stub_tsv         TSVECTOR     GENERATED ALWAYS AS (
+        setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('simple', coalesce(source_ref, '')), 'B') ||
+        to_tsvector('simple', chunks)
+    ) STORED,
+    error            TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at       TIMESTAMPTZ DEFAULT NULL,
+    ready_at         TIMESTAMPTZ DEFAULT NULL
+);
+
+-- Partial index driving BOTH the worker drain and the recall not-ready probe.
+CREATE INDEX IF NOT EXISTS idx_documents_active
+    ON {schema_name}.documents (created_at) WHERE status IN ('pending', 'processing');
+
+-- Partial index driving the re-mine eligibility scan (migration 298): the ONLY cohort the
+-- re-mine pass re-opens is terminal rows with zero committed edges or a 'partial' verdict.
+-- Expressions MUST stay identical to the selector predicate in
+-- remine_documents_prepass (src/re_embedder/embedder.py) or the planner cannot use it.
+CREATE INDEX IF NOT EXISTS idx_documents_regrowth
+    ON {schema_name}.documents (created_at)
+    WHERE status IN ('ready', 'partial', 'error')
+      AND (facts_committed = 0 OR status = 'partial');
+
+-- The one access path the stub lane takes (migration 299): stub_tsv @@ query. GIN over
+-- ONE tsvector per document row — the chunk array folds into a single vector, so
+-- posting-list pressure stays low. Fastupdate pending-list caveat for corpus dumps:
+-- searches scan the pending list until vacuum folds it (gin.html §65.4.4.1); the drain
+-- already batches — tune gin_pending_list_limit per-index if a tenant ever bulk-dumps.
+CREATE INDEX IF NOT EXISTS idx_documents_stub_tsv
+    ON {schema_name}.documents USING GIN (stub_tsv);
+
+
+-- ============================================================================
+-- growth_work_queue — the DURABLE BREADCRUMB for brain-starved growth work
+-- (migration 300, gauntlet R8; mechanics in src/re_embedder/growth_work_queue.py)
+--
+-- WHAT THE LEDGER SAYS IS DUE but the tenant brain could not do (lane closed:
+-- rate-limited/circuit-broken/down) lands here instead of vanishing unrecorded.
+--   operation_type ∈ ('enrichment','synonym_convergence','whatis_climb','promotion',
+--                     'recall_miss_reexamine')   [R7: query-miss feedback]
+--   target_id      = the deferred subsystem name, or the staged_facts.id (as text)
+--                    for a Class-C promotion deferral; for recall_miss_reexamine
+--                    '{schema}:{document_id}:{chunk_index}' — the chunk a real
+--                    user's query surfaced after the graph walk missed
+--   priority       1(highest)..9 — drain order: promotion 2, recall_miss_reexamine 2
+--                   (recall-visible — a user asked), enrichment 5 (default),
+--                   synonym_convergence 6, whatis_climb 7
+--   completed_at   NULL = pending; stamped on a clean re-attempt; failures stay
+--                  pending (rate-limited retry, one drain attempt per cycle)
+--
+-- The partial unique keeps ONE pending row per (operation_type, target_id) — cycles
+-- of outage collapse onto one breadcrumb per deferred unit. NULL-safe COALESCE form
+-- (house style, same as uq_artefacts_identity) so a NULL target cannot dodge dedup.
+-- Completed rows are exempt from the unique and PRUNABLE. Pending rows are bounded
+-- (GROWTH_QUEUE_MAX, oldest evicted). This table gates nothing and replaces nothing
+-- — the sweep ledger stays the sole due-arbiter; drain-on-recovery is priority-first.
+-- No LLM in the queue mechanics. Per-tenant by construction (search_path, NO public).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS {schema_name}.growth_work_queue (
+    id             BIGSERIAL   PRIMARY KEY,
+    operation_type TEXT        NOT NULL,
+    target_id      TEXT,
+    priority       INTEGER     DEFAULT 5,
+    created_at     TIMESTAMPTZ DEFAULT now(),
+    completed_at   TIMESTAMPTZ
+);
+
+-- The hammering guard: no duplicate PENDING work for the same target.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_growth_work_pending
+    ON {schema_name}.growth_work_queue (operation_type, COALESCE(target_id, ''))
+    WHERE completed_at IS NULL;
+
+-- The drain's access path: pending, priority-first, oldest first.
+CREATE INDEX IF NOT EXISTS idx_growth_work_drain
+    ON {schema_name}.growth_work_queue (priority, created_at)
+
+
+-- ============================================================================
 -- episodic_log — durable, append-only, VERBATIM record of every ingest input,
 --   captured BEFORE extraction. When extraction is weak (short fragments,
 --   misrouted queries, no-triple ramblings) the original words are otherwise
