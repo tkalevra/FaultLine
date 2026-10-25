@@ -26,6 +26,11 @@ from src.api.llm_calls import (
     LLMModels,
 )
 from src.entity_registry.registry import preference_rank, EntityRegistry
+from src.api.db_read import release_read_transaction  # READ-BARRIER — no read transaction
+# may ride across a blocking seam (claim SELECTs vs tenant work)
+from src.api import llm_lane as _llm_lane  # background-lane declaration headers for backend HTTP
+from src.api import ingest_transport as _ingest_transport  # replay/lane markers on re-send POSTs
+from src.re_embedder import growth_work_queue  # durable breadcrumb for brain-starved growth (migration 300, gauntlet R8)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
@@ -62,6 +67,1093 @@ def _rollback_and_reapply_search_path(db_conn, schema_name: str) -> None:
 # .env.example. Empty when unset; the LOCAL fastembed CPU path needs no model name, and the
 # external-API fallback fail-safes (hash vector / None) rather than crashing the loop.
 _EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "").strip()
+
+
+
+
+# ── GROWTH / RECALL-UPLIFT SUPPORT (public-core port of the R6-R9 lane) ────────────────
+#
+# _BACKEND_LANE_HEADERS declares background-lane intent on HTTP calls the re_embedder
+# makes to the API (the API-side middleware may admit/defer by lane; an unmarked call
+# runs interactive). Kept with the ported R7/R9 machinery because the recall-miss
+# uplift's /ingest commit is exactly such a call.
+_BACKEND_LANE_HEADERS = {_llm_lane.LANE_HEADER: _llm_lane.LANE_BACKGROUND}
+
+# Connect-level exception types: the request was NEVER delivered (see
+# _is_backend_unreachable below for why the distinction carries this lane's
+# failure accounting).
+_UNREACHABLE_EXC_TYPES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_HTTPX_ERROR_TYPE = httpx.HTTPError
+
+# Env-tunable HTTP ceiling for the drain's backend /ingest commits.
+_DOC_INGEST_HTTP_TIMEOUT = float(os.getenv("DOC_INGEST_HTTP_TIMEOUT", "180"))
+
+
+def _is_backend_unreachable(exc: BaseException) -> bool:
+    """Did this exception mean WE NEVER REACHED THE BACKEND AT ALL?
+
+    Connect-level (refused / DNS / connect timeout / pool exhaustion) → the request
+    was never delivered. NOTHING was read, so this is not a property of the work
+    item — the correct response is a retry deferral, not a failure mark. Read-level
+    timeouts (request delivered, answer unknown) stay caller-scoped."""
+    if isinstance(exc, _UNREACHABLE_EXC_TYPES):
+        return True
+    if isinstance(exc, (ConnectionRefusedError, ConnectionError)) and not isinstance(
+            exc, _HTTPX_ERROR_TYPE):
+        return True
+    return False
+
+
+# Bracketed structural header line ("[Date: ...]", "[Session: ...]") — scaffolding,
+# never content.
+_DOC_HEADER_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
+
+
+def _lane_has_no_content(text: str) -> bool:
+    """True iff every non-blank line of `text` is a bracketed structural header.
+
+    Deterministic and content-free by construction: it asks only whether a line is
+    scaffolding, never what the line says."""
+    for line in (text or "").splitlines():
+        if line.strip() and not _DOC_HEADER_RE.match(line):
+            return False
+    return True
+
+
+# ── R8 GROWTH WORKSTACK — drain-on-recovery ────────────────────────────────────
+#
+# The re-attempt half of the durable breadcrumb (growth_work_queue.py is the pure-SQL
+# mechanics; THIS is the growth-loop half that knows how to run a deferred operation).
+# Each pending item's target_id names the deferred unit: a SUBSYSTEM (lane-gate
+# deferral — the deferred operation is that subsystem's bounded run for this tenant) or
+# a staged_facts.id (Class-C promotion's classify-before-promote half). The runners
+# below call the SAME bounded functions/queries the normal cycle calls — no second
+# implementation of any growth decision, no LLM in the queue mechanics.
+
+
+# ── R9 DETERMINISTIC-FIRST RECALL-MISS UPLIFT (spine + GLiNER2 BEFORE the brain) ─
+#
+# Owner ruling (binding, 2026-10-24): GLiNER2 + spaCy are the PRIMARY uplift mechanism
+# (deterministic, local, free); the BYO brain is the FALLBACK when deterministic
+# extraction genuinely can't parse — never the primary. R7's recall-miss
+# re-examination re-opened the chunk through the normal enrichment path (a backend
+# harvest TURN — brain-first billing even when the spine would have sufficed). For a
+# recall-miss chunk the query already told us the ANSWER IS IN THE CHUNK (the passage
+# lane hit it), so re-running a brain turn to re-discover what we already located
+# wastes budget. This section is the SENTENCE_PIPELINE discipline (spine primary,
+# rewrite fail-safe) applied to the uplift path: extraction runs IN-PROCESS on the
+# re_embedder (spaCy + a locally-loaded GLiNER2 — zero network, zero brain), and only
+# the COMMIT rides the normal /ingest door (same provenance router, same WGM gate,
+# same replay-marker retired-value freeze).
+
+# GLiNER2 model id — MUST mirror src/api/main.py's startup load (same weights, same
+# typing behaviour; a different id here would type the same sentence differently on
+# the two lanes and the deriver's convergence rule would flap).
+_RECALL_UPLIFT_GLINER2_MODEL_ID = "fastino/gliner2-base-v1"
+
+# Entity label set — MUST mirror _gliner2_entity_labels(source != "llm_learn") in
+# src/api/main.py (the constant default arm: concise, ≤6, no examples — Pitfall 11).
+_RECALL_UPLIFT_LABELS = ["Person", "Animal", "Organization", "Location", "Object", "Concept"]
+
+# Typing threshold — MUST mirror GLINER2_ENTITY_THRESHOLD in src/api/main.py,
+# including its FAULT-SAFE parse (main's _env_float falls back to 0.5 on a
+# non-numeric value; a bare float() here would crash the whole worker at import
+# on a config typo the backend itself survives).
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+_RECALL_UPLIFT_GLINER2_THRESHOLD = _env_float("GLINER2_ENTITY_THRESHOLD", 0.5)
+
+# A failed GLiNER2 load backs off for an hour (a download/model error must not be
+# retried every drain cycle); while backed off the deterministic pass runs SPINE-ONLY
+# (the deriver's own documented str fallback — thin-tag gap-fill, still zero brain).
+_RECALL_UPLIFT_GLINER2_RETRY_S = 3600.0
+_gliner2_model_cache = None          # the loaded model, or None while unloaded/failed
+_gliner2_failed_until = 0.0          # monotonic backoff gate after a load failure
+
+
+def _recall_uplift_gliner():
+    """The locally-loaded GLiNER2 for the deterministic uplift pass (lazy singleton).
+
+    Same weights as the backend's startup model; loaded ON the first recall-miss
+    uplift, cached for the process life. A load failure backs off (see above) and
+    returns None — the caller runs the spine WITHOUT entity typing (fail-safe
+    direction: less typing, never a brain call, never a crash)."""
+    global _gliner2_model_cache, _gliner2_failed_until
+    if _gliner2_model_cache is not None:
+        return _gliner2_model_cache
+    import time as _time
+    if _time.monotonic() < _gliner2_failed_until:
+        return None
+    try:
+        from gliner2 import GLiNER2
+        _gliner2_model_cache = GLiNER2.from_pretrained(_RECALL_UPLIFT_GLINER2_MODEL_ID)
+        log.info("recall_uplift.gliner2_ready "
+                 f"model={_RECALL_UPLIFT_GLINER2_MODEL_ID} (deterministic uplift typing enabled)")
+        return _gliner2_model_cache
+    except Exception as e:  # noqa: BLE001 — no model → spine-only pass, never a crash
+        _gliner2_failed_until = _time.monotonic() + _RECALL_UPLIFT_GLINER2_RETRY_S
+        log.warning(
+            "recall_uplift.gliner2_unavailable "
+            f"retry_s={_RECALL_UPLIFT_GLINER2_RETRY_S:.0f} error={type(e).__name__}: "
+            f"{str(e)[:120]} (deterministic uplift runs spine-only meanwhile)")
+        return None
+
+
+def _gliner2_type_doc(sdoc, gmodel, labels):
+    """Write GLiNER2's typed spans onto ONE parsed spaCy Doc — the ENTITY-TYPING
+    phase of src/api/main.py's ``_build_typed_doc``, mirrored here so the
+    re_embedder runs it in-process (importing src.api.main from a worker would
+    drag the whole FastAPI app into the drain process).
+
+    Mirrored mechanics (keep in sync with main.py::_build_typed_doc): the
+    ROUND-7 machine-value veto (``is_value_shape`` — a value is never an entity
+    span), the coordinated-surface split ("Mia, Theo" → two spans), exact
+    case-insensitive substring locate → ``char_span(contract)`` (never fuzzy),
+    longest-first overlap resolution, ``set_ents``. DELIBERATELY ABSENT: the
+    GLiNER2 RELATION pass (main.py writes ``doc._.rel``) — that phase needs the
+    tenant rel_type registry + DB reads; the spine deriver's SVO predicate covers
+    the deterministic uplift, and adding the relation pass here would duplicate
+    tenant-brain-adjacent machinery on the worker. A DRIFT CANARY lives in the
+    test suite (the typed-doc mirror pins the veto + split + longest-first
+    behaviours against the same fixtures main.py documents). Fail-safe: any
+    error → the Doc is returned untyped (deriver thin-tag gap-fill)."""
+    if sdoc is None or gmodel is None or not labels:
+        return sdoc
+    try:
+        res = gmodel.extract_entities(
+            sdoc.text, labels, threshold=_RECALL_UPLIFT_GLINER2_THRESHOLD,
+            include_confidence=True, max_len=2048)
+        ents = ((res or {}).get("entities") or {})
+        # normalize the confidence shape back to {label: [surface, ...]} (the
+        # consumer contract _gliner2_type_entities normalizes to in main.py)
+        ent_map: dict[str, list] = {}
+        for _label, _spans in (ents or {}).items():
+            for _sp in (_spans or []):
+                _txt = (_sp.get("text") if isinstance(_sp, dict) else _sp) or ""
+                _txt = str(_txt).strip()
+                if _txt:
+                    ent_map.setdefault(_label, []).append(_txt)
+        if not ent_map:
+            return sdoc
+        from src.extraction.value_shapes import is_value_shape
+        for _lbl in list(ent_map.keys()):
+            _kept = [s for s in (ent_map.get(_lbl) or []) if not is_value_shape(s)]
+            if _kept:
+                ent_map[_lbl] = _kept
+            else:
+                del ent_map[_lbl]
+        if not ent_map:
+            return sdoc
+        import re as _re
+        _text = sdoc.text
+        _low = _text.lower()
+        _spans = []
+        for _label, _names in ent_map.items():
+            _lab = (_label or "").strip().upper()
+            if not _lab:
+                continue
+            _surfaces: list[str] = []
+            for _nm in (_names or []):
+                _n0 = (_nm or "").strip()
+                if not _n0:
+                    continue
+                _parts = [p.strip() for p in _re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", _n0) if p.strip()]
+                _surfaces.extend(_parts if len(_parts) > 1 else [_n0])
+            for _n in _surfaces:
+                if not _n:
+                    continue
+                _start = _low.find(_n.lower())
+                while _start != -1:
+                    _sp = sdoc.char_span(_start, _start + len(_n), label=_lab,
+                                         alignment_mode="contract")
+                    if _sp is not None:
+                        _spans.append(_sp)
+                    _start = _low.find(_n.lower(), _start + 1)
+        if not _spans:
+            return sdoc
+        _spans.sort(key=lambda s: (s.end_char - s.start_char), reverse=True)
+        _kept, _used = [], set()
+        for _sp in _spans:
+            _idxs = set(range(_sp.start, _sp.end))
+            if _idxs & _used:
+                continue
+            _kept.append(_sp)
+            _used |= _idxs
+        sdoc.set_ents(_kept)
+    except Exception as e:  # noqa: BLE001 — typing miss → untyped Doc (thin-tag fill)
+        log.debug(f"recall_uplift.gliner2_type_failed: {type(e).__name__}: {str(e)[:120]}")
+    return sdoc
+
+
+def _deterministic_chunk_edges(chunk_text):
+    """The DETERMINISTIC uplift extraction for ONE document chunk — the spine
+    deriver (``derive_sentence_facts``) + GLiNER2 entity typing, run IN-PROCESS
+    (spaCy + a local GLiNER2; ZERO network, ZERO brain budget). This is the
+    SENTENCE_PIPELINE spine applied at the recall-miss uplift point.
+
+    Returns ``None`` when the deterministic LAYER is unavailable (the spaCy/
+    linguistics module or its model cannot load — the caller falls through to
+    the brain-first R7 path), ``[]`` when the layer ran clean and found nothing,
+    and a non-empty list of /ingest-shaped edge dicts on success. The edge
+    conversion FOLLOWS the backend sentence pipeline's shape (subject/rel_type/
+    object, confidence 0.8, object_type from the deriver's thin tag,
+    subject_type from GLiNER2 where the subject is not the user, polarity/
+    event_date/... threaded where present; tentative facts are SKIPPED exactly
+    as the pipeline routes them to the Class-C lane). It is a deliberate SUBSET
+    of the pipeline: the interrogative prefilter, Hearst twin suppression and
+    repair-frame peel live behind request-scoped machinery this worker lane
+    does not own; a deterministic edge that would have been suppressed there
+    still faces the SAME /ingest WGM gate + provenance router, which is the
+    authoritative filter. Replay-safety: same chunk → same edges → a byte-
+    identical /ingest body, which is what the backend's idempotency key hashes
+    (server-side dedupe is conditional on the idempotency cache, exactly as for
+    the house doc lane — a lost-response retry carries the SAME inherited
+    'outcome unknown' window, no new one)."""
+    try:
+        from src.extraction.linguistics import (
+            _parse as _ling_parse,
+            _strip_leading_discourse_marker as _strip_mk,
+            derive_sentence_facts,
+        )
+    except Exception as e:  # noqa: BLE001 — layer absent → caller falls to the brain
+        log.warning(f"recall_uplift.spine_layer_unavailable: {type(e).__name__}: "
+                    f"{str(e)[:120]} (falling through to brain-first re-examination)")
+        return None
+    if not chunk_text or not chunk_text.strip():
+        return []
+    # Session reference for date anchoring — the chunker re-carries the session
+    # header INTO every chunk, so derive_now(chunk) resolves the same reference
+    # the backend's /ingest would (frozen marker time, else wall-clock now). The
+    # SECOND return is the marker-STRIPPED text (the exact entry contract
+    # /ingest applies before its pipeline) — parse THAT, so the header line
+    # cannot leak into sentence 1 and pollute its edge.
+    try:
+        from src.temporal import derive_now as _derive_now
+        reference, chunk_text = _derive_now(chunk_text)
+    except Exception:  # noqa: BLE001 — fail-safe: wall-clock now (main.py's own fallback)
+        from datetime import datetime as _dt, timezone as _tz
+        reference = _dt.now(_tz.utc)
+    if not chunk_text or not chunk_text.strip():
+        return []
+    try:
+        doc = _ling_parse(chunk_text)
+    except Exception as e:  # noqa: BLE001 — parse layer down → brain-first
+        log.warning(f"recall_uplift.spine_parse_unavailable: {type(e).__name__}: "
+                    f"{str(e)[:120]} (falling through to brain-first re-examination)")
+        return None
+    if doc is None:
+        return None
+    gmodel = _recall_uplift_gliner()
+    if gmodel is None:
+        log.info("recall_uplift.deterministic_pass spine_only=true (GLiNER2 unavailable)")
+    edges: list[dict] = []
+    seen: set = set()
+    prior_nps: list[str] = []
+    for sent in doc.sents:
+        _sent = (sent.text or "").strip()
+        if not _sent:
+            continue
+        try:
+            _stripped = _strip_mk(_sent)
+        except Exception:  # noqa: BLE001 — parity with _build_typed_doc's guard
+            _stripped = _sent
+        sdoc = None
+        try:
+            sdoc = _ling_parse(_stripped)
+        except Exception:  # noqa: BLE001 — per-sentence fail-safe → str path below
+            sdoc = None
+        if sdoc is None:
+            typed = _stripped            # str path: deriver re-parses, thin-tag fill
+        else:
+            typed = _gliner2_type_doc(sdoc, gmodel, _RECALL_UPLIFT_LABELS)
+        try:
+            facts = derive_sentence_facts(typed, reference, prior_nps=list(prior_nps))
+        except Exception as e:  # noqa: BLE001 — per-sentence fail-safe (pipeline parity)
+            log.debug(f"recall_uplift.derive_failed: {type(e).__name__}: {str(e)[:120]}")
+            facts = []
+        # subject GLiNER2 types off the typed Doc (the pipeline's _subj_types map)
+        _subj_types: dict = {}
+        if sdoc is not None:
+            try:
+                for _ent in sdoc.ents:
+                    _es = (_ent.text or "").strip().lower()
+                    if _es and _ent.label_:
+                        _subj_types.setdefault(_es, _ent.label_.upper())
+            except Exception:  # noqa: BLE001
+                _subj_types = {}
+        for _f in (facts or []):
+            _key = (_f.subject, _f.rel_type, (_f.object or "").strip().lower())
+            if not all(_key) or _key in seen:
+                continue
+            seen.add(_key)
+            _f_negated = bool(getattr(_f, "negated", False))
+            if getattr(_f, "tentative", False) and not _f_negated:
+                continue  # pipeline parity: uncertain activity → never a durable B edge
+            _edge = {
+                "subject": _f.subject,
+                "rel_type": _f.rel_type,
+                "object": _f.object,
+                "fact_provenance": "user_stated",   # the router OVERWRITES this for
+                                                    # source="document" (staged B) —
+                                                    # the extraction-time stamp only
+                                                    # names the deriver's own tiering
+                "confidence": 0.8,
+            }
+            if getattr(_f, "preferred_label", False):
+                _edge["is_preferred_label"] = True
+            if getattr(_f, "subject_role_anchor", None):
+                _edge["subject_role_anchor"] = _f.subject_role_anchor
+            if getattr(_f, "object_role_anchor", None):
+                _edge["object_role_anchor"] = _f.object_role_anchor
+            if _f_negated:
+                _edge["polarity"] = "negated"
+            if _f.subject == "user":
+                _edge["subject_type"] = "Person"
+            else:
+                _stype = _subj_types.get((_f.subject or "").strip().lower())
+                if _stype:
+                    _edge["subject_type"] = _stype
+            if _f.thin_type:
+                _edge["object_type"] = _f.thin_type
+            if getattr(_f, "scalar_datatype", None):
+                _edge["object_datatype"] = _f.scalar_datatype
+            if getattr(_f, "object_pronoun", None):
+                _edge["object_pronoun"] = _f.object_pronoun
+            if getattr(_f, "temporal_status", None):
+                _edge["temporal_status"] = _f.temporal_status
+            if _f.event_date:
+                _edge["event_date"] = _f.event_date
+                _edge["event_date_granularity"] = _f.event_date_granularity or "day"
+            edges.append(_edge)
+            # Antecedent discipline (pipeline parity, main.py's scalar skip): a
+            # SCALAR object is a literal VALUE ("my address is 123 …" — the
+            # deriver tags scalar_datatype), not a referrable entity — it must
+            # never become a coref antecedent for later sentences.
+            if (_f.object and _f.object not in ("it", "they", "them")
+                    and not getattr(_f, "scalar_datatype", None)):
+                prior_nps.append(_f.object)
+    return edges
+
+
+def _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name) -> bool:
+    """R7 recall-miss pickup: re-owe ONE chunk of a terminal document (plan §R7).
+
+    The marker's target_id is '{schema}:{document_id}:{chunk_index}' — a user
+    query missed the graph while the passage lane surfaced THIS chunk as holding
+    the answer. The re-examination is the R2 re-mine path CHUNK-SCOPED, not
+    document-scoped: re-owe exactly the named chunk (drop only ITS chunk_state
+    ledger entry — every other chunk's entry is preserved, committed-or-not),
+    flip the document terminal → pending with the SAME atomic transition
+    remine_documents_prepass uses, and bump reextract_attempts — which is what
+    makes the NORMAL document drain re-send the chunk under the
+    X-FL-Deferred-Replay marker (reextract_attempts > 0 → _doc_replay), so the
+    backend's retired-value freeze engages on every re-ingested edge. No second
+    pipeline: the ordinary drain's claim, backoff, lease, brain bind and chunk
+    queue re-process the chunk; this function only re-opens it.
+
+    BRAIN-GATED BY THE DRAIN, not here: the growth drain runs only when the
+    tenant brain's lane is open, so no LLM spend happens while starved — a
+    closed lane leaves the marker pending (the R8 queue's rate-limited retry).
+
+    Bounded, fail-safe throughout: the flip refuses documents already at the R2
+    attempts ceiling (reextract_attempts < _DOC_REMINE_MAX_ATTEMPTS — no
+    infinite re-examination of a chunk extraction cannot cast), is atomic on
+    STILL-terminal status (a concurrent drain/retry claim wins and this is a
+    no-op), and every degenerate shape (foreign schema segment, malformed ids,
+    document gone, pre-298 schema) RETIRES the breadcrumb rather than wedging
+    it pending forever. ONE deliberate non-retire: a non-terminal document
+    whose named chunk carries a DONE-or-FAILED ledger entry DEFERS (False,
+    retry next cycle) — neither terminal entry is re-read by the owning
+    drain's owed filter on every lane, so retiring would silently complete
+    the marker without effect (sibling-marker shape).
+    True = resolved (drain marks completed); False = retry.
+    """
+    try:
+        if not target_id:
+            return True
+        # Parse '{schema}:{document_id}:{chunk_index}'. rsplit so a schema name
+        # could never smuggle a colon past the split (it cannot — slug-derived —
+        # but the parse stays total regardless).
+        parts = str(target_id).rsplit(":", 2)
+        if len(parts) != 3 or not parts[0] or parts[0] != schema_name:
+            log.debug(f"growth_drain.recall_miss_foreign_target target={target_id} "
+                      f"schema={schema_name} (retired)")
+            return True
+        try:
+            doc_id, chunk_idx = int(parts[1]), int(parts[2])
+        except ValueError:
+            log.debug(f"growth_drain.recall_miss_malformed_target target={target_id} (retired)")
+            return True
+        if doc_id <= 0 or chunk_idx < 0:
+            return True
+        if schema_name in _remine_columns_missing_schemas:
+            return True  # pre-298 tenant — the lane cannot run; retire the breadcrumb
+        with conn.cursor() as cur:
+            # Capability probe (same shape as remine_documents_prepass): a pre-298
+            # schema would 42703 on the flip below and abort this drain's shared
+            # transaction — self-disable the lane for this tenant instead.
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'documents' "
+                "AND column_name = 'reextract_attempts'",
+                (schema_name,),
+            )
+            if cur.fetchone() is None:
+                _remine_columns_missing_schemas.add(schema_name)
+                log.warning(
+                    f"re_embedder.recall_miss_columns_missing schema={schema_name} "
+                    f"(migration 298 not applied — chunk re-examination disabled "
+                    f"for this tenant)")
+                return True
+            cur.execute(
+                "SELECT status, chunk_state FROM documents"
+                " WHERE id = %s AND user_id = %s",
+                (doc_id, user_id),
+            )
+            row = cur.fetchone()
+        # READ BARRIER — the probes just opened a read on this SHARED per-tenant
+        # connection; the flip below is fast SQL but the house invariant is
+        # "no read transaction crosses a seam", and every other growth_drain
+        # runner keeps the same discipline.
+        release_read_transaction(
+            conn, context=f"re_embedder.growth_drain.recall_miss schema={schema_name}")
+        if not row:
+            return True  # document gone (deleted / tenant wiped) — retire
+        status, chunk_state = row[0], row[1]
+        state = chunk_state if isinstance(chunk_state, dict) else {}
+        if isinstance(chunk_state, str):
+            try:
+                state = json.loads(chunk_state)
+            except Exception:  # noqa: BLE001 — unreadable ledger → re-owe whole doc shape
+                state = {}
+        entry = (state or {}).get(str(chunk_idx))
+        if status not in ("ready", "partial", "error"):
+            # NON-TERMINAL (round-1 critic GAP + round-2 critic GAP): a
+            # pending/processing document is owned by the document drain, and its
+            # finalize flushes the ledger the drain itself built — a chunk_state
+            # write here would be lost (last-writer-wins). Split by whether this
+            # marker's work is ALREADY owed ON BOTH LANES: an entry that is
+            # neither done nor failed is genuinely owed → retire. A done OR
+            # FAILED entry is unmet work → DEFER (False), stay pending, and
+            # re-owe on a later cycle once terminal — the queue lane's owed
+            # filter excludes BOTH terminal states (embedder _drain_document_
+            # via_queue owed predicate), so retiring either would silently stamp
+            # the marker completed without effect; the legacy lane would re-read
+            # 'failed' but not 'done', and deferring is lane-independent.
+            if not entry or entry.get("s") not in ("done", "failed"):
+                return True   # genuinely owed — the owning drain will read it
+            log.debug(
+                f"growth_drain.recall_miss_defer doc={doc_id} chunk={chunk_idx} "
+                f"schema={schema_name} (document pending/processing; re-owe on a "
+                f"later cycle once terminal)")
+            return False      # done-or-failed — retry when terminal
+        # CHUNK-SCOPED re-open: drop ONLY the named chunk's entry (whatever its
+        # prior state — the point is THIS chunk's extraction was insufficient for
+        # a real user's question); every other chunk's entry passes through
+        # untouched. Missing entry (never reached / already owed) is a no-op drop
+        # and the flip still lets the drain collect it.
+        new_state = {k: v for k, v in (state or {}).items() if k != str(chunk_idx)}
+        with conn.cursor() as cur:
+            # The flip — atomic on STILL-terminal + inside the R2 attempts
+            # ceiling, mirroring remine_documents_prepass: attempts = 0 (deliberate
+            # fresh re-read, not an outage redelivery), reextract_attempts + 1
+            # (arms the replay marker for the drain's re-send).
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — parameterised, values only
+                """
+                UPDATE documents
+                SET status = 'pending', started_at = NULL, ready_at = NULL,
+                    attempts = 0, brain_deferred_since = NULL,
+                    reextract_attempts = reextract_attempts + 1,
+                    chunk_state = %s::jsonb
+                WHERE id = %s AND user_id = %s
+                  AND status IN ('ready', 'partial', 'error')
+                  AND reextract_attempts < %s
+                RETURNING reextract_attempts
+                """,
+                (json.dumps(new_state), doc_id, user_id, _DOC_REMINE_MAX_ATTEMPTS),
+            )
+            flipped = cur.fetchone()
+        conn.commit()
+        if not flipped:
+            # A concurrent claim took the row, or the attempts ceiling is hit —
+            # either way this breadcrumb is resolved, not retryable.
+            log.debug(f"growth_drain.recall_miss_flip_noop doc={doc_id} "
+                      f"schema={schema_name} (claimed concurrently or at attempts "
+                      f"ceiling — retired)")
+            return True
+        log.info(
+            f"growth_drain.recall_miss_reexamine doc={doc_id} chunk={chunk_idx} "
+            f"user={str(user_id)[:8]} schema={schema_name} "
+            f"attempt={int(flipped[0] or 0)} "
+            f"(chunk re-owed to the NORMAL document drain under the replay marker)"
+        )
+        return True
+    except psycopg2.Error as e:
+        if getattr(e, "pgcode", None) == "42703":
+            # UndefinedColumn mid-flight (migration 298 vanished? partial schema):
+            # self-disable for this tenant and retire — same rule as the prepass.
+            # ROLLBACK FIRST (round-1 critic): returning True on an aborted
+            # transaction would fail every remaining drain statement this cycle
+            # (mark_completed, census) — clean the shared conn before exiting.
+            if schema_name:
+                _remine_columns_missing_schemas.add(schema_name)
+            try:
+                _rollback_and_reapply_search_path(conn, schema_name)
+            except Exception:  # noqa: BLE001 — best-effort; the drain's guards remain
+                pass
+            log.warning(f"re_embedder.recall_miss_columns_missing_midpass "
+                        f"schema={schema_name}: {e}")
+            return True
+        raise  # anything else is a retry — the caller's except arm rolls back + rebinds
+
+
+def _recall_miss_uplift(target_id, conn, user_id, schema_name, backend_url) -> bool:
+    """R9 deterministic-first pickup for ONE recall-miss marker (owner ruling:
+    spine + GLiNER2 BEFORE the brain).
+
+    Same marker, same target parse, same document-state gating as the R7 brain
+    arm below (``_recall_miss_reexamine_chunk`` — which this function falls
+    through to whenever the deterministic layer or the commit door is absent).
+    The difference is ONLY what happens on a TERMINAL document with the named
+    chunk in hand:
+
+      1. TRIVIAL chunk (header-only scaffolding — ``_lane_has_no_content``):
+         completed, honest no-op. Nothing was extractable the first time either;
+         burning a brain re-examination on scaffolding is the junk class.
+      2. DETERMINISTIC pass (``_deterministic_chunk_edges`` — in-process spine
+         deriver + GLiNER2, zero network, zero brain) yields ≥1 edge: commit via
+         the NORMAL /ingest door (source="document" → provenance router →
+         staged B, WGM gate, replay-marker retired-value freeze — the marker is
+         ALWAYS sent because a recall-miss re-send is by definition a re-attempt
+         of already-attempted content) and COMPLETE. No flip, no document-drain
+         involvement, no brain call: the C→B uplift happened deterministically.
+      3. ZERO edges on REAL content: the marker completes and a
+         ``recall_miss_brain`` work item (priority 5 — below every deterministic
+         phase) carries the brain re-examination to a later drain cycle; THAT
+         runner is the R7 flip (re-owe the chunk to the normal document drain
+         under the replay marker, every R7 semantic intact).
+      4. Deterministic layer unavailable (spaCy/linguistics down) or no commit
+         door (backend_url unset): fall through to the R7 brain-first flip —
+         today's behaviour, logged (fail-safe family).
+
+    Episodic retention is deliberately NOT re-posted: the first drain already
+    retained this chunk verbatim under the idempotent turn_key
+    ``doc:<id>:chunk:<idx>`` (migration 274), so a second append would dedupe to
+    the same row and cost a network call for nothing.
+
+    True = resolved (drain marks completed); False = retry (marker stays pending).
+    """
+    try:
+        if not target_id or not backend_url:
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+        parts = str(target_id).rsplit(":", 2)
+        if len(parts) != 3 or not parts[0] or parts[0] != schema_name:
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+        try:
+            doc_id, chunk_idx = int(parts[1]), int(parts[2])
+        except ValueError:
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+        if doc_id <= 0 or chunk_idx < 0:
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+        if schema_name in _remine_columns_missing_schemas:
+            return True  # pre-298 tenant — the lane cannot run; retire the breadcrumb
+        with conn.cursor() as cur:
+            # Capability probe (same shape as _recall_miss_reexamine_chunk): a
+            # pre-298 schema would 42703 on the SELECT below and abort this
+            # drain's shared transaction — self-disable the lane for this tenant.
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'documents' "
+                "AND column_name = 'reextract_attempts'",
+                (schema_name,),
+            )
+            if cur.fetchone() is None:
+                _remine_columns_missing_schemas.add(schema_name)
+                log.warning(
+                    f"re_embedder.recall_miss_columns_missing schema={schema_name} "
+                    f"(migration 298 not applied — chunk re-examination disabled "
+                    f"for this tenant)")
+                return True
+            cur.execute(
+                "SELECT status, chunk_state, chunks, source_ref FROM documents"
+                " WHERE id = %s AND user_id = %s",
+                (doc_id, user_id),
+            )
+            row = cur.fetchone()
+        # READ BARRIER — the probes just opened a read on this SHARED per-tenant
+        # connection; the deterministic pass below is CPU work and the /ingest
+        # commit is an HTTP hop. House invariant: no read transaction crosses a
+        # seam (every other growth_drain runner keeps the same discipline).
+        release_read_transaction(
+            conn, context=f"re_embedder.growth_drain.recall_miss_uplift schema={schema_name}")
+        if not row:
+            return True  # document gone (deleted / tenant wiped) — retire
+        status, chunk_state, chunks_raw, source_ref = row[0], row[1], row[2], row[3]
+        state = chunk_state if isinstance(chunk_state, dict) else {}
+        if isinstance(chunk_state, str):
+            try:
+                state = json.loads(chunk_state)
+            except Exception:  # noqa: BLE001 — unreadable ledger → re-owe whole doc shape
+                state = {}
+        entry = (state or {}).get(str(chunk_idx))
+        if status not in ("ready", "partial", "error"):
+            # NON-TERMINAL — the R7 rule verbatim (a pending/processing document
+            # is owned by the document drain; a chunk_state write here would be
+            # lost to the finalize flush). The deterministic pass commits THROUGH
+            # /ingest (never the ledger), but running it while the drain may
+            # itself be re-sending the same owed chunk buys a duplicate-work
+            # window for zero uplift — the R7 defer/retire split is kept whole.
+            if not entry or entry.get("s") not in ("done", "failed"):
+                return True   # genuinely owed — the owning drain will read it
+            log.debug(
+                f"growth_drain.recall_miss_defer doc={doc_id} chunk={chunk_idx} "
+                f"schema={schema_name} (document pending/processing; re-owe on a "
+                f"later cycle once terminal)")
+            return False      # done-or-failed — retry when terminal
+        chunks = chunks_raw if isinstance(chunks_raw, list) else []
+        try:
+            if isinstance(chunks_raw, str):
+                chunks = json.loads(chunks_raw)
+        except Exception:  # noqa: BLE001
+            chunks = []
+        if not isinstance(chunks, list) or chunk_idx >= len(chunks):
+            log.debug(f"growth_drain.recall_miss_chunk_gone doc={doc_id} "
+                      f"chunk={chunk_idx} schema={schema_name} (retired)")
+            return True  # index past the retained chunks — nothing to re-examine
+        chunk = chunks[chunk_idx]
+        if not isinstance(chunk, str) or not chunk.strip():
+            log.info(
+                f"growth_drain.recall_miss_uplift deterministic_zero trivial "
+                f"chunk={chunk_idx} doc={doc_id} schema={schema_name} "
+                f"(empty chunk — honest no-op)")
+            return True
+        if _lane_has_no_content(chunk):
+            log.info(
+                f"growth_drain.recall_miss_uplift deterministic_zero trivial "
+                f"chunk={chunk_idx} doc={doc_id} schema={schema_name} "
+                f"(header-only scaffolding — nothing to extract, no brain spend)")
+            return True
+        edges = _deterministic_chunk_edges(chunk)
+        if edges is None:
+            # Deterministic layer unavailable (spaCy/linguistics down) — the R7
+            # brain-first path, logged (the brief's fail-safe arm).
+            log.warning(
+                f"growth_drain.recall_miss_uplift deterministic_unavailable "
+                f"chunk={chunk_idx} doc={doc_id} schema={schema_name} "
+                f"(falling through to brain-first re-examination)")
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+        if edges:
+            # THE COMMIT — the normal /ingest door, replay-marker ALWAYS on (a
+            # recall-miss re-send is a re-attempt of already-attempted content,
+            # which is exactly what X-FL-Deferred-Replay tells the backend so the
+            # retired-value freeze engages — R2). The POST body is byte-stable
+            # for the same chunk (deterministic extraction), which is what the
+            # backend's idempotency key hashes — server-side dedupe is therefore
+            # available exactly when it is for the house doc lane (idempotency
+            # cache up), with the same inherited lost-response window, no new one.
+            _headers = {
+                **_BACKEND_LANE_HEADERS,
+                _ingest_transport.REPLAY_MARKER_HEADER: _ingest_transport.REPLAY_MARKER_VALUE,
+                _ingest_transport.REPLAY_LANE_HEADER: _ingest_transport.REPLAY_LANE_REEXTRACT,
+            }
+            try:
+                _resp = httpx.post(
+                    f"{backend_url}/ingest",
+                    json={"text": chunk, "user_id": user_id, "edges": edges,
+                          "source": "document", "source_ref": source_ref},
+                    headers=_headers,
+                    timeout=_DOC_INGEST_HTTP_TIMEOUT,
+                )
+            except Exception as _ie:  # noqa: BLE001 — transport fault = retry, not retire
+                if _is_backend_unreachable(_ie):
+                    log.warning(
+                        f"growth_drain.recall_miss_uplift_ingest_unreachable "
+                        f"doc={doc_id} chunk={chunk_idx} schema={schema_name} "
+                        f"(marker stays pending; retry next cycle)")
+                else:
+                    log.warning(
+                        f"growth_drain.recall_miss_uplift_ingest_failed "
+                        f"doc={doc_id} chunk={chunk_idx} schema={schema_name}: "
+                        f"{type(_ie).__name__}: {str(_ie)[:120]} (retry next cycle)")
+                return False
+            if _resp.status_code >= 500 or _resp.status_code == 404:
+                log.warning(
+                    f"growth_drain.recall_miss_uplift_ingest_http "
+                    f"doc={doc_id} chunk={chunk_idx} schema={schema_name} "
+                    f"status={_resp.status_code} (retry next cycle)")
+                return False
+            if _resp.status_code >= 400:
+                # 4xx = a deterministic refusal (validation/frozen-store shape).
+                # Retrying the identical POST would loop forever — defer to the
+                # brain lane instead (it re-opens through the full pipeline).
+                log.warning(
+                    f"growth_drain.recall_miss_uplift_ingest_refused "
+                    f"doc={doc_id} chunk={chunk_idx} schema={schema_name} "
+                    f"status={_resp.status_code} body={str(_resp.text)[:160]} "
+                    f"(deterministic commit refused; deferring to the brain lane)")
+                if growth_work_queue.record_brain_defer_on_conn(
+                        conn, schema_name, str(target_id)) is None:
+                    return False   # the defer WRITE faulted — retry, never retire
+                return True
+            _j = {}
+            try:
+                _j = _resp.json()
+            except Exception:  # noqa: BLE001 — 2xx without JSON is a commit we cannot count
+                pass
+            if _j.get("status") == "ingest_disabled":
+                log.warning(
+                    f"growth_drain.recall_miss_uplift_ingest_disabled "
+                    f"doc={doc_id} chunk={chunk_idx} schema={schema_name} "
+                    f"(frozen store; marker stays pending)")
+                return False
+            _committed = int(_j.get("committed", 0) or 0)
+            _staged = int(_j.get("staged", 0) or 0)
+            if _committed == 0 and _staged == 0:
+                # The deterministic edges were ALL already present (the /ingest
+                # edge-hash deduped every one — the marker's premise "extraction
+                # missed something" is NOT addressed by determinism: re-deriving
+                # the same edges changes nothing). Completing here would be the
+                # silent-complete-without-effect class; defer to the brain lane
+                # instead — it re-opens the chunk through the full pipeline.
+                if growth_work_queue.record_brain_defer_on_conn(
+                        conn, schema_name, str(target_id)) is None:
+                    return False   # the defer WRITE faulted — retry, never retire
+                log.info(
+                    f"growth_drain.recall_miss_uplift deterministic_duplicate "
+                    f"brain_deferred chunk={chunk_idx} doc={doc_id} "
+                    f"schema={schema_name} user={str(user_id)[:8]} "
+                    f"edges={len(edges)} committed=0 staged=0 "
+                    f"(all edges already present; brain re-examination queued at priority 5)"
+                )
+                return True
+            log.info(
+                f"growth_drain.recall_miss_uplift deterministic edges={len(edges)} "
+                f"chunk={chunk_idx} doc={doc_id} schema={schema_name} "
+                f"user={str(user_id)[:8]} committed={_committed} "
+                f"staged={_staged} "
+                f"(C→B uplift committed deterministically in-process; no brain call)"
+            )
+            return True
+        # ZERO deterministic edges on real content → the brain lane, NEXT cycle,
+        # at priority 5 (below every deterministic phase — owner ruling). A FAULT
+        # on the defer write returns None → the marker stays PENDING (retry — the
+        # deterministic pass is free, so re-running it costs nothing); completing
+        # on a fault would be the silent-complete-without-effect class.
+        if growth_work_queue.record_brain_defer_on_conn(
+                conn, schema_name, str(target_id)) is None:
+            return False
+        log.info(
+            f"growth_drain.recall_miss_uplift deterministic_zero brain_deferred "
+            f"chunk={chunk_idx} doc={doc_id} schema={schema_name} "
+            f"user={str(user_id)[:8]} "
+            f"(spine+GLiNER2 found nothing; brain re-examination queued at priority 5)"
+        )
+        return True
+    except psycopg2.Error as e:
+        if getattr(e, "pgcode", None) == "42703":
+            # UndefinedColumn mid-flight — same rule as the R7 arm: self-disable
+            # for this tenant, clean the shared conn, retire.
+            if schema_name:
+                _remine_columns_missing_schemas.add(schema_name)
+            try:
+                _rollback_and_reapply_search_path(conn, schema_name)
+            except Exception:  # noqa: BLE001 — best-effort; the drain's guards remain
+                pass
+            log.warning(f"re_embedder.recall_miss_uplift_columns_missing_midpass "
+                        f"schema={schema_name}: {e}")
+            return True
+        raise  # anything else is a retry — the caller's except arm rolls back + rebinds
+
+
+def _growth_work_reattempt(operation_type, target_id, conn, user_id, schema_name,
+                           qwen_api_url, postgres_dsn, qdrant_url,
+                           changed_schemas=None, backend_url=None) -> bool:
+    """Re-attempt ONE deferred growth operation. True = clean (drain marks it
+    completed); False = still starved (item stays pending — rate-limited retry).
+
+    A flag-OFF subsystem resolves its breadcrumb: the deferral no longer applies
+    because the operation is permanently disabled, and holding it pending would be a
+    wedge. Self-isolating: any fault returns False, never raises.
+    """
+    try:
+        if operation_type == "promotion":
+            # The deferred operation is the classify-before-promote pass. ONE pass
+            # re-attempts every eligible row (bounded, LIMIT 50/cycle; the drain
+            # memoizes per operation, so N promotion items still cost one pass) —
+            # per-item completion is decided by _growth_work_item_done against THIS
+            # item's staged row, so a still-starved row keeps its breadcrumb pending.
+            _n_promoted = promote_class_c_hits(conn, qdrant_url, qwen_api_url,
+                                               user_id=user_id, schema_name=schema_name)
+            if _n_promoted and changed_schemas is not None:
+                changed_schemas.add(schema_name)  # new structured facts → ledger marks
+            return True
+
+        if operation_type == "recall_miss_reexamine":
+            # R9 deterministic-first (owner ruling): the spine deriver + GLiNER2
+            # run IN-PROCESS on the chunk BEFORE any brain spend; only a zero-edge
+            # pass on real content defers to the brain lane (recall_miss_brain,
+            # priority 5). No commit door (backend_url unset — tests/legacy
+            # callers) → the R7 brain-first shape, byte-for-byte.
+            if backend_url:
+                return _recall_miss_uplift(
+                    target_id, conn, user_id, schema_name, backend_url)
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+
+        if operation_type == "recall_miss_brain":
+            # R9 phase 2 — the deterministic pass came up empty on real content;
+            # the brain re-examination is the R7 flip verbatim (re-owe the chunk
+            # to the NORMAL document drain under the replay marker: retired-value
+            # freeze, attempts ceiling, DOC_RETRY_BACKOFF, lease — every R7
+            # semantic, one house implementation).
+            return _recall_miss_reexamine_chunk(target_id, conn, user_id, schema_name)
+
+        if target_id == "ontology_eval":
+            if not has_pending_ontology_work(conn):
+                return True  # already resolved — nothing due; retire the breadcrumb
+            # READ BARRIER before the blocking call — the pending-work probe just
+            # opened a read on this shared connection (the house invariant; the main
+            # loop's own ontology_eval site has the identical barrier).
+            release_read_transaction(
+                conn, context=f"re_embedder.growth_drain.ontology_eval schema={schema_name}")
+            evaluate_ontology_candidates(conn, qwen_api_url)
+            if changed_schemas is not None:
+                changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "aspect_synonym":
+            evaluate_aspect_synonym_candidates(conn, postgres_dsn, schema_name, qwen_api_url)
+            if changed_schemas is not None:
+                changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "synonym_convergence":
+            if not _ENGINE_SYNONYM_CONVERGENCE:
+                return True
+            stats = converge_lifted_synonyms(conn, postgres_dsn, schema_name, qwen_api_url)
+            if stats.get("converged", 0) > 0 and changed_schemas is not None:
+                changed_schemas.add(schema_name)
+            # brain_unavailable > 0 means the brain STILL would not answer for these
+            # rels — that is the same starvation the breadcrumb records, not success.
+            return stats.get("brain_unavailable", 0) == 0
+
+        if target_id == "whatis_classify":
+            if not _ENGINE_WHATIS_CLASSIFY:
+                return True
+            classify_unknown_concepts(conn, qwen_api_url, user_id=user_id,
+                                      schema_name=schema_name)
+            if changed_schemas is not None:
+                changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "classify_climb":
+            if not _ENGINE_CLASSIFY_CLIMB:
+                return True
+            climb_classification_chains(conn, qwen_api_url, user_id=user_id,
+                                        schema_name=schema_name)
+            if changed_schemas is not None:
+                changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "name_conflicts":
+            _nc = resolve_name_conflicts(conn, qwen_api_url)
+            if _nc.get("resolved", 0) > 0 and changed_schemas is not None:
+                changed_schemas.add(schema_name)  # merges/alias writes → ledger marks
+            return True
+
+        if target_id == "head_tail_sweep":
+            # Compact mirror of the cycle's bounded head/tail pass (same helper, same
+            # fill-only-what-is-missing rule, same LIMIT 10). READ BARRIER before each
+            # LLM hop — the house idle-in-transaction invariant.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rel_type, head_types, tail_types, natural_language"
+                    " FROM rel_types"
+                    " WHERE (head_types IS NULL OR head_types = ARRAY[]::TEXT[]"
+                    "        OR tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                    " ORDER BY confidence DESC NULLS LAST"
+                    " LIMIT 10"
+                )
+                rows = cur.fetchall()
+            if not rows:
+                return True
+            for _rt, _ht, _tt, _nl in rows:
+                release_read_transaction(
+                    conn, context=f"re_embedder.growth_drain.head_tail schema={schema_name} rel={_rt}")
+                _md = _query_llm_for_rel_type_metadata(
+                    _rt, "unknown", "unknown", _nl or "", qwen_api_url)
+                _new_head = _md.get("llm_head_types")
+                _new_tail = _md.get("llm_tail_types")
+                _set_head = (not _ht) and bool(_new_head)
+                _set_tail = (not _tt) and bool(_new_tail)
+                if not (_set_head or _set_tail):
+                    continue
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE rel_types SET"
+                        "  head_types = CASE WHEN (head_types IS NULL OR head_types = ARRAY[]::TEXT[])"
+                        "                    THEN %s ELSE head_types END,"
+                        "  tail_types = CASE WHEN (tail_types IS NULL OR tail_types = ARRAY[]::TEXT[])"
+                        "                    THEN %s ELSE tail_types END"
+                        " WHERE rel_type = %s",
+                        (_new_head if _set_head else None,
+                         _new_tail if _set_tail else None, _rt),
+                    )
+                conn.commit()
+                if changed_schemas is not None:
+                    changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "taxonomy_discovery":
+            # Compact mirror of the cycle's bounded novel-rel anti-join (same helper,
+            # LIMIT 10). Lazy import — same as the loop site (avoids an import cycle).
+            from src.api.main import _llm_discover_taxonomy_from_facts
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT rel_type FROM staged_facts "
+                    "WHERE rel_type NOT IN (SELECT rel_type FROM rel_types) LIMIT 10"
+                )
+                novel_rels = [row[0] for row in cur.fetchall()]
+            if not novel_rels:
+                return True
+            release_read_transaction(
+                conn, context=f"re_embedder.growth_drain.taxonomy schema={schema_name}")
+            for rel_type in novel_rels:
+                discovered = _llm_discover_taxonomy_from_facts(
+                    conn, "system", [{"rel_type": rel_type}])
+                if discovered and discovered.get("taxonomy_name"):
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO entity_taxonomies "
+                            "(taxonomy_name, description, member_entity_types, "
+                            "rel_types_defining_group, has_transitivity, "
+                            "transitive_rel_types, is_hierarchical, parent_rel_type, source) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                            "ON CONFLICT (taxonomy_name) DO NOTHING",
+                            (discovered.get("taxonomy_name"),
+                             discovered.get("description", ""),
+                             discovered.get("member_entity_types", "{}"),
+                             discovered.get("rel_types_defining_group", []),
+                             discovered.get("has_transitivity", False),
+                             discovered.get("transitive_rel_types", "{}"),
+                             discovered.get("is_hierarchical", False),
+                             discovered.get("parent_rel_type"),
+                             "engine_learned_re_embedder"),
+                        )
+                    conn.commit()
+                    if changed_schemas is not None:
+                        changed_schemas.add(schema_name)
+            return True
+
+        if target_id == "orphan_stub_and_nl_fill":
+            # Compact mirror of the cycle's bounded FILL half (LIMIT 5, same generator,
+            # fill-only-what-is-empty). The stub-mint half is deterministic and never
+            # defers — it runs every cycle regardless of the lane.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rel_type FROM rel_types"
+                    " WHERE (natural_language IS NULL OR natural_language = ''"
+                    "        OR natural_language_2p IS NULL OR natural_language_2p = '')"
+                    " ORDER BY confidence DESC"
+                    " LIMIT 5"
+                )
+                missing_nl = [row[0] for row in cur.fetchall()]
+            if not missing_nl:
+                return True
+            for rt in missing_nl:
+                release_read_transaction(
+                    conn, context=f"re_embedder.growth_drain.nl_fill schema={schema_name} rel={rt}")
+                _phrasing = generate_rel_type_phrasing(rt, user_id=user_id)
+                nl = _phrasing.get("natural_language", "")
+                nl_2p = _phrasing.get("natural_language_2p", "")
+                if nl:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE rel_types SET natural_language = %s"
+                            " WHERE rel_type = %s AND (natural_language IS NULL OR natural_language = '')",
+                            (nl, rt),
+                        )
+                    conn.commit()
+                    if changed_schemas is not None:
+                        changed_schemas.add(schema_name)
+                if nl_2p:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE rel_types SET natural_language_2p = %s"
+                            " WHERE rel_type = %s AND (natural_language_2p IS NULL OR natural_language_2p = '')",
+                            (nl_2p, rt),
+                        )
+                    conn.commit()
+                    if changed_schemas is not None:
+                        changed_schemas.add(schema_name)
+            return True
+
+        # Unknown target: retire the breadcrumb rather than wedge it forever — a
+        # future rename of a subsystem would otherwise leave permanent pending rows.
+        log.debug(f"growth_drain.unknown_target op={operation_type} target={target_id}")
+        return True
+    except Exception as e:  # noqa: BLE001 — a re-attempt fault is a retry, not a crash
+        # ROLLBACK + RE-BIND: this conn is SHARED (the per-tenant _ont_db) and more
+        # items follow this one — an aborted transaction here would fail every
+        # remaining item AND the drain's census with InFailedSqlTransaction.
+        try:
+            _rollback_and_reapply_search_path(conn, schema_name)
+        except Exception:  # noqa: BLE001 — best-effort; the drain's own guards remain
+            pass
+        log.warning(
+            f"growth_drain.reattempt_error op={operation_type} target={target_id} "
+            f"schema={schema_name} (item stays pending, priority backs off): "
+            f"{type(e).__name__}: {str(e)[:150]}"
+        )
+        return False
+
+
+def _growth_work_item_done(operation_type, target_id, conn) -> bool:
+    """Per-item completion oracle for the drain. Only 'promotion' needs a probe: the
+    item is done when its staged row is no longer an eligible Class-C promotion
+    candidate (promoted, tier-changed, decayed, or gone). Everything else completes
+    on the runner's own verdict."""
+    if operation_type != "promotion":
+        return True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM staged_facts"
+                " WHERE id = %s AND fact_class = 'C'"
+                "   AND promoted_at IS NULL AND hit_count >= 3",
+                (target_id,),
+            )
+            return cur.fetchone() is None
+    except Exception as e:  # noqa: BLE001 — an unreadable probe leaves the item pending
+        log.debug(f"growth_drain.item_done_probe_error target={target_id}: {e}")
+        return False
+
+
+# === FLAG: DOC_REMINE_ENABLED (gauntlet R2, default OFF) — the DOCUMENT-lane re-mine =====
+#
+# The migration-197 analog for the `documents` table: re-queue terminal documents whose
+# chunks produced ZERO committed edges (or that terminated 'partial') so the normal
+# drain re-reads them against the ontology as it stands NOW. OFF BY DEFAULT: applying
+# migration 298 changes nothing; the owner flips DOC_REMINE_ENABLED=true after deploy.
+DOC_REMINE_ENABLED = os.getenv(
+    "DOC_REMINE_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
+_DOC_REMINE_BATCH = max(1, int(os.getenv("DOC_REMINE_BATCH", "2")))
+_DOC_REMINE_MAX_ATTEMPTS = max(1, int(os.getenv("DOC_REMINE_MAX_ATTEMPTS", "3")))
+_DOC_REMINE_MIN_AGE_HOURS = max(0.0, float(os.getenv("DOC_REMINE_MIN_AGE_HOURS", "24")))
+_DOC_REMINE_INTERVAL_S = max(60, int(os.getenv("DOC_REMINE_INTERVAL_SECONDS", "900")))
+
+# Tenants already found to lack migration 298 — log once, then self-disable the lane
+# (the flag must never be able to STOP the drain that already works).
+_remine_columns_missing_schemas: set = set()
+
+# Module-local pass cadence + rotation cursor. Single-element lists so the call sites can
+# stay stateless (the pacing inside the prepass is the ONE source of truth).
+_DOC_REMINE_LAST_RUN = [0.0]
+_DOC_REMINE_CURSOR = [None]
 
 
 def _flag(name: str, default: str = "true") -> bool:
@@ -8048,6 +9140,226 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
     return total_deleted
 
 
+def _read_remine_attempts(db_conn, doc_id, schema_name) -> int:
+    """The row's re-mine attempt count (migration 298), or 0 when unavailable.
+
+    Its own guarded SELECT: 0 on ANY failure (pre-298 schema, error) = "not a
+    replay" = byte-for-byte the first-drain /ingest POST shape."""
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT reextract_attempts FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+        db_conn.commit()
+        return int(row[0] or 0) if row else 0
+    except Exception as e:  # noqa: BLE001 — pre-298 schema, or anything else: not a replay
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        return 0
+
+
+def remine_documents_prepass(postgres_dsn: str, ready_schemas, skip_tenants=None) -> int:
+    """DOCUMENT-lane ontology-regrowth re-mine (gauntlet R2; DOC_REMINE_ENABLED, default OFF).
+
+    The migration-298 analog of the episodic lane's regrowth re-eligibility: re-queue
+    terminal documents whose chunks produced ZERO committed edges (or that terminated
+    'partial') so the NORMAL drain re-reads them against the ontology as it stands NOW —
+    including rel_types/taxonomies grown since their last (failed) pass.
+
+    SELECTOR + STAMPER, NEVER A SECOND PIPELINE. The pass only (a) selects, (b) re-opens
+    the zero-edge/failed chunks in ``chunk_state`` (done chunks that committed something
+    are KEPT — re-reading a captured fact would double-count), and (c) flips the row
+    terminal → pending with the same transition POST /documents/retry uses
+    (started_at/ready_at NULL, attempts reset, brain_deferred_since cleared). The
+    ordinary drain then re-reads the owed chunks under the X-FL-Deferred-Replay marker
+    (their reextract_attempts > 0), inheriting every bound the drain already enforces:
+    the atomic claim, the DOC_RETRY_BACKOFF reclaim gate (a rate_deferred re-mine
+    reschedules at the paced cadence instead of hammering — the shared-backoff
+    requirement), the lease reclaim, the brain bind, the chunk queue.
+
+    BUDGET — every axis is bounded, because a growth-triggered backfill that ignores
+    budget is BUG-005 at corpus scale (and GraphRAG's own "indexing can be an expensive
+    operation" warning):
+      • DOC_REMINE_BATCH documents per pass, total (default 2);
+      • at most ONE document per tenant per pass, round-robin via a rotation cursor —
+        with batch=2 two DIFFERENT tenants are served each pass, never the same
+        corpus twice in a row;
+      • the pass runs at most once per DOC_REMINE_INTERVAL_SECONDS (default 900s) no
+        matter how often its callers tick (the doc-drain daemon ticks every 4s);
+      • eligibility: terminal ('ready'/'partial'/'error') AND (facts_committed = 0 OR
+        status = 'partial') AND terminal since >= DOC_REMINE_MIN_AGE_HOURS (default 24)
+        AND reextract_attempts < DOC_REMINE_MAX_ATTEMPTS (default 3). A document that
+        re-terminates zero-edge is re-selected only after the age floor again, and only
+        while attempts remain — no infinite re-mining.
+
+    The mark (``reextract_ontology_mark``) is stamped with the tenant's walkable-place
+    count at selection time — the migration-197 bookkeeping, recorded even though
+    selection itself is time+attempts based, so a future regrowth-gated variant has its
+    baseline.
+
+    Returns the number of documents re-queued; NEVER raises (per-tenant fail-safe, the
+    prepass contract). Callers do not need to gate on DOC_REMINE_ENABLED — the check is
+    inside, first thing, so an OFF deploy costs one env read.
+    """
+    if not DOC_REMINE_ENABLED:
+        return 0
+    now_m = time.monotonic()
+    if now_m - _DOC_REMINE_LAST_RUN[0] < _DOC_REMINE_INTERVAL_S:
+        return 0
+    _DOC_REMINE_LAST_RUN[0] = now_m
+
+    skip_tenants = skip_tenants or set()
+    tenants = [(u, s) for u, s in (ready_schemas or []) if u not in skip_tenants]
+    if not tenants:
+        return 0
+
+    # ROUND-ROBIN: start at the tenant AFTER the last one served last pass (the cursor
+    # holds the user_id that was being served when the batch ran out). A restart resuming
+    # from the top is correct — process-local cursors only ever cost one rotation.
+    _start = 0
+    if _DOC_REMINE_CURSOR[0] is not None:
+        for _i, (_u, _s) in enumerate(tenants):
+            if _u == _DOC_REMINE_CURSOR[0]:
+                _start = (_i + 1) % len(tenants)
+                break
+    ordered = tenants[_start:] + tenants[:_start]
+
+    queued = 0
+    served: list = []
+    _db = None
+    try:
+        _db = psycopg2.connect(postgres_dsn)
+        for _user, _schema in ordered:
+            if queued >= _DOC_REMINE_BATCH:
+                break
+            if _schema in _remine_columns_missing_schemas:
+                continue
+            try:
+                with _db.cursor() as cur:
+                    # Capability probe (pre-298 schema → self-disable the lane for this
+                    # tenant, log once): the flip names the new columns, and an
+                    # UndefinedColumn there would abort this tenant's txn every pass.
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'reextract_attempts'",
+                        (_schema,))
+                    if cur.fetchone() is None:
+                        _remine_columns_missing_schemas.add(_schema)
+                        log.warning(
+                            f"re_embedder.doc_remine_columns_missing schema={_schema} "
+                            f"(migration 298 not applied — re-mine lane disabled for "
+                            f"this tenant)")
+                        continue
+                    # The candidate. Partial-index-shaped predicate (migration 298's
+                    # idx_documents_regrowth): expressions MUST stay identical to the
+                    # index predicate or the planner cannot use it. Oldest terminal
+                    # first; ONE row per tenant per pass (round-robin).
+                    cur.execute(f"SET search_path TO {_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                    # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+                        """
+                        SELECT id, chunk_state FROM documents
+                        WHERE status IN ('ready', 'partial', 'error')
+                          AND (facts_committed = 0 OR status = 'partial')
+                          AND reextract_attempts < %s
+                          AND COALESCE(ready_at, started_at, created_at)
+                              < now() - (%s * INTERVAL '1 hour')
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        (_DOC_REMINE_MAX_ATTEMPTS, _DOC_REMINE_MIN_AGE_HOURS),
+                    )
+                    row = cur.fetchone()
+                _db.commit()
+                if not row:
+                    continue
+                doc_id, chunk_state = row[0], row[1]
+                state = chunk_state if isinstance(chunk_state, dict) else {}
+                if isinstance(chunk_state, str):
+                    try:
+                        state = json.loads(chunk_state)
+                    except Exception:  # noqa: BLE001 — unreadable ledger → whole doc re-owed
+                        state = {}
+                # CHUNK-LEVEL RE-OPEN (the actual re-mine): a chunk with NO entry has no
+                # terminal state and is already owed. Of the TERMINAL entries, KEEP only
+                # the ones that captured something (s='done' with c>0 — re-reading them
+                # would double-count what already landed); re-ow the ZERO-EDGE done
+                # entries (c==0 — the ontology could not cast them then) and the FAILED
+                # ones by dropping their ledger entries entirely.
+                kept = {k: v for k, v in (state or {}).items()
+                        if isinstance(v, dict) and v.get("s") == "done"
+                        and (int(v.get("c") or 0)) > 0}
+                dropped = len(state or {}) - len(kept)
+                # The mark for THIS pass (migration-197 bookkeeping: walkable places now).
+                _mark = _tenant_walkable_place_count(_db, _schema)
+                # The flip — atomic on STILL-terminal: a concurrent drain/retry that
+                # already took the row makes this UPDATE a no-op (rowcount 0 → skip).
+                # attempts = 0 mirrors POST /documents/retry: the re-mine is a deliberate
+                # fresh re-read, not an outage redelivery, so the drain's redelivery bound
+                # starts clean (the RE-MINE bound is reextract_attempts, separate).
+                with _db.cursor() as cur:
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+                        """
+                        UPDATE documents
+                        SET status = 'pending', started_at = NULL, ready_at = NULL,
+                            attempts = 0, brain_deferred_since = NULL,
+                            reextract_ontology_mark = COALESCE(%s, reextract_ontology_mark),
+                            reextract_attempts = reextract_attempts + 1,
+                            chunk_state = %s::jsonb
+                        WHERE id = %s AND user_id = %s
+                          AND status IN ('ready', 'partial', 'error')
+                          AND (facts_committed = 0 OR status = 'partial')
+                        RETURNING reextract_attempts
+                        """,
+                        (_mark, json.dumps(kept), doc_id, _user),
+                    )
+                    _flipped = cur.fetchone()
+                    flipped = 1 if _flipped else 0
+                    _new_attempt = int(_flipped[0] or 0) if _flipped else 0
+                _db.commit()
+                if not flipped:
+                    continue
+                queued += 1
+                served.append(_user)
+                log.info(f"re_embedder.doc_remine_queued doc_id={doc_id} "
+                         f"user_id={_user[:8]} schema={_schema} "
+                         f"attempt={_new_attempt} "
+                         f"reopened_chunks={dropped} kept_chunks={len(kept)} "
+                         f"mark={_mark} "
+                         f"(zero-edge/failed chunks re-owed to the NORMAL drain under "
+                         f"the replay marker)")
+            except psycopg2.Error as _probe_err:
+                _rollback_and_reapply_search_path(_db, _schema)
+                if getattr(_probe_err, "pgcode", None) == "42703":
+                    # UndefinedColumn mid-pass (migration 298 vanished? partial schema):
+                    # self-disable for this tenant, same as the probe above.
+                    _remine_columns_missing_schemas.add(_schema)
+                    log.warning(f"re_embedder.doc_remine_columns_missing_midpass "
+                                f"schema={_schema}: {_probe_err}")
+                    continue
+                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
+                            f"{_probe_err}")
+            except Exception as _t_err:  # noqa: BLE001 — one tenant never aborts the pass
+                _rollback_and_reapply_search_path(_db, _schema)
+                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
+                            f"{_t_err}")
+    except Exception as _pass_err:  # noqa: BLE001 — never raises, prepass contract
+        log.warning(f"re_embedder.doc_remine_pass_error: {_pass_err}")
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception as _close_err:  # noqa: BLE001 — a failed close on an
+                # already-dead connection is not actionable here; logged so it is
+                # never silent.
+                log.debug(f"re_embedder.doc_remine_pass_close_failed: {_close_err}")
+    # Advance the rotation cursor to the LAST tenant actually served this pass, so the
+    # next pass starts after it. No tenant served → cursor untouched (start from top).
+    if served:
+        _DOC_REMINE_CURSOR[0] = served[-1]
+    return queued
+
+
 def main():
     """Main poll loop."""
     global _http_client_sync
@@ -8189,6 +9501,18 @@ def main():
             if ready_schemas:
                 log.info(f"re_embedder.ready_schemas_found count={len(ready_schemas)}")
 
+            # R2 DOCUMENT RE-MINE PREPASS (DOC_REMINE_ENABLED, default OFF): re-queue
+            # terminal zero-edge/'partial' documents against the grown ontology. Runs
+            # at most once per _DOC_REMINE_INTERVAL_S, bounded batch, round-robin.
+            # Fail-safe: a prepass fault never blocks the cycle.
+            if ingest_enabled and DOC_REMINE_ENABLED:
+                try:
+                    _n_remined = remine_documents_prepass(postgres_dsn, ready_schemas)
+                    if _n_remined:
+                        log.info(f"re_embedder.remine_prepass requeued={_n_remined}")
+                except Exception as _remine_err:  # noqa: BLE001 — non-fatal by contract
+                    log.warning(f"re_embedder.remine_prepass_error: {_remine_err}")
+
             # PHASE 2b: Process each user schema independently
             for user_id, schema_name in ready_schemas:
                 try:
@@ -8202,6 +9526,50 @@ def main():
                         # re-extraction) mutates knowledge rows — paused as a unit.
                         # (Cycle-level pause already logged once above, not per user.)
                         if ingest_enabled:
+                            # ══ R8 GROWTH WORKSTACK — drain-on-recovery, priority-first ════
+                            # The per-tenant growth_work_queue (migration 300) holds the durable
+                            # breadcrumb for work left pending (recall_miss markers from the
+                            # query wrapper, brain-deferred re-examinations from the R9
+                            # uplift). Drain it BEFORE this cycle's new work — promotion
+                            # (recall-visible) first, then enrichment → synonym convergence →
+                            # what-is-climb. Each item re-attempts its deferred operation;
+                            # success stamps completed_at, failure leaves it pending
+                            # (rate-limited retry next cycle). Fail-safe: a drain fault warns
+                            # and the cycle proceeds exactly as before.
+                            try:
+                                if growth_work_queue.pending_count(db_per_user) > 0:
+                                    _gq_changed: set = set()
+
+                                    def _gq_ledger_noop(op, tgt, ok):
+                                        pass  # no sweep ledger on this engine; hook point only
+
+                                    growth_work_queue.drain(
+                                        db_per_user,
+                                        schema_name=schema_name,
+                                        runner=lambda op, tgt: _growth_work_reattempt(
+                                            op, tgt, db_per_user, user_id, schema_name,
+                                            qwen_api_url, postgres_dsn, qdrant_url,
+                                            changed_schemas=_gq_changed,
+                                            backend_url=backend_api_url),
+                                        item_done=lambda op, tgt: _growth_work_item_done(
+                                            op, tgt, db_per_user),
+                                        lane_probe=lambda: True,
+                                        on_attempted=_gq_ledger_noop,
+                                    )
+                                    # The drain's read re-opened a transaction on this
+                                    # shared connection — release it so the first subsystem
+                                    # below starts clean (the house invariant).
+                                    release_read_transaction(
+                                        db_per_user,
+                                        context=f"re_embedder.growth_work_drain schema={schema_name}")
+                            except Exception as _gq_err:  # noqa: BLE001 — non-fatal by contract
+                                _rollback_and_reapply_search_path(db_per_user, schema_name)
+                                log.warning(
+                                    f"re_embedder.growth_work_drain_error schema={schema_name} "
+                                    f"(non-fatal, cycle continues): {type(_gq_err).__name__}: "
+                                    f"{str(_gq_err)[:150]}"
+                                )
+
                             # Promote staged facts for this user
                             n_promoted = promote_staged_facts(db_per_user, qdrant_url, user_id=user_id, schema_name=schema_name)
                             if n_promoted:

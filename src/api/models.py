@@ -326,3 +326,69 @@ class QueryResponse(BaseModel):
     # result (`miss=True`, no fabricated number). None when no calc intent. Additive.
     #   {op, answer, value, unit, granule, miss, cited_dates, [miss_reason]}
     temporal_computation: Optional[dict] = None
+    # DOCUMENT-HITS STUB LANE (migration 299, plan W2.3 — deterministic, ZERO LLM). The
+    # literal SELECT: documents whose stub_tsv (title A / source_ref B / verbatim chunks)
+    # matches the query tokens, ranked by ts_rank, top 3. Surfaced for recall's
+    # "You have a document: …" assert line. Tenant-scoped by the bound search_path;
+    # soft-fails to [] — NEVER raises into the caller (a broken stub lane must not break
+    # the walk). [] = honest no-match (and pre-299 schemas). A hit's `status` is part of
+    # the data: a 'pending'/'processing' hit is VERBATIM TEXT ONLY — the stub is
+    # searchable at the enqueue commit, facts come later. Never counted as facts.
+    document_hits: Optional[list[dict]] = None
+    # R7 MISS-ESCALATION: True when the graph walk (Layer 1) returned ZERO facts AND the
+    # passage lane (Layer 2, R6) surfaced ≥1 hit — the recall KNOWS it fell back to the
+    # document text instead of the graph. Observability only: the response body is
+    # otherwise unchanged apart from this additive key (the passage hits ride
+    # document_hits as before), no fabrication, and a both-lanes-miss stays
+    # False (the honest empty). The tag is the signal the
+    # query side also feeds back into growth: on this exact shape the wrapper writes
+    # recall_miss markers into growth_work_queue (operation_type
+    # 'recall_miss_reexamine') so the growth drain re-examines the chunk that had
+    # the answer — the NEXT time this question is asked, the graph walk finds it.
+    escalated: bool = False
+    # R7 marker gate: the graph walk's OWN resolved STORED-fact count — the composed
+    # walk result BEFORE any synthetic verdict/grounding row is injected and BEFORE the
+    # presentation gates (type-assertion, lexical topic). A presentation gate can
+    # remove EVERY rendered fact on a walk that SUCCEEDED — rendered facts alone
+    # cannot distinguish that from a true walk miss; conversely a synthetic
+    # no-answer grounding row can re-inflate a pre-gate count on a TRUE miss. The
+    # marker gate therefore requires BOTH the rendered list AND this walk-boundary
+    # count to be empty. None on early-return paths where the walk did not report a
+    # count (treated as 0 — every such empty-facts path IS a miss). The `escalated`
+    # tag above stays rendered-facts-based: the recall genuinely fell back to the
+    # document lane for the USER either way; only the feedback halves differ.
+    walk_facts_found: Optional[int] = None
+
+
+class DocumentEnqueueRequest(BaseModel):
+    """Enqueue a chunked document into the per-tenant async ingestion registry.
+
+    The flagship `ingest_document` lane chunks the document deterministically
+    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
+    `documents` row status='pending' (chunks retained verbatim) and returns fast.
+    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
+    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
+    """
+    user_id: str
+    chunks: list[str]
+    chunk_count: int = 0
+    source_ref: Optional[str] = None
+    title: Optional[str] = None
+    truncated: bool = False
+    part_index: int = 0
+    part_count: int = 1
+    total_chunks: int = 0
+    # R5 PARSER SEAM (migration 298): which parser produced ``chunks`` —
+    # 'naive_v1' (pdfplumber line-walk / raw pasted text) or 'docling_v1'
+    # (src/ingest/doc_parser.py, layout-aware). Normalized + shape-checked
+    # [a-z0-9_]+ at the enqueue door — the stamp must never lie. Rows written
+    # before migration 298 read the column default ('naive_v1'), which is
+    # honest for every legacy row.
+    parser_version: Optional[str] = None
+
+
+class LearnTopicRequest(BaseModel):
+    topic: str
+    user_id: str = "anonymous"
+    source_text: Optional[str] = None
+    source_url: Optional[str] = None
