@@ -34905,8 +34905,137 @@ def _fetch_location_grounding(db, user_id: str, schema_name: str | None) -> dict
         return None
 
 
+
+
+
+def _recall_escalation_plan(walk_facts, document_hits, walk_facts_found=None):
+    """R7 layer-escalation decision (plan DEV/BUGS/plan-100pct-addressability-20261024.md §R7).
+
+    Given the graph walk's rendered fact list, the R6 passage lane's hits, and
+    the walk's own resolved fact count (``walk_facts_found`` — see
+    QueryResponse), decide:
+
+      * ``escalated`` — Layer 1 (graph walk) rendered ZERO facts while Layer 2
+        (passage lane) surfaced ≥1 hit (a hit is a hit, passage OR title-only
+        discovery — either way the recall answered from the document text, not
+        the graph). This tags the response ``escalated: True`` — observability
+        only, the body is otherwise unchanged. Rendered-based ON PURPOSE: even
+        when the topic gate hid the walk's facts, the USER's answer still came
+        from the document lane — the fallback genuinely happened.
+      * ``marker_rows`` — the PASSAGE hits (chunk_index not None) worth a
+        ``recall_miss`` growth marker: each is a specific chunk that contained
+        the answer the graph could not reach. NON-empty ONLY on a TRUE graph
+        miss: (i) rendered facts empty AND (ii) the walk's own resolved count
+        is 0/None. (ii) is the round-3/4 critic GAP guard — a walk whose facts
+        a presentation gate hid (topic gate, before=13 after=0) SUCCEEDED at
+        extraction, and a synthetic no-answer grounding row must not
+        re-inflate the count on a true miss; either way a marker's premise
+        ("extraction missed something in THIS chunk") would be wrong and its
+        spend non-self-curing (re-examine → same facts → gate hides them
+        again → re-arm hourly). A graph hit never writes markers, however many
+        passages also hit; a title-only discovery row carries no chunk to
+        re-examine and is excluded; a both-lanes miss yields no rows (no
+        fabrication).
+
+    Pure function on purpose: the escalation contract is pin-worthy without the
+    walk's 2.5k-line machinery.
+    """
+    facts = walk_facts or []
+    hits = [h for h in (document_hits or []) if isinstance(h, dict)]
+    graph_missed = len(facts) == 0 and not (walk_facts_found or 0)
+    escalated = bool((not facts) and hits)
+    marker_rows = ([h for h in hits if h.get("chunk_index") is not None]
+                   if graph_missed else [])
+    return escalated, marker_rows
+
+
+def _record_recall_miss_markers(user_id: str, marker_rows: list) -> None:
+    """R7: write recall_miss growth-work markers for passages a graph-miss surfaced.
+
+    Runs on a DETACHED threadpool task (fire-and-forget): it starts after the
+    /query response is already assembled and NEVER blocks, slows, or fails the
+    turn — every fault is contained here (debug log, no raise). One marker per
+    chunk-bearing passage hit, into the EXISTING growth_work_queue (migration
+    300), rate-limited to one per (document, chunk) per hour inside
+    growth_work_queue.record_recall_miss — the query side's signal for what
+    extraction missed, drained by the growth engine when the brain is available.
+    """
+    try:
+        if not marker_rows:
+            return
+        schema_name = _derive_tenant_schema(user_id)
+        if not schema_name:
+            return
+        from src.re_embedder.growth_work_queue import record_recall_miss
+        for _row in marker_rows:
+            try:
+                record_recall_miss(schema_name, _row.get("document_id"),
+                                   _row.get("chunk_index"))
+            except Exception as _one:  # noqa: BLE001 — one bad row never kills the rest
+                log.debug("query.recall_miss_marker_row_failed err=%s",
+                          str(_one)[:120])
+    except Exception as _e:  # noqa: BLE001 — fire-and-forget contract: never raises
+        log.debug("query.recall_miss_marker_write_failed err=%s", str(_e)[:120])
+
+
+#: R7: strong references to the detached recall-miss marker tasks. asyncio keeps
+#: only WEAK references to bare ensure_future results — an unreferenced task can
+#: be garbage-collected mid-flight, silently dropping the marker. The set holds
+#: each task until its done-callback discards it (the standard pattern).
+_recall_miss_marker_tasks: set = set()
+
+
 @app.post("/query")
 async def query(request: QueryRequest) -> QueryResponse:
+    """Customer-facing recall door — thin wrapper over the walk impl.
+
+    DOCUMENT-HITS STUB LANE (migration 299, W2.3) + R7 MISS-ESCALATION: attached
+    HERE so EVERY _query_impl return path (typed-walk early returns, abstentions,
+    the main render) carries the section. The stub read has NO data dependency on
+    the walk (it needs only the resolved user + the query text), so it runs
+    CONCURRENTLY with the walk on a threadpool task — soft-fails to [] inside the
+    helper (never raises). On a true graph miss with ≥1 passage hit the response
+    is tagged ``escalated`` and a recall_miss marker per chunk is fire-and-forget
+    written to the growth_work_queue; the growth drain re-examines those chunks
+    so the next time this question is asked, the graph walk finds it.
+    """
+    _uid = _require_resolvable_user_id(request.user_id, "/query")
+    await _ensure_tenant_ready(_uid, "/query")
+    from starlette.concurrency import run_in_threadpool
+    import asyncio as _asyncio
+    _hits_task = _asyncio.ensure_future(
+        run_in_threadpool(_document_hits_for_query, _uid, request.text))
+    try:
+        _pending = _query_impl(request)
+        # The impl is async on this lineage; a sync stand-in (tests / future
+        # refactor to the main-line sync shape) is awaited through unchanged.
+        _resp = await _pending if hasattr(_pending, "__await__") else _pending
+    except Exception:
+        _hits_task.cancel()
+        raise
+    try:
+        _hits = await _hits_task
+        if isinstance(_resp, QueryResponse):
+            _resp.document_hits = _hits
+            if not _resp.error:
+                _escalated, _marker_rows = _recall_escalation_plan(
+                    _resp.facts, _hits,
+                    walk_facts_found=_resp.walk_facts_found)
+                if _escalated:
+                    _resp.escalated = True
+                if _marker_rows:
+                    _mt = _asyncio.ensure_future(run_in_threadpool(
+                        _record_recall_miss_markers, _uid, _marker_rows))
+                    _recall_miss_marker_tasks.add(_mt)
+                    _mt.add_done_callback(_recall_miss_marker_tasks.discard)
+    except Exception as _dh_exc:  # noqa: BLE001 — the stub lane never breaks the walk
+        log.warning("query.document_hits_attach_failed err=%s", str(_dh_exc)[:120])
+        if isinstance(_resp, QueryResponse):
+            _resp.document_hits = []
+    return _resp
+
+
+async def _query_impl(request: QueryRequest) -> QueryResponse:
     """
     Phase 5 Query Endpoint: Simplified orchestration of Phase 1-4 components.
 
@@ -36797,6 +36926,20 @@ async def query(request: QueryRequest) -> QueryResponse:
                         types=[a["type"] for a in active_alerts])
 
         # Step 9: Return QueryResponse with structured facts + metadata dicts
+        # R7 marker gate (round-3/round-4 critic GAPs): count at the WALK
+        # BOUNDARY — `resolved_facts` is the composed walk result BEFORE any
+        # synthetic verdict/grounding row is injected (named-winner,
+        # temporal_calc, sum/count-over-walk, recursive-walk metacog, the
+        # no-answer location fallback) and BEFORE the presentation gates
+        # (type-assertion, topic). Rendered emptiness alone cannot distinguish
+        # a true walk miss from (a) a presentation-gate removal (before=13
+        # after=0, round 3) or (b) a synthetic no-answer grounding row
+        # re-inflating a pre-gate count on a TRUE miss (round 4) — counting
+        # here kills both directions. None-safe: an early-return path that
+        # never composed resolved_facts reports no count, and every
+        # empty-facts early return IS a miss.
+        _rf_walk = locals().get("resolved_facts")
+        _walk_found_n = len(_rf_walk) if isinstance(_rf_walk, (list, tuple)) else None
         return QueryResponse(
             anchor=anchor,
             facts=facts_with_definition,
@@ -36809,6 +36952,7 @@ async def query(request: QueryRequest) -> QueryResponse:
             temporal_ordered=locals().get("_temporal_ordered", False),
             template=locals().get("_query_template"),
             temporal_computation=locals().get("_temporal_calc_result"),
+            walk_facts_found=_walk_found_n,
         )
 
     except Exception as e:
@@ -39706,6 +39850,463 @@ def episodic_append(req: EpisodicAppendRequest):
                 _db.close()
             except Exception:
                 pass
+
+
+# ── Async document-ingestion registry (documents table, migration 183) ───────
+# ETA honesty (under-promise / over-deliver). The async doc lane is drained by the
+# re_embedder poll loop's fast doc-drain pre-pass, so a freshly-enqueued document
+# waits at most ~ONE poll interval before it is claimed on the next tick, THEN pays
+# the per-chunk LLM extraction cost. The ETA is DERIVED from that real cadence — the
+# poll interval + per-chunk extraction time × chunks — never a hardcoded lie, and is
+# floored at one full poll interval so it can never under-shoot the pickup delay.
+#
+# Poll interval mirrors the re_embedder's REEMBED_INTERVAL (default 60s; the two
+# processes read the same env var). A busy rig whose full heavy cycle exceeds one
+# interval can raise DOC_ETA_POLL_INTERVAL to stay conservative.
+_DOC_ETA_PER_CHUNK_SECONDS = int(os.environ.get("DOC_ETA_PER_CHUNK_SECONDS", "6") or 6)
+# Worst-case pickup delay before the fast pre-pass claims a pending doc = ~one poll
+# interval. Defaults to the re_embedder's own REEMBED_INTERVAL so the two stay in sync.
+_DOC_ETA_POLL_INTERVAL = int(
+    os.environ.get("DOC_ETA_POLL_INTERVAL")
+    or os.environ.get("REEMBED_INTERVAL", "60")
+    or 60
+)
+# Small fixed startup/probe margin on top of the interval (pre-pass probe + claim +
+# first /ingest round-trip) so we still over-estimate for a 0/1-chunk doc.
+_DOC_ETA_STARTUP_MARGIN = int(os.environ.get("DOC_ETA_STARTUP_MARGIN", "10") or 10)
+
+
+def _doc_eta_seconds(total_chunks: int) -> int:
+    """Conservative ETA (seconds) for `total_chunks` still-to-process chunks.
+
+    Derived from the real drain cadence — ONE poll interval of pickup delay (the
+    fast pre-pass claims the doc on the next tick) + a small startup margin + the
+    per-chunk LLM extraction cost — rounded UP to the nearest 5s and floored at one
+    full poll interval. Always over-estimates so the ingest_document promise holds
+    (under-promise / over-deliver): eta >= poll interval, and grows with chunk count."""
+    n = max(0, int(total_chunks))
+    raw = _DOC_ETA_POLL_INTERVAL + _DOC_ETA_STARTUP_MARGIN + n * _DOC_ETA_PER_CHUNK_SECONDS
+    raw = max(raw, _DOC_ETA_POLL_INTERVAL)  # never under-shoot the pickup delay
+    return int(((raw + 4) // 5) * 5)  # round up to nearest 5
+
+
+def _derive_tenant_schema(user_id: str) -> Optional[str]:
+    """Immutable slug from UUID → tenant schema (mirrors /episodic/append)."""
+    try:
+        from src.provisioning.schema_manager import derive_schema_name, derive_user_slug_from_uuid
+        return derive_schema_name(derive_user_slug_from_uuid(user_id))
+    except Exception as e:
+        log.error("doc_registry.schema_derive_failed", error=str(e), user_id=(user_id or "")[:8])
+        return None
+
+
+@app.post("/documents/enqueue")
+def documents_enqueue(req: DocumentEnqueueRequest):
+    """Enqueue a chunked document for ASYNC hybrid extraction (documents registry).
+
+    Writes ONE per-tenant `documents` row status='pending' (chunks retained verbatim
+    in JSONB) and returns FAST with the document id + a modest ETA. The re_embedder
+    poll loop drains it. Purely additive — no WGM gate / class assignment / query
+    scope here. Resilient: an unprovisioned schema / missing table soft-fails (never
+    500s the caller's ingest, mirroring /episodic/append)."""
+    # Freeze switch (knowledge-store mode): enqueue is a write surface — refuse coherently.
+    if not _INGEST_ENABLED:
+        log.info("ingest.disabled_rejected", endpoint="/documents/enqueue")
+        return {"status": "ingest_disabled", "document_id": None,
+                "message": "Ingest is disabled (knowledge-store mode)."}
+
+    user_id = req.user_id or "anonymous"
+    if user_id == "anonymous":
+        return {"status": "soft_error", "document_id": None}
+
+    schema_name = _derive_tenant_schema(user_id)
+    if schema_name is None:
+        return {"status": "soft_error", "document_id": None}
+
+    chunks = [c for c in (req.chunks or []) if isinstance(c, str) and c.strip()]
+    if not chunks:
+        return {"status": "no_content", "document_id": None, "chunk_count": 0}
+    chunk_count = req.chunk_count or len(chunks)
+
+    # R5 PARSER SEAM (migration 298): normalize + shape-check the parser stamp at the
+    # door — the stamp must never lie. Default 'naive_v1' is HONEST, not neutral: every
+    # legacy row was parsed by the pdfplumber/paste path.
+    parser_version = (req.parser_version or "naive_v1").strip().lower() or "naive_v1"
+    if not re.fullmatch(r"[a-z0-9_]+", parser_version):
+        log.warning("doc_registry.invalid_parser_version", user_id=user_id[:8],
+                    requested=str(req.parser_version)[:40])
+        return {"status": "invalid_parser_version", "document_id": None,
+                "message": "parser_version must match [a-z0-9_]+"}
+
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO documents
+                        (user_id, source_ref, title, chunks, chunk_count, status, truncated,
+                         parser_version)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, 'pending', %s, %s)
+                    RETURNING id
+                    """,
+                    (user_id, req.source_ref, req.title, json.dumps(chunks),
+                     chunk_count, bool(req.truncated), parser_version),
+                )
+                parser_version_recorded = True
+            except psycopg2.errors.UndefinedColumn:
+                # Pre-298 schema (parser_version column absent): fall back to the
+                # legacy INSERT. The row reads the column default, which is honest for
+                # every LEGACY row but would mis-stamp a parsed enqueue during
+                # migration lag — so the degradation logs LOUDLY naming the dropped
+                # stamp. Deploy-order contract: apply 298 BEFORE enabling DOC_PARSER.
+                _db.rollback()
+                with _db.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}")
+                    cur.execute(
+                        """
+                        INSERT INTO documents
+                            (user_id, source_ref, title, chunks, chunk_count, status, truncated)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, 'pending', %s)
+                        RETURNING id
+                        """,
+                        (user_id, req.source_ref, req.title, json.dumps(chunks),
+                         chunk_count, bool(req.truncated)),
+                    )
+                parser_version_recorded = False
+                log.warning("doc_registry.enqueued_pre298_schema", user_id=user_id[:8],
+                            schema=schema_name, dropped_parser_version=parser_version)
+            new_id = cur.fetchone()[0]
+        _db.commit()
+        eta = _doc_eta_seconds(chunk_count)
+        log.info("doc_registry.enqueued", user_id=user_id[:8], schema=schema_name,
+                 document_id=new_id, chunk_count=chunk_count, eta_seconds=eta)
+        return {"status": "pending", "document_id": new_id,
+                "chunk_count": chunk_count, "eta_seconds": eta,
+                "truncated": bool(req.truncated),
+                "parser_version_recorded": parser_version_recorded}
+    except Exception as e:
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.error("doc_registry.enqueue_failed", error=str(e),
+                  user_id=user_id[:8], schema=schema_name)
+        return {"status": "soft_error", "document_id": None}
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+
+
+@app.get("/documents/pending")
+def documents_pending(user_id: str):
+    """Recall not-ready probe: is any document still processing for this tenant?
+
+    Returns {pending: bool, count, chunks_remaining, eta_seconds}. Best-effort and
+    fail-SAFE — an unprovisioned schema / missing table / any error returns
+    pending=False so recall never breaks and simply omits the not-ready line."""
+    _quiet = {"pending": False, "count": 0, "chunks_remaining": 0, "eta_seconds": 0}
+    uid = (user_id or "").strip()
+    if not uid or uid == "anonymous":
+        return _quiet
+    schema_name = _derive_tenant_schema(uid)
+    if schema_name is None:
+        return _quiet
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            cur.execute(
+                """
+                SELECT count(*), COALESCE(sum(chunk_count), 0)
+                FROM documents
+                WHERE status IN ('pending', 'processing')
+                """
+            )
+            row = cur.fetchone()
+        count = int(row[0] or 0)
+        chunks_remaining = int(row[1] or 0)
+        if count <= 0:
+            return _quiet
+        return {"pending": True, "count": count, "chunks_remaining": chunks_remaining,
+                "eta_seconds": _doc_eta_seconds(chunks_remaining)}
+    except Exception as e:
+        # Missing table (pre-migration-183 schema) or any DB error → fail-safe quiet.
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.debug("doc_registry.pending_probe_soft_fail user_id=%s err=%s", uid[:8], str(e)[:120])
+        return _quiet
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+
+
+# ── DOCUMENT-HITS STUB LANE (migration 299, plan W2.3) ──────────────────────────────────
+#
+# THE LITERAL SELECT the owner directive asks recall to stay: find documents by their
+# keyword-searchable stub (title A / source_ref B / verbatim chunks — all committed at the
+# ENQUEUE insert, hours before extraction), rank by ts_rank, top 3. Deterministic end to
+# end — GIN answers the @@, the row's own columns answer everything else; NO LLM, no
+# embedding, no query-time smartening. The semantic lane stays optional-by-design (cortex
+# rails: tenant-partitioned, relative rerank; RRF k=60 is the named successor if the
+# rerank lane is ever replaced — research doc, Area 3).
+#
+# Tenant scope is the bound search_path (NO public) — a caller cannot see another tenant's
+# documents because the schema IS the boundary. SOFT-FAIL TO EMPTY, NEVER RAISES: a
+# conversational turn is waiting on this read and a broken stub lane must not break the
+# walk (the same contract /documents/pending ships). Empty on: no/anonymous user, blank
+# query, a query with NO surviving content token (junk-only / function-word-only /
+# non-ASCII-only — see _document_query_tokens), unprovisioned schema, pre-299 schema
+# (no stub_tsv column), or no match.
+#
+# QUERY MECHANICS (W2 regression fix, 2026-10-22 — the live EPA wound). This hook used to
+# build ``websearch_to_tsquery('simple', q)``, which under the 'simple' config has NO
+# stemming and NO stopword removal and ANDs EVERY token. A natural-language question
+# ("What is the soap making process?") therefore demanded the lexemes ``what & is & the &
+# soap …`` to co-occur in ONE chunk → 0 sections → document_hits died exactly when users
+# ask in questions. The fix is TOKEN MECHANICS, deterministic, no query-time smartening
+# and no domain vocabulary: tokenize in Python (same shape as cortex._tokenize), drop a
+# small closed-class English function-word set, and OR-combine what survives via
+# ``to_tsquery('simple', 'a | b | c')``. OR is the RECALL FLOOR — a question now hits any
+# document chunk carrying ANY content term — and ts_rank supplies the ordering, so
+# keyword queries keep their exact behavior (a keyword query's tokens are all content
+# tokens; OR over them ranks the same survivors AND would have). The two-stage cost
+# structure is unchanged: the GIN prefilter answers @@, and the per-chunk rank/shaping
+# below run ONLY on the bounded candidate survivors.
+#
+# R6 — THE PASSAGE RESHAPE (plan DEV/BUGS/plan-100pct-addressability-20261024.md,
+# 2026-10-24). Stage 2 used to shape a ts_headline over title+source_ref+ALL chunks
+# CONCATENATED — it found the RIGHT document but surfaced a stitched snippet, not the
+# passage that answers the question ("17 matching sections" is not an answer; the answer
+# is IN one of those sections). The research doc's strongest external evidence (DEV/
+# RESEARCH/recall-uplift-sota-20261024.md — Letta: passage search over retained files hit
+# 74.0% on LoCoMo, beating graph-only memory) says the retained text itself is the recall
+# surface. Stage 2 therefore now ranks EVERY CHUNK of each GIN-prefiltered candidate doc
+# individually (ts_rank over to_tsvector('simple', chunk_text) vs the SAME tsquery) and
+# returns the top chunks BY TEXT — the caller gets {document_id, title, chunk_index,
+# chunk_text, rank}: the actual passage. Deterministic, zero LLM, zero new storage (chunks
+# JSONB is already retained; the GIN index already answers stage 1). The small-to-big
+# pattern (LlamaIndex ParentDocumentRetriever): rank small (the chunk), return it whole.
+#
+# TITLE-ONLY DISCOVERY FALLBACK: stub_tsv carries setweight(title,'A') || source_ref ||
+# chunks, so a query can pass stage 1 on the TITLE alone while no single chunk carries the
+# token. Dropping those rows would REGRESS W2's document-discovery pin ("You have a
+# document: X" for a title match), so each candidate doc with ZERO chunk matches keeps ONE
+# fallback row (chunk_index/chunk_text NULL, rank NULL) sorted strictly BELOW every
+# passage (NULLS LAST): passages always win, and a title-only match still surfaces the
+# document itself.
+#
+# COST CEILING (unchanged discipline, "rank on a bounded candidate set" — research doc,
+# Area 2): stage 1 keeps at most _DOC_PASSAGE_CANDIDATE_DOCS survivor docs by doc-level
+# ts_rank, and per-chunk expansion + ranking runs ONLY inside that survivor set — never
+# over all chunks of all documents. The old stage 2 already walked every chunk of its
+# survivors (string_agg + the per-chunk match count); per-chunk ts_rank is the same
+# complexity class with the headline stitching REMOVED.
+_DOC_QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+")   # same token shape as cortex._tokenize
+_DOC_QUERY_MIN_TOKEN_LEN = 2                     # drops 1-char debris ('s from possessives)
+
+#: Closed-class English function words ONLY — token mechanics, NOT domain vocabulary.
+#: Derived from the classic NLTK/Snowball English stoplist REDUCED to the unambiguous
+#: function classes (articles, conjunctions, prepositions, pronouns, copulas/auxiliaries,
+#: wh-question words). Deliberately EXCLUDED and left live: negations ("no"/"not" carry
+#: meaning — dropping them would make "windows not booting" match every windows doc),
+#: modals whose homonyms are content ("can"/"will"/"may" — a can, a will, May the month),
+#: and every noun/verb/adjective. The stub chunks are extracted prose; this set filters
+#: the QUERY side only and never touches stored text.
+_DOC_QUERY_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "nor", "yet", "so", "because", "if", "then",
+    "else", "although", "while", "until", "since", "as",
+    "of", "at", "by", "for", "with", "about", "against", "between", "into", "through",
+    "during", "before", "after", "above", "below", "to", "from", "up", "down", "in",
+    "out", "on", "off", "over", "under", "again", "further", "once", "here", "there",
+    "i", "me", "my", "we", "our", "ours", "you", "your", "yours", "he", "him", "his",
+    "she", "her", "hers", "it", "its", "they", "them", "their", "theirs",
+    "this", "that", "these", "those",
+    "who", "whom", "whose", "what", "which", "when", "where", "why", "how",
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "doing", "have", "has", "had", "having",
+    "than", "too", "very",
+})
+
+#: Cap the OR fan-out: a pasted 5000-word "query" must not become a 5000-term GIN probe.
+#: 24 content terms is far above any real question; ts_rank still orders, this only
+#: bounds the prefilter.
+_DOC_QUERY_MAX_TOKENS = 24
+
+#: Stage-1 candidate ceiling (R6): per-chunk expansion + ts_rank runs on at most this many
+#: GIN-prefiltered survivor docs (doc-level ts_rank DESC). Survivors only — never all
+#: chunks of all docs. 8 keeps the complexity class of the old stage 2 (which already
+#: walked every chunk of its 3 survivors twice) while giving the passage rank a wider
+#: doc pool than the final passage LIMIT so a great chunk in doc #4 can still surface.
+_DOC_PASSAGE_CANDIDATE_DOCS = 8
+
+
+def _document_query_tokens(query_text: str) -> list[str]:
+    """Tokenize a document-hits query the way the stub lane can actually match it.
+
+    Lowercase ASCII word tokens ([a-z0-9]+, the cortex._tokenize shape), length >= 2,
+    minus the closed-class function-word set above — deduplicated, order-preserving,
+    capped at _DOC_QUERY_MAX_TOKENS. Every returned token is safe to embed in a
+    ``to_tsquery('simple', ...)`` argument BY CONSTRUCTION: the token regex admits only
+    letters and digits, so no tsquery metacharacter (& | ! ( ) : * ' /) can survive, and
+    no quoting layer is needed or added."""
+    if not query_text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in _DOC_QUERY_TOKEN_RE.findall(str(query_text).lower()):
+        if len(tok) < _DOC_QUERY_MIN_TOKEN_LEN or tok in _DOC_QUERY_STOPWORDS:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= _DOC_QUERY_MAX_TOKENS:
+                break
+    return out
+
+
+def _document_hits_for_query(user_id: str, query_text: str, limit: int = 3) -> list[dict]:
+    """Passage-search the per-tenant documents stub: rank CHUNKS, return their TEXT.
+
+    Query mechanics: content tokens OR-combined via to_tsquery('simple') — see the block
+    comment above for why (the W2 websearch-AND regression) and why that is deterministic
+    token mechanics, not smartening. Stage 1 = the GIN prefilter on stub_tsv (bounded to
+    _DOC_PASSAGE_CANDIDATE_DOCS survivor docs); stage 2 = per-chunk ts_rank inside the
+    survivor set ONLY. Each hit is ONE PASSAGE: {document_id, title, source_ref, status,
+    chunk_count, chunk_index (0-based, the chunks-array ordinal), chunk_text, rank} —
+    or, for a candidate whose title/source matched but no chunk did, ONE discovery
+    fallback row with chunk_index/chunk_text/rank NULL (ranked below every passage).
+    Returns [] on anything less than a clean hit list — never raises into the caller."""
+    _empty: list[dict] = []
+    uid = (user_id or "").strip()
+    if not uid or uid == "anonymous":
+        return _empty
+    _q = (query_text or "").strip()
+    if not _q:
+        return _empty
+    _tokens = _document_query_tokens(_q)
+    if not _tokens:
+        # Nothing indexable survived token mechanics (junk-only, function-word-only, or
+        # non-ASCII-only input). HONEST EMPTY: the OR floor must not degenerate into a
+        # match-everything probe, and the legacy AND over these same tokens missed anyway.
+        # The walk's other lanes still serve this query — this is one soft-fail lane.
+        return _empty
+    _tsq_arg = " | ".join(_tokens)
+    schema_name = _derive_tenant_schema(uid)
+    if schema_name is None:
+        return _empty
+    _db = None
+    try:
+        _db = psycopg2.connect(os.environ.get("POSTGRES_DSN"))
+        with _db.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema_name}")
+            # TWO-STAGE, DELIBERATELY (R6 passage reshape of the adversarial-review shape):
+            # stage 1 = the cheap GIN prefilter + doc-level rank sort, bounded to
+            # _DOC_PASSAGE_CANDIDATE_DOCS survivors; stage 2 = per-chunk ts_rank,
+            # executed ONLY inside that survivor set (never all chunks of all docs —
+            # a common token under 'simple' can match thousands of rows). The LEFT JOIN
+            # LATERAL keeps one discovery-fallback row (all-NULL passage columns) per
+            # candidate doc whose chunks ALL miss, so a title-only match still surfaces
+            # the document — sorted NULLS LAST, below every real passage.
+            cur.execute(
+                """
+                WITH q AS (SELECT to_tsquery('simple', %s) AS tsq),
+                cand AS (
+                    SELECT d.id, d.title, d.source_ref, d.status, d.chunk_count,
+                           d.created_at, d.chunks,
+                           ts_rank(d.stub_tsv, q.tsq) AS doc_rank
+                    FROM documents d, q
+                    WHERE d.stub_tsv @@ q.tsq
+                    ORDER BY doc_rank DESC, d.created_at DESC, d.id ASC
+                    LIMIT %s
+                )
+                SELECT c.id, c.title, c.source_ref, c.status, c.chunk_count,
+                       m.chunk_index,
+                       m.chunk_text,
+                       m.chunk_rank
+                FROM cand c
+                LEFT JOIN LATERAL (
+                    SELECT (o.ord - 1)::int AS chunk_index,
+                           o.chunk_text,
+                           ts_rank(to_tsvector('simple', o.chunk_text), q.tsq) AS chunk_rank
+                    FROM jsonb_array_elements_text(c.chunks)
+                             WITH ORDINALITY AS o(chunk_text, ord)
+                    CROSS JOIN q
+                    WHERE to_tsvector('simple', o.chunk_text) @@ q.tsq
+                ) m ON true
+                ORDER BY m.chunk_rank DESC NULLS LAST,
+                         c.created_at DESC, c.id ASC,
+                         m.chunk_index ASC NULLS LAST
+                LIMIT %s
+                """,
+                (_tsq_arg, _DOC_PASSAGE_CANDIDATE_DOCS,
+                 max(1, min(int(limit), 10))),
+            )
+            rows = cur.fetchall() or []
+    except psycopg2.errors.UndefinedColumn:
+        # Pre-299 schema: the stub_tsv column does not exist yet. Honest empty — the stub
+        # lane does not exist for this tenant, which is not a failure of the walk.
+        if _db is not None:
+            try:
+                _db.rollback()
+            except Exception:
+                pass
+        log.warning("doc_registry.stub_lane_pre299 user_id=%s", uid[:8])
+        return _empty
+    except psycopg2.errors.UndefinedTable:
+        # Pre-183 schema (no documents table): same honest empty.
+        if _db is not None:
+            try:
+                _db.rollback()
+            except Exception:
+                pass
+        return _empty
+    except Exception as e:  # noqa: BLE001 — the stub lane NEVER breaks the walk
+        try:
+            if _db is not None:
+                _db.rollback()
+        except Exception:
+            pass
+        log.warning("doc_registry.stub_lane_soft_fail user_id=%s err=%s", uid[:8], str(e)[:160])
+        return _empty
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+    hits: list[dict] = []
+    for r in rows:
+        try:
+            hits.append({
+                "document_id": int(r[0]),
+                "title": r[1],
+                "source_ref": r[2],
+                "status": r[3],
+                "chunk_count": int(r[4] or 0),
+                # NULL on a title-only discovery-fallback row — the renderer speaks the
+                # old "You have a document: X" shape for those (no passage to quote).
+                "chunk_index": int(r[5]) if r[5] is not None else None,
+                "chunk_text": r[6],
+                "rank": float(r[7]) if r[7] is not None else None,
+            })
+        except (TypeError, ValueError):
+            continue
+    return hits
+
 
 
 def _defer_context_to_episodic(req: StoreContextRequest, reason: str) -> StoreContextResponse:

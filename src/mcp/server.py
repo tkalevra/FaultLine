@@ -812,6 +812,287 @@ async def _ingest_statement_via_spine(
     return _spine_data
 
 
+
+#: Passage display ceiling (R6): the chunker caps chunks at _DOC_CHUNK_MAX_CHARS (1200),
+#: so a real passage is quoted WHOLE — this ceiling only trims pathological hand-seeded
+#: rows, never an honest chunk. Deterministic constant, not a smart trim.
+_DOC_PASSAGE_DISPLAY_CHARS = 1500
+
+#: Passage cleanup subset of _MCP_STRIP_PATTERNS: annotation debris ONLY. The UUID-token
+#: pattern that lives in this repo's legacy _MCP_STRIP_PATTERNS list is DELIBERATELY
+#: excluded here — a UUID quoted in the user's own document is CONTENT, not a store
+#: entity id to redact (the passage has no store-membership context; it must stay
+#: verbatim, per the membership-gated-strip ruling the upstream renderer codified).
+_DOC_PASSAGE_STRIP_PATTERNS = [
+    _re.compile(r'^\[(?:staged|Class [ABC]|Class-[ABC])\]\s*', _re.I),
+    _re.compile(r'\bconfidence=[\d.]+\b', _re.I),
+]
+
+
+def _render_document_hit_lines(hits: list) -> list[str]:
+    """Deterministic assert lines for the document passage lane (migration 299 → R6).
+
+    A PASSAGE hit renders as "From your document <title>: <the actual chunk text that
+    matches> (document id N, section M)" — the passage IS the answer, quoted verbatim
+    (whitespace-collapsed for the single-line assert band), never a stitched headline.
+    A title-only discovery row (chunk_text None — the title/source matched but no single
+    chunk did) renders the W2 shape: "You have a document: <title> (document id N)".
+    Pure string shaping over rows the backend SELECT already returned — NO LLM, no
+    re-ranking, no smartening. The import status is stated honestly when the document is
+    not 'ready': a stub hit is VERBATIM TEXT ONLY, never committed facts (the stub-lane
+    honesty rule, migration 299). Never raises — a malformed hit is skipped."""
+    lines: list[str] = []
+    # Per-status honesty (adversarial-review fix): 'error' is NOT "still extracting" —
+    # the facts are not coming; say what is actually true for each terminal state.
+    _STATUS_SUFFIX = {
+        "pending": "import pending — verbatim text only, facts still extracting",
+        "processing": "import processing — verbatim text only, facts still extracting",
+        "partial": "import partial — verbatim text only, some sections failed",
+        "error": "import failed — verbatim text only; retry_document can re-read it",
+    }
+    for _h in hits or []:
+        try:
+            if not isinstance(_h, dict):
+                continue
+            _title = (_h.get("title") or _h.get("source_ref")
+                      or f"document {_h.get('document_id')}").strip()
+            _title = _clean_for_mcp(str(_title))[:120]
+            _status = str(_h.get("status") or "").strip()
+            _status_note = ""
+            if _status and _status != "ready":
+                _status_note = _STATUS_SUFFIX.get(
+                    _status, f"import {_status} — verbatim text only")
+            _passage = _h.get("chunk_text")
+            if isinstance(_passage, str) and _passage.strip():
+                # THE PASSAGE IS THE ANSWER: quote the chunk verbatim (whitespace-
+                # collapsed — chunks carry markdown newlines; the assert band is one
+                # line), capped only at the pathological-row ceiling above. Cleanup is
+                # LIMITED to _DOC_PASSAGE_STRIP_PATTERNS (internal annotation debris);
+                # the UUID strip is DELIBERATELY skipped — see its definition above.
+                for _pat in _DOC_PASSAGE_STRIP_PATTERNS:
+                    _passage = _pat.sub("", _passage)
+                _passage = " ".join(_passage.split())
+                if len(_passage) > _DOC_PASSAGE_DISPLAY_CHARS:
+                    _passage = _passage[:_DOC_PASSAGE_DISPLAY_CHARS - 1].rstrip() + "…"
+                _sec = _h.get("chunk_index")
+                _sec = f", section {int(_sec) + 1}" if isinstance(_sec, int) else ""
+                _line = (f"From your document {_title}: {_passage} "
+                         f"(document id {_h.get('document_id')}{_sec}")
+            else:
+                # Title/source-only match (or a legacy W2-shaped hit): the document row
+                # exists but no single chunk answered — discovery, not passage.
+                _line = f"You have a document: {_title} (document id {_h.get('document_id')}"
+            if _status_note:
+                _line += f"; {_status_note}"
+            _line += ")."
+            lines.append(_line)
+        except Exception:  # noqa: BLE001 — a malformed hit never breaks recall
+            continue
+    return lines
+
+
+# ── INSTANT DOCUMENT STUB FACTS (migration 299 era, plan W2.2) ──────────────────────────
+#
+# The enqueue commit makes the verbatim text keyword-searchable (stub_tsv, migration 299);
+# THIS lane makes the document's STRUCTURE walkable in the graph at the same instant — the
+# document entity, its title/filename alias, and the headings the parser reported — ZERO
+# LLM, deterministic, minted from PARSER-PROVIDED STRUCTURE ONLY.
+#
+# THE BUG-05 TRAP: interrogative fragments ("what is X", "how does Y work") must never
+# become junk ENTITIES with fabricated parent_of edges. The mint below therefore carries
+# a hard screen, pinned by tests:
+#   * NEVER from chunk text — body prose is extraction's job; the stub mints
+#     only the document's own name surface and markdown ATX headings (parser structure:
+#     docling renders headings as '#'; naive_v1 pasted text simply carries none).
+#   * NEVER a question-shaped name — a title/filename/heading that reads as a question
+#     mints NOTHING (the document stays fully searchable via stub_tsv; only the GRAPH
+#     mint is suppressed). A question is a yield shape, not a thing.
+# Provenance follows the document lane's existing convention: source="document" →
+# llm_inferred, staged Class B, source_ref citation threaded (migration 128), seeded rels
+# only (instance_of P31, also_known_as P742, part_of P361, owns) — no invented vocabulary.
+#
+
+_STUB_INTERROGATIVES = frozenset({
+    "what", "who", "whom", "whose", "when", "where", "why", "how", "which",
+})
+
+# Bounded structure yield: a stub is a table of contents, not a re-index of the body.
+_STUB_MAX_HEADINGS = 20
+
+_STUB_ATX_HEADING_RE = _re.compile(r"^\s{0,3}#{1,6}\s+(\S.*?)\s*$")
+
+
+def _stub_is_question_shaped(name: str) -> bool:
+    """True when a name surface reads as a QUESTION — the BUG-05 guard.
+
+    Deterministic, closed-class: a trailing '?' or a leading wh-interrogative word. A
+    question-shaped string mints NOTHING (graph-side); it stays searchable via stub_tsv."""
+    s = (name or "").strip().rstrip("!. ")
+    if s.endswith("?"):
+        return True
+    first = _re.match(r"[A-Za-z]+", s)
+    return bool(first) and first.group(0).lower() in _STUB_INTERROGATIVES
+
+
+def _stub_filename_stem(source_ref: str) -> str:
+    """The filename surface of a source_ref ('file:///a/b/Report_v2.pdf' → 'Report_v2').
+
+    A URL path TAIL WITHOUT an extension is also a legitimate document name surface
+    ('https://site/docs/whitepaper' → 'whitepaper' — a slug the publisher named the
+    document by); only an EMPTY tail yields ''. The question-shape screen still applies
+    downstream before anything mints."""
+    s = (source_ref or "").strip()
+    if not s:
+        return ""
+    tail = _re.split(r"[\\/]", s)[-1].strip()
+    if not tail or tail in (".", ".."):
+        return ""
+    # URL query-string / fragment tails are NOT part of the document's name surface
+    # (adversarial-review fix): 'whitepaper?id=9' or 'faq#what-is-x' mint as junk.
+    tail = _re.sub(r"[?#].*$", "", tail).strip()
+    if not tail:
+        return ""
+    stem = _re.sub(r"\.[A-Za-z0-9]{1,8}$", "", tail).strip()
+    return stem
+
+
+def _stub_heading_names(chunks: list[str]) -> list[str]:
+    """Markdown ATX headings the PARSER reported ('#'-prefixed lines in the chunk text).
+
+    Docling (docling_v1) renders layout headings exactly this way; naive_v1 pasted text
+    carries none unless the source itself was markdown (then it IS provided structure).
+    Question-shaped headings are dropped HERE, at the yield — they never reach an edge."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks or []:
+        for line in (chunk or "").splitlines():
+            m = _STUB_ATX_HEADING_RE.match(line or "")
+            if not m:
+                continue
+            h = m.group(1).strip().strip("*_`").strip()
+            if not h or len(h) > 200 or h.lower() in seen:
+                continue
+            if _stub_is_question_shaped(h):
+                continue  # BUG-05: a question-shaped heading is yield text, not a thing
+            seen.add(h.lower())
+            out.append(h)
+            if len(out) >= _STUB_MAX_HEADINGS:
+                return out
+    return out
+
+
+def _mint_document_stub_edges(*, title: str, source_ref: str,
+                              chunks: list[str]) -> list[dict[str, Any]]:
+    """Build the deterministic stub edges for ONE document. Pure — no I/O, no LLM.
+
+    Returns [] (mint NOTHING) when no non-question-shaped name surface exists, or when the
+    only surface is question-shaped (the BUG-05 pin)."""
+    t = (title or "").strip()
+    stem = _stub_filename_stem(source_ref)
+    name = ""
+    aliases: list[str] = []
+    if t and not _stub_is_question_shaped(t):
+        name = t
+        if stem and stem.lower() != t.lower() and not _stub_is_question_shaped(stem):
+            aliases.append(stem)
+    elif stem and not _stub_is_question_shaped(stem):
+        name = stem
+        if t and t.lower() != stem.lower() and not _stub_is_question_shaped(t):
+            aliases.append(t)
+    if not name:
+        # No clean name surface (empty, or the only surface is question-shaped): mint
+        # nothing. The document remains fully stub_tsv-searchable; only the graph stays
+        # free of a junk entity.
+        return []
+
+    edges: list[dict[str, Any]] = [
+        # The document instance filed AT its type node — THE HARD LINE respected: the
+        # title/filename is the artefact's NAME (naming layer), never itself a place.
+        {"subject": name, "rel_type": "instance_of", "object": "document",
+         "subject_type": "Object", "object_type": "Concept",
+         "fact_provenance": "llm_inferred"},
+        # Reachability from the user anchor, exactly like the upload-event lane's owns edge.
+        {"subject": "user", "rel_type": "owns", "object": name,
+         "subject_type": "Person", "object_type": "Object",
+         "fact_provenance": "llm_inferred"},
+    ]
+    for alias in aliases:
+        edges.append({"subject": name, "rel_type": "also_known_as", "object": alias,
+                      "subject_type": "Object", "object_type": "Concept",
+                      "fact_provenance": "llm_inferred"})
+    for h in _stub_heading_names(chunks):
+        if h.lower() == name.lower():
+            continue
+        # A heading IS a component of the document (part_of: component → whole, seeded
+        # P361, no invented vocabulary).
+        edges.append({"subject": h, "rel_type": "part_of", "object": name,
+                      "subject_type": "Concept", "object_type": "Object",
+                      "fact_provenance": "llm_inferred"})
+    ref = (source_ref or "").strip()
+    if ref:
+        for e in edges:
+            e["source_ref"] = ref
+    return edges
+
+
+async def _mint_document_stub_facts(*, user_id: str, title: str, source_ref: str,
+                                    chunks: list[str], document_id: Any) -> int:
+    """Write the stub facts for an accepted document. Best-effort + LOUD, zero LLM.
+
+    Returns the edge count minted (0 = nothing minted — no name surface, or the write
+    did not land, which is logged). NEVER raises into the accept path: the document is
+    already accepted; a failed surface-mint must not fail the ingest."""
+    try:
+        edges = _mint_document_stub_edges(title=title, source_ref=source_ref, chunks=chunks)
+        if not edges:
+            _log("document_stub: no mint (no clean name surface) "
+                 f"user={user_id[:8]} doc={document_id} ref={(source_ref or '')!r:.120}")
+            return 0
+        body: dict[str, Any] = {
+            "text": f"document stub: {(title or source_ref or '').strip()}"[:200],
+            "user_id": user_id,
+            "edges": edges,
+            "source": "document",  # document tier: → llm_inferred, staged B (never A)
+        }
+        if (source_ref or "").strip():
+            body["source_ref"] = source_ref.strip()
+        try:
+            resp = await _http_client.post(
+                f"{FAULTLINE_API_URL}/ingest", json=body, timeout=15.0)
+        except Exception as _ie:  # noqa: BLE001 — transport fault never fails the accept
+            _log(f"SECURITY-CRITICAL: document_stub_mint_not_committed "
+                 f"user={user_id[:8]} doc={document_id} edges={len(edges)} "
+                 f"reason={_ie!r} — stub facts not committed, ingest unaffected")
+            return 0
+        if resp.status_code >= 400:
+            _log(f"SECURITY-CRITICAL: document_stub_mint_refused "
+                 f"user={user_id[:8]} doc={document_id} edges={len(edges)} "
+                 f"status={resp.status_code} — stub facts not committed, ingest unaffected")
+            return 0
+        data = {}
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 — non-JSON success shape
+            data = {}
+        # HONEST COUNT: report what the store SAID landed (committed + staged — the
+        # document tier is staged-B by design). The fallback to the sent count fires
+        # ONLY when the success shape carries neither key; an explicit zero stays an
+        # honest zero (the store said nothing landed).
+        landed = None
+        try:
+            if "committed" in data or "staged" in data:
+                landed = int(data.get("committed") or 0) + int(data.get("staged") or 0)
+        except (TypeError, ValueError):
+            landed = None
+        _log(f"document_stub: minted {landed if landed is not None else '?'}/"
+             f"{len(edges)} stub edge(s) doc={document_id} user={user_id[:8]}")
+        return landed if landed is not None else len(edges)
+    except Exception as stub_exc:  # noqa: BLE001 — the stub never breaks the ingest
+        _log(f"SECURITY-CRITICAL: document_stub_mint_failed "
+             f"user={user_id[:8]} doc={document_id}: {stub_exc!r} — ingest unaffected")
+        return 0
+
+
 async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     """Call FaultLine /query endpoint and return human-readable prose.
 
@@ -870,6 +1151,15 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     data = resp.json()
 
     facts = data.get("facts", [])
+    # DOCUMENT PASSAGE LANE (migration 299 → R6): the walk payload carries the
+    # deterministic per-chunk passage hits over documents chunks (top 3 chunks,
+    # backend-ranked by per-chunk ts_rank). Rendered below as a deterministic ASSERT
+    # line — the passage is VERBATIM RETAINED TEXT (a row-level fact, not an
+    # inference), so unlike the held band this is stated as plain knowledge.
+    # Empty/absent = honest no-match; the backend lane soft-failed to [] and never
+    # raised.
+    _doc_hits = data.get("document_hits") or []
+    _doc_hit_lines = _render_document_hit_lines(_doc_hits)
     attributes: dict = data.get("attributes", {})
     # NOTE: preferred_names / canonical_identity are no longer consumed here —
     # perspective ("you" vs name) is resolved upstream in the backend's
@@ -881,6 +1171,13 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
         # all). Otherwise it's an honest empty recall.
         if _ingest_fallback is not None:
             return _ingest_fallback
+        if _doc_hit_lines:
+            # Empty fact walk, but the stub lane matched: the document hit IS the
+            # grounded answer surface for "do I have anything about Y" (migration 299).
+            # Deterministic ASSERT lines only — no abstention on top (we DID find
+            # something: the document, verbatim). A pending import still says so via
+            # the hit line's own honest status suffix.
+            return {"memory": "\n".join(_doc_hit_lines)}
         return {"memory": "No relevant facts found."}
 
     # Perspective ("you" vs name) is now resolved UPSTREAM by the backend
@@ -967,6 +1264,15 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     for attr, value in attributes.items():
         line = f"{attr}: {value}"
         _emit(line, "A")
+
+    # DOCUMENT-HITS STUB LANE (migration 299, W2.3): deterministic assert lines ride the
+    # asserted band (the document row EXISTS — row-level fact, not an inference), joined
+    # AFTER the fact lines so extracted facts still lead. They count as content below,
+    # so a facts-empty-but-doc-hit recall renders the hits instead of the abstention.
+    for _dl in _doc_hit_lines:
+        if _dl not in seen:
+            seen.add(_dl)
+            assert_lines.append(_dl)
 
     if not assert_lines and not hold_lines and not event_lines:
         return {"memory": "No relevant facts found."}
@@ -1378,6 +1684,9 @@ async def ingest_document_tool(
     """
     ref = (source_ref or title or "").strip()
 
+    # W2.2: set at accept time (after chunking); 0 on every early-return path.
+    stub_facts_minted = 0
+
     def _summary(status: str, **overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
             "status": status,
@@ -1388,6 +1697,9 @@ async def ingest_document_tool(
             "context_stored": 0,
             "truncated": False,
             "source_ref": ref,
+            # W2.2 instant stub: count of deterministic document-structure edges minted
+            # at accept time (0 = no clean name surface or the mint did not land).
+            "stub_facts_minted": stub_facts_minted,
         }
         base.update(overrides)
         return base
@@ -1425,6 +1737,16 @@ async def ingest_document_tool(
         f"ingest_document: {len(chunks)} chunks (ref={ref!r}, chars={len(text)}, "
         f"route={extractor_route})"
     )
+
+    # ── INSTANT STUB FACTS (migration 299 era, plan W2.2) ─────────────────────
+    # Right after acceptance the tool mints deterministic stub facts (document entity +
+    # title/filename alias + parser-reported headings; source="document" → staged B;
+    # ZERO LLM, never from chunk text or question-shaped surfaces — the BUG-05 trap),
+    # so "what is doc X / do I have anything about Y" is answerable the moment the
+    # document is accepted, before any chunk extraction completes. The count rides the
+    # response as ``stub_facts_minted``. Best-effort: a mint failure never fails ingest.
+    stub_facts_minted = await _mint_document_stub_facts(
+        user_id=user_id, title=title, source_ref=ref, chunks=chunks, document_id=None)
 
     sem = asyncio.Semaphore(3)
 
