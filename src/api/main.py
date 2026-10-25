@@ -35026,7 +35026,10 @@ async def query(request: QueryRequest) -> QueryResponse:
     _hits_task = _asyncio.ensure_future(
         run_in_threadpool(_document_hits_for_query, _uid, request.text))
     try:
-        _resp = await _query_impl(request)
+        _pending = _query_impl(request)
+        # The impl is async on this lineage; a sync stand-in (tests / future
+        # refactor to the main-line sync shape) is awaited through unchanged.
+        _resp = await _pending if hasattr(_pending, "__await__") else _pending
     except Exception:
         _hits_task.cancel()
         raise
