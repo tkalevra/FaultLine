@@ -337,7 +337,12 @@ async def test_recall_empty_walk_with_doc_hit_renders_the_document_line(monkeypa
     assert "No relevant facts found" not in mem
 
 
-async def test_recall_with_facts_leads_with_facts_doc_line_after(monkeypatch):
+async def test_recall_with_facts_doc_passage_leads(monkeypatch):
+    """BUG-09 (adversarial bench 2026-10-24) REVERSED the old order: the verbatim
+    document passage (highest-truth band, row-level fact from source) now LEADS the
+    extracted facts, so B-tier extraction debris can never own the topline above
+    verified source text. The old name/assertion (facts lead, doc line after) pinned
+    the W2.3-era order this lane deliberately supersedes."""
     s = server_module()
 
     async def fake_post(url, json=None, timeout=None, headers=None):
@@ -365,7 +370,7 @@ async def test_recall_with_facts_leads_with_facts_doc_line_after(monkeypatch):
     monkeypatch.setattr(s, "RECALL_INTENT_ROUTING", False, raising=False)
     out = await recall_memory_tool("dog", "u-alice")
     mem = out["memory"]
-    assert mem.index("Your dog is Rex.") < mem.index("From your document Dog Manual")
+    assert mem.index("From your document Dog Manual") < mem.index("Your dog is Rex.")
 
 
 # ── DB pins (a) + (d): dedicated throwaway database, real migration corpus ──────────────

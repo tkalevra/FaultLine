@@ -1190,11 +1190,12 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     facts = data.get("facts", [])
     # DOCUMENT PASSAGE LANE (migration 299 → R6): the walk payload carries the
     # deterministic per-chunk passage hits over documents chunks (top 3 chunks,
-    # backend-ranked by per-chunk ts_rank). Rendered below as a deterministic ASSERT
-    # line — the passage is VERBATIM RETAINED TEXT (a row-level fact, not an
-    # inference), so unlike the held band this is stated as plain knowledge.
-    # Empty/absent = honest no-match; the backend lane soft-failed to [] and never
-    # raised.
+    # backend-ranked by per-chunk ts_rank). Rendered as deterministic ASSERT lines
+    # through the document band (BUG-09: passages LEAD every fact band and keep the
+    # second person in every voice) — the passage is VERBATIM RETAINED TEXT (a
+    # row-level fact, not an inference), so unlike the held band this is stated as
+    # plain knowledge. Empty/absent = honest no-match; the backend lane soft-failed
+    # to [] and never raised.
     _doc_hits = data.get("document_hits") or []
     _doc_hit_lines = _render_document_hit_lines(_doc_hits)
     attributes: dict = data.get("attributes", {})
@@ -1213,7 +1214,8 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
             # grounded answer surface for "do I have anything about Y" (migration 299).
             # Deterministic ASSERT lines only — no abstention on top (we DID find
             # something: the document, verbatim). A pending import still says so via
-            # the hit line's own honest status suffix.
+            # the hit line's own honest status suffix. BUG-09: they LEAD (their own
+            # band, second person — never rewritten to a third person).
             return {"memory": "\n".join(_doc_hit_lines)}
         return {"memory": "No relevant facts found."}
 
@@ -1302,16 +1304,21 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
         line = f"{attr}: {value}"
         _emit(line, "A")
 
-    # DOCUMENT-HITS STUB LANE (migration 299, W2.3): deterministic assert lines ride the
-    # asserted band (the document row EXISTS — row-level fact, not an inference), joined
-    # AFTER the fact lines so extracted facts still lead. They count as content below,
-    # so a facts-empty-but-doc-hit recall renders the hits instead of the abstention.
+    # DOCUMENT-HITS STUB LANE (migration 299, W2.3): the deterministic assert lines ride
+    # their OWN document band (BUG-09, 2026-10-24 bench): they LEAD every fact band (a
+    # passage is verbatim-from-source; extracted/staged facts may be B-tier debris and
+    # must never own the topline above verified text) and they are exempt from any
+    # person rewriting ("their document" would mis-attribute the seat's own library).
+    # They still count as content below, so a facts-empty-but-doc-hit recall renders the
+    # hits instead of the abstention.
     for _dl in _doc_hit_lines:
-        if _dl not in seen:
-            seen.add(_dl)
-            assert_lines.append(_dl)
+        seen.add(_dl)
 
-    if not assert_lines and not hold_lines and not event_lines:
+    # Doc hits COUNT AS CONTENT (they did when they rode assert_lines; they still must
+    # now that they have their own band): a recall whose facts were all confidence-
+    # filtered but which holds a verbatim passage renders the passage, never an
+    # abstention on top of a found document.
+    if not assert_lines and not hold_lines and not event_lines and not _doc_hit_lines:
         return {"memory": "No relevant facts found."}
 
     preamble = (
@@ -1322,6 +1329,14 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     )
 
     sections: list[str] = []
+    # DOCUMENT PASSAGES LEAD (BUG-09): verbatim source text is the highest-truth band,
+    # so it renders FIRST — never below staged/extracted facts — and is never
+    # person-rewritten (the seat IS the document owner; "their document" is a
+    # mis-attribution, not a neutralization). Plain join, no intro of its own — a
+    # passage line already carries its own "From your document <title>: …" framing.
+    _docs = [str(x).strip() for x in (_doc_hit_lines or []) if str(x).strip()]
+    if _docs:
+        sections.append("\n".join(_docs))
     if event_lines:
         # PART 2: the events are ALREADY in true chronological order (PostgreSQL sorted
         # them by date). The model must NOT re-derive or reorder the sequence — it
