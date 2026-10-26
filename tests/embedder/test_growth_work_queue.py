@@ -327,12 +327,15 @@ def test_drain_failure_backs_off_priority(bound_conn):
 
 
 def test_drain_lane_probe_stops_the_batch(bound_conn):
-    """The brain flapping closed mid-drain stops further spend; the rest of the
-    batch keeps its pending rows (rate-limited retry next cycle)."""
+    """The brain flapping closed mid-drain stops further BRAIN spend; the closed
+    operation's items stay pending (rate-limited retry next cycle) — and (BUG-08)
+    the skip is PER OPERATION: it must not block a later deterministic operation
+    whose lane is open."""
     with bound_conn.cursor() as cur:
         cur.execute(
             "INSERT INTO growth_work_queue (operation_type, target_id, priority)"
-            " VALUES ('promotion', '1', 2), ('enrichment', 'ontology_eval', 5)")
+            " VALUES ('promotion', '1', 2), ('enrichment', 'ontology_eval', 5),"
+            "       ('recall_miss_reexamine', 'x:1:0', 2)")
     bound_conn.commit()
     calls = []
 
@@ -340,12 +343,17 @@ def test_drain_lane_probe_stops_the_batch(bound_conn):
         calls.append((op, tgt))
         return True
 
-    probes = [True, False]  # open for the first op, flaps closed before the second
-    res = GWQ.drain(bound_conn, runner, schema_name="s",
-                    lane_probe=lambda: probes.pop(0) if probes else False)
-    assert calls == [("promotion", "1")]   # enrichment never attempted
+    def _probe(operation):
+        # lane closed for promotion (first in priority order), OPEN for the rest
+        return operation != "promotion"
+
+    res = GWQ.drain(bound_conn, runner, schema_name="s", lane_probe=_probe)
+    assert ("promotion", "1") not in calls        # lane-closed op never ran
+    assert ("enrichment", "ontology_eval") in calls
+    assert ("recall_miss_reexamine", "x:1:0") in calls
+    assert res["drained"] == 2
     rows = dict((t, op) for op, t, _p in _pending_rows(bound_conn))
-    assert rows == {"ontology_eval": "enrichment"}
+    assert rows == {"1": "promotion"}             # the closed lane's item stays pending
 
 
 def test_drain_reports_attempted_to_caller(bound_conn):

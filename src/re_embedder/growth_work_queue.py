@@ -97,6 +97,19 @@ OPERATION_PRIORITY = {
     "recall_miss_brain": 5,
 }
 
+#: Operations whose DRAIN RUNNER spends ZERO brain budget (BUG-08): their
+#: re-attempt is pure SQL + in-process deterministic work (the R9 spine deriver
+#: + GLiNER2 run IN-PROCESS; the only wire call is the /ingest commit door,
+#: which is brain-free). A brain-lane gate must NEVER block these — on prod the
+#: document drain keeps the tenant brain's lane permanently closed (posture
+#: tightened / fail-closed), and one blanket lane check gating the whole drain
+#: left 8 recall_miss markers pending for 3+ hours while the deterministic
+#: phase that could have resolved them cost nothing. Brain-BEARING operations
+#: (promotion's classify pass, enrichment, synonym convergence, whatis-climb,
+#: and recall_miss_brain — whose flip hands the chunk BACK to the paced brain's
+#: document drain) stay lane-gated.
+DETERMINISTIC_OPERATIONS = frozenset({"recall_miss_reexamine"})
+
 # ── R7 recall-miss markers (gauntlet R7; the query side's feedback into growth) ─
 #
 # Written by the /query wrapper when Layer 1 (the graph walk) returns ZERO facts
@@ -592,9 +605,13 @@ def drain(conn, runner, item_done=None, schema_name: str = "",
 
     AMPLIFICATION GUARDS (round-1 critic): (a) one re-attempt per DISTINCT deferred
     operation per drain — ten pending promotion rows cost ONE promotion pass, not
-    ten (item_done still adjudicates every row); (b) ``lane_probe()`` (optional) is
-    consulted before each distinct operation — if the brain flapped closed mid-drain,
-    the rest of the batch stays pending instead of burning fail-closed calls;
+    ten (item_done still adjudicates every row); (b) ``lane_probe(operation_type)``
+    (optional, BUG-08: the probe is consulted PER OPERATION TYPE) — if the lane the
+    operation needs is closed (the brain flapped mid-drain for a brain-bearing op),
+    the rest of the batch stays pending instead of burning fail-closed calls. A
+    probe MUST NOT blanket-veto deterministic operations (see
+    DETERMINISTIC_OPERATIONS) — the caller-side gate
+    (embedder._growth_drain_lane_open) is the one translation layer and is pinned;
     (c) ``on_attempted(operation_type, target_id, ok)`` (optional) lets the caller
     record the ledger run for a subsystem it re-ran, so the normal cycle below does
     not immediately re-spend on the same input.
@@ -642,24 +659,38 @@ def drain(conn, runner, item_done=None, schema_name: str = "",
 
     drained = 0
     attempted: dict = {}   # distinct-op key -> ok verdict (ONE pass per operation)
+    probe_closed: set = set()   # operation types whose lane probed closed this drain
     for item_id, operation, target in items:
         key = (operation, "promotion" if operation == "promotion" else target)
         if key in attempted:
             ok = attempted[key]
+        elif operation in probe_closed:
+            # BUG-08: this operation's lane probed closed on an EARLIER item this
+            # drain — skip (stays pending, rate-limited retry next cycle) without
+            # re-probing, and WITHOUT blocking the operations after it: a closed
+            # brain lane must not head-of-line-block a deterministic operation the
+            # way the old blanket `break` did.
+            continue
         else:
             # Mid-drain lane probe: the brain can flap closed again — stop spending;
             # the un-attempted items keep their pending rows (rate-limited retry).
+            # BUG-08: the probe receives the OPERATION TYPE so a deterministic
+            # operation (DETERMINISTIC_OPERATIONS) is never blocked by a brain-lane
+            # verdict it does not need. A closed verdict skips THIS operation's
+            # items only; the drain continues to later operations.
             if lane_probe is not None:
                 try:
-                    lane_open = bool(lane_probe())
-                except Exception:  # noqa: BLE001
+                    lane_open = bool(lane_probe(operation))
+                except Exception:  # noqa: BLE001 — a raising probe is a closed lane
                     lane_open = False
                 if not lane_open:
+                    probe_closed.add(operation)
                     log.info(
                         f"growth_work_drain lane_closed_mid_drain schema={schema_name} "
-                        f"remaining_items stay pending (rate-limited retry next cycle)"
+                        f"operation={operation} items stay pending "
+                        "(rate-limited retry next cycle)"
                     )
-                    break
+                    continue
             # READ BARRIER before every re-attempt: an early-returning runner (e.g.
             # "nothing due") can leave its SELECT's read open on this shared
             # connection; the next operation must not inherit it across its LLM hop.
