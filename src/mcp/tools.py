@@ -3,7 +3,10 @@
 TOOLS = [
     {
         "name": "recall_memory",
-        "description": "Call at the START of a turn to look up what you already know when the user "
+        "description": "This is FaultLine's memory query. If the host offers `search_notes` or "
+                       "`view_note`, those are temporary notes, NOT FaultLine — use this tool "
+                       "when the user asks what you know about them. "
+                       "Call at the START of a turn to look up what you already know when the user "
                        "asks about or references something you may know about them, their people, or "
                        "their world. This only READS memory — it never saves; to SAVE a new fact the "
                        "user states, use remember_facts instead. The results are things you "
@@ -32,7 +35,12 @@ TOOLS = [
     },
     {
         "name": "remember_facts",
-        "description": "Save something the user just told you. Call this whenever the user states a "
+        "description": "This is FaultLine's persistent memory — validated, provenance-tracked, "
+                       "and queryable from any client. If the host offers a `write_note` or "
+                       "similar tool, that is a temporary note, NOT FaultLine memory — always "
+                       "use this tool when the user says 'remember', 'save to Faultline', or "
+                       "refers to their memory. "
+                       "Save something the user just told you. Call this whenever the user states a "
                        "fact about themselves, another person, or their world — a name, relationship, "
                        "preference, job, possession, or location — even mentioned in passing, and also "
                        "when they correct a prior fact. Default to calling it; skip only pure questions "

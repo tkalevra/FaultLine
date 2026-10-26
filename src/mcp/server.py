@@ -2613,6 +2613,10 @@ async def run_mcp_server() -> None:
                             (params or {}).get("protocolVersion")),
                         "capabilities": {"tools": {}, "prompts": {}},
                         "serverInfo": {"name": "faultline-mcp", "version": "1.0.0"},
+                        # The one server-level routing notice FOSS carries (premise.py, 2026-10-26):
+                        # clients that surface initialize.instructions (OpenWebUI ≥0.6.31 native MCP)
+                        # get the FaultLine-vs-host-notes differentiation in the system prompt.
+                        "instructions": _premise.SERVER_INSTRUCTIONS,
                         "resultType": "complete",
                     },
                 })
