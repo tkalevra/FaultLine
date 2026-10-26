@@ -4258,9 +4258,14 @@ def _mint_groupings_from_membership(db, user_id: str, min_members: int = None) -
                         SELECT subject_id, object_id, rel_type FROM facts
                          WHERE rel_type = ANY(%s) AND superseded_at IS NULL
                            AND archived_at IS NULL AND deleted_at IS NULL
-                        UNION
-                        SELECT subject_id, object_id, rel_type FROM staged_facts
-                         WHERE rel_type = ANY(%s) AND promoted_at IS NULL
+                         UNION
+                         SELECT subject_id, object_id, rel_type FROM staged_facts
+                          WHERE rel_type = ANY(%s) AND promoted_at IS NULL
+                          -- TOMBSTONE (Phase-4 parity, BUG-05 2026-10-24): a soft-deleted
+                          -- (quarantined junk) staged row must not feed growth either —
+                          -- co-membership minted from extraction debris grows the SHELF
+                          -- from forgotten junk.
+                            AND deleted_at IS NULL
                   ) m
                  WHERE object_id <> %s
                  GROUP BY object_id, rel_type
