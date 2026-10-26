@@ -7,6 +7,7 @@ import traceback
 import uuid
 import threading          # module-level: _REL_TYPE_CATEGORY_LOCK guards the rel_type memo
 import time               # module-level: time.monotonic() for TTL/deadline arithmetic
+from concurrent.futures import ThreadPoolExecutor  # passage-lane dedicated budget (BUG-02)
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -19,6 +20,7 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse   # 503 shed response at the turn barrier
 from src.api.logging_config import set_log_level, get_log_level, LogLevel, log_crit
+from src.api import errors as _errors  # THE ONE ERROR SEAM — no exception text in a response body
 from src.config.settings import settings
 from src.entity_registry.registry import EntityRegistry
 from src.entity_registry.entity_type_cache import initialize_entity_type_cache, get_entity_type_cache
@@ -38865,6 +38867,85 @@ def _record_recall_miss_markers(user_id: str, marker_rows: list) -> None:
 _recall_miss_marker_tasks: set = set()
 
 
+#: PASSAGE-LANE EXECUTOR (BUG-02, adversarial bench 2026-10-24): the document-hits read is
+#: sub-second pure-Postgres FTS and it is the FLOOR of every /query answer, so it gets its
+#: own small thread budget instead of sharing anyio's worker pool with the graph walks.
+#: Under brain purgatory the shared pool is saturated by minutes-long walks (bench: doc-lane
+#: ``waiting: 169``); a passage read queued behind those lost its result window and
+#: ``document_hits`` silently arrived ``[]`` on exactly the slow turns that needed the lane
+#: most — indistinguishable from an honest no-match. A dedicated executor cannot be starved
+#: by walk load: the floor computes even when the walk lane is fully wedged. Threads spawn
+#: on demand, so an idle lane costs nothing.
+_DOC_HITS_LANE_WORKERS = 8
+try:
+    _DOC_HITS_LANE_WORKERS = max(1, int(os.getenv("DOCUMENT_HITS_LANE_WORKERS", "8")))
+except ValueError:  # junk in the env must never crash-loop the API import
+    log.warning("query.doc_hits_workers_invalid using_default=8")
+_document_hits_executor = ThreadPoolExecutor(
+    max_workers=_DOC_HITS_LANE_WORKERS, thread_name_prefix="fl-doc-hits")
+
+
+def _query_walk_timeout_s() -> float:
+    """BUG-07: the wall-clock budget the /query graph walk may spend before it is shed.
+
+    ``/query`` computes the passage floor FIRST (BUG-01), then runs the walk under
+    ``asyncio.wait_for`` with exactly this many seconds. On expiry the walk await is
+    cancelled (the worker thread is abandoned — a blocking call cannot be killed — its
+    pool token is released and its eventual result discarded) and the response is served
+    from the floor. Without this bound a slow-but-alive brain hung the walk for 34+
+    bench-measured minutes past every client budget, minting a zombie per retry.
+
+    Read per-request (never cached) so an operator or a test can move it without a
+    restart. Invalid or non-positive values fall back to the default WITH a warning —
+    this knob exists to bound the walk, and a fat-fingered ``0`` must not silently
+    disable the bound. Ops contract: keep this below the MCP client's QUERY_WALK budget
+    (``MCP_BRAIN_TIMEOUT_QUERY_WALK``, default 30s) minus ~2s margin — the response has
+    to LAND inside the client's window or the passages this seam guarantees are computed
+    and then never received.
+    """
+    _default = 30.0
+    raw = (os.environ.get("QUERY_WALK_TIMEOUT_S") or "").strip()
+    if not raw:
+        return _default
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning("query.walk_budget_invalid value=%r using_default=%s", raw[:40], _default)
+        return _default
+    if val <= 0.0:
+        log.warning("query.walk_budget_non_positive value=%r using_default=%s",
+                    raw[:40], _default)
+        return _default
+    return val
+
+
+def _document_hits_timeout_s() -> float:
+    """BUG-01 companion: the passage lane's own wall-clock budget (default 5s).
+
+    Passage-first made the lane the head of the response: a wedged Postgres (a
+    connect with no route can hang in TCP retry land for minutes) must not turn
+    the deterministic floor into the new blocker the walk used to be. On expiry
+    the RESPONSE stops waiting (hits=[], honest alert): the executor thread
+    cannot be cancelled and its eventual result is simply discarded — bounded
+    twice over by the helper's own connection close in ``finally``.
+    """
+    _default = 5.0
+    raw = (os.environ.get("DOCUMENT_HITS_LANE_TIMEOUT_S") or "").strip()
+    if not raw:
+        return _default
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning("query.doc_hits_budget_invalid value=%r using_default=%s",
+                    raw[:40], _default)
+        return _default
+    if val <= 0.0:
+        log.warning("query.doc_hits_budget_non_positive value=%r using_default=%s",
+                    raw[:40], _default)
+        return _default
+    return val
+
+
 @app.post("/query")
 async def query(request: QueryRequest) -> QueryResponse:
     """Customer-facing recall door — opens the TURN DEADLINE, then runs the real handler.
@@ -38874,9 +38955,11 @@ async def query(request: QueryRequest) -> QueryResponse:
     indentation is not worth churning to wrap in a ``with``. Everything under here — however
     deep, sync or async — reads the same ambient deadline via ``src.api.turn_budget``.
 
-    The budget NEVER aborts the turn. It only decides whether an OPTIONAL brain call is
-    affordable (see ``_aspect_map_via_llm``); the deterministic walk always runs to
-    completion and always answers. A turn that runs over budget is logged, not failed —
+    The TURN budget never aborts the turn. It only decides whether an OPTIONAL brain call is
+    affordable (see ``_aspect_map_via_llm``). The WALK itself is separately bounded by
+    ``QUERY_WALK_TIMEOUT_S`` (BUG-07): when the walk exceeds it, the walk is shed and the
+    response is served from the passage floor computed BEFORE it (BUG-01) — the C tier
+    always answers, B/A enrich on top. A turn that runs over budget is logged, not failed —
     the recall still returns facts, and ``query.turn_budget`` is the signal that says which
     turns are over and what the deadline refused for them.
 
@@ -38947,63 +39030,164 @@ async def query(request: QueryRequest) -> QueryResponse:
             _uid = _require_resolvable_user_id(request.user_id, "/query")
             await _ensure_tenant_ready(_uid, "/query")
             from starlette.concurrency import run_in_threadpool
-            # DOCUMENT-HITS STUB LANE (migration 299, W2.3): attached HERE, at the
-            # wrapper, so EVERY _query_impl return path (typed-walk early returns,
-            # abstentions, the main render) carries the section. The stub read has NO
-            # data dependency on the walk (it needs only the resolved user + the query
-            # text), so it runs CONCURRENTLY with the walk (adversarial-review fix) —
-            # its latency hides behind the walk instead of stacking on it. Soft-fails
-            # to [] inside the helper (never raises).
-            import asyncio as _asyncio
-            _hits_task = _asyncio.ensure_future(
-                run_in_threadpool(_document_hits_for_query, _uid, request.text))
+            import anyio as _anyio  # local: walk offload — abandon_on_cancel is the 4.x kwarg
+
+            # PASSAGE-FIRST (BUG-01/BUG-02/BUG-07 seam, adversarial bench 2026-10-24): the
+            # document-hits lane (C tier) is computed BEFORE the graph walk and is committed
+            # to the response before any brain-dependent work runs — the C→B→A direction
+            # made literal in the request lifecycle. The old shape ran this lane CONCURRENTLY
+            # with the walk, and the bench measured what that costs: a slow-but-alive brain
+            # (NIM 429 purgatory, EXTRACT 229-398s/call) hung the walk past every client
+            # budget and the concurrent lane's result died with the response it was riding
+            # on — 96% of bench questions got NOTHING, not even passages, because a full
+            # outage fast-fails to this floor but a PARTIAL one starves it. Here the floor
+            # is already in hand whatever the walk does next: walk in budget → both
+            # surfaces; walk slow → shed at the budget, floor served; walk failed → floor
+            # served. The read runs on its OWN executor (``_document_hits_executor``) so a
+            # saturated walk pool cannot starve it (BUG-02 — the result is computed before
+            # the walk, never in a concurrent future that can be dropped), and it soft-fails
+            # to [] inside the helper: never an exception into the turn.
+            _t_hits = time.monotonic()
+            _hits: list = []
+            _lane_shed = False
             try:
-                _resp = await run_in_threadpool(_query_impl, request)
-            except Exception:
-                # Best-effort containment: a threadpool read cannot be truly cancelled
-                # once started — cancel() only detaches the task; the read completes
-                # bounded (the helper's finally closes its connection) and its result
-                # is discarded. It never breaks the failing walk.
-                _hits_task.cancel()
-                raise
+                _hits = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        _document_hits_executor, _document_hits_for_query,
+                        _uid, request.text),
+                    timeout=_document_hits_timeout_s())
+            except TimeoutError:
+                # Bounded twice: the wait ends here even if the read cannot. The
+                # response must never inherit the lane's own outage — that would
+                # just move BUG-01 from the walk to the floor.
+                _lane_shed = True
+                log.warning("query.document_hits_lane_timeout")
+            except Exception as _dh_exc:  # noqa: BLE001 — floor-lane soft-fail contract
+                log.warning("query.document_hits_lane_soft_fail err=%s", str(_dh_exc)[:120])
+            log.info("query.document_hits_lane_served",
+                     hits=len(_hits), shed=_lane_shed,
+                     lane_ms=round((time.monotonic() - _t_hits) * 1000))
+
+            # BOUNDED WALK (BUG-07): ``_query_impl`` runs on anyio's worker pool with
+            # abandon_on_cancel=True under asyncio.wait_for(QUERY_WALK_TIMEOUT_S). On
+            # budget expiry the await is cancelled, the worker thread is ABANDONED (a
+            # blocking call cannot be killed; its pool token is released immediately and
+            # its eventual result is discarded), and the response is served from the floor
+            # above. The same abandon seam is what lets a client DISCONNECT release the
+            # worker instead of minting the 34-minute zombies the bench measured, each of
+            # which held a pool slot against every later turn. OPTIONAL brain calls inside
+            # the walk still consult the ambient turn budget (unchanged) — this wall is
+            # what that budget alone could never be: a deadline that actually ends the
+            # wait. The walk inherits the copied context, so those budget reads work.
+            _walk_budget_s = _query_walk_timeout_s()
+            _t_walk = time.monotonic()
+            _resp: Optional[QueryResponse] = None
+            _walk_fault: Optional[str] = None
+            _walk_error: Optional[BaseException] = None
             try:
-                _hits = await _hits_task
-                if isinstance(_resp, QueryResponse):
-                    _resp.document_hits = _hits
-                    # R7 MISS-ESCALATION + FEEDBACK (plan §R7): the wrapper is the
-                    # one place BOTH lane outcomes are in hand, so it is the one
-                    # place the layer decision is made. Zero graph facts + ≥1
-                    # passage hit → tag the response (observability — the recall
-                    # knows it fell back to the document text) and fire-and-forget
-                    # a recall_miss marker per chunk that had the answer; the
-                    # growth drain re-examines those chunks so the NEXT time this
-                    # question is asked, the graph walk finds it. A graph hit
-                    # writes NO markers; a both-lane miss tags nothing (the honest
-                    # empty stands). A walk that FAILED (error set) is an
-                    # infrastructure fault, NOT a graph miss — its facts==[] is
-                    # "could not look", not "looked and found nothing", so it
-                    # neither tags nor marks (the marker's premise — extraction
-                    # missed something in THIS chunk — would be false). The marker
-                    # write runs on a detached threadpool task and can never slow
-                    # or fail this response.
-                    if not _resp.error:
-                        _escalated, _marker_rows = _recall_escalation_plan(
-                            _resp.facts, _hits,
-                            walk_facts_found=_resp.walk_facts_found)
-                        if _escalated:
-                            _resp.escalated = True
-                        if _marker_rows:
-                            # Strong ref (see _recall_miss_marker_tasks): without
-                            # it the marker task is GC-eligible the moment this
-                            # frame returns — a silently dropped breadcrumb.
-                            _mt = _asyncio.ensure_future(run_in_threadpool(
-                                _record_recall_miss_markers, _uid, _marker_rows))
-                            _recall_miss_marker_tasks.add(_mt)
-                            _mt.add_done_callback(_recall_miss_marker_tasks.discard)
-            except Exception as _dh_exc:  # noqa: BLE001 — the stub lane never breaks the walk
-                log.warning("query.document_hits_attach_failed err=%s", str(_dh_exc)[:120])
-                if isinstance(_resp, QueryResponse):
-                    _resp.document_hits = []
+                _resp = await asyncio.wait_for(
+                    _anyio.to_thread.run_sync(_query_impl, request,
+                                              abandon_on_cancel=True),
+                    timeout=_walk_budget_s)
+            except TimeoutError:
+                # wait_for's expiry raises the SAME exception class the walk itself
+                # might raise internally — tell them apart by the clock, because the
+                # two faults say different things to ops (budget too small vs brain
+                # call timed out inside the walk).
+                if time.monotonic() - _t_walk >= _walk_budget_s:
+                    _walk_fault = "walk_budget_exceeded"
+                    log.warning("query.walk_budget_exceeded",
+                                budget_s=round(_walk_budget_s, 3), hits=len(_hits),
+                                walk_elapsed_s=round(time.monotonic() - _t_walk, 3))
+                else:
+                    _walk_fault = "walk_failed"
+                    _walk_error = TimeoutError("walk-internal timeout")
+                    log.error("query.walk_failed err=walk-internal-timeout "
+                              "budget_s=%s elapsed_s=%s",
+                              round(_walk_budget_s, 3),
+                              round(time.monotonic() - _t_walk, 3))
+            except Exception as _walk_exc:  # noqa: BLE001 — the walk may not take the floor
+                _walk_fault = "walk_failed"
+                # except-as deletes its name at block exit — capture before that.
+                _walk_error = _walk_exc
+                log.error("query.walk_failed err=%s", str(_walk_exc)[:160])
+            if _walk_fault is not None:
+                # The floor answers; the fault rides alerts (+ error-with-ref when there is
+                # no floor). `error` is set ONLY when there are NO passage hits: the MCP
+                # client drops every body carrying a non-empty `error`
+                # (backend_soft_failure → degraded envelope, doc hits never rendered), so
+                # an error-set body WITH passages would discard them — BUG-01's exact loss,
+                # recreated one field up. With no floor either, `error` MUST be set: an
+                # empty 200 with no error reads as "you have no facts" — the
+                # confident-abstention lie backend_soft_failure exists to prevent.
+                if _hits:
+                    _resp = QueryResponse(
+                        anchor="", facts=[], confidence_applied=False,
+                        staged_facts_count=0,
+                        alerts=[{"alert_type": _walk_fault,
+                                 "message": ("The graph walk did not complete in budget and "
+                                             "was shed; document passages are served. "
+                                             "Nothing was lost — retry for the full recall."),
+                                 "budget_s": round(_walk_budget_s, 3)}])
+                else:
+                    # Bare-name handoff into the one error seam (public_detail takes
+                    # the OBJECT; the IE2 census rightly does not trust an exception
+                    # expression wrapped in a conditional — a bare alias does not
+                    # launder anything the callee wouldn't already be censused for).
+                    _fault_ref: BaseException = TimeoutError(
+                        "graph walk exceeded its time budget")
+                    if _walk_fault == "walk_failed" and _walk_error is not None:
+                        _fault_ref = _walk_error
+                    _resp = QueryResponse(
+                        anchor="", facts=[], confidence_applied=False,
+                        staged_facts_count=0,
+                        error=_errors.public_detail(
+                            _fault_ref, where="query.walk",
+                            what=("graph walk failed; no document passage floor was "
+                                  "available")))
+            elif isinstance(_resp, QueryResponse):
+                _resp.document_hits = _hits
+            if isinstance(_resp, QueryResponse) and _resp.document_hits is None:
+                # Fault responses (and any future early-return shape) reach here with
+                # document_hits unset — one line, and no path can forget the floor.
+                _resp.document_hits = _hits
+            if _lane_shed and isinstance(_resp, QueryResponse):
+                # The lane's own shed is said out loud on every outcome: a response
+                # missing its passages for a lane fault is a different fact from an
+                # honest no-match, and the HTTP caller should be able to tell.
+                _resp.alerts = list(_resp.alerts or []) + [{
+                    "alert_type": "document_hits_lane_timeout",
+                    "message": ("The document-passage lane did not answer in budget; "
+                                "this response may be missing document passages. "
+                                "Nothing was lost — retry."),
+                }]
+            # R7 MISS-ESCALATION + FEEDBACK (plan §R7): the wrapper is the one place BOTH
+            # lane outcomes are in hand, so it is the one place the layer decision is made.
+            # Zero graph facts + ≥1 passage hit → tag the response and fire-and-forget a
+            # recall_miss marker per chunk that had the answer; the growth drain re-examines
+            # those chunks so the NEXT time this question is asked, the graph walk finds it.
+            # A graph hit writes NO markers; a both-lane miss tags nothing (the honest empty
+            # stands). A walk that FAILED or was SHED at the budget (round-2 critic MINOR 1,
+            # BUG-07) is an infrastructure fault, NOT a graph miss — its facts==[] is
+            # "could not look", not "looked and found nothing", so it neither tags nor marks
+            # (the marker's premise — extraction missed something in THIS chunk — would be
+            # false). The marker write runs on a detached threadpool task and can never slow
+            # or fail this response.
+            if (_walk_fault is None and isinstance(_resp, QueryResponse)
+                    and not _resp.error):
+                _escalated, _marker_rows = _recall_escalation_plan(
+                    _resp.facts, _hits,
+                    walk_facts_found=_resp.walk_facts_found)
+                if _escalated:
+                    _resp.escalated = True
+                if _marker_rows:
+                    # Strong ref (see _recall_miss_marker_tasks): without it the marker
+                    # task is GC-eligible the moment this frame returns — a silently
+                    # dropped breadcrumb.
+                    _mt = asyncio.ensure_future(run_in_threadpool(
+                        _record_recall_miss_markers, _uid, _marker_rows))
+                    _recall_miss_marker_tasks.add(_mt)
+                    _mt.add_done_callback(_recall_miss_marker_tasks.discard)
             return _resp
         finally:
             # Emitted for EVERY turn, budgeted or over. This is the observability the
