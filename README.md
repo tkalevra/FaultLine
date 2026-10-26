@@ -223,17 +223,33 @@ Two independent choices — the wizard handles both, or set them by hand.
 
 **2. How your chat client calls FaultLine's memory tools** — all through the **MCP server on `:8002`** (Bearer `MCP_API_KEY`). Any number of clients can share one store at once:
 
-- **OpenWebUI** → Settings → Tools → `+` (OpenAPI), or Admin Settings → External Tools (native MCP, 0.6.31+) *(below)*
+- **OpenWebUI** → **native MCP recommended** (Settings → Admin → Integrations, 0.6.31+); OpenAPI tool server also supported *(below)*
 - **Claude Desktop** → the `.mcpb` extension *(below)*
 - **Cursor / other MCP clients** → `http://<host>:8002/mcp` with header `Authorization: Bearer <MCP_API_KEY>`
 
 ### Connect to OpenWebUI
 
-*Verified against OpenWebUI v0.10.x (latest); the paths below apply from v0.6.31+. OpenWebUI's menu labels shift between releases — look for **Tools** (OpenAPI) or **External Tools** (native MCP) if yours differ.*
+*Verified against OpenWebUI v0.10.x (latest); the paths below apply from v0.6.31+. OpenWebUI's menu labels shift between releases — look for **Tools** (OpenAPI) or **External Tools / Integrations** (native MCP) if yours differ.*
 
-FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWebUI can reach it two ways. **Use Option A** — it's the only path that reliably forwards the per-user identity header FaultLine scopes on.
+FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWebUI can reach it two ways — and the choice changes **what the model sees**, not just the plumbing.
 
-**Option A — OpenAPI tool server (recommended):**
+#### Connection type — use native MCP (read this first)
+
+**Prefer the native MCP connection.** On a native MCP connection (OpenWebUI ≥0.6.31), OpenWebUI surfaces the MCP server's `instructions` in the system prompt of every conversation. That is the channel where FaultLine tells the model: *"your memory tools are `remember_facts` / `recall_memory` — the host's built-in note tools are not."* The **OpenAPI connection type drops that channel entirely**: only tool names and descriptions cross over, and they compete with OpenWebUI's built-in Notes tools (`write_note`, `view_note`, `search_notes`). Weaker models regularly lose that competition — you say *"remember this"*, the model calls `write_note`, and your fact lands in an ephemeral note instead of the knowledge graph. **Silently** — the note works, so nothing looks broken.
+
+**To connect (native MCP):**
+
+1. **Settings → Admin → Integrations → Add Connection** (admin-only; older releases label it **Admin Settings → External Tools → `+` Add Server**).
+2. **Type:** `MCP (Streamable HTTP)` — the only transport OpenWebUI's native MCP supports.
+3. **URL:** `http://<host>:8002/mcp` · **Auth:** `Bearer` → your `MCP_API_KEY`.
+
+**Verify on first run.** After connecting, send a chat saying **"remember that I like pizza"** and check which tool the model calls: it must be **`remember_facts`** — **not `write_note`**. (Show tool calls in the chat, or check FaultLine's logs for the `remember_facts` call — `REST remember_facts` / `Tool call: remember_facts`.)
+
+> **Troubleshooting — memory goes to Notes instead of FaultLine.** If the model uses `write_note` or `search_notes` instead of FaultLine tools, your connection is likely the **OpenAPI type** — switch to native MCP (see above). The OpenAPI door drops the server instructions that steer the model to the memory tools; on that door only the tool descriptions carry FaultLine's identity. If the native connection or its tools don't appear at all, the **OpenAPI alternative** below still works — the differentiation rides the tool descriptions on that door too.
+
+> ⚠️ **Per-user caveat (multi-user instances).** As of v0.10.x, `ENABLE_FORWARD_USER_INFO_HEADERS` does **not** forward `X-OpenWebUI-User-*` headers over native MCP, and custom-header template tokens (`{{USER_ID}}`) may not resolve there yet ([open-webui#21134](https://github.com/open-webui/open-webui/issues/21134)). Single-user installs are unaffected in practice — pin your tenant with `FAULTLINE_USER_ID`, or use a per-seat MCP key (a seat token *is* the identity). Multi-user instances that need per-user memory today: use the **OpenAPI alternative** below and accept the weaker tool routing.
+
+#### The OpenAPI alternative — per-user header forwarding
 
 1. **Settings → Tools → `+`** (Manage Tool Servers). For an instance-wide server, use **Admin Settings → Tools** instead.
 2. **URL:** `http://faultline-mcp:8002` (same Docker network) or `http://<host>:8002`. The modal may pre-fill `https://` — change it to `http://` for a local server, then hit **refresh** to test.
@@ -241,14 +257,6 @@ FaultLine's server on `:8002` speaks **both** OpenAPI and native MCP, so OpenWeb
 4. Set **`ENABLE_FORWARD_USER_INFO_HEADERS=true`** in OpenWebUI's environment so each user's memory is scoped to them. It forwards the `X-OpenWebUI-User-Id` header FaultLine keys on (also `-User-Name`/`-Email`/`-Role`) — without it, per-user memory won't work.
 
 OpenWebUI reads `/openapi.json` and surfaces all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — in every conversation.
-
-**Option B — native MCP (OpenWebUI 0.6.31+):**
-
-1. **Admin Settings → External Tools → `+` (Add Server)** — native MCP is **admin-only**.
-2. **Type:** `MCP (Streamable HTTP)` (the only transport OpenWebUI's native MCP supports).
-3. **URL:** `http://<host>:8002/mcp` · **Auth:** `Bearer` → your `MCP_API_KEY`.
-
-> ⚠️ **Native MCP is the newer, less-tested path with FaultLine** (its `/mcp` is a stateless JSON-RPC endpoint) — if the server or tools don't appear, use **Option A**. And per-user scoping is weaker here: as of v0.10.x, `ENABLE_FORWARD_USER_INFO_HEADERS` does **not** forward `X-OpenWebUI-User-*` headers over native MCP, and custom-header template tokens (`{{USER_ID}}`) may not resolve there yet ([open-webui#21134](https://github.com/open-webui/open-webui/issues/21134)). For reliable per-user memory use **Option A**; if you run native MCP, pin a single tenant with `FAULTLINE_USER_ID`.
 
 **Tool firing (weak models).** As of v0.10.0, OpenWebUI defaults every model to **Native** function calling (the old "Default" mode is renamed **"Legacy"** and is unsupported). Native works for most 2024+ models; if a smaller model (Qwen, Llama, Mistral, Phi) won't reliably call the tools, switch **Chat Controls → Advanced Params → Function Calling → Legacy** (or set it per-model / globally under **Model Parameters**).
 

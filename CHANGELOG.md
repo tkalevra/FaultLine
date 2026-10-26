@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased (2026-10-26) — OWUI Shadow-Memory Routing Fix
+
+**Source:** independent user report — the user said "Faultline" three times; the model routed
+all three memory operations to OpenWebUI's built-in Notes (`write_note`/`view_note`/
+`search_notes`). Data went to ephemeral storage while the user believed it was in FaultLine.
+Analysis: `DEV/BUGS/foss-owui-notes-shadow-memory-20261024.md` (private repo).
+
+**Tool differentiation (`src/mcp/tools.py`, `src/mcp/http_server.py`):**
+- `remember_facts` and `recall_memory` descriptions now LEAD with FaultLine identity and
+  name the host built-ins they are not: `write_note` is a temporary note, NOT FaultLine
+  memory. Applied to BOTH doors — the native MCP door (`tools/list`) and the OpenAPI door
+  (`/openapi.json`, the door the bug report came in on). Measured: 985/892 (MCP door),
+  985/700 (OpenAPI door) — all ≤1024, pinned in
+  `tests/mcp/test_tool_description_differentiation.py`.
+- The differentiation leads (first ~100 chars) so hosts that truncate tool definitions
+  (OWUI Tool Search) still see the FaultLine identity.
+
+**Server instructions (`src/mcp/premise.py`):**
+- `SERVER_INSTRUCTIONS` — a routing notice, NOT the SaaS premise — now rides
+  `initialize` on both transports. Native-MCP clients (OWUI ≥0.6.31) surface it in the
+  system prompt; the OpenAPI door drops it, which is why the README now recommends the
+  native MCP connection type.
+
+**README:**
+- New "Connection type — use native MCP (read this first)" section: why (instructions only
+  reach the model through the MCP door), exact steps (Settings → Admin → Integrations →
+  Add Connection → MCP Streamable HTTP), a first-run verification ("remember that I like
+  pizza" → must call `remember_facts`, not `write_note`), and a troubleshooting note for
+  the `write_note`/`search_notes` symptom. Per-user header caveat (multi-user → OpenAPI)
+  retained honestly.
+
 ## Unreleased (2026-08-03) — MCP Safety + UX Pass
 
 **MCP layer (`src/mcp/server.py`):**
