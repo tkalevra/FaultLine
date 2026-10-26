@@ -12733,6 +12733,17 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     if not text or len(text) < 2:
         return {"intent": "STATEMENT", "confidence": 0.0}
 
+    # SKIP-LLM TIER FLAG (MCP brain-independence lane, 2026-10-25): the MCP bounds its
+    # classify budget at MCP_CLASSIFY_TIMEOUT_S (default 3s) and, when that budget is
+    # exceeded on a lane that still needs a route, re-asks ONCE with skip_llm=true to
+    # get the deterministic answer fast. The LLM tiers inside this endpoint (TIER-2 cue
+    # corroboration, the sub-gate INTENT_ADJUDICATION escalation) each have a
+    # documented deterministic fail-open; with the flag set we take those fail-opens
+    # DIRECTLY — spaCy preroutes, GLiNER2, the DB pattern/cache layers and all feedback
+    # writes behave exactly as they do when an adjudicator is unavailable. Flag absent
+    # (every other caller): byte-identical legacy behavior.
+    skip_llm = req.get("skip_llm") is True
+
     # === PRE-GLINER2 CORRECTION BYPASS GATE ===
     # A correction BYPASSES GLiNER2 intent classification (classify_text) — GLiNER2 stays pure
     # for its strengths and is never made to judge negation. We skip ONLY the GLiNER2 intent
@@ -12774,48 +12785,56 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         if _cue_route and _cue_tier == "ambiguous":
             _bypass_route = None
             _bypass_conf = 0.0
-            try:
-                from .llm_calls import call_llm_with_retry_async as _preclassify_llm
-                _pc_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You route a memory system. Decide whether the user is changing something "
-                            "you already know, or not. Pick ONE route:\n"
-                            "- CORRECTION: replacing/overwriting a previously stored value OR removing a "
-                            "structural link between things the user already told you (e.g. 'actually she "
-                            "is 14 not 12'; 'aurora's ip is now 10.0.0.5'; 'my pets are not part of my "
-                            "family').\n"
-                            "- RETRACTION: deleting/forgetting a stored fact entirely (e.g. 'forget that I "
-                            "have a dog').\n"
-                            "- STATEMENT: anything else — a NEW fact, preference, habit, or a question — "
-                            "including a brand-new negative fact, that does not change anything stored "
-                            "before.\n"
-                            'Respond with STRICT JSON only: {"route":"CORRECTION|RETRACTION|STATEMENT",'
-                            '"confidence":0.0-1.0}.'
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ]
-                _pc_result = await _preclassify_llm(
-                    messages=_pc_messages,
-                    model=LLMModels.get("INTENT_PRECLASSIFY"),
-                    user_id=user_id,
-                    max_retries=1,                   # latency-sensitive, fail open fast
-                    operation="INTENT_PRECLASSIFY",  # 4.0s timeout + 32 max_tokens
-                )
-                if isinstance(_pc_result, dict):
-                    _r = _pc_result.get("route")
-                    _cf = _pc_result.get("confidence")
-                    if isinstance(_r, str) and _r.strip().upper() in ("CORRECTION", "RETRACTION", "STATEMENT"):
-                        _bypass_route = _r.strip().upper()
-                    try:
-                        _bypass_conf = float(_cf) if _cf is not None else 0.0
-                    except (ValueError, TypeError):
-                        _bypass_conf = 0.0
-            except Exception as _pc_err:
-                log.error("classify_intent.bypass_preclassify_failed",
-                          user_id=user_id[:8], error=str(_pc_err)[:160])
+            if skip_llm:
+                # No corroboration possible without the LLM → NO agreement → the
+                # fall-through to GLiNER2 below (the same path a STATEMENT verdict or
+                # sub-gate LLM confidence takes). A destructive bypass may NEVER fire
+                # uncorroborated.
+                log.info("classify_intent.cue_corroboration_skipped",
+                         user_id=user_id[:8], note="skip_llm — deterministic layers only")
+            else:
+                try:
+                    from .llm_calls import call_llm_with_retry_async as _preclassify_llm
+                    _pc_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You route a memory system. Decide whether the user is changing something "
+                                "you already know, or not. Pick ONE route:\n"
+                                "- CORRECTION: replacing/overwriting a previously stored value OR removing a "
+                                "structural link between things the user already told you (e.g. 'actually she "
+                                "is 14 not 12'; 'aurora's ip is now 10.0.0.5'; 'my pets are not part of my "
+                                "family').\n"
+                                "- RETRACTION: deleting/forgetting a stored fact entirely (e.g. 'forget that I "
+                                "have a dog').\n"
+                                "- STATEMENT: anything else — a NEW fact, preference, habit, or a question — "
+                                "including a brand-new negative fact, that does not change anything stored "
+                                "before.\n"
+                                'Respond with STRICT JSON only: {"route":"CORRECTION|RETRACTION|STATEMENT",'
+                                '"confidence":0.0-1.0}.'
+                            ),
+                        },
+                        {"role": "user", "content": text},
+                    ]
+                    _pc_result = await _preclassify_llm(
+                        messages=_pc_messages,
+                        model=LLMModels.get("INTENT_PRECLASSIFY"),
+                        user_id=user_id,
+                        max_retries=1,                   # latency-sensitive, fail open fast
+                        operation="INTENT_PRECLASSIFY",  # 4.0s timeout + 32 max_tokens
+                    )
+                    if isinstance(_pc_result, dict):
+                        _r = _pc_result.get("route")
+                        _cf = _pc_result.get("confidence")
+                        if isinstance(_r, str) and _r.strip().upper() in ("CORRECTION", "RETRACTION", "STATEMENT"):
+                            _bypass_route = _r.strip().upper()
+                        try:
+                            _bypass_conf = float(_cf) if _cf is not None else 0.0
+                        except (ValueError, TypeError):
+                            _bypass_conf = 0.0
+                except Exception as _pc_err:
+                    log.error("classify_intent.bypass_preclassify_failed",
+                              user_id=user_id[:8], error=str(_pc_err)[:160])
 
             # AGREEMENT — the spaCy cue flagged a destructive directive; fire the bypass ONLY if the
             # LLM also confirms a destructive route (CORRECTION or the stronger RETRACTION) at/above
@@ -13243,9 +13262,22 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
         #     no hardcoded timeout/max_tokens.
         #   • Fail loud, fall back to today's default (STATEMENT), NEVER block ingest.
         # Only escalate when below gate, real GLiNER2 confidence, and a known user (not anonymous).
+        # skip_llm (MCP brain-independence lane): no adjudication possible without the LLM —
+        # the arm below applies the SAME sub-gate STATEMENT safety net an escalation
+        # error/timeout/circuit-open takes today. Never blocks, never routes a destructive
+        # sub-gate guess. Logged like the other tiers' skips (round-2 review finding 8).
+        if (skip_llm and user_id and user_id != "anonymous"
+                and confidence > 0.0 and confidence < user_gate_threshold):
+            # Mirrors the escalation arm's OWN guards (round-3 review NIT-4): logs exactly
+            # when the LLM escalation WOULD have engaged had the flag been absent.
+            log.info("classify_intent.subgate_escalation_skipped",
+                     user_id=user_id[:8], gliner2_confidence=round(confidence, 3),
+                     gate=round(user_gate_threshold, 3),
+                     note="skip_llm — sub-gate STATEMENT safety net without the LLM escalation")
         if (confidence < user_gate_threshold
                 and confidence > 0.0
-                and user_id and user_id != "anonymous"):
+                and user_id and user_id != "anonymous"
+                and not skip_llm):
             # The route GLiNER2 leaned toward pre-gate (its low-confidence guess). The gate should
             # learn whether THAT guess was trustworthy in this confidence band.
             gliner2_pre_gate_route = intent
