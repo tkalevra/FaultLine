@@ -9,6 +9,7 @@ import json
 import os
 import re as _re
 import sys
+import time as _time
 from typing import Any
 
 import httpx
@@ -711,7 +712,108 @@ async def _maybe_intercept_slash(raw: str, user_id: str) -> dict[str, Any] | Non
     return None
 
 
-async def _classify_and_gate(text: str, user_id: str) -> tuple[str, float, float]:
+# ── BRAIN-SLOW BREAKER (brain-independence lane, 2026-10-25; FOSS port 2026-10-26) ────
+#
+# THE DEFECT (live on private prod 2026-10-24): the API-layer passage-first fix works (a
+# direct POST /query serves document_hits in <10s with the NIM brain rate-limited), but
+# recall_memory through THIS server still hung 15s+ because its PRE-QUERY brain call
+# (/classify-intent) blocked the pipeline behind the LLM tiers inside classify (the
+# corroboration and sub-gate escalation budgets server-side, each with retries). The
+# per-call timeout bounds ONE call; this breaker carries the "brain is slow" verdict
+# ACROSS turns so the next recall does not re-pay the probe:
+#
+#   classify probe budget exceeded (or classify transport-unreachable)
+#     → _mark_brain_slow(user_id): that SEAT's window opens for MCP_BRAIN_SLOW_COOLDOWN_S
+#       (default 60s). PER-SEAT on purpose (round-2 review finding 3): one tenant's
+#       rate-limited brain must not fast-path another tenant's healthy-brain turns.
+#     → every recall_memory for THAT seat in the window takes the FAST PATH: intent routing
+#       and the confidence gate are SKIPPED entirely and /query fires directly with the raw
+#       text (the API's passage-first floor + QUERY_WALK_TIMEOUT_S bound the rest)
+#     → a HEALTHY full-route /classify-intent answer for that seat CLOSES the window.
+#       RECOVERY PATHS (round-2 review finding 4, stated honestly): the fast-path arm
+#       skips classify entirely, so a RECALL-ONLY seat closes its window by cooldown
+#       expiry, or by any healthy WRITE-lane classify (remember/retract classify every
+#       turn), whichever comes first — a recall-only seat can pay up to one cooldown
+#       window of route-fidelity loss per trip (its turns are still served, and retained
+#       verbatim; only the intent diverts are suspended).
+#
+# MCP_BRAIN_DEGRADED=1 is the ops-owned explicit arm of the same path (declare it, don't
+# measure it — e.g. while the brain box is being worked on); it is GLOBAL because the
+# operator is describing the BOX. This is a LATENCY breaker, not a correctness one: the
+# fast path substitutes no route (QUERY-for-recall is the documented read-only fail-safe —
+# it writes nothing, deletes nothing, and /query parses the text itself), so a
+# false-positive open window costs route fidelity on one turn, never data.
+_BRAIN_SLOW: dict[str, dict[str, Any]] = {}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Env knob reader (positive float or the default; junk falls back silently)."""
+    try:
+        _v = float((os.environ.get(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return _v if _v > 0.0 else default
+
+
+def _classify_probe_budget_s() -> float:
+    """The RECALL classify probe's budget (MCP_CLASSIFY_TIMEOUT_S, default 3s).
+
+    PRECEDENCE (round-2 review finding 9): this knob REPLACES the 10s table default for
+    the RECALL PROBE only — write lanes keep the 10s legacy budget because their escalated
+    verdicts are load-bearing route decisions (a 3s ceiling there would time out a HEALTHY
+    brain's escalation and route corrections through the STATEMENT fail-open). It must sit
+    UNDER the LLM-tier budgets inside /classify-intent that it exists to escape."""
+    return _env_float("MCP_CLASSIFY_TIMEOUT_S", 3.0)
+
+
+def _brain_slow_cooldown_s() -> float:
+    return _env_float("MCP_BRAIN_SLOW_COOLDOWN_S", 60.0)
+
+
+def _mark_brain_slow(user_id: str, reason: str) -> None:
+    _now = _time.monotonic()
+    # prune expired seats so the map stays bounded by LIVE windows, not tenant history
+    for _k in [k for k, v in _BRAIN_SLOW.items() if float(v.get("until") or 0.0) <= _now]:
+        _BRAIN_SLOW.pop(_k, None)
+    _BRAIN_SLOW[user_id or "anonymous"] = {
+        "until": _now + _brain_slow_cooldown_s(), "reason": str(reason)[:200]}
+    _log(f"brain_slow.marked seat={(user_id or 'anonymous')[:8]} "
+         f"cooldown_s={_brain_slow_cooldown_s():.0f} reason={str(reason)[:200]}"
+         " — that seat's recall turns take the fast path (/query direct)")
+
+
+def _brain_slow_active(user_id: str | None = None) -> bool:
+    if os.environ.get("MCP_BRAIN_DEGRADED", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    _st = _BRAIN_SLOW.get(user_id or "anonymous")
+    return bool(_st) and _time.monotonic() < float(_st.get("until") or 0.0)
+
+
+def _brain_slow_reason(user_id: str | None = None) -> str:
+    if os.environ.get("MCP_BRAIN_DEGRADED", "").strip().lower() in ("1", "true", "yes"):
+        return "MCP_BRAIN_DEGRADED=1 (ops-declared, global)"
+    _st = _BRAIN_SLOW.get(user_id or "anonymous") or {}
+    return str(_st.get("reason") or "")
+
+
+def _brain_slow_reset(why: str = "") -> None:
+    if _BRAIN_SLOW:
+        _log(f"brain_slow.cleared {why}")
+    _BRAIN_SLOW.clear()
+
+
+def _brain_transport_slow(exc: BaseException) -> bool:
+    """Round-2 review finding 5 (FOSS shape): only TRANSPORT exhaustion — timeout or
+    unreachable — marks the seat slow. A deterministic backend DECISION (4xx) or a
+    malformed body is the backend DECIDING, not crawling: the full pipeline is correct
+    there and the trip turn must not fast-path retention on it."""
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+async def _classify_and_gate(text: str, user_id: str, *,
+                             gliner2_fallback: bool = False,
+                             probe_budget: float | None = None,
+                             ) -> tuple[str, float, float]:
     """Consult the DB-weighted intent BRAIN: /classify-intent + per-user confidence gate.
 
     Single source of truth for the route decision, shared by remember_facts_tool and
@@ -721,38 +823,92 @@ async def _classify_and_gate(text: str, user_id: str) -> tuple[str, float, float
     re-derive a weaker "confidence < gate → STATEMENT" route that would clobber an escalated
     CORRECTION. The `gate` is returned only for the diagnostic log line; it does not drive routing.
 
-    Non-fatal by design: intent defaults to STATEMENT and gate to 0.70 if either endpoint is
-    unavailable. Callers decide their own fail-safe (recall_memory_tool falls back to plain recall).
+    BOUNDED PROBE (brain-independence lane, 2026-10-25): ``probe_budget`` bounds this call
+    when given — the RECALL probe passes ``MCP_CLASSIFY_TIMEOUT_S`` (default 3s), because
+    the LLM tiers INSIDE /classify-intent are the 15s+ prod hang and recall must never wait
+    for them. Write lanes leave it None (the legacy 10s — their escalated verdicts are
+    load-bearing route decisions). When the budget is exceeded (or the endpoint is
+    transport-unreachable) the brain is marked slow for this SEAT (that seat's recall turns
+    fast-path for the cooldown window), and — when this lane still needs a route on a
+    degraded box (``gliner2_fallback=True``, currently remember_facts) — ONE re-ask with
+    ``skip_llm: true`` fetches the DETERMINISTIC answer (spaCy preroutes + GLiNER2 + DB
+    pattern layers, no LLM tier). That is still the backend's route, not a transport guess.
+    ``gliner2_fallback=False`` (the default — byte-identical to the classic contract;
+    recall) skips the re-ask: recall's fail-safe IS the fast path — fire /query with the
+    raw text and let the passage-first floor answer.
+
+    A classify failure still RAISES (after the re-ask, when enabled) — callers keep their
+    own fail-safe (recall falls back to the plain read-only walk; remember defaults to
+    STATEMENT). The confidence-gate read stays non-fatal and is SKIPPED on the GLiNER2-only
+    arm (a slow brain must not be probed twice for a value nothing routes on).
     """
     intent = "STATEMENT"
     confidence = 0.0
+    _classify_budget = probe_budget if probe_budget is not None else 10.0
+    _from_fallback = False
     try:
         classify_resp = await _http_client.post(
             f"{FAULTLINE_API_URL}/classify-intent",
             params={"user_id": user_id},
             json={"text": text},
-            timeout=10.0,
+            timeout=_classify_budget,
         )
         classify_resp.raise_for_status()
         classify_data = classify_resp.json()
         intent = classify_data.get("intent", "STATEMENT")
         confidence = float(classify_data.get("confidence", 0.0))
     except Exception as exc:
-        _log(f"intent_classify_fallback: {exc!r} — defaulting to STATEMENT")
-        raise
+        # Transport exhaustion (timeout / unreachable): the LLM tiers inside
+        # /classify-intent are the hang — NEVER wait for them. Mark THIS seat's window
+        # (its recall turns fast-path until a healthy full-route answer closes it), then
+        # degrade to the deterministic answer when this lane needs a route at all.
+        # A deterministic backend decision (4xx) or malformed body does NOT mark: the
+        # backend is DECIDING, not crawling (round-2 review finding 5).
+        if _brain_transport_slow(exc):
+            _mark_brain_slow(user_id, f"{type(exc).__name__}: {str(exc)[:120]}")
+        if not gliner2_fallback:
+            _log(f"intent_classify_unavailable: {exc!r} — NOT defaulting; caller surfaces the failure")
+            raise
+        _log(f"intent_classify_unavailable: {exc!r} — re-asking GLiNER2-only (skip_llm)")
+        try:
+            classify_resp = await _http_client.post(
+                f"{FAULTLINE_API_URL}/classify-intent",
+                params={"user_id": user_id},
+                json={"text": text, "skip_llm": True},
+                timeout=_classify_budget,
+            )
+            classify_resp.raise_for_status()
+            classify_data = classify_resp.json()
+            intent = classify_data.get("intent", "STATEMENT")
+            confidence = float(classify_data.get("confidence", 0.0))
+            _from_fallback = True
+        except Exception as exc2:  # noqa: BLE001 — any failure here: surface the ORIGINAL below
+            _log(f"intent_classify_gliner2_only_unavailable: {exc2!r} — NOT defaulting; "
+                 "caller surfaces the original failure")
+            raise exc
+
+    if not _from_fallback:
+        # A healthy FULL-route answer closes THIS seat's brain-slow window (half-open
+        # recovery: the next turn pays the full pipeline again, immediately). Other seats'
+        # windows are untouched — their evidence is their own.
+        _BRAIN_SLOW.pop(user_id or "anonymous", None)
 
     gate = 0.70
-    try:
-        gate_resp = await _http_client.get(
-            f"{FAULTLINE_API_URL}/confidence-gate/{user_id}",
-            timeout=5.0,
-        )
-        gate_resp.raise_for_status()
-        gate = float(gate_resp.json().get("threshold", 0.70))
-    except Exception as exc:
-        _log(f"confidence_gate_fallback: {exc!r} — defaulting to 0.70")
+    if _from_fallback:
+        _log("confidence_gate_skipped (GLiNER2-only arm — diagnostic read omitted on a slow brain)")
+    else:
+        try:
+            gate_resp = await _http_client.get(
+                f"{FAULTLINE_API_URL}/confidence-gate/{user_id}",
+                timeout=5.0,
+            )
+            gate_resp.raise_for_status()
+            gate = float(gate_resp.json().get("threshold", 0.70))
+        except Exception as exc:
+            _log(f"confidence_gate_fallback: {exc!r} — defaulting to 0.70")
 
-    _log(f"intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}")
+    _log(f"intent_classified: intent={intent} confidence={confidence:.3f} gate={gate:.3f}"
+         f"{' (gliner2_only)' if _from_fallback else ''}")
     return intent, confidence, gate
 
 
@@ -1152,33 +1308,81 @@ async def recall_memory_tool(query: str, user_id: str) -> dict[str, Any]:
     # The fact that the model called recall_memory is just the entry point; it defers to the
     # backend brain's route. FAIL-SAFE: classify error → fall through to plain recall below.
     _ingest_fallback = None  # non-eating STATEMENT-ingest result; surfaced only if the walk is empty
+    _fast_path = False  # brain-slow turn: routing/gate skipped, /query fires with raw text
     if RECALL_INTENT_ROUTING:
-        try:
-            intent, _confidence, _gate = await _classify_and_gate(query, user_id)
-        except Exception:
-            intent = "QUERY"  # classify unavailable → treat as a genuine recall (never break recall)
-        if intent in ("RETRACTION", "CORRECTION"):
-            return await retract_fact_tool(query, user_id, classified_intent=intent)
-        # STATEMENT → ingest as a NON-EATING fallback. UNIFORM-PATH PRINCIPLE: recall ALWAYS
-        # walks the layers; a recall is never replaced by an ingest no-op. GLiNER2 routinely
-        # mis-classifies an interrogative as STATEMENT ("how am I feeling" scored STATEMENT) —
-        # the old `return remember_facts_tool(...)` then ATE the recall and surfaced
-        # {"status":"no_ingest"} instead of walking. Now: attempt the ingest (so a genuinely
-        # mis-routed whole statement like "my dog is Rex" still gets stored — remember_facts_tool
-        # is itself gated, so a question that extracts nothing stores nothing), but DO NOT return
-        # here. Fall through to the /query layer walk; only surface this ingest result if the walk
-        # finds nothing (a true statement with nothing to recall). _passes_ingest_gate still
-        # filters non-ingestable bare keywords so we don't waste an extraction pass on them.
-        _ingest_fallback = None
-        if intent == "STATEMENT" and _passes_ingest_gate(query):
-            _ingest_fallback = await remember_facts_tool(query, user_id)
-        # intent == "QUERY", a non-ingestable STATEMENT, or anything else → normal recall below.
+        if _brain_slow_active(user_id):
+            # ── FAST PATH (brain-independence lane, 2026-10-25) ────────────────────
+            # The brain is KNOWN slow (this seat's breaker open from a classify timeout
+            # this window, or MCP_BRAIN_DEGRADED=1). SKIP the confidence gate and intent
+            # routing entirely and fire /query directly with the raw text: the API's
+            # passage-first floor (BUG-01/02/07) serves document_hits regardless of brain
+            # state, its own QUERY_WALK_TIMEOUT_S bounds the walk, and /query parses the
+            # text itself. This substitutes NO route — QUERY-for-recall is the documented
+            # read-only fail-safe (writes nothing, deletes nothing), so a false-positive
+            # window costs one turn of route fidelity, never data.
+            intent = "QUERY"
+            _fast_path = True
+            _log(f"recall_memory.fast_path: brain slow for this seat "
+                 f"({_brain_slow_reason(user_id)}) — intent routing + confidence gate "
+                 "SKIPPED, /query direct")
+        else:
+            try:
+                # gliner2_fallback=False: on a classify timeout DO NOT re-ask — the
+                # budget already marked this seat's brain slow, and the re-ask would pay
+                # a second budget against the same slow endpoint. THIS turn's degradation
+                # is the trip arm below (intent=QUERY + fast-path retention); the NEXT
+                # turn enters through the breaker arm above with zero classify spend.
+                # probe_budget: the recall probe rides MCP_CLASSIFY_TIMEOUT_S (default
+                # 3s) — the one knob that must sit UNDER the LLM-tier budgets it is
+                # escaping; write lanes keep the 10s legacy (see _classify_and_gate).
+                intent, _confidence, _gate = await _classify_and_gate(
+                    query, user_id, gliner2_fallback=False,
+                    probe_budget=_classify_probe_budget_s())
+            except Exception:
+                # TRIP ARM. Transport exhaustion (timeout / unreachable) marked this seat
+                # slow on the way out; a deterministic backend DECISION (4xx) or a
+                # malformed body did NOT — the full pipeline is correct there. Only the
+                # slow shape fast-paths retention (round-2 review finding 5). Either way
+                # recall's read-only fail-safe stands: never break recall.
+                intent = "QUERY"  # classify unavailable → treat as a genuine recall (never break recall)
+                _fast_path = _brain_slow_active(user_id)
+            if intent in ("RETRACTION", "CORRECTION"):
+                return await retract_fact_tool(query, user_id, classified_intent=intent)
+            # STATEMENT → ingest as a NON-EATING fallback. UNIFORM-PATH PRINCIPLE: recall ALWAYS
+            # walks the layers; a recall is never replaced by an ingest no-op. GLiNER2 routinely
+            # mis-classifies an interrogative as STATEMENT ("how am I feeling" scored STATEMENT) —
+            # the old `return remember_facts_tool(...)` then ATE the recall and surfaced
+            # {"status":"no_ingest"} instead of walking. Now: attempt the ingest (so a genuinely
+            # mis-routed whole statement like "my dog is Rex" still gets stored — remember_facts_tool
+            # is itself gated, so a question that extracts nothing stores nothing), but DO NOT return
+            # here. Fall through to the /query layer walk; only surface this ingest result if the walk
+            # finds nothing (a true statement with nothing to recall). _passes_ingest_gate still
+            # filters non-ingestable bare keywords so we don't waste an extraction pass on them.
+            _ingest_fallback = None
+            if intent == "STATEMENT" and _passes_ingest_gate(query):
+                _ingest_fallback = await remember_facts_tool(query, user_id)
+            # intent == "QUERY", a non-ingestable STATEMENT, or anything else → normal recall below.
 
     # Intent-INDEPENDENT harvest: even though this turn routes to recall, a fact may be buried
     # in the question ("...help me? by the way, I fixed the fence three weeks ago"). The cheap
     # segmenter (trigger_span, no LLM) splits it off and GLiNER2 ingests it — so question-carried
     # facts are stored, not dropped at the QUERY gate. Best-effort; no-op when no span is found.
-    await _harvest_turn_facts(query, user_id)
+    if _fast_path or _brain_slow_active(user_id):
+        # FAST-PATH RETENTION instead of the harvest (brain-independence lane). Keys on
+        # the breaker STATE here, not the entry-time flag, so it covers BOTH arms: the
+        # entry fast path AND the trip turn (a probe that timed out mid-turn marked this
+        # seat on its way out — round-2 review findings 1/2; RECALL_INTENT_ROUTING=off
+        # turns take it too when the window is open). /harvest-spans can itself sit on
+        # LLM-tailored lanes with only the client's default budget — on the exact box
+        # this lane fixes it could re-hang the turn AFTER the routing was skipped. The
+        # honest degradation is to retain the turn VERBATIM via /episodic/append (one
+        # INSERT, no LLM, its own 5s budget, soft-fail) so the re-miner can extract it
+        # once the brain is healthy. The intent is None — the brain classified NOTHING on
+        # this turn, and the durable row must not carry a transport-fabricated verdict
+        # (round-2 review finding 2). Deterministic, bounded, loses nothing recoverable.
+        await _episodic_capture(query, user_id, None)
+    else:
+        await _harvest_turn_facts(query, user_id)
 
     resp = await _http_client.post(
         f"{FAULTLINE_API_URL}/query",
@@ -1513,7 +1717,12 @@ async def remember_facts_tool(text: str, user_id: str) -> dict[str, Any]:
     # consumed identically by recall_memory_tool). Non-fatal: default to STATEMENT/0.70 if the
     # endpoint is unavailable (the model called remember_facts → safest fall-through is ingest).
     try:
-        intent, confidence, gate = await _classify_and_gate(text, user_id)
+        # gliner2_fallback=True (brain-independence lane): when the budgeted classify times
+        # out, ONE skip_llm re-ask fetches the backend's DETERMINISTIC route (spaCy preroutes
+        # + GLiNER2 + DB patterns — no LLM tier) so a slow-brain box still routes statements
+        # instead of degrading them. The STATEMENT default below is unchanged for the case
+        # where even the deterministic answer cannot be had.
+        intent, confidence, gate = await _classify_and_gate(text, user_id, gliner2_fallback=True)
     except Exception:
         intent, confidence, gate = "STATEMENT", 0.0, 0.70
 
