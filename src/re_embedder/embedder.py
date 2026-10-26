@@ -120,6 +120,35 @@ def _lane_has_no_content(text: str) -> bool:
     return True
 
 
+def _growth_drain_lane_open(user_id, schema_name, operation_type) -> bool:
+    """Op-aware lane gate for the growth work drain (BUG-08).
+
+    DETERMINISTIC operations (growth_work_queue.DETERMINISTIC_OPERATIONS) pass
+    UNCONDITIONALLY: their runner spends zero brain — the R9 spine deriver +
+    GLiNER2 run IN-PROCESS and the only wire call is the /ingest commit door,
+    which is brain-free. A blanket brain-lane check gating them is exactly how
+    8 recall_miss_reexamine markers sat pending for 3+ hours on the private
+    prod (measured 2026-10-25: 135 re_embedder.llm_skip lines / 24h — the
+    document drain kept the lane permanently fail-closed — and ZERO
+    growth_work_drain lines, so the drain never ran once). Brain-bearing
+    operations keep the lane verdict via the lane machinery when one exists.
+
+    FOSS-port note: this engine has no brain-lane/posture machinery (the
+    private lineage delegates to ``_reembedder_llm_lane_open`` — not part of
+    the public core). The delegation seam is kept verbatim: when a lane check
+    is present (test wiring, a future port of the lane) brain-bearing
+    operations consult it with the "ontology_eval" brain-level proxy; without
+    one the lane is trivially OPEN — matching this engine's behaviour, where
+    the drain has always run ungated and BUG-08's starvation could not occur.
+    """
+    if operation_type in growth_work_queue.DETERMINISTIC_OPERATIONS:
+        return True
+    _lane = globals().get("_reembedder_llm_lane_open")
+    if _lane is not None:
+        return bool(_lane(user_id, "ontology_eval", schema_name))
+    return True
+
+
 # ── R8 GROWTH WORKSTACK — drain-on-recovery ────────────────────────────────────
 #
 # The re-attempt half of the durable breadcrumb (growth_work_queue.py is the pure-SQL
@@ -9728,6 +9757,13 @@ def main():
                             # and the cycle proceeds exactly as before.
                             try:
                                 if growth_work_queue.pending_count(db_per_user) > 0:
+                                    # BUG-08 (adversarial bench 20261024): the drain
+                                    # gate is OP-AWARE (_growth_drain_lane_open):
+                                    # deterministic operations drain unconditionally;
+                                    # brain-bearing ones keep the lane verdict (and its
+                                    # breadcrumb) when lane machinery exists. The probe
+                                    # receives the OPERATION TYPE — a closed verdict
+                                    # skips that op's items, never the whole batch.
                                     _gq_changed: set = set()
 
                                     def _gq_ledger_noop(op, tgt, ok):
@@ -9743,7 +9779,8 @@ def main():
                                             backend_url=backend_api_url),
                                         item_done=lambda op, tgt: _growth_work_item_done(
                                             op, tgt, db_per_user),
-                                        lane_probe=lambda: True,
+                                        lane_probe=lambda op: _growth_drain_lane_open(
+                                            user_id, schema_name, op),
                                         on_attempted=_gq_ledger_noop,
                                     )
                                     # The drain's read re-opened a transaction on this
