@@ -110,7 +110,20 @@ _KEEP_PREPOSITIONS: frozenset[str] = frozenset({
 # Filler determiners/articles inside a span (e.g. "issue WITH THE server" → drop "the").
 _INNER_DETERMINERS: frozenset[str] = frozenset({"the", "a", "an"})
 
-_NON_WORD = re.compile(r"[^a-z0-9]+")
+# [es branch] UNICODE-AWARE. This was `[^a-z0-9]+`, an ASCII class, so every accented character
+# was treated as a SEPARATOR and split the word around it: "está"→"est"+"a", "diseñó"→"dise"+"ó",
+# "años"→"a"+"os". Every Spanish surface carrying a diacritic was therefore shredded into
+# fragments before it was ever snake_cased, minting junk rel_types that no alias layer could
+# bridge back together. `\w` under Python 3 `re` is Unicode by default, so this keeps letters,
+# digits and underscore in ANY script while still collapsing punctuation/whitespace runs.
+#
+# ⚠️ MIGRATION NOTE: this changes the canonical slug for accented surfaces (`est` → `está`).
+# Rel_types minted by the OLD shredding behavior will not match newly-minted ones. On an install
+# that already ingested Spanish, re-ingest to consolidate — the old slugs were corrupt anyway.
+# `\W` alone would KEEP underscore, losing the snake_case split the callers rely on — so the
+# class is `[\W_]`: every non-word char PLUS underscore, exactly the old separator set minus the
+# accented letters it should never have been eating.
+_NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 _WS = re.compile(r"\s+")
 
 # Contraction artifacts — clitic fragments left behind when an apostrophe is stripped during
