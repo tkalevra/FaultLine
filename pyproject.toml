@@ -15,7 +15,20 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Christopher Thompson" }]
 classifiers = ["Programming Language :: Python :: 3.11"]
 dependencies = [
-    "gliner2",
+    # gliner2 is PINNED with its [local] extra, and the pin must stay. The [local] extra is
+    # what makes torch/transformers/peft DECLARED dependencies of the pin: newer gliner2
+    # releases moved them out of the base install (PyPI base now ships only
+    # pydantic/requests/tqdm/urllib3), so a bare "gliner2" resolves them to NOTHING and the
+    # Docker build dies at the GLiNER2 pre-download step with
+    # `ModuleNotFoundError: No module named 'torch'` — a build break with NO source change
+    # behind it. The 1.3.2 -> 2.1.0 package upgrade was measured GO on the 39-case
+    # D1_HYBRID span checkpoint (fastino/gliner2-base-v1, 87.2% == baseline, byte-identical
+    # typed spans on the six canonical labels — see the benchmark note in src/api/main.py);
+    # the load/extract/classify call shapes are unchanged. The GLiNER2.5 MODEL swap is NOT
+    # part of this pin. transformers is floored at 4.57 (verified through 5.22.x). A new
+    # major means re-measuring the same benchmark — a measured decision, never a silent one.
+    "gliner2[local]==2.1.0",
+    "transformers>=4.57,<6",
     "huggingface_hub>=0.23.0,<1.0.0",
     "psycopg2-binary",
     "httpx",
