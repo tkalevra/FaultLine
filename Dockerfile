@@ -9,8 +9,26 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --upgrade pip
 
 COPY pyproject.toml .
+
+# ── CPU-ONLY TORCH — install FIRST, BEFORE the project deps ──────────────────
+# gliner2[local] declares torch, but the DEFAULT PyPI torch wheel BUNDLES THE FULL CUDA
+# RUNTIME (nvidia-cudnn, cublas, nccl, ...): a ~526 MB download and ~2.5 GB installed of
+# GPU libraries that a CPU-only deployment can never use. Installing the CPU-only wheel
+# FIRST satisfies the dependency, so the later `pip install -e .` resolves torch as
+# already-present and never drags in the CUDA build. Do NOT remove this step: without it
+# a dependency bump can silently leave the builder with NO torch at all, and the GLiNER2
+# pre-download below dies with `ModuleNotFoundError: No module named 'torch'` — exactly
+# how fresh-clone builds broke on every branch before this fix.
+# Running a GPU host? Override the index: --build-arg TORCH_INDEX_URL=https://pypi.org/simple
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch --index-url ${TORCH_INDEX_URL}
+
 # Install base + api dependencies (includes redis for re_embedder)
 RUN pip install --no-cache-dir -e . && pip install --no-cache-dir ".[api]"
+
+# Fail LOUD if a CUDA build sneaks back in: a GPU torch on a CPU-only host is ~2 GB of dead
+# weight, and silently tolerating it is how it got here in the first place.
+RUN python -c "import torch, sys; v = torch.__version__; sys.exit('FATAL: CUDA torch installed on a CPU-only image (' + v + ')') if '+cu' in v or torch.version.cuda else print('CPU-only torch OK', v)"
 
 # Pre-download the GLiNER2 model while gliner2 is on PATH via the venv
 RUN python -c "from gliner2 import GLiNER2; GLiNER2.from_pretrained('fastino/gliner2-base-v1')"
