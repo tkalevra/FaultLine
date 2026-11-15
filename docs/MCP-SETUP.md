@@ -22,7 +22,7 @@
 
 The MCP server runs as a child process of Claude Desktop on your workstation. It reaches the FaultLine backend over the network. No HTTP transport, no bearer token needed — the process is local and trusted.
 
-**When to use**: Claude Desktop on your local machine, FaultLine on a server or local Docker.
+**When to use**: Claude Desktop on your local machine, FaultLine on TrueNAS or local Docker.
 
 ```json
 {
@@ -32,7 +32,7 @@ The MCP server runs as a child process of Claude Desktop on your workstation. It
       "args": ["/path/to/FaultLine/tools/mcp_server.py"],
       "env": {
         "FAULTLINE_USER_ID": "YOUR-USER-UUID-HERE",
-        "FAULTLINE_API_URL": "http://your-server-host:8000"
+        "FAULTLINE_API_URL": "http://YOUR-TRUENAS-IP:8000"
       }
     }
   }
@@ -58,14 +58,16 @@ The `faultline-mcp` service reads both automatically on startup.
 
 #### Step 2a — OpenWebUI integration
 
-In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server**
+In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server** (native MCP) **OR** Settings → Tools → `+` (OpenAPI tool server — the recommended path that reliably forwards the per-user identity header).
 
 | Field | Value |
 |-------|-------|
-| URL | `http://faultline-mcp:8002/mcp` (Docker-internal) |
+| URL | `http://faultline-mcp:8002/mcp` (native MCP, Docker-internal) or `http://faultline-mcp:8002` (OpenAPI tool server) |
 | Bearer Token | `<your MCP_API_KEY value>` |
 
-OpenWebUI will call `tools/list`, discover all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — and surface them as native tools in every conversation. The MCP tools are the live integration path; the legacy OpenWebUI Filter in `openwebui/` is intentionally disabled.
+OpenWebUI discovers the six memory tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — plus the two agent-cortex tools (`iremember`, `irecall`), and surfaces them in every conversation. Tool descriptions OpenWebUI reads come from **`src/mcp/tools.py::TOOLS`** — the single source of truth. `/openapi.json` is a hand-built spec (`_build_tool_openapi`) that resolves each operation's description from `TOOLS`; the `@app.post` decorator text is never served to an OpenAPI client, so editing it changes nothing. Do NOT keep two copies in sync — that is the drift this consolidation removed. (The legacy OpenWebUI Filter exists but is intentionally disabled — the MCP tool server is the supported path.)
+
+> ⚠️ **Do not "correct" the paragraph above back to "`http_server.py` is the source of truth".** A peer review on the pre-consolidation `review/08d0a468-mcp-redirect` line did exactly that (commit `7c15156d`) in good faith — its branch predated the fix. On this line it is backwards, and it is the specific trap that already cost real product quality: three hand-maintained copies of the tool descriptions drifted, the OpenAPI door served a stripped `recall_memory` description with the "call at the START of a turn" trigger deleted, and every OpenWebUI-hosted model read the impoverished copy. `_build_tool_openapi` now resolves descriptions FROM `TOOLS`; `_TOOL_OPS` owns only the transport-specific schema shape. Pinned by `tests/mcp/test_premise_and_tool_parity.py`.
 
 #### Step 2b — Claude Desktop over HTTP (remote MCP server)
 
@@ -75,7 +77,7 @@ If you want Claude Desktop to connect to the Docker sidecar directly rather than
 {
   "mcpServers": {
     "faultline": {
-      "url": "http://your-server-host:8002/mcp",
+      "url": "http://YOUR-TRUENAS-IP:8002/mcp",
       "headers": {
         "Authorization": "Bearer YOUR-MCP-API-KEY-HERE"
       }
@@ -85,6 +87,13 @@ If you want Claude Desktop to connect to the Docker sidecar directly rather than
 ```
 
 Note: Claude Desktop's HTTP MCP support requires a recent version (0.10+). Check the hammer icon appears after restarting.
+
+---
+
+## Auth model
+
+- **Self-hosted (this guide):** the shared `MCP_API_KEY` Bearer is transport auth. The OpenWebUI↔MCP hop is on a trusted segment and OpenWebUI stamps the logged-in user's UUID into `X-OpenWebUI-User-Id`; the MCP transport binds that UUID to `faultline_{user_slug}` via `SET search_path` (no `public`) for every backend call (`src/mcp/server.py:127`).
+- **Managed SaaS offering:** the hosted FaultLine offering at https://faultline.ca adds its own account/seat auth model on top of this transport; those details are documented with the SaaS offering, not here.
 
 ---
 

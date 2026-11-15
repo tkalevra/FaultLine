@@ -1,66 +1,91 @@
 # FaultLine Deployment Guide
 
-For the full, annotated deployment walkthrough see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-This is the quick start.
-
 ## Prerequisites
 
 - Docker & Docker Compose v2+
-- ~4 GB RAM (8 GB recommended)
-- An LLM backend you already run (Ollama, LM Studio, OpenWebUI, or an
-  OpenAI-compatible API)
+- 4GB RAM recommended
+- PostgreSQL data volume (~1GB)
+- Qdrant data volume (~500MB)
+- LLM endpoint (Ollama, LM Studio, or OpenAI-compatible API)
 
-## Quick start
+## Quick Start
 
 ```bash
 git clone https://github.com/tkalevra/FaultLine.git
 cd FaultLine
 
+# Copy and edit environment
 cp .env.example .env
-# Set LLM_BACKEND_TYPE + LLM_BASE_URL to point at the LLM you already run.
+# Edit .env with your LLM endpoint and any overrides
 
+# Build and start all services
 docker compose up -d --build
 
-# Verify the backend
+# Verify health (backend API on port 8000)
 curl http://localhost:8000/health
-# {"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}
 ```
 
-## Services & ports
+Expected response: `{"status":"ok","database":"ok","qdrant":"ok","llm":"ok"}`
+
+## Services
 
 | Service | Port | Purpose |
-|---|---|---|
-| `faultline` | **8000** | Backend API — `/ingest`, `/query`, `/health` |
-| `faultline-mcp` | **8002** | MCP server — `recall_memory`, `remember_facts`, `learn_facts`, `retract_fact` (the live integration path) |
-| `postgres` | 5432 | PostgreSQL — authoritative fact storage (per-tenant schemas) |
-| `qdrant` | 6333 | Qdrant — present in the stack; retired for user memory (holds no user facts) |
+|---------|------|---------|
+| faultline (backend API) | 8000 | FastAPI — `/ingest`, `/query`, `/health` |
+| faultline-mcp | 8002 | MCP server (Streamable HTTP / JSON-RPC) — `/mcp` + REST shorthand (`/recall_memory`, `/remember_facts`, `/ingest_document`, `/learn_facts`, `/retract_fact`, `/forget_fact`) |
+| postgres | 5432 | PostgreSQL — authoritative A/B fact storage |
+| qdrant | 6333 | Qdrant — Class C short-term vector index only |
+| redis | 6379 | Rate limiting + event queues |
 
-The **MCP server on `:8002`** is the production integration path. The OpenWebUI
-Filter in `openwebui/` is intentionally disabled and is not the live path.
+> **Note on Portainer deployments:** `docker-compose-portainer-withoutqdrant.yml` maps the backend host port as `8001:8000`. The **container listens on 8000**; 8001 is only a host-side remap on that stack. The MCP server always listens on 8002.
 
 ## Configuration
 
-See [`docs/ENV-REFERENCE.md`](docs/ENV-REFERENCE.md) for the variable summary and
-[`.env.example`](.env.example) for the full annotated list. The three you must set:
+See `.env.example` for the full list. Key variables:
 
-| Variable | Purpose |
-|---|---|
-| `POSTGRES_DSN` | PostgreSQL connection |
-| `LLM_BACKEND_TYPE` | LLM protocol (`ollama` / `lm_studio` / `openwebui` / `openai` / …) |
-| `LLM_BASE_URL` | Host + port of your LLM (no path) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_BACKEND_TYPE` | `ollama` | Backend protocol selector (`openwebui` \| `ollama` \| `lm_studio` \| `openai` \| `anthropic` \| `groq` \| `localai` \| `raw`) |
+| `LLM_BASE_URL` | `http://host.docker.internal:11434` | LLM endpoint (host+port only, no path) |
+| `POSTGRES_DSN` | Set in compose | PostgreSQL connection |
+| `QDRANT_URL` | `http://qdrant:6333` | Vector store (Class C only) |
+| `MCP_API_KEY` | (unset = open) | Bearer token on the MCP HTTP transport (port 8002) |
+| `FAULTLINE_USER_ID` | (unset) | Single-user dev fallback; MUST be unset in multi-user deploys |
+| `REEMBED_INTERVAL` | `10` | Background sync interval (seconds) |
+| `RATE_LIMIT_PER_MIN` | `100` | Max requests per user per minute |
+| `SAAS_OAUTH_GOOGLE_CLIENT_ID` / `..._SECRET` | (unset) | Google sign-up/log-in door (unset = door not offered) |
+| `SAAS_OAUTH_GITHUB_CLIENT_ID` / `..._SECRET` | (unset) | GitHub sign-up/log-in door (unset = door not offered) |
+| `SAAS_OAUTH_REDIRECT_BASE` | falls back to `SAAS_MCP_PUBLIC_URL` | Origin for OAuth redirect URIs + the post-callback return page |
 
-## Production notes
+### OAuth providers (Google / GitHub)
 
-- Use external volumes for PostgreSQL and Qdrant data persistence.
-- Set `MCP_API_KEY` to a secret token (the MCP HTTP transport on `:8002` is
-  network-accessible — leaving it blank is dev-only).
-- Tune `DB_POOL_SIZE` to expected concurrency; set `FAULTLINE_LOG_LEVEL=INFO`.
-- Monitor `/health` for dependency status.
+Register an OAuth app per provider and set the client env above. Redirect URIs to register:
+
+- `<SAAS_OAUTH_REDIRECT_BASE>/me/oauth/google/callback`
+- `<SAAS_OAUTH_REDIRECT_BASE>/me/oauth/github/callback`
+
+Both doors reuse the password doors' gates exactly (rate limit, seat status, fail-closed
+MFA, disposable/spam/ban/one-mailbox/3-strikes, approval valve). OAuth-created logins get a
+random password hash — password sign-in stays inert until the user sets one via
+forgot-password. Details: `saas/oauth_login.py` module docstring.
+
+## Production Notes
+
+- Use external volumes for PostgreSQL and Qdrant data persistence
+- Configure `DB_POOL_SIZE` based on expected concurrency
+- Set `LOG_LEVEL=INFO` for production
+- Monitor `/health` endpoint for dependency status
+- Re-embedder syncs facts every `REEMBED_INTERVAL` seconds
 
 ## Troubleshooting
 
 ```bash
+# View logs
 docker compose logs faultline
+
+# Restart a service
 docker compose restart faultline
+
+# Check database connectivity
 docker compose exec postgres psql -U faultline -d faultline -c "SELECT 1"
 ```

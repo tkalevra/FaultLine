@@ -116,7 +116,7 @@ def check_prereqs():
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 def _http_get(url, headers=None, timeout=8):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected — url is from operator env (FAULTLINE_API_URL / MCP_RECALL_URL / MCP_REMEMBER_URL), never user input
         return r.status, r.read().decode("utf-8", "replace")
 
 
@@ -515,6 +515,39 @@ def _host_for_container(url):
     return url
 
 
+def _write_owner_only(path, lines):
+    """Write ``lines`` to ``path`` so that NO byte of it is ever readable by anyone but the owner.
+
+    A pre-existing ``.env`` (typically 0644 from a hand copy) keeps its mode when opened with
+    O_TRUNC — so "created 0600" was false for the overwrite case, and a chmod AFTER the write
+    leaves a window in which the keys sit in a world-readable file. Instead: the bytes go to a
+    sibling temp file created with ``O_CREAT | O_EXCL`` and mode 0600 — the mode is set by the
+    kernel at creation, before any write — then ``os.replace`` swaps it into place atomically,
+    so the visible path is either the old file or a complete 0600 one. Never a partial file,
+    never a readable window. (POSIX open(2): mode applies at creation; rename(2) is atomic.)
+    Best-effort on filesystems without POSIX modes — says so, never fails the install silently.
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # codeql[py/clear-text-storage-sensitive-data] BY-DESIGN: the source is cfg["LLM_API_KEY"] / mcp_key typed by the installing user (write_env's to_set); the installer's whole job is to write them into the gitignored .env docker-compose reads, and this file descriptor was created O_CREAT|O_EXCL with mode 0600 BEFORE the first byte — then os.replace()d into place atomically. round_3/TRIAGE.md row 16
+            f.writelines(lines)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)   # a filesystem that ignored the creation mode (SMB, some NFS)
+    except OSError as exc:  # noqa: BLE001
+        print(yellow(f"  ! could not restrict {path} to owner-only ({type(exc).__name__}); "
+                     f"it contains API keys — check its permissions yourself"))
+
+
 def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
     if not os.path.exists(ENV_EXAMPLE):
         print(red(f"  ✗ {ENV_EXAMPLE} not found — run this from the FaultLine repo root."))
@@ -523,8 +556,10 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
         if not ask_yes(".env already exists — overwrite? (a backup is made)", default_yes=False):
             print(yellow("  Kept existing .env. Nothing written."))
             return
-        shutil.copy(ENV_PATH, ENV_PATH + ".bak")
-        print(dim("  backed up existing .env → .env.bak"))
+        # the backup carries the same secrets as the original — same 0600-temp + rename write
+        with open(ENV_PATH, encoding="utf-8") as _old:
+            _write_owner_only(ENV_PATH + ".bak", _old.readlines())
+        print(dim("  backed up existing .env → .env.bak (mode 0600)"))
 
     to_set = {
         "LLM_BACKEND_TYPE": cfg["LLM_BACKEND_TYPE"],
@@ -559,9 +594,14 @@ def write_env(cfg, mcp_key, faultline_user_id="", embed_overrides=None):
         if k not in seen:
             out.append(f"{k}={v}\n")
 
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(out)
-    print(green(f"  ✓ wrote {ENV_PATH}"))
+    # BY DESIGN, and documented: ``.env`` IS the secret store this installer exists to write —
+    # ``LLM_API_KEY`` and ``MCP_API_KEY`` have to live somewhere docker-compose can read them, and
+    # ``.env`` is that place (gitignored). What can be controlled is WHO can read the file:
+    # ``_write_owner_only`` puts the bytes in a 0600 file that never had another mode and
+    # renames it into place (OWASP ASVS 4.0 V2.10.4 / V6.4.1: secrets at rest are
+    # access-controlled). The CodeQL annotation sits on the one line that writes, inside it.
+    _write_owner_only(ENV_PATH, out)
+    print(green(f"  ✓ wrote {ENV_PATH} (mode 0600 — owner-only; it holds your API keys)"))
 
 
 # ── next steps ────────────────────────────────────────────────────────────────
@@ -748,11 +788,12 @@ _LANGUAGES = {
            "icu_locale": "it-IT",
            "spacy_model": "it_core_news_sm",
            "ts_config": "italian"},
-    "es": {"label": "Español  (experimental)",
-           "branches": ("es",),
-           "icu_locale": "es-ES",
-           "spacy_model": "es_core_news_sm",
-           "ts_config": "spanish"},
+    # To add Spanish: create the `es` branch, then uncomment. NOTHING ELSE changes.
+    #   "es": {"label": "Español  (experimental)",
+    #          "branches": ("es",),
+    #          "icu_locale": "es-ES",
+    #          "spacy_model": "es_core_news_sm",
+    #          "ts_config": "spanish"},
 }
 _DEFAULT_LANG = "en"
 
@@ -821,13 +862,12 @@ def _switch_branch_and_reexec(targets, note):
 
 
 def language_gate():
-    """FIRST prompt, before anything else. English → the `main`/`master` (en) code; any other
-    language → that language's branch (its own code + prompts) via checkout + re-exec. The branch
-    IS the language, so there is no bilingual-string refactor. Fail-safe: an unresolvable switch
-    prints a note and continues in the current branch's language, never crashes."""
+    """FIRST prompt, before anything else. English → the `main`/`master` (en) code; Italian → the
+    EXPERIMENTAL `it` branch (multilingual code + Italian prompts) via checkout + re-exec. The branch
+    IS the language, so there is no bilingual-string refactor. Bilingual prompt, fail-safe."""
     if os.environ.get("_FL_LANG_SWITCHED"):
         return  # re-exec after a branch switch — language already chosen, don't re-prompt.
-    lang = choose("Language / Lingua / Idioma",
+    lang = choose("Language / Lingua",
                   [(k, v["label"]) for k, v in _LANGUAGES.items()])
     # Record BEFORE any switch: _switch_branch_and_reexec replaces this process, and on the far
     # side the early-return above fires, so the environment is the only carrier of the choice.
@@ -835,9 +875,11 @@ def language_gate():
     branch = _current_branch()
     want = _LANGUAGES[lang]["branches"]
     if branch not in want:
-        _switch_branch_and_reexec(
-            list(want),
-            f"Switching to the {_LANGUAGES[lang]['label']} branch and restarting setup…")
+        note = ("Passo al ramo italiano (sperimentale) e riavvio l'installazione…  "
+                "(Switching to the experimental Italian branch and restarting…)"
+                if lang == "it" else
+                f"Switching to the {_LANGUAGES[lang]['label']} branch and restarting setup…")
+        _switch_branch_and_reexec(list(want), note)
     # else: already on the branch for the chosen language → continue.
 
 
