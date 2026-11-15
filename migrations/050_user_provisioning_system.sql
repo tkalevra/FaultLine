@@ -19,7 +19,7 @@ CREATE INDEX IF NOT EXISTS idx_users_slug ON public.users (slug);
 CREATE TABLE IF NOT EXISTS public.user_provisioning (
     id SERIAL PRIMARY KEY,
     user_id UUID NOT NULL UNIQUE,
-    schema_name TEXT NOT NULL UNIQUE, -- "faultline_christopher", etc.
+    schema_name TEXT NOT NULL UNIQUE, -- "faultline_example", etc.
     status TEXT NOT NULL DEFAULT 'provisioning', -- provisioning | ready | error
     error_message TEXT, -- set if status='error'
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_user_provisioning_schema ON public.user_provision
 -- Migrations log: track which migrations have been applied to each schema
 CREATE TABLE IF NOT EXISTS public.migrations_log (
     id SERIAL PRIMARY KEY,
-    schema_name TEXT NOT NULL, -- e.g., "faultline_christopher"
+    schema_name TEXT NOT NULL, -- e.g., "faultline_example"
     migration_name TEXT NOT NULL, -- e.g., "001_create_facts.sql"
     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (schema_name, migration_name)

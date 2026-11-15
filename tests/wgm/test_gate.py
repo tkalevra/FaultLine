@@ -203,7 +203,7 @@ def test_conflict_inserts_new_fact():
     which iterated it and raised."""
     gate = _stub_gate(["also_known_as"], scenario=_CONFLICT_SCENARIO)
 
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "alex", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["status"] == "conflict"
@@ -216,7 +216,7 @@ def test_conflict_penalizes_old_fact():
     and the result links old → new fact ids."""
     gate = _stub_gate(["also_known_as"], scenario=_CONFLICT_SCENARIO)
 
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "alex", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["superseded_fact_id"] == 42

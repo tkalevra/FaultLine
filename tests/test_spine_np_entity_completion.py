@@ -65,7 +65,7 @@ def test_employer_of_propn_tail_captured_whole(sentence, tail):
         f"of-tail '{tail}' dropped from works_for object in: {sentence} -> {_triples(sentence)}"
 
 
-def test_employer_full_surface_university_of_guelph():
+def test_employer_full_surface_example_university():
     assert _has("I work at the Example University.", "user", "works_for", "university", "elmstead")
 
 

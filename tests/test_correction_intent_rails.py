@@ -563,7 +563,7 @@ class TestMarriedToDenialRail:
         assert got["ids"] == []
         assert "wife" in got["detail"] and "seren" in got["detail"]
 
-    def test_chris_mint_blocked_end_to_end_scaffold(self):
+    def test_sam_mint_blocked_end_to_end_scaffold(self):
         """Composition of the Sam wound: detection fires (CORRECTION preroute), the
         floor scaffolds the denial, and the gate MISSES on an absent stored marriage —
         honest failed response, zero writes, no fabricated positive row anywhere."""

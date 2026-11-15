@@ -37,7 +37,7 @@ def check_provisioning_status(user_id: str, db: Optional[psycopg2.extensions.con
     Examples:
         >>> result = check_provisioning_status("550e8400-e29b-41d4-a716-446655440000")
         >>> assert result['status'] == 'ready'
-        >>> assert result['schema_name'] == 'faultline_christopher'
+        >>> assert result['schema_name'] == 'faultline_example'
     """
     close_conn = False
 

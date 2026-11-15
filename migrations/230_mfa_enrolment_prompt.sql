@@ -4,7 +4,7 @@
 -- THE PROBLEM THIS SOLVES. MFA has existed and worked in both human realms for months
 -- (public.mfa_factors, saas/mfa.py, the "Security methods" block in the My Account panel), but it
 -- is only reachable by opening a modal and scrolling — so nobody turns it on. MEASURED in
--- production: the OptimusCannabis tenant admin has no enabled factor; the HelpDeskPro one does.
+-- production: the OptimusCannabis tenant admin has no enabled factor; the ExampleCorp one does.
 -- That is not an authentication defect, it is a DISCOVERY defect, and the fix is prompting, not
 -- a change to how the second factor is verified. NOTHING in this migration touches the
 -- verification path (saas/mfa.require_mfa_decision stays fail-CLOSED and untouched).

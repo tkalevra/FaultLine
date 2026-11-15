@@ -258,11 +258,11 @@ def derive_schema_name(user_slug: str) -> str:
         user_slug: Human-readable slug from users.slug (e.g., "alicia")
 
     Returns:
-        Schema name (e.g., "faultline_christopher")
+        Schema name (e.g., "faultline_example")
 
     Examples:
         >>> derive_schema_name("alicia")
-        'faultline_christopher'
+        'faultline_alicia'
 
         >>> derive_schema_name("vera")
         'faultline_marla'
@@ -1176,7 +1176,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
         ...     user_slug="alicia"
         ... )
-        >>> assert schema_name == "faultline_christopher"
+        >>> assert schema_name == "faultline_alicia"
         >>> assert status == "ready"
     """
     schema_name = derive_schema_name(user_slug)
@@ -1510,7 +1510,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
     Args:
         user_id: UUID of user (for logging)
-        schema_name: Schema to delete (e.g., "faultline_christopher")
+        schema_name: Schema to delete (e.g., "faultline_example")
         db: Optional psycopg2 connection. Creates new if not provided.
 
     Returns:
@@ -1519,7 +1519,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
     Examples:
         >>> success = delete_user_schema(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     schema_name="faultline_christopher"
+        ...     schema_name="faultline_example"
         ... )
         >>> assert success
     """

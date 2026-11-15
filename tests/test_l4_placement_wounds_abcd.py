@@ -228,7 +228,7 @@ def test_ingest_write_site_uses_canonical_key_source():
 # ── WOUND C: device hostname-stem coref shape rules ─────────────────────────────────
 
 def test_p70_family_surfaces_stem_match():
-    fam = ["p70", "sam-p70", "chris_P70", "p70 laptop", "lenovo thinkpad p70",
+    fam = ["p70", "sam-p70", "tara_P70", "p70 laptop", "lenovo thinkpad p70",
            "my p70", "SAM-P70"]
     for a in fam:
         for b in fam:

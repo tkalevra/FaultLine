@@ -266,7 +266,7 @@ class TestGroupBNameCollision:
         result = _query(client, "tell me about entity a", self.uid)
         assert result.get("status") == "ok"
 
-    def test_8_gabriella_reproduction(self, app):
+    def test_8_marina_reproduction(self, app):
         """EXACT reproduction of live bug: Marina ingested but invisible."""
         client = TestClient(app)
 
