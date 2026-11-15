@@ -203,7 +203,7 @@ def test_conflict_inserts_new_fact():
     which iterated it and raised."""
     gate = _stub_gate(["also_known_as"], scenario=_CONFLICT_SCENARIO)
 
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "marco", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["status"] == "conflict"
@@ -216,7 +216,7 @@ def test_conflict_penalizes_old_fact():
     and the result links old → new fact ids."""
     gate = _stub_gate(["also_known_as"], scenario=_CONFLICT_SCENARIO)
 
-    result = gate.validate_edge("arthur", "christophe", "also_known_as",
+    result = gate.validate_edge("arthur", "marco", "also_known_as",
                                 user_id="user1", provenance="doc")
 
     assert result["superseded_fact_id"] == 42
@@ -548,14 +548,14 @@ def test_staged_hierarchy_conflict_purges_inverted_system_token_subject():
     # Pass 2 (inverted — subject IS a system token): returns one row.
     cursor_mock.fetchall.side_effect = [
         [],        # conflicting rows with different object_id
-        [(201,)],  # inverted row: "person instance_of christopher" ← wrong direction
+        [(201,)],  # inverted row: "person instance_of marco" ← wrong direction
     ]
     cursor_mock.rowcount = 1
 
     deleted = gate._delete_conflicting_staged_hierarchy_facts(
         subject_id="person",   # system token — inversion guard fires
         rel_type="instance_of",
-        object_id="christopher-uuid",
+        object_id="marco-uuid",
     )
 
     assert deleted == 1
