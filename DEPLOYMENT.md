@@ -31,12 +31,16 @@ curl http://localhost:8000/health
 | Service | Port | Purpose |
 |---|---|---|
 | `faultline` | **8000** | Backend API — `/ingest`, `/query`, `/health` |
-| `faultline-mcp` | **8002** | MCP server — `recall_memory`, `remember_facts`, `learn_facts`, `retract_fact` (the live integration path) |
+| `faultline-mcp` | **8002** | MCP server (Streamable HTTP / JSON-RPC) — `/mcp` + REST shorthand (`recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact`) — the live integration path |
 | `postgres` | 5432 | PostgreSQL — authoritative fact storage (per-tenant schemas) |
 | `qdrant` | 6333 | Qdrant — present in the stack; retired for user memory (holds no user facts) |
 
 The **MCP server on `:8002`** is the production integration path. The OpenWebUI
 Filter in `openwebui/` is intentionally disabled and is not the live path.
+
+> **Note on Portainer deployments:** `docker-compose-portainer-withoutqdrant.yml` maps the
+> backend host port as `8001:8000`. The **container listens on 8000**; 8001 is only a host-side
+> remap on that stack. The MCP server always listens on 8002.
 
 ## Configuration
 

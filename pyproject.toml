@@ -47,6 +47,16 @@ dependencies = [
     # VALIDATES each against a reference (RELATIVE_BASE) — a non-date span → None → dropped.
     # NO date guessing: a miss yields NULL event_date, never a fabricated "today".
     "dateparser>=1.2,<2.0",
+    # Deterministic OFFLINE lexical hypernymy for the SYNC L4 is-a ladder
+    # (src/api/wordnet_ladder.py, consumed by main.py::_attach_wordnet_hypernym_ladder). WordNet's
+    # noun hypernym/is-a hierarchy (Princeton WordNet; the "@" pointer = hypernym) supplies the
+    # `subclass_of` rungs (dermatologist→doctor→…, handbag→bag→container…) SYNCHRONOUSLY at ingest so
+    # hypernym aggregation (COUNT/SUM over subclass_of) works at query time. Pure-Python (Apache-2.0),
+    # NO ML/GPU/network — a local corpus lookup, same spirit as dateparser for time. The `wordnet`
+    # (+ `omw-1.4`) CORPUS is NOT bundled with the PyPI wheel — it is BAKED into the image by the
+    # Dockerfile (`python -m nltk.downloader wordnet omw-1.4`, NLTK_DATA baked in). If the corpus is
+    # ever absent at runtime, wordnet_ladder.py fail-safes to a no-op (WordNet miss → async LLM climb).
+    "nltk>=3.8,<4.0",
     # Deterministic calendar delta-arithmetic for the recall EXPOSE+CALC derivation
     # (src/api/main.py::_whole_years_since → dateutil.relativedelta): whole completed
     # years between a stored birth/creation date and today = age / elapsed. Leap- and
@@ -84,6 +94,9 @@ test = [
     "pytest-asyncio>=0.23",
     "pytest-mock",
     "requests",
+    # tests/migration_census.py (imported by test_first_boot_migration_corpus) parses the
+    # migration corpus with sqlparse; undeclared, a clean `pip install -e .[test]` collection-errors.
+    "sqlparse",
     "fastapi>=0.110",
     "uvicorn[standard]",
     "pydantic>=2.0",
@@ -96,6 +109,13 @@ faultline-mcp = "src.mcp.cli:main"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# importlib import mode: two DIFFERENT test files legitimately share the basename
+# test_per_tenant_isolation_rollback.py (tests/ and tests/embedder/). Under the default
+# prepend mode pytest derives the module name from the basename alone, so the second one
+# collides with the first and the WHOLE run aborts with "import file mismatch" -- no test
+# result at all, from a naming coincidence. importlib gives each file a unique module
+# identity and needs no __init__.py sprinkled through the test tree.
+addopts = "--import-mode=importlib"
 markers = [
     "live: test calls live services (LLM/GLiNER2/DB) — skipped unless RUN_LIVE=1",
 ]
