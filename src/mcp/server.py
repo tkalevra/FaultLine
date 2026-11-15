@@ -4471,7 +4471,10 @@ def _archive_query_band_once(user_id: str, query: str) -> str:
     """One bounded archive read: cue words → anchor entities → superseded history rows →
     band text. Soft-fails "" (the band is additive; recall must never break on it)."""
     import psycopg2 as _ps
-    conn = _ps.connect(os.environ["POSTGRES_DSN"])
+    _dsn = os.environ.get("POSTGRES_DSN", "").strip()
+    if not _dsn:
+        return None  # no DSN configured (open-core dev / test) — the honest abstention stands
+    conn = _ps.connect(_dsn)
     try:
         cur = conn.cursor()
         cur.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE %s",
@@ -6033,10 +6036,10 @@ def _negative_space_serve(user_id: str, query: str,
             return out
         except Exception as _exc:  # noqa: BLE001 — the serve is bonus honesty; recall never breaks
             if attempts >= 2:
-                log.warning("recall.negative_space_failed after retry err=%s",
-                            str(_exc)[:120])
+                _log_warn("recall.negative_space_failed",
+                          f"after retry err={str(_exc)[:120]}")
                 return None
-            log.info("recall.negative_space_retry attempt=1 err=%s", str(_exc)[:120])
+            _log(f"recall.negative_space_retry attempt=1 err={str(_exc)[:120]}")
 
 
 def _floor_degraded_envelope(hits: list, base_memory: str, **fields) -> dict[str, Any]:
