@@ -1809,6 +1809,11 @@ _LIMITS = {
     "MCP_BACKOFF_CAP_S": (0.0, 3600.0),
     "MCP_STATEMENT_DEFER_EXTRACTION_ATTEMPTS": (1, 50),
     "MCP_STATEMENT_DEFER_BACKOFF_S": (0.1, 3600.0),
+    # Vehicle update (foss-es uplift port): the saas-lineage server added this knob to
+    # _ENV_LIMITS without updating this hand-written census copy — the drift the pin
+    # exists to catch, present on the saas tree itself. Table value verbatim from
+    # server.py.
+    "MCP_RECALL_TOTAL_BUDGET_S": (1.0, 600.0),
     "MEMORY_TEACHES_MAX_LINES": (0, 100),
     "RECALL_ASSERT_CONF_FLOOR": (0.0, 1.0),
     "EXPERIENCE_SURFACING_MAX_LINES": (0, 100),

@@ -6070,9 +6070,9 @@ def _negative_space_serve(user_id: str, query: str,
             return out
         except Exception as _exc:  # noqa: BLE001 — the serve is bonus honesty; recall never breaks
             if attempts >= 2:
-                _log("recall.negative_space_failed after retry err=%s", str(_exc)[:120])
+                _log(f"recall.negative_space_failed after retry err={str(_exc)[:120]}")
                 return None
-            _log("recall.negative_space_retry attempt=1 err=%s", str(_exc)[:120])
+            _log(f"recall.negative_space_retry attempt=1 err={str(_exc)[:120]}")
 
 
 def _floor_degraded_envelope(hits: list, base_memory: str, **fields) -> dict[str, Any]:
