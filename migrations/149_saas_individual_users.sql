@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_individual_users_account
 -- (SAAS_INDIVIDUAL_INVITE_CODE) is also honored by the router for owner bootstrap.
 CREATE TABLE IF NOT EXISTS public.individual_invites (
     code         TEXT PRIMARY KEY,                       -- the invite code (opaque)
-    note         TEXT,                                   -- optional human note ("chris test seat")
+    note         TEXT,                                   -- optional human note ("daniel test seat")
     max_uses     INTEGER NOT NULL DEFAULT 1,
     used_count   INTEGER NOT NULL DEFAULT 0,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

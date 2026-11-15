@@ -48,20 +48,20 @@ CREATE INDEX IF NOT EXISTS idx_extraction_patterns_category
 -- Bootstrap: Identity patterns (self-identification via "my name is", "I am", "call me")
 INSERT INTO extraction_patterns (pattern_regex, rel_type, description, example_text, category, source, global_confidence)
 VALUES
-  ('\bmy\s+name\s+is\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: my name is X', 'my name is Christopher', 'identity', 'hardcoded_legacy', 0.90),
-  ('\bi\s+am\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: I am X', 'I am Christopher', 'identity', 'hardcoded_legacy', 0.88),
-  ('\bi''m\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: I''m X', 'I''m Christopher', 'identity', 'hardcoded_legacy', 0.87),
-  ('\bcall\s+me\s+([A-Z][a-z]+)', 'pref_name', 'User preference: call me X', 'call me Chris', 'identity', 'hardcoded_legacy', 0.92),
-  ('\bpeople\s+call\s+me\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: people call me X', 'people call me Chris', 'identity', 'hardcoded_legacy', 0.85),
+  ('\bmy\s+name\s+is\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: my name is X', 'my name is Daniel', 'identity', 'hardcoded_legacy', 0.90),
+  ('\bi\s+am\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: I am X', 'I am Daniel', 'identity', 'hardcoded_legacy', 0.88),
+  ('\bi''m\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: I''m X', 'I''m Daniel', 'identity', 'hardcoded_legacy', 0.87),
+  ('\bcall\s+me\s+([A-Z][a-z]+)', 'pref_name', 'User preference: call me X', 'call me Dan', 'identity', 'hardcoded_legacy', 0.92),
+  ('\bpeople\s+call\s+me\s+([A-Z][a-z]+)', 'also_known_as', 'User identity: people call me X', 'people call me Dan', 'identity', 'hardcoded_legacy', 0.85),
 
   -- First-person preference patterns
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'First-person: prefers to be called X', 'I prefer to be called Chris', 'preference', 'hardcoded_legacy', 0.89),
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bgoes\s+by\s+([A-Z][a-z]+)', 'pref_name', 'First-person: goes by X', 'I go by Chris', 'preference', 'hardcoded_legacy', 0.88),
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bpreferred\s+name\s+is\s+([A-Z][a-z]+)', 'pref_name', 'First-person: preferred name is X', 'My preferred name is Chris', 'preference', 'hardcoded_legacy', 0.87),
-  ('\bplease\s+call\s+me\s+([A-Z][a-z]+)', 'pref_name', 'First-person: please call me X', 'please call me Chris', 'preference', 'hardcoded_legacy', 0.90),
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bknown\s+as\s+([A-Z][a-z]+)', 'pref_name', 'First-person: known as X', 'I''m known as Chris', 'preference', 'hardcoded_legacy', 0.86),
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\blike\s+to\s+(?:be|go)\s+(?:by|called)\s+([A-Z][a-z]+)', 'pref_name', 'First-person: like to be called X', 'I like to be called Chris', 'preference', 'hardcoded_legacy', 0.85),
-  ('\bi\s+wants?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'First-person: I want to be called X', 'I want to be called Chris', 'preference', 'hardcoded_legacy', 0.87),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bprefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'First-person: prefers to be called X', 'I prefer to be called Dan', 'preference', 'hardcoded_legacy', 0.89),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bgoes\s+by\s+([A-Z][a-z]+)', 'pref_name', 'First-person: goes by X', 'I go by Dan', 'preference', 'hardcoded_legacy', 0.88),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bpreferred\s+name\s+is\s+([A-Z][a-z]+)', 'pref_name', 'First-person: preferred name is X', 'My preferred name is Dan', 'preference', 'hardcoded_legacy', 0.87),
+  ('\bplease\s+call\s+me\s+([A-Z][a-z]+)', 'pref_name', 'First-person: please call me X', 'please call me Dan', 'preference', 'hardcoded_legacy', 0.90),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\bknown\s+as\s+([A-Z][a-z]+)', 'pref_name', 'First-person: known as X', 'I''m known as Dan', 'preference', 'hardcoded_legacy', 0.86),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )\blike\s+to\s+(?:be|go)\s+(?:by|called)\s+([A-Z][a-z]+)', 'pref_name', 'First-person: like to be called X', 'I like to be called Dan', 'preference', 'hardcoded_legacy', 0.85),
+  ('\bi\s+wants?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'First-person: I want to be called X', 'I want to be called Dan', 'preference', 'hardcoded_legacy', 0.87),
 
   -- Third-person preference patterns
   ('([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+prefers?\s+(?:to\s+be\s+called\s+)?([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, age N, who prefers X', 'Mara, age 10, who prefers emma', 'preference', 'hardcoded_legacy', 0.88),

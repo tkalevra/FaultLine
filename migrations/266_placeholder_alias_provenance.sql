@@ -10,7 +10,7 @@
 --      gate (_populate_preferred_names), the fallback SQL (preference_source != 'provisioned')
 --      and the re_embedder's suspect_preferred_name flag — so an unstamped placeholder was
 --      accepted by ALL of them and recall rendered the literal 'user' forever (measured on the
---      owner's live demo 2026-08-21: 'My name is Christopher' registered non-preferred every
+--      a live demo 2026-08-21: 'My name is Daniel' registered non-preferred every
 --      time; corrections were idempotent no-ops).
 --
 -- Scope guard — this stamps ONLY the one known placeholder shape:

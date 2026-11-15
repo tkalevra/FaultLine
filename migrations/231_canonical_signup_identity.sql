@@ -12,7 +12,7 @@
 -- ════════════════════════════════════════════════════════════════════════════════════════
 -- LOGIN STILL RESOLVES ON THE RAW ADDRESS. Nobody's stored ``email`` / ``username`` is rewritten
 -- by this migration or by the code that accompanies it, and NO authentication path is switched to
--- the canonical form. A person who registered ``chris+faultline@gmail.com`` signs in with exactly
+-- the canonical form. A person who registered ``daniel+faultline@gmail.com`` signs in with exactly
 -- that string, forever. People save credentials to a password manager; silently changing someone's
 -- username locks them out of their own vault entry for a benefit they never asked for. The
 -- canonical form is an IDENTITY KEY for "may this signup happen", never a credential.
@@ -314,7 +314,7 @@ BEGIN
             '10):%    %',
             _groups, _rows, E'\n', E'\n', _sample
             USING HINT = 'These are usually deliberate: a staff member holding alex@x.com and '
-                         'chris+ops@x.com as two dashboard logins. One mailbox is now one login, '
+                         'daniel+ops@x.com as two dashboard logins. One mailbox is now one login, '
                          'so retire or re-address the extras, then re-run. The individual_users '
                          'constraint applies independently and is unaffected by this.';
     END IF;

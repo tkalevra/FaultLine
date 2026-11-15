@@ -29,8 +29,8 @@ VALUES
 
   -- Reclarification patterns: "Actually/Wait/Sorry + fact"
   ('actually', 'reclarification', 1, 0.85, NULL, 'Actually, I work for Acme', 'Explicit reclarification marker'),
-  ('wait,', 'reclarification', 2, 0.75, NULL, 'Wait, my name is Christopher', 'User catches own error mid-conversation'),
-  ('wait ', 'reclarification', 2, 0.75, NULL, 'Wait my name is Christopher', 'Wait without comma'),
+  ('wait,', 'reclarification', 2, 0.75, NULL, 'Wait, my name is Daniel', 'User catches own error mid-conversation'),
+  ('wait ', 'reclarification', 2, 0.75, NULL, 'Wait my name is Daniel', 'Wait without comma'),
   ('sorry,', 'reclarification', 2, 0.75, NULL, 'Sorry, we don''t have pets', 'User apologizes while correcting'),
   ('sorry ', 'reclarification', 2, 0.75, NULL, 'Sorry we don''t have pets', 'Sorry without comma'),
   ('i meant', 'reclarification', 1, 0.8, NULL, 'I meant to say Leo', 'Explicit intention marker'),

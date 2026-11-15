@@ -3,7 +3,7 @@
 --
 -- WHY
 -- ---
--- The spine deriver captured a FIRST-PERSON self-name ("I prefer to be called Chris") and the
+-- The spine deriver captured a FIRST-PERSON self-name ("I prefer to be called Dan") and the
 -- "<role>'s name is <PROPN>" frame, but a THIRD-PARTY nickname stated with a PHRASAL alias idiom —
 -- "she goes by Dee", "he is known as Sammy", "she is referred to as Mars" — was DROPPED, and the
 -- intransitive/copula-state chains mis-minted a junk (she, has_state, go) / (she, has_state, know)
