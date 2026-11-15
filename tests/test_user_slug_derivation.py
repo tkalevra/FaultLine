@@ -27,8 +27,8 @@ def test_derive_user_slug_from_uuid_all_fs():
 
 def test_derive_user_slug_from_uuid_uppercase():
     """Test that uppercase UUIDs are lowercased."""
-    result = derive_user_slug_from_uuid("10D7D879-63CD-4F31-92CE-F2C9EDB760AB")
-    assert result == "1a2b3c4d_63cd_4f31_92ce_f2c9edb760ab"
+    result = derive_user_slug_from_uuid("3F9C2E17-63CD-4F31-92CE-F2C9EDB760AB")
+    assert result == "3f9c2e17_63cd_4f31_92ce_f2c9edb760ab"
     assert result.islower()
 
 
