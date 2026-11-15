@@ -1,6 +1,6 @@
 """The account's rate budget must count the TOTAL number of requests it actually sends.
 
-Prod incident 2026-08-11 (account d0fa70b1 on Cerebras Free tier — a real 5 RPM ceiling):
+Prod incident 2026-08-11 (synthetic-account 7e4b90d2 on Cerebras Free tier — a real 5 RPM ceiling):
 the configured pace was CORRECT at 5 RPM and the account still 429'd continuously for
 hours. Three independent under-counts multiplied:
 
