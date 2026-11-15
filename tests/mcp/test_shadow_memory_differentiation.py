@@ -78,5 +78,10 @@ def test_served_descriptions_stay_under_the_openai_limit():
     served = {i["post"]["operationId"]: len(i["post"]["description"]) for i in spec["paths"].values()}
     assert served["recall_memory"] <= premise.OPENAI_DESCRIPTION_LIMIT
     assert served["remember_facts"] <= premise.OPENAI_DESCRIPTION_LIMIT
-    assert served["recall_memory"] == 1009, "recall_memory description moved — re-pin WITH evidence"
-    assert served["remember_facts"] == 1011, "remember_facts description moved — re-pin WITH evidence"
+    # FOSS PORT (2026-11-15 uplift): the foss host-note naming block is re-woven into the
+    # canonical descriptions (source rewrite had dropped it), so the served lengths moved
+    # from the private line's 1009/1011 to 1006/991. Vehicle-swap with the MECHANISM byte-
+    # identical: <= limit + the exact host-note phrases. Re-pin evidence: measured on the
+    # foss uplift tip with MEMORY_TEACHES on (production condition).
+    assert served["recall_memory"] == 1006, "recall_memory description moved — re-pin WITH evidence"
+    assert served["remember_facts"] == 991, "remember_facts description moved — re-pin WITH evidence"

@@ -21,6 +21,7 @@ Auth:
 """
 
 import hashlib
+import psycopg2
 import hmac
 import json
 import mimetypes
@@ -1866,6 +1867,13 @@ def _build_tool_openapi() -> dict:
 
     paths: dict = {}
     for t in _TOOL_OPS:
+        # FOSS-port moat seam: an op with NO canonical text is a closed-layer op whose
+        # schema lives moat-side (saas/agent_mcp_tool.py). When the guarded fold above
+        # did not land (open core — no saas/), serving it from _TOOL_OPS' local copy
+        # would resurrect exactly the hand-written second copy this builder exists to
+        # abolish, and would advertise a closed product door on the public spec. Skip it.
+        if t["op"] not in _canonical:
+            continue
         paths[t["path"]] = {
             "post": {
                 "operationId": t["op"],
@@ -1966,6 +1974,82 @@ async def security_txt():
 _bearer = HTTPBearer(auto_error=False, description="MCP_API_KEY bearer token")
 
 
+
+# ── FOSS control-plane dashboard-credential auth (the webui's minted credentials). ──
+# Ported back VERBATIM from foss main (the saas-lineage rewrite dropped it; without it,
+# webui-minted seat tokens + rotated MCP keys stop authenticating on the MCP door).
+# The saas account-token block above stays first in _resolve_principal — SAAS_MODE-gated,
+# inert here. This block is the OPEN-CORE resolution path.
+
+def _dashboard_dsn() -> str:
+    return os.environ.get("POSTGRES_DSN", "").strip()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _dashboard_lookup(query: str, params: tuple) -> Optional[tuple]:
+    """Run a single SELECT against the shared DB; return the first row or None.
+
+    Opens a short-lived connection per call — local postgres, one indexed probe,
+    negligible cost. Any error → None (auth falls back to env); the MCP path
+    never hard-fails on a DB hiccup. Blocking, but ~ms and not on the chat path.
+    """
+    dsn = _dashboard_dsn()
+    if not dsn:
+        return None
+    try:
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception:  # noqa: BLE001 — DB optional; degrade to env auth
+        return None
+
+
+def _resolve_seat_token_db(credentials: Optional[str]) -> Optional[str]:
+    """Return the seat's user_id if credentials is a valid active seat token."""
+    if not credentials:
+        return None
+    row = _dashboard_lookup(
+        "SELECT user_id FROM public.dashboard_seats "
+        "WHERE token_hash = %s AND active = TRUE",
+        (_sha256_hex(credentials),),
+    )
+    if not row:
+        return None
+    return str(row[0])
+
+
+def _mcp_key_active_db(credentials: Optional[str]) -> bool:
+    """True if credentials matches an active rotated MCP key in the DB."""
+    if not credentials:
+        return False
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys "
+        "WHERE key_hash = %s AND is_active = TRUE LIMIT 1",
+        (_sha256_hex(credentials),),
+    ) is not None
+
+
+def _any_dashboard_credential_configured() -> bool:
+    """True if the operator has minted ANY seat or rotated key (DB-gated).
+
+    Gates the anonymous-dev fallback: once seats/keys exist in the DB, the open
+    anonymous mode is suppressed even if MCP_API_KEY env is unset, so minting the
+    first seat closes the open posture."""
+    # NOTE the empty params tuple on BOTH probes. `_dashboard_lookup(query, params)` takes
+    # params as a REQUIRED positional; omitting it raises TypeError at the CALL SITE, i.e.
+    # before the callee's `try`, so its documented "any error -> None, never hard-fails"
+    # fail-safe never gets the chance to run. Every credential-less request then 500s inside
+    # require_auth — which is the DEFAULT posture for a fresh self-hosted install.
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1", ()
+    ) is not None or _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
+    ) is not None
+
+
 def _resolve_principal(credentials: str | None) -> str | None:
     """Map a presented bearer credential to a principal.
 
@@ -1978,33 +2062,56 @@ def _resolve_principal(credentials: str | None) -> str | None:
     # SAAS_MODE off → this whole block is skipped and behavior is EXACTLY today's
     # (single shared key → "shared"). Import is lazy + fail-closed: any resolver error
     # denies (returns None → 401), never falls through to the shared path.
+    # FOSS PORT NOTE (2026-11-15): the private line's form wrapped the whole block in
+    # try/except → return None. That is fail-closed WITH the closed layer present, but on
+    # the open core the `from saas.config import ...` itself raises ModuleNotFoundError —
+    # which would deny EVERY request (measured: the shadow-memory initialize smoke 401'd).
+    # Module-absence is the open core's NORMAL state, not a resolver error: treat it as
+    # "skip the account block", keep fail-closed for genuine errors while saas/ is present.
     try:
         from saas.config import saas_mode_enabled
-        if saas_mode_enabled():
-            if credentials is None:
-                return None
-            # Per-user token (flu_…): resolve to the BOUND UUID → this becomes the principal
-            # and activates bind_tenant Option A (the token can act ONLY as this UUID; any
-            # other claimed X-OpenWebUI-User-Id → 403). An unknown/revoked token or an
-            # inactive seat → None (fail-closed → 401); NEVER retried as an account key.
-            from saas.tokens import is_user_token, resolve_user_token
-            if is_user_token(credentials):
-                return resolve_user_token(credentials)
-            # Account key (flk_…): resolve to the account principal (control plane).
-            from saas.accounts import resolve_key_to_account
-            account_id = resolve_key_to_account(credentials)
-            if account_id is None:
-                return None
-            return f"account:{account_id}"
-    except Exception:
-        return None  # fail-closed
+    except ModuleNotFoundError:
+        saas_mode_enabled = None  # open core — the closed layer is absent by design
+    if saas_mode_enabled is not None:
+        try:
+            if saas_mode_enabled():
+                if credentials is None:
+                    return None
+                # Per-user token (flu_…): resolve to the BOUND UUID → this becomes the principal
+                # and activates bind_tenant Option A (the token can act ONLY as this UUID; any
+                # other claimed X-OpenWebUI-User-Id → 403). An unknown/revoked token or an
+                # inactive seat → None (fail-closed → 401); NEVER retried as an account key.
+                from saas.tokens import is_user_token, resolve_user_token
+                if is_user_token(credentials):
+                    return resolve_user_token(credentials)
+                # Account key (flk_…): resolve to the account principal (control plane).
+                from saas.accounts import resolve_key_to_account
+                account_id = resolve_key_to_account(credentials)
+                if account_id is None:
+                    return None
+                return f"account:{account_id}"
+        except Exception:
+            return None  # fail-closed (with the closed layer present)
 
-    if not MCP_API_KEY:
-        return "anonymous"  # unauthenticated mode (dev/localhost only)
-    if credentials is None:
-        return None
-    if hmac.compare_digest(credentials, MCP_API_KEY):
+    # ── Open core: dashboard-credential resolution (seat token / rotated key / env key). ──
+    # 1. Per-seat token (highest precedence — strongest auth): the token IS the identity;
+    #    bind_tenant's Option A then treats the seat's user_id as the authoritative principal.
+    seat_uid = _resolve_seat_token_db(credentials)
+    if seat_uid:
+        return seat_uid
+    # 2. Rotated MCP key minted by the webui control plane.
+    if _mcp_key_active_db(credentials):
         return "shared"
+    # 3. Env MCP_API_KEY (back-compat / bootstrap).
+    if MCP_API_KEY:
+        if credentials is not None and hmac.compare_digest(credentials, MCP_API_KEY):
+            return "shared"
+        return None
+    # 4. Anonymous dev mode — ONLY when nothing is configured anywhere (no env key AND
+    #    no DB seats/keys) AND no credential was presented. Minting the first seat/key
+    #    closes the open posture even with the env key unset.
+    if credentials is None and not _any_dashboard_credential_configured():
+        return "anonymous"
     return None
 
 

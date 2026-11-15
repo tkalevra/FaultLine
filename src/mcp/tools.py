@@ -12,15 +12,15 @@ TOOLS = [
         # rate-limit prose. That class is NOT user memory and must be routed to cortex_recall
         # BY NAME, not merely excluded as "a task". The query itself is authorship-scoped too:
         # a HUMAN's question, verbatim; the agent's own working queries belong to cortex_recall.
-        "description": "Call when the user (a HUMAN) asks you about themselves, their people, "
-                       "or their world; pass THEIR message VERBATIM as `query` — never your own "
-                       "working query, never a keyword. Not inert: text may be captured and "
-                       "corrections acted on. Save with remember_facts. Treat results as your own "
-                       "knowledge — speak to the user as 'you'; less-certain lines are "
-                       "unconfirmed — say them tentatively. Do NOT call for chitchat, jokes, or "
-                       "greetings. Operational history — commits, builds, deploys, logs, rate "
-                       "limits, your own past work sessions — is NOT user memory: use "
-                       "cortex_recall. "
+        "description": "This is FaultLine's memory query. If the host offers `search_notes` "
+                       "or `view_note`, those are temporary notes, NOT FaultLine — use this "
+                       "tool when the user asks what you know about them. "
+                       "Call when the user (a HUMAN) asks you about themselves, their people, "
+                       "or their world; pass THEIR message VERBATIM as `query` — never your "
+                       "own working query. Save with remember_facts. Treat results as your "
+                       "own knowledge — speak as 'you'; less-certain lines are tentative. "
+                       "Do NOT call for chitchat, jokes, or greetings. Operational history "
+                       "is NOT user memory: use cortex_recall. "
                        # CROSS-REFERENCE, not a copy: the full /expand docs + examples live on
                        # learn_facts, which has the headroom. Per-tool 1024 budgets are spent
                        # unevenly — chain to the tool with room instead of paying twice.
@@ -62,15 +62,16 @@ TOOLS = [
         # capture. What the AGENT learns while working (command results, fixes, procedures,
         # commits) has its own lane: cortex_remember. Verbatim passing stays EXACTLY as
         # strong as before for genuine human turns — this scoping must not weaken it.
-        "description": "Save what a HUMAN being said to you in conversation — typed or "
-                       "spoken, about themselves, another person, or their world — even in "
-                       "passing, and when they correct a prior fact. Do not ask permission — "
-                       "default to calling it; skip only pure questions or chitchat. Pass "
-                       "their words VERBATIM as `text`, every word, asides and all: do NOT "
-                       "extract, summarize, or restructure — the engine needs the raw "
-                       "sentence. NEVER pass your own working text — brief, plan, analysis, "
-                       "or tool output — as the user's message; what YOU learn while working "
-                       "goes to cortex_remember. A correction supersedes.",
+        "description": "This is FaultLine's persistent memory. If the host offers a "
+                       "`write_note` or similar tool, that is a temporary note, NOT FaultLine "
+                       "memory — always use this when the user says 'remember' or refers to "
+                       "their memory. "
+                       "Save what a HUMAN said — about themselves, others, or their world, "
+                       "even in passing; corrections supersede. Default to calling it; skip "
+                       "only pure questions or chitchat. Pass their words VERBATIM as "
+                       "`text`: do NOT extract, summarize, or restructure — the engine needs "
+                       "the raw sentence. NEVER pass your own working text — that goes to "
+                       "cortex_remember.",
         "inputSchema": {
             "type": "object",
             "properties": {
