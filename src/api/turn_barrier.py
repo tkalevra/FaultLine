@@ -63,9 +63,6 @@ ENABLED = os.environ.get("TURN_BARRIER_ENABLED", "true").lower() in ("1", "true"
 # Don't alert on every shed — one trip notice per interval per process.
 ALERT_MIN_INTERVAL_S = float(os.environ.get("TURN_BARRIER_ALERT_INTERVAL_S", "900"))
 
-_sem: Optional[asyncio.Semaphore] = None
-_sem_loop: Optional[asyncio.AbstractEventLoop] = None
-_sem_lock = threading.Lock()
 
 # Optional host-supplied escalation hook, set via ``set_notifier``. Kept as a plain
 # module-level slot rather than an import of any particular mailer so this file has NO
@@ -84,6 +81,9 @@ def set_notifier(fn) -> None:
     global _notifier
     _notifier = fn
 
+_sem: Optional[asyncio.Semaphore] = None
+_sem_loop: Optional[asyncio.AbstractEventLoop] = None
+_sem_lock = threading.Lock()
 
 _state_lock = threading.Lock()
 _state = {

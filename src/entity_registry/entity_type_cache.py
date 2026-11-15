@@ -3,7 +3,6 @@ EntityTypeCache: Runtime cache of valid entity types from database.
 Provides database-driven validation without hardcoded VALID_ENTITY_TYPES.
 """
 
-import psycopg2
 import time
 from typing import Set
 import logging
@@ -37,7 +36,13 @@ class EntityTypeCache:
     def _refresh(self) -> None:
         """Reload entity types from database."""
         try:
-            with psycopg2.connect(self.dsn) as conn:
+            # read_only_connection (src/api/db_read.py): autocommit + readonly + guaranteed
+            # close(). `with psycopg2.connect(...)` COMMITS but does NOT close — it abandoned a
+            # live backend on every TTL refresh, surviving only until GC (not a guarantee: a
+            # traceback or reference cycle pins it indefinitely — one such backend was measured
+            # 6 days old). Same defect class as the 2026-08-01 prod idle-in-transaction stall.
+            from src.api.db_read import read_only_connection
+            with read_only_connection(self.dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT LOWER(entity_type) FROM entity_types WHERE is_learnable=true"

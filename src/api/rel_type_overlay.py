@@ -55,6 +55,8 @@ import contextvars
 import psycopg2
 import structlog
 
+from src.api.db_read import read_only_connection
+
 log = structlog.get_logger()
 
 # Columns selected for the FULL meta dict (superset used by _build_rel_type_meta in
@@ -66,6 +68,24 @@ _SELECT_COLS = (
     "label, natural_language, natural_language_2p, temporal_class, source, "
     # SCALAR-TYPE discipline (migration 101): the datatype of a SCALAR slot + its range/unit.
     # Drives metadata-driven per-datatype validation + datatype-aware coercion at ingest.
+    "scalar_datatype, value_min, value_max, unit, "
+    # CARDINALITY (migration 168, DESIGN-memory-temporal-lifecycle §5 recency-supersede):
+    # is_single_valued = the rel holds at most ONE CURRENT value per subject (OWL-functional
+    # STATE, e.g. residence) → recency picks the latest as current, older coexisting undated
+    # 'now' values render as FORMER. FALSE (default) = multi-valued (speaks/likes) → all
+    # values stay current. Appended LAST to match migration 168's ALTER … ADD COLUMN ordinal
+    # so the bootstrap INSERT INTO rel_types SELECT * FROM public.rel_types stays aligned.
+    "is_single_valued"
+)
+
+# LEGACY column list WITHOUT the migration-168 cardinality column, for graceful
+# degradation against a tenant schema that has not yet had 168 fanned out. A row read
+# with this list is 19-wide; _row_to_meta defaults is_single_valued=False for it (the
+# SAFE, non-destructive value — an un-migrated rel never wrongly hides a value).
+_SELECT_COLS_LEGACY = (
+    "rel_type, category, tail_types, head_types, storage_target, fact_class, "
+    "is_symmetric, inverse_rel_type, is_hierarchy_rel, correction_behavior, "
+    "label, natural_language, natural_language_2p, temporal_class, source, "
     "scalar_datatype, value_min, value_max, unit"
 )
 
@@ -127,10 +147,14 @@ def get_current_schema() -> str | None:
 
 
 def _row_to_meta(row) -> dict:
+    # Slice the fixed 19-wide prefix; the migration-168 cardinality column (if present)
+    # is the optional 20th — index-read so a 19-wide legacy row (un-migrated schema) is
+    # handled without a tuple-unpack width mismatch.
     (rel_type, category, tail_types, head_types, storage_target, fact_class,
      is_symmetric, inverse_rel_type, is_hierarchy_rel, correction_behavior,
      label, natural_language, natural_language_2p, temporal_class, source,
-     scalar_datatype, value_min, value_max, unit) = row
+     scalar_datatype, value_min, value_max, unit) = row[:19]
+    is_single_valued = row[19] if len(row) > 19 else False
     return {
         "category": category,
         "tail_types": tail_types or [],
@@ -161,6 +185,11 @@ def _row_to_meta(row) -> dict:
         "value_min": value_min,
         "value_max": value_max,
         "unit": unit,
+        # CARDINALITY (migration 168): single-current-valued STATE rel → recency-supersede
+        # at render (older coexisting undated 'now' value(s) → FORMER). Default False =
+        # multi-valued (all values stay current). Consumed by the query render seams
+        # (_recency_collapse_single_valued_state / convert_to_prose). Subject-agnostic.
+        "is_single_valued": bool(is_single_valued),
     }
 
 
@@ -170,9 +199,21 @@ def _fetch_meta(dsn: str, schema_qualifier: str) -> dict:
     Returns {rel_type: meta_dict}.
     """
     meta: dict = {}
-    with psycopg2.connect(dsn) as conn:
+    # read_only_connection: autocommit + readonly + guaranteed close. A metadata read must
+    # never own a transaction (AccessShareLock held across a slow caller = the prod
+    # deprovision/pg_dump stall) and must never own a backend past its own scope. See
+    # src/api/db_read.py.
+    with read_only_connection(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT {_SELECT_COLS} FROM {schema_qualifier}.rel_types")
+            try:
+                cur.execute(f"SELECT {_SELECT_COLS} FROM {schema_qualifier}.rel_types")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query _SELECT_COLS is a module constant column list; schema_qualifier is a validated schema identifier (pre-condition of this function)
+            except psycopg2.errors.UndefinedColumn:
+                # Migration 168 (is_single_valued) not yet fanned out into this schema.
+                # Fail-safe degrade to the legacy column set; _row_to_meta defaults the
+                # cardinality to False (the non-destructive value). Under autocommit the
+                # failed statement leaves NO aborted transaction behind, so the retry runs
+                # directly — the old explicit rollback() existed only to clear that txn.
+                cur.execute(f"SELECT {_SELECT_COLS_LEGACY} FROM {schema_qualifier}.rel_types")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query _SELECT_COLS_LEGACY is a module constant; schema_qualifier is a validated schema identifier
             for row in cur.fetchall():
                 meta[row[0]] = _row_to_meta(row)
     return meta

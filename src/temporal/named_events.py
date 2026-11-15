@@ -18,12 +18,29 @@ Subject-agnostic, deterministic, fail-safe (any miss / error → ``None``).
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import date, timedelta
 
 import structlog
 
 log = structlog.get_logger()
+
+# ── OFFSET-FROM-NAMED-EVENT nearest-occurrence anchoring (default ON) ──────────────────────────────
+# A signed offset off a recurring named event ("a week before Black Friday") must anchor to the
+# occurrence whose OFFSET RESULT sits NEAREST the reference — the TimeML/TIMEX3 rule that a
+# relative-indefinite expression (RI-TIMEX) resolves against the anchor in the window closest to the
+# Document Creation Time (candidate dates are ranked by proximity to the DCT; clinical RI-TIMEX
+# normalization, PMC4986666). Resolving the EVENT's own most-recent-PAST year FIRST and THEN
+# offsetting mis-fires when the event is still upcoming at the reference but the offset pulls the
+# result into the past: "a week before Black Friday" said 2023-11-20 → Black Friday 2023 is Nov-24
+# (future), so most-recent-past picked 2022 → 2022-11-18, a YEAR off and a broken date-diff operand.
+# Choosing the candidate-year whose OFFSET-date is the LATEST on-or-before the reference yields
+# 2023-11-17 (correct). Deterministic pure calendar arithmetic. OFF → legacy most-recent-past-of-event
+# (a non-upcoming event is byte-identical either way, so this only changes the upcoming-event case).
+OFFSET_NEAREST_YEAR: bool = os.environ.get(
+    "TEMPORAL_OFFSET_NEAREST_YEAR", "true"
+).strip().lower() not in ("0", "false", "no")
 
 
 # ── nth-weekday-of-month helper (Thanksgiving, etc.) ──────────────────────────────────
@@ -154,6 +171,101 @@ _OFFSET_NAMED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── ANCHORED "IN ADVANCE" OFFSET ("three months in advance", "a week ahead of the trip") ──────────
+# A PRE-EVENT relative duration: the count+unit measures BACKWARD from an ANCHOR event the action
+# PRECEDES ("book three months in advance [of the trip]"). This is a NEGATIVE offset from that anchor
+# event — NOT "N units ago" from the utterance. spaCy DATE-NER tags the bare "three months" and
+# dateparser then mis-resolves it to (reference − N) as though it read "three months ago", poisoning
+# the event date (the idx19 CHAINED-RELATIVE gap). TimeML/TIMEX3: an anchored DURATION (a
+# relative-indefinite RI-TIMEX) resolves against a DISCOURSE anchor event, not the Document Creation
+# Time (Pustejovsky et al., TimeML 2003; RI-TIMEX normalization anchors to the nearest event,
+# PMC4986666). This resolver only PARSES the count+unit+advance-marker grammatically; the CALLER
+# supplies the anchor date (the nearest prior dated event) and applies the signed offset. Calendar
+# grammar (the SAME closed class as the unit tables above), NOT a domain word-list. The number words
+# are a closed cardinal class (number grammar), NOT domain vocabulary.
+_ADVANCE_NUM_WORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+# "<count> <unit> in advance | beforehand | ahead of <…>". The marker is the closed set of adverbials
+# that denote PRECEDENCE-before-an-anchor. "ahead of" REQUIRES the "of" (bare "ahead" is ambiguous
+# with a future sense and is deliberately NOT matched).
+_ADVANCE_OFFSET_RE = re.compile(
+    r"\b(?P<count>a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)\s+"
+    r"(?P<unit>days?|weeks?|fortnights?|months?|years?)\s+"
+    r"(?P<marker>in\s+advance|beforehand|ahead\s+of)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_advance_offset(text: str):
+    """Parse a PRE-EVENT "in advance" offset out of ``text`` → ``(count:int, unit:str)`` or ``None``.
+
+    "had to book three months in advance" → ``(3, "months")``. Grammatical, deterministic, a closed
+    calendar/number-grammar class (NO domain word-list). Returns ``None`` when no such construction is
+    present. The SIGN is fixed NEGATIVE (the action precedes the anchor); the caller applies it to an
+    anchor date via :func:`apply_advance_offset`. Fail-safe: any error → ``None`` (never fabricates)."""
+    if not text:
+        return None
+    try:
+        m = _ADVANCE_OFFSET_RE.search(text)
+        if not m:
+            return None
+        raw = (m.group("count") or "").lower()
+        count = _ADVANCE_NUM_WORDS.get(raw)
+        if count is None:
+            count = int(raw) if raw.isdigit() else None
+        if not count or count <= 0:
+            return None
+        unit = (m.group("unit") or "").lower()
+        if (unit not in _OFFSET_UNIT_DAYS and unit not in _OFFSET_UNIT_MONTHS
+                and unit not in _OFFSET_UNIT_YEARS):
+            return None
+        return (count, unit)
+    except Exception as e:  # noqa: BLE001 — fail-safe: never fabricate
+        log.warning("temporal.parse_advance_offset_failed",
+                    text=(text or "")[:48], error=str(e)[:120])
+        return None
+
+
+def apply_advance_offset(anchor: date, count: int, unit: str) -> date:
+    """``anchor − count*unit`` (a pre-event offset). Reuses the signed-offset calendar arithmetic
+    (day/week/fortnight via timedelta, month/year via calendar math). Deterministic, pure."""
+    return _apply_signed_offset(anchor, -1, count, unit)
+
+
+def _named_rule_for_text(text: str):
+    """The ``(canonical_name, rule)`` for the named event in ``text`` (canon or longest embedded
+    surface), or ``None``. Shares the SAME name-resolution as ``resolve_named_event`` but returns the
+    calendar RULE so the caller can evaluate it across candidate years (offset nearest-occurrence)."""
+    if not text:
+        return None
+    name = _canon_name(text)
+    if name is None:
+        low = text.lower()
+        cands = sorted((n for n in _NAMED_RULES if n in low), key=len, reverse=True)
+        name = cands[0] if cands else None
+    if name is None:
+        return None
+    rule = _NAMED_RULES.get(name)
+    if rule is None:
+        return None
+    return (name, rule)
+
+
+def _apply_signed_offset(base: date, sign: int, count: int, unit: str) -> date:
+    """Apply a SIGNED calendar offset (``sign*count`` ``unit``) to ``base`` — day/week/fortnight via
+    ``timedelta``, month/year via calendar arithmetic. Pure, deterministic."""
+    if unit in _OFFSET_UNIT_DAYS:
+        return base + timedelta(days=sign * count * _OFFSET_UNIT_DAYS[unit])
+    if unit in _OFFSET_UNIT_MONTHS:
+        return _shift_months(base, sign * count * _OFFSET_UNIT_MONTHS[unit])
+    # years
+    try:
+        return base.replace(year=base.year + sign * count)
+    except ValueError:  # Feb-29 → Feb-28 fail-safe
+        return base.replace(year=base.year + sign * count, day=28)
+
 
 def resolve_offset_named_event_span(text: str, reference):
     """Like ``resolve_offset_named_event`` but ALSO returns the matched SPAN so the peel can excise
@@ -175,19 +287,36 @@ def resolve_offset_named_event_span(text: str, reference):
         count = 1 if raw in ("a", "an") else int(raw)
         sign = 1 if (m.group("dir") or "").lower() == "after" else -1
         rest = m.group("rest")
-        anchor = resolve_named_event(rest, reference)
-        if anchor is None:
-            return None
-        base, _g = anchor
-        if unit in _OFFSET_UNIT_DAYS:
-            d = base + timedelta(days=sign * count * _OFFSET_UNIT_DAYS[unit])
-        elif unit in _OFFSET_UNIT_MONTHS:
-            d = _shift_months(base, sign * count * _OFFSET_UNIT_MONTHS[unit])
-        else:  # years
+        d = None
+        if OFFSET_NEAREST_YEAR:
+            # NEAREST-OCCURRENCE: evaluate the event RULE across candidate years, apply the offset to
+            # each, and pick the OFFSET-date that is the latest on-or-before the reference (else the
+            # nearest future one). This anchors "a week before Black Friday" to the season nearest the
+            # utterance, not the event's own most-recent-past year. Deterministic calendar arithmetic.
+            nr = _named_rule_for_text(rest)
+            if nr is None:
+                return None
+            _name, rule = nr
             try:
-                d = base.replace(year=base.year + sign * count)
-            except ValueError:  # Feb-29 → Feb-28 fail-safe
-                d = base.replace(year=base.year + sign * count, day=28)
+                ref_d = reference.date()
+            except Exception:  # noqa: BLE001 — reference is already a date
+                ref_d = reference
+            cands = []
+            for y in (ref_d.year + 1, ref_d.year, ref_d.year - 1):
+                try:
+                    cands.append(_apply_signed_offset(rule(y), sign, count, unit))
+                except Exception:  # noqa: BLE001 — a bad year → skip that candidate
+                    continue
+            if not cands:
+                return None
+            past = [c for c in cands if c <= ref_d]
+            d = max(past) if past else min(cands)
+        else:
+            anchor = resolve_named_event(rest, reference)
+            if anchor is None:
+                return None
+            base, _g = anchor
+            d = _apply_signed_offset(base, sign, count, unit)
         # SPAN: from the count group through the recognized named-event surface inside ``rest``.
         # Map back onto the ORIGINAL ``text`` (the regex ran on a stripped copy — re-locate the count).
         stripped = text.strip()
@@ -279,4 +408,40 @@ def resolve_named_event(text: str, reference):
         return (d, "day")
     except Exception as e:  # noqa: BLE001 — fail-safe: never fabricate
         log.warning("temporal.resolve_named_event_failed", text=(text or "")[:48], error=str(e)[:120])
+        return None
+
+
+def resolve_named_event_span(text: str, reference):
+    """Like ``resolve_named_event`` but ALSO returns the matched SPAN so a date PEEL can excise the
+    bare named-event phrase. Returns ``(date, "day", start, span_text)`` or ``None``.
+
+    This is the BARE-named-event sibling of ``resolve_offset_named_event_span`` ("a week before
+    Black Friday"): for the non-offset case ("… on Black Friday", "… on Christmas") the point
+    resolver already knows the date; this adds the surface LOCATION so the peel/residue path can
+    drop the named-event phrase out of the clause (parity with the offset span resolver and the
+    engine's own date-span excision). Without a span the peel could resolve the date but leave the
+    holiday name folding into the residue relation. ``start`` is the index (in the ORIGINAL text) of
+    the longest known named-event surface present verbatim; ``span_text`` is that surface. The whole
+    rule set is the SAME closed formal calendar class as the holiday rules above — calendar grammar,
+    NOT a domain word-list. Deterministic, fail-safe: any miss/error → ``None`` (never fabricates)."""
+    if not text or reference is None:
+        return None
+    try:
+        anchor = resolve_named_event(text, reference)
+        if anchor is None:
+            return None
+        d, g = anchor
+        low = text.lower()
+        # Longest known surface present verbatim wins (specificity — "christmas eve" over "christmas").
+        cands = sorted((n for n in _NAMED_RULES if n in low), key=len, reverse=True)
+        if not cands:
+            return None
+        surface = cands[0]
+        start = low.find(surface)
+        if start < 0:
+            return None
+        return (d, g or "day", start, text[start:start + len(surface)])
+    except Exception as e:  # noqa: BLE001 — fail-safe: never fabricate
+        log.warning("temporal.resolve_named_event_span_failed",
+                    text=(text or "")[:48], error=str(e)[:120])
         return None
