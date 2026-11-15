@@ -140,7 +140,7 @@ class TestGroupEdgeOutwardToUserIsCut:
     """`_group_edge_is_outward_to_user` — bounds the grown-grouping walk (over-widen fix).
 
     Live e2e caught the named-group all-edges fetch reaching the USER node via
-    `chris has_interest_in espresso`, then the downstream /query expansions cascaded the
+    `dan has_interest_in espresso`, then the downstream /query expansions cascaded the
     user's whole personal profile (occupation/family/address) into a "tell me about
     espresso" answer. The bound: cut a group-node edge whose non-group endpoint is the
     querying user. These prove it fires for the user link and NOT for domain members.
@@ -150,9 +150,9 @@ class TestGroupEdgeOutwardToUserIsCut:
     USER = "user-uuid"
 
     def test_user_interest_edge_is_cut(self):
-        # (chris, has_interest_in, espresso) — user is the subject, espresso the group.
+        # (dan, has_interest_in, espresso) — user is the subject, espresso the group.
         assert m._group_edge_is_outward_to_user(self.USER, self.GRP, self.GRP, self.USER)
-        # (espresso, some_rel, chris) — user on the object side too.
+        # (espresso, some_rel, dan) — user on the object side too.
         assert m._group_edge_is_outward_to_user(self.GRP, self.USER, self.GRP, self.USER)
 
     def test_domain_member_edge_is_KEPT(self):

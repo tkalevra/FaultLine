@@ -2,7 +2,7 @@
 """THE PET-RELATION DENIAL FLOOR + THE HONEST ZERO-WRITE AUDIT (LIVE-OPENWEBUI FIX 3).
 
 THE MEASURED WOUND (DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the owner's
-prod seat): "Quillfeather is not a pet of Chris's" classified CORRECTION → ZERO DB writes,
+prod seat): "Quillfeather is not a pet of Dan's" classified CORRECTION → ZERO DB writes,
 no retraction_outcomes row, the old has_pet rows stayed live. The SEC-BUG-1 family: the
 correction executor produced nothing and reported nothing.
 
@@ -30,7 +30,7 @@ os.environ.pop("POSTGRES_DSN", None)
 import src.api.main as M  # noqa: E402
 
 # THE MEASURED PROD SENTENCE (the diagnosis §2, 03:22:41 turn).
-MEASURED = "Quillfeather is not a pet of Chris's"
+MEASURED = "Quillfeather is not a pet of Dan's"
 
 
 def test_measured_pet_denial_builds_the_scaffold():
@@ -44,8 +44,8 @@ def test_measured_pet_denial_builds_the_scaffold():
 
 
 def test_pet_denial_owner_surface_is_lowercased():
-    r = M._negated_name_correction_floor("Quillfeather is not a pet of Chris")
-    assert r is not None and r["subject_name"] == "chris"
+    r = M._negated_name_correction_floor("Quillfeather is not a pet of Dan")
+    assert r is not None and r["subject_name"] == "dan"
 
 
 def test_first_person_pet_denial_owns_the_user_slot():
@@ -77,7 +77,7 @@ def test_class_noun_plural_subject_declines():
 
 
 def test_non_negated_root_declines():
-    assert M._negated_name_correction_floor("Quillfeather is a pet of Chris") is None
+    assert M._negated_name_correction_floor("Quillfeather is a pet of Dan") is None
 
 
 def test_incomplete_exit_writes_the_outcome_row():

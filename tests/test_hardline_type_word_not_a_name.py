@@ -57,7 +57,7 @@ def test_bare_common_type_noun_is_demoted(surface):
         "Capital One",   # NER ORG
         "Luna",       # PROPN / NER
         "Diane",         # NER PERSON
-        "Chris",         # NER PERSON
+        "Dan",         # NER PERSON
         "New York",      # NER GPE
         "Rex",           # named instance
         "OPNsense",      # acronym-prefixed product (interior caps)

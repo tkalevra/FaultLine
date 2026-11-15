@@ -11,7 +11,7 @@ entity and the VALUE was destroyed. Two defects, one class:
 
   D1  "My favourite colour is Blue."   -> (user, owns, 'favourite colour')  [+ has_pet upgrade
                                           downstream: the user's colour became their PET]
-  D2  "Christopher is the user's name" -> (name, related_to, user), 'Christopher' DROPPED
+  D2  "Daniel is the user's name" -> (name, related_to, user), 'Daniel' DROPPED
 
 Every assertion below is on the string the LIVE deriver emits, printed and eyeballed first — not
 on the value we wish it emitted.
@@ -101,27 +101,27 @@ def test_preference_value_capture_is_not_collateral_damage():
 # chain knew the construction in ONE direction only.
 
 @pytest.mark.parametrize("sentence", [
-    "My name is Christopher.",              # naming noun = nsubj, 1st-person possessor
-    "The user's name is Christopher.",      # naming noun = nsubj, bare nominal possessor
-    "Christopher is the user's name.",      # naming noun = attr,  bare nominal possessor
-    "Christopher is my name.",              # naming noun = attr,  1st-person possessor
+    "My name is Daniel.",              # naming noun = nsubj, 1st-person possessor
+    "The user's name is Daniel.",      # naming noun = nsubj, bare nominal possessor
+    "Daniel is the user's name.",      # naming noun = attr,  bare nominal possessor
+    "Daniel is my name.",              # naming noun = attr,  1st-person possessor
 ])
 def test_all_four_naming_orders_converge_on_the_alias(sentence):
     """A specificational pair must specify the SAME value whichever way it is linearized."""
-    assert ("user", "also_known_as", "christopher") in _edges(sentence), \
+    assert ("user", "also_known_as", "daniel") in _edges(sentence), \
         f"{sentence!r} -> {_edges(sentence)}"
 
 
 def test_the_name_is_never_dropped_as_uncovered_residue():
-    """'Christopher' was logged derive_residue_uncovered — captured nowhere at all."""
-    e = _edges("Christopher is the user's name.")
-    assert any("christopher" in t[0] or "christopher" in t[2] for t in e), \
+    """'Daniel' was logged derive_residue_uncovered — captured nowhere at all."""
+    e = _edges("Daniel is the user's name.")
+    assert any("daniel" in t[0] or "daniel" in t[2] for t in e), \
         f"the NAME itself was dropped: {e}"
 
 
 def test_the_naming_noun_never_becomes_an_entity():
     """(name, related_to, user) files the SLOT as the referent — THE HARD LINE, inverted."""
-    e = _edges("Christopher is the user's name.")
+    e = _edges("Daniel is the user's name.")
     assert not [t for t in e if t[0] in L._naming_nouns()], \
         f"a naming noun was minted as an entity: {e}"
 
@@ -132,22 +132,22 @@ def test_the_naming_rail_is_asked_not_the_literal_lemma_name():
     identically to a construction "… NAME" handled fine. That is a subject-agnostic violation:
     the class lives on the per-tenant rail and the code must ASK the rail."""
     assert "nickname" in L._naming_nouns(), L._naming_nouns()
-    assert ("user", "also_known_as", "christopher") in \
-        _edges("Christopher is the user's nickname."), \
-        _edges("Christopher is the user's nickname.")
+    assert ("user", "also_known_as", "daniel") in \
+        _edges("Daniel is the user's nickname."), \
+        _edges("Daniel is the user's nickname.")
 
 
 def test_spacy_token_identity_is_compared_by_offset_not_by_is():
     """spaCy builds a NEW Token wrapper on every Doc access, so `c is not role` is ALWAYS True and
     the "exclude the role itself" filter excluded nothing. Latent until the predicational arm
     arrived: in the bare-possessor frame the naming noun's only `poss` child IS the role, so the
-    filter re-selected it and the possessor collapsed onto the role surface — (christopher,
+    filter re-selected it and the possessor collapsed onto the role surface — (daniel,
     related_to, user) instead of the alias edge. Same defect class as commit 53545151.
 
     This asserts the PROPERTY rather than the code: a token compared to itself is `is`-distinct
     but offset-identical.
     """
-    doc = L._get_nlp()("Christopher is the user's name.")
+    doc = L._get_nlp()("Daniel is the user's name.")
     name = [t for t in doc if t.text == "name"][0]
     role = next(c for c in name.children if c.dep_ == "poss")
     twin = doc[role.i]

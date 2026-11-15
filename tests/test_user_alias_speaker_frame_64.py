@@ -76,19 +76,19 @@ def test_third_party_propn_refused():
     assert not ok
 
 
-# ── the speaker's own frames still license (no regression on "I'm Chris") ────────────────────────
+# ── the speaker's own frames still license (no regression on "I'm Dan") ────────────────────────
 @pytest.mark.parametrize("text,alias", [
-    ("I'm Chris.", "chris"),
-    ("I am Christopher and I live in Riverton.", "christopher"),
-    ("I am called Chris.", "chris"),
-    ("People call me Chris.", "chris"),
-    ("Chris is my name.", "chris"),
+    ("I'm Dan.", "dan"),
+    ("I am Daniel and I live in Riverton.", "daniel"),
+    ("I am called Dan.", "dan"),
+    ("People call me Dan.", "dan"),
+    ("Dan is my name.", "dan"),
     # #93 frames (used by the repair's chat-side judgement)
-    ("My name's Chris.", "chris"),
-    ("Name's Chris.", "chris"),
-    ("This is Chris speaking.", "chris"),
-    ("Chris here.", "chris"),
-    ("It's Chris.", "chris"),
+    ("My name's Dan.", "dan"),
+    ("Name's Dan.", "dan"),
+    ("This is Dan speaking.", "dan"),
+    ("Dan here.", "dan"),
+    ("It's Dan.", "dan"),
 ])
 def test_speaker_frames_license(text, alias):
     ok, why = _licence()(text, alias)
@@ -140,17 +140,17 @@ def test_gate_function_policy():
     assert g(_DOC, "what", alias_on_user=True, pref_source="rel_default", source="document", **kw)
     assert g("I'm Matt Shumer.", "matt shumer", alias_on_user=True, pref_source="user_stated",
              source="document", **kw)
-    assert g("My name is Chris.", "chris", alias_on_user=True, pref_source="user_stated",
+    assert g("My name is Dan.", "dan", alias_on_user=True, pref_source="user_stated",
              source="api", doc_lane=True, **kw), "a source_ref citation marks the document lane"
-    assert g("My name is Chris.", "chris", alias_on_user=True, pref_source="user_stated",
+    assert g("My name is Dan.", "dan", alias_on_user=True, pref_source="user_stated",
              source="document", is_correction=True)
     # another entity's alias: untouched
     assert g(_DOC, "gauntlet loop", alias_on_user=False, pref_source="rel_default",
              source="document", **kw) is None
     # chat (#93): no first-person licence demanded; only closed-class tokens refused
-    for text, alias in (("My name's Chris.", "chris"), ("Name's Chris.", "chris"),
-                        ("This is Chris speaking.", "chris"), ("Chris here.", "chris"),
-                        ("It's Chris.", "chris"), ("I'm Chris.", "chris"),
+    for text, alias in (("My name's Dan.", "dan"), ("Name's Dan.", "dan"),
+                        ("This is Dan speaking.", "dan"), ("Dan here.", "dan"),
+                        ("It's Dan.", "dan"), ("I'm Dan.", "dan"),
                         ("call me May", "may")):
         assert g(text, alias, alias_on_user=True, pref_source="rel_default",
                  source="mcp", **kw) is None, text
@@ -190,7 +190,7 @@ def test_e2e_speaker_name_still_lands(e2e):
 
 
 @pytest.mark.parametrize("text,name", [
-    ("My name's Chris.", "chris"), ("Name's Kaveh.", "kaveh"),
+    ("My name's Dan.", "dan"), ("Name's Kaveh.", "kaveh"),
     ("This is Ilse speaking.", "ilse"), ("Tomasz here.", "tomasz"), ("It's Marit.", "marit"),
 ])
 def test_e2e_93_chat_self_identification_lands(e2e, text, name):

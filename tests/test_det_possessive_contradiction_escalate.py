@@ -234,7 +234,7 @@ def test_rows_no_contradiction_same_owner():
 
 def test_rows_no_contradiction_self_row_on_self_statement():
     rows = [{"rel_type": "has_pet", "subject_id": "selfid", "object_id": "o1",
-             "sub_alias": "chris", "obj_alias": "luna", "self_ids": ["selfid"]}]
+             "sub_alias": "dan", "obj_alias": "luna", "self_ids": ["selfid"]}]
     assert M._possessive_rows_contradict(_shape(), rows) is None
 
 

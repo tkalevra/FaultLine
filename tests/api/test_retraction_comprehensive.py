@@ -280,7 +280,7 @@ class TestRetractionPipelineComprehensive:
         # SETUP: Baseline fact (age=18)
         ingest_resp = _ingest(
             client,
-            "My name is Chris and I am 18 years old",
+            "My name is Dan and I am 18 years old",
             self.uid
         )
         assert ingest_resp.get("status") in ["valid", "ok", "corrected"]
@@ -341,7 +341,7 @@ class TestRetractionPipelineComprehensive:
         # SETUP: Baseline fact (spouse=Aurora)
         ingest_resp = _ingest(
             client,
-            "My name is Chris and my wife is Aurora",
+            "My name is Dan and my wife is Aurora",
             self.uid
         )
         assert ingest_resp.get("status") in ["valid", "ok", "corrected"]
@@ -542,7 +542,7 @@ class TestRetractionPipelineComprehensive:
         # SETUP: Baseline facts (age, spouse, pet)
         ingest_resp = _ingest(
             client,
-            "My name is Chris, I am 42 years old. My wife is Jane. I have a dog.",
+            "My name is Dan, I am 42 years old. My wife is Jane. I have a dog.",
             self.uid
         )
         assert ingest_resp.get("status") in ["valid", "ok", "corrected"]
@@ -621,7 +621,7 @@ class TestRetractionPipelineComprehensive:
         # SETUP: Baseline facts
         ingest_resp = _ingest(
             client,
-            "My name is Chris. I am 18 years old. I am a teacher in Toronto.",
+            "My name is Dan. I am 18 years old. I am a teacher in Toronto.",
             self.uid
         )
         assert ingest_resp.get("status") in ["valid", "ok", "corrected"]
@@ -720,7 +720,7 @@ class TestRetractionPipelineComprehensive:
         # SETUP: Baseline facts
         ingest_resp = _ingest(
             client,
-            "My name is Chris. I am 25 years old. My wife is Aurora. I have a dog named Spot.",
+            "My name is Dan. I am 25 years old. My wife is Aurora. I have a dog named Spot.",
             self.uid
         )
         assert ingest_resp.get("status") in ["valid", "ok", "corrected"]
@@ -781,7 +781,7 @@ class TestRetractionPipelineMocked:
         resp = FactCorrectionResponse(
             status="corrected",
             subject_uuid="user-123",
-            subject_name="Chris",
+            subject_name="Dan",
             old_rel_type="spouse",
             old_value="Aurora",
             new_rel_type="spouse",
@@ -790,7 +790,7 @@ class TestRetractionPipelineMocked:
             confidence=0.95,
             facts_superseded=1,
             hierarchies_modified=[],
-            message="✓ Chris: spouse=Aurora → spouse=Sarah"
+            message="✓ Dan: spouse=Aurora → spouse=Sarah"
         )
 
         assert resp.status == "corrected"

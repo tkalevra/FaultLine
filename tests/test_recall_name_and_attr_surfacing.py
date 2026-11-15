@@ -64,10 +64,10 @@ def test_non_name_query_not_detected(q):
 
 # ── PIECE 2: registry → name facts ───────────────────────────────────────────
 def test_synthesize_emits_pref_and_aka():
-    rows = [("chris", True), ("ace", False), ("finn", False)]
-    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="chris")
+    rows = [("dan", True), ("ace", False), ("finn", False)]
+    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="dan")
     rels = {f["object"]: f["rel_type"] for f in out}
-    assert rels["chris"] == "pref_name"
+    assert rels["dan"] == "pref_name"
     assert rels["ace"] == "also_known_as"
     assert rels["finn"] == "also_known_as"
     # subject is the user UUID (identity slot), object is the alias STRING (no UUID leak)
@@ -77,16 +77,16 @@ def test_synthesize_emits_pref_and_aka():
 
 def test_synthesize_filters_junk_aliases():
     # "worried"/"thinking" are loose-ingest junk — never surfaced as a name.
-    rows = [("chris", True), ("worried", False), ("thinking", False)]
-    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="chris")
+    rows = [("dan", True), ("worried", False), ("thinking", False)]
+    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="dan")
     names = {f["object"] for f in out}
-    assert names == {"chris"}
+    assert names == {"dan"}
     assert not _is_surfaceable_user_name("worried")
 
 
 def test_synthesize_dedups_case_insensitive():
-    rows = [("Chris", True), ("chris", False)]
-    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="chris")
+    rows = [("Dan", True), ("dan", False)]
+    out = _synthesize_user_name_facts(_FakeConn(rows), "u-1", preferred_user_name="dan")
     assert len(out) == 1
 
 

@@ -279,10 +279,10 @@ def test_r4_litmus_sentence_keeps_the_pet_binding():
 
 
 def test_r4_real_hostname_construction_still_caught():
-    s = "My laptop, hostname: chris-P70 has an ip of: 192.0.2.83/25 and exists on tailscale."
+    s = "My laptop, hostname: dan-P70 has an ip of: 192.0.2.83/25 and exists on tailscale."
     doc = L._parse(s)
     lap = next(t for t in doc if t.text == "laptop")
-    assert L._hostname_binding_appositive(lap) == "chris-p70"
+    assert L._hostname_binding_appositive(lap) == "dan-p70"
 
 
 def test_r4_window_flag_off_restores_the_unbounded_scan(monkeypatch):

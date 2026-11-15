@@ -2,10 +2,10 @@
 """THE RELATIONAL NEGATION-DELETION IN THE STATEMENT LANE (LIVE-OPENWEBUI FIX 2).
 
 THE MEASURED WOUND (DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the owner's
-prod seat): "Chris does not have a child named Aurora Flood" routed STATEMENT (the ingest
+prod seat): "Dan does not have a child named Aurora Flood" routed STATEMENT (the ingest
 lane) and the negated name-type binding was SKIPPED SILENTLY — no negated row anywhere —
 so Aurora later landed LIVE from the stale-chat re-assert (born_on + age=0 stored). The
-scalar-own negation already works ("Chris does not own a Goose" → (user, owns, goose)
+scalar-own negation already works ("Dan does not own a Goose" → (user, owns, goose)
 polarity='negated'); the relational did not.
 
 THE FIX: the named-binding chain (``_chain_object_named_value`` — the always-on seam) emits
@@ -29,7 +29,7 @@ os.environ.pop("POSTGRES_DSN", None)
 import src.extraction.linguistics as L  # noqa: E402
 
 # THE MEASURED PROD SENTENCES (the diagnosis §2).
-MEASURED_CHILD = "Chris does not have a child named Aurora Flood"
+MEASURED_CHILD = "Dan does not have a child named Aurora Flood"
 MEASURED_PET = "I do not have a cat named Goose"
 
 
@@ -51,7 +51,7 @@ def test_measured_child_denial_emits_negated_child_of():
            if r.get("rel_type") == "child_of" and r.get("negated")]
     assert len(neg) == 1, rows
     assert "aurora flood" in str(neg[0].get("subject"))
-    assert "chris" in str(neg[0].get("object"))
+    assert "dan" in str(neg[0].get("object"))
 
 
 def test_measured_child_denial_never_asserts_type_or_alias():
@@ -77,7 +77,7 @@ def test_affirmed_binding_unchanged():
     assert any(r.get("rel_type") == "has_pet" and not r.get("negated") for r in rows)
     assert any(r.get("rel_type") == "instance_of" and r.get("object") == "cat"
                for r in rows)
-    kin = _as_dicts(_facts("Chris has two sons: Leo and Marco"))
+    kin = _as_dicts(_facts("Dan has two sons: Leo and Marco"))
     assert any(r.get("rel_type") == "child_of" and not r.get("negated") for r in kin)
 
 

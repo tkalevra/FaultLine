@@ -48,8 +48,8 @@ def test_feelverb_captures_novel_complement():
 @pytest.mark.parametrize("text", [
     "i am worried",              # bare copula — ambiguous, routed through grounding, NOT here
     "i am stressed",             # bare copula
-    "i am chris",                # bare copula (a name) — must never be emitted as a feeling
-    "my name is chris",          # name
+    "i am dan",                # bare copula (a name) — must never be emitted as a feeling
+    "my name is dan",          # name
     "i am a teacher",            # role
     "i am thinking about goats",  # cognition, not an emotion
 ])
@@ -76,9 +76,9 @@ from src.api.main import _SELF_PREDICATION_COPULA, _SELF_PREDICATION_RELS, _IDEN
 
 @pytest.mark.parametrize("text,fires", [
     ("i am worried", True),       # bare copula → grounded (not regex-named)
-    ("i'm chris", True),
+    ("i'm dan", True),
     ("i am a teacher", True),
-    ("my name is chris", False),  # explicit naming → handled by precise pattern, not the router
+    ("my name is dan", False),  # explicit naming → handled by precise pattern, not the router
     ("i feel anxious", False),    # feel-verb owns it
     ("what do i know about fences", False),
     ("the goats are out", False),

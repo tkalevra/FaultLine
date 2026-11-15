@@ -253,7 +253,7 @@ def test_rollback_arm_read_lane_live(explode_on_contact):
     point = {
         "score": 0.82,
         "payload": {
-            "subject": "chris", "rel_type": "works_for", "object": "riverton",
+            "subject": "dan", "rel_type": "works_for", "object": "riverton",
             "confidence": 0.9, "fact_class": "C", "source_table": "staged_facts",
             "fact_id": 42, "provenance": "user_stated",
         },
@@ -262,7 +262,7 @@ def test_rollback_arm_read_lane_live(explode_on_contact):
          patch.object(main, "USER_MEMORY_VECTOR_LANE", True), \
          patch.object(main, "embed_text", return_value=[0.1] * 8) as emb, \
          patch.object(httpx, "post", return_value=_canned_qdrant_response([point])) as hp:
-        hits = main.qdrant_semantic_search("who does chris work for", [], "u",
+        hits = main.qdrant_semantic_search("who does dan work for", [], "u",
                                            "http://qdrant:6333", "http://llm")
     assert emb.called, "rollback arm did not embed (legacy lane dead?)"
     assert hp.called and "/collections/" in hp.call_args[0][0], "rollback arm did not search Qdrant"
@@ -329,7 +329,7 @@ def test_rollback_arm_ingest_c_sync_runs(explode_on_contact):
         def commit(self):
             self.commits += 1
 
-    staged = [(9, "chris", "riverton", "works_for", "user_stated", 0.9, "C", None)]
+    staged = [(9, "dan", "riverton", "works_for", "user_stated", 0.9, "C", None)]
     conn = _FakeConn(staged)
     with patch.object(main, "REMOVE_QDRANT_MEMORY_LANE", False), \
          patch.object(main, "USER_MEMORY_VECTOR_LANE", True), \

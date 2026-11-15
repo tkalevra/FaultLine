@@ -101,10 +101,10 @@ def test_negated_name_assertion_denial_shape():
 
 
 def test_negated_name_assertion_self_shape():
-    got = linguistics.negated_name_assertion("I am not Chris.")
+    got = linguistics.negated_name_assertion("I am not Dan.")
     assert got is not None
     _subject, denied = got
-    assert denied == "Chris"
+    assert denied == "Dan"
 
 
 def test_negated_class_negation_is_not_a_correction():
@@ -263,18 +263,18 @@ class TestNegatedNameCorrectionFloor:
         assert got["confidence"] >= 0.9
 
     def test_self_name_denial_scaffold(self):
-        got = _api_main._negated_name_correction_floor("I am not Chris.")
+        got = _api_main._negated_name_correction_floor("I am not Dan.")
         assert got is not None
         assert got["subject_name"] == "user"
         assert got["old_rel_type"] == "name"
-        assert got["old_value"] == "Chris"
+        assert got["old_value"] == "Dan"
         assert got["new_value"] is None
 
     def test_contraction_self_denial_scaffold(self):
-        got = _api_main._negated_name_correction_floor("I'm not Chris.")
+        got = _api_main._negated_name_correction_floor("I'm not Dan.")
         assert got is not None
         assert got["old_rel_type"] == "name"
-        assert got["old_value"] == "Chris"
+        assert got["old_value"] == "Dan"
 
     def test_plural_conj_denial_names_both(self):
         got = _api_main._negated_name_correction_floor(
@@ -502,8 +502,8 @@ class TestFloorDenialSurfacesMarker:
         assert not got.get("denial_surfaces")
 
 # == R4 follow-up: the "married to <NAME>" participial denial rail (live bench wound) ==
-# "I am not married to Chris." used to file as a STATEMENT and INVERT: the ingest lane
-# minted a positive (user, spouse, chris) row (fabricated marriage — bench row 670) and
+# "I am not married to Dan." used to file as a STATEMENT and INVERT: the ingest lane
+# minted a positive (user, spouse, dan) row (fabricated marriage — bench row 670) and
 # "…not married to Wren." re-validated the [wife]-weld row 469. The rail makes the
 # negated_name_assertion detector (and therefore the CORRECTION preroute + the harvest
 # suppression union) see the participial shape, and the floor scaffold it with
@@ -518,17 +518,17 @@ class TestMarriedToDenialRail:
     'married to' ONLY (dating/engaged/divorced generalization is a planner decision)."""
 
     def test_nna_married_to_name_is_detected(self):
-        """THE CHRIS-MINT RAIL: the detector the preroute consumes fires — the turn
+        """THE Dan-MINT RAIL: the detector the preroute consumes fires — the turn
         routes CORRECTION, never STATEMENT, so no positive spouse row can be minted."""
-        assert negated_name_assertion("I am not married to Chris.") == ("I", "Chris")
+        assert negated_name_assertion("I am not married to Dan.") == ("I", "Dan")
 
     def test_nna_married_to_wren_shape_detected(self):
         assert negated_name_assertion("I am not married to Wren.") == ("I", "Wren")
 
     def test_nna_married_to_conj_names(self):
-        got = negated_name_assertion("I am not married to Chris or Dana.")
+        got = negated_name_assertion("I am not married to Dan or Dana.")
         assert got is not None and got[0] == "I"
-        assert {w for w in got[1].split() if w not in ("or",)} == {"Chris", "Dana"}
+        assert {w for w in got[1].split() if w not in ("or",)} == {"Dan", "Dana"}
 
     def test_nna_married_to_class_pobj_stays_out(self):
         """A negated CLASS complement is a new negative FACT, not a correction."""
@@ -536,18 +536,18 @@ class TestMarriedToDenialRail:
 
     def test_nna_family_scope_held(self):
         """ONE shape only: other participials stay out (planner decision to extend)."""
-        assert negated_name_assertion("I am not divorced from Chris.") is None
+        assert negated_name_assertion("I am not divorced from Dan.") is None
 
     def test_floor_married_to_scaffold_matches_possessive(self):
-        got = _api_main._negated_name_correction_floor("I am not married to Chris.")
+        got = _api_main._negated_name_correction_floor("I am not married to Dan.")
         assert got["old_rel_type"] == "spouse"
-        assert got["denial_surfaces"] == ["Chris"]
+        assert got["denial_surfaces"] == ["Dan"]
         assert got["new_value"] is None and got["new_rel_type"] is None
 
     def test_floor_married_to_conj_scaffold(self):
         got = _api_main._negated_name_correction_floor(
-            "I am not married to Chris or Dana.")
-        assert set(got["denial_surfaces"]) == {"Chris", "Dana"}
+            "I am not married to Dan or Dana.")
+        assert set(got["denial_surfaces"]) == {"Dan", "Dana"}
 
     def test_wren_weld_not_revalidated(self):
         """THE WREN-REVALIDATE RAIL: the floor hands the gate the turn's named surface;
@@ -564,12 +564,12 @@ class TestMarriedToDenialRail:
         assert "wife" in got["detail"] and "seren" in got["detail"]
 
     def test_chris_mint_blocked_end_to_end_scaffold(self):
-        """Composition of the Chris wound: detection fires (CORRECTION preroute), the
+        """Composition of the Dan wound: detection fires (CORRECTION preroute), the
         floor scaffolds the denial, and the gate MISSES on an absent stored marriage —
         honest failed response, zero writes, no fabricated positive row anywhere."""
-        assert negated_name_assertion("I am not married to Chris.") == ("I", "Chris")
+        assert negated_name_assertion("I am not married to Dan.") == ("I", "Dan")
         surf = _api_main._negated_name_correction_floor(
-            "I am not married to Chris.")["denial_surfaces"]
+            "I am not married to Dan.")["denial_surfaces"]
         cur = _FakeCur({}, {})
         got = _denial_exact_key_probe(cur, _USER, "spouse", surf)
         assert got["verdict"] == "missed"

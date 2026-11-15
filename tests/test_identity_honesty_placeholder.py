@@ -3,7 +3,7 @@
 Measured on the owner's live demo (2026-08-21): a fresh seat's PREFERRED alias is the
 provisioning placeholder 'user' (inserted by schema_manager bootstrap WITHOUT a
 preference_source, so it lands at the column default 'unspecified' — rank 0 — not even
-'provisioned' — rank 1). A user-stated name ("My name is Christopher") registers EVERY time
+'provisioned' — rank 1). A user-stated name ("My name is Daniel") registers EVERY time
 as a NON-preferred alias and nothing ever promotes it, so recall renders 'user' forever and
 corrections are idempotent no-ops.
 
@@ -148,7 +148,7 @@ def test_ingest_edge_lane_promotes_user_stated_names():
 
 
 def test_user_stated_name_promotes_over_placeholder(seat):
-    """THE GOLD BAR: 'hello, my name is Christopher' on a fresh seat → christopher preferred
+    """THE GOLD BAR: 'hello, my name is Daniel' on a fresh seat → daniel preferred
     within the same write. The /ingest alias lane shape: spine edge with
     is_preferred_label=False + turn-level preference signal → preference_source='user_stated'
     + is_pref=True (the promotion this change ships). The registry's rank guard arbitrates:
@@ -166,7 +166,7 @@ def test_user_stated_name_promotes_over_placeholder(seat):
         _placeholder(seat, uid, stamped=stamped)
         reg = EntityRegistry(seat, auto_commit=False, schema_name=_schema_of(seat))
         result = reg.register_alias(
-            uid, "christopher",
+            uid, "daniel",
             is_preferred=True,          # the promotion: a user-stated name IS a prefLabel claim
             entity_type="Person",
             preference_source="user_stated",  # turn-level signal ("my name is …")
@@ -175,7 +175,7 @@ def test_user_stated_name_promotes_over_placeholder(seat):
         assert isinstance(result, dict) and result.get("written"), (
             "register_alias must report the write (bug 2 contract) — both lanes need it")
         row = _preferred_row(seat, uid)
-        assert row is not None and row[0] == "christopher", (
+        assert row is not None and row[0] == "daniel", (
             f"user-stated name must be preferred (placeholder was "
             f"{'provisioned' if stamped else 'unstamped'}) — got {row}")
         assert row[1] == "user_stated"
@@ -184,20 +184,20 @@ def test_user_stated_name_promotes_over_placeholder(seat):
 def test_weak_source_does_not_demote_user_stated(seat):
     """The promotion is USER-TRUTH keyed, not free-for-all: a later weak claim
     (rel_default, e.g. an engine re-encounter) must NOT displace the user's chosen name —
-    the registry's demotion guard keeps the incumbent (the wren-over-chris poisoning,
+    the registry's demotion guard keeps the incumbent (the wren-over-dan poisoning,
     prevented at the source)."""
     uid = str(uuid.uuid4())
     with seat.cursor() as c:
         c.execute("INSERT INTO entities (id, entity_type) VALUES (%s, 'Person')", (uid,))
     seat.commit()
     reg = EntityRegistry(seat, auto_commit=False, schema_name=_schema_of(seat))
-    reg.register_alias(uid, "christopher", is_preferred=True,
+    reg.register_alias(uid, "daniel", is_preferred=True,
                        entity_type="Person", preference_source="user_stated")
     reg.register_alias(uid, "wren", is_preferred=True,
                        entity_type="Person", preference_source="rel_default")
     seat.commit()
     row = _preferred_row(seat, uid)
-    assert row is not None and row[0] == "christopher", (
+    assert row is not None and row[0] == "daniel", (
         f"a rel_default claim must not demote the user-stated name — got {row}")
 
 
@@ -215,7 +215,7 @@ def test_correction_promotes_the_new_name(seat):
         c.execute("INSERT INTO entities (id, entity_type) VALUES (%s, 'Person')", (uid,))
     seat.commit()
     reg = EntityRegistry(seat, auto_commit=False, schema_name=_schema_of(seat))
-    reg.register_alias(uid, "christopher", is_preferred=True,
+    reg.register_alias(uid, "daniel", is_preferred=True,
                        entity_type="Person", preference_source="user_stated")
     reg.register_alias(uid, "yannick", is_preferred=True,
                        entity_type="Person", preference_source="user_stated")

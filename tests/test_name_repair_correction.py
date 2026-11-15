@@ -406,7 +406,7 @@ def test_a_third_party_name_is_refused_on_the_speaker(text, value):
     ("Actually my name is Thorne, not Wrenna.", "thorne"),   # THE self-rename: must NOT be refused
     ("my name is Thorne, not Wrenna.", "thorne"),
     ("Actually my name is thorne, not wrenna.", "thorne"),   # lower case, same frame
-    ("I go by Chris, not Christopher.", "chris"),            # naming predicate, 1st-person subject
+    ("I go by Dan, not Daniel.", "dan"),            # naming predicate, 1st-person subject
     ("Actually our name is Thorne, not Wrenna.", "thorne"),  # Person=1 plural
 ])
 def test_the_speaker_renaming_themselves_is_never_refused(text, value):
@@ -434,12 +434,12 @@ def test_an_unrelated_correction_riding_the_same_turn_is_untouched(text, value):
 # the write through.
 
 @pytest.mark.parametrize("text,value,refused", [
-    ("Actually my sister's name is Thorne, and my name is Chris.", "thorne", True),
-    ("Actually my sister's name is Thorne, and my name is Chris.", "chris", False),
-    ("Actually my name is Chris, and my sister's name is Thorne.", "thorne", True),
-    ("Actually my name is Chris, and my sister's name is Thorne.", "chris", False),
-    ("My name is Chris. My sister's name is Thorne.", "thorne", True),
-    ("My name is Chris. My sister's name is Thorne.", "chris", False),
+    ("Actually my sister's name is Thorne, and my name is Dan.", "thorne", True),
+    ("Actually my sister's name is Thorne, and my name is Dan.", "dan", False),
+    ("Actually my name is Dan, and my sister's name is Thorne.", "thorne", True),
+    ("Actually my name is Dan, and my sister's name is Thorne.", "dan", False),
+    ("My name is Dan. My sister's name is Thorne.", "thorne", True),
+    ("My name is Dan. My sister's name is Thorne.", "dan", False),
 ])
 def test_a_self_naming_clause_does_not_disarm_the_third_party_clause(text, value, refused):
     assert _refuses(text, value) is refused, (text, value)
@@ -1548,12 +1548,12 @@ def test_a_multi_token_value_selects_its_clause_by_the_part_the_deriver_emits(mo
 
 
 def test_two_naming_clauses_in_one_turn_are_not_resolved_to_one_referent(monkeypatch):
-    """"…my sister's name is Thorne, and my name is Chris." names TWO referents. The walk resolves
+    """"…my sister's name is Thorne, and my name is Dan." names TWO referents. The walk resolves
     a clause, not a turn, and a predicate that cannot say WHICH clause the write is for must not
     answer. Clause-locality is the same discipline the guards already keep."""
     db = _install_graph(monkeypatch, **_SISTER_GRAPH)
     assert m._walk_naming_clause_referent(
-        db, USER, "Actually my sister's name is Thorne, and my name is Chris.") is None
+        db, USER, "Actually my sister's name is Thorne, and my name is Dan.") is None
 
 
 @pytest.mark.parametrize("text", [

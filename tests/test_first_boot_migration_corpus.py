@@ -711,7 +711,7 @@ def _plant_tenant(dsn: str, schema: str, seat: str, *, grown_has_port: bool, ide
             if identity == "renamed":
                 cur.execute("UPDATE entity_aliases SET is_preferred = false WHERE entity_id = %s AND alias = 'user'", (seat,))
                 cur.execute("INSERT INTO entity_aliases (entity_id, alias, is_preferred, preference_source) "
-                            "VALUES (%s, 'chris', true, 'user_stated')", (seat,))
+                            "VALUES (%s, 'dan', true, 'user_stated')", (seat,))
             elif identity == "stripped":
                 cur.execute("DELETE FROM entity_aliases WHERE entity_id = %s AND alias = 'user'", (seat,))
             else:
@@ -920,7 +920,7 @@ def test_fb6_fixed_corpus_over_the_tenant_bearing_box_holds_every_per_tenant_pin
 
 def test_fb6_084_keys_on_the_seat_identity_not_an_alias_string(tenant_box):
     """(a) a seat with NO 'user' alias (B, stripped) is cleaned; (b) a seat that renamed itself
-    (A: 'user' demoted, 'chris' preferred) is cleaned; (c) the impostor entity wearing alias
+    (A: 'user' demoted, 'dan' preferred) is cleaned; (c) the impostor entity wearing alias
     'user' keeps its llm_learned rows on both tenants. Driven; the pins live in _tenant_pins."""
     s = tenant_box
     a, b = s["tenants"]["A"], s["tenants"]["B"]

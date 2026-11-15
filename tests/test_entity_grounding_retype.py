@@ -115,7 +115,7 @@ def test_user_authored_exempt_from_quarantine_lands_as_stated():
 def test_type_consistent_edge_left_alone():
     """Person subject + Person-only scalar = correct slot → no re-route."""
     d = _retype_mistyped_edge(
-        _edge(subject="chris", rel_type="nationality", object="canadian"),
+        _edge(subject="dan", rel_type="nationality", object="canadian"),
         subject_gliner_type="Person",
         object_is_known_class=True,
         rel_meta_resolver=_resolver,

@@ -39,7 +39,7 @@ def test_value_shape_ipv4_cidr():
 
 
 def test_value_shape_email_url():
-    assert is_value_shape("chris@example.com") is True
+    assert is_value_shape("dan@example.com") is True
     assert is_value_shape("https://wiki.internal/x") is True
 
 
@@ -50,7 +50,7 @@ def test_bare_number_is_deliberately_not_a_value_shape():
 
 
 def test_word_surfaces_are_not_value_shapes():
-    for w in ("mac", "wifi", "chris-p70", "laptop", "wireless nic"):
+    for w in ("mac", "wifi", "dan-p70", "laptop", "wireless nic"):
         assert is_value_shape(w) is False, w
 
 
@@ -213,22 +213,22 @@ class _FakeDB:
 
 
 def test_ranked_alias_descends_type_to_its_owned_instance(monkeypatch):
-    """The 'laptop' surface names a bare TYPE node whose instance (chris-p70) is
+    """The 'laptop' surface names a bare TYPE node whose instance (dan-p70) is
     OWNED and carries the attributes. The ranking descends the rung and returns
     the instance at rank class 0."""
     import src.api.main as M
     store = {
         "aliases": [("type-node",)],
-        "attrs": [("junk-person",), ("chris-p70",)],
-        "instances": [("chris-p70", "type-node")],
+        "attrs": [("junk-person",), ("dan-p70",)],
+        "instances": [("dan-p70", "type-node")],
         "facts": [],
     }
     db = _FakeDB(store)
     monkeypatch.setattr(M, "_entity_owned_by",
-                        lambda d, eid, uid: eid == "chris-p70")
+                        lambda d, eid, uid: eid == "dan-p70")
     hit = M._ranked_alias_anchor(db, "laptop", "u-1")
     assert hit is not None
-    assert hit[0] == "chris-p70" and hit[1] == 0, hit
+    assert hit[0] == "dan-p70" and hit[1] == 0, hit
 
 
 def test_ranked_alias_unowned_junk_is_never_a_class0_override(monkeypatch):

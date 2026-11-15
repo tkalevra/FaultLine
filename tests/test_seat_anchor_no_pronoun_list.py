@@ -88,7 +88,7 @@ def test_marker1_is_case_insensitive_on_the_entity_id():
 def test_marker2_a_provisioning_tier_alias_identifies_the_seat_owner_with_no_schema():
     """Measured on prod: 11/12 tenants carry exactly one such alias, never on a non-seat
     entity. It is what covers a caller that has no bound schema name."""
-    cur = _FakeCur({OTHER_UUID: [("chris", "provisioned")]})
+    cur = _FakeCur({OTHER_UUID: [("dan", "provisioned")]})
     assert WG.is_seat_anchor(cur, OTHER_UUID) is True
 
 
@@ -129,7 +129,7 @@ def test_empty_and_none_entity_ids_are_never_the_anchor():
 
 def test_a_non_tenant_schema_name_contributes_nothing():
     """`public` carries no seat UUID; the detector must fall through to marker 2, not guess."""
-    cur = _FakeCur({OTHER_UUID: [("chris", "unspecified")]})
+    cur = _FakeCur({OTHER_UUID: [("dan", "unspecified")]})
     assert WG.is_seat_anchor(cur, OTHER_UUID, schema_name="public") is False
 
 

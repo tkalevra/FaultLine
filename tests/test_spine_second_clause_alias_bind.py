@@ -150,12 +150,12 @@ def test_non_person_possessor_is_not_a_person_bind():
 
 def test_first_person_self_naming_still_defers():
     """The self case stays owned by the preference/naming seam — the alias chain must
-    not double-capture "I prefer to be called Chris"."""
+    not double-capture "I prefer to be called Dan"."""
     facts = m.derive_sentence_facts(
-        "I prefer to be called Chris", _REF,
-        prior_nps=[], turn_persons=["chris"], turn_role_names={})
+        "I prefer to be called Dan", _REF,
+        prior_nps=[], turn_persons=["dan"], turn_role_names={})
     for s, rel, o in _triples(facts):
-        assert not (o == "chris" and rel == "also_known_as"), _triples(facts)
+        assert not (o == "dan" and rel == "also_known_as"), _triples(facts)
 
 
 def test_negated_alias_is_absence():

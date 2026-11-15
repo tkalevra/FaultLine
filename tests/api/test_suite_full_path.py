@@ -100,7 +100,7 @@ class TestGroupABaseIntegration:
 
         # Ingest
         text = (
-            "My name is Christopher, I prefer to be called Chris. "
+            "My name is Daniel, I prefer to be called Dan. "
             "I am married to Mara, who prefers to be called Mars. "
             "We have 3 children: Leo (19), Chiara who goes by Chi (10), "
             "and Marco who prefers Dev (12)."
@@ -197,9 +197,9 @@ class TestGroupABaseIntegration:
         client = TestClient(app)
 
         for i in range(3):
-            _ingest(client, f"Chris likes coffee (x{i+1})", self.uid)
+            _ingest(client, f"Dan likes coffee (x{i+1})", self.uid)
 
-        result = _query(client, "what does chris like", self.uid)
+        result = _query(client, "what does dan like", self.uid)
         assert result.get("status") == "ok"
         facts = result.get("facts", [])
         likes = [f for f in facts if f["rel_type"] == "likes"]
@@ -274,10 +274,10 @@ class TestGroupBNameCollision:
         edges_user = [
             {"subject": "user", "object": "chi", "rel_type": "pref_name",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "user", "object": "christopher", "rel_type": "also_known_as",
+            {"subject": "user", "object": "daniel", "rel_type": "also_known_as",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
-        _ingest(client, "I go by Chi, also Christopher", self.uid, edges=edges_user)
+        _ingest(client, "I go by Chi, also Daniel", self.uid, edges=edges_user)
 
         # Now ingest Chiara — same preferred name "chi"
         text = "We have a third Daughter, Chiara who's 10 and goes by Chi"
@@ -542,9 +542,9 @@ class TestGroupDSensitivityNovel:
         client = TestClient(app)
 
         for conf_text in ("definitely", "maybe", "possibly"):
-            _ingest(client, f"Chris {conf_text} likes tea", self.uid)
+            _ingest(client, f"Dan {conf_text} likes tea", self.uid)
 
-        result = _query(client, "what does chris like", self.uid)
+        result = _query(client, "what does dan like", self.uid)
         assert result.get("status") == "ok"
 
     def test_19_entity_type_propagation(self, app):

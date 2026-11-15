@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import src.fact_store.store as store_module
 from src.fact_store.store import FactStoreManager
 
-USER = "11111111-1111-1111-1111-111111111111"   # chris (the speaker; object of the kin rows)
+USER = "11111111-1111-1111-1111-111111111111"   # dan (the speaker; object of the kin rows)
 LEO = "33333333-3333-3333-3333-333333333333"
 DES = "55555555-5555-5555-5555-555555555555"
 KIN_IDS = [101, 102, 103, 104, 105]             # the five (X, child_of, user) rows

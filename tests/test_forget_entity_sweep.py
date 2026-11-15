@@ -96,7 +96,7 @@ def test_admission_speaker_entity_declines():
     import src.api.main as M
 
     _u = "99999999-9999-9999-9999-999999999999"
-    eid, reason = M._admit_forget_mention("Chris", [_u], _u)
+    eid, reason = M._admit_forget_mention("Dan", [_u], _u)
     assert eid is None
     assert reason == "speaker_entity"
 

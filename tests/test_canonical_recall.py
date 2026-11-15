@@ -5,7 +5,7 @@ Covers the four levers of the presentation/lean-query fix:
   1. One centralized display resolver (resolve_entity_display) — "you" vs preferred
      vs safe fallback; NEVER a non-preferred alias when a preferred one exists.
   2. Dedup on UUID before render — same-UUID DB+Qdrant copies collapse to one
-     (the "you works for riverton" AND "chris works for riverton" duplication).
+     (the "you works for riverton" AND "dan works for riverton" duplication).
   3. Preferred-name facts kept and rendered cleanly (pref_name survives).
   4. Non-preferred (also_known_as) aliases held in reserve — gated on name-intent.
 """
@@ -42,11 +42,11 @@ def test_resolve_entity_display_never_nonpreferred_when_preferred_exists():
     db = MagicMock()
     # DB preferred lookup returns the preferred alias first.
     cur = MagicMock()
-    cur.fetchone.return_value = ("Chris",)
+    cur.fetchone.return_value = ("Dan",)
     db.cursor.return_value.__enter__.return_value = cur
     # No map entry → falls to DB preferred-first resolve_display_name path.
     out = resolve_entity_display(ORG_UUID, set(), None, db)
-    assert out == "Chris"
+    assert out == "Dan"
 
 
 def test_resolve_entity_display_none_is_safe():
@@ -87,7 +87,7 @@ def test_dedup_ungrounded_qdrant_would_not_collapse():
     name in the Qdrant slot (NOT grounded), the keys differ and dedup can't collapse
     — proving why UUID grounding must run before dedup."""
     db_fact = {"subject": USER_UUID, "object": ORG_UUID, "rel_type": "works_for", "source": "db"}
-    ungrounded = {"subject": "chris", "object": "riverton", "rel_type": "works_for", "source": "qdrant"}
+    ungrounded = {"subject": "dan", "object": "riverton", "rel_type": "works_for", "source": "qdrant"}
     # Two distinct keys → NOT collapsed (the pre-fix duplication).
     assert len(deduplicate_facts([db_fact, ungrounded])) == 2
 
@@ -100,20 +100,20 @@ def test_pref_name_fact_rendered_not_dropped():
     cur = MagicMock()
     cur.fetchall.return_value = [("pref_name", "X's preferred name is Y")]
     db.cursor.return_value.__enter__.return_value = cur
-    facts = [{"_subject_id": USER_UUID, "object": "Chris", "rel_type": "pref_name", "fact_class": "A"}]
+    facts = [{"_subject_id": USER_UUID, "object": "Dan", "rel_type": "pref_name", "fact_class": "A"}]
     prose = convert_to_prose(
         facts, db, anchor=USER_UUID, user_id=USER_UUID,
-        preferred_alias_map={USER_UUID: "Chris"},
+        preferred_alias_map={USER_UUID: "Dan"},
     )
     assert len(prose) == 1
-    assert "Chris" in prose[0]
+    assert "Dan" in prose[0]
 
 
 # ── Lever 4: non-preferred aliases gated on name-intent ──────────────────────
 
 def test_name_intent_detects_name_queries():
     assert _query_has_name_intent("what is my full name?")
-    assert _query_has_name_intent("what is Chris actually called")
+    assert _query_has_name_intent("what is Dan actually called")
     assert _query_has_name_intent("what's his real name")
     assert _query_has_name_intent("is he also known as anything")
     assert _query_has_name_intent("what name does she go by")

@@ -703,8 +703,8 @@ def _parse_sent(text):
 def test_typed_doc_veto_machine_value_spans():
     """ROUND-7 canary: a machine value (MAC/email/URL) is never an entity span —
     the veto must hold on the mirror, not just main.py."""
-    doc = _parse_sent("Ping the host at chris@example.com okay.")
-    gmodel = _FakeGliner({"Person": [{"text": "chris@example.com", "confidence": 0.9}]})
+    doc = _parse_sent("Ping the host at dan@example.com okay.")
+    gmodel = _FakeGliner({"Person": [{"text": "dan@example.com", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     assert [e.text for e in out.ents] == []
 

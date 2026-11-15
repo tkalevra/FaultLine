@@ -349,7 +349,7 @@ class TestConvertToProse:
 
         with _meta(parent_of=PARENT_OF, spouse=SPOUSE), \
                 patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["Alice", "Bob", "Chris", "Dana"]
+            mock_resolve.side_effect = ["Alice", "Bob", "Dan", "Dana"]
 
             prose_list = convert_to_prose(facts, mock_db)
 

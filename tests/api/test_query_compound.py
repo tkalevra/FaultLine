@@ -49,7 +49,7 @@ class TestQueryFamilyCompound:
         client = TestClient(app)
 
         text = (
-            "My name is Christopher, I prefer to be called Chris, "
+            "My name is Daniel, I prefer to be called Dan, "
             "I am married to Mara, who prefers to be called Mars. "
             "We have 3 children, a daughter Chiara, age 10, who prefers Chi, "
             "Leo, our son is 19, and a son named Marco, age 12, who goes by Dev."
@@ -75,8 +75,8 @@ class TestQueryFamilyCompound:
                         if len(k) > 30 and k == v]
         assert len(uuids_in_pns) == 0, f"UUIDs in preferred_names: {uuids_in_pns}"
 
-        # Canonical identity must be "chris" (preferred name)
-        assert canonical.lower() == "chris", f"canonical_identity={canonical}, expected 'chris'"
+        # Canonical identity must be "dan" (preferred name)
+        assert canonical.lower() == "dan", f"canonical_identity={canonical}, expected 'dan'"
 
         # Must have spouse fact with display name
         spouse_facts = [f for f in facts if f["rel_type"] == "spouse"]
@@ -102,7 +102,7 @@ class TestQueryFamilyCompound:
                     age_count = _cur.fetchone()[0]
             assert age_count >= 2, f"Expected at least 2 ages, got {age_count}"
 
-        # Must have pref_name for user (chris)
+        # Must have pref_name for user (dan)
         pref_facts = [f for f in facts
                       if f["rel_type"] == "pref_name" and f["subject"] == "user"]
         assert len(pref_facts) >= 1

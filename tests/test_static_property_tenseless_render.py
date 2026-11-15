@@ -158,7 +158,7 @@ def test_static_classification_never_takes_tense(_stub_overlay, rel, subj, obj):
 
 
 @pytest.mark.parametrize("rel,subj,obj", [
-    ("parent_of", "diane", "chris"),
+    ("parent_of", "diane", "dan"),
     ("same_as", "bob", "robert"),
 ])
 def test_static_NON_hierarchy_rel_also_tenseless(_stub_overlay, rel, subj, obj):
@@ -206,7 +206,7 @@ def test_fluent_rel_keeps_the_currently_contrast(_stub_overlay):
     out = m.convert_to_prose(
         [_pf("lives_in", subj, cur, "now"), _pf("lives_in", subj, former, "past")],
         db=None, anchor="user", user_id="user",
-        preferred_alias_map={subj: "chris", cur: "vancouver", former: "toronto"})
+        preferred_alias_map={subj: "dan", cur: "vancouver", former: "toronto"})
     cur_line = next(p for p in out if "vancouver" in p.lower())
     assert "currently" in cur_line.lower(), out
 
@@ -214,7 +214,7 @@ def test_fluent_rel_keeps_the_currently_contrast(_stub_overlay):
 # ── The other direction: FLUENT rels must KEEP their tense (no over-suppression) ───────
 
 @pytest.mark.parametrize("rel,subj,obj", [
-    ("member_of", "chris", "chess club"),   # hierarchy rel, but a membership LAPSES
+    ("member_of", "dan", "chess club"),   # hierarchy rel, but a membership LAPSES
     ("part_of", "wheel", "car"),            # hierarchy rel, but a part is DETACHED
 ])
 def test_fluent_hierarchy_rel_keeps_tense(_stub_overlay, rel, subj, obj):
@@ -227,7 +227,7 @@ def test_fluent_hierarchy_rel_keeps_tense(_stub_overlay, rel, subj, obj):
 
 def test_fluent_state_rel_unchanged_no_regression(_stub_overlay):
     """The shipped undated-state FORMER framing (lives_in) is untouched."""
-    line = _render("lives_in", "chris", "london", "past")
+    line = _render("lives_in", "dan", "london", "past")
     assert _tensed(line), line
 
 
