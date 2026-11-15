@@ -282,7 +282,7 @@ def test_entity_default_falls_through():
     out = _compose_object_clause(
         rel_type="spouse",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"], "category": ""},
-        subject_name="you", object_name="elena",
+        subject_name="you", object_name="marla",
         object_id="99999999-9999-9999-9999-999999999999", object_is_uuid=True,
         named_type_name=None,  # no instance_of type → not a named-instance shape
         template="X and Y are spouses/partners", template_2p=None,
@@ -308,17 +308,17 @@ def test_participated_in_not_hijacked():
 
 
 # ── SUBJECT-SIDE NAMED-INSTANCE flip (inverse-anchor composer) ────────────────
-# THE BUG: (leo, child_of, you) was rendered "you are a son named Leo" (makes
-# the USER the son). Fix: flip along inverse_rel_type → "you have a son named Leo".
+# THE BUG: (cyrus, child_of, you) was rendered "you are a son named Cyrus" (makes
+# the USER the son). Fix: flip along inverse_rel_type → "you have a son named Cyrus".
 # Subject-agnostic, ZERO kin literals — Type comes from the entity's instance_of.
 def test_inverse_anchor_child_of_you():
     out = _compose_inverse_anchor_clause(
         rel_type="child_of",
         rel_meta={"inverse_rel_type": "parent_of", "is_symmetric": False},
         anchor_name="you", anchor_is_you=True,
-        instance_name="leo", instance_type_name="son",
+        instance_name="cyrus", instance_type_name="son",
     )
-    assert out == "you have a son named leo"
+    assert out == "you have a son named cyrus"
 
 
 def test_inverse_anchor_daughter_article_unchanged():
@@ -326,9 +326,9 @@ def test_inverse_anchor_daughter_article_unchanged():
         rel_type="child_of",
         rel_meta={"inverse_rel_type": "parent_of", "is_symmetric": False},
         anchor_name="you", anchor_is_you=True,
-        instance_name="mia", instance_type_name="daughter",
+        instance_name="gabriella", instance_type_name="daughter",
     )
-    assert out == "you have a daughter named mia"
+    assert out == "you have a daughter named gabriella"
 
 
 def test_inverse_anchor_non_kin_metadata_driven():
@@ -356,12 +356,12 @@ def test_inverse_anchor_no_inverse_metadata_returns_none():
 
 
 def test_inverse_anchor_no_type_returns_none():
-    # No instance_of TYPE → never fabricate "you have a named leo" → None.
+    # No instance_of TYPE → never fabricate "you have a named cyrus" → None.
     out = _compose_inverse_anchor_clause(
         rel_type="child_of",
         rel_meta={"inverse_rel_type": "parent_of", "is_symmetric": False},
         anchor_name="you", anchor_is_you=True,
-        instance_name="leo", instance_type_name=None,
+        instance_name="cyrus", instance_type_name=None,
     )
     assert out is None
 
@@ -372,9 +372,9 @@ def test_inverse_anchor_symmetric_renders_relationship():
         rel_type="spouse",
         rel_meta={"inverse_rel_type": "spouse", "is_symmetric": True, "label": "spouse"},
         anchor_name="you", anchor_is_you=True,
-        instance_name="elena", instance_type_name=None,
+        instance_name="marla", instance_type_name=None,
     )
-    assert out == "elena is your spouse"
+    assert out == "marla is your spouse"
 
 
 def test_inverse_anchor_third_person_uses_has():
@@ -383,45 +383,45 @@ def test_inverse_anchor_third_person_uses_has():
         rel_type="child_of",
         rel_meta={"inverse_rel_type": "parent_of", "is_symmetric": False},
         anchor_name="diane", anchor_is_you=False,
-        instance_name="leo", instance_type_name="son",
+        instance_name="cyrus", instance_type_name="son",
     )
-    assert out == "diane has a son named leo"
+    assert out == "diane has a son named cyrus"
 
 
 # ── Shape 1 symmetric guard (object-side spouse softening) ────────────────────
 def test_object_side_symmetric_typed_renders_relationship():
-    # (user, spouse, elena) with elena typed "wife": NOT "you and a wife named
-    # Elena" — render "Elena is your wife" (role = object's own type word).
+    # (user, spouse, marla) with marla typed "wife": NOT "you and a wife named
+    # Marla" — render "Marla is your wife" (role = object's own type word).
     out = _compose_object_clause(
         rel_type="spouse",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"],
                   "category": "", "is_symmetric": True},
-        subject_name="you", object_name="elena",
+        subject_name="you", object_name="marla",
         object_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", object_is_uuid=True,
         named_type_name="wife",
         template="X and Y are spouses", template_2p="You and Y are spouses",
         subject_is_you=True,
     )
-    assert out == "elena is your wife"
+    assert out == "marla is your wife"
 
 
 def test_object_side_copula_verb_becomes_possessive():
-    # (you, parent_of, leo) — the walk presents the user-subject direction of the
-    # stored (leo, child_of, you). parent_of's verb is the copula "are"; the
-    # named-instance shape is POSSESSIVE → "you have a son named Leo", NOT
-    # "you are a son named Leo" (which makes the USER the son). Metadata-driven,
-    # ZERO kin literals — son comes from leo's instance_of.
+    # (you, parent_of, cyrus) — the walk presents the user-subject direction of the
+    # stored (cyrus, child_of, you). parent_of's verb is the copula "are"; the
+    # named-instance shape is POSSESSIVE → "you have a son named Cyrus", NOT
+    # "you are a son named Cyrus" (which makes the USER the son). Metadata-driven,
+    # ZERO kin literals — son comes from cyrus's instance_of.
     out = _compose_object_clause(
         rel_type="parent_of",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"],
                   "category": "", "is_symmetric": False, "inverse_rel_type": "child_of"},
-        subject_name="you", object_name="leo",
+        subject_name="you", object_name="cyrus",
         object_id="dddddddd-dddd-dddd-dddd-dddddddddddd", object_is_uuid=True,
         named_type_name="son",
         template="X is the parent of Y", template_2p="You are the parent of Y",
         subject_is_you=True,
     )
-    assert out == "you have a son named leo"
+    assert out == "you have a son named cyrus"
 
 
 def test_object_side_copula_third_person_uses_has():
@@ -429,13 +429,13 @@ def test_object_side_copula_third_person_uses_has():
         rel_type="parent_of",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"],
                   "category": "", "is_symmetric": False, "inverse_rel_type": "child_of"},
-        subject_name="diane", object_name="leo",
+        subject_name="diane", object_name="cyrus",
         object_id="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", object_is_uuid=True,
         named_type_name="son",
         template="X is the parent of Y", template_2p="You are the parent of Y",
         subject_is_you=False,
     )
-    assert out == "diane has a son named leo"
+    assert out == "diane has a son named cyrus"
 
 
 def test_object_side_copula_vowel_article_an():
@@ -510,13 +510,13 @@ def test_inverse_dedup_prefers_user_subject():
 def test_inverse_dedup_keeps_non_inverse():
     overlay = {"spouse": {"inverse_rel_type": None}}
     rendered = [
-        {"prose": "you are married to elena", "subj_id": "U", "obj_id": "X",
+        {"prose": "you are married to marla", "subj_id": "U", "obj_id": "X",
          "rel_type": "spouse", "subject_is_you": True},
         {"prose": "you have a dog named fraggle", "subj_id": "U", "obj_id": "D",
          "rel_type": "has_pet", "subject_is_you": True},
     ]
     out = _dedup_inverse_pairs(rendered, overlay)
-    assert out == ["you are married to elena", "you have a dog named fraggle"]
+    assert out == ["you are married to marla", "you have a dog named fraggle"]
 
 
 def test_inverse_dedup_distinct_pairs_not_collapsed():

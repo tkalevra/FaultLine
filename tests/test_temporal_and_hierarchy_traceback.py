@@ -47,7 +47,7 @@ def test_detect_temporal_future_dated():
 
 
 def test_detect_temporal_now_default():
-    status, ed, _gran = m._detect_temporal("I work at Millbrook")
+    status, ed, _gran = m._detect_temporal("I work at Guelph")
     assert status == "now"
     assert ed is None
 
@@ -403,7 +403,7 @@ def test_convert_to_prose_no_date_for_undated_fact():
     fact = {
         "subject_id": user,
         "rel_type": "spouse",
-        "object": "Elena",
+        "object": "Marla",
         "fact_class": "A",
         # no event_date
     }
@@ -412,19 +412,58 @@ def test_convert_to_prose_no_date_for_undated_fact():
                           "natural_language_2p": "You are married to Y",
                           "label": "spouse"}}
     with _patch("src.api.main.rel_type_overlay.resolve_current", return_value=overlay), \
-         _patch("src.api.main.resolve_display_name", return_value="Elena"):
+         _patch("src.api.main.resolve_display_name", return_value="Marla"):
         prose = m.convert_to_prose([fact], db, anchor=user, user_id=user)
     assert len(prose) == 1
     assert "(on " not in prose[0]
 
 
-# NOTE (open core): the upstream test `test_convert_to_prose_historical_keeps_until_not_event_date`
-# is deliberately NOT carried here. It asserts the "used to" past-state prose (a former state
-# de-conjugated to grammatical past: "You used to live in Toronto"), part of recall-voice work
-# that has not landed in the open core yet — this engine still renders the fail-safe
-# "Previously, ..." form. Shipping a test for a feature this repository does not contain would
-# be a lie; skipping it silently would be worse. Restore it when the recall-voice path syncs.
+def test_convert_to_prose_historical_keeps_until_not_event_date():
+    """Historical (superseded) facts read as PAST and keep their '(until …)' marker, and
+    must NOT also get the event-date '(on …)' append — the branch is else-gated.
 
+    PAST-MARKER CONTRACT CHANGE (deliberate, `c9c6e7bf` "feat(recall): natural clean output —
+    provenance-driven voice, preamble up-chain, 'used to' prose", 2026-07-12 — POST-dating this
+    test). A former state is now de-conjugated to grammatical past ("You used to live in
+    Toronto") instead of the old broken "Previously, You live in Toronto" (present-tense verb
+    with a mid-sentence capital grafted on). "Previously, …" survives only as the FAIL-SAFE for
+    a shape `_reframe_former_state` cannot cleanly transform (main.py:34840).
+
+    This test's LOAD-BEARING intent is unchanged and still fully asserted: the fact reads as
+    FORMER, keeps '(until …)', and does not ALSO take the '(on …)' event-date append.
+    """
+    user = "33333333-3333-3333-3333-333333333333"
+    fact = {
+        "subject_id": user,
+        "rel_type": "lives_in",
+        "object": "Toronto",
+        "fact_class": "A",
+        "historical": True,
+        "valid_until": "2024-01-01T00:00:00+00:00",
+        "event_date": "2020-01-01T00:00:00+00:00",
+    }
+    db = _mock_db_for_prose()
+    overlay = {"lives_in": {"natural_language": "X lives in Y",
+                            "natural_language_2p": "You live in Y", "label": "lives in"}}
+    with _patch("src.api.main.rel_type_overlay.resolve_current", return_value=overlay), \
+         _patch("src.api.main.resolve_display_name", return_value="Toronto"):
+        prose = m.convert_to_prose([fact], db, anchor=user, user_id=user)
+    assert len(prose) == 1
+    # Reads as a FORMER state — grammatical past, not a current assertion.
+    assert prose[0].startswith("You used to live in Toronto")
+    # …and never as a PRESENT-tense assertion (the defect c9c6e7bf removed).
+    assert not prose[0].startswith("You live in")
+    assert "(until 2024-01-01)" in prose[0]
+    assert "(on " not in prose[0]
+
+
+# ── RC-subject-anchored-walk-recall (NON-temporal analogue): CONCEPT-ANCHOR WALK ──
+# "what do I know about fences" pins the anchor to the USER (the "I" identity keyword),
+# so the user-anchored DEFAULT FLOOR fires and the NAMED concept's own facts (anchored
+# to the fence entity, not the user) get filtered. The concept-anchor walk OR-s in the
+# named concept entity's OWN facts via a plain identity SELECT — the non-temporal twin of
+# the temporal event lane. These tests drive the two new helpers with a tiny fake cursor
+# (DSN-independent, deterministic, no live DB).
 
 _FENCE = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _USER = "99999999-9999-9999-9999-999999999999"

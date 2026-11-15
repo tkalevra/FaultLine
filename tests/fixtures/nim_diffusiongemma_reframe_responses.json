@@ -1,0 +1,89 @@
+{
+ "_provenance": "Recorded 2026-10-01 from integrate.api.nvidia.com/v1/chat/completions, model google/diffusiongemma-26b-a4b-it, REFRAME request shape (reframe._SYSTEM_PROMPT + user turn \"I live in Fredericton.\", temperature 0.0, max_tokens 256, stream false). Response bodies verbatim; no request headers, no credential. Issue #107.",
+ "reframe_plain": {
+  "request_extra": {},
+  "status": 200,
+  "response": {
+   "id": "chatcmpl-9c77129f9ef50b9b",
+   "object": "chat.completion",
+   "created": 1790894911,
+   "model": "google/diffusiongemma-26b-a4b-it",
+   "choices": [
+    {
+     "index": 0,
+     "message": {
+      "role": "assistant",
+      "content": "{\"atoms\": [{\"statement\": \"I live in Fredericton.\", \"source\": \"I live in Fredericton.\"}]}",
+      "refusal": null,
+      "annotations": null,
+      "audio": null,
+      "function_call": null,
+      "tool_calls": [],
+      "reasoning": null
+     },
+     "logprobs": null,
+     "finish_reason": "stop",
+     "stop_reason": 106,
+     "token_ids": null,
+     "routed_experts": null
+    }
+   ],
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.21.0-d9f6bf25",
+   "usage": {
+    "prompt_tokens": 2057,
+    "total_tokens": 2082,
+    "completion_tokens": 25,
+    "prompt_tokens_details": null
+   },
+   "prompt_logprobs": null,
+   "prompt_token_ids": null,
+   "prompt_text": null,
+   "kv_transfer_params": null
+  }
+ },
+ "reframe_reasoning_effort_low": {
+  "request_extra": {
+   "reasoning_effort": "low"
+  },
+  "status": 200,
+  "response": {
+   "id": "chatcmpl-80a856d8c98f8e51",
+   "object": "chat.completion",
+   "created": 1790894912,
+   "model": "google/diffusiongemma-26b-a4b-it",
+   "choices": [
+    {
+     "index": 0,
+     "message": {
+      "role": "assistant",
+      "content": null,
+      "refusal": null,
+      "annotations": null,
+      "audio": null,
+      "function_call": null,
+      "tool_calls": [],
+      "reasoning": "*   Input message: \"I live in Fredericton.\"\n    *   Goal: Convert to clean, single-fact statements for a memory graph.\n\n    *   Fact: \"I live in Fredericton.\"\n    *   Subject: \"I\"\n    *   Verb: \"live\"\n    *   Location: \"Fredericton\"\n\n    *   Rule 1: No new facts. (Check)\n    *   Rule 2: No dropped facts. (Check)\n    *   Rule 3: One fact per line. (Check)\n    *   Rule 4: Strip chatter. (Check)\n    *   Rule 5: Drop opinion/plan. (Check)\n    *   Rule 6: Pronoun resolution. (N/A)\n    *   Rule 7: Relative clause. (N/A)\n    *   Rule 8: Lists. (N/A)\n\n    *   Statement: \"I live in Fredericton.\"\n    *   Source: \"I live in Fredericton.\"\n\n    ```json\n    {\"atoms\": [{\"statement\": \"I live in Fredericton.\", \"source\": \"I live in Fredericton\""
+     },
+     "logprobs": null,
+     "finish_reason": "length",
+     "stop_reason": null,
+     "token_ids": null,
+     "routed_experts": null
+    }
+   ],
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.21.0-d9f6bf25",
+   "usage": {
+    "prompt_tokens": 2055,
+    "total_tokens": 2311,
+    "completion_tokens": 256,
+    "prompt_tokens_details": null
+   },
+   "prompt_logprobs": null,
+   "prompt_token_ids": null,
+   "prompt_text": null,
+   "kv_transfer_params": null
+  }
+ }
+}

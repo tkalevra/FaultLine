@@ -140,7 +140,7 @@ def _clean_state(monkeypatch):
 
 
 CHUNK_TEXT = ("Marcus owns two vintage synthesizers. "
-              "His sister Nora works at the hospital in Millbrook.")
+              "His sister Lena works at the hospital in Guelph.")
 
 
 def _seed_doc(conn, user, doc_id=1, status="ready", chunk_state=None,
@@ -221,12 +221,7 @@ def no_extract_lane(monkeypatch):
     deterministic path must not borrow the brain-bearing extraction lane."""
     def _must_not_run(*a, **k):
         raise AssertionError("_document_chunk_edges (brain extraction lane) fired")
-    # raising=False: this lineage's embedder carries no _document_chunk_edges at
-    # all (no brain-bearing document extraction lane) — the attribute is planted
-    # as the tripwire and the REAL zero-brain enforcement is the wire() httpx
-    # recorder above (no /harvest-spans, no /extract/rewrite).
-    monkeypatch.setattr(embedder, "_document_chunk_edges", _must_not_run,
-                        raising=False)
+    monkeypatch.setattr(embedder, "_document_chunk_edges", _must_not_run)
 
 
 def _reattempt(bound_conn, tenant, op="recall_miss_reexamine",
@@ -708,20 +703,20 @@ def _parse_sent(text):
 def test_typed_doc_veto_machine_value_spans():
     """ROUND-7 canary: a machine value (MAC/email/URL) is never an entity span —
     the veto must hold on the mirror, not just main.py."""
-    doc = _parse_sent("Ping the host at sam@example.com okay.")
-    gmodel = _FakeGliner({"Person": [{"text": "sam@example.com", "confidence": 0.9}]})
+    doc = _parse_sent("Ping the host at chris@example.com okay.")
+    gmodel = _FakeGliner({"Person": [{"text": "chris@example.com", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     assert [e.text for e in out.ents] == []
 
 
 def test_typed_doc_coordinated_surface_splits():
     """A comma/"and"-joined surface seeds EACH member as its own span (the
-    "Mia, Theo" glue-defect fixture main.py documents)."""
-    doc = _parse_sent("Mia and Theo visited Millbrook today.")
-    gmodel = _FakeGliner({"Person": [{"text": "Mia and Theo", "confidence": 0.9}]})
+    "Gabriella, Des" glue-defect fixture main.py documents)."""
+    doc = _parse_sent("Gabriella and Des visited Guelph today.")
+    gmodel = _FakeGliner({"Person": [{"text": "Gabriella and Des", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     surfaces = sorted(e.text.lower() for e in out.ents)
-    assert surfaces == ["theo", "mia"]
+    assert surfaces == ["des", "gabriella"]
 
 
 def test_typed_doc_longest_span_wins_overlap():
@@ -738,14 +733,14 @@ def test_typed_doc_longest_span_wins_overlap():
 def test_typed_doc_non_verbatim_span_never_seeds():
     """A span GLiNER2 "found" but the text does not contain is dropped (exact
     case-insensitive locate only — never fuzzy)."""
-    doc = _parse_sent("Nora works at the hospital.")
+    doc = _parse_sent("Lena works at the hospital.")
     gmodel = _FakeGliner({"Person": [{"text": "Elena", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     assert [e.text for e in out.ents] == []
 
 
 def test_typed_doc_fail_safe_on_gliner_error():
-    doc = _parse_sent("Nora works at the hospital.")
+    doc = _parse_sent("Lena works at the hospital.")
 
     class _Boom:
         def extract_entities(self, *a, **k):

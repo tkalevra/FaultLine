@@ -1,9 +1,9 @@
 """MCP RECALL BRAIN-INDEPENDENCE — the fast path serves passages regardless of brain state.
 
-The MCP-layer twin of the API passage-first fix (gauntlet 2026-10-25; FOSS port 2026-10-26).
-The API layer already serves document_hits from /query no matter how slow the LLM brain is;
-this lane makes the MCP's recall_memory tool stop BLOCKING on the pre-query brain call
-(/classify-intent's LLM tiers are the 15s+ prod hang):
+The MCP-layer twin of the API passage-first fix (gauntlet 2026-10-25). The API layer already
+serves document_hits from /query no matter how slow the LLM brain is; this lane makes the MCP's
+recall_memory tool stop BLOCKING on the pre-query brain calls (/classify-intent's LLM tiers were
+4s/30s/4s server-side — the 15s+ prod hang):
 
   (a) brain-slow (classify over budget)   → recall returns passages <5s, breaker OPENS
   (b) brain-dead (classify refused fast)  → recall still returns passages
@@ -17,14 +17,8 @@ this lane makes the MCP's recall_memory tool stop BLOCKING on the pre-query brai
                                             fails and the lane needs a route; the re-ask
                                             failing too still surfaces the ORIGINAL cause
 
-FOSS-port adaptation: this lineage has no _brain_request/BrainUnavailable budget-table
-machinery (private-lineage) — the probe is a plain httpx POST bounded by probe_budget, the
-slow-vs-decision split is httpx.TimeoutException/TransportError vs HTTPStatusError, and the
-probe is ONE attempt (no in-turn retry on this engine). The pins are the same contract
-expressed against those shapes.
-
-All backend traffic is a URL router mock — no DB, no live API. The slow brain is simulated
-the way httpx actually reports one: sleep past the call's OWN timeout kwarg, then ReadTimeout.
+All backend traffic is a URL router mock — no DB, no live API. The slow brain is simulated the
+way httpx actually reports one: sleep past the call's OWN timeout kwarg, then ReadTimeout.
 """
 
 import asyncio
@@ -54,7 +48,7 @@ _QUERY_OK = {
     # `definition` is the prose surface the MCP renderer emits (fact_class A +
     # user_stated provenance → the ASSERT band)
     "facts": [{"definition": "You own a Corolla", "fact_class": "A",
-               "fact_provenance": "user_stated", "confidence": 0.95}],
+               "provenance": "user_stated", "confidence": 0.95}],
     "attributes": {},
     "document_hits": list(_PASSAGE_HITS),
 }
@@ -129,10 +123,13 @@ class _Router:
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
     """Module-state hygiene: the brain-slow breaker is cross-turn by design, so every test
-    starts and ends with the window CLOSED; the recall probe knob is pinned tight (0.3s)
-    so the slow-brain mock sleeps 0.7s, not 3.4s."""
+    starts and ends with the window CLOSED; BOTH classify budgets are pinned tight (0.3s)
+    — the recall probe knob AND the write-lane per-op budget (the `_classify_and_gate`
+    direct tests exercise the write-lane arm, whose budget comes from the table; unpinned,
+    the slow-brain mock sleeps 10.4s per attempt there — round-2 review finding 1)."""
     S._brain_slow_reset("test isolation")
     monkeypatch.setenv("MCP_CLASSIFY_TIMEOUT_S", "0.3")
+    monkeypatch.setenv("MCP_BRAIN_TIMEOUT_CLASSIFY_INTENT", "0.3")
     S._FAULTLINE_URL_DETECTED = True
     yield
     S._brain_slow_reset("test isolation")
@@ -155,13 +152,14 @@ async def test_slow_brain_recall_serves_passages_under_5s_and_opens_the_breaker(
     assert elapsed < 5.0, f"recall waited {elapsed:.2f}s on a slow-brain classify"
     assert "Wind Energy Handbook" in result["memory"], result["memory"][:200]
     assert "Modern turbines achieve 20-40% efficiency." in result["memory"]
-    # the budget bound the probe to ONE attempt and NO skip_llm re-ask — recall's
-    # degradation IS the fast path, not a second classify spend
+    assert not result.get("isError") and result.get("status") != "degraded", result
+    # the budget bound the probe to ONE attempt (recall: retry=False) and NO skip_llm
+    # re-ask — recall's degradation IS the fast path, not a second classify spend
     assert len(router.classify_calls()) == 1, router.classify_calls()
     # TRIP-TURN RETENTION (round-2 review finding 1): the probe timed out MID-TURN, so the
     # retention decision below must key on the breaker STATE (marked on the way out), not
     # the entry-time flag — the trip turn takes the fast-path retention too, never the
-    # full /harvest-spans await that could re-hang it.
+    # full /harvest-spans await that could re-hang it (REFRAME lanes, BUG-005 class).
     assert not any("/harvest-spans" in u for u in router.post_urls()), router.post_urls()
     assert any("/episodic/append" in u for u in router.post_urls())
     # the /query walk still fired with the RAW text
@@ -180,11 +178,12 @@ async def test_dead_brain_classify_still_serves_passages():
     result = await _recall(router)
 
     assert "Modern turbines achieve 20-40% efficiency." in result["memory"]
+    assert not result.get("isError"), result
     assert any("/query" in u for u in router.post_urls())
     assert S._brain_slow_active(_UID) is True  # dead brain also trips the window
 
 
-# ── (c) brain-fast: the FULL pipeline, breaker stays closed ───────────────────────────
+# ── (c) brain-fast: the FULL pipeline, byte-for-byte, breaker stays closed ────────────
 
 
 async def test_fast_brain_full_pipeline_and_breaker_stays_closed():
@@ -199,10 +198,10 @@ async def test_fast_brain_full_pipeline_and_breaker_stays_closed():
     assert any("/confidence-gate" in u for u in router.gets)
     # NO skip_llm on the healthy probe
     assert all(b.get("skip_llm") is not True for b in router.classify_calls())
-    # BOTH surfaces render: the fact AND the passage (BUG-09: the passage LEADS)
+    # BOTH surfaces render: the fact AND the passage
     assert "Wind Energy Handbook" in result["memory"]
     assert "Corolla" in result["memory"]
-    assert result["memory"].index("From your document") < result["memory"].index("Corolla")
+    assert not result.get("isError")
     assert S._brain_slow_active(_UID) is False  # a healthy full-route classify closes the window
 
 
@@ -222,12 +221,15 @@ async def test_open_breaker_fires_query_direct_without_classify():
     # deterministic retention replaced the harvest (no /harvest-spans on a degraded turn)
     assert not any("/harvest-spans" in u for u in router.post_urls()), router.post_urls()
     assert any("/episodic/append" in u for u in router.post_urls())
-    # the durable row carries NO transport-fabricated verdict: the brain classified
-    # nothing this turn
+    # the durable row carries NO transport-fabricated verdict: intent is None (the brain
+    # classified nothing this turn) and the backend model accepts that natively
     append_body = next(b for u, b in router.posts if "/episodic/append" in u)
     assert append_body["intent"] is None
+    from src.api.models import EpisodicAppendRequest
+    EpisodicAppendRequest.model_validate(append_body)  # round-3 MINOR-2: acceptance pinned
     assert any("/query" in u for u in router.post_urls())
     assert "Modern turbines achieve 20-40% efficiency." in result["memory"]
+    assert not result.get("isError")
 
 
 # ── explicit ops-declared degradation: MCP_BRAIN_DEGRADED=1 ──────────────────────────
@@ -269,20 +271,20 @@ async def test_classify_budget_exceeded_reasks_gliner2_only_for_route_lanes():
     router = _Router(slow_classify=True, skip_llm_classify={"intent": "STATEMENT", "confidence": 0.55})
     with patch.object(S, "_http_client", router):
         intent, conf, gate = await S._classify_and_gate(
-            "my dog is called Rufus", _UID, gliner2_fallback=True, probe_budget=0.3)
+            "my dog is called Rufus", _UID, retry=True, gliner2_fallback=True)
 
     assert intent == "STATEMENT" and conf == 0.55
     calls = router.classify_calls()
-    assert len(calls) == 2, calls           # 1 budgeted probe attempt, then ONE skip_llm re-ask
-    assert all(b.get("skip_llm") is not True for b in calls[:1])
-    assert calls[1].get("skip_llm") is True
+    assert len(calls) == 3, calls           # 2 budgeted probe attempts (retry=True), then ONE skip_llm re-ask
+    assert all(b.get("skip_llm") is not True for b in calls[:2])
+    assert calls[2].get("skip_llm") is True
     assert router.gets == []                # the diagnostic gate read is skipped on this arm
     assert S._brain_slow_active(_UID) is True   # the probe timeout still marked the window
 
 
 async def test_gliner2_reask_failing_too_surfaces_the_original_cause():
     # skip_llm arm also over budget (a backend that hangs everything) → the ORIGINAL
-    # ReadTimeout is the surfaced failure, unchanged.
+    # BrainUnavailable is the surfaced failure — attempts and endpoint unchanged.
     class _AllSlow(_Router):
         """Even the skip_llm re-ask hangs past its budget."""
 
@@ -297,22 +299,22 @@ async def test_gliner2_reask_failing_too_surfaces_the_original_cause():
 
     all_slow = _AllSlow()
     with patch.object(S, "_http_client", all_slow), \
-         pytest.raises(httpx.ReadTimeout):
+         pytest.raises(S.BrainUnavailable) as ei:
         await S._classify_and_gate("my dog is called Rufus", _UID,
-                                   gliner2_fallback=True, probe_budget=0.3)
-    assert len(all_slow.classify_calls()) == 2  # 1 probe attempt + 1 re-ask
+                                   retry=True, gliner2_fallback=True)
+    assert ei.value.endpoint == "/classify-intent"
+    assert ei.value.attempts == 2  # the ORIGINAL probe's attempts — not the re-ask's 1
+    assert "ReadTimeout" in ei.value.cause
+    assert len(all_slow.classify_calls()) == 3  # 2 probe attempts + 1 re-ask
 
 
 # ── env parsing pins ─────────────────────────────────────────────────────────────────
 
 
-def test_classify_budget_knobs_parse_with_defaults(monkeypatch):
-    monkeypatch.delenv("MCP_CLASSIFY_TIMEOUT_S", raising=False)
-    assert S._classify_probe_budget_s() == 3.0
-    monkeypatch.setenv("MCP_CLASSIFY_TIMEOUT_S", "1.5")
-    assert S._classify_probe_budget_s() == 1.5
-    monkeypatch.setenv("MCP_CLASSIFY_TIMEOUT_S", "junk")
-    assert S._classify_probe_budget_s() == 3.0  # junk → default, not a crash
+def test_classify_budget_knob_lives_in_the_limits_table(monkeypatch):
+    assert "MCP_CLASSIFY_TIMEOUT_S" in S._ENV_LIMITS
+    assert "MCP_BRAIN_SLOW_COOLDOWN_S" in S._ENV_LIMITS
+    # the cooldown knob parses with its default when unset
     monkeypatch.delenv("MCP_BRAIN_SLOW_COOLDOWN_S", raising=False)
     assert S._brain_slow_cooldown_s() == 60.0
 
@@ -320,39 +322,38 @@ def test_classify_budget_knobs_parse_with_defaults(monkeypatch):
 # ── (e) end-to-end through the MCP HTTP transport — the door a client actually uses ──
 
 
-def test_rest_door_e2e_slow_brain_serves_passages_under_5s(monkeypatch):
+def test_rest_door_e2e_slow_brain_serves_passages_under_5s():
     """The REST /recall_memory door (the OpenWebUI/live-client lane), through the real
-    FastAPI transport, against a mocked slow brain: the budgeted classify probe times
-    out, the turn survives, and the passage floor is served well under the client-timeout
-    danger zone."""
+    FastAPI transport with its per-request turn wall, against a mocked slow brain: the
+    budgeted classify probe times out, the turn survives, and the passage floor is served
+    well under the client-timeout danger zone."""
     from fastapi.testclient import TestClient
-    from src.mcp import http_server as h
+    from src.mcp.http_server import app
 
-    monkeypatch.setattr(S, "_ensure_provisioned", _async_true)
-    monkeypatch.setattr(h, "MCP_API_KEY", "")
-    with TestClient(h.app) as client:
-        router = _Router(slow_classify=True)
-        with patch.object(S, "_http_client", router):
-            t0 = time.monotonic()
-            resp = client.post("/recall_memory",
-                               json={"query": "how efficient are wind turbines",
-                                     "user_id": _UID})
-            elapsed = time.monotonic() - t0
+    S._provisioned_users.add(_UID)
+    try:
+        with TestClient(app) as client:
+            router = _Router(slow_classify=True)
+            with patch.object(S, "_http_client", router):
+                t0 = time.monotonic()
+                resp = client.post("/recall_memory",
+                                   json={"query": "how efficient are wind turbines",
+                                         "user_id": _UID})
+                elapsed = time.monotonic() - t0
 
-        assert resp.status_code == 200, resp.text[:300]
-        body = resp.json()
-        memory = body.get("memory") or body.get("content", [{}])[0].get("text", "")
-        assert "Modern turbines achieve 20-40% efficiency." in memory, body
-        assert elapsed < 5.0, f"the door answered in {elapsed:.2f}s on a slow brain"
-        assert S._brain_slow_active(_UID) is True   # the next turn through this door fast-paths
-
-
-async def _async_true(user_id):
-    return True
+            assert resp.status_code == 200, resp.text[:300]
+            body = resp.json()
+            memory = body.get("memory") or body.get("content", [{}])[0].get("text", "")
+            assert "Modern turbines achieve 20-40% efficiency." in memory, body
+            assert elapsed < 5.0, f"the door answered in {elapsed:.2f}s on a slow brain"
+            assert S._brain_slow_active(_UID) is True   # the next turn through this door fast-paths
+    finally:
+        S._provisioned_users.discard(_UID)
+        S._brain_slow_reset("test isolation")
 
 
 # ── per-seat isolation (round-2 review finding 3): one tenant's slow brain must not
-#    fast-path another tenant's healthy turns — deployments run per-account BYO brains.
+#    fast-path another tenant's healthy turns — SaaS runs per-account BYO brains.
 
 
 async def test_a_marked_seat_does_not_fast_path_another_seat():
@@ -367,6 +368,28 @@ async def test_a_marked_seat_does_not_fast_path_another_seat():
     assert "Modern turbines achieve 20-40% efficiency." in result["memory"]
     assert S._brain_slow_active(_UID) is False      # this seat's window untouched
     assert S._brain_slow_active(other) is True      # the marked seat keeps its window
+
+
+# ── fail-safe (constraint 5): the fast path erroring is an HONEST retrieval failure ──
+
+
+async def test_fast_path_query_failure_is_the_honest_retrieval_failure():
+    S._mark_brain_slow(_UID, "pin: breaker open, and /query itself unreachable")
+    router = _Router()
+    router.query_payload = None
+
+    async def _dead_query(url, **kwargs):
+        if "/query" in url:
+            raise httpx.ConnectError("query down too")
+        return await _Router.post(router, url, **kwargs)
+
+    router.post = _dead_query
+    result = await _recall(router)
+
+    assert result.get("isError") is True and result.get("status") == "degraded", result
+    assert "retrieval failure" in result["memory"], result["memory"]
+    assert "not an empty memory" in result["memory"]  # honest: never a confident abstention
+    assert result.get("brain_unavailable") == "/query"
 
 
 # ── RECALL_INTENT_ROUTING=off + open window (round-2 review finding 2): the retention

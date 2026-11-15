@@ -56,16 +56,16 @@ class TestYouAgreementFixup:
     """Minimal 2nd-person agreement fixup for the 3p-template fallback (no 2p row)."""
 
     def test_yous_to_your(self):
-        assert _you_agreement_fixup("you's preferred name is Sam") == "your preferred name is Sam"
+        assert _you_agreement_fixup("you's preferred name is Chris") == "your preferred name is Chris"
 
     def test_you_is_to_you_are(self):
-        assert _you_agreement_fixup("you is the parent of Leo") == "you are the parent of Leo"
+        assert _you_agreement_fixup("you is the parent of Cyrus") == "you are the parent of Cyrus"
 
     def test_you_has_to_you_have(self):
         assert _you_agreement_fixup("you has a pet that is Fraggle") == "you have a pet that is Fraggle"
 
     def test_you_was_to_you_were(self):
-        assert _you_agreement_fixup("you was born in Millbrook") == "you were born in Millbrook"
+        assert _you_agreement_fixup("you was born in Guelph") == "you were born in Guelph"
 
     def test_no_fuzzy_s_stripping(self):
         # The fixup must NOT mangle "you likes"/"you runs" — only the explicit set.
@@ -182,24 +182,24 @@ class TestPerspectiveResolution:
         ident = {"user", str(uuid4()).lower()}
         db = MagicMock()
 
-        with patch("src.api.main.resolve_display_name", return_value="Leo"):
+        with patch("src.api.main.resolve_display_name", return_value="Cyrus"):
             result = _resolve_perspective_name(other_uuid, ident, db)
 
-        assert result == "Leo"
+        assert result == "Cyrus"
 
     def test_namesake_third_party_not_collapsed(self):
         """A third party whose preferred name equals the user's name must NOT
         become 'you' — the decision is on the UUID, not the string."""
         user_uuid = str(uuid4())
-        namesake_uuid = str(uuid4())  # different UUID, same display name "sam"
+        namesake_uuid = str(uuid4())  # different UUID, same display name "chris"
         ident = {"user", user_uuid.lower()}
         db = MagicMock()
 
-        with patch("src.api.main.resolve_display_name", return_value="sam"):
+        with patch("src.api.main.resolve_display_name", return_value="chris"):
             result = _resolve_perspective_name(namesake_uuid, ident, db)
 
         # graph identity says this is NOT the user → keep their (preferred) name
-        assert result == "sam"
+        assert result == "chris"
 
 
 # ── The rel_type templates convert_to_prose ACTUALLY reads ────────────────────────────────
@@ -287,13 +287,13 @@ class TestConvertToProsePerspective:
         ]
 
         with _meta(parent_of=PARENT_3P), \
-                patch("src.api.main.resolve_display_name", return_value="Leo"):
+                patch("src.api.main.resolve_display_name", return_value="Cyrus"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
 
         # The template row here is 3p-only (no natural_language_2p), so this exercises
         # the null-fallback agreement fixup: "you is" → "you are" (migration 081 adds
         # the real 2p template "You are the parent of Y"; this guards un-backfilled rows).
-        assert prose == ["you are the parent of Leo"]
+        assert prose == ["you are the parent of Cyrus"]
 
     def test_no_anchor_falls_back_to_names(self):
         user_uuid = str(uuid4())
@@ -308,12 +308,12 @@ class TestConvertToProsePerspective:
         cur.fetchall.return_value = [("parent_of", "X is the parent of Y")]
 
         with _meta(parent_of=PARENT_3P), \
-                patch("src.api.main.resolve_display_name", side_effect=["sam", "Leo"]):
+                patch("src.api.main.resolve_display_name", side_effect=["chris", "Cyrus"]):
             prose = convert_to_prose([fact], db)  # no anchor → plain names
 
         # Display names are TITLECASED at render — deliberate (`c059e8a`: "render it like a
         # person"). This test pinned the pre-c059e8a lowercase output; the product is right.
-        assert prose == ["Sam is the parent of Leo"]
+        assert prose == ["Chris is the parent of Cyrus"]
 
     def test_class_c_no_staged_label(self):
         user_uuid = str(uuid4())
@@ -359,13 +359,13 @@ class TestConvertToProsePerspective:
 
         # Templates come from the rel_type OVERLAY, not this cursor (since 5161ee7). Injecting
         # them via cur.fetchall fed a DEAD SEAM: no template resolved, the composer fell through
-        # to the bare "you parent_of Leo" join, and the test read as a 2p regression that was
+        # to the bare "you parent_of Cyrus" join, and the test read as a 2p regression that was
         # never there. Inject where the code actually LOOKS.
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", return_value="Leo"):
+                patch("src.api.main.resolve_display_name", return_value="Cyrus"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
 
-        assert prose == ["You are the parent of Leo"]
+        assert prose == ["You are the parent of Cyrus"]
 
     def test_pref_name_2p_template(self):
         """pref_name 2p form: 'X's preferred name is Y' → 'You go by Y'."""
@@ -373,7 +373,7 @@ class TestConvertToProsePerspective:
         fact = {
             "subject_id": user_uuid,
             "rel_type": "pref_name",
-            "object": "Sam",
+            "object": "Chris",
             "fact_class": "A",
         }
         db, cur = _mock_db()
@@ -382,12 +382,12 @@ class TestConvertToProsePerspective:
             [("pref_name", "X's preferred name is Y", "You go by Y")],
         ]
         with _meta(pref_name=PREF), \
-                patch("src.api.main.resolve_display_name", return_value="Sam"):
+                patch("src.api.main.resolve_display_name", return_value="Chris"):
             prose = convert_to_prose(
                 [fact], db, anchor=user_uuid, user_id=user_uuid,
-                preferred_alias_map={user_uuid: "Sam"},
+                preferred_alias_map={user_uuid: "Chris"},
             )
-        assert prose == ["You go by Sam"]
+        assert prose == ["You go by Chris"]
 
     def test_non_you_subject_keeps_3p_template(self):
         """A third-party subject (not the querying user) keeps the 3p template
@@ -408,9 +408,9 @@ class TestConvertToProsePerspective:
         # subject must not steal it. Injected via the overlay (the live seam), so the guard is
         # actually exercised instead of silently falling back to a bare join.
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", side_effect=["Elena", "Leo"]):
+                patch("src.api.main.resolve_display_name", side_effect=["Marla", "Cyrus"]):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        assert prose == ["Elena is the parent of Leo"]
+        assert prose == ["Marla is the parent of Cyrus"]
 
     def test_object_side_you_stays_3p(self):
         """Object-side 'you' is already grammatical on the 3p template — only the
@@ -427,10 +427,10 @@ class TestConvertToProsePerspective:
         cur.fetchall.side_effect = [[]]  # same_as
 
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", return_value="Elena"):
+                patch("src.api.main.resolve_display_name", return_value="Marla"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        # Subject=Elena (3p), object resolves to "you" → grammatical 3p sentence.
-        assert prose == ["Elena is the parent of you"]
+        # Subject=Marla (3p), object resolves to "you" → grammatical 3p sentence.
+        assert prose == ["Marla is the parent of you"]
 
     def test_null_2p_falls_back_with_agreement_fixup(self):
         """Legacy/un-backfilled row: natural_language_2p IS NULL → 3p fallback with
@@ -439,7 +439,7 @@ class TestConvertToProsePerspective:
         fact = {
             "subject_id": user_uuid,
             "rel_type": "pref_name",
-            "object": "Sam",
+            "object": "Chris",
             "fact_class": "A",
         }
         db, cur = _mock_db()
@@ -451,13 +451,13 @@ class TestConvertToProsePerspective:
         # the string it asserted was produced by the Shape-4 CLOBBER BUG, not by the agreement
         # fixup it claims to guard. Patching the real seam makes it exercise the fixup for real.
         with _meta(pref_name=PREF_NO_2P), \
-                patch("src.api.main.resolve_display_name", return_value="Sam"):
+                patch("src.api.main.resolve_display_name", return_value="Chris"):
             prose = convert_to_prose(
                 [fact], db, anchor=user_uuid, user_id=user_uuid,
-                preferred_alias_map={user_uuid: "Sam"},
+                preferred_alias_map={user_uuid: "Chris"},
             )
-        # "you's preferred name is Sam" → fixup → "your preferred name is Sam"
-        assert prose == ["your preferred name is Sam"]
+        # "you's preferred name is Chris" → fixup → "your preferred name is Chris"
+        assert prose == ["your preferred name is Chris"]
         assert "you's" not in prose[0]
 
     def test_placeholder_broken_template_falls_back_to_label(self):
@@ -529,9 +529,9 @@ class TestConvertToProsePerspective:
         }
         with patch("src.api.main.rel_type_overlay.resolve_current",
                    return_value=good_meta), \
-             patch("src.api.main.resolve_display_name", return_value="Leo"):
+             patch("src.api.main.resolve_display_name", return_value="Cyrus"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        assert prose == ["You are the parent of Leo"]
+        assert prose == ["You are the parent of Cyrus"]
 
     def test_unbound_context_not_perspective_rewritten(self):
         """context (store_context) facts are unbound prose — no perspective."""
@@ -885,7 +885,7 @@ class TestConvertToProseNamedInstanceJoin:
 
     def test_object_is_user_not_joined(self):
         """The user (object resolves to 'you') is NEVER type-tagged as a named instance:
-        'Elena is the parent of you', not 'a person named you'."""
+        'Marla is the parent of you', not 'a person named you'."""
         user_uuid = str(uuid4())
         other_uuid = str(uuid4())
         meta = dict(self._TEMPLATE_META)
@@ -898,7 +898,7 @@ class TestConvertToProseNamedInstanceJoin:
             "subject_id": other_uuid, "rel_type": "parent_of",
             "object_id": user_uuid, "fact_class": "A",
         }]
-        pref = {other_uuid: "Elena"}
+        pref = {other_uuid: "Marla"}
         db, cur = _mock_db()
         cur.fetchall.return_value = []
         cur.fetchone.return_value = ("zzz",)  # even if a stray type existed, the you-guard wins
