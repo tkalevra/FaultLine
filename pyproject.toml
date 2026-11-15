@@ -15,22 +15,32 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Christopher Thompson" }]
 classifiers = ["Programming Language :: Python :: 3.11"]
 dependencies = [
-    # gliner2 is PINNED with its [local] extra, and the pin must stay. The [local] extra is
-    # what makes torch/transformers/peft DECLARED dependencies of the pin: newer gliner2
-    # releases moved them out of the base install (PyPI base now ships only
-    # pydantic/requests/tqdm/urllib3), so a bare "gliner2" resolves them to NOTHING and the
-    # Docker build dies at the GLiNER2 pre-download step with
-    # `ModuleNotFoundError: No module named 'torch'` — a build break with NO source change
-    # behind it. The 1.3.2 -> 2.1.0 package upgrade was measured GO on the 39-case
-    # D1_HYBRID span checkpoint (fastino/gliner2-base-v1, 87.2% == baseline, byte-identical
-    # typed spans on the six canonical labels — see the benchmark note in src/api/main.py);
-    # the load/extract/classify call shapes are unchanged. The GLiNER2.5 MODEL swap is NOT
-    # part of this pin. transformers is floored at 4.57 (verified through 5.22.x). A new
-    # major means re-measuring the same benchmark — a measured decision, never a silent one.
+    # PINNED, and it must stay pinned. 2026-08-27: an UNPINNED gliner2 silently absorbed a
+    # MAJOR bump (1.3.2 -> 2.0.0) which moved transformers/torch/peft/safetensors out of
+    # the base install and into an optional [local] extra. The image build then died at the
+    # GLiNER2 pre-download step with ModuleNotFoundError: No module named 'transformers'
+    # (Dockerfile:34) - a build break with NO source change behind it, discovered only
+    # because a deploy was attempted. 1.3.2 is the version the RUNNING pre-prod image
+    # carried (live: gliner2 1.3.2 / transformers 4.57.6 / torch 2.13.0+cpu / tokenizers
+    # 0.22.2), per the standing rule: moving to 2.x means gliner2[local] AND re-validating
+    # Pitfall 11 (label purity / detection rate) against a major version - a measured
+    # decision, never a silent one.
+    # 2026-11-06 UPGRADE, EVIDENCED (harness + gates: benchmarks/gliner25_upgrade/, report:
+    # docs/GLINER2-2.5-UPGRADE-MIGRATION.md). 1.3.2 -> 2.1.0 measured gate-clean on the SAME
+    # span checkpoint (fastino/gliner2-base-v1): 39-case D1_HYBRID intent benchmark 87.2% ==
+    # baseline with 0/10 editor false-CORRECTION and 20/20 STATEMENT; typing on the six
+    # canonical labels byte-identical spans (loose recall 0.837 / F1 0.769 both versions);
+    # CPU latency neutral-to-better. [local] is now EXPLICIT so the 2026-08-27
+    # ModuleNotFoundError class cannot recur: transformers/torch become DECLARED deps of the
+    # pin, not transitive accidents. transformers floored at 4.57 (the live prod version);
+    # harness-verified through 5.22.1. Measured combo: gliner2 2.1.0 / transformers 5.22.1 /
+    # torch 2.15.0+cpu. The GLiNER2.5 MODEL swap (fastino/gliner2.5-base-v1 via AutoExtractor)
+    # is NO-GO as of this revalidation - intent drops to 69.2% / 2-of-10 false-CORRECTION
+    # (Pitfall 11 gate FAIL). Model id changes ONLY via a re-passed benchmark.
     "gliner2[local]==2.1.0",
     "transformers>=4.57,<6",
     "huggingface_hub>=0.23.0,<1.0.0",
-    "psycopg2-binary",
+    "psycopg2-binary>=2.9",
     "httpx",
     "structlog",
     "redis>=5.0",
@@ -47,6 +57,16 @@ dependencies = [
     # VALIDATES each against a reference (RELATIVE_BASE) — a non-date span → None → dropped.
     # NO date guessing: a miss yields NULL event_date, never a fabricated "today".
     "dateparser>=1.2,<2.0",
+    # Deterministic OFFLINE lexical hypernymy for the SYNC L4 is-a ladder
+    # (src/api/wordnet_ladder.py, consumed by main.py::_attach_wordnet_hypernym_ladder). WordNet's
+    # noun hypernym/is-a hierarchy (Princeton WordNet; the "@" pointer = hypernym) supplies the
+    # `subclass_of` rungs (dermatologist→doctor→…, handbag→bag→container…) SYNCHRONOUSLY at ingest so
+    # hypernym aggregation (COUNT/SUM over subclass_of) works at query time. Pure-Python (Apache-2.0),
+    # NO ML/GPU/network — a local corpus lookup, same spirit as dateparser for time. The `wordnet`
+    # (+ `omw-1.4`) CORPUS is NOT bundled with the PyPI wheel — it is BAKED into the image by the
+    # Dockerfile (`python -m nltk.downloader wordnet omw-1.4`, NLTK_DATA baked in). If the corpus is
+    # ever absent at runtime, wordnet_ladder.py fail-safes to a no-op (WordNet miss → async LLM climb).
+    "nltk>=3.8,<4.0",
     # Deterministic calendar delta-arithmetic for the recall EXPOSE+CALC derivation
     # (src/api/main.py::_whole_years_since → dateutil.relativedelta): whole completed
     # years between a stored birth/creation date and today = age / elapsed. Leap- and
@@ -61,6 +81,22 @@ dependencies = [
     # mis-reads spoken initialisms. Optional at runtime: absent → initialism rule + vowel-
     # letter fallback (prose polish only — the article is NOT a det-scorer gold token).
     "inflect>=7.0,<8.0",
+    # pdfplumber : deterministic PDF text + image-XObject geometry for the binary intake lane
+    #   (src/ingest/binary_intake.py). NO LLM on this path — a test greps the module for
+    #   llm_calls/gliner/httpx so a future "use a model for captions" edit trips immediately.
+    #   Licence chain machine-checked, all permissive, NO AGPL: pdfplumber MIT, pdfminer.six MIT,
+    #   Pillow MIT-CMU (HPND), pypdfium2 BSD-3/Apache-2.0 (Google PDFium — NOT MuPDF).
+    #   ⚠️ PyMuPDF is AGPL/Artifex and is FORBIDDEN here — it would threaten the AGPL core's
+    #   single-licence posture.
+    #   ⚠️ IMAGE REBUILD REQUIRED, and this line busts an early Docker COPY layer: the next build
+    #   reinstalls ~2GB of CPU torch + the spaCy model. 20-30 min is EXPECTED, not a hang.
+    "pdfplumber>=0.11,<0.12",
+    # FOSS PORT NOTE (2026-11-15): the saas-lineage pyproject also declares argon2-cffi,
+    # pyotp, itsdangerous, segno, webauthn, cryptography and stripe for the closed
+    # tenant-console auth/billing realm (saas/dashboard_auth.py, saas/crypto.py,
+    # saas/payments_stripe.py). Those modules are not part of the open core and every
+    # import of them in src/ is SAAS_MODE-gated with a guarded, fail-closed fallback —
+    # so the open-core build does not carry those dependencies.
 ]
 
 [project.optional-dependencies]
@@ -84,9 +120,29 @@ test = [
     "pytest-asyncio>=0.23",
     "pytest-mock",
     "requests",
+    # DSN-gated suites (e.g. test_second_clause_alias_grounding_db.py) exercise the
+    # real EntityRegistry against a throwaway postgres; without the driver they skip.
+    "psycopg2-binary>=2.9",
     "fastapi>=0.110",
     "uvicorn[standard]",
     "pydantic>=2.0",
+    # tests/migration_census.py (imported by test_first_boot_migration_corpus) parses the
+    # migration corpus with sqlparse; undeclared, a clean `pip install -e .[test]` collection-errors.
+    "sqlparse",
+]
+docling = [
+    # R5 parser seam (src/ingest/doc_parser.py): OPTIONAL layout-aware CPU parser,
+    # selected by env DOC_PARSER=docling. Deliberately NOT a base dependency — the
+    # base install stays light and the fallback-to-naive contract covers its absence.
+    #
+    # ⚠️ CPU-ONLY HOST CONTRACT: bare `pip install docling` resolves torch to the
+    # CUDA-bundled Linux wheels (measured 2026-10-21: nvidia_cudnn_cu13 ~553 MB and
+    # the rest of the CUDA stack). Install CPU torch FIRST, then docling:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+    #   pip install -e ".[docling]"
+    # doc_parser pins behaviour (AcceleratorDevice.CPU, do_ocr=False) at runtime;
+    # pip cannot carry a per-extra index-url, so the two-step install IS the pin.
+    "docling>=2,<3",
 ]
 
 [project.scripts]
@@ -96,6 +152,13 @@ faultline-mcp = "src.mcp.cli:main"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# importlib import mode: two DIFFERENT test files legitimately share the basename
+# test_per_tenant_isolation_rollback.py (tests/ and tests/embedder/). Under the default
+# prepend mode pytest derives the module name from the basename alone, so the second one
+# collides with the first and the WHOLE run aborts with "import file mismatch" -- no test
+# result at all, from a naming coincidence. importlib gives each file a unique module
+# identity and needs no __init__.py sprinkled through the test tree.
+addopts = "--import-mode=importlib"
 markers = [
     "live: test calls live services (LLM/GLiNER2/DB) — skipped unless RUN_LIVE=1",
 ]

@@ -21,6 +21,18 @@
 # thing that changes between OpenWebUI / LM Studio / Claude is these env values.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── COMPOSE PROJECT NAME — PINNED ON PURPOSE (do not remove) ────────────────────────
+# Compose derives the project name from the DIRECTORY when `name:` is absent. On the pre-prod
+# host this file is rsync'd to /mnt/MAIN/data/docker/faultline/, which derives `faultline` — the
+# SAME project label Portainer stack 55 runs under — so a stray `docker compose up` there matched
+# stack 55's running services by (project, service) label and RECREATED them onto this file's
+# volumes (measured 2026-09-14: postgres/redis rebound to stale volumes, the API left in
+# `Created`). Pinning the name makes that mistake fail LOUD instead: Docker refuses the
+# container_name conflicts ("name already in use") and touches nothing. Locally this equals the
+# directory-derived name already in use (FaultLine-dev → faultline-dev), so volumes are unchanged.
+# Pre-prod is deployed ONLY via Portainer stack 55 — see tools/preprod_deploy.py.
+name: faultline-dev
+
 services:
 
   # ── FaultLine backend API ───────────────────────────────────────────────────
@@ -28,22 +40,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Baked CPU models are BUILD-time config (the wheel is downloaded at build). Defaults live in
+      # the Dockerfile ARGs (validated en_core_web_sm / nomic); override here via .env if needed.
       args:
-        # MUST be a BUILD ARG, not just runtime env: the model wheel is BAKED into the image
-        # (Dockerfile `ARG SPACY_MODEL`). Setting SPACY_MODEL only in .env would leave the
-        # image carrying the English model while the runtime asked for another one — and the
-        # linguistic layer NO-OPs silently when the requested model isn't baked. That would
-        # make a non-English language choice quietly half-inert.
-        #
-        # ⚠️ NOT A PARITY CLAIM. The spine's dependency chains are built and validated against
-        # ENGLISH. Pointing the parser at it_core_news_sm / es_core_news_sm makes it match the
-        # text; it does not make the chains correct for that language. Portable in principle
-        # (the UD features they key on exist in these models), UNMEASURED in practice.
+        # ⚠️ The spine deriver's chains (possessive / genitive-name / copula-measure, and the
+        # Person=1 / Poss=Yes morphology they key on) are BUILT AND VALIDATED AGAINST ENGLISH.
+        # A non-English install sets this from the language gate (es_core_news_sm /
+        # it_core_news_sm) so the parser at least matches the text — but the chains are
+        # PORTABLE IN PRINCIPLE, NOT PROVEN. The UD features exist in those models; nobody has
+        # measured the chains against them. Do not read a language switch as parity.
         SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
+        FASTEMBED_MODEL: ${FASTEMBED_MODEL:-nomic-ai/nomic-embed-text-v1.5}
     image: faultline:latest
     container_name: faultline-api
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       # INSTALL LANGUAGE — set by quickstart.py's language gate; both EMPTY for English, which
       # makes the entrypoint's collation guard a total no-op (not one query issued).
@@ -70,23 +83,27 @@ services:
       LLM_BACKEND_TYPE: ${LLM_BACKEND_TYPE:-ollama}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen2.5}
-      CATEGORY_LLM_MODEL: ${CATEGORY_LLM_MODEL:-qwen2.5}
+      # Model identity is pure config (resolved via LLMModels; NO literals in code). Base model for
+      # every operation = WGM_LLM_MODEL; pattern-extraction (re_embedder) = PATTERN_EXTRACTION_MODEL
+      # (falls back to WGM_LLM_MODEL when unset); optional per-op override = LLM_MODEL_<OP>.
+      WGM_LLM_MODEL: ${WGM_LLM_MODEL:-qwen/qwen3.5-9b}
+      PATTERN_EXTRACTION_MODEL: ${PATTERN_EXTRACTION_MODEL:-qwen/qwen3.5-9b}
+
+      # Feature flags — these carry the family/relational + temporal + dash-specifier capture work
+      # and are required ON to reproduce the validated 10/10. Code-default is OFF; set ON for the
+      # full feature set (overridable in .env).
+      SENTENCE_PIPELINE: ${SENTENCE_PIPELINE:-true}
+      SPINE_NAMING_CHAIN: ${SPINE_NAMING_CHAIN:-true}
 
       # FaultLine self-reference + tuning
       FAULTLINE_API_URL: ${FAULTLINE_API_URL:-http://faultline:8000}
-      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-10}
+      # Re-embedder poll interval (seconds). Prod-sane default; do NOT carry the local test value 86400.
+      REEMBED_INTERVAL: ${REEMBED_INTERVAL:-300}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-100}
       FAULTLINE_LOG_LEVEL: ${FAULTLINE_LOG_LEVEL:-INFO}
-
-      # ── FOSS control plane (operator webui on :8000/) ────────────────────────
-      # Operator bearer for /api/dashboard/* (seats, tokens, LLM Brain, MCP key).
-      # Unset → the backend auto-mints a random one and prints it once to the logs
-      # (look for the FAULTLINE_ADMIN_TOKEN line). Set it here to pin a known value.
-      FAULTLINE_ADMIN_TOKEN: ${FAULTLINE_ADMIN_TOKEN:-}
-      # Optional friendly MCP URL shown in the OpenWebUI tab (defaults derived).
-      MCP_EXTERNAL_URL: ${MCP_EXTERNAL_URL:-}
+      # SaaS account layer (CLOSED-SOURCE, flag-gated). OFF (default) == today's behavior.
+      # BYO-LLM engine brain: master key to decrypt per-tenant LLM creds + SSRF egress allowlist.
     extra_hosts:
       # Lets the container reach an LLM running on the Docker host.
       - "host.docker.internal:host-gateway"
@@ -115,15 +132,44 @@ services:
     entrypoint: ["python", "tools/mcp_server.py", "--transport", "http", "--port", "8002"]
     ports:
       - "8002:8002"
+    env_file:
+      - .env
     environment:
       FAULTLINE_API_URL: http://faultline:8000
       FAULTLINE_USER_ID: ${FAULTLINE_USER_ID:-}
       MCP_API_KEY: ${MCP_API_KEY:-}
-      # Shared postgres — lets the MCP server validate per-seat tokens minted
-      # from the control-plane webui AND honour rotated MCP keys immediately
-      # (dashboard_seats / dashboard_mcp_keys tables, public schema). Falls back
-      # to MCP_API_KEY env when the tables are empty or the DB is unreachable.
+      # SaaS account layer — the MCP container enforces the seat check + hosts /admin.
       POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://faultline:faultline@postgres:5432/faultline}
+      # Tenant-console human auth (signed sessions) + BYO-LLM cred encryption + SSRF egress.
+      # Onboarding (Phase 4): customer-facing MCP URL advertised in the config blob, and
+      # OneTimeSecret credentials for the one-time onboarding link (all optional — onboard
+      # falls back to returning the raw instruction blob when OTS is unset).
+      OTS_API_URL: ${OTS_API_URL:-}
+      OTS_USERNAME: ${OTS_USERNAME:-}
+      OTS_APITOKEN: ${OTS_APITOKEN:-}
+      # first-touch-cold-path round 6 — the episodic re-append drain's durability + shutdown fit.
+      # The spool holds every retained-turn re-append that is not yet CONFIRMED by an answered
+      # /episodic/append; it must live on a MOUNTED, WRITABLE (uid 10001) path or a recreate
+      # destroys it. The stop grace is raised so the shutdown flush (MCP_EPISODIC_SHUTDOWN_FLUSH_S,
+      # default half the grace, <= 5s) can land before SIGKILL; MCP_STOP_GRACE_S mirrors it so the
+      # process derives its budget from the same number.
+      MCP_EPISODIC_SPOOL_DIR: /var/lib/faultline-mcp/spool
+      MCP_STOP_GRACE_S: "30"
+      # Provisioning-kick spacing for the episodic drain (round 11). `${VAR-120}` (single dash)
+      # passes an EMPTY shell value through as empty — so a local drive can hand the container a
+      # bad knob and prove it boots on the default with one WARN (round 12), unset → 120.
+      MCP_EPISODIC_PROV_KICK_INTERVAL_S: "${MCP_EPISODIC_PROV_KICK_INTERVAL_S-120}"
+      # round 13: same pass-through for one int knob and one float knob so a local drive can hand
+      # the container `inf` / `1e400` and prove it boots on the defaults with one WARN each.
+      MCP_INGEST_RETRY_ATTEMPTS: "${MCP_INGEST_RETRY_ATTEMPTS-3}"
+      MCP_EPISODIC_REAPPEND_BASE_S: "${MCP_EPISODIC_REAPPEND_BASE_S-2.0}"
+      # round 15: the two function-level knobs the critic hung a first turn with, plus the turn wall
+      MCP_PROVISIONING_POLL_SEC: "${MCP_PROVISIONING_POLL_SEC-2.0}"
+      MCP_BRAIN_TIMEOUT_CLASSIFY_INTENT: "${MCP_BRAIN_TIMEOUT_CLASSIFY_INTENT-10.0}"
+      MCP_TURN_WALL_S: "${MCP_TURN_WALL_S-240}"
+    volumes:
+      - mcp-spool:/var/lib/faultline-mcp/spool
+    stop_grace_period: 30s
     depends_on:
       - faultline
     networks:
@@ -146,10 +192,10 @@ services:
       #
       # EMPTY for English = today's behaviour byte-for-byte (the postgres image default). A
       # non-English install sets it from the language chosen in quickstart.py, e.g.
-      #   POSTGRES_INITDB_ARGS=--locale-provider=icu --icu-locale=es-ES --encoding=UTF8
+      #   POSTGRES_INITDB_ARGS=--locale-provider=icu --icu-locale=it-IT --encoding=UTF8
       #
       # ICU, not libc, DELIBERATELY: this image ships NO es_*/it_* OS locales (`locale -a` finds
-      # none), so `--locale=es_ES.utf8` FAILS outright. ICU carries its own locale data and needs
+      # none), so `--locale=it_IT.utf8` FAILS outright. ICU carries its own locale data and needs
       # nothing installed. Requires PG15+; this image is 16.
       #
       # ⚠️ Only applies when the data volume is EMPTY. Against an existing volume initdb never
@@ -215,6 +261,18 @@ volumes:
   qdrant_data:
   redis_data:
   ollama_data:
+  # Episodic re-append spool for faultline-mcp (round 6). A PLAIN named volume is root-owned when
+  # its mountpoint does not exist in the image, and the runtime user is uid 10001 — so it is bound
+  # to a host directory the runtime user can write (create it with `mkdir -p .mcp-spool && chmod
+  # 1777 .mcp-spool`, or chown it to 10001). A plain named volume works once the Dockerfile
+  # creates the mountpoint owned by the runtime user (`mkdir -p /var/lib/faultline-mcp/spool &&
+  # chown 10001:10001 ...`) — that is a Dockerfile change, another lane's file.
+  mcp-spool:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${MCP_SPOOL_HOST_DIR:-${PWD}/.mcp-spool}
 
 networks:
   faultline-net:

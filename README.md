@@ -40,6 +40,10 @@ Facts are stored as typed relationships — person, age, occupation, network dev
 
 `/expand networking` teaches FaultLine how networking works before you mention your first device. `/expand kubernetes online https://kubernetes.io/docs/concepts/` reads the actual docs and builds the ontology from them. You point it at the source, it learns the structure, and every fact you mention in that domain from then on is stored and retrieved in context — not as an isolated string. And everything it learns is still correctable by you.
 
+### 6. The agent gets its own memory, too
+
+FaultLine no longer stores only what *you* tell it. The AI now keeps its **own** operating memory — the gotchas it hit, the corrections it was given, the procedures that worked — in a *second, firewalled* store that never mixes with your facts. One substrate, two memories: your grounded knowledge on one side, the agent's own working notes on the other, each walled off from the other by the database. ([how it works ↓](#the-agent-gets-its-own-memory-too))
+
 ---
 
 ## What it looks like in practice
@@ -78,6 +82,28 @@ AI:   "Your firewall OPNsense is a networking device — I have that from earlie
 - Relevant facts are injected into the conversation before the AI responds
 - Memories strengthen with confirmation; corrections archive the old value cleanly
 - `/expand <topic>` teaches FaultLine how a domain is structured so facts about it land correctly
+
+---
+
+## The agent gets its own memory, too
+
+Every memory system so far — including the rest of this README — stores what the *human* said. FaultLine now also gives the **AI its own memory**: a separate, private place for the agent to record *how to operate* — the gotchas it hit, the corrections it was handed, the procedures that worked — so it stops repeating its own mistakes.
+
+This is not the user's memory wearing a different label. It's a **second memory** that lives beside the first, and the two never touch:
+
+- **Your memory** — your grounded facts: people, devices, IPs, preferences. Validated, correctable, user-is-truth. (Everything above.)
+- **The agent's memory** — the *cortex*: the agent's own operating notes, in its own voice ("`docker restart` won't adopt a new image"; "this location anchor is thin — check the backstop"). **Never a user fact, and never served as one.**
+
+**The two are firewalled — structurally, not by policy.** The cortex gets its **own PostgreSQL schema** (`flagent_<id>`, separate from your `faultline_<id>`) and its **own vector collection**, bound the same isolation way as everything else — `SET search_path` *without* `public`. So the walk that answers *your* questions physically cannot name the agent's notes, and an agent note can never surface as if you'd said it. The boundary **is** the schema, enforced by the database — the same guarantee that keeps one user's memory out of another's. Each user carries both memories, walled off from each other and from every other user's.
+
+**How the agent uses it — two MCP tools that mirror the user-facing pair:**
+
+- **`cortex_remember`** — the agent records an operational note ("noted for myself — not something you told me"). Say the same lesson three times and it **hardens into a rule**.
+- **`cortex_recall`** — the agent pulls its relevant notes back *before* it acts. Recall is **hybrid**: deterministic keyword + tag matching, plus a semantic lane over the cortex's own vector index that ranks a note by how far it **stands out from the field** (a relative margin, not a brittle fixed similarity cutoff) — so a note surfaces whether or not it's phrased the same way, and the lane stays quiet when nothing is genuinely relevant.
+
+Notes are captured automatically as the agent works — a correction it receives, a trap worth flagging next time, surfaced just in time — and can also be written explicitly. And because a cortex note is just text in Postgres delivered over MCP, it's **model-agnostic**: swap the underlying model and the agent's accumulated operating memory comes along unchanged.
+
+*Shipped: the per-user cortex store, the `cortex_remember` · `cortex_recall` MCP tools, hybrid keyword + semantic recall, harden-on-repeat, and automatic capture.*
 
 ---
 
@@ -270,31 +296,29 @@ FaultLine ships a `.mcpb` extension for one-click installation in Claude Desktop
 
 ### Install the extension
 
-1. Build the extension (requires Python):
+1. Build the extension (requires Python; values are baked in at build time):
    ```bash
-   cd tools/claude-desktop
-   python build_mcpb.py
-   # → produces faultline.mcpb
+   # from the repo root, so tools.claude_desktop_bundle resolves
+   python3 tools/claude-desktop/build_mcpb.py \
+     --user-id "$(python3 -c 'import uuid; print(uuid.uuid4())')" \
+     --url http://localhost:8002/mcp \
+     --token "$MCP_API_KEY"
+   # → produces tools/claude-desktop/faultline.mcpb
    ```
+   Env fallbacks: `FAULTLINE_USER_ID`, `FAULTLINE_MCP_URL`, `MCP_API_KEY`.
+   The **User ID** isolates your memory store — if you also use OpenWebUI, use the same
+   UUID from **OpenWebUI → Settings → Account** so both clients share one memory store.
 
 2. In Claude Desktop: **Settings → Extensions → Advanced settings → Install Extension** → select `faultline.mcpb`
 
-3. Claude Desktop prompts for three values:
-
-   | Field | What it is | How to get it |
-   |---|---|---|
-   | **FaultLine MCP URL** | HTTP endpoint for the MCP server | Default: `http://localhost:8002`. Change the host if FaultLine runs on another machine. |
-   | **User ID** | UUID that isolates your memory store | Generate one: `python -c "import uuid; print(uuid.uuid4())"`. If you also use OpenWebUI, use the same UUID from **OpenWebUI → Settings → Account** so both clients share one memory store. |
-   | **MCP API Key** | Bearer token for authentication | Must match `MCP_API_KEY` in your `.env`. Generate one: `python -c "import secrets; print(secrets.token_hex(32))"` |
-
-4. Make sure your Docker stack is running (`docker compose up -d`) — the extension connects to the MCP server at port 8002.
+3. Make sure your Docker stack is running (`docker compose up -d`) — the extension connects to the MCP server at port 8002.
 
 ### How it works
 
-The extension is a thin stdio-to-HTTP proxy. Claude Desktop spawns it as a local process; it forwards JSON-RPC messages to your Docker MCP server. No SDK dependencies — just Python stdlib.
+The extension is a zero-dependency stdio-to-HTTP proxy in Node.js. Claude Desktop ships its own Node runtime and spawns the proxy as a local process; it forwards JSON-RPC messages to your Docker MCP server. Nothing to install, nothing to fetch at launch.
 
 ```
-Claude Desktop (stdio) → faultline_proxy.py → HTTP → localhost:8002/mcp → Docker
+Claude Desktop (stdio) → node server.js → HTTP → localhost:8002/mcp → Docker
 ```
 
 ### Alternative: direct HTTP (Streamable HTTP clients)
@@ -319,11 +343,14 @@ MCP clients that support HTTP transport directly (no stdio needed) can connect w
 | `recall_memory` | Query the knowledge graph — retrieves facts relevant to the conversation |
 | `remember_facts` | Extract and store facts from conversation text |
 | `ingest_document` | Store a document/article/long-form text; chunked and mined for facts |
-| `learn_facts` | Ingest structured ontological statements directly (`X is a subclass of Y`, …) |
+| `learn_facts` | Ingest structured ontological statements directly (`X is a subclass of Y`, …; also the `/expand` entry point) |
 | `retract_fact` | Remove a fact from the knowledge graph (natural-language retraction) |
 | `forget_fact` | Tombstone ONE specific named fact (`subject` + optional `rel_type`/`old_value`) |
+| `cortex_remember` | *(agent cortex)* the model records its own operational note |
+| `cortex_recall` | *(agent cortex)* the model recalls its own operational notes |
 
-All six tools are backed by the same store your OpenWebUI conversations write to.
+The first six read and write **your** memory; `cortex_remember` / `cortex_recall` reach only the
+agent's own firewalled cortex. All of them are backed by the same store your OpenWebUI conversations write to.
 
 ### System prompt (important)
 

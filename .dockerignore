@@ -1,27 +1,23 @@
-# Development artifacts
-dprompt-*.md
-scratch*.md
-DEEPSEEK_INSTRUCTION_TEMPLATE.md
-compact-instruct.md
-CLAUDE.md
+# CONTEXT WHITELIST (ported from the private line, 2026-11-15) — SUPERSEDES the
+# exclude-list approach. The legacy builder on a deploy host (DOCKER_BUILDKIT=0)
+# tar-streams the ENTIRE context to the daemon BEFORE the first RUN step. Residue in
+# the checkout (DEV/, benchmarks/, scratch docs, venvs) otherwise rides to the daemon
+# and can put the build in a long zero-step "Sending build context" stall.
+# Whitelist EXACTLY what the Dockerfile COPYs; everything else stays on the host, out
+# of the context. Image layers are IDENTICAL: this changes only what rides to the daemon.
+*
+!Dockerfile
+!pyproject.toml
+!docker-entrypoint.sh
+!src
+!migrations
+!tools
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.venv/
-venv/
-
-# Git
-.git/
-.gitignore
-
-# Tests and dev scripts
-tests/
-check_entity_ids.py
-scripts/
-
-# Logs and temp
-*.log
-.deepseek/
+# nested junk patterns REMAIN necessary on top of the whitelist: re-including a
+# top-level dir (src, tools, ...) re-admits EVERYTHING under it, so fossil
+# __pycache__/*.pyc inside keep-dirs rides unless explicitly re-excluded. Caught
+# live 2026-10-16 on the private line: a stale src/api/__pycache__ pyc failed the
+# Dockerfile non-root readability gate.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/

@@ -24,15 +24,15 @@ FaultLine solves this by **actually remembering things you say** and using those
 
 When you say something to the assistant, FaultLine listens for facts.
 
-**Example:** "My son Alex is 12, and my wife is Jordan."
+**Example:** "My son Des is 12, and my wife is Marla."
 
 FaultLine identifies:
-- **Fact 1:** Alex is a son (relationship: parent_of)
-- **Fact 2:** Jordan is a wife (relationship: spouse)
-- **Fact 3:** Alex's age is 12 (attribute)
+- **Fact 1:** Des is a son (relationship: parent_of)
+- **Fact 2:** Marla is a wife (relationship: spouse)
+- **Fact 3:** Des's age is 12 (attribute)
 
 **But wait, you might correct yourself:**
-- "Actually, Alex is 14, not 12"
+- "Actually, Des is 14, not 12"
 
 FaultLine notices the correction word "Actually" and marks it as an override. Your correction wins over any AI guess.
 
@@ -52,28 +52,28 @@ Now FaultLine validates these facts before storing them.
   - YES? Use what we know about it
   - NO? Learn it as something new
   
-- "Is Alex a known type of person?"
+- "Is Des a known type of person?"
   - YES? Skip
-  - NO? Remember Alex is a person
+  - NO? Remember Des is a person
 
 - "Does this conflict with anything we know?"
-  - Example: Can't have "Alex is a type of dog" AND "Alex is your son" at the same time
+  - Example: Can't have "Des is a type of dog" AND "Des is your son" at the same time
 
 **Then it stores the fact with a confidence level:**
-- **High confidence (you said it directly):** "My son Alex" → stored immediately ✓
-- **Medium confidence (AI inferred it):** "Based on context, Alex is probably 14" → ask for confirmation ⚠️
-- **Low confidence (AI guessed something new):** "Alex might be a Gemini zodiac sign" → hold for later evaluation ❓
+- **High confidence (you said it directly):** "My son Des" → stored immediately ✓
+- **Medium confidence (AI inferred it):** "Based on context, Des is probably 14" → ask for confirmation ⚠️
+- **Low confidence (AI guessed something new):** "Des might be a Gemini zodiac sign" → hold for later evaluation ❓
 
 ---
 
 ### Step 3: Use It (Recall)
 
-Later, you ask: "How old is Alex?"
+Later, you ask: "How old is Des?"
 
 FaultLine:
-1. **Finds all relevant facts** about Alex
-   - Direct facts: Alex is your son, age is 14
-   - Connections: Alex is connected to you, to Jordan
+1. **Finds all relevant facts** about Des
+   - Direct facts: Des is your son, age is 14
+   - Connections: Des is connected to you, to Marla
    - Context: Related to family memories
 
 2. **Checks for consistency**
@@ -81,12 +81,12 @@ FaultLine:
    - Is the source trustworthy? Yes (you said it)
 
 3. **Tells the AI**
-   - Adds to context: "You have a son named Alex who is 14"
+   - Adds to context: "You have a son named Des who is 14"
    - The AI sees this before answering
 
 4. **AI responds naturally**
-   - "Alex is 14 years old. How is he doing?"
-   - No guessing, no forgetting, no asking "who is Alex?"
+   - "Des is 14 years old. How is he doing?"
+   - No guessing, no forgetting, no asking "who is Des?"
 
 ---
 
@@ -107,8 +107,7 @@ Example:
 - We KNOW Toronto is in Canada from data
 - We NEVER confuse one for the other
 
-FaultLine does not use vector search for user memory at all — the vector tier is
-retired. Every fact lives in PostgreSQL, and **facts decide what's true**.
+Vectors help us find related memories, but **facts decide what's true**.
 
 ---
 
@@ -138,12 +137,12 @@ Facts get stored in different places depending on what they are:
 | Type | Example | Storage | Purpose |
 |------|---------|---------|---------|
 | **Attributes** | "age = 14" | Single value table | Quick lookup |
-| **Relationships** | "spouse → Jordan" | Connection graph | Find connected people |
-| **Classifications** | "Alex is a Person" | Hierarchy | Understand what things are |
+| **Relationships** | "spouse → Marla" | Connection graph | Find connected people |
+| **Classifications** | "Des is a Person" | Hierarchy | Understand what things are |
 
 This matters because the system can answer different questions efficiently:
-- "How old is Alex?" → Quick attribute lookup
-- "Who is Alex connected to?" → Graph traversal
+- "How old is Des?" → Quick attribute lookup
+- "Who is Des connected to?" → Graph traversal
 - "What am I?" → Hierarchy traversal
 
 ---
@@ -153,32 +152,28 @@ This matters because the system can answer different questions efficiently:
 Not all facts are equal.
 
 **Class A — You said it directly**
-- "My name is Sam"
+- "My name is Chris"
 - Confidence: 100% (1.0)
-- Storage: Permanent (lands in `facts` immediately; never reclassified)
+- Storage: Permanent (in `facts` immediately; never reclassified)
 
 **Class B — AI inferred it following the established ontology**
 - AI saw: "I work at Acme Corp" (Acme's ontology already exists)
-- Confidence: 80% (0.8), or 60% (0.6) if the ontology had to be created in-flow
-- Storage: Lives in `staged_facts` first; **materializes** into `facts` once it has been
-  confirmed 3 times — still Class B, NOT promoted to A
+- Confidence: 80% (0.8) or 60% (0.6) if ontology was created in-flow
+- Storage: Lives in `staged_facts` first; **materializes** into `facts` (still Class B — NOT promoted to A) once it's been seen 3 times
 
 **Class C — AI guessed something new (no ontology yet)**
 - AI inferred: "You might be interested in gardening" (based on one mention)
 - Confidence: 40% (0.4)
-- Storage: Temporary (30-day expiry). If it keeps showing up — or keeps being recalled —
-  it **graduates to Class B** at the 3-confirmation threshold. That is the only tier
-  change in the system.
+- Storage: Temporary (30-day expiry). If it keeps showing up — or keeps being recalled — it **graduates to Class B** at the 3-confirmation threshold (the only tier change in the system). If a recall hit keeps bumping it, the same C→B graduation fires.
 
-**Why?** Because corrections from you matter most. AI guesses come second. Random patterns
-expire. A and B never change class; only C ever promotes, and only to B.
+**Why?** Because corrections from you matter most. AI guesses come second. Random patterns expire. A and B never change class; only C ever promotes (to B).
 
 ---
 
 ## Example: Full Cycle
 
 ### Day 1
-**You say:** "My son Alex is 12, and my wife is Jordan"
+**You say:** "My son Des is 12, and my wife is Marla"
 
 FaultLine:
 - Extracts facts
@@ -187,7 +182,7 @@ FaultLine:
 - Learns: parent_of relationship, spouse relationship
 
 ### Day 2
-**You say:** "Actually Alex is 14 now"
+**You say:** "Actually Des is 14 now"
 
 FaultLine:
 - Detects the correction
@@ -198,10 +193,10 @@ FaultLine:
 **You ask:** "Tell me about my family"
 
 FaultLine:
-- Retrieves: Alex (son, age 14), Jordan (spouse)
-- Formats naturally: "Your son Alex is 14 and your wife is Jordan"
+- Retrieves: Des (son, age 14), Marla (spouse)
+- Formats naturally: "Your son Des is 14 and your wife is Marla"
 - Injects into AI context
-- AI responds: "You have a son Alex who is 14 and a wife Jordan. That's a nice family! How are they doing?"
+- AI responds: "You have a son Des who is 14 and a wife Marla. That's a nice family! How are they doing?"
 
 **No guessing. No forgetting. Just remembering.**
 
@@ -215,7 +210,7 @@ FaultLine:
 - Hallucinations: "Your son is probably named John" (just guessing)
 
 **FaultLine-Enhanced AI:**
-- "Your son Alex is 14 and your wife is Jordan"
+- "Your son Des is 14 and your wife is Marla"
 - Remembers across conversations
 - Never guesses about your personal facts
 - Asks for clarification if unsure

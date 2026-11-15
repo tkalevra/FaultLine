@@ -16,22 +16,27 @@ If you discover a security vulnerability in FaultLine, please email **security@f
 
 ### Data Protection
 
-- **PostgreSQL:** Use strong credentials and enable SSL/TLS for production. Restrict network access to database via firewall rules.
-- **Qdrant:** The vector tier is **retired for user memory** and holds no user facts. If the service runs in your stack, still protect it with authentication and network isolation.
+- **PostgreSQL:** Use strong credentials and enable SSL/TLS for production. Restrict network access to database via firewall rules. Holds authoritative Class A/B memory.
+- **Qdrant:** Vector database serves ONLY the agent cortex (the per-seat `flagent-<uuid>` collection) — it no longer holds any user memory. User memory (Class A/B/C, including the short-term Class-C tier) lives entirely in PostgreSQL (`facts`/`staged_facts`/`episodic_log`); the user-memory vector tier is retired (`USER_MEMORY_VECTOR_LANE=false` in production, implemented + validated on pre-prod). Protect Qdrant with authentication and network isolation.
 - **Redis:** Used for rate limiting and event queues. Configure password authentication and disable SAVE/BGSAVE in production if using ephemeral queues.
 - **Entity UUIDs:** UUIDs are v5 surrogates derived from display names, not cryptographic identifiers. Do not rely on UUID uniqueness for security purposes.
 
 ### LLM Integration
 
 - **OpenWebUI Credentials:** Protect API tokens and bearer credentials. Use environment variables or secrets management, never hardcode in source.
-- **LLM Endpoint:** All LLM calls flow through a centralized `_get_llm_url()` function with fallback chain (env var → Docker service name → localhost). Verify endpoint configuration in production.
-- **Prompt Injection:** LLM prompts are populated from database metadata (rel_types table descriptions, entity names). Validate and sanitize all user input before persisting to database.
+- **LLM Endpoint:** All LLM calls flow through a centralized client (`src/api/llm_calls.py` + `src/api/llm_client.py`); the endpoint resolves from `LLM_BACKEND_TYPE` + `LLM_BASE_URL` (host+port only). Verify endpoint configuration in production. Per-operation timeouts and token budgets are env-overridable via `LLM_TIMEOUT_<OP>` / `LLM_MAX_TOKENS_<OP>` — never hardcode.
+- **Prompt Injection:** LLM prompts are populated from database metadata (rel_types table descriptions, entity names). Validate and sanitize all user input before persisting to database. A pre-flight injection-signal detector gates `remember_facts` (`src/mcp/server.py`).
 
 ### Authentication & Authorization
 
-- **OpenWebUI Integration:** FaultLine trusts OpenWebUI's user authentication. User UUIDs are passed by OpenWebUI filter layer; do not accept user_id from HTTP headers directly.
-- **Per-Tenant Isolation:** Each user's memory lives in its own PostgreSQL schema (`faultline_{user_id}`), bound per request via `search_path`. The schema **is** the tenant boundary — there is no shared `user_id` column to filter on and forget. Ensure OpenWebUI forwards the authenticated user identity (the `X-OpenWebUI-User-Id` header) so requests bind to the correct schema.
-- **Rate Limiting:** Per-user rate limit (default 100 req/min) is enforced at `/query` and `/ingest` endpoints. Configure via `RATE_LIMIT_PER_MIN` environment variable.
+- **MCP transport auth:** The public core requires `MCP_API_KEY` as a Bearer token on every `POST /mcp` and REST-shorthand call (`src/mcp/http_server.py:555,652`). Unauthenticated mode (key unset) is for dev/localhost ONLY. (The managed SaaS offering layers its own account/seat auth on top of this transport; that model is documented with the SaaS offering, not in this public security doc.)
+- **Per-user identity:** The MCP transport resolves caller identity ONCE via `bind_tenant` from `X-OpenWebUI-User-Id` (OpenWebUI header) or `arguments.user_id`, validates it as a well-formed UUID, and binds `SET search_path TO faultline_{user_slug}` **without `public`** for every backend call. A malformed or unauthorized claim fails loud (400/403), never silently routes to a shared pool.
+- **Per-User Isolation:** User memory is isolated per PostgreSQL schema (`faultline_{user_slug}`) via `SET search_path` **without `public`** — that schema boundary IS the tenant isolation (no shared `user_id` column to filter on and forget). Under `USER_MEMORY_VECTOR_LANE=false` there are no per-user Qdrant collections for user memory; the cortex collections (`flagent-<uuid>`) are per-seat and structurally firewalled from user memory.
+- **Rate Limiting:** Per-user_id tracking, 100 req/min default, enforced at `/query` and `/ingest`.
+
+### Transport Hardening
+
+- **Security response headers middleware:** every MCP response carries safe-default headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `Cross-Origin-Resource-Policy`, and a strict `Content-Security-Policy`) — `src/mcp/http_server.py:84-154`. Additive + reversible via `MCP_SECURITY_HEADERS=0`. This is a public-core control (SOC 2 CC6.6/CC6.7 boundary protection), not SaaS-specific.
 
 ### Known Issues & Workarounds
 
@@ -97,4 +102,4 @@ FaultLine implements best practices for open-source security:
 ## Contacts
 
 **Security:** security@faultline.local  
-**Issue Reports:** [GitHub Issues](https://github.com/tkalevra/FaultLine/issues)
+**Issue Reports:** [GitHub Issues](https://github.com/tkalevra/FaultLine-dev/issues)

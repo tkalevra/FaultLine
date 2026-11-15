@@ -39,17 +39,41 @@ secrets.json
 # Claude Code (dev-only, contains session data and skills)
 .claude/
 
-# Dev-only documentation (internal topology, operational prompts, bug reports)
+# Dev-only documentation and scratch trees — never part of the open core
 DEV/
 BUGS/
+PROMPTS/
+IMPROVEMENTS/
+SECURITY/
+archive/
+benchmarks/
+compliance/
+ops/
+MCP-REFACTOR/
 
-# Test suites (contain internal URLs, user IDs, test fixtures)
+# External test scratch suites. The TRACKED suite lives in lowercase tests/ — a blanket
+# 'tests/' rule here silently skipped every NEW test file at git-add time (tracked files
+# kept committing, so the trap was invisible): this line hit exactly that with
+# tests/conftest.py (dc0c00c6). Rule removed 2026-11-15 (ported from the private line's
+# 2026-11-04 fix); if untracked test artifacts ever need ignoring, add a NARROW rule,
+# never the tree itself.
 TESTS/
-tests/
+
+# MCP document-lane spool — the compose `mcp-spool` volume bind-mounts ${PWD}/.mcp-spool
+# at runtime. Without this rule a `git add -A` sweeps live document chunks into a commit.
+.mcp-spool/
+
+# Local rig compose override — environment-specific, points at a .env that is itself
+# gitignored. Committing it would pin one machine's brain choice.
+docker-compose.override.yml
+
+# Agent worktrees — local scratch, never part of the tree
+.worktrees/
 
 # Test result artifacts
 *.pyc
 __pycache__/
+.pre-prod-env
 
 # Local API-key / credential drop files. NEVER commit — this is a PUBLIC repo.
 # A key file was found untracked in this working tree on 2026-07-30; these patterns
