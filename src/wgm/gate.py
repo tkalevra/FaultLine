@@ -249,10 +249,10 @@ def _type_mismatch_refuse_on() -> bool:
 # ── STORED-TYPE PRECEDENCE (the convergence residual: the T04 pet misroute) ─────────
 # THE WOUND (acceptance5, seat 19fa579d, image c27d55211d, 2026-11-15 — kept-seat
 # forensics re-measured on residual-autopsy4 seat 6c891e26: marla1.entity_type='Person'
-# and fraggle.entity_type='Animal' were CORRECT in the DB the whole time): "Fraggle is
+# and luna.entity_type='Animal' were CORRECT in the DB the whole time): "Luna is
 # Mars's morkie." still type_refused because the REFUSAL CHECK validated the CALLER-
 # PASSED per-mention surface guesses ('mars' → LOCATION by the planet heuristic,
-# 'fraggle' → PERSON by the name NER) against has_pet's declared {Person}/{Animal} —
+# 'luna' → PERSON by the name NER) against has_pet's declared {Person}/{Animal} —
 # the stored world-model types never got a vote. ``_membership_retype_blocked`` had
 # already stopped the DB retype path (the types above are clean), but the EXTRACTION's
 # mention-time types still overrode them at the check. THE CONTRACT (the same

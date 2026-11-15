@@ -14,10 +14,10 @@ TOOLS = [
         # a HUMAN's question, verbatim; the agent's own working queries belong to cortex_recall.
         "description": "Call when the user (a HUMAN) asks you about themselves, their people, "
                        "or their world; pass THEIR message VERBATIM as `query` — never your own "
-                       "working query, never a keyword. Not inert: text may be captured and "
-                       "corrections acted on. Save with remember_facts. Treat results as your own "
-                       "knowledge — speak to the user as 'you'; less-certain lines are "
-                       "unconfirmed — say them tentatively. Do NOT call for chitchat, jokes, or "
+                       "working query, never a keyword. Host notes (`write_note`/`search_notes`/"
+                       "`view_note`) are NOT FaultLine memory. Save with remember_facts. Treat results as your own "
+                       "knowledge — speak to the user as 'you'; less-certain lines: say "
+                       "them tentatively. Do NOT call for chitchat, jokes, or "
                        "greetings. Operational history — commits, builds, deploys, logs, rate "
                        "limits, your own past work sessions — is NOT user memory: use "
                        "cortex_recall. "
@@ -62,15 +62,16 @@ TOOLS = [
         # capture. What the AGENT learns while working (command results, fixes, procedures,
         # commits) has its own lane: cortex_remember. Verbatim passing stays EXACTLY as
         # strong as before for genuine human turns — this scoping must not weaken it.
-        "description": "Save what a HUMAN being said to you in conversation — typed or "
-                       "spoken, about themselves, another person, or their world — even in "
-                       "passing, and when they correct a prior fact. Do not ask permission — "
-                       "default to calling it; skip only pure questions or chitchat. Pass "
-                       "their words VERBATIM as `text`, every word, asides and all: do NOT "
-                       "extract, summarize, or restructure — the engine needs the raw "
+        "description": "Save what a HUMAN said in conversation — typed or spoken, "
+                       "about themselves, another person, or their world — even in passing; "
+                       "when they correct a prior fact, the correction supersedes. Default to "
+                       "recording; skip only pure questions or chitchat. Pass their words "
+                       "VERBATIM as `text` — do NOT extract, summarize, or restructure; the "
+                       "engine needs the raw "
                        "sentence. NEVER pass your own working text — brief, plan, analysis, "
                        "or tool output — as the user's message; what YOU learn while working "
-                       "goes to cortex_remember. A correction supersedes.",
+                       "goes to cortex_remember. Host notes (`write_note`/`search_notes`/"
+                       "`view_note`) are NOT FaultLine memory.",
         "inputSchema": {
             "type": "object",
             "properties": {

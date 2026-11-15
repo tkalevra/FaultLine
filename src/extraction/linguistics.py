@@ -161,7 +161,7 @@ SPINE_PET_NAMED_POSSESSION: bool = os.environ.get(
 
 # ── FLAG: ENTITY_CENTRIC_FILING (the wound-map doctrine lane — the WORLD MODEL THESIS,
 # 2026-11-15; default ON; OFF = byte-parity, every arm below is skipped whole).
-# The pet ladder is the CORRECT shape: Fraggle stands as an ENTITY (instance_of its class),
+# The pet ladder is the CORRECT shape: Luna stands as an ENTITY (instance_of its class),
 # the ownership edge runs from the possessor, and the pets walk rides it. This flag GENERALIZES
 # that discipline to the thing-spaces the ladder never owned — possessions / events /
 # collections (the owner doctrine: entities exist in MULTIPLES of L4 spaces simultaneously;
@@ -468,11 +468,11 @@ _CORRECTIVE_ALT_EXCLUDED_POS: frozenset = frozenset({
 # not always agree: MEASURED on ``en_core_web_sm`` (the shipped ``SPACY_MODEL``), an out-of-
 # vocabulary proper name in that slot is tagged ADJ and attached ``acomp`` instead of PROPN/``attr``,
 # and the mis-tag tracks the NAME TOKEN, not the frame — "my {sister,mother,dog,colleague}'s name is
-# Marlow" is ``acomp``/ADJ in ALL FOUR while the same four with Diana/Renata/Rex/Kate/Bob/Sarah/
-# Zephyrine/Marla/Priya/Susan/Fraggle are ``attr``/PROPN in all four; "my name is Marlow" is
+# Marlen" is ``acomp``/ADJ in ALL FOUR while the same four with Diana/Renata/Rex/Kate/Bob/Sarah/
+# Zephyra/Mara/Mira/Susan/Luna are ``attr``/PROPN in all four; "my name is Marlen" is
 # ``acomp``/ADJ too. A complement scan filtered to attr/oprd/dobj/obj therefore drops the WHOLE
 # construction for those names — silently, with no error: the chain simply declines and every fact
-# in the turn is lost. (Live: "Actually my sister's name is Marlow, not Marla." derived ZERO edges.)
+# in the turn is lost. (Live: "Actually my sister's name is Marlen, not Mara." derived ZERO edges.)
 #
 # This is the SAME parser-unreliability that ``corrective_negation_alternative`` below already
 # documents for the ALTERNATIVE slot one clause over ("… is Bob, not Rob" → Rob/ADJ) — there the
@@ -480,7 +480,7 @@ _CORRECTIVE_ALT_EXCLUDED_POS: frozenset = frozenset({
 # dependency itself is what moved, so the discriminating signal has to be the one thing that still
 # separates a NAME from a genuine COMMON adjective: ORTHOGRAPHY. Measured in the same parser,
 # a common predicate adjective in this slot is lower-case ("my sister's name is short/unusual/hard")
-# while the mis-tagged name is TITLE-CASE ("Marlow").
+# while the mis-tagged name is TITLE-CASE ("Marlen").
 #
 # ⚠️ SAY EXACTLY WHAT TITLE CASE DOES AND DOES NOT SEPARATE. An earlier version of this comment
 # claimed "capitalisation is the orthographic marker of a proper name" — that is FALSE as stated
@@ -1113,7 +1113,7 @@ def _clause_has_corrective_alternative(anchor):
 
     Returns the TOKEN, not a flag, because its part of speech is the discriminator the caller
     needs: measured in this parser, the alternative is PROPN when the slot holds a NAME
-    ("…is Marlow, not MARLA") and ADJ when it holds a property ("…is Greek, not ROMAN").
+    ("…is Marlen, not MARLA") and ADJ when it holds a property ("…is Greek, not ROMAN").
 
     Grammatical evidence that a complement slot holds a NAME rather than a property: you can only
     correct a name TO another name. Used to narrow the OOV mis-tag recovery in
@@ -1168,23 +1168,23 @@ def _copular_name_complement(copula):
             # Victorian, Biblical, Nordic, Shakespearean …): 25/25 minted a person, against 4/25
             # before the arm existed. A guard added to CAPTURE content was storing a falsehood.
             #
-            # No local signal separates them: measured in this parser, `Irish` and `Marlow` are BOTH
+            # No local signal separates them: measured in this parser, `Irish` and `Marlen` are BOTH
             # `acomp`/ADJ/JJ, `is_oov` is True for EVERY token (en_core_web_sm ships no vectors),
             # `ent_type_` is empty for both, and the lemmatiser lower-cases both. Orthography,
             # vocabulary, entity type and lemma all fail — so the evidence has to come from the
             # FRAME rather than from the token.
             #
             # IT DOES, AND IT IS EXACTLY THE FRAME THIS ARM EXISTS FOR: a CORRECTIVE alternative
-            # ("… is Marlow, NOT Marla"). You can only correct a name TO another name, so a rejected
+            # ("… is Marlen, NOT Mara"). You can only correct a name TO another name, so a rejected
             # alternative is grammatical evidence that the slot holds a name — and the plain
             # assertion "My sister's name is Irish." carries none, so it is declined and mints
-            # nothing. Measured: every corrective case still repairs (Renata/Thorne/Priya via the
-            # legacy PROPN arm, Marlow via this one) and all 25 proper adjectives fall back to the
+            # nothing. Measured: every corrective case still repairs (Renata/Thorne/Mira via the
+            # legacy PROPN arm, Marlen via this one) and all 25 proper adjectives fall back to the
             # parent's behaviour.
             # ── THE `acomp` MIS-TAG ARM IS REMOVED. IT WAS FITTED TO THE TOKEN IT WAS DEBUGGED ON.
             # It existed to recover an OOV name that spaCy mis-tags ADJ in the naming slot
-            # ("…name is Marlow"). Measured over 225 names x 5 role nouns in the corrective frame,
-            # its NET GAIN over the pre-lane parent was EXACTLY ONE NAME — `Marlow`, the token it
+            # ("…name is Marlen"). Measured over 225 names x 5 role nouns in the corrective frame,
+            # its NET GAIN over the pre-lane parent was EXACTLY ONE NAME — `Marlen`, the token it
             # was developed against — while it LOST Juniper, Rosalind and Ugo, which tag ADJ in the
             # same frame. 1075/1125 repaired with the arm, 1075/1125 without it. Zero net value,
             # against a standing risk of minting a PERSON out of an adjective.
@@ -1197,9 +1197,9 @@ def _copular_name_complement(copula):
             #      adjective corrections still minted, 7/8, worse than the 2/8 parent baseline.
             #   3. COMPLEMENT POS == PROPN — refuses the adjectives but also refuses real names
             #      (Juniper/Rosalind/Ugo tag ADJ here), which is how the arm reached zero net gain.
-            #   4. NEUTRAL-FRAME RE-PARSE ("They were very X yesterday.") — tags Marlow, Diane and
-            #      Fraggle ADJ as well; 3 of 9 real names lost.
-            #   5. THE REJECTED ALTERNATIVE'S POS — separates "Marlow, not Marla" from "Greek, not
+            #   4. NEUTRAL-FRAME RE-PARSE ("They were very X yesterday.") — tags Marlen, Diane and
+            #      Luna ADJ as well; 3 of 9 real names lost.
+            #   5. THE REJECTED ALTERNATIVE'S POS — separates "Marlen, not Mara" from "Greek, not
             #      Roman", but collapses the moment the alternative is itself a name: in
             #      "…is Greek, not Wrenna." the adjective and the name are byte-identical in dep,
             #      POS and alternative (acomp/ADJ, alt PROPN/appos).
@@ -1230,7 +1230,7 @@ def _copular_name_complement(copula):
             #     Location/Person-0.31 (below the 0.5 entity threshold) by GLiNER2 → ent_type_
             #     excludes them. ZERO adjectives admitted.
             #   • names in the acomp slot: PROPN/NNP AND GLiNER2-Person 0.966–1.0 → admitted
-            #     (Elaine, Emily; Marlow/Juniper/Rosalind/Ugo still tag ADJ → still declined,
+            #     (Elaine, Emily; Marlen/Juniper/Rosalind/Ugo still tag ADJ → still declined,
             #     the documented unrepairable population, no regression).
             # The typing is ONLY present on the HARVEST path (``_build_typed_doc`` writes
             # GLiNER2 spans onto the deriver's Doc); on the untyped str-fallback path
@@ -1284,8 +1284,8 @@ def corrective_negation_alternative(tok):
         # DEPENDENCY (appos/conj) plus the ordering gate below is what identifies the alternative.
         # Only genuine function words / punctuation are excluded — they are never an alternative.
         # The DEP mis-assignment is the same OOV-name failure the POS note above describes, one
-        # step further in: MEASURED on ``en_core_web_sm``, "… is actually Renata, not Marlow."
-        # attaches Marlow as ``amod``/ADJ of Renata, while the structurally identical
+        # step further in: MEASURED on ``en_core_web_sm``, "… is actually Renata, not Marlen."
+        # attaches Marlen as ``amod``/ADJ of Renata, while the structurally identical
         # "… is Diana, not Diane." / "… is Zeb, not Zebediah." attach ``appos``.
         # ⚠️ CORRECTED — the previous note here justified the arm with "a post-head ``amod`` is not
         # an ordinary adjectival modifier anyway, English attributive adjectives PRECEDE their
@@ -1294,7 +1294,7 @@ def corrective_negation_alternative(tok):
         #     ordinary ("something rare", "the people responsible", "attorney general"), so the
         #     absolute is false as grammar. (b) More to the point, the ``amod`` this arm actually
         #     sees is often PRE-head, so the premise does not even describe the configuration:
-        #     MEASURED on en_core_web_sm, "… is actually Renata, not Marlow." gives Marlow(i=9)
+        #     MEASURED on en_core_web_sm, "… is actually Renata, not Marlen." gives Marlen(i=9)
         #     amod of Renata(i=6) — post-head — while "… is short, not long." gives short(i=5)
         #     amod of long(i=8) and "… is Irish, not French." gives Irish(i=5) amod of French(i=8)
         #     — both PRE-head, and in those two the ``amod`` token is the ASSERTED element, not the
@@ -1454,8 +1454,8 @@ SPINE_POSSESSIVE_ALIENABILITY: bool = os.environ.get(
 
 # ── BELONG_TO SHAPE GUARD (default ON; OFF → byte-identical legacy emission) ─────────────────────
 # MEASURED WOUND (BUG-R4-2 conviction, the owner's live seat + the R4 corpus control, 2026-11-14):
-# the sortal genitive leg of ``_chain_possessive`` read "<X> is <P>'s <Y>" ("Fraggle is Mars's
-# morkie.", "Goose is Cyrus's cat.", "Sophia is Desmonde's corn snake.") in ISOLATION — it saw only
+# the sortal genitive leg of ``_chain_possessive`` read "<X> is <P>'s <Y>" ("Luna is Mars's
+# morkie.", "Goose is Leo's cat.", "Bella is Marco's corn snake.") in ISOLATION — it saw only
 # the (possessor P, possessed head Y) pair and emitted the CLASS-SUBJECT loose link
 # ``(Y, related_to/belongs_to, P)`` while the copula subject NAME X fell through as ``uncovered``
 # residue. Beside a contradicting original (a live (P', has_pet, X) row from an earlier plant) this
@@ -2075,8 +2075,8 @@ def _pa_core_active() -> bool:
     return os.environ.get("SPINE_PA_CORE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # COLLECTIVE MEMBER-LIST reconciliation (default ON). A "<subj> <verb> [<count>] <HEAD>: M1, M2, …"
-# enumeration ("we have three kids: Gabriella, Des, Cyrus", "my team has three engineers: Sarah, Tom,
-# Priya", "we run three servers: Apollo, Vault, Echo") was mangled by the generic chains: the collective
+# enumeration ("we have three kids: Chiara, Dev, Leo", "my team has three engineers: Sarah, Tom,
+# Mira", "we run three servers: Apollo, Vault, Echo") was mangled by the generic chains: the collective
 # HEAD became a type the members were ``instance_of`` / the user ``owns``, only the FIRST member got
 # typed, and members lost their proper membership/kinship edge. This post-chain pass reconciles the
 # construction deterministically: route by the HEAD noun's resolved cue/type (kinship head → the kin
@@ -2089,9 +2089,9 @@ COLLECTIVE_MEMBER_LIST: bool = os.environ.get(
 
 # DETERMINISTIC ENUMERATION PRE-SPLIT (the atomizer reliability net). The LLM atomizer's split of a
 # colon-introduced named list ("My team has three engineers: Sarah who is 35, Tom who is a backend
-# dev, and a designer named Priya") VARIES run-to-run — sometimes it folds "a designer named Priya"
+# dev, and a designer named Mira") VARIES run-to-run — sometimes it folds "a designer named Mira"
 # back into the membership line (so the downstream collective walk, which only routes BARE PROPN
-# conjuncts, silently drops Priya's member_of), sometimes it drops a per-member attribute, and on a
+# conjuncts, silently drops Mira's member_of), sometimes it drops a per-member attribute, and on a
 # REFRAME timeout the whole dense sentence flows un-split (cross-member smear). ``split_enumeration``
 # normalizes the structurally-obvious colon list DETERMINISTICALLY so the spine sees the SAME clean
 # atom set every time, regardless of LLM variance. Subject-agnostic, structural (colon + comma/"and"
@@ -2103,7 +2103,7 @@ ENUM_PRESPLIT: bool = os.environ.get(
 
 # ENUM_PRESPLIT_CONTENT_COVERAGE (default ON; OFF = byte-parity with the pre-round-4
 # splitter) — WOUND-MAP ROUND 4, the cecil SECOND-ATOM DROP (BUG-pet-ladder-merge-drop
-# class, live-captured 2026-11-13 on pre-prod: "Nutmeg's vet appointment is on the 22nd
+# class, live-captured 2026-11-13 on the lab stack. "Nutmeg's vet appointment is on the 22nd
 # at 9:30am at Cedar Grove Veterinary Clinic, and our bearded dragon Cecil lives in the
 # 40-gallon tank by the window." → split_enumeration split at the TIME COLON of "9:30am",
 # rebuilt "…at 9: Cedar Grove Veterinary Clinic and Cecil." from the PROPN names, and
@@ -2392,7 +2392,7 @@ def _install_identifier_tokenizer(nlp) -> None:
 
 
 def _install_bracket_infix(nlp) -> None:
-    r"""SPLIT a bracket GLUED between two word characters — "Desmonde(goes" → ``Desmonde`` ``(`` ``goes``.
+    r"""SPLIT a bracket GLUED between two word characters — "Marco(goes" → ``Marco`` ``(`` ``goes``.
 
     GROUNDING: spaCy Tokenizer ``infix_finditer`` — "a function to find internal segment separators,
     e.g. hyphens" (spaCy Tokenizer API). Brackets live in spaCy's PREFIX/SUFFIX rules, which only fire
@@ -2400,9 +2400,9 @@ def _install_bracket_infix(nlp) -> None:
     survives as ONE token.
 
     THE CAPTURE BUG THIS CLOSES (measured on the live spine): a user writing a parenthetical alias with
-    no space — "I have a son named Desmonde(goes by Dez)" — tokenized as the single PROPN
-    ``Desmonde(goes``, which the naming chain then bound as THE NAME. The stored memory read "a son
-    named Desmonde(goes", with a gender/kin edge hung off that malformed surface. The parenthetical is
+    no space — "I have a son named Marco(goes by Max)" — tokenized as the single PROPN
+    ``Marco(goes``, which the naming chain then bound as THE NAME. The stored memory read "a son
+    named Marco(goes", with a gender/kin edge hung off that malformed surface. The parenthetical is
     a UNIVERSAL orthographic boundary, not a domain fact, so it belongs in the tokenizer: with the run
     split, the SPACED and UNSPACED forms parse IDENTICALLY and the alias chain sees the same shape.
 
@@ -2594,7 +2594,7 @@ def _get_nlp():
             # footprint). We only need tagger + parser for POS + dependency labels.
             _nlp = spacy.load(_SPACY_MODEL, disable=["ner"])
             _install_identifier_tokenizer(_nlp)  # keep CVE ids / version strings / x86-64 whole
-            # …split a BRACKET glued between word characters ("Desmonde(goes" → "Desmonde ( goes"),
+            # …split a BRACKET glued between word characters ("Marco(goes" → "Marco ( goes"),
             # which spaCy's default rules leave WHOLE (a bracket is a prefix/suffix, never an infix).
             _install_bracket_infix(_nlp)
             # …and stop spaCy's own exception table from shattering a cue surface the engine holds
@@ -2820,7 +2820,7 @@ SPINE_VERBLESS_SFORM_REPAIR: bool = os.environ.get(
 def _repair_verbless_sform_appositive(doc) -> int:
     """Re-read a verbless S-form appositive the parser nominalized. Returns repairs made.
 
-    PROD-BUG-3 (the faultline.ca wire drive + the pre-prod baseline seat, 2026-11-12):
+    PROD-BUG-3 (the llm.example.com wire drive + the lab baseline seat, 2026-11-12):
     "My brother Aldous lives in Vancouver." parses with NO VERB AT ALL — spaCy's small
     model resolved the verb-ambiguous s-form ``lives`` into the PLURAL-NOUN reading
     (NOUN/NNS, ``appos`` of the kin head ``brother``), hung the person's NAME off it as a
@@ -4293,8 +4293,8 @@ def analyze_copula_relational_predicate(text: str) -> list[dict]:
             prep_objs = _adj_prep_objects(comp)
             if not prep_objs:
                 # ── THE TO-INFINITIVE MIS-TAG RECOVERY (PROD-BUG-2, the shellfish ZERO-row
-                # medical miss; measured on the faultline.ca wire drive + reproduced on the
-                # pre-prod baseline seat, 2026-11-12) ──
+                # medical miss; measured on the llm.example.com wire drive + reproduced on the lab
+                # lab baseline seat, 2026-11-12) ──
                 # en_core_web_sm reads "<class adj> to <NP>" with a VERB-AMBIGUOUS object NP
                 # as an infinitive clause: "I'm severely allergic to shellfish" parses
                 # ``shellfish`` as VERB/xcomp with ``to`` as its ``aux`` — NO ``prep`` child
@@ -4464,7 +4464,7 @@ def analyze_possessive_predication(text: str):
             # the same slice-vs-rail defect this guard already fixed for kinship alone. "My manager is
             # 45." was yielding ``PossessivePredication(possessed='manager', value='45')``, which mints
             # ``(user, manager, "45")``: the possessed PERSON ROLE canonicalizes into a rel_type and
-            # somebody ELSE's scalar lands in the user's own slot. "My boss is Priya." is worse — a NAME
+            # somebody ELSE's scalar lands in the user's own slot. "My boss is Mira." is worse — a NAME
             # as the VALUE of a role-derived rel. A possessed PERSON is never a preference AXIS whatever
             # class the role noun sits in, so decline for the whole rail, not just kinship. Same
             # fail-safe direction as before (nothing resolves → no decline → today's reading).
@@ -4781,7 +4781,7 @@ def _np_join(toks) -> str:
 
 def _genitive_copula_named_subject(head_tok):
     r"""BELONG_TO-SHAPE GUARD probe (module-level so the router can reuse the same grammar):
-    for a genitive possessed head H ("morkie" in "Fraggle is Mars's morkie."), return the
+    for a genitive possessed head H ("morkie" in "Luna is Mars's morkie."), return the
     copula subject token X when the clause is a POSSESSIVE COPULA whose subject is a DISTINCT
     PROPN proper name — the named-instance shape — else ``None``.
 
@@ -4816,7 +4816,7 @@ def _genitive_copula_named_subject(head_tok):
 class PossessiveCopulaShape:
     """A deterministic reading of a possessive copula "<X> is <P>'s <Y>" (any person).
 
-    ``name``          the copula subject surface, lowercased ("fraggle")
+    ``name``          the copula subject surface, lowercased ("luna")
     ``owner``         the possessor surface, lowercased ("mars"; "my"/"our" kept verbatim)
     ``owner_is_self`` True when the possessor is a 1st-person possessive ("my"/"our")
     ``kind``          the possessed head phrase, lowercased ("corn snake")
@@ -5552,7 +5552,7 @@ def _nearest_hostname_surface(doc, before_idx):
     whose token run carries a digit-bearing token of >=3 chars (the same hostname shape the
     registry's WOUND C coref matches: 'chris-p70', 'p70 workstation', 'xps 15') -- or None.
 
-    THE WOUND IT GUARDS (live-fail 2, pre-prod be10006d verdict): a 3rd-person possessive
+    THE WOUND IT GUARDS (live-fail 2, lab be10006d verdict): a 3rd-person possessive
     determiner over HARDWARE ("its mac is ...") whose antecedent lives in a SIBLING atom must
     resolve to the DEVICE the turn is about -- never to the SPEAKER. The speaker is 1st-person
     by the single language hook; an inanimate 3rd-person possessive is grammatically incapable
@@ -5894,7 +5894,7 @@ def possessor_of_possessive_attribute(sentence: str, value: str) -> str | None:
                     _ante = _possessive_pronoun_antecedent(doc, c)
                     if _ante:
                         return _ante
-                    # LIVE-FAIL 2 DEVICE GUARD (pre-prod be10006d verdict): an inanimate
+                    # LIVE-FAIL 2 DEVICE GUARD (lab be10006d verdict): an inanimate
                     # 3rd-person possessive ("its mac") whose antecedent lives in a SIBLING
                     # sentence/atom resolves to the nearest HOSTNAME-SHAPED NP of the doc --
                     # it for hardware is the device, NEVER the speaker (the speaker is
@@ -7144,8 +7144,8 @@ def _np_conjuncts(head_tok) -> list:
     ``[head_tok]``. Structural only — NO list/word enumeration.
 
     PROPER-NOUN LIST QUIRK (appos chaining): spaCy is INCONSISTENT about how it chains a
-    comma-separated list of BARE PROPER NAMES. "Gabriella, Des, and Cyrus" parses as a clean conj
-    chain (Gabriella →conj Des →conj Cyrus), but "Apollo, Vault, and Echo" parses the middle
+    comma-separated list of BARE PROPER NAMES. "Chiara, Dev, and Leo" parses as a clean conj
+    chain (Chiara →conj Dev →conj Leo), but "Apollo, Vault, and Echo" parses the middle
     member as ``appos`` (Apollo →appos Vault →conj Echo) — so a pure-conj walk DROPS the tail
     ("Vault"/"Echo"). We therefore ALSO follow an ``appos`` edge, but ONLY when BOTH endpoints are
     PROPN (the proper-noun-list signature): an apposition RENAME ("my friend Sam", "the president, a
@@ -7311,10 +7311,10 @@ def split_enumeration(sentence: str):
     Item shapes recognized (subject-agnostic, structural — NO domain/role/type word list):
       • RELATIVE clause  "Sarah who is 35"          → name="Sarah",  atom="Sarah is 35."
                          "Tom who is a backend dev" → name="Tom",    atom="Tom is a backend dev."
-      • NAMING apposite  "a designer named Priya"   → name="Priya",  atom="Priya is a designer."
+      • NAMING apposite  "a designer named Mira"   → name="Mira",  atom="Mira is a designer."
         (structural: a ``acl`` VERB with a PROPN ``oprd``/``attr``/``dobj`` child — the reduced
          "named/called <Name>" relative — NOT a verb word list)
-      • BARE proper name "Cyrus"                    → name="Cyrus",  (no attribute atom)
+      • BARE proper name "Leo"                    → name="Leo",  (no attribute atom)
 
     FABRICATION-SAFE ("USER IS TRUTH"): every emitted atom's content tokens must be a subset of the
     SOURCE sentence's content tokens (the copula "is" is the only inserted function word) — any
@@ -7916,7 +7916,7 @@ def _binding_age_string(name_tok, type_tok):
 
 def _binding_nickname(name_tok, type_tok):
     r"""A "<who> goes by <Nick>" nickname bound to THIS named instance, or None. TWO constructions:
-    the PARENTHETICAL run ("Desmonde (goes by Dez)" — linearly anchored to this name) and the
+    the PARENTHETICAL run ("Marco (goes by Max)" — linearly anchored to this name) and the
     RELATIVE CLAUSE ("Jamie who goes by Jay"). Both are SCOPED to THIS binding so a sibling's nickname
     never bleeds onto this name — the parenthetical by the bracket sitting on the token immediately
     after the NAME, the relcl by ``_binding_own_relcl`` (head=type_tok). spaCy parses the relative
@@ -7926,13 +7926,13 @@ def _binding_nickname(name_tok, type_tok):
     PROPN/NOUN pobj that is NOT the bound name. Structural (dependency + the surface preposition "by"),
     NO nickname word-list. Fail-safe → None."""
     try:
-        # (a) PARENTHETICAL alias run — "Desmonde (goes by Dez)" / "Gabriella (goes by Gabby)".
+        # (a) PARENTHETICAL alias run — "Marco (goes by Max)" / "Chiara (goes by Chi)".
         #     Checked FIRST because it is LINEARLY anchored to THIS name (the bracket opens on the
         #     token immediately after it), which is a stricter scope than the relcl walk below.
         #
         #     THE CAPTURE BUG THIS CLOSES (measured on the live spine): spaCy gives a parenthetical
         #     alias run NO subject of its own, so it re-attaches the bare alias VERB as the nsubj of
-        #     the following copula ("… (goes by Dez) is 12" → nsubj(is) = "goes"). The nickname was
+        #     the following copula ("… (goes by Max) is 12" → nsubj(is) = "goes"). The nickname was
         #     therefore DROPPED (the relcl branch below never matches — there is no ``relcl``), and a
         #     junk ("goes", age, "12") scalar was minted off the verb. Reading the run LINEARLY — the
         #     bracket immediately after the NAME, then an alias-predicate verb — recovers the alias
@@ -7990,10 +7990,10 @@ def _bound_name_for_type(type_tok, _naming):
       (3) COPULA       — the type is the ``nsubj`` of a copula ``be`` whose ``attr``/``oprd`` is a
                          PROPN with no determiner ("my friend is Sam").
       (4) INVERSE COPULA — the mirror of (3): the type is the POSSESSED ``attr``/``oprd`` and the NAME
-                         is the ``nsubj`` ("Marla is my wife"). Gated on 1st-person possession.
+                         is the ``nsubj`` ("Mara is my wife"). Gated on 1st-person possession.
       (5) COPULA TYPE-PREDICATE — a DETERMINER-introduced predicate nominal is a second, narrower TYPE
-                         for the instance the possessed subject NP already names ("My dog Fraggle is a
-                         morkie" → morkie binds to Fraggle).
+                         for the instance the possessed subject NP already names ("My dog Luna is a
+                         morkie" → morkie binds to Luna).
 
     A determiner-introduced common-noun complement is never a name (it's a type) in branches (1)–(4);
     branch (5) inverts that reading deliberately — there the determiner is what identifies the TYPE,
@@ -8076,7 +8076,7 @@ def _bound_name_for_type(type_tok, _naming):
     #     transitive naming construction "name/call/dub <X> <Name>" whose object complement spaCy tags
     #     ``oprd`` ("object predicate"; see spaCy glossary — https://github.com/explosion/spaCy glossary.py).
     #     CASING-ROBUST, mirroring the copula branch (3) below: en_core_web_sm tags a LOWERCASE name
-    #     ("apollo"/"fraggle"/"whiskers") as NOUN, not PROPN, so a PROPN-ONLY match silently dropped every
+    #     ("apollo"/"luna"/"whiskers") as NOUN, not PROPN, so a PROPN-ONLY match silently dropped every
     #     lowercase named instance on the possessed form ("I have a server named apollo") — the diagnosed
     #     drop. Accept a PROPN complement always, and a NOUN complement too: the naming construction leaves
     #     no ambiguity — the post-naming-verb object-predicate complement IS the name regardless of its POS
@@ -8105,11 +8105,11 @@ def _bound_name_for_type(type_tok, _naming):
     #     the complement is NOT determiner-introduced (a det → "is a poodle" is a TYPE, owned
     #     elsewhere). A bare PROPN complement is always accepted. This never over-captures "the printer
     #     is Apollo"-style non-possessed subjects (no 1st-person poss → NOUN complement rejected).
-    #     NAMING-NOUN EXCLUSION: "my mother's name is Priya" (and the apostrophe-stripped "my mothers
-    #     name is Priya" the atomizer produces) is the NAMING construction owned by
-    #     ``_chain_genitive_name`` — it binds Priya as the PERSON and hangs the kin relation there.
+    #     NAMING-NOUN EXCLUSION: "my mother's name is Mira" (and the apostrophe-stripped "my mothers
+    #     name is Mira" the atomizer produces) is the NAMING construction owned by
+    #     ``_chain_genitive_name`` — it binds Mira as the PERSON and hangs the kin relation there.
     #     Read as a type↔name binding instead, the naming noun became the TYPE and the store gained a
-    #     phantom classification (priya, instance_of, "mothers name"). The head noun "name" is the
+    #     phantom classification (mira, instance_of, "mothers name"). The head noun "name" is the
     #     same grammatical marker ``_chain_possessive``'s ``_is_name_copula_nsubj`` guard already keys
     #     on, so this exclusion matches the ownership boundary the rest of the module observes.
     if type_tok.dep_ in ("nsubj", "nsubjpass") and (
@@ -8157,14 +8157,14 @@ def _bound_name_for_type(type_tok, _naming):
                 except Exception:  # noqa: BLE001
                     pass
                 return c, "copula"
-    # (4) INVERSE COPULA — "Marla is my wife": the NAME is the ``nsubj`` and the POSSESSED ROLE is the
-    #     ``attr``. Branch (3) reads only the forward order ("my wife is Marla"), so this everyday
+    # (4) INVERSE COPULA — "Mara is my wife": the NAME is the ``nsubj`` and the POSSESSED ROLE is the
+    #     ``attr``. Branch (3) reads only the forward order ("my wife is Mara"), so this everyday
     #     order bound NOTHING and the role noun leaked as its own entity: the possessive chain minted
     #     (wife, spouse, user) — a PHANTOM "Wife" person that then collected an instance_of, an owns,
-    #     and a retraction's negative fact, all conflicting with the real (marla, spouse, user).
+    #     and a retraction's negative fact, all conflicting with the real (mara, spouse, user).
     #     GATED on the role being 1st-person POSSESSED ("my"/"our" — Person=1 ∧ Poss=Yes), the same
     #     user-anchored gate branch (3) and ``_chain_copula_name`` use, so an unpossessed predicate
-    #     nominal ("Marla is a doctor" — a ROLE reading owned by the appositive/role chains) is never
+    #     nominal ("Mara is a doctor" — a ROLE reading owned by the appositive/role chains) is never
     #     swept in here. The complement NAME must be a bare PROPN (no determiner) and not a wh-word.
     if type_tok.dep_ in ("attr", "oprd"):
         head = type_tok.head
@@ -8198,11 +8198,11 @@ def _bound_name_for_type(type_tok, _naming):
                     except Exception:  # noqa: BLE001
                         pass
                     return c, "copula_inverse"
-    # (5) COPULA TYPE-PREDICATE ON AN ALREADY-NAMED SUBJECT — "My dog Fraggle is a morkie": the
+    # (5) COPULA TYPE-PREDICATE ON AN ALREADY-NAMED SUBJECT — "My dog Luna is a morkie": the
     #     predicate nominal is a SECOND, more specific type for the instance the subject NP already
     #     names. Without this the breed bound to NOTHING and the attribute-scalar chain read the whole
     #     clause as a possessed-attribute literal, minting the noun-as-relation junk (user, dog,
-    #     morkie) while the real (fraggle, instance_of, morkie) was never captured — the "a Cat named
+    #     morkie) while the real (luna, instance_of, morkie) was never captured — the "a Cat named
     #     <breed>" shape in the live store. The subject role must be 1st-person POSSESSED and carry the
     #     appositive PROPN NAME; the predicate nominal must be DETERMINER-INTRODUCED (that determiner
     #     is exactly what makes it a TYPE rather than a name — the inverse of branches (1)–(3)).
@@ -8319,7 +8319,7 @@ def analyze_name_type_bindings(text):
                 name = (name_tok.text or "").strip()
             if not type_noun or not name or name.lower() == type_noun:
                 continue
-            # ATTRIBUTE-VALUE APPOSITION IS NOT A TYPE↔NAME BINDING. "Gabriella, age 10, F." is a
+            # ATTRIBUTE-VALUE APPOSITION IS NOT A TYPE↔NAME BINDING. "Chiara, age 10, F." is a
             # <attribute> <value> pair followed by a code — spaCy hangs the trailing "F." on "age" as
             # an ``appos``, which read as "a "type" (age) named F". The live store took that literally:
             # a gender-code entity F, filed as an instance of "age", carrying a "10 F" quantity. The
@@ -13410,7 +13410,7 @@ def _inherent_relation_for_noun(noun_lemma: str) -> str:
 
 def _person_role_relation(role_lemma: str) -> str | None:
     """The canonical PERSON-ROLE relation binding a NAMED person to the user for the "my <role> is/=
-    <Name>" family of constructions ("My manager is Priya Sharma" → (priya sharma, manager_of, user)).
+    <Name>" family of constructions ("My manager is Mira Sharma" → (mira sharma, manager_of, user)).
     The ROLE analogue of ``_inherent_relation_for_noun`` for kinship — a SINGLE resolver so every chain
     that touches the construction (copula-name, named-instance) AGREES and DEDUPS. Resolution, all
     metadata-driven off the per-tenant cue classes (NO domain literal):
@@ -13927,7 +13927,7 @@ _NAME_TYPE_BINDER_TWIN_RELS = frozenset({
 
 # BINDER_ALIAS_SPARE_NAMED_INSTANCE (default ON; OFF = byte-parity with the pre-round-4
 # suppressor) — WOUND-MAP ROUND 4, the pet-ladder ALIAS RUNG (BUG-pet-ladder-merge-drop's
-# deterministic residue, live-captured 2026-11-13 on pre-prod): "Our dog Biscuit is a
+# deterministic residue, live-captured 2026-11-13 on the lab stack): "Our dog Biscuit is a
 # corgi; we adopted him in May 2023." lands (user,dog,corgi) as an attr-scalar whose
 # claimed VALUE token set contains "corgi" — and the union-level twin suppression then
 # ate the SPINE_PET_NAMED_POSSESSION arm's deliberate class→instance alias rung
@@ -14079,7 +14079,7 @@ def build_turn_role_name_map(text) -> dict:
 
     Recognized constructions (role must be a KINSHIP/RELATIONAL cue-class noun; name a PROPN span):
       • passive/active naming  — "my mother is named Sarah" / "… is called Kate" (naming verb)
-      • genitive naming        — "my mother's name is Priya" (name-copula nsubj + role poss/compound)
+      • genitive naming        — "my mother's name is Mira" (name-copula nsubj + role poss/compound)
       • appositive naming      — "my son David Chen" (role noun renamed by an apposed PROPN)
       • copula naming          — "my sister is Sarah" (SPINE_NAMING_CHAIN only, PROPN attr complement)
 
@@ -14657,11 +14657,11 @@ IDENTIFIER_UNIT_SCALAR: bool = os.environ.get(
     "IDENTIFIER_UNIT_SCALAR", "true").strip().lower() not in ("0", "false", "no")
 
 
-# ── SPINE_TURNED_AGE (wound-map round 4, the family-onboarding smoke, wound "priya-age"):
-# the turned-N AGE CONVENTION — "Our eldest, Priya, turned 14 on January 22." — minted the
-# attr `turn` ((priya, turn, "14") off the measure-verb bare-cardinal arm, then a
-# future-coerced event_date at ingest), so recall served "Priya's turn is 2027-01-22" for
-# "How old is Priya?". A "turned/turns N" clause (verb lemma `turn` + a BARE INTEGER
+# ── SPINE_TURNED_AGE (wound-map round 4, the family-onboarding smoke, wound "mira-age"):
+# the turned-N AGE CONVENTION — "Our eldest, Mira, turned 14 on January 22." — minted the
+# attr `turn` ((mira, turn, "14") off the measure-verb bare-cardinal arm, then a
+# future-coerced event_date at ingest), so recall served "Mira's turn is 2027-01-22" for
+# "How old is Mira?". A "turned/turns N" clause (verb lemma `turn` + a BARE INTEGER
 # direct object ≤ 120 — the human-age ceiling) mints the AGE attribute
 # (subject, age, "N") — the EXACT storage the existing bare-number person scalar frame
 # ("X is 9" → the copula-measure branch (b)) uses: same rel, same bare-string value, no
@@ -18281,7 +18281,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # legitimate TYPE — and the predicate is exactly inverted relative to the source it rests on.
         #
         # WHAT IT COST, measured against the parent: it deleted USER CONTENT IN BOTH POLARITIES.
-        #   "Marla is a faster runner than Devon."   lost (marla, instance_of, `faster runner`)
+        #   "Mara is a faster runner than Devon."   lost (mara, instance_of, `faster runner`)
         #   "Sarah is a better cook than her sister." lost (sarah, instance_of, `better cook`)
         #   "He is no more a plumber than I am."      lost (he, instance_of, `plumber`, NEGATED)
         # A guard written to suppress junk ate real facts, and a correct DENIAL with them. One junk
@@ -18569,7 +18569,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             log.debug("linguistics.countable_instance_typing_failed", error=str(_tie)[:160])
 
         # ── GENERAL COORDINATED-CONJUNCT DISTRIBUTION (rel-agnostic) ────────────────────────────
-        # When a predicate's SUBJECT or OBJECT is a COORDINATED list ("... Cyrus, Des, and Gabriella",
+        # When a predicate's SUBJECT or OBJECT is a COORDINATED list ("... Leo, Dev, and Chiara",
         # "affects Apache, Nginx, and OpenSSL", "I use Python, Rust, and Go"), a capture chain binds only
         # the FIRST conjunct and the coordinated rest are silently dropped. This step distributes the
         # SAME resolved (subject, rel, object) over EVERY coordinated sibling of the bound head — one
@@ -18949,14 +18949,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                 if _c.dep_ in ("dobj", "obj") and _c.pos_ == "NOUN" and (
                                         any(_g.dep_ in ("appos", "conj") for _g in _c.children)):
                                     _ni_suppress.add(_c.i)
-                    # the nickname relative clause "who goes by Des" (the ``go`` verb + its subtree)
+                    # the nickname relative clause "who goes by Dev" (the ``go`` verb + its subtree)
                     if (_t.lemma_ or "").strip().lower() == "go" and _t.pos_ == "VERB" and \
                             _t.dep_ in ("relcl", "acl"):
                         if any(_c.dep_ == "prep" and (_c.text or "").strip().lower() == "by"
                                for _c in _t.children):
                             for _d in _t.subtree:
                                 _ni_suppress.add(_d.i)
-                    # the PARENTHETICAL nickname run "(goes by Dez)" — the binding consumed it as the
+                    # the PARENTHETICAL nickname run "(goes by Max)" — the binding consumed it as the
                     # nickname, but spaCy leaves the subject-less alias verb re-attached as the nsubj
                     # of the FOLLOWING clause, where the sibling chains read it as an entity. Suppress
                     # the verb and its prep/pobj by LINEAR position (the bracket), because the
@@ -19903,14 +19903,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         _date_attr_binds, _date_attr_suppress, _date_attr_suppress_surf = [], set(), set()
 
     # ── KINSHIP-COLLECTIVE PRE-PASS (the family-list case) ───────────────────────────────────────
-    # "We have three kids: Gabriella, Des, and Cyrus." — a COLLECTIVE kinship head ("kids"/"children"/
+    # "We have three kids: Chiara, Dev, and Leo." — a COLLECTIVE kinship head ("kids"/"children"/
     # "sons") governing a named member list. The bare SVO would mint a degenerate (user, have, kids)
-    # owning the collective TYPE, and the dash chain would distribute the verb (user, have, gabriella).
+    # owning the collective TYPE, and the dash chain would distribute the verb (user, have, chiara).
     # Neither uses the KINSHIP relation the head metadata carries. Here we detect such a head ONCE so:
     #   • the SVO chain SUPPRESSES the (user, have, <collective>) edge (the collective is a class, not a
     #     thing the user owns), and
     #   • the dash-specifier chain re-routes each named member to the head's kinship rel + direction
-    #     ((gabriella, child_of, user)) + the head's intrinsic gender, if any.
+    #     ((chiara, child_of, user)) + the head's intrinsic gender, if any.
     # Detection is grammatical + metadata-driven (the DB-grown kinship cue maps via the head's LEMMA —
     # NO kinship word list in code) and fail-safe (any miss → today's behavior). ``_kin_collective``
     # maps the collective head token index → (kin_rel, gender_or_None); the members are resolved by the
@@ -21557,8 +21557,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 if comp is None:
                     return None
                 # PERSON-ROLE + PROPER NAME → the NAMED PERSON is an entity, NOT a scalar value. "My
-                # manager is Priya Sharma" must bind (priya sharma, manager_of, user) via the copula-
-                # name / named-instance chains — NOT (user, manager, "priya sharma") as an attribute
+                # manager is Mira Sharma" must bind (mira sharma, manager_of, user) via the copula-
+                # name / named-instance chains — NOT (user, manager, "mira sharma") as an attribute
                 # scalar (that novel rel on the USER anchor was the exact edge that queued the self as a
                 # concept). Defer, the analogue of the kinship guard above. Gated on SPINE_NAMING_CHAIN
                 # (only then does a chain bind the person) + a PROPN complement, so a non-name value
@@ -21900,7 +21900,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # en_core_web_sm mis-tags an OUT-OF-VOCABULARY proper name as a common NOUN in exactly
             # this slot, and the mis-tag tracks the NAME TOKEN, not the frame:
             #     "My mother's name is Diane."  → Diane **NOUN NN** attr -> is
-            #     "my mother's name is Priya."  → Priya **PROPN NNP** attr -> is
+            #     "my mother's name is Mira."  → Mira **PROPN NNP** attr -> is
             # Same frame, same slot, different tag. Without the orthographic term below this chain
             # emitted `(mother, name, "diane")` alongside the naming chain's correct
             # `(diane, parent_of, user)` — filing a PERSON'S NAME as a scalar VALUE, which is a HARD
@@ -22383,8 +22383,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # per-noun rel like ticket_number). Step aside so only ONE has_reference_id edge is minted.
             if _identifier_context_binding(tok) is not None:
                 continue
-            # NAMED-INSTANCE TYPE-PREDICATE GUARD: "My dog Fraggle is a morkie" — "dog" is a bound
-            # TYPE (Fraggle is its appositive name), so the clause CLASSIFIES the named instance; it
+            # NAMED-INSTANCE TYPE-PREDICATE GUARD: "My dog Luna is a morkie" — "dog" is a bound
+            # TYPE (Luna is its appositive name), so the clause CLASSIFIES the named instance; it
             # is not a possessed-attribute literal keyed by the role noun. Without this the chain
             # minted the noun-as-relation (user, dog, "morkie") — the breed filed as a value of a
             # "dog" attribute on the USER, while the named instance never received its type. The
@@ -22643,7 +22643,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # A digit-valued possessed copula whose subject head is an ADMITTED THING ("my
             # handbag was 800 dollars") is the map100 flattening class when filed flat:
             # (user, handbag, "800 dollars") keys the THING as a user-attr rel_type. The
-            # Fraggle pattern files the THING + its component: (user, owns, handbag) — the
+            # Luna pattern files the THING + its component: (user, owns, handbag) — the
             # member edge per the /expand consult — + (handbag, instance_of, handbag) ONLY
             # when the NP narrows the head ("designer handbag" → handbag; a bare head IS its
             # own type place) + (handbag, <slot>, "800 dollars") — the slot from the grown
@@ -22921,7 +22921,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # Y" -> ``subclass_of``), and ``member`` is simply MIS-FILED by the classifier set —
                 # "a member of the hockey team" is not a taxonomic classifier at all, and routing it
                 # there produced ``subclass_of(<common-noun subject>, team)`` for a common-noun
-                # subject and a bare ``instance_of(priya, member)`` for a proper-noun one. Every other
+                # subject and a bare ``instance_of(mira, member)`` for a proper-noun one. Every other
                 # classifier (kind/type/sort/species/breed/variety/form/class/genre/category/subtype)
                 # fails the name-congruence gate and so can never reach this lane.
                 _rp_comp = None
@@ -23010,7 +23010,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if not subject:
                 continue
             # BLENDED_FAMILY_CAPTURE wound-4: the pronoun subject resolves to the named person
-            # ("she's a freshman" → priya; "she's a pediatric nurse" → maren) — the literal
+            # ("she's a freshman" → mira; "she's a pediatric nurse" → maren) — the literal
             # "she" filed the role on a junk island beside the named person.
             _cr4 = _subject_person_coref(tok)
             if _cr4:
@@ -24411,7 +24411,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if tok.pos_ != "VERB":
                 continue
             if tok.i in _ni_suppress:
-                continue  # the named-instance nickname relcl ("who goes by Des") — not a state
+                continue  # the named-instance nickname relcl ("who goes by Dev") — not a state
             if tok.i in _emp_suppress:
                 continue  # the employment chain owns this verb — never "(user, has_state, work)"
             if tok.i in _quantity_verb_suppress:
@@ -25449,12 +25449,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # BELONG_TO SHAPE GUARD (BELONG_TO_SHAPE_GUARD, default ON; OFF → byte-identical
                     # legacy emission). The sortal leg reads the genitive in ISOLATION — but when the
                     # possessed head is the COPULA COMPLEMENT and the copula subject is a distinct
-                    # PROPN name ("Fraggle is Mars's morkie."), the statement is about the NAMED
+                    # PROPN name ("Luna is Mars's morkie."), the statement is about the NAMED
                     # INSTANCE: the class-subject loose link (morkie, related_to/belongs_to, mars) is
                     # exactly the wrong-shape junk twin BUG-R4-2 convicted, and it starves the pet
                     # registry (the NAME fell through as uncovered residue). File per the registry
-                    # discipline instead — (fraggle, also_known_as, Fraggle), (fraggle, instance_of,
-                    # morkie), (mars, has_pet, fraggle) — and never mint the class-subject row.
+                    # discipline instead — (luna, also_known_as, Luna), (luna, instance_of,
+                    # morkie), (mars, has_pet, luna) — and never mint the class-subject row.
                     _bg_tok = None
                     if BELONG_TO_SHAPE_GUARD:
                         _bg_tok = _genitive_copula_named_subject(head)
@@ -26088,9 +26088,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # here would decline the correction shape and lose the asserted-name bind
             # (certified: test_correction_shape_binds_the_asserted_name).
             # THE FULL NAME is the entity — rebuild the contiguous proper-name span (given +
-            # family name: "Priya Sharma"), not just the ``attr`` head token ("Sharma"). Same NP
+            # family name: "Mira Sharma"), not just the ``attr`` head token ("Sharma"). Same NP
             # rebuild the kinship appositive collapse uses, so both chains agree on the one instance
-            # surface and a later atom binds/resolves to the SAME "priya sharma".
+            # surface and a later atom binds/resolves to the SAME "mira sharma".
             proper_name = _np_phrase(proper)
             role_lemma = (tok.lemma_ or tok.text or "").strip().lower()
             if not proper_name or not role_lemma or proper_name == role_lemma:
@@ -26103,7 +26103,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #   • KINSHIP role   → its specific kin rel from the kinship_noun cue map
             #                      (metadata-driven): (sarah, sibling_of, user).
             #   • PERSON-ROLE    → a role-DERIVED ``<role>_of`` relation bound to the named person
-            #                      (manager → (priya sharma, manager_of, user)). This rel is NOVEL,
+            #                      (manager → (mira sharma, manager_of, user)). This rel is NOVEL,
             #                      so it GROWS per-tenant via the WGM gate / ontology_evaluations —
             #                      it is NOT pre-seeded and it is NOT the seeded role_noun→works_for
             #                      map value (that map serves the INVERSE "Globex is my employer"
@@ -26124,13 +26124,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     continue   # non-role, non-kin head → this chain does not own it
                 _emit(proper_name, _role_rel, "user", obj_tok=None, subj_tok=proper)
             # ROLE-ALIAS leg: register the ROLE surface as an alias of the NAMED person so a later
-            # atom ("My manager is on leave") resolves manager→priya and lands on the named person.
+            # atom ("My manager is on leave") resolves manager→mira and lands on the named person.
             # THE HARD LINE: the role is a slot/alias ON the named instance, not a second entity.
             _emit(proper_name, "also_known_as", role_lemma, obj_tok=None, subj_tok=proper)
             # COLLAPSE the role noun AND claim the named-person span so no later chain (attr-scalar,
-            # named-instance) re-reads "manager" or "priya sharma" as a standalone entity / novel
-            # attribute (the (user, manager, priya) + (priya, instance_of, manager) + (user, owns,
-            # priya) junk this construction otherwise leaks).
+            # named-instance) re-reads "manager" or "mira sharma" as a standalone entity / novel
+            # attribute (the (user, manager, mira) + (mira, instance_of, manager) + (user, owns,
+            # mira) junk this construction otherwise leaks).
             _claim(tok, proper)
 
     def _chain_passive_name(doc):
@@ -26306,7 +26306,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     def _chain_alias_predicate(doc):
         r"""THIRD-PARTY / NAMED-SUBJECT ALIAS PREDICATE (Failure 2). Capture a NON-first-person
         subject's nickname/alias and file it via ``also_known_as`` on that person:
-            "She prefers to be called Mars"  → (marla, also_known_as, mars)   [she → Marla by coref]
+            "She prefers to be called Mars"  → (mara, also_known_as, mars)   [she → Mara by coref]
             "She goes by Dee"                → (dana,  also_known_as, dee)
             "He is known as Sammy"           → (sam,   also_known_as, sammy)
             "Dana goes by Dee"               → (dana,  also_known_as, dee)    [named subject]
@@ -26355,7 +26355,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # → (subject_surface | None, is_first_person). First-person self is flagged so the caller
             # defers to the preference/naming seam. A PROPN is used directly; a KIN/RELATIONAL role
             # NOUN whose proper name a turn-level naming construction bound ("My wife likes to be
-            # called Mars" — wife→marla via the turn_role_names CAP2DUP whole-turn map) collapses
+            # called Mars" — wife→mara via the turn_role_names CAP2DUP whole-turn map) collapses
             # onto that named person, so the role surface never grounds a parallel entity; anything
             # else → None (never guess a non-name subject — pronouns resolve in _own_alias_verb via
             # _resolve_person_referent so the ASSIGNED NAME can be excluded from the pool).
@@ -26383,7 +26383,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # PRONOUN subjects resolve via _resolve_person_referent(st, exclude_surface=name): the
             # name THIS clause assigns is the edge's OBJECT, never its subject antecedent, so
             # excluding it from the turn-level person pool can only DISAMBIGUATE ("My wifes name is
-            # Marla, she prefers to be called Mars" with the nickname NER-typed PERSON leaves exactly
+            # Mara, she prefers to be called Mars" with the nickname NER-typed PERSON leaves exactly
             # one real person — the referent). Structural exclusion, subject-agnostic: no name list.
             _alias_suppress.add(verb.i)
             _claim(verb, name_tok)
@@ -26853,7 +26853,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the name is filed via its surface, never classified into L4 and never carries a date.
             # Modifiers already stripped by keying on the "name" head noun.
             #
-            # THIRD-PARTY BRANCH — the second clause of the naming turn ("My wifes name is Marla,
+            # THIRD-PARTY BRANCH — the second clause of the naming turn ("My wifes name is Mara,
             # her name is Mars"): the possessive pronoun resolves to the person the FIRST clause
             # already established (turn pool minus THIS clause's own assigned name — structural,
             # subject-agnostic), so the alias binds to THAT person's surface and ingest files it on
@@ -27305,8 +27305,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # TURN-LEVEL person pool minus THIS clause's own assigned name: the name a naming/alias
         # clause ASSIGNS is that edge's OBJECT, never its subject antecedent, so excluding it can
         # only disambiguate — a pool naming just the referent and the new alias is a ONE-person
-        # turn for resolution purposes ("My wifes name is Marla, she prefers to be called Mars"
-        # with the nickname NER-typed PERSON → ['marla', 'mars'] minus 'mars' → marla). Exactly
+        # turn for resolution purposes ("My wifes name is Mara, she prefers to be called Mars"
+        # with the nickname NER-typed PERSON → ['mara', 'mars'] minus 'mars' → mara). Exactly
         # one survivor → that person; zero or several → None (never guess). Subject-agnostic:
         # morphology + the whole-turn NER pool, no name list.
         try:
@@ -27341,7 +27341,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # subject-agnostic, NO name/role word list; fail-safe → None.
         try:
             # BLENDED_FAMILY_CAPTURE wound-2: an APPOSITIVELY-RENAMED SUPERLATIVE head ("Our
-            # eldest, Priya, turned 14") is the same one-referent construction — spaCy tags
+            # eldest, Mira, turned 14") is the same one-referent construction — spaCy tags
             # "eldest" ADJ (Degree=Sup), and the strict NOUN gate returned None, so the clause
             # filed on the bare adjective while the apposed name orbited unclaimed. An appos
             # PROPN on an ADJ head names the SAME referent; the NAME is the entity.
@@ -27461,10 +27461,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # NOMINAL-SUBJECT GATE + PARENTHETICAL RECOVERY. A measured entity is a NOMINAL; a
                 # VERB can never carry an age. spaCy nonetheless hands this chain a VERB nsubj for a
                 # parenthetical alias run, which has no subject of its own and gets re-attached to the
-                # following copula: "My son Desmonde (goes by Dez) is 12" → nsubj(is) = "goes", which
+                # following copula: "My son Marco (goes by Max) is 12" → nsubj(is) = "goes", which
                 # this chain stored as ("goes", age, "12"). Reject the non-nominal, then RECOVER the
                 # real subject — the nearest PROPER NAME to the LEFT of the bracket that opens the
-                # run — so the age still lands on Desmonde instead of being dropped with the junk.
+                # run — so the age still lands on Marco instead of being dropped with the junk.
                 # A NOMINAL subject falls through to the full resolution ladder below unchanged.
                 if tok.pos_ not in ("NOUN", "PROPN", "PRON"):
                     _rec = None
@@ -27838,10 +27838,10 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             except Exception:  # noqa: BLE001 — fail-safe
                 _subj_et = ""
             # PROPER-NOUN OVERRIDE (live-only bug, was silently dropping per-member ages): a PROPER
-            # NOUN subject ("Gabriella is 10", "Des is 12") is a NAMED entity whose bare-cardinal
+            # NOUN subject ("Chiara is 10", "Dev is 12") is a NAMED entity whose bare-cardinal
             # copula complement is ITS OWN measurement. GLiNER2's type on a one-name micro-sentence is
-            # NOISE — it mis-types "Gabriella"→Animal and "Des"→Organization, so the additive guard
-            # below would VETO their age (head_types={Person}) while admitting "Cyrus"→Person. The
+            # NOISE — it mis-types "Chiara"→Animal and "Dev"→Organization, so the additive guard
+            # below would VETO their age (head_types={Person}) while admitting "Leo"→Person. The
             # guard's real job is the COMMON-noun over-reach ("the tomatoes are 2-3 inches tall" → leave
             # to has_state). A PROPN named subject is never that case, so trust the grammar, not the
             # noisy NER. Grammatical (PROPN), subject-agnostic, NO word list.
@@ -28155,7 +28155,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
     def _chain_ordinal_grade(doc):
         # THE ORDINAL GRADE WORD (SPINE_ORDINAL_GRADE, wound-map round 4 "rowan-grade") —
-        # "My stepson Rowan is 12, seventh grade at Crestwood Middle." / "Priya is in the
+        # "My stepson Rowan is 12, seventh grade at Crestwood Middle." / "Mira is in the
         # seventh grade." — mints the SAME digit-grade storage the existing bare-count frame
         # owns ("he's in grade 4" → (subj, grade, "4", scalar_datatype="string")): the
         # ordinal WORD immediately LEFT-ADJACENT to the `grade` head noun (amod↔head, i = i-1;
@@ -28558,7 +28558,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _generic_surface = (generic_obj.lemma_ or generic_obj.text or "").strip().lower()
             # KINSHIP COLLECTIVE re-route: when the generic head is a kinship collective the pre-pass
             # flagged ("kids"/"children"/"sons" → child_of), each named member is bound to the head's
-            # KINSHIP rel toward the possessor — (gabriella, child_of, user) — NOT (user, have, gabriella)
+            # KINSHIP rel toward the possessor — (chiara, child_of, user) — NOT (user, have, chiara)
             # and NOT (user, owns, kids). Direction: the kin map gives the rel the HEAD plays toward the
             # possessor, so the member is the SUBJECT and the possessor the OBJECT. The head's intrinsic
             # gender (if any — neutral kin roles carry none) rides as a scalar on each member. Metadata-
@@ -28648,7 +28648,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         #                                              the rel_types overlay (_possession_rel_for_type).
         #   3c. NON-kin, NOT self-possessed person/role → (name, has_role, type) — a generic role slot.
         #   4. age scalar (name, age, "19")         — the bare cardinal in the binding's span.
-        #   5. nickname (name, also_known_as, Des)  — a "goes by Des" run.
+        #   5. nickname (name, also_known_as, Dev)  — a "goes by Dev" run.
         #   6. SUPPRESS the bare TYPE noun (son/daughter/dog/children) from becoming a standalone entity
         #      (claim it) once the named instance binds — the role is a CLASSIFICATION, not a thing.
         # Gated behind SPINE_NAMING_CHAIN (parity with the sibling naming chains); subject-agnostic,
@@ -28722,13 +28722,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             _type_obj = type_head or type_noun
 
             # SHARED-ROLE COORDINATED NAMES (general conj-distribution, role-bleed-safe). "children named
-            # Cyrus, Des, and Gabriella" / "My kids are Cyrus, Des, and Gabriella" bind ONE role over a
+            # Leo, Dev, and Chiara" / "My kids are Leo, Dev, and Chiara" bind ONE role over a
             # COORDINATED name list, but the detector returns a single binding (the first name). Walk the
             # coordination (``_np_conjuncts`` — the shared conj/PROPN-appos collector) and distribute the
             # SAME role to every coordinated sibling that is NOT independently bound to its own type — so
             # the mixed "a son Alex, a daughter Robin" case (each name has its own binding) never bleeds a
             # role across siblings. Each name is its OWN MEMORY entity; a NAME is never classified as a
-            # type (THE HARD LINE — we replicate the role, we do not make Cyrus a type). Fail-safe.
+            # type (THE HARD LINE — we replicate the role, we do not make Leo a type). Fail-safe.
             _emit_names = [name_key]
             try:
                 _ptok = next((t for t in doc if t.pos_ == "PROPN"
@@ -28826,7 +28826,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 elif type_head in _role_noun_map():
                     # a PERSON ROLE noun in the ``role_noun`` cue class (manager/boss/supervisor) → the
                     # role-DERIVED ``<role>_of`` relation bound to the NAMED person, the SAME rel
-                    # ``_chain_copula_name`` emits for "my manager is Priya Sharma" (so the two chains
+                    # ``_chain_copula_name`` emits for "my manager is Mira Sharma" (so the two chains
                     # AGREE and dedup — the kinship analogue). GROWS per-tenant via ontology_evaluations
                     # (novel rel), NOT the seeded works_for org-map value. Queue the role for growth.
                     _emit(nk, f"{type_head}_of", "user", subj_tok=None, obj_tok=None)
@@ -29043,8 +29043,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # only reach a NOUN appos. If the HEAD is a bound proper name, the role is its type — skip.
             if named in _owned_name_keys:
                 continue
-            # ATTRIBUTE-VALUE APPOSITIVE → a SCALAR, not a role. "Gabriella, age 10" states a VALUE
-            # for an attribute; it does not give Gabriella the role "age". The discriminator is the
+            # ATTRIBUTE-VALUE APPOSITIVE → a SCALAR, not a role. "Chiara, age 10" states a VALUE
+            # for an attribute; it does not give Chiara the role "age". The discriminator is the
             # cardinal the appositive noun carries on itself (a ``nummod``) — an attribute SATURATED
             # by its value — which a genuine role appositive ("Rachel, a real estate agent") never
             # has. Emit the attribute keyed by its own head noun with the cardinal as a STRING scalar
@@ -29172,7 +29172,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     (_subj.text or _subj.lemma_ or "").strip().lower()
                 _member_set = set(_members)
                 # The FULL enumerated region: every NOUN/PROPN in the appos/conj subtree under the head
-                # / first member, INCLUDING common-noun specifiers ("a designer named Priya" contributes
+                # / first member, INCLUDING common-noun specifiers ("a designer named Mira" contributes
                 # "designer"). The dash-specifier RECOVERY pass distributes the raw colon list over ALL
                 # of these, minting (governor, owns/have, <specifier>) junk we must drop alongside the
                 # member possession junk. Structural walk, NO word list.
@@ -29206,7 +29206,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # a member is ``instance_of`` the COLLECTIVE head (plural class) — never its real type
                     if _r == "instance_of" and _o in _hv and _s in _ms_set:
                         return True
-                    # subject owns/has a MEMBER (possession junk: "user owns gabriella"/"team have sarah")
+                    # subject owns/has a MEMBER (possession junk: "user owns chiara"/"team have sarah")
                     if _r in ("owns", "own", "have", "has") and _o in _ms_set:
                         return True
                     # the GOVERNOR (the construction's subject, or the user) "owns/has" anything in the
@@ -29971,13 +29971,13 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                   subj_tok=_subj_tok, obj_tok=None)
                     _claim(_obj, _v)
                     continue
-            # ── THE TURNED-N AGE CONVENTION (SPINE_TURNED_AGE, wound-map round 4 "priya-age") ─────
-            # "Our eldest, Priya, turned 14 on January 22." / "She turns 15 in March." — the
+            # ── THE TURNED-N AGE CONVENTION (SPINE_TURNED_AGE, wound-map round 4 "mira-age") ─────
+            # "Our eldest, Mira, turned 14 on January 22." / "She turns 15 in March." — the
             # measure verb `turn` (lemma) with a BARE INTEGER direct object ≤ 120 states the
             # subject's AGE at the (optional) date, exactly like the copula bare-number person
             # scalar ("X is 9"). Reuse THAT frame's storage: rel "age", the bare numeral surface
             # as the string value, NO scalar_datatype — never the opaque verb-lemma `turn`
-            # attribute (the wound: recall served "Priya's turn is 2027-01-22"). The bind already
+            # attribute (the wound: recall served "Mira's turn is 2027-01-22"). The bind already
             # passed the bare-cardinal pre-pass firewalls (NUM dobj, plain-integer shape, no
             # 4-digit calendar year); the ≤120 ceiling is the human-age bound. Deterministic:
             # lemma + digit value-shape, no LLM, no word list beyond the verb itself. The
@@ -30626,7 +30626,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     def _chain_object_named_value(doc):
         # OBJECT NAMED-VALUE (G4 — LongMemEval dense-capture "the name is dropped"). A stated PROPER
         # NAME that identifies a common-noun THING — "a playlist called Summer Vibes", "a dog named
-        # Fraggle", "I named my project Phoenix", "my favorite restaurant is Nobu" — is the ANSWER to a
+        # Luna", "I named my project Phoenix", "my favorite restaurant is Nobu" — is the ANSWER to a
         # "what is the name of …" question, yet the SVO/possessive backbone keeps only the generic head
         # (playlist / dog / project / restaurant) and DROPS the name entirely. This chain recovers the
         # name and files it in the NAMING LAYER of the referent: (referent-type, also_known_as, Name).
@@ -30661,7 +30661,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
         def _ecf_mint_instance(_name_key, _l4_place, _owner, _member_rel, _name_surface):
             """THE SHARED MINT (entity-centric filing) — the ONE emitter both the pet arm and the
-            thing arm call, so the Fraggle pattern stays ONE shape (this GENERALIZES, never forks):
+            thing arm call, so the Luna pattern stays ONE shape (this GENERALIZES, never forks):
               • (<name>, instance_of, <type place>) — the instance IS-AN-INSTANCE of its class
                 (THE HARD LINE: the name is the instance, the kind is the place — never the
                 reverse, never the name into L4);
@@ -30905,7 +30905,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # THE SHARED MINT (entity-centric filing refactor): the SAME emitter the
                     # thing arm below uses — identical emits in identical order, so the pet
                     # ladder's shape is byte-for-byte unchanged and the generalization never
-                    # forks (one Fraggle pattern, two admissions).
+                    # forks (one Luna pattern, two admissions).
                     _ecf_mint_instance(_name_key, _l4_place, "user", _poss, _name)
                 except Exception:  # noqa: BLE001 — a pet-arm miss never breaks the alias seam
                     log.debug("linguistics.pet_named_possession_failed", type_head=_type_head)
@@ -30934,7 +30934,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # byte-for-byte). A naming binding whose type head is a THING — a possession, an
             # event, a collection; NOT a person (the person lanes skipped above), NOT an animal
             # (the pet arm owns animals), NOT an inalienable body part, NOT an abstract Concept
-            # — stands as an ENTITY with the same Fraggle shape the pet arm files: the name is
+            # — stands as an ENTITY with the same Luna shape the pet arm files: the name is
             # the instance, the type NP its L4 place, and the member edge runs from the
             # possessor. THE /EXPAND CONSULT names the edge: the L4 space map
             # (``_l4_space_map`` — the binder's own entity_taxonomies rows, DB-held, grown
@@ -30981,7 +30981,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                                  name=_ta_name_key[:40], type_place=_ta_place[:40],
                                  owner=_ta_owner[:32], member_rel=_ta_rel[:32],
                                  note="THE MINT RULE — a thing-noun naming frame stands the "
-                                      "thing as an entity (Fraggle pattern generalized); the "
+                                      "thing as an entity (Luna pattern generalized); the "
                                       "alias-only twin is refused for an instance")
                         continue
                 except Exception:  # noqa: BLE001 — a thing-arm miss never breaks the alias seam
@@ -31006,7 +31006,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     #   • "…attending various workshops and lectures, LIKE the workshop on 'Effective Time Management'
     #     at the local community center last Saturday." → the NAMED event VANISHED (only the two
     #     general edges survived; `derive_residue_uncovered` listed the lost tokens);
-    #   • "I have several pets, SUCH AS a dog named Fraggle."      → "several pets as dog"   (garbage)
+    #   • "I have several pets, SUCH AS a dog named Luna."      → "several pets as dog"   (garbage)
     #   • "I visited many museums INCLUDING the Louvre last April." → "many museums including louvre"
     # The corruption is ``_nominal_pp_complement`` folding the MARKER PP into the general NP's object
     # surface. The repair uses the SAME mechanism as the existing peeled-date exclusion: the marker
@@ -31362,7 +31362,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # enumeration is fixed up here (drop collective-as-type/owns junk; distribute the right kin/
         # membership edge to EVERY member). Runs in BOTH modes: the dash_specifier_only RECOVERY pass
         # fires on the RAW un-atomized turn, so a named-member collective ("my team has three engineers:
-        # Sarah, Tom, and a designer named Priya") would otherwise leak the un-reconciled
+        # Sarah, Tom, and a designer named Mira") would otherwise leak the un-reconciled
         # (team, owns, <member>) / collective-as-type junk from the dash chain. The reconciliation only
         # acts on a HEAD with appos PROPER-NOUN members, so the crop-seed recovery case (common-noun
         # specifiers — tomatoes/peppers) it is meant for is never touched. Fail-safe → chain output.
@@ -32534,9 +32534,9 @@ def segmentation_residual_signals(text: str) -> set:
 #   COORDINATED VP     "I bought a car and sold the bike"   → the second conjunct shares the matrix
 #                      subject (UD: ``conj`` VERB with no ``nsubj`` of its own). Re-attaching that
 #                      subject is a COPY of the user's own tokens, not a rewrite.
-#   SUBJECT RELATIVE   "Gabriella who is 10"                → the relative pronoun IS the clause
+#   SUBJECT RELATIVE   "Chiara who is 10"                → the relative pronoun IS the clause
 #                      subject, so promoting the head noun into subject position recovers the second
-#                      assertion ("Gabriella is 10") from the user's own tokens. This is exactly the
+#                      assertion ("Chiara is 10") from the user's own tokens. This is exactly the
 #                      operation ``split_enumeration`` already performs and treats as fabrication-safe.
 # APPOSITION ("the laptop, a Dell XPS 13") is the third shape and is DELIBERATELY left alone — it is
 # a second assertion, but the deriver's naming/binder chains already read it off the intact NP and
@@ -32626,7 +32626,7 @@ def decompose_assertions(text: str) -> list:
         return [text]
     # A COLON ENUMERATION is owned by ``split_enumeration`` (which knows the membership-line +
     # per-member-attribute shape) or, when that declines, by the LLM escalation. Generic assertion
-    # decomposition on a list mis-attaches the count noun to each member ("three kids are Des"), so
+    # decomposition on a list mis-attaches the count noun to each member ("three kids are Dev"), so
     # this construction is handed on untouched — ``unsplit_enumeration`` then flags it.
     if ":" in text:
         return [text]
@@ -32647,7 +32647,7 @@ def decompose_assertions(text: str) -> list:
             changed = True
         out.extend(pieces)
 
-    # BOUNDED FIXPOINT: a nested construction ("my daughter Gabriella, who is 10, broke her leg" —
+    # BOUNDED FIXPOINT: a nested construction ("my daughter Chiara, who is 10, broke her leg" —
     # an apposition carrying its own relative clause) only peels one layer per pass. Re-run on the
     # produced pieces until nothing changes, capped at 2 further rounds (structural recursion depth,
     # not a heuristic) so a pathological parse can never loop.
@@ -32697,7 +32697,7 @@ def _decompose_one_clause(clause: str, nlp) -> list:
     extracted: list = []          # (anchor_index, rendered_text)
 
     # ORDER IS LOAD-BEARING — INNERMOST construction first. A relative clause can sit INSIDE an
-    # apposition ("my daughter Gabriella, who is 10"): lifting the apposition first would carry the
+    # apposition ("my daughter Chiara, who is 10"): lifting the apposition first would carry the
     # relative clause away inside it, strand its tokens in no unit at all, and trip the coverage
     # guard (abandoning an otherwise clean decomposition). Relatives first, then coordinated VPs.
     _ordered = ([t for t in doc if t.dep_ in ("relcl", "acl")]

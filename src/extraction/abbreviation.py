@@ -200,10 +200,10 @@ against .87/.84 for their loosest — ⚠️ their schemes differ on several axe
 evidence for the DIRECTION of the trade, not an ablation of this constraint alone).
 
 Concretely, it rejects genuine NON-INITIAL abbreviations — CONTRACTIONS/TRUNCATIONS, where the
-short form is a prefix or squeeze of ONE word: {config}≡{configuration}, {des}≡{desmonde}, and the
+short form is a prefix or squeeze of ONE word: {config}≡{configuration}, {des}≡{marco}, and the
 paper's own mixed-case shape {hb}≡{hemoglobin}. Those keep today's unwarranted provenance, which
 is exactly today's behaviour. The trade is deliberate and it is forced: a truncation abbreviation
-({config} from "configuration") and a truncation NICKNAME ({des} from "Desmonde") are the SAME
+({config} from "configuration") and a truncation NICKNAME ({des} from "Marco") are the SAME
 orthographic object, so NO rule over these two surfaces alone can admit one and refuse the other.
 Refusing both is the direction that cannot corrupt.
 
@@ -235,7 +235,7 @@ constructed name-after-type cases, with each nickname swapped for an initialism-
 
 THE TWO REJECTIONS ARE ARITHMETIC, NOT SEMANTICS — and that makes the finding worse, not better.
 The only Family-B cases that fail ({lt} ≡ {laptop}, {ct} ≡ {cat}; end to end also {de} ≡
-{desmonde}, {co} ≡ {company}) fail because a ONE-WORD long form has exactly ONE word-initial, so
+{marco}, {co} ≡ {company}) fail because a ONE-WORD long form has exactly ONE word-initial, so
 no two-character short form can align. The rule did not recognise a name; it ran out of words.
 Proof that the protection is word-count arithmetic and nothing else: HYPHENATE the same one-word
 type and the bypass returns, because §3.2's own boundary test — the one reused in
@@ -349,7 +349,7 @@ MISSED LICENCES (the safe direction — the alias simply keeps today's unwarrant
 * Only parenthetical definitions are recognised. "SAF stands for sustainable aviation fuel" and
   "sustainable aviation fuel, or SAF," carry a real licence this method does not see.
 * Non-initial abbreviations (truncations/contractions) are refused by design — see WHAT IT COSTS
-  above. Measured on the production corpus this removed {des}≡{desmonde} and the already-imprecise
+  above. Measured on the production corpus this removed {des}≡{marco} and the already-imprecise
   {cli}≡{command line tool}.
 * REPEATED-LETTER TRUNCATION, inherited from the paper's backward walk and not introduced here:
   a short form whose letter recurs inside a long-form word matches the INNER occurrence first, so
@@ -588,7 +588,7 @@ def is_leading_letter_match(short_form, long_form) -> bool:
     its TYPE PHRASE, two constructions Schwartz & Hearst cannot tell apart. See the module
     docstring for the measurement, for the paper's own explicit advice AGAINST adding constraints,
     and for exactly what this costs (non-initial truncations such as {config}≡{configuration} are
-    refused along with {des}≡{desmonde}; they are the same orthographic object).
+    refused along with {des}≡{marco}; they are the same orthographic object).
 
     Non-alphanumeric characters in the short form are skipped, matching §3.2's own "ignore non
     alphanumeric characters", so a dotted initialism ("S.A.F.") behaves as its letters do.

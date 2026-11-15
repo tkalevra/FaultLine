@@ -913,7 +913,7 @@ class EntityRegistry:
     # (register_alias — the walk reaches every scalar from any alias), NOT a merge rewrite.
     # GUARDS (a wrong bind corrupts user truth):
     #   • both sides must carry a hostname-shaped shared token (digit-bearing ≥3 chars, one is a
-    #     suffix of the other) — 'daughter'/'gabriella' class surfaces can never match;
+    #     suffix of the other) — 'daughter'/'chiara' class surfaces can never match;
     #   • the candidate must NOT be the USER entity, the seat anchor, a Person-typed entity, or a
     #     class-side node (weld_guard) — a similarly-NICKNAMED PERSON never merges;
     #   • EXACTLY ONE survivor — genuine ambiguity keeps today's separate mint.

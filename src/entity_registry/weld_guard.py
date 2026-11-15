@@ -174,13 +174,13 @@ _ENV_MODE = "ALIAS_WELD_GUARD"
 #   exactly that. The eligible count is the number that matters.
 #
 #   ELIGIBLE welds 22 → 6 refusals, every one a NAME welded onto an entity the USER declared
-#   a class ({dog}+{fraggle}, {cat}+{fraggle}+{goose}, {morkie dog}+{sophia}+{fraggle},
-#   {corn snake}+{sophia}). Every refusal verified class-side with USER-STATED evidence.
+#   a class ({dog}+{luna}, {cat}+{luna}+{goose}, {morkie dog}+{bella}+{luna},
+#   {corn snake}+{bella}). Every refusal verified class-side with USER-STATED evidence.
 #   FORWARD blast radius, TOTAL across armed arms: 194 entities. Sampled: common-noun type
 #   nodes (runtime/driver/process/servidor) — where a user's name must never land.
 #   SEAT-OWNER false refusals: 0 historical, 0 forward-looking.
-#   Legitimate multi-alias entities: 0 refused — {marla,mars,wife}, {cyrus,son},
-#   {desmonde,son}, {gabriella,gabby} and the seat's {user,chris,christopher} all pass.
+#   Legitimate multi-alias entities: 0 refused — {mara,mars,wife}, {leo,son},
+#   {marco,son}, {chiara,chi} and the seat's {user,chris,christopher} all pass.
 #   Lexical canonicalization lane: 0 refusals, proven by a positive control, not by absence.
 _DEFAULT_MODE = "enforce"
 
@@ -210,7 +210,7 @@ _DEFAULT_MODE = "enforce"
 #     Seat-owner false refusals: 0 historical, 0 forward.
 #     Corpus leak survey — the matcher licenses 12 distinct pairs across 5 443 real turns;
 #     9 are genuine definitions ({cpa}/{certified public accountant}, {nat}/{network address
-#     translation}, {des}/{desmonde}, …), 3 are spurious ({free}/{freemium does not count}) and
+#     translation}, {des}/{marco}, …), 3 are spurious ({free}/{freemium does not count}) and
 #     NONE of the 3 coincides with any weld, so their measured production effect is zero.
 #
 # IT IS STILL `off`, AND THAT IS DELIBERATE — the remaining reason is no longer the warrant.

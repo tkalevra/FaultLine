@@ -24,6 +24,8 @@ import hashlib
 import hmac
 import json
 import mimetypes
+
+import psycopg2
 import os
 import re
 import sys
@@ -1866,6 +1868,13 @@ def _build_tool_openapi() -> dict:
 
     paths: dict = {}
     for t in _TOOL_OPS:
+        if t["op"] not in _canonical:
+            # Open-core (no saas/): ops whose canonical text lives MOAT-SIDE (customer_chat
+            # ← saas/agent_mcp_tool.py) must not be advertised at all — serving the local
+            # _TOOL_OPS string would publish a dead tool the call-time gate 404s anyway, and
+            # it breaks the canonical-text parity contract this builder exists to enforce.
+            # Under SaaS the fold above supplies the canonical text, so the entry stays.
+            continue
         paths[t["path"]] = {
             "post": {
                 "operationId": t["op"],
@@ -1966,6 +1975,90 @@ async def security_txt():
 _bearer = HTTPBearer(auto_error=False, description="MCP_API_KEY bearer token")
 
 
+# ── FOSS control-plane credentials (the webui's dashboard-minted auth) ───────
+# Ported verbatim from the foss http_server so the saas-lineage rewrite of this
+# module does NOT un-land the FOSS control plane (the 2026-11-09 standing rule:
+# a file-replacement port silently un-lands sibling-line fixes). The webui mints
+# per-seat tokens and rotates the MCP key into public.dashboard_seats /
+# public.dashboard_mcp_keys; the MCP transport consults them here on every auth:
+#   • a per-seat token resolves to a seat's user_id → returned as the principal →
+#     bind_tenant's dormant "Option A" activates with NO call-site change; the
+#     token IS the identity, the X-OpenWebUI-User-Id header becomes a
+#     cross-check, not the source.
+#   • a rotated-then-revoked MCP key stops working IMMEDIATELY (no cache; a
+#     single indexed lookup on every auth).
+# When the DB is unreachable OR the operator has minted nothing yet, behaviour
+# falls back to the original env-MCP_API_KEY / anonymous-dev path (back-compat).
+
+def _dashboard_dsn() -> str:
+    return os.environ.get("POSTGRES_DSN", "").strip()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _dashboard_lookup(query: str, params: tuple) -> Optional[tuple]:
+    """Run a single SELECT against the shared DB; return the first row or None.
+
+    Opens a short-lived connection per call — local postgres, one indexed probe,
+    negligible cost. Any error → None (auth falls back to env); the MCP path
+    never hard-fails on a DB hiccup. Blocking, but ~ms and not on the chat path.
+    """
+    dsn = _dashboard_dsn()
+    if not dsn:
+        return None
+    try:
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception:  # noqa: BLE001 — DB optional; degrade to env auth
+        return None
+
+
+def _resolve_seat_token_db(credentials: Optional[str]) -> Optional[str]:
+    """Return the seat's user_id if credentials is a valid active seat token."""
+    if not credentials:
+        return None
+    row = _dashboard_lookup(
+        "SELECT user_id FROM public.dashboard_seats "
+        "WHERE token_hash = %s AND active = TRUE",
+        (_sha256_hex(credentials),),
+    )
+    if not row:
+        return None
+    return str(row[0])
+
+
+def _mcp_key_active_db(credentials: Optional[str]) -> bool:
+    """True if credentials matches an active rotated MCP key in the DB."""
+    if not credentials:
+        return False
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys "
+        "WHERE key_hash = %s AND is_active = TRUE LIMIT 1",
+        (_sha256_hex(credentials),),
+    ) is not None
+
+
+def _any_dashboard_credential_configured() -> bool:
+    """True if the operator has minted ANY seat or rotated key (DB-gated).
+
+    Gates the anonymous-dev fallback: once seats/keys exist in the DB, the open
+    anonymous mode is suppressed even if MCP_API_KEY env is unset, so minting the
+    first seat closes the open posture."""
+    # NOTE the empty params tuple on BOTH probes. `_dashboard_lookup(query, params)` takes
+    # params as a REQUIRED positional; omitting it raises TypeError at the CALL SITE, i.e.
+    # before the callee's `try`, so its documented "any error -> None, never hard-fails"
+    # fail-safe never gets the chance to run. Every credential-less request then 500s inside
+    # require_auth — which is the DEFAULT posture for a fresh self-hosted install.
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1", ()
+    ) is not None or _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
+    ) is not None
+
+
 def _resolve_principal(credentials: str | None) -> str | None:
     """Map a presented bearer credential to a principal.
 
@@ -1999,12 +2092,28 @@ def _resolve_principal(credentials: str | None) -> str | None:
     except Exception:
         return None  # fail-closed
 
-    if not MCP_API_KEY:
-        return "anonymous"  # unauthenticated mode (dev/localhost only)
-    if credentials is None:
-        return None
-    if hmac.compare_digest(credentials, MCP_API_KEY):
+    # ── FOSS control plane: dashboard-minted seat tokens + rotated MCP keys ──
+    # (1) Per-seat token (highest precedence — strongest auth): returns the seat's
+    #     user_id UUID; bind_tenant's dormant "Option A" treats it as the identity.
+    # (2) Rotated MCP key in the DB → 'shared' (a revoked key dies immediately —
+    #     no cache, one indexed probe per auth).
+    seat_uid = _resolve_seat_token_db(credentials)
+    if seat_uid:
+        return seat_uid
+    if _mcp_key_active_db(credentials):
         return "shared"
+    # (3) Env MCP_API_KEY (back-compat / bootstrap).
+    if MCP_API_KEY:
+        if credentials is None:
+            return None
+        if hmac.compare_digest(credentials, MCP_API_KEY):
+            return "shared"
+        return None
+    # (4) Anonymous dev mode — only when nothing is configured anywhere (no env key
+    # AND no dashboard seats/keys) AND no credential was presented. Minting the
+    # first seat/key closes the open posture.
+    if credentials is None and not _any_dashboard_credential_configured():
+        return "anonymous"
     return None
 
 
