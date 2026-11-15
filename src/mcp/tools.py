@@ -400,7 +400,7 @@ TOOLS = [
         "name": "forget_fact",
         "description": "Use ONLY for a precise tombstone of ONE already-stored fact about a NAMED "
                        "target, when the user points at a specific stored value you can pin exactly "
-                       "— e.g. 'forget that Ada is my spouse', 'delete that my work email is "
+                       "— e.g. 'forget that Mia is my spouse', 'delete that my work email is "
                        "chris@foo.com'. You MUST fill 'subject' (who the fact is about; 'me' for the "
                        "user) and 'old_value' (the stored value to remove); 'rel_type' narrows it "
                        "further. A subject alone, or a relation alone, is refused. "

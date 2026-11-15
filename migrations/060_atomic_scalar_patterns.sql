@@ -3,7 +3,7 @@
 -- These patterns are matched against input text BEFORE the LLM extraction call.
 -- Detected values are injected as type annotations into the extraction prompt,
 -- preventing the LLM from splitting structured values on their delimiters
--- (e.g., IP "192.168.40.20" split to "192" on the first octet).
+-- (e.g., IP "192.0.2.20" split to "192" on the first octet).
 --
 -- category = 'scalar_atomic' marks them as pre-flight detectors, not
 -- compound extraction patterns like category='identity' etc.
@@ -32,7 +32,7 @@ VALUES
   '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
   'has_ip',
   'IPv4 address',
-  '192.168.40.20',
+  '192.0.2.20',
   'scalar_atomic', 'bootstrap', 0.97
 ),
 

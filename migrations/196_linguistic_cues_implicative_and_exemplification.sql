@@ -36,7 +36,7 @@
 -- built on. They were being lost, and two of them DESTRUCTIVELY. Measured 2026-07-30:
 --     "…attending various workshops and lectures, LIKE the workshop on 'Effective Time Management'
 --      at the local community center last Saturday."  -> the NAMED event VANISHED entirely.
---     "I have several pets, SUCH AS a dog named Fraggle."   -> object "several pets AS dog"  (garbage)
+--     "I have several pets, SUCH AS a dog named Luna."   -> object "several pets AS dog"  (garbage)
 --     "I visited many museums INCLUDING the Louvre last April."
 --                                                          -> object "many museums INCLUDING louvre"
 --                                                             + the resolved 2022-04-05 ORPHANED

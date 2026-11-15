@@ -264,8 +264,8 @@ def derive_schema_name(user_slug: str) -> str:
         >>> derive_schema_name("christopher")
         'faultline_example'
 
-        >>> derive_schema_name("ada")
-        'faultline_marla'
+        >>> derive_schema_name("mia")
+        'faultline_mia'
     """
     # Sanitize slug: lowercase, alphanumeric + underscore only
     safe_slug = "".join(c if c.isalnum() or c == "_" else "_" for c in user_slug.lower())

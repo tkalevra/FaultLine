@@ -10,7 +10,7 @@
 --   hierarchy rels (is_hierarchy_rel=true): instance_of, is_a, member_of, part_of, subclass_of
 --   transitivity is an entity_taxonomies property (019), NOT a rel_types column — see the note
 --   below the first UPDATE for why the two transitivity UPDATEs this file used to carry are gone.
--- ("my animals" walks DOWN transitive subclass_of to Fraggle; instance_of is a single hop.)
+-- ("my animals" walks DOWN transitive subclass_of to Luna; instance_of is a single hop.)
 --
 -- These are guarded UPDATEs against EXISTING curated rel_types — they touch nothing else and
 -- never mint a rel. This is NOT keyword-promotion of novel rels (which stays disabled per the

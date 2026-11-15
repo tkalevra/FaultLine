@@ -3600,8 +3600,8 @@ CORRECTION_ROLE_SLOT_REBIND = os.environ.get(
 # default ON). THE WOUND (measured live on the litmus seat 3e7b2cc4, image b9161e04,
 # 2026-11-14 autopsy: tools/regression_results/convergence/results/autopsy-report.md):
 # a user correction/statement that lands the RIGHT row MINTS it BESIDE the wrong one and
-# the wrong row stays live — "Goose is Cyrus's cat." committed (cyrus, has_pet, goose)
-# while the planted (user, has_pet, goose) stayed live; the scalar twin "Desmonde is 13."
+# the wrong row stays live — "Goose is Leo's cat." committed (leo, has_pet, goose)
+# while the planted (user, has_pet, goose) stayed live; the scalar twin "Marco is 13."
 # landed attribute=has_value BESIDE the stale age=12 (the SEAM-1 non-animate retype fired
 # on a mistyped subject, so the age slot was never superseded); and a negated twin row
 # served beside its affirmed counterpart. THREE deterministic arms, all serve the owner's
@@ -3635,14 +3635,14 @@ CORRECTION_REPLACE_NOT_PARALLEL = os.environ.get(
 #      (dimension ENTITY); the named pet entity (Rex, an Animal in the pets space) never
 #      became the removal target. The speaker guard now refuses the wipe honestly, but the
 #      removal must WORK: a removal targets a THING, never the speaker by default.
-#   2. T02 "Actually my wife's name is Marla MacPhee." — flakes to
+#   2. T02 "Actually my wife's name is Mara Reyes." — flakes to
 #      clarification_needed / failed ~2 of 3 runs (the R4-J extraction-draw variance
 #      class): the correction extraction's subject/object resolution wobbles at temp 0;
 #      the deterministic ", not <Name>" marker landed for the contrast-clause shape but
 #      this shape has none.
-#   3. the Location retype — 'mars'/'desmonde' (person-shaped, kin/pet-membership-bearing
+#   3. the Location retype — 'mars'/'marco' (person-shaped, kin/pet-membership-bearing
 #      entities) retyped entity_type=Location IN PLACE post-plant by the zero-shot typer's
-#      class-a stamp, cascading type_refused on T04 "Fraggle is Mars's morkie."
+#      class-a stamp, cascading type_refused on T04 "Luna is Mars's morkie."
 # THE FIX, deterministic where possible: (a) a retraction whose subject bound the SPEAKER
 # rebinds to the NAMED THING when its surface strong-matches exactly one stored entity
 # (the same admission discipline as FORGET_ENTITY_SWEEP); (b) a closed kin-name
@@ -3701,7 +3701,7 @@ CORRECTION_ROLE_SLOT_BIND = os.environ.get(
 #     {ANY}) minutes after the junk rows were planted, so mere declaredness is
 #     worthless as a junk signal; authority provenance is the signal) while the
 #     INVERSE tuple (y, has_pet-style defining rel, x) is live affirmed —
-#     ((fraggle, belong_to, marla) beside live (marla, has_pet, fraggle)) — is the
+#     ((luna, belong_to, mara) beside live (mara, has_pet, luna)) — is the
 #     junk duplicate of that edge; superseded, never deleted.
 #   ARM B — the kind-foreign member: a live edge on a rel that ONLY animate-membered
 #     taxonomies declare (has_pet/child_of/spouse/parent_of/sibling_of — computed from
@@ -3738,7 +3738,7 @@ SHAPE_RECONCILIATION_SWEEP = os.environ.get(
 # (two kids at the same live age → honest abstain: a wrong merge beats a lost twin);
 # the twin's alias must name an ACTIVE KIN — the word after the age morphology is
 # checked against the per-tenant kinship_noun cue rail (bootstrap floor: son/daughter/
-# child/kid — metadata, never a word list; 'a 20-year-old car' is a car, never Cyrus)
+# child/kid — metadata, never a word list; 'a 20-year-old car' is a car, never Leo)
 # whose mapped rel must be one of the kid's own slot rels — and the noun's INTRINSIC
 # gender (the kinship_gender rail, the same floor's sibling category) must not
 # contradict the kid's live has_gender (a son never consolidates into a kid known
@@ -3883,7 +3883,7 @@ INTENT_DETERMINISTIC_FIRST = os.getenv(
 
 # ── DET_POSSESSIVE_CONTRADICTION_ESCALATE (default ON; OFF → byte-parity) ────────────────────────
 # BUG-R4-2 conviction (the owner's live seat + the round-4 corpus control): a correction phrased
-# as a PLAIN POSSESSIVE ("Fraggle is my morkie." against a live (mars, has_pet, fraggle) row)
+# as a PLAIN POSSESSIVE ("Luna is my morkie." against a live (mars, has_pet, luna) row)
 # satisfied EVERY tier-2 gate — declarative, cue-free, non-negated, speaker-anchored — so the
 # deterministic-first possessive arm short-circuited to STATEMENT and SKIPPED the GLiNER2 /
 # below-gate INTENT_ADJUDICATION escalation layers. The turn then walked in as a NEW statement
@@ -10360,7 +10360,7 @@ def _queue_concept_for_grounding(
     # The object must NOT be the user/anchor or the subject itself. THE HARD LINE: the user anchor
     # is the grounded self (a NAMED INSTANCE, never a type) — recognize it BY IDENTITY
     # (concept_object_id == user_id, the tenant anchor UUID), not just the literal "user" surface.
-    # A relational edge whose OBJECT is the user (e.g. pre-directionality `(priya, related_to, user)`)
+    # A relational edge whose OBJECT is the user (e.g. pre-directionality `(mira, related_to, user)`)
     # would otherwise queue the anchor's UUID as a "novel concept", and the what-is climb then mints
     # `(user, subclass_of, role)`. `_attach_to_seeded_backbone` already guards the anchor this way;
     # this mirrors it. Subject-agnostic: user_id is the runtime anchor, not a hardcoded subject.
@@ -10600,7 +10600,7 @@ def enforce_directionality(
 
     Examples:
     - User says "alice is parent of me" → invert to "I am parent of alice" (parent_of canonical)
-    - User says "Ada is spouse of me" → swap to (user, spouse, ada) (canonical anchor-first)
+    - User says "Mia is spouse of me" → swap to (user, spouse, ada) (canonical anchor-first)
 
     Returns: (corrected_subject, corrected_object, corrected_rel_type)
     """
@@ -12170,9 +12170,9 @@ def _collect_member_taxonomy_entities(
       - "my animals" → transitive subclass_of → the pet.
 
     SUBJECT-AGNOSTIC: the anchor is whatever `resolve_anchor` produced (user OR any
-    entity UUID — my / Ada's / the datacenter's). NEVER `if subject == user`. The
-    nesting recursion stays anchored to the SAME subject, so "Ada's family" folds
-    Ada's pets, not the user's.
+    entity UUID — my / Mia's / the datacenter's). NEVER `if subject == user`. The
+    nesting recursion stays anchored to the SAME subject, so "Mia's family" folds
+    Mia's pets, not the user's.
 
     Metadata-driven: reads rel_types_defining_group, member_taxonomies,
     has_transitivity, transitive_rel_types from the bound tenant schema (NO
@@ -13088,12 +13088,12 @@ def _is_grown_ontology_row(rel_type, provenance, fact_provenance=None,
     ``subclass_of`` clause above is a proxy for "the engine grew this", and it is exactly wrong
     on the rows it actually catches: an engine-grown rung is already caught by the provenance
     clause, so the only rows the relation clause could ever add are the ones an engine lane did
-    NOT mint — i.e. the user's own "a fraggle is a kind of puppet", silently deleted from every
+    NOT mint — i.e. the user's own "a luna is a kind of puppet", silently deleted from every
     reply. When the caller can supply fact_provenance, a user statement is never grown ontology.
 
     User-grounded leaf rows (user_stated ``instance_of``/``has_pet``/``part_of``/``owns`` …)
     are NOT grown-ontology and are returned normally — so a leaf reached THROUGH the ladder
-    (my family → pets → Fraggle) still surfaces. Deterministic; no domain literals.
+    (my family → pets → Luna) still surfaces. Deterministic; no domain literals.
 
     THE AUTHORSHIP CLAUSE (the one that closes the recorded ``instance_of`` residue). A type
     assertion is the person's memory only when the person made it. ``fact_provenance`` is the
@@ -13660,7 +13660,7 @@ def _detect_semantic_conflicts(
 
     # WOUND E — THE instance_of TARGET-SHAPE GUARD (THE HARD LINE, fail-closed). instance_of is
     # the L4 PLACE edge: its object must be a TYPE node, never a named instance/person (measured
-    # prod: "P70 Laptop is an instance of CYRUS" — the owner's son, a Person entity — a category
+    # prod: "P70 Laptop is an instance of LEO" — the owner's son, a Person entity — a category
     # error across the hard line). Same evidence superset as hardline_guard.refuses_subclass_rung,
     # polarity inverted for the TARGET slot. Fail direction per the owner: REFUSE THE EDGE
     # (supersede_new — dropped, never misfiled across ontologies), and when the real type is
@@ -14119,7 +14119,7 @@ def _decide_supersede_or_coexist(
 
     # ── SINGLE-VALUED STATE-SLOT SUPERSEDE (LIVE-OPENWEBUI FIX 4; INGEST_STATEREL_SLOT_
     # SUPERSEDE, default ON, OFF → skipped, byte-for-byte coexist) ─────────────────────
-    # THE MEASURED WOUND (the owner's prod seat 2026-11-13): "My spouse is Marla MacPhee…"
+    # THE MEASURED WOUND (a production seat, 2026-11-13): "My spouse is Mara Reyes…"
     # landed beside the PRIOR spouse slot live — ``ingest.temporal_coexist`` "same-slot state
     # conflict kept BOTH rows live (keep-both)" — and five test-junk spouse rows stayed live
     # with it. A spouse slot is OWL-FUNCTIONAL (one current holder), so blanket coexist on a
@@ -16208,7 +16208,7 @@ def _turn_first_person_anchored(text: str) -> bool:
     (``linguistics._is_first_person_personal_pronoun`` / ``_is_first_person_possessive``):
     a genuine 1st-person personal pronoun ("I"/"we" — Person=1 ∧ PronType=Prs ∧ no Poss)
     or a 1st-person possessive determiner ("my"/"our" — the same morphology with Poss=Yes)
-    anywhere in the turn. A turn about somebody else ("her name is Ada") declines and keeps
+    anywhere in the turn. A turn about somebody else ("her name is Mia") declines and keeps
     today's path. Fail-safe: layer unavailable / parse miss → False (never routes)."""
     try:
         from src.extraction.linguistics import (
@@ -17541,20 +17541,20 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
 
 # ── NAME-REPAIR CORRECTION: the GRAMMAR owns the subject, not the LLM's guess ─────────────────────
 # THE DEFECT THIS CLOSES (measured end-to-end on a fresh tenant, through the MCP door):
-#   1. "My sister Marla lives in Toronto."           → (user, sibling_of, marla); Marla is her own
-#      entity, preferred alias "marla", holding lives_in/instance_of/has_gender.
-#   2. "Actually my sister's name is Marlow, not Marla."  → status:"corrected", and the DB shows the
+#   1. "My sister Mara lives in Toronto."           → (user, sibling_of, mara); Mara is her own
+#      entity, preferred alias "mara", holding lives_in/instance_of/has_gender.
+#   2. "Actually my sister's name is Marlow, not Mara."  → status:"corrected", and the DB shows the
 #      correction landed on the WRONG PERSON. The correction-extraction LLM flattens the 1st-person
 #      possessive to subject_name="user"; ``resolve_anchor`` then finds "sister" but it is an L4 TYPE
 #      node, correctly place-blocked (THE HARD LINE), so resolution falls through to an n-gram hit on
-#      the bare surface "marla" — the RIGHT entity — which the value-entity guard then REJECTS
-#      because "marla" is the correction's own old value. Subject collapses to the SPEAKER, and what
+#      the bare surface "mara" — the RIGHT entity — which the value-entity guard then REJECTS
+#      because "mara" is the correction's own old value. Subject collapses to the SPEAKER, and what
 #      happens next is a coin flip on the LLM's rel guess, both outcomes wrong and both reported
 #      "corrected": old_rel_type="name" writes a ``name=Marlow`` SCALAR onto the USER'S OWN entity (a
 #      name the speaker never claimed — THE HARD LINE violated: a memory filed at the wrong person),
 #      or old_rel_type is pinned to "sibling_of" and the RELATIONAL branch supersedes the real kin
 #      edge and mints a brand-new EMPTY "marlow" entity as the sibling — the sister keeps her old
-#      name, loses her kinship, and her city/gender/type facts are orphaned. Recall answers "Marla"
+#      name, loses her kinship, and her city/gender/type facts are orphaned. Recall answers "Mara"
 #      either way. (Both variants observed at this HEAD; the LLM's guess is not deterministic.)
 #
 # THE GUARD IS NOT WRONG, ITS PREMISE IS. "a correction's subject can never be its own old/new value"
@@ -19745,7 +19745,7 @@ def _label_write_misbinds_referent(db, text, rel_type, target_uuid, new_value, u
 
          A label in a REFERRING slot is untouched ("John's name is actually Jonathan." resolves
          through ``john``, John's own way of being referred to), as is a role-noun subject
-         ("My daughter's name is Priya Nair." → ``(daughter, name, 'priya nair')``), whose only
+         ("My daughter's name is Mira Nair." → ``(daughter, name, 'mira nair')``), whose only
          label IS the value being assigned.
 
       3. the shared predicate ``_name_correction_misbinds_referent`` then answers the same question
@@ -23493,8 +23493,8 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
 
     # === PRE-GLINER2 DECLARATIVE-STATEMENT ROUTE (intent-misroute fix) ===
     # A first-person declarative that ASSERTS facts ("I wanted to tell you about my family. My
-    # wife's name is Ada. We have three kids: Gabriella, Des, and Cyrus.") is mis-scored QUERY
-    # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Des/Cyrus drop.
+    # wife's name is Mia. We have three kids: Chiara, Dev, and Leo.") is mis-scored QUERY
+    # by GLiNER2's verbose labels (the "tell" verb) → it never reaches ingest and Dev/Leo drop.
     # Mirror the affect/correction pre-gates: when the turn carries >= 2 GRAMMATICAL assertions
     # (count_declarative_assertions — explicit-subject copula/transitive predicates; imperatives
     # like "tell me about my family" and questions are excluded by construction), route STATEMENT
@@ -23619,7 +23619,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     # tier-2 escalation below when the seat holds a LIVE possession/kin row this possessive
     # statement would CONTRADICT — the stored row IS the explicit old-value evidence the
     # CORRECTION_MARKER_GATE floors demand, so a correction phrased as a plain possessive
-    # ("Fraggle is my morkie." against a live (mars, has_pet, fraggle)) is no longer refused
+    # ("Luna is my morkie." against a live (mars, has_pet, luna)) is no longer refused
     # as "marker-less" after the escalation stood the shortcut down. False everywhere else →
     # every marker floor is byte-identical today.
     _pc_marker_ok = False
@@ -23735,8 +23735,8 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
                       user_id=user_id[:8], error=str(_pf_err)[:120])
 
     # ── THE STORED-CONTRADICTION ESCALATION, THIRD-PERSON LEG (same flag, same probe) ──────
-    # A plain possessive correction is usually THIRD-person ("Fraggle is Mars's morkie." against
-    # a live (desmonde, has_pet, fraggle) row): tier-2's speaker-anchored gate declines it by
+    # A plain possessive correction is usually THIRD-person ("Luna is Mars's morkie." against
+    # a live (marco, has_pet, luna) row): tier-2's speaker-anchored gate declines it by
     # morphology, so the shortcut was never the risk — but the marker floors downstream refuse
     # the GLiNER2/adjudicated CORRECTION label for lack of a repair marker, and the turn walked
     # in as a NEW statement (the BUG-R4-2 conviction). Run the SAME ONE bounded probe whenever
@@ -25120,7 +25120,7 @@ def _scalar_sensitivity_for(category: str | None, datatype: str | None) -> str:
 
 # WOUND A (host-CIDR discipline, prod seat 10d7d879): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
 # with a prefix length — NOT a subnet declaration. The detector's CIDR grammar used to file the rel
-# ``has_subnet`` unconditionally, so ``"an ip of: 192.168.40.83/25"`` landed as has_subnet beside
+# ``has_subnet`` unconditionally, so ``"an ip of: 192.0.2.83/25"`` landed as has_subnet beside
 # (never superseding) the host's real has_ip. The value SHAPE decides: a CIDR-shaped value files
 # ``has_ip`` (datatype stays ``cidr`` — detector-carried) UNLESS the local context explicitly names
 # it a subnet/netmask/vlan statement (``the subnet is 10.0.0.0/24`` still files has_subnet). The
@@ -26674,7 +26674,7 @@ SPINE_PENDING_GROUNDING = os.getenv("SPINE_PENDING_GROUNDING", "false").lower() 
 AFFECT_STATEMENT_PREROUTE = os.getenv("AFFECT_STATEMENT_PREROUTE", "true").lower() not in ("0", "false", "no")
 # DECLARATIVE-STATEMENT PRE-ROUTE (intent-misroute fix): a multi-sentence first-person
 # declarative carrying >= 2 grammatical assertions ("I wanted to tell you about my family.
-# My wife's name is Ada. We have three kids …") is mis-scored QUERY by GLiNER2 (the "tell"
+# My wife's name is Mia. We have three kids …") is mis-scored QUERY by GLiNER2 (the "tell"
 # verb) and dropped at the QUERY gate. A fact-bearing declarative must reach ingest. Grammar-
 # only (count_declarative_assertions: explicit-subject copula/transitive assertions, imperatives
 # and questions excluded), BEFORE GLiNER2 (kept pure, no label edits). Fail-safe → GLiNER2.
@@ -27337,8 +27337,8 @@ def _build_typed_doc(sentence: str, gmodel, labels):
             if not isinstance(_label_conf, dict):
                 _label_conf = {}
             # COORDINATED-SURFACE SPLIT (subject-agnostic, deterministic): GLiNER2 sometimes returns a
-            # comma/"and"-joined LIST of names as ONE surface ("Gabriella, Des") — seeding that whole
-            # span as a single entity GLUES the names into one merged entity ("gabriella des") and the
+            # comma/"and"-joined LIST of names as ONE surface ("Chiara, Dev") — seeding that whole
+            # span as a single entity GLUES the names into one merged entity ("chiara des") and the
             # tail member is lost. Split such a surface on its coordinating commas / " and " into the
             # individual names and seed EACH as its own typed span. A surface with no internal
             # coordinator is unchanged. Pure punctuation/coordinator split — NO fuzzy/similarity.
@@ -28348,8 +28348,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
 
     # DETERMINISTIC ENUMERATION PRE-SPLIT (the atomizer reliability net). The LLM atomizer's split of
     # a colon-introduced named list is NON-DETERMINISTIC: it intermittently FOLDS "a designer named
-    # Priya" back into the membership line (the downstream collective walk routes only BARE PROPN
-    # conjuncts, so Priya's member_of silently drops), drops a per-member attribute ("backend dev"),
+    # Mira" back into the membership line (the downstream collective walk routes only BARE PROPN
+    # conjuncts, so Mira's member_of silently drops), drops a per-member attribute ("backend dev"),
     # or — on a REFRAME timeout — leaves the whole dense sentence un-split (cross-member smear). For
     # EACH atom that is itself a recognizable colon enumeration, replace it with split_enumeration's
     # canonical set (bare-name membership + one clean per-member copula atom). This makes the spine's
@@ -28363,7 +28363,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             return " ".join((_a or "").strip().lower().split())
 
         # (a) Per-ATOM normalization: an LLM atom that is ITSELF a colon enumeration (the FOLDED /
-        #     un-split / timeout-smeared form, e.g. "…and a designer named Priya.") is replaced by the
+        #     un-split / timeout-smeared form, e.g. "…and a designer named Mira.") is replaced by the
         #     deterministic bare-name membership + per-member copula atoms.
         _normalized: list[str] = []
         _enum_hits = 0
@@ -29193,8 +29193,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             log.debug("sentence_pipeline.named_role_recovery_failed", error=str(_nrre)[:120])
 
         # ── PERSON-SUBJECT SCALAR RECONCILIATION (cross-atom, metadata-driven) ───────────────────────
-        # The atomizer SPLITS a per-member attribute onto its own micro-atom ("Gabriella is 10."), where
-        # GLiNER2 mis-types the bare name (Gabriella→Animal, Des→Organization). That noisy type rides the
+        # The atomizer SPLITS a per-member attribute onto its own micro-atom ("Chiara is 10."), where
+        # GLiNER2 mis-types the bare name (Chiara→Animal, Dev→Organization). That noisy type rides the
         # SCALAR edge's ``subject_type`` and the WGM gate then QUARANTINES the Person-scoped scalar (age
         # head_types={Person}) to Class C — even though the SAME turn established the member as a PERSON
         # via a kin/person relation ("…child_of user", head/tail Person). Reconcile across the batch:
@@ -34023,7 +34023,7 @@ def _idempotency_cached_residence_rows_retired(schema_name: Optional[str], cache
 
 # ── THE HARD LINE (ingest enforcement): a TYPE-word is not a NAME ────────────────
 # A common noun ("ticket", "issue", "refund", "address") is a TYPE — an L4 place, what a
-# thing IS. A NAME is a proper name / user-given label (Diane, Fraggle, "Capital One") — the
+# thing IS. A NAME is a proper name / user-given label (Diane, Luna, "Capital One") — the
 # naming layer (is_preferred alias). On the /extract/rewrite LLM path a dense multi-entity
 # sentence can emit relational edges whose subject/object is a bare common noun; the dumb
 # registry mints EVERY new entity surface is_preferred=true unconditionally (entity_registry/
@@ -34092,7 +34092,7 @@ def _surface_is_bare_common_type_noun(surface: str) -> bool:
     toks = [t for t in doc_pos if not t.is_space]
     if not toks:
         return False
-    # NAME signal 2: any proper-noun token (PROPN) — a proper name (e.g. "Fraggle").
+    # NAME signal 2: any proper-noun token (PROPN) — a proper name (e.g. "Luna").
     if any(t.pos_ == "PROPN" for t in toks):
         return False
     # TYPE signal: at least one common NOUN and every token is a common lexical class.
@@ -35448,7 +35448,7 @@ def _supersede_parallel_slot_rows(db, class_a_rows, negated_triples=()) -> int:
             for (subj, rel), keep_obj in plan["subject_side"].items():
                 # RETIRE-CONDITIONAL-ON-REPLACEMENT (acceptance2, measured live
                 # 2026-11-14 seat e9271c7a: T02 flaked to clarification_needed — the
-                # (user, spouse, marla) replacement NEVER committed — yet the sweep
+                # (user, spouse, mara) replacement NEVER committed — yet the sweep
                 # still retired the live spouse rows and the serve lost the family).
                 # THE CONTRACT: a sweep is CONDITIONAL on its replacement actually
                 # committing — retire-the-old only when the-new exists LIVE in this
@@ -35829,7 +35829,7 @@ def _consolidate_generic_kin_twins(db, user_id, kid_entity_id, age_value) -> int
             # ACTIVE kinship_noun (the per-tenant cue rail's bootstrap floor) whose
             # mapped rel is one of this kid's own slot rels — and the noun's intrinsic
             # gender must not contradict the kid's live has_gender ('a 20-year-old car'
-            # is a car, never Cyrus; a son never consolidates into a kid known female).
+            # is a car, never Leo; a son never consolidates into a kid known female).
             try:
                 _rel_map = dict(linguistic_cue_overlay.resolve_kinship_rel_map(
                     os.environ.get("POSTGRES_DSN")) or {})
@@ -35899,7 +35899,7 @@ def _consolidate_generic_kin_twins(db, user_id, kid_entity_id, age_value) -> int
                     retired += _n_retired
                     # THE MERGE COMPLETES (acceptance6b residual: the twin's kin EDGES
                     # retired but its ATTR rows and aliases stayed live — the serve kept
-                    # voicing the generic remnants beside the named kid, and 'marla'
+                    # voicing the generic remnants beside the named kid, and 'mara'
                     # gold-absent while a twin still held live identity). Two completions,
                     # both supersession/demote (never a hard delete):
                     #   (a) the twin's live ATTR rows retire — admission already
@@ -35948,7 +35948,7 @@ def _entity_retraction_speaker_misbind(subject_uuid, request_user_id, enabled=No
     is keyed on the SPEAKER's own entity — the "Remove Rex." class: the retraction
     extractor returned subject=user (rel=pref_name, old=Rex), dimension ENTITY bound
     to the user, and the unbounded remove_all_facts wipe retired EVERY affirmed row
-    touching the speaker (spouse ×3, child_of ×5, user-has-fraggle) in one UPDATE
+    touching the speaker (spouse ×3, child_of ×5, user-has-luna) in one UPDATE
     while the response reported facts_superseded=0 + success. A whole-entity
     retraction NEVER targets the speaker: the user names the person/thing to forget;
     a genuine whole-self wipe is the purge door. ``enabled`` = the flag (OFF →
@@ -36189,7 +36189,7 @@ def _membership_retype_blocked(cur, entity_id, new_type, enabled=None) -> bool:
     """ARM 3 (pure decider): True when a type stamp would RETYPE an existing
     person-shaped / kin-pet-membership-bearing entity to Location — refuse it.
 
-    MEASURED WOUND (acceptance4 autopsy evidence): 'mars' and 'desmonde' — entities
+    MEASURED WOUND (acceptance4 autopsy evidence): 'mars' and 'marco' — entities
     holding live spouse/child_of edges and Person types — were retyped
     ``entity_type=Location`` IN PLACE by the ingest class-a unconditional stamp riding a
     zero-shot (GLiNER) object_type guess ("Mars" the planet), which then cascaded
@@ -36233,7 +36233,7 @@ def _seam1_age_shelf(entity_kind, prior_live_age_row, enabled=None):
     Animate kinds keep 'age'; a non-animate subject with NO prior age row keeps the
     pre-fix guard ('has_value' — the staging-port class); a non-animate subject that
     ALREADY holds a live age row KEEPS 'age' (prior-slot precedence: the slot the
-    tenant already owns is the slot the write supersedes — 'Desmonde is 13' archives
+    tenant already owns is the slot the write supersedes — 'Marco is 13' archives
     age 12 instead of minting a parallel has_value twin). ``enabled`` False (flag OFF)
     ignores the prior row → byte-for-byte pre-fix decision."""
     if enabled is None:
@@ -39947,7 +39947,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                     # ── THE HARD LINE: a bare common TYPE-noun object is not a NAME ──
                     # Only for RELATIONAL objects (scalar objects are STRING values, never
                     # entities). A bare common-noun object surface (incl. a type/class object of
-                    # instance_of) must not stand as a preferred NAME. Proper names (Fraggle,
+                    # instance_of) must not stand as a preferred NAME. Proper names (Luna,
                     # Diane, "Capital One") return False from the test and are left untouched.
                     if (not _is_scalar_rel_type(edge.rel_type)
                             and canonical_object and canonical_object != user_entity_id
@@ -42380,7 +42380,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                                     # PRIOR-SLOT PRECEDENCE (CORRECTION_REPLACE_NOT_PARALLEL
                                     # arm 2; the convergence litmus age-slot class): probe
                                     # the subject's LIVE age row FIRST — a subject that
-                                    # already holds an age slot keeps it, so "Desmonde is
+                                    # already holds an age slot keeps it, so "Marco is
                                     # 13." SUPERSEDES the stale age=12 row instead of
                                     # minting a parallel has_value twin beside it (measured
                                     # autopsy seat 3e7b2cc4: attribute=has_value value=13
@@ -48131,7 +48131,7 @@ def _decompose_query_steps(query_text: str, intent: dict | None = None) -> list[
     # chain itself. "what is X" / "what's X" / "tell me about X" / "whose X" /
     # "when is X's birthday" / "where is X's …". WHEN/WHERE are query-NLU scaffolding
     # (what is ASKED), not a fact word-list — stripping them lets the SAME possessive
-    # decomposition reach the entity's dated/scalar slot (bug: "when is Fraggle's
+    # decomposition reach the entity's dated/scalar slot (bug: "when is Luna's
     # birthday" left "when"/"is" as junk owner steps → the walk defers → recall misses).
     _lead = re.match(
         r"^(?:what(?:'s| is| are| was| were)?|who(?:'s| is)?|"
@@ -49240,8 +49240,8 @@ def resolve_typed_walk(
         # and the entity DOES carry a date-valued scalar — possibly under a
         # differently-typed rel (a birth date mis-stored as born_in, a provisioning
         # date, …). Surface that date fact and STOP; the render lane appends the
-        # derived age. This is what makes "how old is Cyrus" (age slot empty, born
-        # date present) and "when is Fraggle's birthday" (stored under born_in, not
+        # derived age. This is what makes "how old is Leo" (age slot empty, born
+        # date present) and "when is Luna's birthday" (stored under born_in, not
         # born_on) answer instead of defer. Keyed on the ASK class + the VALUE being a
         # date, never an attribute-name list. Fail-safe: no date scalar → fall through.
         if scalar_res in (_WALK_KNOWN_GAP, _WALK_NO_SLOT):
@@ -50233,7 +50233,7 @@ def _entity_is_l4_place(db, entity_id: str) -> bool:
       • it declares its own superclass — it is the SUBJECT of a P279 (``subclass_of``) rel.
 
     It is NOT a place when it is itself filed at one — SUBJECT of a P31 (``instance_of``):
-    a named instance is a MEMORY and wins the tie (``Fraggle instance_of dog`` → Fraggle is
+    a named instance is a MEMORY and wins the tie (``Luna instance_of dog`` → Luna is
     the memory, dog is the place).
 
     METADATA-DRIVEN: the classification rels come from ``rel_types.wikidata_pid`` ∈
@@ -59403,9 +59403,9 @@ def _collapse_instance_of_to_most_specific(facts: list[dict], db) -> list[dict]:
 
     When a named instance carries MULTIPLE ``instance_of`` types AND the laid-down L4
     ladder relates them (one type is a ``subclass_of`` DESCENDANT of another — e.g.
-    ``(fraggle, instance_of, dog)`` + ``(fraggle, instance_of, poodle)`` with
+    ``(luna, instance_of, dog)`` + ``(luna, instance_of, poodle)`` with
     ``poodle subclass_of dog`` grown by the ±6 backbone), the broader type is redundant
-    as a DIRECT classification: "Fraggle is a poodle" already entails "…is a dog". Drop
+    as a DIRECT classification: "Luna is a poodle" already entails "…is a dog". Drop
     the ANCESTOR ``instance_of`` edge so the render asserts the MOST-SPECIFIC type; the
     ancestor still surfaces as the parent CLASS via the subclass_of ladder ("poodle is a
     subclass of dog"), so no information is lost — only the duplicate broad assertion.
@@ -64115,12 +64115,12 @@ def fetch_facts_from_anchor(
                         inverse_rel_type = rel_type_meta.get("inverse_rel_type")
 
                         # For asymmetric relationships, fully invert: swap subject/object
-                        # AND use the inverse rel_type. This transforms (cyrus, child_of, user)
-                        # → (user, parent_of, cyrus), matching the anchor's perspective.
+                        # AND use the inverse rel_type. This transforms (leo, child_of, user)
+                        # → (user, parent_of, leo), matching the anchor's perspective.
                         # The dedup step will merge this with any lower-confidence direct
                         # counterpart and keep the higher-confidence version.
                         # Half-inversion (flip rel_type only, no subject/object swap) produces
-                        # semantically wrong facts like "cyrus is the parent of user".
+                        # semantically wrong facts like "leo is the parent of user".
                         rel_type_final = rel_type_orig
                         if not is_symmetric and inverse_rel_type:
                             facts.append({
@@ -65492,8 +65492,8 @@ def fetch_facts_from_anchor(
                             # a BROAD self/group recall ("tell me about my family" → anchor is
                             # the user; every family fact + member scalar is wanted), but it is
                             # the LEAK for a NARROW question anchored on a CONCRETE non-user
-                            # entity: "how old is Cyrus" resolves the anchor to Cyrus, scope-
-                            # deference maps Cyrus's child_of → the family taxonomy, and this
+                            # entity: "how old is Leo" resolves the anchor to Leo, scope-
+                            # deference maps Leo's child_of → the family taxonomy, and this
                             # lane then floods the WHOLE family domain + everyone's scalars
                             # (Diane, the user's address/heart-rate). For a concrete non-user
                             # anchor the anchor-BOUNDED taxonomy_query above + the descent +
@@ -68134,10 +68134,10 @@ def _compose_object_clause(
                 and not is_hier and named_type_name
                 and named_type_name.lower() != object_name.lower()):
             # SYMMETRIC guard: a symmetric rel (spouse/sibling_of/…) has no possessive
-            # reading — "you have a wife named Ada" / the verb-less "you and a wife
-            # named Ada" both read wrong. Render the relationship NATURALLY anchor-
+            # reading — "you have a wife named Mia" / the verb-less "you and a wife
+            # named Mia" both read wrong. Render the relationship NATURALLY anchor-
             # first using the object's OWN type word as the role noun: "<Name> is your
-            # <Type>" ("Ada is your wife"). ZERO kin literals — the role is the
+            # <Type>" ("Mia is your wife"). ZERO kin literals — the role is the
             # object's instance_of TYPE (data). Only when the subject is the anchor
             # ("you"); otherwise fall through to the possessive shape below.
             if bool(rel_meta.get("is_symmetric")) and subject_is_you:
@@ -68148,10 +68148,10 @@ def _compose_object_clause(
                 # POSSESSIVE-VERB normalization: the named-instance shape ("a <Type>
                 # named <Name>") is a POSSESSIVE construction. A rel whose template verb
                 # is a copula (parent_of → "You ARE the parent of Y") would render the
-                # WRONG perspective here — "you are a son named Cyrus" makes the USER the
+                # WRONG perspective here — "you are a son named Leo" makes the USER the
                 # son. When the named instance is on the OBJECT side and the parsed verb
                 # is a copula, substitute the closed-class possessive primitive (have/has)
-                # so it reads "you have a son named Cyrus". Grammar primitive, NOT a domain
+                # so it reads "you have a son named Leo". Grammar primitive, NOT a domain
                 # token (same justification as Shape 4's predicate inventory). Non-copula
                 # rel verbs (has_pet→have, owns→own) are kept verbatim.
                 if verb in ("is", "are", "was", "were", "be", "am"):
@@ -68206,14 +68206,14 @@ def _compose_inverse_anchor_clause(
     The structure-driven NAMED-INSTANCE composer was built for POSSESSION — the named
     instance on the OBJECT side ((user, has_pet, rex) → "you have a dog named
     Rex"). When the SAME shape appears MIRRORED — the named instance on the SUBJECT
-    side and the query anchor ("you") on the OBJECT side ((cyrus, child_of, you)) — the
+    side and the query anchor ("you") on the OBJECT side ((leo, child_of, you)) — the
     object-side composer's gate (object≠"you") rightly declines, and the bare template
-    path renders it from the WRONG perspective ("you are a son named Cyrus": it makes the
+    path renders it from the WRONG perspective ("you are a son named Leo": it makes the
     USER the son). This composer re-frames such a fact FROM THE ANCHOR'S perspective by
     FLIPPING along the rel's ``inverse_rel_type`` (overlay metadata):
 
-      (cyrus, child_of, you)  --inverse-->  (you, parent_of, cyrus)
-        → "you have a son named Cyrus"   (Type=son from cyrus's instance_of, Name=Cyrus)
+      (leo, child_of, you)  --inverse-->  (you, parent_of, leo)
+        → "you have a son named Leo"   (Type=son from leo's instance_of, Name=Leo)
 
     Detection is purely STRUCTURAL (caller guarantees: named instance on subject side,
     anchor on object side) + the rel having an ``inverse_rel_type`` in metadata. ZERO
@@ -68226,10 +68226,10 @@ def _compose_inverse_anchor_clause(
       • ASYMMETRIC inverse (parent_of ≠ child_of): the anchor POSSESSES a typed-and-named
         instance → "<anchor> have/has a <Type> named <Name>" (Shape-1 possessive reading,
         mirrored). Falls through (None) when no instance_of TYPE is known, so we never
-        fabricate "you have a named Cyrus".
+        fabricate "you have a named Leo".
       • SYMMETRIC rel (spouse: inverse == self): no possession reading — render the
         relationship naturally, anchor-first → "<Name> is your <role>" using the rel's
-        own label as the role noun. (e.g. spouse → "Ada is your spouse"; if a cleaner
+        own label as the role noun. (e.g. spouse → "Mia is your spouse"; if a cleaner
         2p relation template exists the caller keeps that instead — see wiring.)
 
     Returns the full prose string, or None to leave the existing render untouched.
@@ -68246,7 +68246,7 @@ def _compose_inverse_anchor_clause(
             # NOUN from metadata (spouse → "spouse"); de-snake a bare rel_type fallback.
             role = (rel_meta.get("label") or rel_type.replace("_", " ")).strip().lower()
             poss = "your" if anchor_is_you else ("%s's" % anchor_name)
-            # "<Name> is your <role>"  (e.g. "Ada is your spouse")
+            # "<Name> is your <role>"  (e.g. "Mia is your spouse")
             return "%s is %s %s" % (instance_name, poss, role)
 
         # ASYMMETRIC inverse — the anchor POSSESSES a typed, named instance.
@@ -68260,7 +68260,7 @@ def _compose_inverse_anchor_clause(
         # (the type head word premodified — "third birdhouse") is NOT a proper name. Detect it
         # STRUCTURALLY (type head is a whole-word token of the display form) and render the
         # plain NP, never "…named…". Subject-agnostic, deterministic; a real proper name never
-        # contains its own type word so named instances (Rex/Cyrus) are untouched.
+        # contains its own type word so named instances (Rex/Leo) are untouched.
         import re as _re
         _inst_is_common_noun = False
         try:
@@ -68421,7 +68421,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
         user_id: Canonical user UUID (identity-set seed alongside anchor).
 
     Returns:
-        List of prose strings (e.g., "You are married to Ada")
+        List of prose strings (e.g., "You are married to Mia")
         Facts with missing natural_language template are skipped with warning logged
     """
     prose_list = []
@@ -69158,13 +69158,13 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                 if not is_unbound:
                     # SUBJECT-SIDE NAMED-INSTANCE flip (perspective fix): when the named
                     # instance is on the SUBJECT side and the query anchor ("you") is the
-                    # OBJECT — (cyrus, child_of, you) — the object-side composer declines
+                    # OBJECT — (leo, child_of, you) — the object-side composer declines
                     # (object=="you") and the bare template renders the WRONG perspective
-                    # ("you are a son named Cyrus"). Re-frame anchor-first by FLIPPING along
-                    # the rel's inverse_rel_type (overlay metadata): (cyrus, child_of, you)
-                    # → you-parent_of-cyrus → "you have a son named Cyrus". The Type ("son")
-                    # is cyrus's instance_of (resolved here, mirroring the object-side block),
-                    # the Name is cyrus's alias — ZERO kin literals. Detection is STRUCTURAL:
+                    # ("you are a son named Leo"). Re-frame anchor-first by FLIPPING along
+                    # the rel's inverse_rel_type (overlay metadata): (leo, child_of, you)
+                    # → you-parent_of-leo → "you have a son named Leo". The Type ("son")
+                    # is leo's instance_of (resolved here, mirroring the object-side block),
+                    # the Name is leo's alias — ZERO kin literals. Detection is STRUCTURAL:
                     # object is the anchor (UUID), subject is a UUID named instance, rel has a
                     # metadata inverse. Symmetric rels (spouse) render naturally. Runs BEFORE
                     # the object-side composer; takes priority for this mirrored shape.
@@ -72025,7 +72025,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                     # engine-minted is-a rows) must NOT be RETURNED as the user's memory. Hold
                     # them out of the rendered set; the leaf instance rows (has_pet/part_of/
                     # instance_of user-grounded) are kept, so a leaf reached THROUGH the ladder
-                    # (family → pets → Fraggle) still surfaces.
+                    # (family → pets → Luna) still surfaces.
                     _before = len(_down_hier_facts) + len(_down_entity_facts)
                     _down_hier_facts = [
                         _f for _f in _down_hier_facts
@@ -73626,7 +73626,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                                rel_type=rel_type, object_uuid=object_id[:8])
                     continue
             else:
-                # Issue 4 Fix: Scalar fact: object is STRING value (age="12", name="Ada")
+                # Issue 4 Fix: Scalar fact: object is STRING value (age="12", name="Mia")
                 object_display = object_id  # Use as-is (already a string value)
 
             # Create resolved fact with display names (remove internal _id fields)
@@ -74512,7 +74512,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
 # family.member_taxonomies), records it in severed_taxonomies (the durable lock the
 # growth engine must respect), and marks source='user_corrected'. Class A,
 # NOT-superseded: the engine can never re-link what the user severed. Subject-agnostic
-# (works for ANY two groups: "Ada's pets aren't her family" is the same op).
+# (works for ANY two groups: "Mia's pets aren't her family" is the same op).
 #
 # Metadata-driven detection (no hardcoded group/rel names):
 #   • GROUPS  — both surface tokens resolve to entity_taxonomies.taxonomy_name (tenant).
@@ -78364,7 +78364,7 @@ def correct_fact(req: FactCorrectionRequest):
                     # live 2026-11-15 seat 932cc9e0: "Remove Rex." extracted subject=user,
                     # rel=pref_name → dimension ENTITY keyed on the SPEAKER → the unbounded
                     # wipe below retired EVERY affirmed row touching the user — spouse ×3,
-                    # child_of ×5, user-has-fraggle — one UPDATE at 00:33:05.989, while the
+                    # child_of ×5, user-has-luna — one UPDATE at 00:33:05.989, while the
                     # response reported facts_superseded=0 + success). THE CONTRACT: a wipe is
                     # CONDITIONAL on its TARGET being the entity the user NAMED — a whole-
                     # entity retraction NEVER targets the speaker ("remove <name>" must name
@@ -79213,7 +79213,7 @@ def retract_fact(req: RetractRequest):
         # resolving. That is how a redaction reports success and changes nothing.
         #
         # THIS BLOCK WAS A SILENT NO-OP FOR FOUR INDEPENDENT REASONS, each one on its own
-        # sufficient to persist zero rows. Measured on a live seat where the surface `cyrus`
+        # sufficient to persist zero rows. Measured on a live seat where the surface `leo`
         # stayed welded to a laptop entity after the owner redacted it:
         #   1. it filtered `entity_id = req.subject` — the RAW SURFACE the caller sent —
         #      against a column that stores entity IDs. (`entity_id` is TEXT, not uuid, so this
@@ -79222,7 +79222,7 @@ def retract_fact(req: RetractRequest):
         #      that can match;
         #   2. it compared `req.old_value` verbatim, while stored aliases are lowercased
         #      (migration 214 keeps `alias` as the lowercase matching key and puts casing in
-        #      `display_form`), so "Cyrus" missed `cyrus`. Every other lookup in this handler
+        #      `display_form`), so "Leo" missed `leo`. Every other lookup in this handler
         #      already lowercases;
         #   3. it required `is_preferred = true`, which excludes the ONE class that most needs
         #      removing: a bad weld arrives NON-preferred (`is_pref` is False on that path), so

@@ -294,7 +294,7 @@ SPINE_POSSESSED_ROLE_RAIL: bool = os.environ.get(
 
 # APPOSITIVE INSTANCE-TYPING (Hearst "NP, a(n) NP" appositive-hyponymy for a NAMED NON-PERSON entity).
 # A proper-named entity apposed to a determiner-introduced common-noun TYPE — "The Art Cube, a
-# gallery", "the Louvre, a museum", "Ada, a startup" — asserts the NAME is-a TYPE (Hearst 1992's
+# gallery", "the Louvre, a museum", "Mia, a startup" — asserts the NAME is-a TYPE (Hearst 1992's
 # canonical appositive hyponymy pattern; UD ``appos``). Today ``_chain_appositive`` emits only a
 # generic ``(name, has_role, type)`` for this, so the named entity is NEVER ``instance_of`` its class
 # and a "how many <type>" count (which grounds the type node then counts its ``instance_of`` members)
@@ -18350,9 +18350,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 and getattr(getattr(obj_tok, "head", None), "i", None) in _adverbial_negate_idx:
             negated = True
         # NAMING-NOUN-IS-NEVER-A-TYPE GUARD (genitive-name fix — THE HARD LINE). "My wife's name
-        # is Ada" must bind Ada as the SPOUSE'S name (spouse + also_known_as), never classify
-        # Ada as a thing of type "name". The atomizer sometimes reshapes the genitive so a generic
-        # copula/SVO seam fires (Ada, instance_of, name) instead of the genitive chain — and "name"
+        # is Mia" must bind Mia as the SPOUSE'S name (spouse + also_known_as), never classify
+        # Mia as a thing of type "name". The atomizer sometimes reshapes the genitive so a generic
+        # copula/SVO seam fires (Mia, instance_of, name) instead of the genitive chain — and "name"
         # is the NAMING-CONSTRUCTION anchor (the same lemma the genitive/possessive-naming seams are
         # built on), NOT an L4 type. So DROP any classification edge whose object IS that naming
         # noun: classifying anything INTO "name" is a category error across the memory/place line.
@@ -19216,12 +19216,12 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
 
     # ── DATED PASSIVE-EVENT PRE-PASS (bind the DATE + predicate to the NAMED entity; participle is
     #    NEVER an object) ─────────────────────────────────────────────────────────────────────────
-    # "My wife Ada was born on July 8, 1985." / "My company Acme was founded in 1998." / "My server
+    # "My wife Mia was born on July 8, 1985." / "My company Acme was founded in 1998." / "My server
     # Apollo was provisioned on March 1, 2023." / "The product was released in 2019." Today a DATED
     # passive-participle clause mints junk: the objectless-state chain reads the participle as a STATE
     # OBJECT and strands the date on the role/possessed noun — (wife, has_state, bear)@1985-07-08,
     # (server, has_state, provision)@2023-03-01 — and sibling chains can read it as a relationship
-    # object (spouse(user, born) / owns(x, founded)). So "When was Ada born?" / "When was Apollo
+    # object (spouse(user, born) / owns(x, founded)). So "When was Mia born?" / "When was Apollo
     # provisioned?" finds nothing (the date is on the wrong node, tagged with a junk state).
     #
     # THE FIX — ONE fully ENTITY-AGNOSTIC + PREDICATE-AGNOSTIC grammatical rule (NO lemma / role /
@@ -19287,7 +19287,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _psubj is None:
                 continue
             # AGENT / OBJECT guard — our lane is the OBJECTLESS dated passive (born / hired /
-            # provisioned / released). A by-agent passive ("founded BY Ada"), a direct object, or a
+            # provisioned / released). A by-agent passive ("founded BY Mia"), a direct object, or a
             # prepositional/oblique complement ("diagnosed WITH diabetes", "cited BY the court") is a
             # real subject↔object relation the agent/SVO chain captures WITH its own date — leave it to
             # that chain so we never mint a redundant date-only twin. This is the SAME objectless test
@@ -33087,7 +33087,7 @@ def count_declarative_assertions(text: str):
 
     WHY THIS EXISTS (intent-misroute fix): a multi-sentence first-person STATEMENT that opens
     with a courtesy/announcement clause ("I wanted to tell you about my family. My wife's name
-    is Ada. We have three kids …") is mis-scored as QUERY by GLiNER2 — the "tell" verb drags
+    is Mia. We have three kids …") is mis-scored as QUERY by GLiNER2 — the "tell" verb drags
     it to the recall route and the whole turn is dropped at the QUERY gate. The grammar is
     unambiguous: the turn CONTAINS asserted facts. This counts them so the caller can route a
     fact-bearing declarative to STATEMENT/ingest BEFORE GLiNER2 (kept pure — no label edits).
@@ -33099,7 +33099,7 @@ def count_declarative_assertions(text: str):
         recall surface we must NOT capture, and
       • PREDICATES content one of two grammatical ways:
           (a) COPULA assignment — a ``be`` root (or a ``cop`` dependency) with a nominal/numeric/
-              adjectival complement (attr/acomp/oprd): "my wife's name IS Ada", "she IS 28".
+              adjectival complement (attr/acomp/oprd): "my wife's name IS Mia", "she IS 28".
           (b) STATIVE/POSSESSIVE transitive — a content-verb root with a direct object (dobj/obj/
               dative/attr): "we HAVE three kids", "I OWN a dog".
           (c) INTRANSITIVE finite predication — a ``VerbForm=Fin`` VERB **ROOT** with no clausal
@@ -35054,7 +35054,7 @@ def _collect_date_spans(text: str) -> list:
     # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 10d7d879) ──────────────
     # A network-address token (IPv4 A.B.C.D, with or without /NN prefix; an octet RUN of three or
     # more dot-groups; IPv6 colon-hex; a MAC pair-shape) is NEVER a date candidate, no matter how
-    # the NER or the numeric regexes proposed it: dateparser on a fragment of "192.168.40.83/25"
+    # the NER or the numeric regexes proposed it: dateparser on a fragment of "192.0.2.83/25"
     # fabricated a calendar date out of the address text and the junk row landed as a dated scalar
     # beside the real has_ip. Same discipline as ``_span_is_bare_duration_measure`` — a structural
     # reject of a span SHAPE that cannot be a time-position, top-level candidates only, fail-safe
@@ -35196,11 +35196,11 @@ def _recover_overextended_date_core(span: str, reference):
 def _span_is_ip_cidr_token(span: str) -> bool:
     """Is ``span`` a NETWORK-ADDRESS token (or a span containing one) — never a time-position?
 
-    Structural shapes only, no word list: a full IPv4 literal (``192.168.40.83``, with or without a
+    Structural shapes only, no word list: a full IPv4 literal (``192.0.2.83``, with or without a
     ``/NN`` prefix), an OCTET RUN of three or more dot-separated numeric groups (an IPv4 literal is
     four; no calendar date anywhere carries three dot-groups), an IPv6 colon-hex run, and a MAC
     pair-shape (``2e:0f:ef:d9:67:11``). This is the date-lane firewall half of the WOUND A fix: the
-    CIDR string "an ip of: 192.168.40.83/25" must never feed dateparser, which happily fabricates a
+    CIDR string "an ip of: 192.0.2.83/25" must never feed dateparser, which happily fabricates a
     calendar date from address fragments (measured live: ip_address='2026-10-25', datatype='date',
     minted from the address text). Deterministic, subject-agnostic, fail-safe → False upstream."""
     if not span:
@@ -35225,7 +35225,7 @@ def _span_is_ip_cidr_token(span: str) -> bool:
     if re.search(r"\b[0-9a-f]{2}(?:[:\-][0-9a-f]{2}){5}\b", _s):
         return True
     # CIDR TAIL FRAGMENT (the ``/NN`` prefix-length tail a NER/regex net sheared off the
-    # address: "83/25" out of "192.168.40.83/25" — the measured fabrication path). A
+    # address: "83/25" out of "192.0.2.83/25" — the measured fabrication path). A
     # ``<num>/<num>`` slash pair is a date candidate ONLY when it reads as a calendar
     # month/day pair (12/25); an impossible reading (83/25) is address residue, never a date.
     for _mfrac in re.finditer(r"\b(\d{1,3})/(\d{1,2})\b", _s):

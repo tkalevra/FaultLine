@@ -58,7 +58,7 @@ def test_first_person_pet_denial_owns_the_user_slot():
 def test_first_person_possessive_pronoun_object_maps_to_user():
     """'of mine' — en_core_web_sm tags it NOUN with no Person morph; the closed
     function-word surface set still maps it to the user."""
-    r = M._negated_name_correction_floor("Sophia is not a dog of mine")
+    r = M._negated_name_correction_floor("Bella is not a dog of mine")
     assert r is not None and r["subject_name"] == "user"
 
 

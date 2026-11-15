@@ -444,7 +444,7 @@ def test_rl1_past_tense_old_keeps_its_history_reading():
     the attributive and the predicative frame."""
     from src.api.main import _detect_temporal_query_intent as intent
     for q in ("What was my old job?",
-              "my old address was in Guelph",
+              "my old address was in Riverton",
               "What was my old plovex called?",
               "How old was my car?",
               "How old were they?",

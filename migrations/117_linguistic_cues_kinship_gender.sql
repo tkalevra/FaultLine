@@ -4,7 +4,7 @@
 -- WHY
 -- ---
 -- The unified NAMED-INSTANCE binding chain ("a son Alex 19", "a daughter Robin 10", "a dog
--- named Fraggle", "a friend Sam" — ONE connector-agnostic detector) resolves, FOR EACH bound
+-- named Luna", "a friend Sam" — ONE connector-agnostic detector) resolves, FOR EACH bound
 -- (ProperName ↔ common-noun Type), the relation from the TYPE's category via METADATA — the ONLY
 -- place domains differ. For a KINSHIP type the chain already mints the specific kin rel (son→child_of)
 -- from the kinship_noun row's `description` (migration 109). It ALSO mints the gender the role

@@ -1,16 +1,16 @@
 """Pins for the THIRD-PARTY NAME CORRECTION defect — a name landing on the SPEAKER.
 
 MEASURED DEFECT (fresh tenant, MCP door, at the parent commit):
-    1. "My sister Marla lives in Toronto."          -> (user, sibling_of, marla); Marla is her own
-       entity, preferred alias "marla", holding lives_in / instance_of / has_gender.
-    2. "Actually my sister's name is Renata, not Marla."  -> status:"corrected", and the write
+    1. "My sister Mara lives in Toronto."          -> (user, sibling_of, mara); Mara is her own
+       entity, preferred alias "mara", holding lives_in / instance_of / has_gender.
+    2. "Actually my sister's name is Renata, not Mara."  -> status:"corrected", and the write
        landed on the WRONG PERSON. Two observed variants, both reported success:
          * `name = Marlow` written as a SCALAR on the USER'S OWN entity (a name the speaker never
            claimed — THE HARD LINE: a memory filed at the wrong person), or
          * old_rel_type pinned to `sibling_of`, so the kin edge was SUPERSEDED and a brand-new
            EMPTY "renata" entity was minted as the sibling — the sister keeps her old name, loses
            her kinship, and her city/gender/type facts are orphaned.
-       Recall answered "Marla" either way.
+       Recall answered "Mara" either way.
 
 ROOT CAUSE, in two layers, and BOTH are pinned here:
 
@@ -25,7 +25,7 @@ ROOT CAUSE, in two layers, and BOTH are pinned here:
 
   (2) THE CORRECTION ENDPOINT NEVER ASKED THE DERIVER. It ran the LLM extraction, which flattens the
       1st-person possessive to subject_name="user", and its value-entity guard then REJECTED the one
-      correct anchor it had found ("marla") on the premise that "a correction's subject can never be
+      correct anchor it had found ("mara") on the premise that "a correction's subject can never be
       its own old/new value". That premise holds for a VALUE correction and INVERTS for a NAME
       correction, where the old value IS the referent's current label.
 
@@ -61,7 +61,7 @@ def _repair_edge(sentence):
 
 @pytest.mark.parametrize("sentence,old_name,new_name", [
     # acomp/ADJ asserted complement (the measured sister failure — derived ZERO edges before).
-    ("Actually my sister's name is Renata, not Marla.", "marla", "renata"),
+    ("Actually my sister's name is Renata, not Mara.", "mara", "renata"),
     # amod/ADJ rejected alternative (the measured colleague failure — anchored on the NEW name,
     # minting a rival entity, before).
     ("My colleague's name is actually Renata, not Marlow.", "marlow", "renata"),
@@ -86,9 +86,9 @@ def test_the_repair_relands_the_relation_on_the_same_entity_it_renames():
     """The kin/relational edge must re-land on the ANCHOR — otherwise the correction replaces the
     person instead of relabelling them (the measured 'sister loses her kinship' variant)."""
     facts = derive_sentence_facts(
-        "Actually my sister's name is Renata, not Marla.", _REF) or []
+        "Actually my sister's name is Renata, not Mara.", _REF) or []
     subjects = {f.subject for f in facts}
-    assert subjects == {"marla"}, (
+    assert subjects == {"mara"}, (
         f"every edge must hang off the one anchor; got {sorted(subjects)} — a second subject means "
         f"a second person was minted")
     rels = {f.rel_type for f in facts}
@@ -113,7 +113,7 @@ def test_a_lowercase_predicate_adjective_is_never_read_as_a_name(sentence):
 
 def test_plain_predicate_negation_is_not_a_repair():
     """"her name is not Diane" rejects without offering an alternative — there is nothing to rename."""
-    assert _repair_edge("My sister's name is not Marla.") is None
+    assert _repair_edge("My sister's name is not Mara.") is None
 
 
 # ── (2) THE CORRECTION-ENDPOINT INTERCEPT ───────────────────────────────────────────────────────
@@ -149,9 +149,9 @@ class _FakeCur:
         sql, params = self._last or ("", None)
         if "entity_aliases" not in sql:
             return []
-        if self._rivals is not None and params and params[0] == "marla":
+        if self._rivals is not None and params and params[0] == "mara":
             return [(e,) for e in self._rivals]
-        if self._rivals is not None and params and params[0] != "marla":
+        if self._rivals is not None and params and params[0] != "mara":
             return [("00000000-0000-0000-0000-0000000000ff",)]   # the possessor surface
         return [self._row] if self._row else []
 
@@ -159,26 +159,26 @@ class _FakeCur:
 def test_intercept_resolves_the_anchor_and_reads_the_rel_off_the_edge():
     cur = _FakeCur(("11111111-2222-3333-4444-555555555555",))
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur)
+        "Actually my sister's name is Renata, not Mara.", cur)
     assert got is not None
     assert got["entity_id"] == "11111111-2222-3333-4444-555555555555"
-    assert got["old_name"] == "marla" and got["new_name"] == "renata"
+    assert got["old_name"] == "mara" and got["new_name"] == "renata"
     # The rel_type is read off the deriver's own edge — the intercept names no rel_type itself.
     assert got["rel_type"] == "pref_name"
     # It must have looked the anchor up by the REJECTED label, not by the new one.
-    assert any(p == ("marla",) for _sql, p in cur.executed), cur.executed
+    assert any(p == ("mara",) for _sql, p in cur.executed), cur.executed
 
 
 def test_intercept_declines_rather_than_minting_a_referent():
     """LOOKUP-ONLY: no stored entity under the rejected label -> decline to the LLM path. A
     correction must never mint the person it is correcting."""
     assert m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", _FakeCur(None)) is None
+        "Actually my sister's name is Renata, not Mara.", _FakeCur(None)) is None
 
 
 @pytest.mark.parametrize("text", [
     "My favorite color is red, not blue.",     # a VALUE correction — the guard's original premise
-    "I moved to Guelph, not Toronto.",
+    "I moved to Riverton, not Toronto.",
     "",
 ])
 def test_intercept_declines_on_anything_that_is_not_a_name_repair(text):
@@ -191,11 +191,11 @@ def test_intercept_is_fail_safe_when_the_lookup_raises():
             raise RuntimeError("db gone")
 
     assert m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", _Boom(None)) is None
+        "Actually my sister's name is Renata, not Mara.", _Boom(None)) is None
 
 
 # ── SUBJECT-AGNOSTICISM, DEMONSTRATED (not merely asserted) ──────────────────────────────────────
-# A suite that only exercises the defect's own lexicon (sister/Marla) passes a fix that hardcodes
+# A suite that only exercises the defect's own lexicon (sister/Mara) passes a fix that hardcodes
 # that lexicon. These drive the SAME construction through roles from DIFFERENT cue classes
 # (kinship_noun, relational/role nouns, and a non-person possessor) with DIFFERENT names, so a
 # lexical patch cannot make them green. The added code carries no role, name, or rel_type literal —
@@ -252,7 +252,7 @@ def test_the_corrective_frame_is_what_licenses_the_mistag_recovery():
     """The paired positive: the SAME orthographic shape IS admitted inside a correction, because a
     rejected alternative is evidence the slot holds a name. Without this the test above is
     satisfiable by disabling the arm entirely."""
-    edge = _repair_edge("Actually my sister's name is Renata, not Marla.")
+    edge = _repair_edge("Actually my sister's name is Renata, not Mara.")
     assert edge is not None and edge.object == "renata", edge
 
 
@@ -275,7 +275,7 @@ def test_rival_referents_are_separated_by_the_role_edge_the_deriver_already_emit
     not be thrown away for a row-order guess."""
     cur = _FakeCur(None, rivals=[_RIVAL, _SISTER], role_holders={_SISTER})
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur,
+        "Actually my sister's name is Renata, not Mara.", cur,
         "00000000-0000-0000-0000-0000000000ff")
     assert got is not None and got["entity_id"] == _SISTER, (got, cur.executed)
 
@@ -286,7 +286,7 @@ def test_rival_referents_the_role_edge_cannot_separate_are_REFUSED_not_guessed()
     for holders in ((), {_RIVAL, _SISTER}):
         cur = _FakeCur(None, rivals=[_RIVAL, _SISTER], role_holders=holders)
         assert m._detect_name_repair_correction(
-            "Actually my sister's name is Renata, not Marla.", cur,
+            "Actually my sister's name is Renata, not Mara.", cur,
             "00000000-0000-0000-0000-0000000000ff") is None, holders
 
 
@@ -294,7 +294,7 @@ def test_a_single_holder_of_the_label_still_resolves_without_any_probe():
     """The unambiguous case is unchanged — no tie, no discriminator needed."""
     cur = _FakeCur(None, rivals=[_SISTER], role_holders=())
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur, "u")
+        "Actually my sister's name is Renata, not Mara.", cur, "u")
     assert got is not None and got["entity_id"] == _SISTER
 
 
@@ -504,7 +504,7 @@ def test_a_stripped_genitive_with_an_uncued_role_still_reads_as_third_party():
     "spaCy tags `Marlow` ADJ in the naming slot; the acomp recovery arm was removed after five "
     "measured discriminators all failed and its net gain proved to be this one token"))
 def test_known_hole_a_mistagged_name_is_not_repaired():
-    edge = _repair_edge("Actually my sister's name is Marlow, not Marla.")
+    edge = _repair_edge("Actually my sister's name is Marlow, not Mara.")
     assert edge is not None and edge.object == "marlow"
 
 
@@ -585,23 +585,23 @@ def test_a_role_noun_is_not_a_label_for_the_referent():
 
 
 @pytest.mark.parametrize("text", [
-    "Actually my sister's name is Thorne, not Wrenna. My accountant's name is Kai, not Priya.",
-    "My accountant's name is Kai, not Priya. Actually my sister's name is Thorne, not Wrenna.",
+    "Actually my sister's name is Thorne, not Wrenna. My accountant's name is Kai, not Mira.",
+    "My accountant's name is Kai, not Mira. Actually my sister's name is Thorne, not Wrenna.",
 ])
 def test_labels_are_clause_local_and_do_not_admit_across_clauses(text):
     """Two naming clauses, two referents. The accountant's label must not admit a write that
     belongs to the sister's clause. Ablating the clause-local label collection (unioning every
-    third-party clause's labels into one set) greens this — ``priya`` would then admit the
+    third-party clause's labels into one set) greens this — ``mira`` would then admit the
     accountant for a value that is the SISTER'S name. Both orders, because clause-local scoping has
     been defeated by subtree containment before on this lane.
 
     ⚠️ KNOWN PARSER LIMIT, stated rather than papered over: as ONE sentence joined by "and"
-    ('…not Wrenna, and my accountant\'s name is Kai, not Priya.') en_core_web_sm attaches BOTH names
+    ('…not Wrenna, and my accountant\'s name is Kai, not Mira.') en_core_web_sm attaches BOTH names
     to the second clause's subtree and leaves the first clause with no complement at all, so no
     downstream logic can separate them. Two sentences (the ordinary way this is written) parse
     cleanly. Verified in the parser, not in the annotation scheme."""
     assert _refuses(text, "thorne", target=ACCOUNTANT,
-                    registry={"priya": [ACCOUNTANT], "wrenna": [SISTER]})
+                    registry={"mira": [ACCOUNTANT], "wrenna": [SISTER]})
 
 
 def test_a_proper_name_possessor_identifies_its_own_bearer():
@@ -657,7 +657,7 @@ def test_the_guard_keeps_its_hands_off_everything_else(text, value):
 
 @pytest.mark.parametrize("role", ["sister", "mother", "brother", "father", "colleague",
                                   "accountant", "dog", "cat", "neighbour"])
-@pytest.mark.parametrize("old,new", [("Wrenna", "Thorne"), ("Priya", "Kai"), ("Susan", "Diana")])
+@pytest.mark.parametrize("old,new", [("Wrenna", "Thorne"), ("Mira", "Kai"), ("Susan", "Diana")])
 def test_the_refusal_is_keyed_on_grammar_not_on_the_role_or_the_name(role, old, new):
     text = f"Actually my {role}'s name is {new}, not {old}."
     assert _refuses(text, new, target=ACCOUNTANT, registry={old.lower(): [SISTER, ACCOUNTANT]})
@@ -812,14 +812,14 @@ def test_the_single_candidate_path_reports_that_no_referent_probe_ran():
     the exact hole the repro drove through."""
     cur = _FakeCur(None, rivals=[_SISTER], role_holders=())
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur, "u")
+        "Actually my sister's name is Renata, not Mara.", cur, "u")
     assert got is not None and got["referent_probed"] is False, got
 
 
 def test_the_role_edge_probe_reports_that_it_resolved_the_referent():
     cur = _FakeCur(None, rivals=[_RIVAL, _SISTER], role_holders={_SISTER})
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur,
+        "Actually my sister's name is Renata, not Mara.", cur,
         "00000000-0000-0000-0000-0000000000ff")
     assert got is not None and got["referent_probed"] is True, got
 
@@ -1001,8 +1001,8 @@ def test_the_deriver_emits_a_name_PART_not_the_joined_label():
     # the SPEAKER (the original defect) and a THIRD PARTY — the guard must not tell them apart.
     ("Actually my sister's name is Mary Anne, not Wrenna.", SPEAKER),
     ("Actually my sister's name is Mary Anne, not Wrenna.", ACCOUNTANT),
-    ("Actually my sister's name is Priya Nair, not Wrenna.", SPEAKER),
-    ("Actually my sister's name is Priya Nair, not Wrenna.", ACCOUNTANT),
+    ("Actually my sister's name is Mira Nair, not Wrenna.", SPEAKER),
+    ("Actually my sister's name is Mira Nair, not Wrenna.", ACCOUNTANT),
     ("Actually my brother's name is Jean Luc, not Wrenna.", ACCOUNTANT),
 ])
 def test_a_multi_token_name_reaches_the_ingest_door(monkeypatch, text, target):
@@ -1058,7 +1058,7 @@ def test_resolution_through_a_REFERRING_label_still_ingests(monkeypatch):
 @pytest.mark.parametrize("text,subject,value", [
     # a FIRST-MENTION naming statement: the only label IS the value being assigned, the subject is
     # the ROLE noun, and nothing is being replaced. These must keep flowing.
-    ("My daughter's name is Priya Nair.", "daughter", "priya nair"),
+    ("My daughter's name is Mira Nair.", "daughter", "mira nair"),
     ("The restaurant's name is Miss Bee Providore.", "restaurant", "miss bee providore"),
 ])
 def test_a_first_mention_naming_statement_is_untouched(monkeypatch, text, subject, value):
@@ -1154,19 +1154,19 @@ def test_a_sole_candidate_that_SATISFIES_the_role_edge_is_probed():
     sister, the probe confirms it, and that is a genuine bearer resolution."""
     cur = _FakeCur(None, rivals=[_SISTER], role_holders={_SISTER})
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur,
+        "Actually my sister's name is Renata, not Mara.", cur,
         "00000000-0000-0000-0000-0000000000ff")
     assert got is not None and got["referent_probed"] is True, got
     assert got["referent_refuted"] is False, got
 
 
 def test_a_sole_candidate_that_FAILS_the_role_edge_is_refuted():
-    """THE COLLEAGUE, IN A UNIT PIN. She holds ``marla`` uniquely and is NOT the speaker's sister,
+    """THE COLLEAGUE, IN A UNIT PIN. She holds ``mara`` uniquely and is NOT the speaker's sister,
     so the probe has real evidence and she fails it — a REFUTATION, not an absence. Restoring
     ``len(candidates) > 1`` around the probe greens this and re-opens the measured 5/5 rename."""
     cur = _FakeCur(None, rivals=[_RIVAL], role_holders=set())
     got = m._detect_name_repair_correction(
-        "Actually my sister's name is Renata, not Marla.", cur,
+        "Actually my sister's name is Renata, not Mara.", cur,
         "00000000-0000-0000-0000-0000000000ff")
     assert got is not None and got["referent_probed"] is False, got
     assert got["referent_refuted"] is True, got
@@ -1203,7 +1203,7 @@ def test_a_multi_token_rejected_name_is_collected_from_the_part_the_deriver_emit
 
 @pytest.mark.parametrize("text,edges", [
     # a FIRST-MENTION naming statement rejects nothing
-    ("My daughter's name is Priya Nair.", [_E("daughter", "name", "priya nair")]),
+    ("My daughter's name is Mira Nair.", [_E("daughter", "name", "mira nair")]),
     # a REFERRING possessor is not a predicated label, so it is never "rejected"
     ("John's name is actually Jonathan.", [_E("john", "also_known_as", "jonathan")]),
     # the speaker's OWN naming clause is not a third-party clause

@@ -38,7 +38,7 @@ import src.fact_store.store as store_module
 from src.fact_store.store import FactStoreManager
 
 USER = "11111111-1111-1111-1111-111111111111"   # chris (the speaker; object of the kin rows)
-CYRUS = "33333333-3333-3333-3333-333333333333"
+LEO = "33333333-3333-3333-3333-333333333333"
 DES = "55555555-5555-5555-5555-555555555555"
 KIN_IDS = [101, 102, 103, 104, 105]             # the five (X, child_of, user) rows
 SENTENCE_OLD_VALUE = "aurora flood was born on 2026-08-08"  # unresolvable: no alias row

@@ -220,7 +220,7 @@ class TestUtilityFunctions:
     def test_infer_gender_from_name_female(self):
         """Test gender inference for female names."""
         assert _infer_gender_from_name("Aurora") == "female"
-        assert _infer_gender_from_name("Marla") == "female"
+        assert _infer_gender_from_name("Mara") == "female"
         assert _infer_gender_from_name("Sophie") == "female"
         assert _infer_gender_from_name("Anna") == "female"
 

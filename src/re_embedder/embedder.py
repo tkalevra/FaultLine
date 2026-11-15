@@ -649,7 +649,7 @@ def _gliner2_type_doc(sdoc, gmodel, labels):
 
     Mirrored mechanics (keep in sync with main.py::_build_typed_doc): the
     ROUND-7 machine-value veto (``is_value_shape`` — a value is never an entity
-    span), the coordinated-surface split ("Gabriella, Des" → two spans), exact
+    span), the coordinated-surface split ("Chiara, Dev" → two spans), exact
     case-insensitive substring locate → ``char_span(contract)`` (never fuzzy),
     longest-first overlap resolution, ``set_ents``. DELIBERATELY ABSENT: the
     GLiNER2 RELATION pass (main.py writes ``doc._.rel``) — that phase needs the
@@ -4963,7 +4963,7 @@ _DOC_CHUNK_HTTP_TIMEOUT = float(os.getenv("DOC_CHUNK_HTTP_TIMEOUT", "180"))
 #
 # MEASURED 2026-07-31 (DOCDRAIN, seat 8162c435, doc_id=9, two chunks): chunk 1 answered
 # inside the window and reported committed=4; chunk 0's POST /ingest was aborted CLIENT-SIDE
-# at 30s and the chunk was recorded failed — yet its six facts (fraggle/instance_of/beagle,
+# at 30s and the chunk was recorded failed — yet its six facts (luna/instance_of/beagle,
 # diane/sibling_of, lives_in/toronto, works_for/shopify, …) landed in `facts` 30s later.
 # So the work SUCCEEDED and we recorded a failure: facts_committed under-counted 4 vs 10 and
 # the document terminated 'partial' (a TERMINAL status) with every fact actually in memory.
@@ -8488,8 +8488,8 @@ _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or 
 # TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
 # nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
 # on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
-# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `fraggle` sat at
-# attempt_count=188, `sophia` 189, `goose` 187 — each a re-classification burning LLM calls — with
+# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `luna` sat at
+# attempt_count=188, `bella` 189, `goose` 187 — each a re-classification burning LLM calls — with
 # 47 rows over cap and 2,372 recorded attempts across 570 rows on ONE seat.
 # This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a
 # global-ontology bump cannot reset. It does NOT replace the additive re-validation: below the
@@ -11084,7 +11084,7 @@ def _ground_coinstance_specificity(db_conn, qwen_api_url: str, user_id: str, roo
     dog as SIBLINGS both attached straight to the broad seeded root (`animal`).
 
     THE GAP THIS CLOSES (the real breed miss, ingest-side): when a named instance is `instance_of`
-    MULTIPLE type nodes (`fraggle instance_of poodle` + `fraggle instance_of dog`), the eager
+    MULTIPLE type nodes (`luna instance_of poodle` + `luna instance_of dog`), the eager
     leaf-anchor (`_attach_to_seeded_backbone`) attaches EACH type DIRECTLY to the seeded backbone
     root — `poodle subclass_of animal` AND `dog subclass_of animal` — as SIBLINGS. The per-leaf
     splice deepens each ladder toward the root but never, on its own, re-parents one sibling UNDER

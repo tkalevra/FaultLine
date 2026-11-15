@@ -8766,8 +8766,8 @@ async def _remember_facts_tool_impl(text: str, user_id: str, *, attested: bool =
                 _log(f"reset_turn_detect_failed (full-text harvest kept): {_dgr_err!r}")
             if _harvest_text:
                 # LIVE-OPENWEBUI FIX 1 (re-drive correction, measured on deploy-ee49b8a7):
-                # the payload is a PROFILE STATEMENT ("spouse Marla MacPhee (Mars), sons
-                # Cyrus 20 and Desmonde 13, …") — the cheap deterministic harvest captured
+                # the payload is a PROFILE STATEMENT ("spouse Mara Reyes (Mars), sons
+                # Leo 20 and Marco 13, …") — the cheap deterministic harvest captured
                 # only the pet edges of it on the measured drive (a telegraphic NP list
                 # needs the FULL spine's LLM atomize to clause-ify). The payload rides the
                 # SAME statement ingest a planted profile statement takes

@@ -120,14 +120,14 @@ def test_facts_render_path_carries_no_hedge_strings():
     out = render(
         None,
         event_lines=["Event #1 [2026-03-04]: You ran the marathon"],
-        assert_lines=["You are married to Ada"],
+        assert_lines=["You are married to Mia"],
         hold_lines=["You may play chess"],
     )
     for hedge in ("Though I don't have a direct answer",
                   "distinct topics", "haven't mentioned",
                   "I can't", "so I can't"):
         assert hedge not in out
-    assert "You are married to Ada" in out
+    assert "You are married to Mia" in out
 
 
 # ── Degraded-failure contract INTACT (never touched by the flag) ───────────────────

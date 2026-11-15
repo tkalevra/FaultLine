@@ -2,7 +2,7 @@
 -- Date: 2026-11-13
 -- Purpose: DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the B2 class.
 --
--- THE MEASURED WOUND (the owner's prod seat, 2026-11-13): "My spouse is Marla MacPhee and
+-- THE MEASURED WOUND (a production seat, 2026-11-13): "My spouse is Mara Reyes and
 -- she prefers to be called Mars" landed BESIDE the prior spouse slot live —
 -- ``ingest.temporal_coexist`` "same-slot state conflict kept BOTH rows live (keep-both)" —
 -- and five test-junk spouse rows stayed live with it. The recall then served both readings.

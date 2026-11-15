@@ -49,11 +49,11 @@ CASES = [
     ("I update my dotfiles with vim", "STATEMENT", True),
     ("My favorite language is Rust", "STATEMENT", False),
     # true STATEMENT (identity / facts / usage)
-    ("My son is named Des and he's 12 years old", "STATEMENT", False),
+    ("My son is named Dev and he's 12 years old", "STATEMENT", False),
     ("I have a dog named Spot who is brown", "STATEMENT", False),
     ("I work as a software engineer at TechCorp", "STATEMENT", False),
     ("I like to play tennis on weekends", "STATEMENT", False),
-    ("My wife's name is Marla", "STATEMENT", False),
+    ("My wife's name is Mara", "STATEMENT", False),
     ("I graduated from MIT", "STATEMENT", False),
     ("I'm 38 years old", "STATEMENT", False),
     ("I live in Kitchener", "STATEMENT", False),

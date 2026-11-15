@@ -4,7 +4,7 @@
 -- WHY
 -- ---
 -- The deterministic LINGUISTIC LAYER (src/extraction/linguistics.py) recovers a NAMING/dubbing
--- construction ("a dog named Fraggle", "the workshop called X") by matching the modifying verb's
+-- construction ("a dog named Luna", "the workshop called X") by matching the modifying verb's
 -- LEMMA against a FROZEN in-code two-word set (`_NAMING_VERB_LEMMAS = frozenset({"name","call"})`).
 -- A frozen list assumes a fixed naming vocabulary and silently DROPS every other English naming
 -- verb ("titled"/"dubbed"/"christened"/"entitled"/"designated"/"termed"/"labelled"/"nicknamed").
@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_linguistic_cues_category
 INSERT INTO public.linguistic_cues
     (cue, category, description, example_text, source, global_confidence)
 VALUES
-  ('name',     'naming_verb', 'Predicative naming verb: "<noun> named X"',     'a dog named Fraggle',                  'seed_naming_dubbing', 0.95),
+  ('name',     'naming_verb', 'Predicative naming verb: "<noun> named X"',     'a dog named Luna',                  'seed_naming_dubbing', 0.95),
   ('call',     'naming_verb', 'Predicative naming verb: "<noun> called X"',    'a server called Apollo',               'seed_naming_dubbing', 0.95),
   ('title',    'naming_verb', 'Dubbing verb: "<noun> titled X"',               'a workshop titled Effective Time Mgmt', 'seed_naming_dubbing', 0.90),
   ('dub',      'naming_verb', 'Dubbing verb: "<noun> dubbed X"',               'a release dubbed Jaguar',              'seed_naming_dubbing', 0.85),

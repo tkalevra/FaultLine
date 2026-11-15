@@ -98,7 +98,7 @@ def test_unknown_host_gets_no_field():
     providers, which would break EVERY call to that endpoint rather than merely failing to
     suppress. known is False so callers can tell "no field needed" from "we don't know".
     """
-    for base in ("http://192.168.40.20:8080", "http://localhost:11434", "https://llm.example.com"):
+    for base in ("http://192.0.2.20:8080", "http://localhost:11434", "https://llm.example.com"):
         got = resolve_reasoning_controls(base, "whatever-model")
         assert got["fields"] == {}, base
         assert got["known"] is False, base

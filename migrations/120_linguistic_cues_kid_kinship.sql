@@ -2,7 +2,7 @@
 -- Add the colloquial kinship noun "kid" to the kinship_noun cue class.
 --
 -- WHY: the collective member-list reconciliation (and the existing _kin_collective pre-pass) routes a
--- named-member enumeration by the HEAD noun's kinship cue ("we have three kids: Gabriella, Des, Cyrus"
+-- named-member enumeration by the HEAD noun's kinship cue ("we have three kids: Chiara, Dev, Leo"
 -- → each member child_of the user). The seed kinship_noun class carried "child" but NOT its everyday
 -- synonym "kid", so "kids" fell through to the generic chains and was mangled into (user, owns, kid)
 -- + (member, instance_of, "kids"). "kid" → child_of (same role "child" plays toward the possessor: the

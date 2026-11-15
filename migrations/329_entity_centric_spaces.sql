@@ -5,7 +5,7 @@
 -- ---
 -- The wound-map doctrine lane (the owner's WORLD MODEL THESIS): entities exist in MULTIPLES
 -- of L4 spaces simultaneously; things stand as entities with components as slots; NOTHING
--- flattens into user attrs. The pet ladder (Fraggle: instance_of + has_pet + the pets
+-- flattens into user attrs. The pet ladder (Luna: instance_of + has_pet + the pets
 -- taxonomy) is the correct shape — this migration gives the GENERALIZED filing arms the
 -- same ground to stand on for the thing spaces the ladder never owned:
 --   • handbag  → possessions   (member via `owns`)

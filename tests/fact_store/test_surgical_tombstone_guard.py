@@ -27,7 +27,7 @@ from src.fact_store.store import FactStoreManager
 
 USER = "11111111-1111-1111-1111-111111111111"
 CHILD = "22222222-2222-2222-2222-222222222222"
-CYRUS = "33333333-3333-3333-3333-333333333333"
+LEO = "33333333-3333-3333-3333-333333333333"
 LAPTOP = "44444444-4444-4444-4444-444444444444"
 
 
@@ -114,7 +114,7 @@ def test_bound_object_tombstone_proceeds_even_multi_row():
 
 
 def test_bound_object_staged_sweep_proceeds():
-    (ids, _), cur = _run("hard_delete", facts_ids=[], staged_ids=[7, 8], old_value=CYRUS)
+    (ids, _), cur = _run("hard_delete", facts_ids=[], staged_ids=[7, 8], old_value=LEO)
     assert sorted(ids) == [7, 8]
 
 

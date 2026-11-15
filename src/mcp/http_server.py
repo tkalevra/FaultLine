@@ -3478,7 +3478,7 @@ async def rest_retract_fact(
     description=(
         "Use ONLY when the user EXPLICITLY and deliberately asks you to forget or delete "
         "ONE specific fact about a NAMED target — e.g. 'forget my email address', "
-        "'delete that I have a dog named Rex', 'forget that Ada is my spouse'. This "
+        "'delete that I have a dog named Rex', 'forget that Mia is my spouse'. This "
         "tombstones the stored value you name (it is recoverable, not a hard wipe). "
         "You MUST name the target: pass `subject` (whose fact — 'me' for the user, or the "
         "named person/thing) AND `old_value` (the stored value to remove); `rel_type` "

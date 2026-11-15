@@ -1,10 +1,10 @@
 -- Migration 099: subject-agnostic naming relation ("X named/called Y")
 -- Date: 2026-06-19
--- Purpose (RC2): "I have a dog named Fraggle." was dropping the name. TWO defects fixed here:
+-- Purpose (RC2): "I have a dog named Luna." was dropping the name. TWO defects fixed here:
 --
 --   (1) RUNG-1 morphology over-stems the naming verb: normalize_rel("named") = "nam" (the
 --       conservative -ed strip), and "nam" matches NO rel_type and NO alias → the verb-lift
---       path in main.py minted a junk grown rel (dog, nam, Fraggle). The honest-dumb-stemmer
+--       path in main.py minted a junk grown rel (dog, nam, Luna). The honest-dumb-stemmer
 --       contract (canonical.py) deliberately leaves over-stems to be BRIDGED by the DB alias
 --       layer (same mechanism that makes "called" → normalize "call" → alias → also_known_as,
 --       seeded in migration 030). "named" was simply MISSING from that seed. We add the
@@ -50,7 +50,7 @@ ON CONFLICT (alias) DO NOTHING;
 --            thing being named) — subject-agnostic, no enumerated subject list.
 --   group 2: the proper name ([A-Z][a-z]+).
 -- The leading (?:a|an|the|my|our|your|his|her|their)? optionally consumes a determiner/possessive
--- so it is NOT captured as the noun ("a dog named Fraggle" → noun='dog', not 'a'). This is bounded
+-- so it is NOT captured as the noun ("a dog named Luna" → noun='dog', not 'a'). This is bounded
 -- English determiner morphology, not an ontology/subject list.
 INSERT INTO public.extraction_patterns
     (pattern_regex, rel_type, description, example_text, category, source, global_confidence)
@@ -58,7 +58,7 @@ VALUES
   ('\b(?:a|an|the|my|our|your|his|her|their)?\s*([a-z]+)\s+(?:named|called)\s+([a-z]+)',
    'also_known_as',
    'Subject-agnostic naming: <noun> named/called <ProperName> → (noun, also_known_as, Name)',
-   'I have a dog named Fraggle',
+   'I have a dog named Luna',
    'identity', 'bootstrap', 0.85)
 ON CONFLICT (pattern_regex, rel_type) DO NOTHING;
 

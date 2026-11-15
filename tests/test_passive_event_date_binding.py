@@ -197,8 +197,8 @@ def test_dateless_passive_state_unchanged():
 
 @requires_model
 def test_by_agent_passive_left_to_relational_chain():
-    # "founded BY Ada" is captured relationally (found_by) with its date — our lane must NOT fire a twin
-    f = _facts("The company was founded in 1998 by Ada.")
+    # "founded BY Mia" is captured relationally (found_by) with its date — our lane must NOT fire a twin
+    f = _facts("The company was founded in 1998 by Mia.")
     assert not _find(f, "company", "founded")   # no date-only scalar twin
     assert any(rel == "found_by" for _s, rel, _o, _e, _d in f)
 

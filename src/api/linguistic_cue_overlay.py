@@ -938,7 +938,7 @@ POSSESSION_VERB_CATEGORY = "possession_verb"
 PET_NOUN_CATEGORY = "pet_noun"
 # ENTITY-CENTRIC FILING (the wound-map doctrine lane, 2026-11-15): the L4-SPACE head classes —
 # the THING spaces the pet ladder never owned. A possessive/naming/count frame whose head names
-# a thing in one of these spaces stands as an ENTITY (the Fraggle pattern generalized), not as a
+# a thing in one of these spaces stands as an ENTITY (the Luna pattern generalized), not as a
 # user attr. Both classes are DB-HELD + per-tenant + GROWABLE (the arms record cue candidates on
 # the growth rail, R7's self-feeding), with these frozensets as the DB-DOWN floors only.
 # ⚠️ FLAGGED BOUNDED LEXICAL CLASSES, honestly documented — collection-ness ("I have 20 X") and

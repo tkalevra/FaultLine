@@ -320,7 +320,7 @@ async def test_non_empty_recall_appends_the_requery_hint(mock_http_client):
     query_response = MagicMock()
     query_response.raise_for_status = MagicMock()
     query_response.json.return_value = {
-        "facts": [{"definition": "You have a pet that is Fraggle",
+        "facts": [{"definition": "You have a pet that is Luna",
                    "fact_class": "A", "rel_type": "has_pet"}],
         "attributes": {},
     }
