@@ -21,6 +21,7 @@ Auth:
 """
 
 import hashlib
+import psycopg2  # dashboard-seat / rotated-MCP-key auth probes (foss auth bridge)
 import hmac
 import json
 import mimetypes
@@ -1866,19 +1867,23 @@ def _build_tool_openapi() -> dict:
 
     paths: dict = {}
     for t in _TOOL_OPS:
+        # MOAT SEAM (foss/it reconciliation): an op whose canonical text lives ONLY moat-side
+        # (customer_chat → saas/agent_mcp_tool.py::TOOL_SCHEMA) must NOT be advertised on the
+        # open-core door from the hand-written _TOOL_OPS copy — that fallback is exactly the
+        # second-source drift this builder exists to abolish, and serving the op at all on a
+        # public build advertises a route whose gate module does not exist. Skip any op with
+        # no canonical text: on saas deploys the fold above supplies it; on open core it is
+        # simply absent from the spec.
+        if t["op"] not in _canonical:
+            continue
         paths[t["path"]] = {
             "post": {
                 "operationId": t["op"],
                 "summary": t["summary"],
-                # `t.get("description", t["summary"])` — NOT `t["description"]`. The
-                # canonical text from tools.py::TOOLS is the ONLY thing ever served (the
-                # parity test pins that), so the local key is unreachable dead prose and a
-                # new op should not have to paste a second copy of its description here just
-                # to satisfy an eagerly-evaluated fallback. Existing ops are unaffected (they
-                # all carry the key); a future op carrying neither degrades to its summary
-                # instead of raising KeyError and taking /openapi.json down with it.
-                "description": _within_budget(
-                    t["op"], _canonical.get(t["op"], t.get("description", t["summary"]))),
+                # Canonical text from tools.py::TOOLS is the ONLY thing ever served (the
+                # parity test pins that); the local `description` key is unreachable dead
+                # prose kept only for shape documentation.
+                "description": _within_budget(t["op"], _canonical[t["op"]]),
                 "security": [{"HTTPBearer": []}],   # per-op (some clients read this, not just global)
                 "requestBody": {
                     "required": True,
@@ -1966,131 +1971,136 @@ async def security_txt():
 _bearer = HTTPBearer(auto_error=False, description="MCP_API_KEY bearer token")
 
 
+def _dashboard_dsn() -> str:
+    return os.environ.get("POSTGRES_DSN", "").strip()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _dashboard_lookup(query: str, params: tuple) -> Optional[tuple]:
+    """Run a single SELECT against the shared DB; return the first row or None.
+
+    Opens a short-lived connection per call — local postgres, one indexed probe,
+    negligible cost. Any error → None (auth falls back to env); the MCP path
+    never hard-fails on a DB hiccup. Blocking, but ~ms and not on the chat path.
+    """
+    dsn = _dashboard_dsn()
+    if not dsn:
+        return None
+    try:
+        with psycopg2.connect(dsn, connect_timeout=3) as db, db.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception:  # noqa: BLE001 — DB optional; degrade to env auth
+        return None
+
+
+def _resolve_seat_token_db(credentials: Optional[str]) -> Optional[str]:
+    """Return the seat's user_id if credentials is a valid active seat token."""
+    if not credentials:
+        return None
+    row = _dashboard_lookup(
+        "SELECT user_id FROM public.dashboard_seats "
+        "WHERE token_hash = %s AND active = TRUE",
+        (_sha256_hex(credentials),),
+    )
+    if not row:
+        return None
+    return str(row[0])
+
+
+def _mcp_key_active_db(credentials: Optional[str]) -> bool:
+    """True if credentials matches an active rotated MCP key in the DB."""
+    if not credentials:
+        return False
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys "
+        "WHERE key_hash = %s AND is_active = TRUE LIMIT 1",
+        (_sha256_hex(credentials),),
+    ) is not None
+
+
+def _any_dashboard_credential_configured() -> bool:
+    """True if the operator has minted ANY seat or rotated key (DB-gated).
+
+    Gates the anonymous-dev fallback: once seats/keys exist in the DB, the open
+    anonymous mode is suppressed even if MCP_API_KEY env is unset, so minting the
+    first seat closes the open posture."""
+    # NOTE the empty params tuple on BOTH probes. `_dashboard_lookup(query, params)` takes
+    # params as a REQUIRED positional; omitting it raises TypeError at the CALL SITE, i.e.
+    # before the callee's `try`, so its documented "any error -> None, never hard-fails"
+    # fail-safe never gets the chance to run. Every credential-less request then 500s inside
+    # require_auth — which is the DEFAULT posture for a fresh self-hosted install.
+    return _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_seats WHERE active = TRUE LIMIT 1", ()
+    ) is not None or _dashboard_lookup(
+        "SELECT 1 FROM public.dashboard_mcp_keys WHERE is_active = TRUE LIMIT 1", ()
+    ) is not None
+
+
 def _resolve_principal(credentials: str | None) -> str | None:
     """Map a presented bearer credential to a principal.
 
-    Today: single shared key → returns 'shared' on match, None on miss.
-    Forward-compat (DEV/SECURITY-multiuser-tenant-isolation.md remediation #1):
-    swap this body for a token→user_id lookup and return the user_id, without
-    touching require_auth's call sites.
-    """
-    # ── SaaS mode: resolve the key to an ACCOUNT principal (control plane). ───────
-    # SAAS_MODE off → this whole block is skipped and behavior is EXACTLY today's
-    # (single shared key → "shared"). Import is lazy + fail-closed: any resolver error
-    # denies (returns None → 401), never falls through to the shared path.
-    try:
-        from saas.config import saas_mode_enabled
-        if saas_mode_enabled():
-            if credentials is None:
-                return None
-            # Per-user token (flu_…): resolve to the BOUND UUID → this becomes the principal
-            # and activates bind_tenant Option A (the token can act ONLY as this UUID; any
-            # other claimed X-OpenWebUI-User-Id → 403). An unknown/revoked token or an
-            # inactive seat → None (fail-closed → 401); NEVER retried as an account key.
-            from saas.tokens import is_user_token, resolve_user_token
-            if is_user_token(credentials):
-                return resolve_user_token(credentials)
-            # Account key (flk_…): resolve to the account principal (control plane).
-            from saas.accounts import resolve_key_to_account
-            account_id = resolve_key_to_account(credentials)
-            if account_id is None:
-                return None
-            return f"account:{account_id}"
-    except Exception:
-        return None  # fail-closed
+    Resolution order (open core; the saas block below is unreachable without the
+    saas package / SAAS_MODE):
+      1. Per-seat token (DB) → returns the seat's user_id UUID. bind_tenant's
+         Option A then treats the token as the authoritative identity.
+      2. Rotated MCP key (DB) → 'shared'.
+      3. SAAS_MODE account principal (saas package present + enabled only).
+      4. Env MCP_API_KEY (back-compat / bootstrap) → 'shared'.
+      5. Anonymous dev mode → only when NO credentials are configured anywhere
+         (no env key AND no DB seats/keys) AND no credential was presented.
 
-    if not MCP_API_KEY:
-        return "anonymous"  # unauthenticated mode (dev/localhost only)
-    if credentials is None:
-        return None
-    if hmac.compare_digest(credentials, MCP_API_KEY):
+    Returns None on every miss → caller raises 401. Constant-time on the env
+    secret path (hmac.compare_digest); the DB paths compare sha256 digests via
+    indexed equality (the preimage is the secret, so there is no partial-secret
+    timing to leak).
+    """
+    # 1. Per-seat token (highest precedence — strongest auth). Webui-minted
+    #    dashboard seat tokens authenticate here on BOTH lines.
+    seat_uid = _resolve_seat_token_db(credentials)
+    if seat_uid:
+        return seat_uid
+    # 2. Rotated MCP key in the DB.
+    if _mcp_key_active_db(credentials):
         return "shared"
+    # 3. SaaS mode: resolve the key to an ACCOUNT principal (control plane).
+    #    The saas package being ABSENT is the open-core gate — the block is
+    #    skipped, NOT an auth failure (an ImportError here must never deny:
+    #    FOSS runs without saas/ entirely). Resolver errors WITH saas present
+    #    stay fail-closed (deny → 401, never fall through to the shared path).
+    try:
+        from saas.config import saas_mode_enabled
+    except ImportError:
+        saas_mode_enabled = None  # open core: the control plane does not exist
+    if saas_mode_enabled is not None and saas_mode_enabled():
+        if credentials is None:
+            return None
+        # Per-user token (flu_…): resolve to the BOUND UUID → this becomes the principal
+        # and activates bind_tenant Option A (the token can act ONLY as this UUID; any
+        # other claimed X-OpenWebUI-User-Id → 403). An unknown/revoked token or an
+        # inactive seat → None (fail-closed → 401); NEVER retried as an account key.
+        from saas.tokens import is_user_token, resolve_user_token
+        if is_user_token(credentials):
+            return resolve_user_token(credentials)
+        # Account key (flk_…): resolve to the account principal (control plane).
+        from saas.accounts import resolve_key_to_account
+        account_id = resolve_key_to_account(credentials)
+        if account_id is None:
+            return None
+        return f"account:{account_id}"
+    # 4. Env MCP_API_KEY.
+    if MCP_API_KEY:
+        if credentials is not None and hmac.compare_digest(credentials, MCP_API_KEY):
+            return "shared"
+        return None
+    # 5. Anonymous dev mode — only when nothing is configured AND nothing was
+    # presented. Once a seat/key exists, the open posture is suppressed.
+    if credentials is None and not _any_dashboard_credential_configured():
+        return "anonymous"
     return None
-
-
-def _saas_rate_limited(principal: str | None) -> bool:
-    """Per-account request rate limit at the auth chokepoint (SAAS_MODE only).
-
-    Returns True when the request must be 429'd, else False. SAAS off / module absent /
-    flag off / any error → False (today's behavior EXACTLY — the limiter is FAIL-OPEN and
-    never wrongly blocks). Mirrors the guarded lazy-import pattern of _saas_write_block.
-    """
-    try:
-        from saas.config import saas_mode_enabled
-        if not saas_mode_enabled():
-            return False
-        from saas.ratelimit import allow_request
-        return not allow_request(principal)
-    except Exception:
-        return False  # fail-open
-
-
-def _client_ip(request: Request) -> str:
-    """Inbound source IP for audit — X-Forwarded-For first hop, but only when the immediate peer
-    is a trusted proxy (SAAS_TRUSTED_PROXY_IPS); otherwise the real peer (a direct client cannot
-    forge its logged source IP). Unset trusted-proxy list → honor XFF as before."""
-    xff = request.headers.get("x-forwarded-for") or ""
-    if xff and _peer_is_trusted_proxy(request):
-        ip = xff.split(",")[0].strip()
-    else:
-        ip = request.client.host if request.client else ""
-    return ip or "unknown"
-
-
-def _saas_origin_denied(principal: str | None, origin: str | None) -> bool:
-    """Post-auth per-tenant ORIGIN ACL at the auth chokepoint (SAAS_MODE only).
-
-    True when this browser Origin must be 403'd for the resolved account (ACL ENABLED + origin
-    not allow-listed). SAAS off / no Origin (server-to-server) / module absent / any error →
-    False (fail-OPEN — never wrongly block; data isolation is the bearer, not this). Mirrors the
-    guarded lazy-import pattern of _saas_rate_limited.
-    """
-    if not origin:
-        return False  # server-to-server (no browser Origin) is never gated
-    try:
-        from saas.config import saas_mode_enabled
-        if not saas_mode_enabled():
-            return False
-        from saas.agent_mode import account_id_for_principal
-        from saas.acl import origin_allowed_for_account
-        account = account_id_for_principal(principal, "")
-        return not origin_allowed_for_account(account, origin)
-    except Exception:
-        return False  # fail-open
-
-
-def _saas_ip_denied(principal: str | None, request: Request) -> bool:
-    """Post-auth inbound source-IP allow/deny rules at the auth chokepoint (SAAS_MODE only).
-
-    The IP twin of _saas_origin_denied above (migration 303, BUG-05): rules from
-    (GLOBAL ∪ the resolved account) in public.saas_ip_rules, most-specific (longest-prefix)
-    match wins, deny beats allow on an exact tie, NO matching rule → allow. SAAS off /
-    unparseable client IP / no account resolvable / module absent / any error → False
-    (FAIL-OPEN — the documented posture matching the origin ACL: this is defense-in-depth
-    on top of the bearer, never the data boundary). The client IP is resolved by
-    _client_ip (XFF first hop only behind a trusted proxy, else the real peer — a direct
-    client cannot forge its evaluated source IP). Mirrors the guarded lazy-import pattern
-    of _saas_rate_limited / _saas_origin_denied.
-
-    KNOWN LIMITATION (critic round 1, W1 — pre-existing _client_ip semantics, now
-    load-bearing): BEHIND a configured trusted proxy the evaluated IP is the XFF LEFTMOST
-    hop, which the CLIENT chose, not the proxy — a caller holding a valid bearer can spoof
-    its evaluated IP past a deny rule. Rightmost-trusted-hop parsing is the standard fix
-    and an owner call (it also changes the request log and the inbound-IP table); until
-    then treat IP rules behind a proxy as abuse-reduction, not a hard boundary — which is
-    exactly the fail-open defense-in-depth posture this gate documents.
-    """
-    try:
-        from saas.config import saas_mode_enabled
-        if not saas_mode_enabled():
-            return False
-        from saas.agent_mode import account_id_for_principal
-        from saas.ip_acl import ip_denied
-        account = account_id_for_principal(principal, "")
-        return ip_denied(account, _client_ip(request))
-    except Exception:
-        return False  # fail-open
-
 
 def _stash_saas_principal_state(
     request: Request, principal: str | None, user_id: str | None = None
@@ -2127,18 +2137,106 @@ def _stash_saas_principal_state(
         pass
 
 
+def _saas_rate_limited(principal: str | None) -> bool:
+    """Per-account request rate limit at the auth chokepoint (SAAS_MODE only).
+
+    Returns True when the request must be 429'd, else False. SAAS off / module absent /
+    flag off / any error → False (today's behavior EXACTLY — the limiter is FAIL-OPEN and
+    never wrongly blocks). Mirrors the guarded lazy-import pattern of _saas_write_block.
+    """
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return False
+        from saas.ratelimit import allow_request
+        return not allow_request(principal)
+    except Exception:
+        return False  # fail-open
+
+
+def _client_ip(request: Request) -> str:
+    """Inbound source IP for audit — X-Forwarded-For first hop, but only when the immediate peer
+    is a trusted proxy (SAAS_TRUSTED_PROXY_IPS); otherwise the real peer (a direct client cannot
+    forge its logged source IP). Unset trusted-proxy list → honor XFF as before."""
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff and _peer_is_trusted_proxy(request):
+        ip = xff.split(",")[0].strip()
+    else:
+        ip = request.client.host if request.client else ""
+    return ip or "unknown"
+
+
+def _saas_ip_denied(principal: str | None, request: Request) -> bool:
+    """Post-auth inbound source-IP allow/deny rules at the auth chokepoint (SAAS_MODE only).
+
+    The IP twin of _saas_origin_denied above (migration 303, BUG-05): rules from
+    (GLOBAL ∪ the resolved account) in public.saas_ip_rules, most-specific (longest-prefix)
+    match wins, deny beats allow on an exact tie, NO matching rule → allow. SAAS off /
+    unparseable client IP / no account resolvable / module absent / any error → False
+    (FAIL-OPEN — the documented posture matching the origin ACL: this is defense-in-depth
+    on top of the bearer, never the data boundary). The client IP is resolved by
+    _client_ip (XFF first hop only behind a trusted proxy, else the real peer — a direct
+    client cannot forge its evaluated source IP). Mirrors the guarded lazy-import pattern
+    of _saas_rate_limited / _saas_origin_denied.
+
+    KNOWN LIMITATION (critic round 1, W1 — pre-existing _client_ip semantics, now
+    load-bearing): BEHIND a configured trusted proxy the evaluated IP is the XFF LEFTMOST
+    hop, which the CLIENT chose, not the proxy — a caller holding a valid bearer can spoof
+    its evaluated IP past a deny rule. Rightmost-trusted-hop parsing is the standard fix
+    and an owner call (it also changes the request log and the inbound-IP table); until
+    then treat IP rules behind a proxy as abuse-reduction, not a hard boundary — which is
+    exactly the fail-open defense-in-depth posture this gate documents.
+    """
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return False
+        from saas.agent_mode import account_id_for_principal
+        from saas.ip_acl import ip_denied
+        account = account_id_for_principal(principal, "")
+        return ip_denied(account, _client_ip(request))
+    except Exception:
+        return False  # fail-open
+
+
+def _saas_origin_denied(principal: str | None, origin: str | None) -> bool:
+    """Post-auth per-tenant ORIGIN ACL at the auth chokepoint (SAAS_MODE only).
+
+    True when this browser Origin must be 403'd for the resolved account (ACL ENABLED + origin
+    not allow-listed). SAAS off / no Origin (server-to-server) / module absent / any error →
+    False (fail-OPEN — never wrongly block; data isolation is the bearer, not this). Mirrors the
+    guarded lazy-import pattern of _saas_rate_limited.
+    """
+    if not origin:
+        return False  # server-to-server (no browser Origin) is never gated
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return False
+        from saas.agent_mode import account_id_for_principal
+        from saas.acl import origin_allowed_for_account
+        account = account_id_for_principal(principal, "")
+        return not origin_allowed_for_account(account, origin)
+    except Exception:
+        return False  # fail-open
+
+
 def require_auth(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
     """FastAPI dependency enforcing the bearer scheme; returns the principal.
 
-    Returns a principal id (threaded so the tenant-isolation follow-up can bind
-    principal→user_id here). Raises 401 on failure. Logs only length + reason —
+    Returns a principal id — either "shared"/"anonymous" (transport auth), a
+    seat's user_id UUID (per-seat token: the token IS the identity) or an SAAS
+    account principal. Raises 401 on failure. Logs only length + reason —
     never any prefix of the secret.
+
+    NB: do NOT short-circuit on ``not MCP_API_KEY`` — _resolve_principal now
+    consults the dashboard DB (seats + rotated keys) and only falls back to the
+    anonymous-dev posture when NOTHING is configured anywhere. Short-circuiting
+    here would let a minted seat be bypassed whenever the env key is unset.
     """
-    if not MCP_API_KEY:
-        return "anonymous"
     presented = creds.credentials if creds is not None else None
     principal = _resolve_principal(presented)
     if principal is None:

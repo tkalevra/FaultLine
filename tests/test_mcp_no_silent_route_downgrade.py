@@ -355,8 +355,12 @@ def test_remember_facts_route_timeout_defers_never_rewrites(monkeypatch):
     assert out["deferred"] is True and out["queued"] is True and out["retry_pending"] is True
     assert S._statement_defer_stats["deferred"] == 1
     assert S._statement_defer_queue is not None and S._statement_defer_queue.qsize() == 1
-    queued_text, queued_uid, queued_src = S._statement_defer_queue.get_nowait()
+    # Vehicle update (foss-es uplift port): the producer's queue item grew a lane + timestamp
+    # ((text, user_id, ingest_source, lane, ts) — the docstring calls the 3-tuple "pre-lane
+    # legacy"). The MECHANISM assertion is unchanged: authorship (text, uid, "mcp") preserved.
+    queued_text, queued_uid, queued_src, queued_lane, _queued_ts = S._statement_defer_queue.get_nowait()
     assert (queued_text, queued_uid, queued_src) == (_TEXT, _UID, "mcp")  # authorship preserved
+    assert queued_lane == "STATEMENT"
     for forbidden in ("/extract/rewrite", "/harvest-spans", "/ingest"):
         assert forbidden not in be.calls, f"{forbidden} was called — the transport substituted a route"
     assert "statement_extractor_route_fallback" not in log
@@ -908,8 +912,9 @@ def test_spine_harvest_timeout_never_becomes_a_rewrite_run(monkeypatch):
     assert "/extract/rewrite" not in be.calls and "/ingest" not in be.calls, be.calls
     assert "statement_spine_harvest_failed" not in log and "falling back" not in log
     assert "brain_unavailable" in log
-    q_text, q_uid, q_src = S._statement_defer_queue.get_nowait()
+    q_text, q_uid, q_src, q_lane, _q_ts = S._statement_defer_queue.get_nowait()
     assert (q_text, q_uid, q_src) == (_TEXT, _UID, "mcp")
+    assert q_lane == "STATEMENT"
 
 
 def test_spine_harvest_retry_lands_and_the_turn_is_a_normal_spine_turn(monkeypatch):

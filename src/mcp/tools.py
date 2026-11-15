@@ -351,12 +351,12 @@ TOOLS = [
             "ingest so the ontology exists to file facts against.\n"
             "(2) Ontological statements you generate — 'X is a subclass of Y', 'X is an instance "
             "of Y', 'X is a part of Y', one per line. ES accepted too: 'X es una subclase de Y', "
-            "'X es una instancia de Y', 'X es parte de Y' (also 'es un tipo de', 'forma parte de'). "
-            "This maps how concepts relate, not general "
-            "knowledge. Stored as Class B (staged), confirmed over time. May supersede an existing learned fact. "
-            "If this returns no_facts, that is a FORMATTING error — rephrase into one of the forms "
-            "above and retry. It does NOT mean ontology storage is unsupported, and it is NOT a "
-            "reason to substitute ingest_document, which stores prose and does not build the graph."
+            "'X es una instancia de Y', 'X es parte de Y'. "
+            "This maps how concepts relate, not general knowledge. Stored as Class B (staged), "
+            "confirmed over time; may supersede an existing learned fact. If this returns "
+            "no_facts, that is a FORMATTING error — rephrase and retry; it does NOT mean "
+            "ontology storage is unsupported, and never substitute ingest_document (prose, "
+            "not graph)."
         ),
         "inputSchema": {
             "type": "object",
