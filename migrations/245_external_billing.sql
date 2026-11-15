@@ -8,7 +8,7 @@
 -- Migration 211 landed COMP, and comp means exactly one thing (owner, verbatim):
 --
 --     "a comped account 'complimentary' is not billed, it's written off with a signature and
---      reason either based on a specific date, or indefinitely, ie. my HelpDeskPro Tenant or
+--      reason either based on a specific date, or indefinitely, ie. my AcmeCorp Tenant or
 --      testing tenants should by default be set as 'complimentary[comp]' accounts"
 --
 -- COMP = COMPLIMENTARY = A DELIBERATE, AUTHORISED WRITE-OFF. Signature (comp_by), reason

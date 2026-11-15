@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS public.platform_settings (
     -- The From: address the WELCOME email is sent as. Defaults to the product no-reply mailbox;
     -- operator-editable (DB-driven, never hardcoded in the sender). Falls back to the SMTP
     -- config's from_address when blank.
-    welcome_from_address    TEXT DEFAULT 'noreply@faultline.ca',
+    welcome_from_address    TEXT DEFAULT 'noreply@example-host.com',
 
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_by              TEXT                         -- operator identity that last wrote

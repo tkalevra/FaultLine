@@ -2235,7 +2235,7 @@ SPINE_RELATIONAL_PREDICATIVE: bool = os.environ.get(
 # NP_ENTITY_COMPLETION (default ON) — capture a MULTI-WORD ENTITY NAME WHOLE at the object slot.
 # A proper-noun-modified / compound-noun entity NP was truncated to its bare HEAD noun in two seams the
 # left-modifier-only ``_object_value_phrase`` never covered, dropping the answer-bearing specifier:
-#   (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Guelph"
+#   (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Riverton"
 #       / "Bank OF America" stored ``works_for → university`` / ``bank`` (``_chain_employment`` folds
 #       only left modifiers; the SVO chain already recovers this via ``_nominal_pp_complement``). The
 #       tail is folded via the existing ``_proper_name_of_tail`` (nested ``prep``-"of" → ``pobj`` PROPN;
@@ -23856,7 +23856,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _org is not None:
                 org_phrase = _object_value_phrase(_org)
                 # FULL ENTITY-NAME COMPLETION: fold the RIGHT ``of <PROPN>`` name tail ("University OF
-                # Guelph", "Bank OF America") that ``_object_value_phrase`` (left-modifiers only) drops —
+                # Riverton", "Bank OF America") that ``_object_value_phrase`` (left-modifiers only) drops —
                 # else the employer truncates to the bare head noun. The SVO chain already recovers this
                 # via ``_nominal_pp_complement``; the employment chain needs it explicitly. Claim the tail
                 # tokens so the residue guard / PA-core (G5 twin-suppression) see the whole name COVERED.
@@ -28855,8 +28855,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # instance class (falls back to owns).
                     _poss = _possession_rel_for_type(type_head, instance_type_tag=_inst_tag)
                     # ALIENABILITY GATE (SPINE_POSSESSIVE_ALIENABILITY) — SECOND ENFORCEMENT POINT.
-                    # This chain re-homes the possession onto the NAME ("my hometown is Guelph" →
-                    # (user, owns, guelph)), and its ``_ni_suppress`` entry makes ``_chain_possessive``
+                    # This chain re-homes the possession onto the NAME ("my hometown is Riverton" →
+                    # (user, owns, riverton)), and its ``_ni_suppress`` entry makes ``_chain_possessive``
                     # step aside (:12935) — so the gate that chain applies at :13180 was NEVER reached
                     # for this construction and ``_possession_rel_for_type`` defaults to ``owns`` with
                     # no value-type check. Same contract, same helper, ONE flag, two enforcement points.
@@ -28871,7 +28871,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # named entity stays a durable object of the user's outbound edge and stays
                     # reachable by the descendant walk. The specific relational reading is separately
                     # captured by the preference/possessive-predication seam (main.py:404 →
-                    # (user, hometown, guelph)), so nothing is lost by withdrawing the ownership claim.
+                    # (user, hometown, riverton)), so nothing is lost by withdrawing the ownership claim.
                     if SPINE_POSSESSIVE_ALIENABILITY and not _possessum_admitted_by_rel_tail(
                             (type_head or "").strip().lower(), _inst_tag or "", _poss):
                         _poss = "related_to"

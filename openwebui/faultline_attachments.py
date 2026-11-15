@@ -70,7 +70,7 @@ class Filter:
         FAULTLINE_MCP_URL: str = Field(
             default="",
             description=("Base URL of the FaultLine MCP server (port 8002), e.g. "
-                         "http://faultline-mcp:8002 (Docker) or https://mcp.faultline.ca. "
+                         "http://faultline-mcp:8002 (Docker) or https://mcp.example-host.com. "
                          "REQUIRED — the bridge is disabled while empty.")
         )
         FAULTLINE_API_KEY: str = Field(

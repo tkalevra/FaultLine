@@ -77,10 +77,10 @@ Filter also calls:
 
 5. **Test it:**
    ```
-   User: "My name is Christopher, I prefer Chris"
+   User: "My name is Daniel, I prefer Dan"
    System: [Extracts and stores facts]
    User: "What's my name?"
-   System: [Uses stored fact to respond with "Christopher, but you prefer Chris"]
+   System: [Uses stored fact to respond with "Daniel, but you prefer Dan"]
    ```
 
 ---

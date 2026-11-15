@@ -21266,7 +21266,7 @@ someone user-adjacent.
 Examples of subject extraction:
 - "I am not a doctor" → subject_name: "user" (speaker/user)
 - "I'm not 18, I'm 23" → subject_name: "user" (speaker/user)
-- "University of Guelph is not a person, it is an organization" → subject_name: "University of Guelph"
+- "Riverton University is not a person, it is an organization" → subject_name: "Riverton University"
 - "Wren is an LLM model, not a person" → subject_name: "Wren"
 - "Computing and Communication Services is an organization" → subject_name: "Computing and Communication Services"
 - "Ottawa is the capital of Canada, not a person" → subject_name: "Ottawa"
@@ -21324,7 +21324,7 @@ RULES:
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
    - Update facts.object_id with hierarchy semantics
    - Example: instance_of dog → cat
-   - Example: "University of Guelph is not a person" → subject_name="University of Guelph", old_value="person", new_value="organization"
+   - Example: "Riverton University is not a person" → subject_name="Riverton University", old_value="person", new_value="organization"
 
 4. SUBJECT dimension (wrong entity):
    - subject_uuid MUST CHANGE
@@ -21491,7 +21491,7 @@ Examples of subject extraction:
 - "I don't have any pets" → subject: "user"
 - "I'm not 42" → subject: "user"
 - "Spot is not a bunny" → subject: "Spot"
-- "University of Guelph is not a person" → subject: "University of Guelph"
+- "Riverton University is not a person" → subject: "Riverton University"
 - "forget that Wren is a person" → subject: "Wren"
 - "Computing and Communication Services is not an organization" → subject: "Computing and Communication Services"
 - "Remove the name Rex" → subject: "user" (self-alias removal)
@@ -21545,7 +21545,7 @@ RULES:
    - rel_type = the hierarchy rel (instance_of, member_of, part_of)
    - object = the type/class being removed
    - Example: "Spot is not a bunny" → subject="Spot", rel_type="instance_of", object="bunny"
-   - Example: "University of Guelph is not a person" → subject="University of Guelph", rel_type="instance_of", object="person"
+   - Example: "Riverton University is not a person" → subject="Riverton University", rel_type="instance_of", object="person"
 
 4. ENTITY (alias removal):
    - dimension = ENTITY
@@ -64694,7 +64694,7 @@ def fetch_facts_from_anchor(
                 # the ask is ENTITY-ANCHORED (never the speaker — user-anchored asks keep
                 # today's scope byte-for-byte) → lay the mapped rel into
                 # ``relationship_rels`` + ``aspect_bound_rels``. MEASURED on the
-                # faultline.ca wire drive + the pre-prod baseline seat: (xcp-ng, run_on,
+                # the hosted-LLM wire drive + the lab baseline seat: (xcp-ng, run_on,
                 # old dell tower …) sat LIVE while "what does my homelab hypervisor run?"
                 # served the located_in fragment — the question's verb bound no rel (no
                 # rel_type ``run``, no alias), so run_on never entered the walk's scope on
@@ -72316,8 +72316,8 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # Qdrant payloads store subject/object as DISPLAY NAMES (re_embedder writes
         # subject_display/object_display), not UUIDs. A DB copy of the same fact keys
         # on its UUID; the Qdrant copy keyed on a display name — so dedup never
-        # collapsed them and the SAME fact rendered twice (e.g. "you works for guelph"
-        # AND "chris works for guelph"). Resolve each Qdrant point's backing row
+        # collapsed them and the SAME fact rendered twice (e.g. "you works for riverton"
+        # AND "alex works for riverton"). Resolve each Qdrant point's backing row
         # (fact_id + source_table) to its real subject_id/object_id UUIDs and stamp
         # them onto the fact, so the UUID-keyed dedup below collapses DB+Qdrant copies
         # and the central resolver renders the survivor ONE way. Runs AFTER the

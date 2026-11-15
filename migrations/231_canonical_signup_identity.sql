@@ -313,7 +313,7 @@ BEGIN
             'by % logins. NOTHING has been created, changed or deleted.%    Conflicts (first '
             '10):%    %',
             _groups, _rows, E'\n', E'\n', _sample
-            USING HINT = 'These are usually deliberate: a staff member holding chris@x.com and '
+            USING HINT = 'These are usually deliberate: a staff member holding alex@x.com and '
                          'chris+ops@x.com as two dashboard logins. One mailbox is now one login, '
                          'so retire or re-address the extras, then re-run. The individual_users '
                          'constraint applies independently and is unaffected by this.';

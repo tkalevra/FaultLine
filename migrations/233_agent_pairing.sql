@@ -6,7 +6,7 @@
 -- shape can only ever support factors that fit in one round trip, so its MFA leg is TOTP-only.
 -- WebAuthn/passkeys are challenge/response — a server-issued challenge must be signed by the
 -- authenticator and returned — and therefore can NEVER fit that shape. MEASURED in production:
--- the OptimusCannabis tenant admin has exactly ONE enabled factor, ``factor_type='webauthn'``
+-- the AcmeCorp tenant admin has exactly ONE enabled factor, ``factor_type='webauthn'``
 -- (a Bitwarden passkey, label "Optimus-FaultLine"), and no TOTP secret at all. That login could
 -- not mint a delegate, which made the ENTIRE appliance connect flow (list seats → bind a seat →
 -- grant the trial) unreachable for them. Migration 230 shipped a deliberately PASSKEY-FIRST

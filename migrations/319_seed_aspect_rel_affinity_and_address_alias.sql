@@ -1,5 +1,5 @@
 -- Migration 319: seed the ASPECT-REL-AFFINITY cue class + the ADDRESS rel-type aliases
--- (PROD-BUG-1 + PROD-BUG-4 serve gaps, the faultline.ca wire drive, 2026-11-12).
+-- (PROD-BUG-1 + PROD-BUG-4 serve gaps, measured on the live wire, 2026-11-12).
 --
 -- WHY
 -- ---

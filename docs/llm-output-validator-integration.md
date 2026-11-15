@@ -340,7 +340,7 @@ assert results['evaluated'] > 0
 
 ### Full Pipeline Test (curl)
 ```bash
-# Send test conversation to hairbrush.helpdeskpro.ca
+# Send test conversation to openwebui.example.com
 # Verify:
 # - Facts stored with correct confidence
 # - Metrics updated globally

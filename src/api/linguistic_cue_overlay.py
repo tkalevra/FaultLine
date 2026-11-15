@@ -1156,7 +1156,7 @@ OFFSPRING_NOUN_CATEGORY = "offspring_noun"
 # ── PROD-BUG-1's ASPECT-REL-AFFINITY SHELF (the run_on serve gap, 2026-11-12): a QUESTION
 # SURFACE keyed class — cue = the question's ASPECT word (a verb/inflection), description =
 # the canonical rel_type the aspect binds to when the store holds that rel's rows. MEASURED
-# on the faultline.ca wire drive + the pre-prod baseline seat: "My homelab hypervisor is
+# on the hosted-LLM wire drive + the lab baseline seat: "My homelab hypervisor is
 # XCP-ng running on an old Dell tower." filed (xcp-ng, run_on, old dell tower …) LIVE — the
 # LLM lane's novel rel — while "what does my homelab hypervisor run?" served the
 # located_in fragment: the question's own verb "run" bound NOTHING (no rel_type named

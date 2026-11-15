@@ -604,7 +604,7 @@ def weld_verdict(cur, entity_id, alias, preference_source,
     warrant, and every label the target already holds is likewise an engine-growth claim. AND
     the target is a PLACE — it occupies a class-side position in this tenant's graph. Measured
     on production, this is the remaining corruption ARMs 1-2 could not see, because it arrived
-    below memory authority on both sides: ``{cat} ≡ {luna}``, ``{company} ≡ {optimuscannabis}``,
+    below memory authority on both sides: ``{cat} ≡ {luna}``, ``{company} ≡ {acmecorp}``,
     ``{old school friend} ≡ {emma}``, ``{landing page} ≡ {gauntlet}``,
     ``{issue triage} ≡ {ci investigation} ≡ {tests}`` — extraction inventing a co-reference and
     the index silently collapsing two referents onto one node. The first four are the SAME

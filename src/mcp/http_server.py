@@ -501,10 +501,10 @@ def _derive_tenant_base_domains() -> frozenset[str]:
     """Registrable base domain(s) whose *.subdomains are the per-tenant scoped surface.
 
     Explicit override via SAAS_TENANT_BASE_DOMAINS (comma-separated), UNIONed with the base
-    (last two labels) of each configured tenant host — so `app.faultline.ca` / `mcp.faultline.ca`
-    auto-derive `faultline.ca` and NO extra config is needed. Any host that is one of these bases
+    (last two labels) of each configured tenant host — so `app.example-host.com` / `mcp.example-host.com`
+    auto-derive `example-host.com` and NO extra config is needed. Any host that is one of these bases
     or a subdomain of it (and isn't an explicitly-classified volenti/admin/tenant host) is the
-    TENANT face. WITHOUT this an arbitrary `*.faultline.ca` label falls through to "internal"
+    TENANT face. WITHOUT this an arbitrary `*.example-host.com` label falls through to "internal"
     (gate no-op) and would serve the god-mode operator console the moment a wildcard DNS record
     exists — a subdomain-takeover / console-exposure landmine. Empty when SAAS is unconfigured
     (fail-safe: behavior unchanged).
@@ -662,7 +662,7 @@ _OPERATOR_CONSOLE_EXACT = frozenset({
     "/dashboard/data/cycle_events.json",
     # ── ADDED 2026-08-13 (drift audit) ────────────────────────────────────────────────
     # The OPERATOR BILLING DASHBOARD. Both files were reachable at
-    # https://app.faultline.ca/dashboard/billing.html — the CUSTOMER face — because
+    # https://app.example-host.com/dashboard/billing.html — the CUSTOMER face — because
     # StaticFiles serves ANY file under saas/dashboard/ and this frozenset is the only thing
     # that hides an operator page from the tenant face. The DATA is safe (every /admin/*
     # route 404s on that face), but ~35 KB of operator JavaScript — internal route names,
@@ -807,7 +807,7 @@ _FACE_SHARED_BY_DESIGN = frozenset({
     # test_endpoint_preview_parity::test_dashboard_js_has_no_inline_script_or_handlers.
     "/dashboard/endpoint_preview.js",
     # The PUBLIC benchmark leaderboard: linked from the marketing site
-    # (saas/landing/index.html → app.faultline.ca/dashboard/leaderboard.html) as well as
+    # (the tenant landing → app.example-host.com/dashboard/leaderboard.html) as well as
     # from both consoles. Gating it to either face would break a published public link.
     "/dashboard/leaderboard.html", "/dashboard/leaderboard.js",
     # The help wiki + printable/PDF build and the connection guides: product documentation,

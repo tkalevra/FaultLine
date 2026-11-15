@@ -152,7 +152,7 @@ This matters because the system can answer different questions efficiently:
 Not all facts are equal.
 
 **Class A — You said it directly**
-- "My name is Chris"
+- "My name is Alex"
 - Confidence: 100% (1.0)
 - Storage: Permanent (in `facts` immediately; never reclassified)
 

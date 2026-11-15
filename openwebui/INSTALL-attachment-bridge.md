@@ -41,7 +41,7 @@ integration. This filter performs no memory reads or writes of its own.
 
 | Valve | Set to |
 |---|---|
-| `FAULTLINE_MCP_URL` | Base URL of the FaultLine MCP server (port **8002**), e.g. `http://faultline-mcp:8002` (same Docker network) or your public edge `https://mcp.faultline.ca`. |
+| `FAULTLINE_MCP_URL` | Base URL of the FaultLine MCP server (port **8002**), e.g. `http://faultline-mcp:8002` (same Docker network) or your public edge `https://mcp.example-host.com`. |
 | `FAULTLINE_API_KEY` | The tool-server connection's bearer key (same value as the Tools connection). |
 | `OWUI_FILES_BASE_URL` | Origin for resolving `/api/v1/files/...` URLs. Inside Docker: `http://open-webui:8080`. Default `http://localhost:8080` is correct when the filter runs inside the OWUI backend. |
 | `ENABLED` | `true` (master switch; set `false` to disable the bridge without removing it). |
@@ -77,7 +77,7 @@ integration. This filter performs no memory reads or writes of its own.
 
 ```bash
 # TOOL-SERVER credential + the seat header — exactly what the filter sends.
-FAULTLINE="http://faultline-mcp:8002"          # or https://mcp.faultline.ca
+FAULTLINE="http://faultline-mcp:8002"          # or https://mcp.example-host.com
 TOOLSERVER_KEY="<the tool-server bearer>"      # MCP_API_KEY (open core) / account key (SaaS)
 SEAT="10d7d879-63cd-4f31-92ce-f2c9edb760ab"    # the OWUI user id (seat)
 
