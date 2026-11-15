@@ -136,7 +136,7 @@ def test_quarantine_selects_junk_and_spares_legit_rows(tenant_cursor):
     _mk_entity(cur, e["empty"], [""])                       # junk: empty surface
     _mk_entity(cur, e["doc_node"], ["document"])            # the seeded type node
     _mk_entity(cur, e["stub_doc"], ["My Real Paper"])
-    _mk_entity(cur, e["known"], ["cj", "Sam Jay"])  # KNOWN: also has a real surface
+    _mk_entity(cur, e["known"], ["cj", "Christopher Jay"])  # KNOWN: also has a real surface
     _mk_entity(cur, e["debris"], ["First Soap"])
     _mk_entity(cur, e["user"], ["user"])
 

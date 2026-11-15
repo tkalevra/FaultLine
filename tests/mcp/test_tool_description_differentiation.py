@@ -21,16 +21,38 @@ import os
 import subprocess
 import sys as _sys
 
+import pytest
 from fastapi.testclient import TestClient
 
 from src.mcp import premise
 from src.mcp.http_server import app
 from src.mcp.tools import TOOLS
 
-# Measured 2026-10-26 — the budget pins. ≤1024 is the hard cap; the exact number is the guard.
-_MCP_DOOR_DESC_LEN = {"recall_memory": 892, "remember_facts": 985}
-_OPENAPI_DOOR_DESC_LEN = {"/recall_memory": 700, "/remember_facts": 985}
+
+@pytest.fixture(autouse=True)
+def _foss_default_description_surface(monkeypatch):
+    """Pin the FOSS-default description surface for the length vehicles.
+
+    The tool descriptions are folded with the MEMORY_TEACHES standing-rule suffix at
+    import time; the fold gate is a pure env read (MEMORY_TEACHES, else SAAS_MODE).
+    On a FOSS install both are unset and the descriptions are the authored lengths
+    below — force that state so the exact-length vehicles are deterministic in a
+    mixed test session (another module may enable the fold for its own assertions).
+    """
+    monkeypatch.delenv("MEMORY_TEACHES", raising=False)
+    monkeypatch.delenv("SAAS_MODE", raising=False)
+
+# Budget guard. ≤1024 is the hard cap (an over-limit description makes an OpenAI-compatible
+# client reject THE ENTIRE TOOL LIST). The exact byte matrix (pathway prefix ON/OFF, the
+# standing-rule suffix, the cortex excision) is owned — re-measured and pinned per
+# configuration — by tests/mcp/test_premise_and_tool_parity.py on the ported tree; this pin
+# keeps the MECHANISM assertions (FaultLine leads, host-note naming, NOT-FaultLine marker,
+# instructions on both transports, routing-only content) and the cliff guard.
+# 2026-11-15 vehicle update (uplift port of saas 35418513): the descriptions and
+# SERVER_INSTRUCTIONS evolved on the saas lineage; the stale foss-era byte counts were
+# retired in favour of the cap + the parity pins.
 _DESC_CAP = 1024
+_INSTRUCTIONS_CAP = 4096
 
 
 def _tool(name):
@@ -40,7 +62,6 @@ def _tool(name):
 def test_remember_facts_differentiation_mcp_door():
     desc = _tool("remember_facts")["description"]
     assert desc
-    assert len(desc) == _MCP_DOOR_DESC_LEN["remember_facts"]
     assert len(desc) <= _DESC_CAP
     assert "FaultLine" in desc
     assert "`write_note`" in desc
@@ -52,7 +73,6 @@ def test_remember_facts_differentiation_mcp_door():
 def test_recall_memory_differentiation_mcp_door():
     desc = _tool("recall_memory")["description"]
     assert desc
-    assert len(desc) == _MCP_DOOR_DESC_LEN["recall_memory"]
     assert len(desc) <= _DESC_CAP
     assert "FaultLine" in desc
     assert "`search_notes`" in desc and "`view_note`" in desc
@@ -67,11 +87,14 @@ def test_differentiation_on_the_openapi_door():
         "/remember_facts": "`write_note`",
         "/recall_memory": "`search_notes`",
     }
-    for path, expected_len in _OPENAPI_DOOR_DESC_LEN.items():
+    markers = {
+        "/remember_facts": "`write_note`",
+        "/recall_memory": "`search_notes`",
+    }
+    for path in ("/remember_facts", "/recall_memory"):
         op = spec["paths"][path]["post"]
         desc = op.get("description", "")
         assert desc, f"{path}: OpenAPI door lost the description"
-        assert len(desc) == expected_len
         assert len(desc) <= _DESC_CAP
         assert "FaultLine" in desc
         assert "NOT FaultLine" in desc
@@ -82,7 +105,7 @@ def test_differentiation_on_the_openapi_door():
 
 def test_server_instructions_routing_notice():
     assert premise.SERVER_INSTRUCTIONS
-    assert len(premise.SERVER_INSTRUCTIONS) <= _DESC_CAP
+    assert len(premise.SERVER_INSTRUCTIONS) <= _INSTRUCTIONS_CAP
     for token in ("remember_facts", "recall_memory", "write_note", "FaultLine"):
         assert token in premise.SERVER_INSTRUCTIONS
     # Routing notices only — no SaaS premise text leaks into the public lineage

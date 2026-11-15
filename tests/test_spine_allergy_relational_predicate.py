@@ -43,8 +43,12 @@ pytestmark = pytest.mark.skipif(
 # ── #1 ALLERGY / RELATIONAL PREDICATE — the data-loss fix ────────────────────────────────
 
 @pytest.mark.parametrize("text,rel,obj", [
-    ("I am allergic to penicillin", "allergic_to", "penicillin"),
-    ("I'm allergic to penicillin", "allergic_to", "penicillin"),
+    # vehicle updated by-design (2026-11-12): af519cdc's landed HEALTH_SHELF detector maps
+    # the class member's '<adj> to <NP>' frame onto the SEEDED has_allergy shelf instead of
+    # the novel allergic_to rel that landed and went dark — the MECHANISM pin (the OBJECT is
+    # captured, never dropped into a feeling) is unchanged.
+    ("I am allergic to penicillin", "has_allergy", "penicillin"),
+    ("I'm allergic to penicillin", "has_allergy", "penicillin"),
     ("I am afraid of spiders", "afraid_of", "spiders"),
 ])
 def test_relational_predicate_captures_object(text, rel, obj):
@@ -64,8 +68,9 @@ def test_allergy_does_not_produce_a_feeling():
 def test_coordinated_allergens_each_captured():
     edges = analyze_copula_relational_predicate("I'm allergic to penicillin and sulfa")
     objs = {(e["rel_type"], e["object"]) for e in edges}
-    assert ("allergic_to", "penicillin") in objs
-    assert ("allergic_to", "sulfa") in objs
+    # vehicle: has_allergy (the af519cdc shelf mapping — see the parametrize note above)
+    assert ("has_allergy", "penicillin") in objs
+    assert ("has_allergy", "sulfa") in objs
 
 
 @pytest.mark.parametrize("text,emotion", [
@@ -121,7 +126,8 @@ def test_harvest_emits_negated_polarity_edge_for_relational_predicate():
 
     neg = _build("I'm not allergic to penicillin")
     assert neg and all(e.get("polarity") == "negated" for e in neg)
-    assert {("allergic_to", "penicillin")} == {(e["rel_type"], e["object"]) for e in neg}
+    # vehicle: has_allergy (the af519cdc shelf mapping) — the polarity mechanism unchanged
+    assert {("has_allergy", "penicillin")} == {(e["rel_type"], e["object"]) for e in neg}
 
     pos = _build("I'm allergic to penicillin")
     assert pos and all("polarity" not in e for e in pos)  # affirmed → column default

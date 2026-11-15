@@ -45,15 +45,28 @@ def _fake(returning):
 
 @pytest.mark.asyncio
 async def test_tools_with_output_schema_emit_structured_content():
-    """recall_memory + remember_facts declare outputSchema -> envelope carries structuredContent,
-    and the text ``content`` mirror is retained for back-compat with text-only clients."""
+    """Every ADVERTISED tool declares outputSchema -> envelope carries structuredContent, and the
+    text ``content`` mirror is retained for back-compat with text-only clients.
+
+    The cortex pair (cortex_recall / cortex_remember) were added to _OUTPUT_SCHEMAS so the
+    agent-cortex lane is as predictably parsable as the user-memory lane: they return the same
+    ``{"memory": ...}`` / ``{"status": ...}`` dict shapes recall_memory and remember_facts
+    already declared, so a text-only client sees the identical ``content`` string while a
+    spec-strict client gains a structured view. This is ADDITIVE — declaring outputSchema never
+    removes the text mirror, so no client regresses.
+    """
     cases = [
         ("recall_memory", {"query": "x"}, {"memory": "No relevant facts found."}),
         ("remember_facts", {"text": "my favourite colour is cerulean"},
          {"status": "stored", "committed": 1, "message": "ok"}),
         # A status the OLD hard-coded enum ["stored","valid","no_ingest","corrected","failed"]
-        # would have REJECTED -> proves the open-string schema accepts the full return surface.
+        # would have REJECTED -> proves the open-string schema accepts the full delegated surface.
         ("remember_facts", {"text": "hi"}, {"status": "query_detected", "message": "use recall_memory"}),
+        # Agent-cortex lane: same dict shapes, now structured.
+        ("cortex_recall", {"query": "deploy"},
+         {"memory": "My own operational notes for this:..."}),
+        ("cortex_remember", {"text": "being corrected IS the trigger"},
+         {"status": "noted", "note": "Noted for myself (operational memory) — my own working note on how to operate better, not something recorded as your fact."}),
     ]
     for tool_name, args, result in cases:
         with patch.dict(_server_mod.TOOL_DISPATCH, {tool_name: _fake(result)}, clear=False):
@@ -65,18 +78,18 @@ async def test_tools_with_output_schema_emit_structured_content():
 
 @pytest.mark.asyncio
 async def test_tools_without_output_schema_stay_text_only():
-    """A tool with no outputSchema entry must NOT emit structuredContent."""
-    name = "noop_untyped_tool"
-    assert name not in _OUTPUT_SCHEMAS
-    result = {"anything": "text-only"}
-    with patch.dict(_server_mod.TOOL_DISPATCH, {name: _fake(result)}, clear=False):
-        env = await _call_tool(name, {"user_id": "struct-pin", "query": "x"})
+    """A tool with no outputSchema entry (the low-level, unadvertised backend tools) must NOT emit
+    structuredContent."""
+    assert "query" not in _OUTPUT_SCHEMAS  # low-level tools are not part of the advertised surface
+    result = {"notes": []}
+    with patch.dict(_server_mod.TOOL_DISPATCH, {"query": _fake(result)}, clear=False):
+        env = await _call_tool("query", {"user_id": "struct-pin", "query": "x"})
     assert "structuredContent" not in env
     assert json.loads(env["content"][0]["text"]) == result
 
 
 def test_remember_facts_status_is_open_string_not_enum():
-    """status is an open string spanning the full return surface, NOT a closed enum —
+    """status is an open string spanning a delegated/retract surface, NOT a closed enum —
     a closed enum here is the landmine that shipped -32600 to spec-strict clients."""
     schema = _OUTPUT_SCHEMAS["remember_facts"]["properties"]["status"]
     assert "enum" not in schema
@@ -93,7 +106,7 @@ def test_recall_memory_status_is_open_string_not_enum():
     assert schema["type"] == "string"
 
 
-def test_advertised_tools_with_schema_are_a_subset_of_tools():
+def test_advertised_tools_with_schema_are_a_subset_of_dispatch():
     """Guard: the only tools that carry structuredContent are exactly those in _OUTPUT_SCHEMAS."""
     advertised = {t["name"] for t in _server_mod.TOOLS}
     assert _OUTPUT_SCHEMAS.keys() <= advertised

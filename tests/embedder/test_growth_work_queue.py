@@ -97,32 +97,22 @@ def _pending_rows(conn):
         return cur.fetchall()
 
 
-# ── pin (a): lane-closed deferral → work items persisted ─────────────────────
-#
-# FOSS-port note: the upstream pins exercised the defer hooks inside
-# ``_reembedder_llm_lane_open`` (brain posture / tenant-brain binding) and inside
-# the promote path — both are SaaS-lane machinery this repo does not carry (see
-# DEV/BUGS/foss-port-cba.md: lane-gate defer hooks unwired on FOSS). The PUBLIC
-# contract those hooks relied on is pinned here directly at the API level.
+# ── pin (a): brain-lane closed → work items persisted ─────────────────────────
 
-def test_record_deferred_persists_the_starvation_breadcrumb(tenant_schema, bound_conn):
-    """record_deferred writes the pending breadcrumb with the subsystem's mapped
-    operation family + priority — the contract the (SaaS-lane) defer hooks call."""
-    assert GWQ.record_deferred(
-        tenant_schema, "synonym_convergence", user_id="11111111-1111-4111-8111-111111111111") is True
-    assert _pending_rows(bound_conn) == [
-        ("synonym_convergence", "synonym_convergence", 6)]
-    # whatis_classify maps to whatis_climb at its own priority
-    assert GWQ.record_deferred(
-        tenant_schema, "whatis_classify", user_id="11111111-1111-4111-8111-111111111111") is True
-    assert _pending_rows(bound_conn) == [
-        ("synonym_convergence", "synonym_convergence", 6),
-        ("whatis_climb", "whatis_classify", 7)]
+def test_lane_closed_no_brain_records_deferred(tenant_schema, bound_conn, monkeypatch):
+    """The fail-closed no-brain exit of _reembedder_llm_lane_open writes the
+    breadcrumb: work due but brain-starved is no longer invisible."""
+    import src.api.llm_calls as llm_calls
+    monkeypatch.setattr(llm_calls, "_saas_brain_unavailable", lambda: True)
+    from src.re_embedder import embedder
+
+    open_ = embedder._reembedder_llm_lane_open(
+        "11111111-1111-4111-8111-111111111111", "synonym_convergence", tenant_schema)
+    assert open_ is False
+    rows = _pending_rows(bound_conn)
+    assert rows == [("synonym_convergence", "synonym_convergence", 6)]
 
 
-@pytest.mark.skip(reason="FOSS port: brain-posture lane gating is SaaS-only machinery "
-                         "(no _reembedder_llm_lane_open on this lineage) — see "
-                         "DEV/BUGS/foss-port-cba.md")
 def test_lane_closed_posture_cooldown_records_deferred(tenant_schema, bound_conn, monkeypatch):
     """The posture branch (brain rate-limited: measured p95 tightening) is the same
     starvation shape — it records too."""
@@ -138,17 +128,16 @@ def test_lane_closed_posture_cooldown_records_deferred(tenant_schema, bound_conn
     assert _pending_rows(bound_conn) == [("whatis_climb", "whatis_classify", 7)]
 
 
-def test_lane_open_records_nothing(tenant_schema, bound_conn):
-    """An OPEN lane (or no lane machinery at all) writes no breadcrumb — the queue
-    only ever holds work that was actually deferred."""
-    # The FOSS engine has no lane gate; the honest equivalent: recording nothing
-    # leaves the queue empty, and a completed deferral re-arms only on a NEW defer.
+def test_lane_open_records_nothing(tenant_schema, bound_conn, monkeypatch):
+    import src.api.llm_calls as llm_calls
+    monkeypatch.setattr(llm_calls, "_saas_brain_unavailable", lambda: False)
+    from src.re_embedder import embedder
+
+    assert embedder._reembedder_llm_lane_open(
+        "11111111-1111-4111-8111-111111111111", "synonym_convergence", tenant_schema) is True
     assert _pending_rows(bound_conn) == []
 
 
-@pytest.mark.skip(reason="FOSS port: promote_class_c_hits on this lineage has no "
-                         "classify-failure defer hook (SaaS lane machinery) — see "
-                         "DEV/BUGS/foss-port-cba.md")
 def test_promotion_classify_failure_records_staged_target(tenant_schema, bound_conn, monkeypatch):
     """The promotion lane's precise deferral point: a Class-C row that earned its
     promotion but could not be structured (brain would not answer) leaves a
@@ -466,8 +455,6 @@ def test_record_deferred_never_raises_on_unreachable_db(monkeypatch):
     assert GWQ.record_deferred("faultline_gwq_x", "synonym_convergence") is False
 
 
-@pytest.mark.skip(reason="FOSS port: no _reembedder_llm_lane_open on this lineage — "
-                         "see DEV/BUGS/foss-port-cba.md")
 def test_lane_gate_survives_a_raising_queue(monkeypatch, tenant_schema):
     """Even a queue that RAISES (contract violation) must not break the lane gate —
     the growth loop keeps running with today's skip behaviour."""
@@ -483,8 +470,6 @@ def test_lane_gate_survives_a_raising_queue(monkeypatch, tenant_schema):
         "11111111-1111-4111-8111-111111111111", "ontology_eval", tenant_schema) is False
 
 
-@pytest.mark.skip(reason="FOSS port: promote path has no defer hook on this lineage — "
-                         "see DEV/BUGS/foss-port-cba.md")
 def test_promotion_loop_survives_a_raising_queue(monkeypatch):
     """The promotion deferral hook is wrapped: a raising queue cannot kill the
     per-row promotion loop (the NEXT staged row is still attempted)."""
@@ -645,9 +630,6 @@ def test_fresh_tenant_template_matches_migration_shape(postgres_dsn, tenant_sche
 
 # ── registry census — the map cannot silently drift ───────────────────────────
 
-@pytest.mark.skip(reason="FOSS port: sweep_ledger is not part of this engine; the "
-                         "census drift-guard has no ledger to census — see "
-                         "DEV/BUGS/foss-port-cba.md")
 def test_every_llm_subsystem_is_mapped_to_an_operation():
     from src.re_embedder.sweep_ledger import SUBSYSTEMS
     llm_subsystems = {name for name, spec in SUBSYSTEMS.items() if spec.get("llm")}
