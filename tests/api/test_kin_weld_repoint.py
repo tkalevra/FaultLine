@@ -172,7 +172,7 @@ def _gate_db(alias_hits, entity_aliases, kin_rows):
 
 USER = "seat-user-uuid-0001"
 MOTHER = "mother-entity-uuid-0001"
-SEREN = "seren-entity-uuid-0001"
+SELENE = "selene-entity-uuid-0001"
 WELD = "weld-entity-uuid-00001"
 
 
@@ -193,8 +193,8 @@ def test_taint_conflicting_kin_rel_target():
 
 def test_no_taint_on_genuine_named_entity():
     # seraphina+wife with a live SPOUSE row (same rel as the bind) — the safe target.
-    db = _gate_db({"seraphina": SEREN}, {SEREN: {"seraphina", "wife"}},
-                  [(USER, "spouse", SEREN)])
+    db = _gate_db({"seraphina": SELENE}, {SELENE: {"seraphina", "wife"}},
+                  [(USER, "spouse", SELENE)])
     assert kin_name_surface_taint(db, "seraphina", "spouse", KIN_NOUNS,
                                   KIN_REL_VALUES, USER) is None
 
@@ -210,7 +210,7 @@ def test_weld_object_gate():
     db = _gate_db({"wife": WELD}, {WELD: {"wife"}}, [])
     assert kin_role_object_on_weld(db, "wife", KIN_NOUNS) is True
     # a role-word surface that resolves onto a NAMED entity — do not refuse.
-    db2 = _gate_db({"wife": SEREN}, {SEREN: {"seraphina", "wife"}}, [])
+    db2 = _gate_db({"wife": SELENE}, {SELENE: {"seraphina", "wife"}}, [])
     assert kin_role_object_on_weld(db2, "wife", KIN_NOUNS) is False
     # no alias at all — mint path, nothing to refuse.
     db3 = _gate_db({}, {}, [])

@@ -48,11 +48,11 @@ def _triples(facts):
     # apostrophe PRESENT (baseline)
     ("My sister's name is Dana.", "dana", "sibling_of"),
     ("My brother's name is Sam.", "sam", "sibling_of"),
-    ("My mother's name is Priya.", "priya", "parent_of"),
+    ("My mother's name is Mira.", "mira", "parent_of"),
     # apostrophe STRIPPED by the atomizer (the Failure-1 repro shape) — plural surface, singular lemma
     ("My sisters name is Dana.", "dana", "sibling_of"),
     ("My brothers name is Sam.", "sam", "sibling_of"),
-    ("My mothers name is Priya.", "priya", "parent_of"),
+    ("My mothers name is Mira.", "mira", "parent_of"),
 ])
 def test_genitive_name_binds_proper_name_no_phantom(text, name, kin):
     facts = m.derive_sentence_facts(text, _REF)

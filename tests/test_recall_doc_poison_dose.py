@@ -250,7 +250,7 @@ def test_missing_provenance_kinship_voices_legacy(monkeypatch):
     a, b = str(uuid4()), str(uuid4())
     fact = {"subject_id": a, "object_id": b, "rel_type": "spouse", "fact_class": "B"}
     with _meta(spouse=SPOUSE), patch(
-            "src.api.main.resolve_display_name", side_effect=["marla", "jo"]):
+            "src.api.main.resolve_display_name", side_effect=["mara", "jo"]):
         prose = convert_to_prose([fact], db)
     assert len(prose) == 1
 

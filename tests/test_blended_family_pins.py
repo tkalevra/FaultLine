@@ -21,7 +21,7 @@ its MEASURED sentence so the family gate cannot regress:
   BF3  BIRTHDAY PAST BINDING — a bare month-day birthday resolved to the NEXT occurrence
        ("her birthday is May 8" → 2027-05-08, a birth date in the FUTURE). The birthday-class
        attribute steps back to the most recent past occurrence.
-  BF4  APPOSITIVELY-RENAMED SUPERLATIVE HEAD — "Our eldest, Priya, turned 14" filed the age
+  BF4  APPOSITIVELY-RENAMED SUPERLATIVE HEAD — "Our eldest, Mira, turned 14" filed the age
        on the bare adjective "eldest" (spaCy tags it ADJ; the appositive-name gate required
        NOUN). The apposed PROPN names the SAME referent.
   BF5  INSTITUTION AT-PP FRAME — "at Ridgeline Elementary" / "at Northgate High" declined as
@@ -70,7 +70,7 @@ _REF = __import__("datetime").datetime(2026, 11, 12)
 # ── THE MEASURED SENTENCES (verbatim from the blended-family smoke driver) ──────────
 WREN = "Our daughter Wren started kindergarten this September; her birthday is August 3."
 SASKIA = "Our youngest Saskia is 3 — her birthday is May 8 — and she goes to Sunflower Daycare."
-PRIYA = ("Our eldest, Priya, turned 14 on January 22; she's a freshman at Northgate High "
+MIRA = ("Our eldest, Mira, turned 14 on January 22; she's a freshman at Northgate High "
          "and carries an EpiPen for a bee-sting allergy.")
 TEO = ("My son Teo is 9 and he's in grade 4 at Ridgeline Elementary — soccer practice at "
        "the Riverside Sportsplex every Tuesday and Thursday at 5pm.")
@@ -149,22 +149,22 @@ def test_bf3_saskia_birthday_steps_back_to_the_past():
 # ══════════════════════════════════════════════════════════════════════════════════
 # BF4 — the appositively-renamed superlative head is the named person
 
-def test_bf4_priya_owns_her_turn_measure():
-    triples = _triples(PRIYA)
+def test_bf4_mira_owns_her_turn_measure():
+    triples = _triples(MIRA)
     subjects = {s for (s, _r, _o) in triples}
     assert "eldest" not in subjects, triples
-    # SPINE_TURNED_AGE (wound-map round 4, wound "priya-age"): the turned-N clause now
+    # SPINE_TURNED_AGE (wound-map round 4, wound "mira-age"): the turned-N clause now
     # mints the AGE attribute (the 'X is 9' storage) instead of the opaque `turn` scalar
-    # that recall served as "Priya's turn is 2027-01-22". Pinned here because this test
-    # froze the legacy (priya, turn, '14') shape the fix replaces.
-    assert ("priya", "age", "14") in triples, triples
+    # that recall served as "Mira's turn is 2027-01-22". Pinned here because this test
+    # froze the legacy (mira, turn, '14') shape the fix replaces.
+    assert ("mira", "age", "14") in triples, triples
     assert not any(r == "turn" for (_s, r, _o) in triples), triples
 
 
-def test_bf4_priya_school_and_epipen_land_on_priya():
-    triples = _triples(PRIYA)
-    assert ("priya", "carry", "epipen") in triples, triples
-    assert ("priya", "instance_of", "freshman") in triples, triples
+def test_bf4_mira_school_and_epipen_land_on_mira():
+    triples = _triples(MIRA)
+    assert ("mira", "carry", "epipen") in triples, triples
+    assert ("mira", "instance_of", "freshman") in triples, triples
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -175,9 +175,9 @@ def test_bf5_teo_educated_at_ridgeline():
     assert ("teo", "educated_at", "ridgeline elementary") in triples, triples
 
 
-def test_bf5_priya_educated_at_northgate():
-    triples = _triples(PRIYA)
-    assert ("priya", "educated_at", "northgate high") in triples, triples
+def test_bf5_mira_educated_at_northgate():
+    triples = _triples(MIRA)
+    assert ("mira", "educated_at", "northgate high") in triples, triples
 
 
 # ══════════════════════════════════════════════════════════════════════════════════

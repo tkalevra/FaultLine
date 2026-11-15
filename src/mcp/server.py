@@ -917,10 +917,10 @@ INGEST_INTENT_INDEPENDENT_HARVEST = os.environ.get(
 
 
 # CORRECTION-TURN HARVEST SUPPRESSION (correction-integrity F2, critic R1 2026-11-07; default ON).
-# Measured on bench seat 4c7e21b8: "Actually my wife is Magnus, not Seren." returned
+# Measured on bench seat 4c7e21b8: "Actually my wife is Magnus, not Selene." returned
 # corrected+facts_superseded=1 (the /retract/correct supersede DID land; the report was TRUE at
 # write time), and then the SAME remember_facts turn's intent-independent harvest re-ingested the
-# CONTRASTIVE-NEGATED surface ("not Seren") as a LIVE (user, spouse, seren) edge - the
+# CONTRASTIVE-NEGATED surface ("not Selene") as a LIVE (user, spouse, selene) edge - the
 # deterministic spine emits the negated surface as a spouse edge (curl-proven on /harvest-spans),
 # the fresh unmarked /ingest upsert RESURRECTS the row /retract/correct had just retired
 # (src/fact_store/store.py superseded_at CASE: an unmarked user_stated re-ingest clears

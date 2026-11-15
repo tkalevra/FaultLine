@@ -192,7 +192,7 @@ graph TD
     
     K --> L["FILTER BY SCOPE<br/>(Query taxonomy match?)<br/>family: Person + Animal entities<br/>work: Person + Organization"]
     
-    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: marla_uuid to Mara<br/>Example: des_uuid to Dev"]
+    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: mara_uuid to Mara<br/>Example: dev_uuid to Dev"]
     
     M --> N["ATTACH METADATA<br/>(_aliases: all names)<br/>entity_types: person, animal<br/>fact_class: A/B/C"]
     

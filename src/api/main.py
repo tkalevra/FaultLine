@@ -37569,7 +37569,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
             # un-retired the denial-retired row IN PLACE). Named in dropped[] (issue #8
             # carrier) so the discard is never silent. Non-kin rels are untouched
             # ("I like my mother" — likes — files normally), and a kin-tie edge whose
-            # object is a real NAME ("My wife is Seren.") never matches (the name is not
+            # object is a real NAME ("My wife is Selene.") never matches (the name is not
             # in the kinship_noun cue class). The kin_weld gate (lane B) is downstream;
             # this runs first and the revive guard holds even when the gate admits.
             if (_taut_rels and _kin_tautology_drop(

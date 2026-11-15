@@ -1113,7 +1113,7 @@ def _clause_has_corrective_alternative(anchor):
 
     Returns the TOKEN, not a flag, because its part of speech is the discriminator the caller
     needs: measured in this parser, the alternative is PROPN when the slot holds a NAME
-    ("…is Marlen, not MARLA") and ADJ when it holds a property ("…is Greek, not ROMAN").
+    ("…is Marlen, not MARA") and ADJ when it holds a property ("…is Greek, not ROMAN").
 
     Grammatical evidence that a complement slot holds a NAME rather than a property: you can only
     correct a name TO another name. Used to narrow the OOV mis-tag recovery in
@@ -26048,7 +26048,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the PROPER NAME — the copula's attr/oprd complement that is a PROPN (a NOUN the parser
             # mis-tagged is excluded here: a common-noun complement is a type/role, owned elsewhere).
             # ROLE-HEAD NO-BIND (F1-R2): the sm tagger alternates attr/acomp for the SAME
-            # construction across names — "My wife is Seren." parses the name attr,
+            # construction across names — "My wife is Selene." parses the name attr,
             # "My wife is Isolde." parses it PROPN acomp (the measure-NP dobj/npadvmod coin-flip
             # class) — and a frame whose name lands in acomp missed this scan entirely, the
             # possessive weld edge shipped, and ingest linked it onto the seat's PRE-EXISTING
