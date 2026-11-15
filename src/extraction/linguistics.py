@@ -2883,7 +2883,7 @@ SPINE_VERBLESS_SFORM_REPAIR: bool = os.environ.get(
 def _repair_verbless_sform_appositive(doc) -> int:
     """Re-read a verbless S-form appositive the parser nominalized. Returns repairs made.
 
-    PROD-BUG-3 (the faultline.ca wire drive + the pre-prod baseline seat, 2026-11-12):
+    PROD-BUG-3 (the production wire drive + the pre-prod baseline seat, 2026-11-12):
     "My brother Aldous lives in Vancouver." parses with NO VERB AT ALL — spaCy's small
     model resolved the verb-ambiguous s-form ``lives`` into the PLURAL-NOUN reading
     (NOUN/NNS, ``appos`` of the kin head ``brother``), hung the person's NAME off it as a
@@ -4357,7 +4357,7 @@ def analyze_copula_relational_predicate(text: str) -> list[dict]:
             prep_objs = _adj_prep_objects(comp)
             if not prep_objs:
                 # ── THE TO-INFINITIVE MIS-TAG RECOVERY (PROD-BUG-2, the shellfish ZERO-row
-                # medical miss; measured on the faultline.ca wire drive + reproduced on the
+                # medical miss; measured on the production wire drive + reproduced on the
                 # pre-prod baseline seat, 2026-11-12) ──
                 # en_core_web_sm reads "<class adj> to <NP>" with a VERB-AMBIGUOUS object NP
                 # as an infinitive clause: "I'm severely allergic to shellfish" parses

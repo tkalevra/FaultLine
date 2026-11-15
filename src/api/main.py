@@ -64714,7 +64714,7 @@ def fetch_facts_from_anchor(
                 # the ask is ENTITY-ANCHORED (never the speaker — user-anchored asks keep
                 # today's scope byte-for-byte) → lay the mapped rel into
                 # ``relationship_rels`` + ``aspect_bound_rels``. MEASURED on the
-                # faultline.ca wire drive + the pre-prod baseline seat: (xcp-ng, run_on,
+                # the production wire drive + the pre-prod baseline seat: (xcp-ng, run_on,
                 # old dell tower …) sat LIVE while "what does my homelab hypervisor run?"
                 # served the located_in fragment — the question's verb bound no rel (no
                 # rel_type ``run``, no alias), so run_on never entered the walk's scope on

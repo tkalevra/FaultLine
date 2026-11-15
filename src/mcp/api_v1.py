@@ -244,6 +244,11 @@ def _v1_docs_public() -> bool:
         from saas.config import saas_mode_enabled
         return not saas_mode_enabled()
     except Exception:
+        # Open core: no saas.config to consult. An ImportError must not silently
+        # re-enable what the operator turned off — honor the raw SAAS_MODE env
+        # flag (FOSS runs with it unset: /v1 docs stay public, unchanged).
+        if (os.environ.get("SAAS_MODE") or "").strip().lower() not in ("", "0", "false", "no"):
+            return False
         return True
 
 

@@ -57,25 +57,25 @@ class _FakeReq:
 def test_xfh_honored_when_no_trusted_proxy_configured(monkeypatch):
     """Unset SAAS_TRUSTED_PROXY_IPS → behavior unchanged: the forwarded host is honored."""
     monkeypatch.delenv("SAAS_TRUSTED_PROXY_IPS", raising=False)
-    req = _FakeReq({"x-forwarded-host": "app.faultline.ca", "host": "faultline-mcp:8002"},
+    req = _FakeReq({"x-forwarded-host": "app.example-saas.com", "host": "faultline-mcp:8002"},
                    peer="203.0.113.9")
-    assert h._effective_host(req) == "app.faultline.ca"
+    assert h._effective_host(req) == "app.example-saas.com"
 
 
 def test_xfh_honored_from_trusted_proxy_peer(monkeypatch):
     monkeypatch.setenv("SAAS_TRUSTED_PROXY_IPS", "10.0.0.0/8")
-    req = _FakeReq({"x-forwarded-host": "app.faultline.ca", "host": "faultline-mcp:8002"},
+    req = _FakeReq({"x-forwarded-host": "app.example-saas.com", "host": "faultline-mcp:8002"},
                    peer="10.1.2.3")
-    assert h._effective_host(req) == "app.faultline.ca"
+    assert h._effective_host(req) == "app.example-saas.com"
 
 
 def test_xfh_ignored_from_untrusted_direct_client(monkeypatch):
     """A direct client (untrusted peer) sets X-Forwarded-Host to try to flip the face —
     it is IGNORED and the real Host is used, so it cannot spoof the served face."""
     monkeypatch.setenv("SAAS_TRUSTED_PROXY_IPS", "10.0.0.0/8")
-    req = _FakeReq({"x-forwarded-host": "admin.faultline.ca", "host": "app.faultline.ca"},
+    req = _FakeReq({"x-forwarded-host": "admin.example-saas.com", "host": "app.example-saas.com"},
                    peer="203.0.113.9")
-    assert h._effective_host(req) == "app.faultline.ca"  # real Host wins, not the spoofed XFH
+    assert h._effective_host(req) == "app.example-saas.com"  # real Host wins, not the spoofed XFH
 
 
 def test_peer_trust_predicate(monkeypatch):

@@ -53,6 +53,10 @@ def _load_from_server(*names):
     tree = ast.parse((REPO / "src" / "mcp" / "server.py").read_text())
     ns: dict = {}
     exec("import re as _re", ns)
+    # The saas-lineage defs read os.environ at their top level (config-layer
+    # defaults the FOSS merge carries); the sandbox namespace must provide the
+    # stdlib names those loaded defs legitimately use.
+    exec("import os", ns)
     for node in tree.body:
         got = getattr(node, "name", None) or (
             getattr(node.targets[0], "id", None) if isinstance(node, ast.Assign) else None
@@ -65,11 +69,22 @@ def _load_from_server(*names):
 
 
 def _load_is_neg():
-    src = (REPO / "src" / "extraction" / "linguistics.py").read_text()
-    start = src.index("_NEG_LEMMAS = frozenset")
-    end = src.index("def _get_nlp():")
+    # AST-extract ONLY the self-contained negation triple (_NEG_LEMMAS,
+    # _NEG_DEPS, _is_neg). The old char-slice up to _get_nlp() also swept in the
+    # saas-lineage _predicate_negated machinery when the lines merged, and that
+    # machinery drags a dependency web (continuative-adverb tables, than-standard
+    # helpers, module regex constants) no sandbox namespace can satisfy.
+    import ast as _ast
+    tree = _ast.parse((REPO / "src" / "extraction" / "linguistics.py").read_text())
     ns: dict = {}
-    exec(src[start:end], ns)
+    exec("import os", ns)
+    for node in tree.body:
+        got = getattr(node, "name", None) or (
+            getattr(node.targets[0], "id", None) if isinstance(node, ast.Assign) else None
+        )
+        if got in ("_NEG_LEMMAS", "_NEG_DEPS", "_is_neg"):
+            exec(_ast.unparse(node), ns)
+    assert "_is_neg" in ns, "could not load _is_neg from linguistics.py"
     return ns["_is_neg"]
 
 
