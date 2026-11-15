@@ -326,7 +326,7 @@ def test_non_instruction_sentences_mint_nothing():
     for t in [
         "The staging API listens on port 8001, the dashboard proxies to it directly.",
         "I always run the smoke suite before a deploy, never after.",
-        "My wife is Seren and we live in Cardiff.",
+        "My wife is Selin and we live in Cardiff.",
     ]:
         assert _pairs(t) == [], t
 

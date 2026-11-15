@@ -2,7 +2,7 @@
 """THE STATE-REL SLOT SUPERSESSION + THE AUTHORITY LADDER (LIVE-OPENWEBUI FIX 4).
 
 THE MEASURED WOUND (DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the owner's
-prod seat): "My spouse is Marla MacPhee and she prefers to be called Mars" added the new
+prod seat): "My spouse is Dana Feld and she prefers to be called Mars" added the new
 spouse row BESIDE the prior spouse slot — ``ingest.temporal_coexist`` "same-slot state
 conflict kept BOTH rows live (keep-both)" — and five test-junk spouse rows stayed live
 with it. The keep-both fired on a SINGLE-VALUED state slot (spouse is OWL-functional:

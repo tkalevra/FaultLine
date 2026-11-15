@@ -282,7 +282,7 @@ def test_entity_default_falls_through():
     out = _compose_object_clause(
         rel_type="spouse",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"], "category": ""},
-        subject_name="you", object_name="marla",
+        subject_name="you", object_name="dana",
         object_id="99999999-9999-9999-9999-999999999999", object_is_uuid=True,
         named_type_name=None,  # no instance_of type → not a named-instance shape
         template="X and Y are spouses/partners", template_2p=None,
@@ -372,9 +372,9 @@ def test_inverse_anchor_symmetric_renders_relationship():
         rel_type="spouse",
         rel_meta={"inverse_rel_type": "spouse", "is_symmetric": True, "label": "spouse"},
         anchor_name="you", anchor_is_you=True,
-        instance_name="marla", instance_type_name=None,
+        instance_name="dana", instance_type_name=None,
     )
-    assert out == "marla is your spouse"
+    assert out == "dana is your spouse"
 
 
 def test_inverse_anchor_third_person_uses_has():
@@ -390,19 +390,19 @@ def test_inverse_anchor_third_person_uses_has():
 
 # ── Shape 1 symmetric guard (object-side spouse softening) ────────────────────
 def test_object_side_symmetric_typed_renders_relationship():
-    # (user, spouse, marla) with marla typed "wife": NOT "you and a wife named
-    # Marla" — render "Marla is your wife" (role = object's own type word).
+    # (user, spouse, dana) with dana typed "wife": NOT "you and a wife named
+    # Dana" — render "Dana is your wife" (role = object's own type word).
     out = _compose_object_clause(
         rel_type="spouse",
         rel_meta={"is_hierarchy_rel": False, "tail_types": ["ANY"],
                   "category": "", "is_symmetric": True},
-        subject_name="you", object_name="marla",
+        subject_name="you", object_name="dana",
         object_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", object_is_uuid=True,
         named_type_name="wife",
         template="X and Y are spouses", template_2p="You and Y are spouses",
         subject_is_you=True,
     )
-    assert out == "marla is your wife"
+    assert out == "dana is your wife"
 
 
 def test_object_side_copula_verb_becomes_possessive():
@@ -510,13 +510,13 @@ def test_inverse_dedup_prefers_user_subject():
 def test_inverse_dedup_keeps_non_inverse():
     overlay = {"spouse": {"inverse_rel_type": None}}
     rendered = [
-        {"prose": "you are married to marla", "subj_id": "U", "obj_id": "X",
+        {"prose": "you are married to dana", "subj_id": "U", "obj_id": "X",
          "rel_type": "spouse", "subject_is_you": True},
         {"prose": "you have a dog named fraggle", "subj_id": "U", "obj_id": "D",
          "rel_type": "has_pet", "subject_is_you": True},
     ]
     out = _dedup_inverse_pairs(rendered, overlay)
-    assert out == ["you are married to marla", "you have a dog named fraggle"]
+    assert out == ["you are married to dana", "you have a dog named fraggle"]
 
 
 def test_inverse_dedup_distinct_pairs_not_collapsed():

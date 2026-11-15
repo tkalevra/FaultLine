@@ -6,7 +6,7 @@ WHAT A "WELD" IS
 ----------------
 "Weld" is a LOCAL COINAGE for this codebase, not a term of art. The established names for the
 error it guards are **over-merge**, **entity conflation**, and **false-positive match**; for
-over-asserted co-reference specifically, see Halpin, Hayes, McCusker, McGuinness & Thompson,
+over-asserted co-reference specifically, see Halpin, Hayes, McCusker, McGuinness & Hale,
 "When owl:sameAs Isn't the Same: An Analysis of Identity in Linked Data" (ISWC 2010), which
 measures exactly this failure — identity links asserted far more strongly than the data warrants.
 
@@ -179,7 +179,7 @@ _ENV_MODE = "ALIAS_WELD_GUARD"
 #   FORWARD blast radius, TOTAL across armed arms: 194 entities. Sampled: common-noun type
 #   nodes (runtime/driver/process/servidor) — where a user's name must never land.
 #   SEAT-OWNER false refusals: 0 historical, 0 forward-looking.
-#   Legitimate multi-alias entities: 0 refused — {marla,mars,wife}, {dax,son},
+#   Legitimate multi-alias entities: 0 refused — {dana,mars,wife}, {dax,son},
 #   {marlow,son}, {marina,gabby} and the seat's {user,sam,alicia} all pass.
 #   Lexical canonicalization lane: 0 refusals, proven by a positive control, not by absence.
 _DEFAULT_MODE = "enforce"
@@ -604,7 +604,7 @@ def weld_verdict(cur, entity_id, alias, preference_source,
     warrant, and every label the target already holds is likewise an engine-growth claim. AND
     the target is a PLACE — it occupies a class-side position in this tenant's graph. Measured
     on production, this is the remaining corruption ARMs 1-2 could not see, because it arrived
-    below memory authority on both sides: ``{cat} ≡ {luna}``, ``{company} ≡ {optimuscannabis}``,
+    below memory authority on both sides: ``{cat} ≡ {luna}``, ``{company} ≡ {examplecorp}``,
     ``{old school friend} ≡ {emma}``, ``{landing page} ≡ {gauntlet}``,
     ``{issue triage} ≡ {ci investigation} ≡ {tests}`` — extraction inventing a co-reference and
     the index silently collapsing two referents onto one node. The first four are the SAME

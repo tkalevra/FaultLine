@@ -113,7 +113,7 @@ graph TD
     
     V -->|HIERARCHY<br/>instance_of, subclass_of| X["LAYER 3: HIERARCHY PATH<br/>facts table<br/>Defines classifications<br/>Theo instance_of person"]
     
-    V -->|RELATIONAL<br/>spouse, parent_of| Y["LAYER 3: RELATIONAL PATH<br/>facts table<br/>Connectivity/relationships<br/>user spouse marla"]
+    V -->|RELATIONAL<br/>spouse, parent_of| Y["LAYER 3: RELATIONAL PATH<br/>facts table<br/>Connectivity/relationships<br/>user spouse dana"]
     
     W --> Z{Classify Confidence}
     X --> Z
@@ -177,7 +177,7 @@ graph TD
     
     E --> F["BASELINE FACTS<br/>(SELECT * FROM facts<br/>WHERE user_id = ?<br/>AND superseded_at IS NULL)"]
     
-    E --> G["GRAPH TRAVERSAL<br/>(_graph_traverse: single-hop)<br/>spouse, parent_of, works_for<br/>(Example: user spouse marla)"]
+    E --> G["GRAPH TRAVERSAL<br/>(_graph_traverse: single-hop)<br/>spouse, parent_of, works_for<br/>(Example: user spouse dana)"]
     
     E --> H["HIERARCHY EXPANSION<br/>(_hierarchy_expand: upward chains)<br/>instance_of, subclass_of<br/>(Example: Theo instance_of person)"]
     
@@ -192,19 +192,19 @@ graph TD
     
     K --> L["FILTER BY SCOPE<br/>(Query taxonomy match?)<br/>family: Person + Animal entities<br/>work: Person + Organization"]
     
-    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: marla_uuid to Marla<br/>Example: des_uuid to Theo"]
+    L --> M["RESOLVE DISPLAY NAMES<br/>(UUID to preferred_name mapping)<br/>Example: dana_uuid to Dana<br/>Example: des_uuid to Theo"]
     
     M --> N["ATTACH METADATA<br/>(_aliases: all names)<br/>entity_types: person, animal<br/>fact_class: A/B/C"]
     
     N --> O["FORMAT AS PROSE<br/>(Natural language injection)<br/>NOT raw tuples or UUIDs"]
     
-    O --> P["Example Formatted Facts:<br/>- You are the parent of Theo<br/>(Class A, confidence 1.0)<br/>- Marla is your spouse<br/>(Class A, confidence 1.0)<br/>- Theo is 12 years old<br/>(Class A, confidence 1.0)<br/>- You have a pet named Fraggle<br/>(Class B, pending confirmation)"]
+    O --> P["Example Formatted Facts:<br/>- You are the parent of Theo<br/>(Class A, confidence 1.0)<br/>- Dana is your spouse<br/>(Class A, confidence 1.0)<br/>- Theo is 12 years old<br/>(Class A, confidence 1.0)<br/>- You have a pet named Fraggle<br/>(Class B, pending confirmation)"]
     
     P --> Q["INJECT INTO CONTEXT<br/>(System message added before<br/>last user message)"]
     
     Q --> R["FaultLine Memory Header<br/>(Facts in readable prose)<br/>Metadata shown to LLM<br/>(Class, confidence, expiry)"]
     
-    R --> S["LLM PROCESSES<br/>(Qwen receives augmented context)<br/>Can reference: Your son Theo<br/>Your spouse Marla, etc"]
+    R --> S["LLM PROCESSES<br/>(Qwen receives augmented context)<br/>Can reference: Your son Theo<br/>Your spouse Dana, etc"]
     
     S --> T["LLM RESPONSE<br/>(Generated with memory context)<br/>References facts naturally<br/>Example: Theo is 12, right?"]
     
@@ -250,7 +250,7 @@ graph TD
 ### RECALL
 - **Four retrieval sources:** Facts + Graph + Hierarchy + Attributes
 - **UUID-based dedup:** Prevents alias variations from creating duplicates
-- **Prose injection:** LLM sees "Marla is your spouse", not "uuid1→spouse→uuid2"
+- **Prose injection:** LLM sees "Dana is your spouse", not "uuid1→spouse→uuid2"
 - **Metadata transparency:** Class/confidence shown to LLM (allows reasoning about certainty)
 
 ---

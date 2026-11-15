@@ -954,10 +954,10 @@ INGEST_INTENT_INDEPENDENT_HARVEST = os.environ.get(
 
 
 # CORRECTION-TURN HARVEST SUPPRESSION (correction-integrity F2, critic R1 2026-11-07; default ON).
-# Measured on bench seat e4a72b6d: "Actually my wife is Magnus, not Seren." returned
+# Measured on bench seat e4a72b6d: "Actually my wife is Magnus, not Selin." returned
 # corrected+facts_superseded=1 (the /retract/correct supersede DID land; the report was TRUE at
 # write time), and then the SAME remember_facts turn's intent-independent harvest re-ingested the
-# CONTRASTIVE-NEGATED surface ("not Seren") as a LIVE (user, spouse, seren) edge - the
+# CONTRASTIVE-NEGATED surface ("not Selin") as a LIVE (user, spouse, selin) edge - the
 # deterministic spine emits the negated surface as a spouse edge (curl-proven on /harvest-spans),
 # the fresh unmarked /ingest upsert RESURRECTS the row /retract/correct had just retired
 # (src/fact_store/store.py superseded_at CASE: an unmarked user_stated re-ingest clears
@@ -5385,7 +5385,7 @@ def _negative_space_probe_forms(query: str) -> list[str]:
 #   SERVE_RENDER_ASPECT_RETAIN: the 6ade9755 eviction fix — the reshaped render's
 #     candidate fetch reached only the topic + its taxonomy bridge, so the owner's
 #     OWN live row on another entity (the row the un-reshaped render carried:
-#     fact 212 takes_classes_at → Serenity Yoga) never entered the candidate set
+#     fact 212 takes_classes_at → Selinity Yoga) never entered the candidate set
 #     and the reshape EVICTED it. The lane admits the owner-anchored candidates
 #     (attrs on the owner + the owner's own facts — same live/affirmed guards,
 #     the SAME per-row aspect-affinity floor ≥1 so the cats-class shapes are
@@ -5914,7 +5914,7 @@ def _negative_space_serve_once(user_id: str, query: str,
         # SERVE_RENDER_ASPECT_RETAIN (round-6, the 6ade9755 eviction fix — see the
         # flag block): the reshaped render's fetch above reaches only facts touching
         # the topic + its taxonomy bridge, so the owner's OWN live rows on other
-        # entities (fact 212 takes_classes_at → Serenity Yoga — the row the
+        # entities (fact 212 takes_classes_at → Selinity Yoga — the row the
         # un-reshaped render carried) never entered the candidate set and the serve
         # EVICTED them. Admit the owner-anchored candidates here — attrs on the
         # owner + the owner's own facts, the same live/affirmed/validity guards,
@@ -8799,7 +8799,7 @@ async def _remember_facts_tool_impl(text: str, user_id: str, *, attested: bool =
                 _log(f"reset_turn_detect_failed (full-text harvest kept): {_dgr_err!r}")
             if _harvest_text:
                 # LIVE-OPENWEBUI FIX 1 (re-drive correction, measured on deploy-ee49b8a7):
-                # the payload is a PROFILE STATEMENT ("spouse Marla MacPhee (Mars), sons
+                # the payload is a PROFILE STATEMENT ("spouse Dana Feld (Mars), sons
                 # Dax 20 and Marlow 13, …") — the cheap deterministic harvest captured
                 # only the pet edges of it on the measured drive (a telegraphic NP list
                 # needs the FULL spine's LLM atomize to clause-ify). The payload rides the

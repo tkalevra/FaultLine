@@ -53,7 +53,7 @@ echo "════════════════════════�
 EXTRACT_RESPONSE=$(curl -s -X POST "$FAULTLINE_URL/extract/rewrite" \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "My son Theo is 12 years old. My wife is Marla.",
+    "text": "My son Theo is 12 years old. My wife is Dana.",
     "context": [],
     "user_id": "'$USER_ID'",
     "thinking": false
@@ -84,7 +84,7 @@ INGEST_RESPONSE=$(curl -s -X POST "$FAULTLINE_URL/ingest" \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "'$USER_ID'",
-    "text": "My son Theo is 12 years old. My wife is Marla.",
+    "text": "My son Theo is 12 years old. My wife is Dana.",
     "edges": []
   }')
 

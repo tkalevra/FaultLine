@@ -2,21 +2,21 @@
 clause's already-resolved person, never mints the alias surface as its own entity.
 
 THE DEFECT (measured live, pre-prod scratch seat, and on the production seat the
-replica was loaded from): the turn "My wifes name is Marla, she prefers to be called
-Mars" committed (user spouse Marla) and (Marla also_known_as wife) correctly, but the
+replica was loaded from): the turn "My wifes name is Dana, she prefers to be called
+Mars" committed (user spouse Dana) and (Dana also_known_as wife) correctly, but the
 alias 'mars' landed on a BRAND-NEW standalone entity. The mechanism, reproduced live at
 HEAD: the LLM atomizer splits the turn into two atoms; when the deriver fails to capture
 the SECOND clause (an unresolvable pronoun subject, or a "her name is Mars" possessive
 copula the naming chains did not own), the sentence yields no alias edge and the
-GLiNER2-relation fallback proposes (mars, related_to, marla) — 'mars' grounds in SUBJECT
+GLiNER2-relation fallback proposes (mars, related_to, dana) — 'mars' grounds in SUBJECT
 position, mints a phantom entity, and recall "who is Mars" resolves to the phantom and
 answers NOTHING.
 
 The fix is at the deriver (capture correct → the fallback is starved and the alias weld
-at ingest files 'mars' on Marla's entity — validated live). These tests pin the bar at
+at ingest files 'mars' on Dana's entity — validated live). These tests pin the bar at
 the deriver level with the HARVEST'S OWN threading shape:
 
-  * atom 1 establishes the person ("My wifes name is Marla" → (marla, spouse, user));
+  * atom 1 establishes the person ("My wifes name is Dana" → (dana, spouse, user));
   * atom 2 is the second clause in every surface the atomizer produces, threaded with
     the whole-turn PERSON pool (BOTH NER readings — the nickname typed PERSON, which is
     the ambiguous-pool production condition, and untyped) and the prior-atom NP
@@ -44,8 +44,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 _REF = datetime.date(2026, 8, 20)
-_TURN = "My wifes name is Marla, she prefers to be called Mars"
-_ATOM1 = "My wifes name is Marla"
+_TURN = "My wifes name is Dana, she prefers to be called Mars"
+_ATOM1 = "My wifes name is Dana"
 
 # second-clause surfaces: the alias-predicate shapes and the possessive-name shapes
 _SECOND_CLAUSES = [
@@ -64,13 +64,13 @@ _SECOND_CLAUSES = [
 # threading states: (label, prior_nps after atom 1, whole-turn PERSON pool)
 _THREADINGS = [
     # spaCy's own NER reading (Mars -> LOC): unambiguous pool
-    ("ner-loc", ["user", "wife"], ["marla"]),
+    ("ner-loc", ["user", "wife"], ["dana"]),
     # the production condition: the nickname NER-typed PERSON -> AMBIGUOUS pool
-    ("ner-person", ["user", "wife"], ["marla", "mars"]),
+    ("ner-person", ["user", "wife"], ["dana", "mars"]),
     # atomizer reordered so the naming atom emitted the name object FIRST
-    ("reordered", ["marla", "user"], ["marla", "mars"]),
+    ("reordered", ["dana", "user"], ["dana", "mars"]),
     # no prior-atom accumulator at all (atom split lost atom 1's edges)
-    ("no-prior", [], ["marla", "mars"]),
+    ("no-prior", [], ["dana", "mars"]),
 ]
 
 
@@ -105,7 +105,7 @@ def test_second_clause_alias_binds_to_first_clause_person(clause, threading):
     triples = _triples(facts)
 
     # THE BIND: the alias edge files 'mars' on the FIRST clause's person surface
-    # (the surface ingest grounds to Marla's entity — validated live).
+    # (the surface ingest grounds to Dana's entity — validated live).
     assert (person, "also_known_as", "mars") in triples, triples
 
     # NO NEW ENTITY: 'mars' never grounds — it appears in NO subject slot (subject-
@@ -116,7 +116,7 @@ def test_second_clause_alias_binds_to_first_clause_person(clause, threading):
         assert o == "mars" or "mars" not in (o or ""), triples
 
 
-@pytest.mark.parametrize("pool", [["marla"], ["marla", "mars"]], ids=["unambiguous", "ambiguous"])
+@pytest.mark.parametrize("pool", [["dana"], ["dana", "mars"]], ids=["unambiguous", "ambiguous"])
 def test_exact_turn_single_sentence(pool):
     """The EXACT production turn as one atom (the atomizer sometimes keeps it whole)."""
     facts = m.derive_sentence_facts(
@@ -140,11 +140,11 @@ def test_non_person_possessor_is_not_a_person_bind():
     person bind: the pool rescue is ANAPHORA resolution and must not fire for "my dog"."""
     facts = m.derive_sentence_facts(
         "My dog likes to be called Rex", _REF,
-        prior_nps=["user"], turn_persons=["marla"], turn_role_names=_turn_role_names())
+        prior_nps=["user"], turn_persons=["dana"], turn_role_names=_turn_role_names())
     triples = _triples(facts)
     for s, rel, o in triples:
         if o == "rex":
-            assert s not in ("marla", "user"), triples  # never welded onto a person
+            assert s not in ("dana", "user"), triples  # never welded onto a person
             assert rel != "also_known_as" or s in ("dog", "rex"), triples
 
 
@@ -161,25 +161,25 @@ def test_first_person_self_naming_still_defers():
 def test_negated_alias_is_absence():
     facts = m.derive_sentence_facts(
         "she does not go by Mars", _REF,
-        prior_nps=["user", "wife"], turn_persons=["marla"], turn_role_names=_turn_role_names())
+        prior_nps=["user", "wife"], turn_persons=["dana"], turn_role_names=_turn_role_names())
     for s, rel, o in _triples(facts):
         assert not (o == "mars" and rel == "also_known_as"), _triples(facts)
 
 
 # ── SUBJECT-AGNOSTICISM PROOF — the fix is keyed on GRAMMAR, not on the defect's lexicon ──
 #
-# The tests above pin the production turn itself. But a fix keyed on wife/Marla/Mars
+# The tests above pin the production turn itself. But a fix keyed on wife/Dana/Mars
 # (a name list, a role literal, a gendered-pronoun lexicon) would pass every one of
 # them. This section proves grammar-keying: the SAME grammatical constructions driven
 # through DIFFERENT kin roles (from the seeded cue classes), different names, and
 # BOTH genders' pronouns. Every case must bind exactly as the defect turn does. If
 # any case here goes red while the defect-turn tests stay green, the fix has leaked
 # a lexical key. (Roles/names drawn per the sibling suite's parametrization:
-# test_spine_genitive_name_and_alias.py uses sister/Dana, brother/Sam, mother/Priya.)
+# test_spine_genitive_name_and_alias.py uses sister/Dana, brother/Sam, mother/Leila.)
 
 _AGNOSTIC_CASES = [
     # (kin role, proper name, nickname, subject pronoun, possessive pronoun)
-    ("mother", "Priya", "Pri", "she", "her"),
+    ("mother", "Leila", "Pri", "she", "her"),
     ("brother", "Sam", "Sammy", "he", "his"),
     ("sister", "Dana", "Dee", "she", "her"),
     ("father", "David", "Dave", "he", "his"),
@@ -282,7 +282,7 @@ def test_possessive_construction_subject_never_becomes_the_discourse_topic():
     for sent, want in [
         ("My friends name is Alex.", "alex"),
         ("My mothers name is Katherine.", "katherine"),
-        ("My wifes name is Marla.", "marla"),
+        ("My wifes name is Dana.", "dana"),
         ("My brothers name is Peter.", "peter"),
     ]:
         t = _topic_of(sent)
@@ -316,15 +316,15 @@ def test_second_atom_alias_binds_the_named_person_not_the_construction_surface()
 
 def test_original_prod_turn_through_the_topic_lane():
     # The original production turn, driven through the same cross-atom threading the
-    # spine uses (topic + role map + person pool): the nickname lands on Marla.
-    turn = "My wifes name is Marla, she prefers to be called Mars"
-    topic = _topic_of("My wifes name is Marla.")
-    assert topic is not None and topic.surface == "marla"
+    # spine uses (topic + role map + person pool): the nickname lands on Dana.
+    turn = "My wifes name is Dana, she prefers to be called Mars"
+    topic = _topic_of("My wifes name is Dana.")
+    assert topic is not None and topic.surface == "dana"
     role_names = m.build_turn_role_name_map(turn)
     f2 = m.derive_sentence_facts("she prefers to be called Mars", None,
                                  prior_nps=["user"], discourse_topic=topic,
-                                 turn_persons=["marla"], turn_role_names=role_names)
-    assert ("marla", "also_known_as", "mars") in _triples(f2), _triples(f2)
+                                 turn_persons=["dana"], turn_role_names=role_names)
+    assert ("dana", "also_known_as", "mars") in _triples(f2), _triples(f2)
 
 
 def test_second_genitive_naming_of_the_same_role_welds_onto_the_first_person():
@@ -433,9 +433,9 @@ _GENITIVE_ROLE_HEAD_CASES = [
     ("Johns mother is named Katherine.", "katherine"),    # apostrophe-stripped compound
     ("John's mother is named Katherine.", "katherine"),   # explicit PROPN poss genitive
     ("Kates brother is named Sam.", "sam"),               # other role, other name
-    ("Alexs wife is called Priya.", "priya"),             # 'called' naming variant
+    ("Alexs wife is called Leila.", "leila"),             # 'called' naming variant
     # RESIDUAL (honest): genitive names the tagger reads as NOUN ("Sams"/"Rachels wife
-    # is called Priya") do not trip the PROPN gate and keep today's subject reading —
+    # is called Leila") do not trip the PROPN gate and keep today's subject reading —
     # a spaCy vocab quirk, not a guard defect; keyed on the tag, never the name.
 ]
 
@@ -461,7 +461,7 @@ def test_first_person_role_head_topic_is_unchanged():
     # PRON, not a PROPN genitive: a different construction.
     t = _topic_of("My mother is named Katherine.")
     assert t is not None and t.surface == "mother", getattr(t, "surface", None)
-    t2 = _topic_of("My wife is named Marla.")
+    t2 = _topic_of("My wife is named Dana.")
     assert t2 is not None and t2.surface == "wife", getattr(t2, "surface", None)
 
 

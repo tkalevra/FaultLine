@@ -329,7 +329,7 @@ def kin_self_role_surface(subject_surface, object_surface, user_surface, kin_nou
         'My wife is Wife.' inverted) — refuse both arrangements.
     (b) the SUBJECT is the USER and the OBJECT surface is a role word: 'my wife is Wife.'
         — the object is the would-be bind name and it is a role word — refuse.
-    (c) 'Marla is my wife.' — the INVERSE-COPULA family (queued since R1): the subject is a
+    (c) 'Dana is my wife.' — the INVERSE-COPULA family (queued since R1): the subject is a
         genuine name and the role phrase sits in the predicate; that is a legitimate bind
         SHAPE and must reach the adjudication, never be refused here."""
     u = str(user_surface or "").strip().lower()

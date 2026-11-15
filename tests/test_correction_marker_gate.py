@@ -104,7 +104,7 @@ def test_every_marker_class_is_admitted(text):
     PGDUMP,
     "My favorite editor is vim",                 # the Pitfall-11 editor/usage class
     "I always run the smoke suite before a deploy",
-    "My wife is Seren and we live in Cardiff",   # a plain statement (supersede rides the store)
+    "My wife is Selin and we live in Cardiff",   # a plain statement (supersede rides the store)
 ])
 def test_plain_statements_carry_no_marker(text):
     assert M._turn_carries_correction_marker(text) is False

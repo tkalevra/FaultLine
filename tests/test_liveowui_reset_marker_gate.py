@@ -2,8 +2,8 @@
 """THE GLOBAL-RESET MARKER VOCABULARY + EXECUTOR (LIVE-OPENWEBUI FIX 1, 2026-11-13).
 
 THE MEASURED WOUND (DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the owner's
-prod seat): "forget all previous family information and replace with: Alicia Thompson
-(Sam), spouse Marla MacPhee (Mars), …" scored GLiNER2 CORRECTION @0.58 but
+prod seat): "forget all previous family information and replace with: Alicia Hale
+(Sam), spouse Dana Feld (Mars), …" scored GLiNER2 CORRECTION @0.58 but
 ``classify_intent.correction_marker_gate`` REFUSED it — the note verbatim: "the turn
 carries NO explicit old-value/repair marker — a prescription/usage statement is not a
 repair; routes STATEMENT (ingest)" — so the whole 16:47–17:16 reset session ingested as
@@ -44,7 +44,7 @@ from src.extraction.reset_shapes import (  # noqa: E402
 # THE MEASURED PROD SENTENCE (the diagnosis §2, 16:47:46 turn — byte-shaped).
 RESET_TURN = (
     "forget all previous family information and replace with: "
-    "Alicia Thompson (Sam), spouse Marla MacPhee (Mars), sons Dax 20 and "
+    "Alicia Hale (Sam), spouse Dana Feld (Mars), sons Dax 20 and "
     "Marlow \"Theo\" 13, daughter Marina \"Gabby\" 10"
 )
 
@@ -99,12 +99,12 @@ def test_detect_global_reset_measured_turn():
     r = detect_global_reset(RESET_TURN)
     assert r is not None
     assert r["scope_category"] == "family"
-    assert "Alicia Thompson" in r["payload"]
+    assert "Alicia Hale" in r["payload"]
 
 
 def test_reset_payload_splits_after_the_carrier():
     p = reset_payload(RESET_TURN)
-    assert p.startswith("Alicia Thompson")
+    assert p.startswith("Alicia Hale")
     assert "forget all" not in p and "replace with" not in p
 
 
@@ -124,4 +124,4 @@ def test_detect_declines_non_reset_carrier_sentence():
 
 
 def test_detect_declines_plain_statement():
-    assert detect_global_reset("My wife is Marla MacPhee and she prefers Mars") is None
+    assert detect_global_reset("My wife is Dana Feld and she prefers Mars") is None

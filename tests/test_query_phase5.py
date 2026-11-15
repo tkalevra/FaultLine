@@ -368,11 +368,11 @@ def test_convert_to_prose_no_uuids():
     with patch('src.api.main.resolve_display_name') as mock_resolve:
         mock_resolve.side_effect = lambda eid, db: {
             "user-uuid": "you",
-            "marla-uuid": "marla",
+            "dana-uuid": "dana",
         }.get(eid, "unknown")
 
         facts = [
-            {"subject_id": "user-uuid", "object_id": "marla-uuid", "rel_type": "spouse", "fact_class": "A"},
+            {"subject_id": "user-uuid", "object_id": "dana-uuid", "rel_type": "spouse", "fact_class": "A"},
         ]
 
         prose = convert_to_prose(facts, mock_db)
@@ -401,11 +401,11 @@ def test_convert_to_prose_class_c_no_label_leak():
     with patch('src.api.main.resolve_display_name') as mock_resolve:
         mock_resolve.side_effect = lambda eid, db: {
             "user": "you",
-            "marla": "marla",
+            "dana": "dana",
         }.get(eid, "unknown")
 
         facts = [
-            {"subject_id": "user", "object_id": "marla", "rel_type": "spouse", "fact_class": "C"},
+            {"subject_id": "user", "object_id": "dana", "rel_type": "spouse", "fact_class": "C"},
         ]
 
         # No anchor passed → plain name resolution (back-compat path).
@@ -465,7 +465,7 @@ def test_query_response_structure():
     response = QueryResponse(
         anchor="user-uuid",
         facts=[
-            _fact("You are married to Marla", "spouse"),
+            _fact("You are married to Dana", "spouse"),
             _fact("You are 45 years old", "age"),
         ],
         confidence_applied=True,
@@ -480,7 +480,7 @@ def test_query_response_structure():
     assert response.error is None
     # The prose the user reads rides on `definition`; the Filter's metadata rides alongside.
     assert [f["definition"] for f in response.facts] == [
-        "You are married to Marla", "You are 45 years old"]
+        "You are married to Dana", "You are 45 years old"]
     assert all("fact_class" in f and "rel_type" in f for f in response.facts)
 
 
@@ -489,7 +489,7 @@ def test_query_response_with_staged_facts():
     response = QueryResponse(
         anchor="user-uuid",
         facts=[
-            _fact("You are married to Marla", "spouse", fact_class="A"),
+            _fact("You are married to Dana", "spouse", fact_class="A"),
             _fact("You like painting", "likes", fact_class="C", confidence=0.4),
         ],
         confidence_applied=True,
@@ -529,7 +529,7 @@ def _leak_probe_response():
     return QueryResponse(
         anchor="user-uuid",
         facts=[
-            _fact("You are married to Marla", "spouse"),
+            _fact("You are married to Dana", "spouse"),
             _fact("Aurora is 12 years old", "age"),
             _fact("Fraggle is a dog", "has_pet", fact_class="C", confidence=0.4),
         ],

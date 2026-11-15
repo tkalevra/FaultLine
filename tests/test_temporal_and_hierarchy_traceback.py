@@ -403,7 +403,7 @@ def test_convert_to_prose_no_date_for_undated_fact():
     fact = {
         "subject_id": user,
         "rel_type": "spouse",
-        "object": "Marla",
+        "object": "Dana",
         "fact_class": "A",
         # no event_date
     }
@@ -412,7 +412,7 @@ def test_convert_to_prose_no_date_for_undated_fact():
                           "natural_language_2p": "You are married to Y",
                           "label": "spouse"}}
     with _patch("src.api.main.rel_type_overlay.resolve_current", return_value=overlay), \
-         _patch("src.api.main.resolve_display_name", return_value="Marla"):
+         _patch("src.api.main.resolve_display_name", return_value="Dana"):
         prose = m.convert_to_prose([fact], db, anchor=user, user_id=user)
     assert len(prose) == 1
     assert "(on " not in prose[0]

@@ -48,11 +48,11 @@ def _triples(facts):
     # apostrophe PRESENT (baseline)
     ("My sister's name is Dana.", "dana", "sibling_of"),
     ("My brother's name is Sam.", "sam", "sibling_of"),
-    ("My mother's name is Priya.", "priya", "parent_of"),
+    ("My mother's name is Leila.", "leila", "parent_of"),
     # apostrophe STRIPPED by the atomizer (the Failure-1 repro shape) — plural surface, singular lemma
     ("My sisters name is Dana.", "dana", "sibling_of"),
     ("My brothers name is Sam.", "sam", "sibling_of"),
-    ("My mothers name is Priya.", "priya", "parent_of"),
+    ("My mothers name is Leila.", "leila", "parent_of"),
 ])
 def test_genitive_name_binds_proper_name_no_phantom(text, name, kin):
     facts = m.derive_sentence_facts(text, _REF)
@@ -70,9 +70,9 @@ def test_genitive_name_binds_proper_name_no_phantom(text, name, kin):
 
 
 def test_genitive_name_third_party_possessor():
-    # "John's mother's name is Susan" → Susan is the parent of John (not the user)
-    facts = m.derive_sentence_facts("John's mother's name is Susan.", _REF)
-    assert ("susan", "parent_of", "john") in _triples(facts), _triples(facts)
+    # "John's mother's name is Sylvia" → Sylvia is the parent of John (not the user)
+    facts = m.derive_sentence_facts("John's mother's name is Sylvia.", _REF)
+    assert ("sylvia", "parent_of", "john") in _triples(facts), _triples(facts)
 
 
 def test_non_kin_compound_is_not_a_collapsed_genitive():

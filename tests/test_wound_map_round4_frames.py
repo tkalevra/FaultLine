@@ -4,11 +4,11 @@ path), env-flag-gated defaulting ON, OFF = byte-for-byte legacy behavior. Hermet
 DB, no network; the pins call the spine derive path directly (the established pattern of
 tests/test_sparse_residual_fixes.py).
 
-FIX 1 — SPINE_TURNED_AGE (wound "priya-age"). Input turn: "Our eldest, Priya, turned 14
+FIX 1 — SPINE_TURNED_AGE (wound "leila-age"). Input turn: "Our eldest, Leila, turned 14
 on January 22; she's a freshman at Northgate High and carries an EpiPen for a bee-sting
-allergy." Legacy behavior minted the attr `turn` ((priya, turn, "14") off the
+allergy." Legacy behavior minted the attr `turn` ((leila, turn, "14") off the
 measure-verb bare-cardinal arm, then a future-coerced event_date at ingest — recall served
-"Priya's turn is 2027-01-22"). The fix: a "turned/turns N" clause (verb lemma `turn` + a
+"Leila's turn is 2027-01-22"). The fix: a "turned/turns N" clause (verb lemma `turn` + a
 bare integer direct object ≤ 120) mints the AGE attribute — the EXACT storage the existing
 bare-number person scalar frame ("X is 9" → the copula-measure branch (b)) uses: rel
 "age", bare numeral string, no scalar_datatype. The optional "on <date>" stays the date
@@ -41,7 +41,7 @@ import src.extraction.linguistics as L  # noqa: E402
 
 _REF = datetime.datetime(2026, 11, 13)
 
-PRIYA = "Our eldest, Priya, turned 14 on January 22."
+LEILA = "Our eldest, Leila, turned 14 on January 22."
 ROWAN = "My stepson Rowan is 12, seventh grade at Crestwood Middle."
 ROWAN_DET = "Rowan is in the seventh grade at Crestwood Middle."
 TEO_DIGIT = "My son Teo is 9 and he's in grade 4 at Ridgeline Elementary."
@@ -60,12 +60,12 @@ def _triples(text, ref=_REF):
 # FIX 1 — SPINE_TURNED_AGE
 
 def test_turned_n_mints_age_not_turn():
-    """The litmus wound sentence: 'turned 14' mints (priya, age, '14') in the SAME storage
+    """The litmus wound sentence: 'turned 14' mints (leila, age, '14') in the SAME storage
     the bare-number person scalar frame uses (rel 'age', bare numeral, scalar_datatype
-    None) — and the opaque legacy (priya, turn, '14') mint is GONE."""
-    facts = _facts(PRIYA)
+    None) — and the opaque legacy (leila, turn, '14') mint is GONE."""
+    facts = _facts(LEILA)
     ages = [f for f in facts if f.rel_type == "age"]
-    assert ("priya", "age", "14") in [(f.subject, f.rel_type, str(f.object))
+    assert ("leila", "age", "14") in [(f.subject, f.rel_type, str(f.object))
                                       for f in ages], [str(f) for f in facts]
     assert all(f.scalar_datatype is None for f in ages), \
         [f.scalar_datatype for f in ages]  # byte-parity with the 'X is 9' age row
@@ -79,8 +79,8 @@ def test_turns_n_future_shape_mints_age():
 def test_turned_age_storage_matches_the_is9_age_frame():
     """Same rel/value/datatype triple shape as the existing age frame on the same subject
     style — one storage, not a parallel one."""
-    t_turned = [f for f in _facts(PRIYA) if f.rel_type == "age"][0]
-    t_is9 = [f for f in _facts("Priya is 14.") if f.rel_type == "age"][0]
+    t_turned = [f for f in _facts(LEILA) if f.rel_type == "age"][0]
+    t_is9 = [f for f in _facts("Leila is 14.") if f.rel_type == "age"][0]
     assert (t_turned.subject, t_turned.rel_type, str(t_turned.object),
             t_turned.scalar_datatype) == \
            (t_is9.subject, t_is9.rel_type, str(t_is9.object), t_is9.scalar_datatype)
@@ -107,9 +107,9 @@ def test_turned_age_off_is_byte_parity_legacy(monkeypatch):
     """OFF-state byte-parity: SPINE_TURNED_AGE forced off reproduces the pre-change
     (measured) legacy output exactly — the verb-lemma `turn` string scalar, no age row."""
     monkeypatch.setattr(L, "SPINE_TURNED_AGE", False)
-    facts = _facts(PRIYA)
+    facts = _facts(LEILA)
     assert [(f.subject, f.rel_type, str(f.object), f.scalar_datatype)
-            for f in facts] == [("priya", "turn", "14", "string")], [str(f) for f in facts]
+            for f in facts] == [("leila", "turn", "14", "string")], [str(f) for f in facts]
 
 
 # ══════════════════════════════════════════════════════════════════════════════════

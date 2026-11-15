@@ -3635,7 +3635,7 @@ CORRECTION_REPLACE_NOT_PARALLEL = os.environ.get(
 #      (dimension ENTITY); the named pet entity (Rex, an Animal in the pets space) never
 #      became the removal target. The speaker guard now refuses the wipe honestly, but the
 #      removal must WORK: a removal targets a THING, never the speaker by default.
-#   2. T02 "Actually my wife's name is Marla MacPhee." — flakes to
+#   2. T02 "Actually my wife's name is Dana Feld." — flakes to
 #      clarification_needed / failed ~2 of 3 runs (the R4-J extraction-draw variance
 #      class): the correction extraction's subject/object resolution wobbles at temp 0;
 #      the deterministic ", not <Name>" marker landed for the contrast-clause shape but
@@ -3701,7 +3701,7 @@ CORRECTION_ROLE_SLOT_BIND = os.environ.get(
 #     {ANY}) minutes after the junk rows were planted, so mere declaredness is
 #     worthless as a junk signal; authority provenance is the signal) while the
 #     INVERSE tuple (y, has_pet-style defining rel, x) is live affirmed —
-#     ((fraggle, belong_to, marla) beside live (marla, has_pet, fraggle)) — is the
+#     ((fraggle, belong_to, dana) beside live (dana, has_pet, fraggle)) — is the
 #     junk duplicate of that edge; superseded, never deleted.
 #   ARM B — the kind-foreign member: a live edge on a rel that ONLY animate-membered
 #     taxonomies declare (has_pet/child_of/spouse/parent_of/sibling_of — computed from
@@ -10360,7 +10360,7 @@ def _queue_concept_for_grounding(
     # The object must NOT be the user/anchor or the subject itself. THE HARD LINE: the user anchor
     # is the grounded self (a NAMED INSTANCE, never a type) — recognize it BY IDENTITY
     # (concept_object_id == user_id, the tenant anchor UUID), not just the literal "user" surface.
-    # A relational edge whose OBJECT is the user (e.g. pre-directionality `(priya, related_to, user)`)
+    # A relational edge whose OBJECT is the user (e.g. pre-directionality `(leila, related_to, user)`)
     # would otherwise queue the anchor's UUID as a "novel concept", and the what-is climb then mints
     # `(user, subclass_of, role)`. `_attach_to_seeded_backbone` already guards the anchor this way;
     # this mirrors it. Subject-agnostic: user_id is the runtime anchor, not a hardcoded subject.
@@ -14119,7 +14119,7 @@ def _decide_supersede_or_coexist(
 
     # ── SINGLE-VALUED STATE-SLOT SUPERSEDE (LIVE-OPENWEBUI FIX 4; INGEST_STATEREL_SLOT_
     # SUPERSEDE, default ON, OFF → skipped, byte-for-byte coexist) ─────────────────────
-    # THE MEASURED WOUND (the owner's prod seat 2026-11-13): "My spouse is Marla MacPhee…"
+    # THE MEASURED WOUND (the owner's prod seat 2026-11-13): "My spouse is Dana Feld…"
     # landed beside the PRIOR spouse slot live — ``ingest.temporal_coexist`` "same-slot state
     # conflict kept BOTH rows live (keep-both)" — and five test-junk spouse rows stayed live
     # with it. A spouse slot is OWL-FUNCTIONAL (one current holder), so blanket coexist on a
@@ -17541,20 +17541,20 @@ def _address_scalar_target(cur, subject_uuid, old_rel_type, old_value, user_id,
 
 # ── NAME-REPAIR CORRECTION: the GRAMMAR owns the subject, not the LLM's guess ─────────────────────
 # THE DEFECT THIS CLOSES (measured end-to-end on a fresh tenant, through the MCP door):
-#   1. "My sister Marla lives in Toronto."           → (user, sibling_of, marla); Marla is her own
-#      entity, preferred alias "marla", holding lives_in/instance_of/has_gender.
-#   2. "Actually my sister's name is Marlow, not Marla."  → status:"corrected", and the DB shows the
+#   1. "My sister Dana lives in Toronto."           → (user, sibling_of, dana); Dana is her own
+#      entity, preferred alias "dana", holding lives_in/instance_of/has_gender.
+#   2. "Actually my sister's name is Marlow, not Dana."  → status:"corrected", and the DB shows the
 #      correction landed on the WRONG PERSON. The correction-extraction LLM flattens the 1st-person
 #      possessive to subject_name="user"; ``resolve_anchor`` then finds "sister" but it is an L4 TYPE
 #      node, correctly place-blocked (THE HARD LINE), so resolution falls through to an n-gram hit on
-#      the bare surface "marla" — the RIGHT entity — which the value-entity guard then REJECTS
-#      because "marla" is the correction's own old value. Subject collapses to the SPEAKER, and what
+#      the bare surface "dana" — the RIGHT entity — which the value-entity guard then REJECTS
+#      because "dana" is the correction's own old value. Subject collapses to the SPEAKER, and what
 #      happens next is a coin flip on the LLM's rel guess, both outcomes wrong and both reported
 #      "corrected": old_rel_type="name" writes a ``name=Marlow`` SCALAR onto the USER'S OWN entity (a
 #      name the speaker never claimed — THE HARD LINE violated: a memory filed at the wrong person),
 #      or old_rel_type is pinned to "sibling_of" and the RELATIONAL branch supersedes the real kin
 #      edge and mints a brand-new EMPTY "marlow" entity as the sibling — the sister keeps her old
-#      name, loses her kinship, and her city/gender/type facts are orphaned. Recall answers "Marla"
+#      name, loses her kinship, and her city/gender/type facts are orphaned. Recall answers "Dana"
 #      either way. (Both variants observed at this HEAD; the LLM's guess is not deterministic.)
 #
 # THE GUARD IS NOT WRONG, ITS PREMISE IS. "a correction's subject can never be its own old/new value"
@@ -19745,7 +19745,7 @@ def _label_write_misbinds_referent(db, text, rel_type, target_uuid, new_value, u
 
          A label in a REFERRING slot is untouched ("John's name is actually Jonathan." resolves
          through ``john``, John's own way of being referred to), as is a role-noun subject
-         ("My daughter's name is Priya Nair." → ``(daughter, name, 'priya nair')``), whose only
+         ("My daughter's name is Leila Nair." → ``(daughter, name, 'leila nair')``), whose only
          label IS the value being assigned.
 
       3. the shared predicate ``_name_correction_misbinds_referent`` then answers the same question
@@ -28360,8 +28360,8 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
 
     # DETERMINISTIC ENUMERATION PRE-SPLIT (the atomizer reliability net). The LLM atomizer's split of
     # a colon-introduced named list is NON-DETERMINISTIC: it intermittently FOLDS "a designer named
-    # Priya" back into the membership line (the downstream collective walk routes only BARE PROPN
-    # conjuncts, so Priya's member_of silently drops), drops a per-member attribute ("backend dev"),
+    # Leila" back into the membership line (the downstream collective walk routes only BARE PROPN
+    # conjuncts, so Leila's member_of silently drops), drops a per-member attribute ("backend dev"),
     # or — on a REFRAME timeout — leaves the whole dense sentence un-split (cross-member smear). For
     # EACH atom that is itself a recognizable colon enumeration, replace it with split_enumeration's
     # canonical set (bare-name membership + one clean per-member copula atom). This makes the spine's
@@ -28375,7 +28375,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
             return " ".join((_a or "").strip().lower().split())
 
         # (a) Per-ATOM normalization: an LLM atom that is ITSELF a colon enumeration (the FOLDED /
-        #     un-split / timeout-smeared form, e.g. "…and a designer named Priya.") is replaced by the
+        #     un-split / timeout-smeared form, e.g. "…and a designer named Leila.") is replaced by the
         #     deterministic bare-name membership + per-member copula atoms.
         _normalized: list[str] = []
         _enum_hits = 0
@@ -35460,7 +35460,7 @@ def _supersede_parallel_slot_rows(db, class_a_rows, negated_triples=()) -> int:
             for (subj, rel), keep_obj in plan["subject_side"].items():
                 # RETIRE-CONDITIONAL-ON-REPLACEMENT (acceptance2, measured live
                 # 2026-11-14 seat e9271c7a: T02 flaked to clarification_needed — the
-                # (user, spouse, marla) replacement NEVER committed — yet the sweep
+                # (user, spouse, dana) replacement NEVER committed — yet the sweep
                 # still retired the live spouse rows and the serve lost the family).
                 # THE CONTRACT: a sweep is CONDITIONAL on its replacement actually
                 # committing — retire-the-old only when the-new exists LIVE in this
@@ -35911,7 +35911,7 @@ def _consolidate_generic_kin_twins(db, user_id, kid_entity_id, age_value) -> int
                     retired += _n_retired
                     # THE MERGE COMPLETES (acceptance6b residual: the twin's kin EDGES
                     # retired but its ATTR rows and aliases stayed live — the serve kept
-                    # voicing the generic remnants beside the named kid, and 'marla'
+                    # voicing the generic remnants beside the named kid, and 'dana'
                     # gold-absent while a twin still held live identity). Two completions,
                     # both supersession/demote (never a hard delete):
                     #   (a) the twin's live ATTR rows retire — admission already
@@ -37589,7 +37589,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
             # un-retired the denial-retired row IN PLACE). Named in dropped[] (issue #8
             # carrier) so the discard is never silent. Non-kin rels are untouched
             # ("I like my mother" — likes — files normally), and a kin-tie edge whose
-            # object is a real NAME ("My wife is Seren.") never matches (the name is not
+            # object is a real NAME ("My wife is Selin.") never matches (the name is not
             # in the kinship_noun cue class). The kin_weld gate (lane B) is downstream;
             # this runs first and the revive guard holds even when the gate admits.
             if (_taut_rels and _kin_tautology_drop(

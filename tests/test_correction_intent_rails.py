@@ -17,7 +17,7 @@ Covers the three correction-integrity findings, each with its deterministic rail
        ("my wife is not a vegetarian") are brand-new negative facts and stay None.
 
   F2   _filter_suppressed_harvest_edges: the correction turn's own old_value
-       ("not Seren") re-ingested by the intent-independent harvest RESURRECTS the row
+       ("not Selin") re-ingested by the intent-independent harvest RESURRECTS the row
        /retract/correct just retired (store.py superseded_at CASE: unmarked user_stated
        re-ingest clears superseded_at) — the false success at the facts table. The
        correction-turn harvest drops those edges by surface identity.
@@ -59,9 +59,9 @@ GENUINE_QUESTIONS = [
 
 CERTIFIED_DECLARATIVE_SHAPES = [
     "Actually my daughter Osric is 19 years old, not 14.",
-    "Actually my wife is Magnus, not Seren.",
+    "Actually my wife is Magnus, not Selin.",
     "Actually I moved to Ashbell.",
-    "My wife is Seren.",
+    "My wife is Selin.",
 ]
 
 
@@ -126,7 +126,7 @@ def test_unseen_name_tagged_adj_is_still_a_denial():
 
 
 def test_positive_statement_is_not_a_denial():
-    assert linguistics.negated_name_assertion("My wife is Seren.") is None
+    assert linguistics.negated_name_assertion("My wife is Selin.") is None
 
 
 def test_question_is_never_a_negated_name_correction():
@@ -137,17 +137,17 @@ def test_question_is_never_a_negated_name_correction():
 
 EDGES = [
     {"subject": "magnus", "rel_type": "spouse", "object": "user"},
-    {"subject": "seren", "rel_type": "spouse", "object": "user"},
-    {"subject": "seren", "rel_type": "also_known_as", "object": "wife"},
+    {"subject": "selin", "rel_type": "spouse", "object": "user"},
+    {"subject": "selin", "rel_type": "also_known_as", "object": "wife"},
     {"subject": "user", "rel_type": "lives_in", "object": "ashbell"},
 ]
 
 
 def test_suppression_drops_edges_naming_the_old_value():
-    kept, dropped = _filter_suppressed_harvest_edges(EDGES, ["Seren"])
+    kept, dropped = _filter_suppressed_harvest_edges(EDGES, ["Selin"])
     assert dropped == 2
     assert all(
-        "seren" not in {str(e.get("subject", "")).lower(), str(e.get("object", "")).lower()}
+        "selin" not in {str(e.get("subject", "")).lower(), str(e.get("object", "")).lower()}
         for e in kept)
     assert len(kept) == 2
 
@@ -155,8 +155,8 @@ def test_suppression_drops_edges_naming_the_old_value():
 def test_suppression_is_exact_surface_identity():
     """No fuzzy matching: a different surface sharing a substring is kept."""
     kept, _ = _filter_suppressed_harvest_edges(
-        [{"subject": "serenade", "rel_type": "feels", "object": "joy"}], ["seren"])
-    assert kept and kept[0]["subject"] == "serenade"
+        [{"subject": "selinade", "rel_type": "feels", "object": "joy"}], ["selin"])
+    assert kept and kept[0]["subject"] == "selinade"
 
 
 def test_suppression_noop_without_surfaces():
@@ -166,7 +166,7 @@ def test_suppression_noop_without_surfaces():
 
 def test_suppression_handles_missing_surface_fields():
     kept, dropped = _filter_suppressed_harvest_edges(
-        [{"rel_type": "spouse"}, {"subject": "seren", "rel_type": "spouse"}], ["seren"])
+        [{"rel_type": "spouse"}, {"subject": "selin", "rel_type": "spouse"}], ["selin"])
     assert dropped == 1 and len(kept) == 1
 
 
@@ -278,10 +278,10 @@ class TestNegatedNameCorrectionFloor:
 
     def test_plural_conj_denial_names_both(self):
         got = _api_main._negated_name_correction_floor(
-            "My daughters are not Seren and Wren.")
+            "My daughters are not Selin and Wren.")
         assert got is not None
         assert got["old_rel_type"] == "child_of"
-        assert "Seren" in got["old_value"] and "Wren" in got["old_value"]
+        assert "Selin" in got["old_value"] and "Wren" in got["old_value"]
         assert got["new_value"] is None
 
     def test_fused_relative_scalar_scaffold(self):
@@ -305,7 +305,7 @@ class TestNegatedNameCorrectionFloor:
             "My boss is not Zedric.") is None
 
     def test_positive_statement_declines(self):
-        assert _api_main._negated_name_correction_floor("My wife is Seren.") is None
+        assert _api_main._negated_name_correction_floor("My wife is Selin.") is None
 
     def test_question_declines(self):
         assert _api_main._negated_name_correction_floor("Is my wife not Isolde?") is None
@@ -424,31 +424,31 @@ class TestDenialExactKeyProbe:
         assert got["ids"] == [(507, "ent-iso")]
 
     def test_named_weld_entity_is_refused_with_extra_aliases(self):
-        """'seren' lives on a weld entity that ALSO carries anouk/elowen: the denial
+        """'selin' lives on a weld entity that ALSO carries anouk/elowen: the denial
         refuses (flipping it would retire names the turn never mentioned) and the
         report NAMES the off-name aliases."""
         cur = _FakeCur(
-            {"seren": "ent-weld", "anouk": "ent-weld", "elowen": "ent-weld"},
+            {"selin": "ent-weld", "anouk": "ent-weld", "elowen": "ent-weld"},
             {(_USER, "ent-weld", "child_of"): [449]})
-        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Seren"])
+        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Selin"])
         assert got["verdict"] == "refused_weld"
         assert got["ids"] == []
         assert "anouk" in got["detail"] and "elowen" in got["detail"]
 
     def test_conj_denial_all_pure_is_flip_ready(self):
         cur = _FakeCur(
-            {"seren": "ent-s", "wren": "ent-w"},
+            {"selin": "ent-s", "wren": "ent-w"},
             {(_USER, "ent-s", "child_of"): [701], (_USER, "ent-w", "child_of"): [702]})
-        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Seren", "Wren"])
+        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Selin", "Wren"])
         assert got["verdict"] == "flipped_ready"
         assert {i for i, _ in got["ids"]} == {701, 702}
 
     def test_conj_denial_with_one_welded_name_changes_nothing(self):
         """ALL-OR-NOTHING: one welded name among the conj → nothing flips."""
         cur = _FakeCur(
-            {"seren": "ent-s", "wren": "ent-weld", "anouk": "ent-weld"},
+            {"selin": "ent-s", "wren": "ent-weld", "anouk": "ent-weld"},
             {(_USER, "ent-s", "child_of"): [701], (_USER, "ent-weld", "child_of"): [449]})
-        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Seren", "Wren"])
+        got = _denial_exact_key_probe(cur, _USER, "child_of", ["Selin", "Wren"])
         assert got["verdict"] == "refused_weld"
         assert got["ids"] == []
 
@@ -493,8 +493,8 @@ class TestFloorDenialSurfacesMarker:
 
     def test_conj_denial_surfaces(self):
         got = _api_main._negated_name_correction_floor(
-            "My daughters are not Seren and Wren.")
-        assert set(got["denial_surfaces"]) == {"Seren", "Wren"}
+            "My daughters are not Selin and Wren.")
+        assert set(got["denial_surfaces"]) == {"Selin", "Wren"}
 
     def test_scalar_arm_carries_no_denial_marker(self):
         got = _api_main._negated_name_correction_floor(
@@ -554,14 +554,14 @@ class TestMarriedToDenialRail:
         the exact-key probe REFUSES the [wife]-weld entity (wren is one of many aliases
         on it) and flips NOTHING — the weld row stays live for the repoint lane only."""
         cur = _FakeCur(
-            {"wren": "ent-wifeweld", "wife": "ent-wifeweld", "seren": "ent-wifeweld"},
+            {"wren": "ent-wifeweld", "wife": "ent-wifeweld", "selin": "ent-wifeweld"},
             {(_USER, "ent-wifeweld", "spouse"): [469]})
         got = _denial_exact_key_probe(cur, _USER, "spouse",
                                       _api_main._negated_name_correction_floor(
                                           "I am not married to Wren.")["denial_surfaces"])
         assert got["verdict"] == "refused_weld"
         assert got["ids"] == []
-        assert "wife" in got["detail"] and "seren" in got["detail"]
+        assert "wife" in got["detail"] and "selin" in got["detail"]
 
     def test_sam_mint_blocked_end_to_end_scaffold(self):
         """Composition of the Sam wound: detection fires (CORRECTION preroute), the

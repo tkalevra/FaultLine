@@ -97,9 +97,9 @@ FIXTURES = [
     },
     {
         "name": "lives_in_load_bearing_prep",
-        "text": "Marla lives in Toronto",
-        "entities": {"Person": ["marla"], "Location": ["toronto"]},
-        "gold": [("marla", "live_in", "toronto")],
+        "text": "Dana lives in Toronto",
+        "entities": {"Person": ["dana"], "Location": ["toronto"]},
+        "gold": [("dana", "live_in", "toronto")],
         "llm_only": [],
         "forbidden": [],
     },

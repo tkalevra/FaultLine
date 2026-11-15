@@ -72,7 +72,7 @@ CREATE TABLE facts (
 );
 
 -- Example rows:
--- (user1, user_uuid, marla_uuid, spouse, 1.0, A, ...)
+-- (user1, user_uuid, dana_uuid, spouse, 1.0, A, ...)
 -- (user1, user_uuid, des_uuid, parent_of, 1.0, A, ...)
 ```
 
@@ -394,7 +394,7 @@ def format_fact_for_injection(fact):
     
     # Example:
     # REL_TYPE_TEMPLATES['spouse'] = "{subject} is your spouse, {object}"
-    # prose = "Marla is your spouse"
+    # prose = "Dana is your spouse"
     
     # Add metadata
     metadata_prose = (

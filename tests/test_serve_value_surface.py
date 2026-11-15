@@ -160,12 +160,12 @@ class TestNegativeSpaceAssembleLead:
             _negative_space_assemble("yoga", rows)
 
     def test_lead_rides_above_the_rows(self):
-        rows = ["user — takes classes at: Serenity Yoga"]
+        rows = ["user — takes classes at: Selinity Yoga"]
         out = _negative_space_assemble(
-            "yoga", rows, lead="You takes classes at: Serenity Yoga")
-        assert out.startswith("You takes classes at: Serenity Yoga\n\n"
+            "yoga", rows, lead="You takes classes at: Selinity Yoga")
+        assert out.startswith("You takes classes at: Selinity Yoga\n\n"
                               "Here's what I remember about yoga:")
-        assert "- user — takes classes at: Serenity Yoga" in out
+        assert "- user — takes classes at: Selinity Yoga" in out
 
 
 class TestHonestyGuardVoice:
@@ -208,7 +208,7 @@ class TestHonestyGuardVoice:
 # ── PART 3 — DB-gated: the 6ade9755 eviction + the residual door legs ──────────
 
 _YOGA_Q = "Where do I take yoga classes?"
-_YOGA_GOLD = "Serenity Yoga"
+_YOGA_GOLD = "Selinity Yoga"
 _CONCERT_Q = "Where did I attend the Imagine Dragons concert?"
 _TIME_Q = "What time do I stop checking work emails and messages?"
 _SPAN_Q = "What was my previous occupation?"
@@ -218,7 +218,7 @@ _RAM_Q = "How much RAM did I upgrade my laptop to?"
 _MONTHS_Q = "How long have I been collecting vintage cameras?"
 
 # the fixture store, shaped like the map rows + the compose5 yoga-entity shape
-_ALIASES = [("serenity", ["Serenity Yoga"]), ("yoga", ["yoga"]),
+_ALIASES = [("selinity", ["Selinity Yoga"]), ("yoga", ["yoga"]),
             ("hobby", ["hobby"]), ("baking", ["baking"]),
             ("vinyasa", ["vinyasa flow"]), ("xfinity", ["Xfinity Center"]),
             ("imagine", ["Imagine Dragons"]), ("mkt", ["marketing specialist"]),
@@ -228,7 +228,7 @@ _ATTRS = [("bike_count", "3", 12), ("laptop_ram_gb", "16", 14),
           ("vintage_camera_collecting_duration_months", "3", 18),
           ("japan_trip_duration_weeks", "2", 20),
           ("imagine_dragons_concert_date", "June 15th", 44)]
-_FACTS = [("takes_classes_at", "USER", "serenity", False, 6),
+_FACTS = [("takes_classes_at", "USER", "selinity", False, 6),
           ("hobby", "USER", "yoga", False, 8),
           ("yoga_practice_style", "USER", "vinyasa", False, 9),
           ("subclass_of", "yoga", "hobby", True, 10),
@@ -356,11 +356,11 @@ class TestSixadeEviction:
             out = S._negative_space_serve(uid, _YOGA_Q, None)
             # the LEAD: the evicted row's class answers in the answer voice
             assert out.startswith(
-                "You takes classes at: Serenity Yoga\n\n"
+                "You takes classes at: Selinity Yoga\n\n"
                 "Here's what I remember about yoga:"), out
             # the band row ALSO survives (lead AND band row — the class is
             # retained twice over), alongside the previously-rendered owner rows
-            assert "- user — takes classes at: Serenity Yoga" in out
+            assert "- user — takes classes at: Selinity Yoga" in out
             assert "- user — yoga practice style: vinyasa flow" in out
             assert "- user — hobby: yoga" in out
             # the dilution scaffolding trades its slots to content

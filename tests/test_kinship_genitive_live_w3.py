@@ -56,7 +56,7 @@ FAM3_COMPOUND = "My mother's name is Elaine and she was born on April 12th, 1958
 FAM3_NAME_Q = "What is my mother's name?"
 FAM3_BORN_Q = "When was my mother born?"
 SISTER = "My sister Diane lives in Toronto with her dog Biscuit."
-LANDLORD = "My landlord's name is Priya. She was born on June 2nd, 1970."
+LANDLORD = "My landlord's name is Leila. She was born on June 2nd, 1970."
 FATHER = "My father's name is Robert. He was born on March 3rd, 1955."
 
 _DSN = os.environ.get("POSTGRES_DSN", "")
@@ -313,25 +313,25 @@ class TestKinshipGenitiveLiveE2E:
         assert self._aliases_of("toronto")
 
     def test_landlord_genitive_subject_agnostic_control(self):
-        # the same frame for a NON-kinship role: Priya binds as the person and the tie
+        # the same frame for a NON-kinship role: Leila binds as the person and the tie
         # lands Class A. DISCLOSED HONESTLY (not pinned, per the lane brief): her
-        # born_on does NOT land on priya when spaCy NER mistypes the name NORP
-        # (measured: en_core_web_sm tags 'Priya' NORP in this frame → the
+        # born_on does NOT land on leila when spaCy NER mistypes the name NORP
+        # (measured: en_core_web_sm tags 'Leila' NORP in this frame → the
         # `_turn_persons` pool is empty → the passive lane's pronoun fallback picks
         # a non-person NP and the born edge files on a junk 'name' entity) — a
         # pre-existing NER/coref seam, NOT this lane's genitive/alias fix; 'landlord'
         # also resolves only the generic `related_to` tie (the role_noun cue rail
         # does not carry it in the seed — tenant-growable).
-        priya = self._aliases_of("priya")
-        assert priya, "priya entity missing"
+        leila = self._aliases_of("leila")
+        assert leila, "leila entity missing"
         _uid = _E2E_STATE["user_id"]
         tie = _E2E_STATE["rows"](
             "SELECT f.rel_type, f.fact_class FROM facts f "
             "WHERE (f.subject_id = %s AND f.object_id = %s) "
             "   OR (f.subject_id = %s AND f.object_id = %s)",
-            (priya[0][0], _uid, _uid, priya[0][0]))
+            (leila[0][0], _uid, _uid, leila[0][0]))
         # EITHER orientation (the atomizer's rewrite varies which chain emits the
-        # non-kin tie; the invariant is the Class-A link between user and priya)
+        # non-kin tie; the invariant is the Class-A link between user and leila)
         assert any(r[0] == "related_to" and r[1] == "A" for r in tie), tie
 
 

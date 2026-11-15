@@ -123,7 +123,7 @@ def test_parenthetical_run_never_becomes_the_scalar_subject():
 @pytest.mark.parametrize("text,name,kin", [
     ("Ines is my wife.", "ines", "spouse"),
     ("Dana is my sister.", "dana", "sibling_of"),
-    ("Priya is my mother.", "priya", "parent_of"),
+    ("Leila is my mother.", "leila", "parent_of"),
 ])
 def test_inverse_copula_binds_the_name_not_the_role(text, name, kin):
     triples = _triples(m.derive_sentence_facts(text, _REF))

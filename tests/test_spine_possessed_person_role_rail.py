@@ -212,7 +212,7 @@ def test_negated_possessed_role_keeps_its_polarity():
 @pytest.mark.parametrize("text,possessed", [
     ("My friend is 34.", "friend"),     # social_role -> would become (user, friend, "34")
     ("My manager is 45.", "manager"),   # role_noun
-    ("My boss is Priya.", "boss"),      # role_noun -> a NAME as the VALUE of a role-derived rel
+    ("My boss is Leila.", "boss"),      # role_noun -> a NAME as the VALUE of a role-derived rel
 ])
 def test_possessed_person_role_is_not_read_as_a_preference_axis(text, possessed):
     # A possessed PERSON has no preference AXIS to fill. Read as one, the ROLE NOUN canonicalizes into

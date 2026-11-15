@@ -24,11 +24,11 @@ FaultLine solves this by **actually remembering things you say** and using those
 
 When you say something to the assistant, FaultLine listens for facts.
 
-**Example:** "My son Theo is 12, and my wife is Marla."
+**Example:** "My son Theo is 12, and my wife is Dana."
 
 FaultLine identifies:
 - **Fact 1:** Theo is a son (relationship: parent_of)
-- **Fact 2:** Marla is a wife (relationship: spouse)
+- **Fact 2:** Dana is a wife (relationship: spouse)
 - **Fact 3:** Theo's age is 12 (attribute)
 
 **But wait, you might correct yourself:**
@@ -73,7 +73,7 @@ Later, you ask: "How old is Theo?"
 FaultLine:
 1. **Finds all relevant facts** about Theo
    - Direct facts: Theo is your son, age is 14
-   - Connections: Theo is connected to you, to Marla
+   - Connections: Theo is connected to you, to Dana
    - Context: Related to family memories
 
 2. **Checks for consistency**
@@ -137,7 +137,7 @@ Facts get stored in different places depending on what they are:
 | Type | Example | Storage | Purpose |
 |------|---------|---------|---------|
 | **Attributes** | "age = 14" | Single value table | Quick lookup |
-| **Relationships** | "spouse → Marla" | Connection graph | Find connected people |
+| **Relationships** | "spouse → Dana" | Connection graph | Find connected people |
 | **Classifications** | "Theo is a Person" | Hierarchy | Understand what things are |
 
 This matters because the system can answer different questions efficiently:
@@ -173,7 +173,7 @@ Not all facts are equal.
 ## Example: Full Cycle
 
 ### Day 1
-**You say:** "My son Theo is 12, and my wife is Marla"
+**You say:** "My son Theo is 12, and my wife is Dana"
 
 FaultLine:
 - Extracts facts
@@ -193,10 +193,10 @@ FaultLine:
 **You ask:** "Tell me about my family"
 
 FaultLine:
-- Retrieves: Theo (son, age 14), Marla (spouse)
-- Formats naturally: "Your son Theo is 14 and your wife is Marla"
+- Retrieves: Theo (son, age 14), Dana (spouse)
+- Formats naturally: "Your son Theo is 14 and your wife is Dana"
 - Injects into AI context
-- AI responds: "You have a son Theo who is 14 and a wife Marla. That's a nice family! How are they doing?"
+- AI responds: "You have a son Theo who is 14 and a wife Dana. That's a nice family! How are they doing?"
 
 **No guessing. No forgetting. Just remembering.**
 
@@ -210,7 +210,7 @@ FaultLine:
 - Hallucinations: "Your son is probably named John" (just guessing)
 
 **FaultLine-Enhanced AI:**
-- "Your son Theo is 14 and your wife is Marla"
+- "Your son Theo is 14 and your wife is Dana"
 - Remembers across conversations
 - Never guesses about your personal facts
 - Asks for clarification if unsure

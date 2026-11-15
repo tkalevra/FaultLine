@@ -310,9 +310,9 @@ def test_pin4_genuine_slot_correction_still_supersedes(tenant, monkeypatch):
     _seed_fact(schema, user_id, "spouse", maren)
 
     out = _correct(user_id, monkeypatch,
-                   "Actually my wife is Ingrid now.",
+                   "Actually my wife is Greta now.",
                    {"subject_name": "user", "old_rel_type": "spouse", "old_value": "Maren",
-                    "new_rel_type": "spouse", "new_value": "Ingrid",
+                    "new_rel_type": "spouse", "new_value": "Greta",
                     "dimension": "RELATIONAL", "confidence": 0.9,
                     "action": "correct", "reason": "slot correction"})
     assert out["status"] == "corrected", (out.get("status"), out.get("message"))
@@ -377,13 +377,13 @@ def test_pin6_helper_guard_skips_only_the_renamed_incumbent(tenant):
         conn.close()
 
     # unguarded sweep (byte-parity shape): the old-value alias row retires
-    ingrid = _seed_entity(schema, "ingrid")
-    edge2 = _seed_fact(schema, user_id, "spouse", ingrid)
+    greta = _seed_entity(schema, "greta")
+    edge2 = _seed_fact(schema, user_id, "spouse", greta)
     conn = psycopg2.connect(_DSN)
     cur = conn.cursor()
     cur.execute(f'SET search_path TO "{schema}"')
     try:
-        n = M._supersede_wire_old_value_rows(conn, user_id, "ingrid", renamed_entity=None)
+        n = M._supersede_wire_old_value_rows(conn, user_id, "greta", renamed_entity=None)
         conn.commit()
         sup = _rows(schema, "SELECT superseded_at FROM facts WHERE id = %s",
                     (edge2,))[0][0]
