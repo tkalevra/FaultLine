@@ -7,6 +7,14 @@ the Model Context Protocol JSON-RPC convention over stdin/stdout.
 import asyncio
 import itertools
 import heapq
+import logging
+
+# FOSS PORT FIX (2026-11-15): `_negative_space_serve`'s fail-safe arm logs via `log.*`,
+# but no module-level `log` existed in this file on EITHER lineage — the saas CI never
+# hit it (live services keep the serve off the error path); on a self-hosted box the
+# first error-path invocation raised NameError instead of warning. Bind the stdlib
+# logger the rest of the open core already configures.
+log = logging.getLogger("faultline.mcp.server")
 import contextvars
 import json
 import math
