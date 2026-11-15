@@ -1,4 +1,4 @@
--- Migration 217: type postal_code as a SCALAR rel_type (was engine-grown mis-typed)
+-- Migration 215: type postal_code as a SCALAR rel_type (was engine-grown mis-typed)
 -- Date: 2026-08-04
 --
 -- WHY
@@ -6,11 +6,11 @@
 -- `postal_code` grew engine-side (source='engine') as a RELATIONAL rel_type with
 -- tail_types=['ANY'], scalar_datatype=NULL, category='pending_placement' — i.e. it never
 -- matured into a scalar. Consequence (measured on a live seat): every statement of a postal
--- code ("my postal code is A1A 1A1") stored the value as a RELATIONAL fact whose object was
--- a freshly-minted Location ENTITY (aliased to a truncated fragment "x9"), instead of a
+-- code ("my postal code is N2G 3M1") stored the value as a RELATIONAL fact whose object was
+-- a freshly-minted Location ENTITY (aliased to a truncated fragment "n2"), instead of a
 -- scalar string in entity_attributes. Recall then had nothing coherent to surface (broken
 -- entity + out-of-scope pending_placement rel), and each LLM-routed correction made it
--- WORSE (A1A 1A1 → x9k → x9 → nothing). The rel_type typing is the root cause: a postal
+-- WORSE (n2g 3m1 → n2g → n2 → nothing). The rel_type typing is the root cause: a postal
 -- code is a SCALAR literal, never an entity reference.
 --
 -- FIX (metadata-driven, subject-agnostic — NO domain literals in Python)

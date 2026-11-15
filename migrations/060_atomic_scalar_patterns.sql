@@ -3,7 +3,7 @@
 -- These patterns are matched against input text BEFORE the LLM extraction call.
 -- Detected values are injected as type annotations into the extraction prompt,
 -- preventing the LLM from splitting structured values on their delimiters
--- (e.g., IP "192.0.2.20" split to "192" on the first octet).
+-- (e.g., IP "192.168.40.20" split to "192" on the first octet).
 --
 -- category = 'scalar_atomic' marks them as pre-flight detectors, not
 -- compound extraction patterns like category='identity' etc.
@@ -32,7 +32,7 @@ VALUES
   '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
   'has_ip',
   'IPv4 address',
-  '192.0.2.20',
+  '192.168.40.20',
   'scalar_atomic', 'bootstrap', 0.97
 ),
 
@@ -117,7 +117,7 @@ VALUES
   '\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b',
   'has_fqdn',
   'Fully-qualified domain name',
-  'your-server-host.example.com',
+  'hairbrush.helpdeskpro.ca',
   'scalar_atomic', 'bootstrap', 0.91
 ),
 
@@ -137,7 +137,7 @@ VALUES
   'https?://[^\s\)\"'']+',
   'has_url',
   'HTTP/HTTPS URL',
-  'https://your-server-host.example.com/api',
+  'https://hairbrush.helpdeskpro.ca/api',
   'scalar_atomic', 'bootstrap', 0.95
 ),
 
@@ -152,15 +152,18 @@ VALUES
 
 ON CONFLICT (pattern_regex, rel_type) DO NOTHING;
 
--- Ensure new rel_types added here exist in rel_types table (permissive defaults)
--- WGM novel-rel-type LLM inference will refine metadata on first use
-INSERT INTO rel_types (rel_type, label, head_types, tail_types, is_symmetric, category, engine_generated, source, confidence)
-VALUES
-  ('has_subnet',  'Has subnet',  ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_mac',     'Has MAC address', ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_email',   'Has email',   ARRAY['ANY'], ARRAY['SCALAR'], false, 'identity', true, 'bootstrap', 0.85),
-  ('has_phone',   'Has phone',   ARRAY['ANY'], ARRAY['SCALAR'], false, 'identity', true, 'bootstrap', 0.85),
-  ('has_port',    'Has port',    ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.80),
-  ('has_url',     'Has URL',     ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85),
-  ('has_uuid',    'Has UUID',    ARRAY['ANY'], ARRAY['SCALAR'], false, 'system', true, 'bootstrap', 0.85)
-ON CONFLICT (rel_type) DO NOTHING;
+-- THE `INSERT INTO rel_types (...) VALUES (... 'bootstrap' ...)` THAT USED TO FOLLOW IS GONE
+-- (gauntlet first-boot-migration-corpus, 2026-09-16). It seeded has_subnet / has_mac / has_email
+-- / has_phone / has_port / has_url / has_uuid with source = 'bootstrap' — a value
+-- `rel_types_source_check` (007: wikidata|builtin|engine|user; 072/073 add expand) has NEVER
+-- admitted. PostgreSQL rejected the statement (SQLSTATE 23514 check_violation) on EVERY boot of
+-- EVERY box, so the ledger recorded this file `failed` forever and re-ran it on every start —
+-- and each re-run re-INSERTed the seed rows above, RESURRECTING the has_phone (migration 184)
+-- and has_port (migration 198) regexes those migrations had corrected, as live duplicates
+-- beside the corrected rows (measured: two active has_port rows, the clock-time false positive
+-- 198 fixed among them). Six of the seven rels are seeded properly (source = 'builtin',
+-- tail_types = {SCALAR}, fact_class = 'B') by 061_fix_networking_rel_types.sql; `has_port`, the
+-- one 061 does not carry, is seeded by 275_seed_has_port_rel_type.sql with the metadata its
+-- siblings received (061 + 101). The duplicate pattern rows are retired by
+-- 276_retire_resurrected_060_pattern_rows.sql. With the dead statement gone this file applies
+-- on the first pass and the ledger stops re-running it.
