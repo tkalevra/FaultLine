@@ -178,7 +178,7 @@ class _AsyncRecordingClient:
 
 def test_grouped_bind_failure_falls_back_to_default_client_sync(monkeypatch):
     """The whole point: a call is never lost to source-IP spreading."""
-    ip = "38.143.57.250"
+    ip = "198.51.100.250"
     monkeypatch.setenv("LLM_SOURCE_IPS", ip)
 
     class _GroupBindFailClient:
@@ -200,7 +200,7 @@ def test_grouped_bind_failure_falls_back_to_default_client_sync(monkeypatch):
 @pytest.mark.asyncio
 async def test_grouped_bind_failure_falls_back_to_default_client_async(monkeypatch):
     """Async twin — this is the lane REFRAME/harvest actually runs on."""
-    ip = "38.143.57.250"
+    ip = "198.51.100.250"
     monkeypatch.setenv("LLM_SOURCE_IPS", ip)
 
     class _GroupBindFailClient:
@@ -225,7 +225,7 @@ async def test_pool_self_empties_then_passes_through(monkeypatch):
 
     This is the self-healing property that bounds the production blast radius to one
     failed bind per IP per process, instead of one per call forever."""
-    ips = ["38.143.57.250", "38.143.57.252", "38.143.57.253"]
+    ips = ["198.51.100.250", "198.51.100.252", "198.51.100.253"]
     monkeypatch.setenv("LLM_SOURCE_IPS", ",".join(ips))
 
     class _GroupBindFailClient:

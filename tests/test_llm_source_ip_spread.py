@@ -52,7 +52,7 @@ class _RecordingClient:
 # ── (a) round-robin rotation across the pool ──────────────────────────────────
 
 def test_three_ips_rotate_round_robin(monkeypatch):
-    ips = ["38.143.57.250", "38.143.57.252", "38.143.57.253"]
+    ips = ["198.51.100.250", "198.51.100.252", "198.51.100.253"]
     monkeypatch.setenv("LLM_SOURCE_IPS", ",".join(ips))
 
     # Capture which source IP each successive call binds to. Patch the per-IP client
@@ -95,9 +95,9 @@ def test_build_sync_client_binds_local_address(monkeypatch):
             pass
 
     monkeypatch.setattr(httpx, "HTTPTransport", _FakeTransport)
-    client = llm_source_ip._build_sync_client("38.143.57.254")
+    client = llm_source_ip._build_sync_client("198.51.100.254")
     try:
-        assert captured["local_address"] == "38.143.57.254"
+        assert captured["local_address"] == "198.51.100.254"
     finally:
         client.close()
 
@@ -153,8 +153,8 @@ def test_invalid_ip_string_skipped_and_falls_back(monkeypatch):
 def test_bind_failure_falls_back_and_retires_ip(monkeypatch):
     # A VALID IP that is not bindable on this host raises EADDRNOTAVAIL at connect time.
     # The call must fall back to the default client (never lost) and retire the bad IP.
-    good = "38.143.57.250"
-    bad = "38.143.57.251"
+    good = "198.51.100.250"
+    bad = "198.51.100.251"
     monkeypatch.setenv("LLM_SOURCE_IPS", f"{bad},{good}")
 
     class _BindFailClient:
@@ -199,7 +199,7 @@ def test_bind_failure_falls_back_and_retires_ip(monkeypatch):
 def test_non_bind_error_is_reraised_and_ip_kept(monkeypatch):
     # A REMOTE failure (endpoint refused/timeout) is NOT the source IP's fault: it must
     # propagate to the caller's existing retry/circuit-breaker and NOT retire the IP.
-    ip = "38.143.57.250"
+    ip = "198.51.100.250"
     monkeypatch.setenv("LLM_SOURCE_IPS", ip)
 
     class _RemoteFailClient:
@@ -233,7 +233,7 @@ class _AsyncRecordingClient:
 
 @pytest.mark.asyncio
 async def test_async_rotates_round_robin(monkeypatch):
-    ips = ["38.143.57.250", "38.143.57.252", "38.143.57.253"]
+    ips = ["198.51.100.250", "198.51.100.252", "198.51.100.253"]
     monkeypatch.setenv("LLM_SOURCE_IPS", ",".join(ips))
     monkeypatch.setattr(
         llm_source_ip, "_build_async_client", lambda ip: _AsyncRecordingClient(ip)
