@@ -125,6 +125,41 @@ def _probe_url(url):
     return url.replace("host.docker.internal", "localhost").rstrip("/")
 
 
+def _chat_probe(base, headers):
+    """Minimal 1-token chat completion against {base}/chat/completions.
+
+    Used when the model listing 404s but the endpoint may still be fully usable.
+    A 200 proves the whole path (endpoint + auth + OpenAI-shaped router). A 400
+    WITH a JSON body also proves the path — the server parsed an OpenAI-shaped
+    request and objected to the placeholder payload (typically the model id),
+    which is exactly the field the user is about to enter by hand. Auth failures
+    stay failures. Returns the probe_models contract: (ok, models, detail).
+    """
+    payload = json.dumps({
+        "model": "",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }).encode("utf-8")
+    req = urllib.request.Request(base + "/chat/completions", data=payload,
+                                 headers={**headers, "Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+            return True, [], "chat probe — endpoint serves no model list; enter the model id manually"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, [], f"HTTP {e.code} — auth failed (check your API key)"
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if e.code == 400 and body.strip().startswith("{"):
+            return True, [], "chat probe — endpoint serves no model list; enter the model id manually"
+        return False, [], f"HTTP {e.code} — endpoint error"
+
+
 # ── connect + list models (the "query for available options" step) ────────────
 def probe_models(backend, base_url, key):
     """
@@ -136,7 +171,21 @@ def probe_models(backend, base_url, key):
         if backend in ("lm_studio", "openai", "openwebui"):
             path = "/api/models" if backend == "openwebui" else "/v1/models"
             headers = {"Authorization": f"Bearer {key}"} if key else {}
-            status, body = _http_get(base + path, headers=headers)
+            try:
+                status, body = _http_get(base + path, headers=headers)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    return False, [], f"HTTP {e.code} — auth failed (check your API key)"
+                if e.code != 404:
+                    raise
+                # 404 on the models list ≠ a broken connection: coding-plan endpoints
+                # (e.g. https://api.z.ai/api/coding/paas/v4) and other gateways sometimes
+                # serve no model listing at all while /chat/completions works perfectly
+                # (measured live on the proof stack, 2026-11-15). Fall back to the exact
+                # call the stack itself makes: a minimal 1-token chat completion with the
+                # configured key. Success → connected, but the model picker degrades to
+                # manual entry (honest about it — never pretend we saw a list).
+                return _chat_probe(base, headers)
             data = []
             try:
                 p = json.loads(body)
