@@ -125,105 +125,88 @@ def test_stub_filename_stem_extracts_basename():
     assert _stub_filename_stem("https://site/docs/faq#what-is-x") == "faq"
 
 
-# ── pin (b): stub facts exist at ACCEPT time (ingest response window) ──────────────────
-#
-# FOSS-port adaptation: this lineage's ingest_document_tool extracts SYNCHRONOUSLY
-# per chunk (no /documents/enqueue round-trip) — the ported stub mint fires at
-# ACCEPTANCE, right after deterministic chunking and BEFORE the first extraction
-# endpoint call. Same contract as the enqueue lane: the mint is the ONLY pre-
-# extraction write, and the response reports it via stub_facts_minted.
+# ── pin (b): stub facts exist at ENQUEUE time (ingest response window) ──────────────────
 
-def _foss_doc_flow_mocks(monkeypatch, s, ingest_response):
-    """Wire the sync doc lane: rewrite route, no short-term lane, canned backend."""
-    monkeypatch.setattr(s, "_statement_extractor_route",
-                        _async_lambda("rewrite"))
-    monkeypatch.setattr(s, "SHORT_TERM_MEMORY", False)
-    posted_urls, ingest_bodies = [], []
+async def test_stub_facts_mint_at_enqueue_before_response(monkeypatch):
+    """The /ingest stub write happens BEFORE the tool returns; the response says so."""
+    posted_urls = []
+    ingest_bodies = []
 
     async def fake_post(url, json=None, timeout=None, headers=None):
         posted_urls.append(url)
-        if url.endswith("/episodic/append"):
-            return _resp({"status": "ok"})
-        if url.endswith("/extract/rewrite"):
-            return _resp({"edges": []})
+        if url.endswith("/documents/enqueue"):
+            return _resp({"status": "pending", "document_id": 7,
+                          "chunk_count": json["chunk_count"], "eta_seconds": 35})
+        if url.endswith("/artefacts/retain"):
+            return _resp({"status": "retained", "artefact_id": 555, "duplicate": False})
         if url.endswith("/ingest"):
             ingest_bodies.append(json)
-            return _resp(ingest_response(len(json.get("edges", []))))
+            return _resp({"committed": 0, "staged": len(json["edges"])})
         raise AssertionError(f"unexpected call: {url}")
 
-    monkeypatch.setattr(s, "_http_client",
+    monkeypatch.setattr(server_module(), "_http_client",
                         MagicMock(post=AsyncMock(side_effect=fake_post)))
-    return posted_urls, ingest_bodies
-
-
-def _async_lambda(value):
-    async def _r(*_a, **_k):
-        return value
-    return _r
-
-
-async def test_stub_facts_mint_at_accept_before_extraction(monkeypatch):
-    """The /ingest stub write happens BEFORE any extraction call; the response says so."""
-    s = server_module()
-    posted_urls, ingest_bodies = _foss_doc_flow_mocks(
-        monkeypatch, s, lambda n: {"committed": 0, "staged": n})
     text = "# Intro\nSome body prose.\n\n# Methods\nMore prose."
     out = await ingest_document_tool(text, "u-alice", source_ref="lab_notes.md",
                                      title="Lab Notes October")
-    # IN THE RESPONSE WINDOW: the accept response reports the stub write.
-    assert out["status"] == "ok"
+    # IN THE RESPONSE WINDOW: the enqueue response reports the stub write.
+    assert out["status"] == "pending"
     assert out.get("stub_facts_minted", 0) >= 3
-    # Exactly ONE /ingest, and it is the STUB — it arrived BEFORE every extraction
-    # endpoint call (the mint is the only pre-extraction write).
-    ingest_calls = [i for i, u in enumerate(posted_urls) if u.endswith("/ingest")]
-    assert len(ingest_calls) == 1
-    first_rewrite = next((i for i, u in enumerate(posted_urls)
-                          if u.endswith("/extract/rewrite")), None)
-    assert first_rewrite is not None
-    assert ingest_calls[0] < first_rewrite
+    # Exactly ONE /ingest, BEFORE the return, under the document tier.
+    assert sum(1 for u in posted_urls if u.endswith("/ingest")) == 1
     body = ingest_bodies[0]
     assert body["source"] == "document"
     rels = {(e["subject"], e["rel_type"], e["object"]) for e in body["edges"]}
     assert ("Lab Notes October", "instance_of", "document") in rels
     assert ("Intro", "part_of", "Lab Notes October") in rels
+    # No extraction endpoints were hit: the stub is the ONLY pre-drain write.
+    assert not any(u.endswith("/harvest-spans") or u.endswith("/extract/rewrite")
+                   for u in posted_urls)
 
 
-async def test_stub_mint_soft_fails_never_breaks_ingest(monkeypatch):
-    """A rejected stub write must not fail (or reshape) the ingest response."""
-    s = server_module()
-
-    def _refuse(n):
-        req = httpx.Request("POST", "http://f/ingest")
-        resp = httpx.Response(400, request=req)
-        return httpx.HTTPStatusError("client error 400", request=req, response=resp)
-
+async def test_stub_mint_soft_fails_never_breaks_enqueue(monkeypatch):
+    """A rejected stub write must not fail (or reshape) the enqueue response."""
     async def fake_post(url, json=None, timeout=None, headers=None):
-        if url.endswith("/episodic/append"):
-            return _resp({"status": "ok"})
-        if url.endswith("/extract/rewrite"):
-            return _resp({"edges": []})
+        if url.endswith("/documents/enqueue"):
+            return _resp({"status": "pending", "document_id": 9,
+                          "chunk_count": json["chunk_count"], "eta_seconds": 10})
+        if url.endswith("/artefacts/retain"):
+            return _resp({"status": "retained", "artefact_id": 1, "duplicate": False})
         if url.endswith("/ingest"):
-            raise _refuse(0)
+            # Deterministic backend refusal (httpx 400 = non-transient) — never retried,
+            # never deferred; the stub mint reports 0 and the enqueue stays intact.
+            req = httpx.Request("POST", url)
+            resp = httpx.Response(400, request=req)
+            raise httpx.HTTPStatusError("client error 400", request=req, response=resp)
         raise AssertionError(url)
 
-    monkeypatch.setattr(s, "_statement_extractor_route",
-                        _async_lambda("rewrite"))
-    monkeypatch.setattr(s, "SHORT_TERM_MEMORY", False)
-    monkeypatch.setattr(s, "_http_client",
+    monkeypatch.setattr(server_module(), "_http_client",
                         MagicMock(post=AsyncMock(side_effect=fake_post)))
+    monkeypatch.setattr(server_module(), "_log_crit", lambda *a, **k: None)
     out = await ingest_document_tool("# A\nbody", "u-alice", source_ref="doc.pdf",
                                      title="A Document")
-    assert out["status"] == "ok"
+    assert out["status"] == "pending"
+    assert out["document_id"] == 9
     assert out.get("stub_facts_minted", 0) == 0
 
 
 async def test_stub_mint_reports_honest_zero_when_store_says_zero(monkeypatch):
     """A success shape explicitly reporting 0 landed edges stays an honest 0."""
-    s = server_module()
-    _foss_doc_flow_mocks(monkeypatch, s, lambda n: {"committed": 0, "staged": 0})
+    async def fake_post(url, json=None, timeout=None, headers=None):
+        if url.endswith("/documents/enqueue"):
+            return _resp({"status": "pending", "document_id": 11,
+                          "chunk_count": json["chunk_count"], "eta_seconds": 5})
+        if url.endswith("/artefacts/retain"):
+            return _resp({"status": "retained", "artefact_id": 2, "duplicate": False})
+        if url.endswith("/ingest"):
+            return _resp({"committed": 0, "staged": 0})  # store deduped/dropped everything
+        raise AssertionError(url)
+
+    monkeypatch.setattr(server_module(), "_http_client",
+                        MagicMock(post=AsyncMock(side_effect=fake_post)))
     out = await ingest_document_tool("# A\nbody", "u-alice", source_ref="doc2.pdf",
                                      title="Another Document")
-    assert out["status"] == "ok"
+    assert out["status"] == "pending"
     assert out["stub_facts_minted"] == 0
 
 
@@ -337,12 +320,14 @@ async def test_recall_empty_walk_with_doc_hit_renders_the_document_line(monkeypa
     assert "No relevant facts found" not in mem
 
 
-async def test_recall_with_facts_doc_passage_leads(monkeypatch):
-    """BUG-09 (adversarial bench 2026-10-24) REVERSED the old order: the verbatim
-    document passage (highest-truth band, row-level fact from source) now LEADS the
-    extracted facts, so B-tier extraction debris can never own the topline above
-    verified source text. The old name/assertion (facts lead, doc line after) pinned
-    the W2.3-era order this lane deliberately supersedes."""
+async def test_recall_with_facts_doc_passage_trails(monkeypatch):
+    """MOVED 2026-11-07 WITH EVIDENCE (fog-family lab, DEV/FINDINGS-fog-family-lab-20261107.md
+    F2/F3): BUG-09's documents-first order was measured hijacking personal recall —
+    "who is my wife?" LED with the ingested paper's worked example while the user's own
+    fact trailed. Provenance is a SORT KEY: the user-stated fact leads; the document
+    citation trails (RECALL_DOCUMENT_TRAIL default ON; the BUG-09 pin this replaces
+    certified the lead order). The doc-ONLY answer shape (no fact lines) is unchanged —
+    pinned in tests/mcp/test_document_hit_perspective_and_order.py."""
     s = server_module()
 
     async def fake_post(url, json=None, timeout=None, headers=None):
@@ -370,7 +355,7 @@ async def test_recall_with_facts_doc_passage_leads(monkeypatch):
     monkeypatch.setattr(s, "RECALL_INTENT_ROUTING", False, raising=False)
     out = await recall_memory_tool("dog", "u-alice")
     mem = out["memory"]
-    assert mem.index("From your document Dog Manual") < mem.index("Your dog is Rex.")
+    assert mem.index("Your dog is Rex.") < mem.index("From your document Dog Manual")
 
 
 # ── DB pins (a) + (d): dedicated throwaway database, real migration corpus ──────────────
@@ -422,6 +407,7 @@ def test_stub_tsv_fresh_mint_legacy_ledger_and_document_hits(monkeypatch):
          foreign tenant, a no-match query, and a pre-299 schema.
     """
     import psycopg2
+    from src.provisioning import boot_migrations as bm
     from src.provisioning.schema_manager import create_user_schema
 
     mig_dir = os.environ.get("FAULTLINE_MIGRATIONS_DIR", "migrations")
@@ -431,18 +417,8 @@ def test_stub_tsv_fresh_mint_legacy_ledger_and_document_hits(monkeypatch):
     dsn = _dedicated_database("stubtsv" + uuid.uuid4().hex[:6])
     monkeypatch.setenv("POSTGRES_DSN", dsn)
     try:
-        # FOSS convention: the whole migration corpus applies at boot (entrypoint
-        # psql loop) — tests apply the files via psql -f per file, the SAME
-        # per-statement continue-on-error semantics the entrypoint uses. The
-        # ported migrations (298-301) are guarded-idempotent and must apply cleanly.
-        import glob as _glob
-        import subprocess as _sp
-        _ported = ("298", "299", "300", "301")
-        for _mf in sorted(_glob.glob(os.path.join(mig_dir, "*.sql"))):
-            _proc = _sp.run(["psql", dsn, "-v", "ON_ERROR_STOP=0", "-q", "-f", _mf],
-                            capture_output=True, text=True)
-            if _proc.returncode != 0 and os.path.basename(_mf).split("_")[0] in _ported:
-                raise AssertionError(f"{_mf} failed: {_proc.stderr[-400:]}")
+        boot = bm.run_boot_migrations(dsn, mig_dir, echo=False)
+        assert boot.fatal is None and boot.ledger_active, (boot.fatal, boot.ledger_error)
 
         # (a1) FRESH MINT: the template carries 299.
         uid_fresh = str(uuid.uuid4())
@@ -469,8 +445,7 @@ def test_stub_tsv_fresh_mint_legacy_ledger_and_document_hits(monkeypatch):
 
         assert has_stub_tsv(schema_fresh), "fresh mint lacks stub_tsv/GIN (template behind 299)"
 
-        # (a2) LEGACY: strip the column + index → re-apply the corpus → back again
-        # (the FOSS boot applies every file every time; 299 is guarded-idempotent).
+        # (a2) LEGACY: strip the column + the ledger's 299 rows → re-sweep → back again.
         uid_legacy = str(uuid.uuid4())
         schema_legacy, status = create_user_schema(uid_legacy, uid_legacy.replace("-", "_"))
         assert status == "ready"
@@ -480,19 +455,15 @@ def test_stub_tsv_fresh_mint_legacy_ledger_and_document_hits(monkeypatch):
             with conn.cursor() as cur:
                 cur.execute(f"ALTER TABLE {schema_legacy}.documents DROP COLUMN stub_tsv")
                 cur.execute(f"DROP INDEX IF EXISTS {schema_legacy}.idx_documents_stub_tsv")
+                cur.execute("DELETE FROM public.schema_migration_status "
+                            "WHERE schema_name=%s AND migration_id='299_documents_stub_tsv'",
+                            (schema_legacy,))
         finally:
             conn.close()
         assert not has_stub_tsv(schema_legacy)
-        _reapplied = False
-        _mf299 = os.path.join(mig_dir, "299_documents_stub_tsv.sql")
-        _bc = psycopg2.connect(dsn)
-        _bc.autocommit = True
-        try:
-            with _bc.cursor() as cur:
-                cur.execute(open(_mf299, encoding="utf-8").read())
-        finally:
-            _bc.close()
-        assert has_stub_tsv(schema_legacy), "re-applied 299 did not restore the legacy tenant"
+        boot2 = bm.run_boot_migrations(dsn, mig_dir, echo=False)
+        assert boot2.fatal is None, boot2.fatal
+        assert has_stub_tsv(schema_legacy), "ledger did not re-apply 299 to the legacy tenant"
 
         # Seed one document per tenant; the query token comes from CHUNK TEXT.
         def insert_doc(schema, title, chunks, uid):

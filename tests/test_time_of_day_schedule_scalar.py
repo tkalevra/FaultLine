@@ -29,6 +29,11 @@ from datetime import date
 
 import pytest
 
+# Pure deriver pins, written and verified with no database: run them on the in-code cue floors
+# explicitly (every whole-suite run used to, by accident of a leaked DSN pop, #63). The
+# divergence WITH the seeded cue tables is a product question, #75.
+pytestmark = pytest.mark.usefixtures("no_tenant_db")
+
 REF = date(2026, 7, 20)  # a Monday — session reference for the dateparser firewall
 
 

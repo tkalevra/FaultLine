@@ -25,7 +25,7 @@ from src.api.main import resolve_display_name, convert_to_prose
 #    Patch the REAL seam — which also makes them DB-independent.
 # 2) `fetchone`: these mocks only ever stubbed `fetchall`, so `cur.fetchone()` returned a
 #    truthy MagicMock — an "empty" mock DB that answers EVERY lookup with a MagicMock. That is
-#    what produced junk like "User and a User named Elena" (the instance_of/named-type probe
+#    what produced junk like "User and a User named Marla" (the instance_of/named-type probe
 #    "found" a MagicMock type). A real empty DB returns None; stub it honestly.
 def _meta(**rows):
     return patch("src.api.main.rel_type_overlay.resolve_current", return_value=rows)
@@ -54,39 +54,50 @@ class TestResolveDisplayName:
     """Test UUID → display name resolution."""
 
     def test_resolve_preferred_name(self):
-        """Test: resolve_display_name returns preferred name from entity_aliases."""
+        """Test: resolve_display_name returns preferred name from entity_aliases.
+
+        R2 contract (e96fb6fe, DISPLAY_PROPER_NAME_RANK): the resolver serves from ONE
+        ordered full-alias read (the ranked proper-name-first read), so the mock serves
+        REAL-shaped rows via fetchall -- a truthy-but-rowless MagicMock fetchall (what a
+        bare MagicMock used to yield) cannot feed the ranked path and forced a legacy
+        fall-through whose extra query broke the once-only certification. The 1-tuple
+        ("Aurora",) shape is also honored: the display-form read is len-guarded (B's
+        triage, canonical_recall pin)."""
         entity_id = str(uuid4())
         mock_db = MagicMock()
         mock_cursor = MagicMock()
         mock_db.cursor.return_value.__enter__.return_value = mock_cursor
 
-        # Mock preferred name lookup. The row shape is (alias, display_form) since
-        # migration 214 — display_form NULL means "no casing observed", so the alias
-        # renders unchanged. Kept in the REAL shape the query actually selects: a mock
-        # that does not match the SELECT is a dead mock asserting nothing.
-        mock_cursor.fetchone.return_value = ("Aurora", None)
+        # Mock preferred name lookup: real 2-wide row shape, preferred-first
+        mock_cursor.fetchall.return_value = [("aurora", "Aurora")]
 
-        result = resolve_display_name(entity_id, mock_db)
+        with patch("src.api.main._entity_is_l4_place", return_value=False):
+            result = resolve_display_name(entity_id, mock_db)
 
         assert result == "Aurora"
         mock_cursor.execute.assert_called_once()
 
     def test_resolve_nonpreferred_alias_fallback(self):
-        """Test: fall back to non-preferred alias when preferred not found."""
+        """Test: fall back to non-preferred alias when preferred not found.
+
+        R2 contract: the ranked full-alias read is NOT preferred-filtered, so a
+        none-preferred entity serves from the SAME single query (is_preferred DESC,
+        alias puts the best non-preferred row first). The row is deliberately 1-WIDE
+        (old-migration-plausible): the len-guarded display-form read must fall back to
+        the alias surface, never raise into the except -> raw-UUID leak (B triage)."""
         entity_id = str(uuid4())
         mock_db = MagicMock()
         mock_cursor = MagicMock()
         mock_db.cursor.return_value.__enter__.return_value = mock_cursor
 
-        # First call (preferred): no result
-        # Second call (any alias): returns "aurora"
-        # (alias, display_form) — the real row shape since migration 214.
-        mock_cursor.fetchone.side_effect = [None, ("aurora", None)]
+        # Only a non-preferred alias exists: the ranked read serves it first
+        mock_cursor.fetchall.return_value = [("aurora",)]
 
-        result = resolve_display_name(entity_id, mock_db)
+        with patch("src.api.main._entity_is_l4_place", return_value=False):
+            result = resolve_display_name(entity_id, mock_db)
 
         assert result == "aurora"
-        assert mock_cursor.execute.call_count == 2
+        assert mock_cursor.execute.call_count == 1
 
     def test_resolve_uuid_fallback(self):
         """Test: return UUID itself if no alias found."""
@@ -149,13 +160,13 @@ class TestConvertToProse:
 
         # rel_types template now comes from the OVERLAY, not the cursor (see _meta note).
         with _meta(spouse=SPOUSE), patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["User", "Elena"]
+            mock_resolve.side_effect = ["User", "Marla"]
 
             prose_list = convert_to_prose([fact], mock_db)
 
         assert len(prose_list) == 1
         assert "User" in prose_list[0]
-        assert "Elena" in prose_list[0]
+        assert "Marla" in prose_list[0]
         assert "married" in prose_list[0].lower()
 
     def test_prose_class_c_no_label_leak(self):
@@ -308,7 +319,7 @@ class TestConvertToProse:
         # Templates via the OVERLAY (X/Y placeholders per natural_language contract).
         with _meta(spouse=SPOUSE, likes=LIKES), \
                 patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["User", "Elena", "User", "Art"]
+            mock_resolve.side_effect = ["User", "Marla", "User", "Art"]
 
             prose_list = convert_to_prose(facts, mock_db)
 

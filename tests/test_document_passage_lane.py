@@ -197,24 +197,15 @@ def r6_db():
     mig_dir = os.environ.get("FAULTLINE_MIGRATIONS_DIR", "migrations")
     if not os.path.isdir(mig_dir):
         pytest.skip(f"migrations dir {mig_dir!r} not found")
+    from src.provisioning import boot_migrations as bm
+    from src.provisioning.schema_manager import create_user_schema
     import psycopg2
 
     dsn = _dedicated_database("r6pass" + uuid.uuid4().hex[:6])
     saved_dsn = os.environ.get("POSTGRES_DSN")
     os.environ["POSTGRES_DSN"] = dsn
-    # FOSS convention: the whole migration corpus applies at boot (entrypoint
-    # psql loop) — tests apply the files via psql -f per file, the SAME
-    # per-statement continue-on-error semantics the entrypoint uses. The ported
-    # migrations (298-301) are guarded-idempotent and must apply cleanly.
-    import glob as _glob
-    import subprocess as _sp
-    _ported = ("298", "299", "300", "301")
-    for _mf in sorted(_glob.glob(os.path.join(mig_dir, "*.sql"))):
-        _proc = _sp.run(["psql", dsn, "-v", "ON_ERROR_STOP=0", "-q", "-f", _mf],
-                        capture_output=True, text=True)
-        if _proc.returncode != 0 and os.path.basename(_mf).split("_")[0] in _ported:
-            raise AssertionError(f"{_mf} failed: {_proc.stderr[-400:]}")
-    from src.provisioning.schema_manager import create_user_schema
+    boot = bm.run_boot_migrations(dsn, mig_dir, echo=False)
+    assert boot.fatal is None and boot.ledger_active, (boot.fatal, boot.ledger_error)
 
     def seed(title, chunks, *, status="pending"):
         uid = str(uuid.uuid4())

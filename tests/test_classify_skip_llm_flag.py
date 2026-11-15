@@ -1,7 +1,6 @@
 """API SKIP-LLM TIER FLAG — /classify-intent's deterministic answer, on demand.
 
-The API half of the MCP brain-independence lane (2026-10-25; FOSS port 2026-10-26 —
-the neg-ensemble pins are private-lineage and dropped, see the note below). The MCP bounds its classify
+The API half of the MCP brain-independence lane (2026-10-25). The MCP bounds its classify
 probe (MCP_CLASSIFY_TIMEOUT_S, default 3s) and, when the budget is exceeded on a lane that
 still needs a route, re-asks once with ``skip_llm: true``. These pins prove the flag gates
 EVERY LLM tier inside /classify-intent while the deterministic layers keep deciding:
@@ -13,6 +12,9 @@ EVERY LLM tier inside /classify-intent while the deterministic layers keep decid
   (sub-gate) a below-gate GLiNER2 label with skip_llm → NO escalation LLM, the sub-gate
             STATEMENT safety net answers (the documented escalation-failure default)
   (sub-gate') without the flag                     → the escalation LLM's route wins
+  (ensemble) the negation-band adjudicator with skip_llm → NO 30s adjudication call, the
+            adjudicator-unavailable fail-open answers (lone-signal rule, NO grow)
+  (ensemble') without the flag                     → the adjudicator fires
 
 No database: POSTGRES_DSN is cleared (every DB-touching layer fail-opens by design) and the
 LLM stack is a recorder. The GLiNER2 model is a stub returning a fixed label/confidence.
@@ -37,9 +39,6 @@ _UID = "5d1c2b3a-1111-4000-8000-abcdefabcdef"
 @pytest.fixture(autouse=True)
 def _db_free(monkeypatch):
     monkeypatch.delenv("POSTGRES_DSN", raising=False)
-    # FOSS rig note: LLMModels.get refuses to guess without a model env var — the
-    # recorder intercepts the actual LLM call, so a dummy name is enough.
-    monkeypatch.setenv("WGM_LLM_MODEL", "foss-port-test-model")
     monkeypatch.setattr(M, "_ensure_tenant_ready", _ready)
 
 
@@ -48,21 +47,10 @@ async def _ready(user_id, endpoint):
 
 
 class _GlinerStub:
-    """Returns a fixed GLiNER2-shaped answer: {"intent": {"label": ..., "confidence": ...}}.
-
-    FOSS-port note: this endpoint passes DESCRIPTION labels to classify_text and maps the
-    returned description back to the intent name — the stub translates intent names to
-    their descriptions so a stub built as ("QUERY", 0.93) scores as QUERY."""
-
-    _DESC = {
-        "QUERY": "asking a question",
-        "STATEMENT": "stating a fact, preference, or habit",
-        "RETRACTION": "deleting or forgetting information",
-        "CORRECTION": "replacing a previously stated value with a different one",
-    }
+    """Returns a fixed GLiNER2-shaped answer: {"intent": {"label": ..., "confidence": ...}}."""
 
     def __init__(self, label, confidence):
-        self.label = self._DESC.get(label, label)
+        self.label = label
         self.confidence = confidence
 
     def classify_text(self, text, labels, include_confidence=True):
@@ -88,7 +76,7 @@ def llm_recorder(monkeypatch):
 async def test_tier2_ambiguous_cue_skip_llm_arm_vs_legacy_arm(llm_recorder, monkeypatch):
     """Both arms, one test (the A/B control): the SAME ambiguous cue — with skip_llm no
     LLM corroboration (no destructive bypass), without it the LLM's verdict wins."""
-    def _cue(text):                   # SYNC — the FOSS endpoint calls _spacy_cue_route(text)
+    def _cue(text, user_id):          # SYNC — the endpoint calls it via asyncio.to_thread
         return ("CORRECTION", "ambiguous")
     monkeypatch.setattr(M, "_spacy_cue_route", _cue)
 
@@ -120,17 +108,53 @@ async def test_subgate_skip_llm_takes_the_statement_net_without_escalating(llm_r
 
 
 async def test_subgate_without_flag_the_escalation_llm_routes(llm_recorder):
+    # BUG-RECALL-13 PART A: the escalation routes a CORRECTION only for a turn carrying an
+    # explicit old-value/repair marker — "the port changed to 8010" (no spaCy cue, so it
+    # reaches the sub-gate; marker admits the escalated verdict). The no-marker companion
+    # ("she moved to Halifax" → STATEMENT through the marker gate) is pinned in
+    # tests/test_correction_marker_gate.py.
     resp = await M.classify_intent(
-        {"text": "she moved to Halifax"}, user_id=_UID,
+        {"text": "the port changed to 8010"}, user_id=_UID,
         model=_GlinerStub("CORRECTION", 0.55))
 
     assert len(llm_recorder) == 1, llm_recorder
     assert resp["intent"] == "CORRECTION"         # the escalated verdict routes
 
 
-# ── NEG-ENSEMBLE: NOT PORTED — the negation-band ensemble adjudicator is private-
-#    lineage machinery (no _neg_scope_ensemble_decide / _neg_ensemble_grow on FOSS);
-#    its skip_llm hunk has no target here. Filed DEV/BUGS/foss-port-gauntlets.md.
+# ── NEG-ENSEMBLE: the 30s adjudicator — skipped, fail-open, no grow ──────────────────
+
+
+def _lone_negscope():
+    """One structural negation voter, no depwalk: the disagreement band (adjudicator zone)."""
+    return [SimpleNamespace(predicates_nominal=True, two_referential_poles=False)]
+
+
+async def test_ensemble_skip_llm_never_adjudicates_and_never_grows(llm_recorder, monkeypatch):
+    grew = []
+    monkeypatch.setattr(M, "_neg_ensemble_grow", lambda *a, **k: grew.append(a))
+
+    resp = await M._neg_scope_ensemble_decide(
+        _UID, "she is not home tonight", _lone_negscope(),
+        gliner2_label="STATEMENT", gliner2_conf=0.9, skip_llm=True)
+
+    assert llm_recorder == [], "skip_llm must not fire the 30s ensemble adjudicator"
+    assert grew == [], "an adjudicator outage must not manufacture evidence (no grow)"
+    assert resp["intent"] == "STATEMENT"          # fail-open: GLiNER2's label stands
+    assert resp["confidence"] == pytest.approx(0.9)
+
+
+async def test_ensemble_without_flag_the_adjudicator_fires(llm_recorder, monkeypatch):
+    grew = []
+    monkeypatch.setattr(M, "_neg_ensemble_grow", lambda *a, **k: grew.append(a))
+
+    resp = await M._neg_scope_ensemble_decide(
+        _UID, "she is not home tonight", _lone_negscope(),
+        gliner2_label="STATEMENT", gliner2_conf=0.9, skip_llm=False)
+
+    assert len(llm_recorder) == 1, llm_recorder
+    assert resp["intent"] == "CORRECTION"         # the adjudicated verdict (0.85 convention)
+    assert grew, "a successful CORRECTION adjudication grows the engine row"
+
 
 # ── gate-passed turns: skip_llm changes nothing above the gate ───────────────────────
 

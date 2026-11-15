@@ -1,10 +1,6 @@
 """BUG-08 (adversarial bench 20261024) — markers never drain, uplift inert.
 
-FOSS-port note (2026-10-26): this engine ships no brain-lane machinery, so the
-lane verdicts are pinned through an INSTALLED lane check (delegation seam); the
-default-no-lane behaviour is pinned separately (trivially open).
-
-THE BREAK (measured on private prod 2026-10-25, owner seat): 8 recall_miss_reexamine
+THE BREAK (measured on prod 2026-10-25, owner seat): 8 recall_miss_reexamine
 markers sat pending 3+ hours (and counting) while the growth cycle ran — 135
 ``re_embedder.llm_skip`` lines / 24h (``tenant_brain_unavailable_failclosed``,
 15 cycles x 9 subsystems) and **zero** ``growth_work_drain`` lines. The drain
@@ -53,7 +49,7 @@ _TEMPLATE = _REPO_ROOT / "src" / "provisioning" / "templates" / "user_schema.sql
 _DSN_BACKEND = "http://backend.test"
 
 CHUNK_TEXT = ("Marcus owns two vintage synthesizers. "
-              "His sister Nora works at the hospital in Millbrook.")
+              "His sister Lena works at the hospital in Elmstead.")
 
 
 def _queue_ddl(schema_name: str) -> str:
@@ -135,10 +131,7 @@ def lane_hard_closed(monkeypatch):
         consultations.append(subsystem)
         return False
 
-    # FOSS adaptation: this lineage has no _reembedder_llm_lane_open in production
-    # (raising=False) — the fixture INSTALLS one to pin _growth_drain_lane_open's
-    # delegation seam: when lane machinery exists, brain-bearing ops consult it.
-    monkeypatch.setattr(embedder, "_reembedder_llm_lane_open", _closed, raising=False)
+    monkeypatch.setattr(embedder, "_reembedder_llm_lane_open", _closed)
     return {"consultations": consultations}
 
 
@@ -168,16 +161,6 @@ def test_deterministic_op_passes_with_lane_hard_closed(lane_hard_closed):
 def test_brain_bearing_ops_keep_the_closed_lane_verdict(lane_hard_closed, op):
     assert embedder._growth_drain_lane_open("u", "s", op) is False
     assert "ontology_eval" in lane_hard_closed["consultations"]
-
-
-def test_no_lane_machinery_means_trivially_open(monkeypatch):
-    """FOSS shape: with no lane check installed (this engine ships none), the gate
-    is OPEN for every operation — the drain always ran ungated here, so BUG-08's
-    starvation could not occur; the op-aware seam exists for a future lane."""
-    monkeypatch.delattr(embedder, "_reembedder_llm_lane_open", raising=False)
-    for op in ("promotion", "enrichment", "synonym_convergence",
-               "whatis_climb", "recall_miss_brain", "recall_miss_reexamine"):
-        assert embedder._growth_drain_lane_open("u", "s", op) is True
 
 
 def test_deterministic_registry_covers_the_uplift_runner():

@@ -25,7 +25,7 @@ split — and only ever for a rel_type the system does not already know.
 
 PURE tests — no DB, no network, no GLiNER2, no LLM.
 
-Run: python3 tools/fltest.py --bug FOSSNEG --test tests/test_negated_possession_and_function_word_rels.py
+Run: python3 tools/fltest.py --bug NEGREDIRECT --test tests/test_negated_possession_and_function_word_rels.py
      (tests/ is gitignored -> git add -f)
 """
 import os
@@ -223,19 +223,17 @@ def test_already_negated_prose_is_not_double_negated():
 
 
 def test_past_tense_lexical_verb_takes_the_bare_form_not_the_past_form():
-    """MEASURED USER-VISIBLE DEFECT (dev line): recall rendered "Diane did not LIVED in Toronto".
+    """MEASURED USER-VISIBLE DEFECT: recall rendered "Diane did not LIVED in Toronto".
 
-    The past branch correctly selected ``did``, then took the bare form from a de-conjugator
-    for PRESENT-tense finite verbs that strips a trailing ``-s``. Handed a past form it
-    returns it unchanged ("lived"→"lived", "went"→"went"), so the clause carried tense TWICE.
-    English do-support puts the tense on the ``do`` operator and leaves the lexical verb in
-    its BARE form (Huddleston & Pullum, CGEL 2002 ch.3 §1.3; Quirk et al. §3.21ff) — "did not
-    live", never "did not lived".
+    The past branch correctly selected ``did``, then took the bare form from
+    ``_verb_present_to_base`` — a de-conjugator for PRESENT-tense finite verbs that strips a
+    trailing ``-s``. Handed a past form it returns it unchanged ("lived"→"lived",
+    "went"→"went"), so the clause carried tense TWICE. English do-support puts the tense on
+    the ``do`` operator and leaves the lexical verb in its BARE form (Huddleston & Pullum,
+    CGEL 2002 ch.3 §1.3; Quirk et al. §3.21ff) — "did not live", never "did not lived".
 
-    This line was written with the lemma from the start (the de-conjugator never existed
-    here), so this test PINS that, it does not change it. The bare form is the finite token's
-    own lemma off the same parse, so it is correct for regular AND irregular pasts, which a
-    spelling rule can never be."""
+    The bare form is now the finite token's own lemma off the same parse, so it is correct
+    for regular AND irregular pasts, which a spelling rule can never be."""
     import src.api.main as m
     assert m._negate_prose("Diane lived in Toronto") == "Diane did not live in Toronto"
     assert m._negate_prose("You carried the box") == "You did not carry the box"
@@ -244,24 +242,37 @@ def test_past_tense_lexical_verb_takes_the_bare_form_not_the_past_form():
 
 
 def test_present_tense_do_support_is_unchanged_by_the_lemma_switch():
-    """The lemma must agree with a surface de-conjugator on every PRESENT form it handled."""
+    """The lemma must agree with the old de-conjugator on every PRESENT form it handled."""
     import src.api.main as m
     assert m._negate_prose("Diane lives in Toronto") == "Diane does not live in Toronto"
     assert m._negate_prose("Diane goes to school") == "Diane does not go to school"
     assert m._negate_prose("You have a pet that is Dog") == "You do not have a pet that is Dog"
 
 
+def test_periphrastic_used_to_is_still_declined():
+    """``used to`` is a MARGINAL MODAL (H&P, CGEL 2002 ch.3 §1.6), not a lexical verb taking
+    ordinary do-support — so it must NOT become "did not use to".
+
+    This is the ONE decline that still has to be explicit: measured on ``en_core_web_sm``,
+    every other member of ``_USED_TO_DECLINE_VERBS`` is tagged AUX (or matches no finite
+    token), so the ``pos_ != "VERB"`` gate already excludes it, but "used" is tagged VERB
+    with lemma "use" and would otherwise reach the bare-form step."""
+    import src.api.main as m
+    assert m._negate_prose("You used to live in London") == (
+        "It is not the case that you used to live in London"
+    )
+
+
 def test_lowercase_clause_still_gets_do_support():
     """A LOWERCASE clause must negate as well as its capitalised twin.
 
     Composed prose renders entity names from ``entity_aliases.alias``, which is LOWERCASED at
-    registration (entity_registry/registry.py) and never re-capitalised for display — so the
-    clause the parser actually sees is sentence-initial-lowercase. That is orthographically
-    ill-formed English and therefore out-of-distribution for a model trained on
-    conventionally-cased text: ``en_core_web_sm`` loses the finite verb entirely and tags
-    "diane lives in toronto" as one compound NOUN chain, so do-support declined and recall read
-    "It is not the case that diane lives in toronto" for a fact whose capitalised twin rendered
-    correctly.
+    registration (registry.py:256) and never re-capitalised for display — so the clause the
+    parser actually sees is sentence-initial-lowercase. That is orthographically ill-formed
+    English and therefore out-of-distribution for a model trained on conventionally-cased text:
+    ``en_core_web_sm`` loses the finite verb entirely and tags "diane lives in toronto" as one
+    compound NOUN chain, so do-support declined and recall read "It is not the case that diane
+    lives in toronto" for a fact whose capitalised twin rendered correctly.
 
     Case restoration as a preprocessing step for degraded input is standard practice — Lita et
     al., "tRuEcasIng", ACL 2003. The retry runs ONLY when the raw parse found no finite verb,
@@ -280,15 +291,15 @@ def test_lowercase_clause_still_gets_do_support():
 
 def test_verbless_clause_still_gets_the_honest_wrapper():
     """THE FAIL-SAFE MUST STAY REACHABLE. The label-fallback lane renders a rel with no learned
-    template as the HONEST NEUTRAL "X {label} Y", which for a NOUN-PHRASE label is a genuinely
-    VERBLESS clause — there is no verb to apply do-support to, and the clause-level wrapper is
-    the CORRECT render.
+    template as the HONEST NEUTRAL "X {label} Y" (main.py), which for a NOUN-PHRASE label is a
+    genuinely VERBLESS clause — there is no verb to apply do-support to, and the clause-level
+    wrapper is the CORRECT render.
 
-    This is the guard on the sentence-case retry: a PRO-FORM SUBSTITUTION probe was measured
-    and REJECTED for this exact reason (substituting a pronoun subject COERCES a verb reading,
-    giving 8/8 false positives on these clauses — "apollo does not ip address 10.0.0.4").
-    Sentence-casing fabricates nothing, and this test is what proves it. A wrong polarity is a
-    TRUTH error; clunky prose is only a style error — never trade the second for the first."""
+    This is the guard on the sentence-case retry: a pro-form probe was measured and REJECTED
+    for this exact reason (substituting a pronoun subject COERCES a verb reading, giving 8/8
+    false positives on these clauses — "apollo does not ip address 10.0.0.4"). Sentence-casing
+    fabricates nothing, and this test is what proves it. A wrong polarity is a TRUTH error;
+    clunky prose is only a style error — never trade the second for the first."""
     import src.api.main as m
     assert m._negate_prose("apollo ip address 10.0.0.4") == (
         "It is not the case that apollo ip address 10.0.0.4"
@@ -319,9 +330,9 @@ def test_do_support_flag_off_restores_the_legacy_insertion():
 
 
 def test_log_crit_call_sites_have_the_logger_argument():
-    """FAIL-LOUD PATHS MUST NOT CRASH. ``log_crit(logger, msg, **args)`` — a call site in
+    """FAIL-LOUD PATHS MUST NOT CRASH. ``log_crit(logger, msg, **args)`` — two call sites in
     main.py omitted the logger, so the reporter raised at the exact moment it was meant to
-    report a failure (TypeError: missing required positional argument 'msg').
+    report a failure (TypeError: missing 'msg'; AttributeError: str has no 'critical').
 
     Pinned by AST across the whole log_* family so a future site cannot regress silently."""
     import ast
