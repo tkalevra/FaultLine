@@ -46,13 +46,13 @@ def _triples(facts):
 
 @pytest.mark.parametrize("text,name,kin", [
     # apostrophe PRESENT (baseline)
-    ("My sister's name is Dana.", "dana", "sibling_of"),
+    ("My sister's name is Katya.", "katya", "sibling_of"),
     ("My brother's name is Sam.", "sam", "sibling_of"),
-    ("My mother's name is Priya.", "priya", "parent_of"),
+    ("My mother's name is Amara.", "amara", "parent_of"),
     # apostrophe STRIPPED by the atomizer (the Failure-1 repro shape) — plural surface, singular lemma
-    ("My sisters name is Dana.", "dana", "sibling_of"),
+    ("My sisters name is Katya.", "katya", "sibling_of"),
     ("My brothers name is Sam.", "sam", "sibling_of"),
-    ("My mothers name is Priya.", "priya", "parent_of"),
+    ("My mothers name is Amara.", "amara", "parent_of"),
 ])
 def test_genitive_name_binds_proper_name_no_phantom(text, name, kin):
     facts = m.derive_sentence_facts(text, _REF)
@@ -87,9 +87,9 @@ def test_non_kin_compound_is_not_a_collapsed_genitive():
 
 @pytest.mark.parametrize("text,name,alias,kin", [
     # naming-verb complement ("prefers to be called X") — passive xcomp, subject on the matrix verb
-    ("My sister's name is Dana, she prefers to be called Dee.", "dana", "dee", "sibling_of"),
+    ("My sister's name is Katya, she prefers to be called Dee.", "katya", "dee", "sibling_of"),
     # alias-PP idiom "goes by X" (go→by)
-    ("My sister's name is Dana, she goes by Dee.", "dana", "dee", "sibling_of"),
+    ("My sister's name is Katya, she goes by Dee.", "katya", "dee", "sibling_of"),
     # alias-PP idiom "known as X" (know→as)
     ("My brother's name is Sam, he is known as Sammy.", "sam", "sammy", "sibling_of"),
 ])
@@ -105,8 +105,8 @@ def test_third_party_nickname_bound_to_corefd_person(text, name, alias, kin):
 
 
 @pytest.mark.parametrize("text,tp,name,alias", [
-    ("She goes by Dee.", ["dana"], "dana", "dee"),
-    ("She prefers to be called Dee.", ["dana"], "dana", "dee"),
+    ("She goes by Dee.", ["katya"], "katya", "dee"),
+    ("She prefers to be called Dee.", ["katya"], "katya", "dee"),
     ("He is known as Sammy.", ["sam"], "sam", "sammy"),
 ])
 def test_alias_pronoun_resolves_via_turn_persons(text, tp, name, alias):
@@ -118,8 +118,8 @@ def test_alias_pronoun_resolves_via_turn_persons(text, tp, name, alias):
 
 def test_alias_named_subject_direct():
     # a NAMED (non-pronoun) subject binds directly, no coref needed
-    facts = m.derive_sentence_facts("Dana goes by Dee.", _REF)
-    assert ("dana", "also_known_as", "dee") in _triples(facts), _triples(facts)
+    facts = m.derive_sentence_facts("Katya goes by Dee.", _REF)
+    assert ("katya", "also_known_as", "dee") in _triples(facts), _triples(facts)
 
 
 def test_unresolved_alias_subject_suppresses_junk_but_emits_nothing():
@@ -141,5 +141,5 @@ def test_same_verb_non_alias_uses_untouched(text):
 
 
 def test_negated_alias_is_not_captured():
-    facts = m.derive_sentence_facts("Dana is not known as Dee.", _REF)
+    facts = m.derive_sentence_facts("Katya is not known as Dee.", _REF)
     assert not any(rel == "also_known_as" for _s, rel, _o in _triples(facts)), _triples(facts)

@@ -11,7 +11,7 @@
 -- (kid→parent_of, son/daughter→parent_of, child→child_of), but NOT the bare plurals a real
 -- question uses: "who are my CHILDREN / kids / sons / daughters?". Measured live on prod (seat
 -- 1a2b3c4d, 2026-10-09, after the #227-#231 deploy): "my children are: Desmond, a son 12;
--- Cato, a son 20; Bianca, a daughter 10" captured PERFECTLY — (desmond|cato|bianca,
+-- Cato, a son 20; Sunniva, a daughter 10" captured PERFECTLY — (desmond|cato|sunniva,
 -- child_of, user) + the three ages — but the recall of "who are my children" bound NO
 -- relationship rel (no 'children' alias row in the tenant), the aspect fell through to a junk
 -- grown scalar attribute, and topic_grounding_filtered dropped 8→2, leaving only stale junk

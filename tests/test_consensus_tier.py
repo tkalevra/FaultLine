@@ -248,14 +248,14 @@ def test_build_typed_doc_attaches_gliner_conf_to_committed_ents():
 
 def test_build_typed_doc_coordinated_split_inherits_parent_score():
     ling = _linguistics_or_loud_skip()
-    g = _FakeGliner({"entities": {"Person": [{"text": "Bianca, Dez", "confidence": 0.66}]}})
-    doc = _build_typed_doc("Bianca, Dez are colleagues.", g, ["Person"])
+    g = _FakeGliner({"entities": {"Person": [{"text": "Sunniva, Dez", "confidence": 0.66}]}})
+    doc = _build_typed_doc("Sunniva, Dez are colleagues.", g, ["Person"])
     assert doc is not None
     got = {}
     for ent in doc.ents:
         got[ent.text.strip().lower()] = getattr(ent._, "gliner_conf", None)
     # each PART inherited the parent surface's score (the split part has no score of its own)
-    assert got.get("bianca") == pytest.approx(0.66)
+    assert got.get("sunniva") == pytest.approx(0.66)
     assert got.get("dez") == pytest.approx(0.66)
 
 

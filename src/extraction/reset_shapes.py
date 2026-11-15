@@ -114,7 +114,7 @@ def detect_global_reset(text) -> dict | None:
 
 def reset_payload(text) -> str:
     """The replacement data of a reset turn: everything after the LAST replacement
-    carrier ("… and replace with: Rowan Ellis (Ren), spouse Dana …" → the
+    carrier ("… and replace with: Rowan Ellis (Ren), spouse Katya …" → the
     profile body). No carrier → "" (a marker-only reset carries no new data). The MCP
     statement harvest ingests THIS span, so the imperative header never mints junk."""
     if not text:

@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS public.users (
     user_id UUID PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
-    slug TEXT NOT NULL UNIQUE, -- "christopher", "dana", etc. — used to derive schema name
+    slug TEXT NOT NULL UNIQUE, -- "christopher", "katya", etc. — used to derive schema name
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

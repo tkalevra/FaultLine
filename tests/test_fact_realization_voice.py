@@ -408,9 +408,9 @@ class TestConvertToProsePerspective:
         # subject must not steal it. Injected via the overlay (the live seam), so the guard is
         # actually exercised instead of silently falling back to a bare join.
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", side_effect=["Dana", "Cato"]):
+                patch("src.api.main.resolve_display_name", side_effect=["Katya", "Cato"]):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        assert prose == ["Dana is the parent of Cato"]
+        assert prose == ["Katya is the parent of Cato"]
 
     def test_object_side_you_stays_3p(self):
         """Object-side 'you' is already grammatical on the 3p template — only the
@@ -427,10 +427,10 @@ class TestConvertToProsePerspective:
         cur.fetchall.side_effect = [[]]  # same_as
 
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", return_value="Dana"):
+                patch("src.api.main.resolve_display_name", return_value="Katya"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        # Subject=Dana (3p), object resolves to "you" → grammatical 3p sentence.
-        assert prose == ["Dana is the parent of you"]
+        # Subject=Katya (3p), object resolves to "you" → grammatical 3p sentence.
+        assert prose == ["Katya is the parent of you"]
 
     def test_null_2p_falls_back_with_agreement_fixup(self):
         """Legacy/un-backfilled row: natural_language_2p IS NULL → 3p fallback with
@@ -885,7 +885,7 @@ class TestConvertToProseNamedInstanceJoin:
 
     def test_object_is_user_not_joined(self):
         """The user (object resolves to 'you') is NEVER type-tagged as a named instance:
-        'Dana is the parent of you', not 'a person named you'."""
+        'Katya is the parent of you', not 'a person named you'."""
         user_uuid = str(uuid4())
         other_uuid = str(uuid4())
         meta = dict(self._TEMPLATE_META)
@@ -898,7 +898,7 @@ class TestConvertToProseNamedInstanceJoin:
             "subject_id": other_uuid, "rel_type": "parent_of",
             "object_id": user_uuid, "fact_class": "A",
         }]
-        pref = {other_uuid: "Dana"}
+        pref = {other_uuid: "Katya"}
         db, cur = _mock_db()
         cur.fetchall.return_value = []
         cur.fetchone.return_value = ("zzz",)  # even if a stray type existed, the you-guard wins

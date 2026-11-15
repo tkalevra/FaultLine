@@ -446,7 +446,7 @@ _NAME_AFTER_TYPE_PHRASE = [
     # people and nicknames — including the owner's real family-roster shape
     ("My sons Cato and Desmond (Dez) are here.", "desmond", "dez"),
     ("An old school friend (Emma) called me.", "old school friend", "emma"),
-    ("I met my primary care provider (Priya) today.", "primary care provider", "priya"),
+    ("I met my primary care provider (Amara) today.", "primary care provider", "amara"),
     ("His younger brother (Davy) moved out.", "younger brother", "davy"),
     # places
     ("We hiked the national park (Nala) trail.", "national park", "nala"),

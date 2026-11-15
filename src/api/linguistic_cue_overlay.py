@@ -613,7 +613,7 @@ _BOOTSTRAP_KINSHIP_GENDER_MAP: dict[str, str] = {
 # CARVE-OUT (lean-seed): the DOMAIN-FLAVORED social roles (boss/colleague/roommate/classmate/coworker/
 # neighbour/acquaintance/manager) vary by domain and are NOT grammar primitives — so they are NOT
 # seeded. They are GROWN PER-TENANT from the OBSERVED construction: a possessed/apposed COMMON-noun role
-# head governing a PERSON-typed named instance ("my colleague Sam", "a roommate named Dana") that is
+# head governing a PERSON-typed named instance ("my colleague Sam", "a roommate named Katya") that is
 # NEITHER kinship NOR an already-grown social role → the role noun is queued (``linguistic_cue_candidate``
 # → re_embedder freq-gate ≥3 → ``<tenant>.linguistic_cues`` category='social_role', grown rel_type = the
 # generic person tie ``knows``). On a COLD tenant such an unknown role DEGRADES to the generic walkable

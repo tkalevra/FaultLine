@@ -474,8 +474,8 @@ class TestRestatementConvergence:
         not weld onto the speaker."""
         reg, cu, conn = self._reg("neg_seat")
         try:
-            reg.resolve(cu, "dana whitfield")           # a person, alias multi-token
-            e = reg.resolve(cu, "old dana whitfield")   # modifier_added-shape surface
+            reg.resolve(cu, "katya whitfield")           # a person, alias multi-token
+            e = reg.resolve(cu, "old katya whitfield")   # modifier_added-shape surface
             user_eid = cu  # user_id is a valid UUID
             assert e != user_eid, "converged onto the user entity"
         finally:

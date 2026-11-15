@@ -2,8 +2,8 @@
 -- Date: 2026-11-13
 -- Purpose: DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the B2 class.
 --
--- THE MEASURED WOUND (the owner's prod seat, 2026-11-13): "My spouse is Dana Feld and
--- she prefers to be called Day" landed BESIDE the prior spouse slot live —
+-- THE MEASURED WOUND (the owner's prod seat, 2026-11-13): "My spouse is Katya Feld and
+-- she prefers to be called Kat" landed BESIDE the prior spouse slot live —
 -- ``ingest.temporal_coexist`` "same-slot state conflict kept BOTH rows live (keep-both)" —
 -- and five test-junk spouse rows stayed live with it. The recall then served both readings.
 --

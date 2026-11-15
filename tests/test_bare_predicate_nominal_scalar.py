@@ -285,7 +285,7 @@ def test_a_kinship_head_still_reads_as_an_age_not_an_attribute_scalar():
 @requires_model
 def test_a_named_person_complement_still_belongs_to_the_naming_chain():
     """PROPN is deliberately excluded from the bare-nominal term (THE HARD LINE: a name is a name)."""
-    assert not [t for t in _scalars("my mother's name is Priya.") if t[1] == "name"]
+    assert not [t for t in _scalars("my mother's name is Amara.") if t[1] == "name"]
 
 
 @requires_model
@@ -334,7 +334,7 @@ def test_the_growth_loop_actually_closes_on_second_exposure(monkeypatch):
 @requires_model
 def test_an_oov_name_mistagged_as_a_common_noun_is_not_a_scalar_value():
     """⚠️ ``pos_ != PROPN`` DOES NOT EXCLUDE A NAME. MEASURED on en_core_web_sm: "Diane" in this slot
-    tags **NOUN NN** while "Priya" in the byte-identical frame tags **PROPN NNP** — the mis-tag
+    tags **NOUN NN** while "Amara" in the byte-identical frame tags **PROPN NNP** — the mis-tag
     tracks the name TOKEN, not the frame. Without the orthographic term this chain emitted
     ``(mother, name, "diane")`` beside the naming chain's correct ``(diane, parent_of, user)``,
     filing a PERSON'S NAME as an attribute VALUE (a HARD LINE violation) and reddening
@@ -352,8 +352,8 @@ def test_the_parser_really_does_mistag_that_name_as_a_common_noun():
     """The premise of the guard above, asserted against the live parser rather than from memory."""
     tags = {t.text: (t.pos_, t.dep_) for t in linguistics._parse("My mother's name is Diane.")}
     assert tags["Diane"] == ("NOUN", "attr"), tags
-    tags2 = {t.text: (t.pos_, t.dep_) for t in linguistics._parse("my mother's name is Priya.")}
-    assert tags2["Priya"] == ("PROPN", "attr"), tags2
+    tags2 = {t.text: (t.pos_, t.dep_) for t in linguistics._parse("my mother's name is Amara.")}
+    assert tags2["Amara"] == ("PROPN", "attr"), tags2
 
 
 @requires_model

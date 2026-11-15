@@ -147,7 +147,7 @@ def app_and_model(monkeypatch):
     monkeypatch.setattr(main, "QUERY_INTERROGATIVE_PREROUTE", False)
     monkeypatch.setattr(main, "CORRECTION_BYPASS_GATE", True)
     # The deterministic-first router (INTENT_DETERMINISTIC_FIRST, default ON) legitimately
-    # OWNS the driven sentence ("My sister Dana …" — speaker-anchored, cue-free, non-negated)
+    # OWNS the driven sentence ("My sister Katya …" — speaker-anchored, cue-free, non-negated)
     # and returns before GLiNER2. THIS pin is about the GLiNER2 off-loop discipline, so it
     # runs with the router OFF; the router's own off-loop discipline is pinned below.
     monkeypatch.setattr(main, "INTENT_DETERMINISTIC_FIRST", False)
@@ -187,7 +187,7 @@ async def _drive(app):
                 return await c.post(
                     "/classify-intent",
                     params={"user_id": "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"},
-                    json={"text": "My sister Dana moved to Halifax last spring."})
+                    json={"text": "My sister Katya moved to Halifax last spring."})
             finally:
                 done.set()
 

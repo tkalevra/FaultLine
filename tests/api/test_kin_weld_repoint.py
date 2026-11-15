@@ -674,12 +674,12 @@ def test_tautology_role_word_surface_refuses_both_sides():
 
 
 def test_tautology_never_fires_on_the_predicate_slot_r8():
-    """RG-B(2) (critic R5B): 'Dana is my wife.' is the INVERSE-COPULA family — the subject
+    """RG-B(2) (critic R5B): 'Katya is my wife.' is the INVERSE-COPULA family — the subject
     is a genuine name and the role phrase sits in the predicate slot. The tautology refusal
     keys on the NAME slot only; this shape must reach the adjudication, never refuse here."""
     NOUNS = frozenset({"wife", "spouse"})
-    assert kin_self_role_surface("Dana", "wife", "user", NOUNS) is None
-    assert kin_self_role_surface("dana", "wife", "user", NOUNS) is None
+    assert kin_self_role_surface("Katya", "wife", "user", NOUNS) is None
+    assert kin_self_role_surface("katya", "wife", "user", NOUNS) is None
     # ...but the same role word on a genuine USER-side frame still refuses
     assert kin_self_role_surface("user", "wife", "user", NOUNS) == "wife"
 

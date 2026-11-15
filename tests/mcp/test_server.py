@@ -1738,7 +1738,7 @@ async def test_recall_no_timestamp_prefix_when_not_temporal_ordered(mock_http_cl
     query_response.raise_for_status = MagicMock()
     query_response.json.return_value = {
         "facts": [
-            {"definition": "You are married to Dana", "fact_class": "A",
+            {"definition": "You are married to Katya", "fact_class": "A",
              "event_date": None, "rel_type": "spouse"},
         ],
         "attributes": {},
@@ -1751,7 +1751,7 @@ async def test_recall_no_timestamp_prefix_when_not_temporal_ordered(mock_http_cl
         result = await recall_memory_tool("who is my spouse", "user-alice")
 
     mem = result["memory"]
-    assert "You are married to Dana" in mem
+    assert "You are married to Katya" in mem
     assert "Event #" not in mem
     assert "order they happened" not in mem
 

@@ -25,7 +25,7 @@ from src.api.main import resolve_display_name, convert_to_prose
 #    Patch the REAL seam — which also makes them DB-independent.
 # 2) `fetchone`: these mocks only ever stubbed `fetchall`, so `cur.fetchone()` returned a
 #    truthy MagicMock — an "empty" mock DB that answers EVERY lookup with a MagicMock. That is
-#    what produced junk like "User and a User named Dana" (the instance_of/named-type probe
+#    what produced junk like "User and a User named Katya" (the instance_of/named-type probe
 #    "found" a MagicMock type). A real empty DB returns None; stub it honestly.
 def _meta(**rows):
     return patch("src.api.main.rel_type_overlay.resolve_current", return_value=rows)
@@ -160,13 +160,13 @@ class TestConvertToProse:
 
         # rel_types template now comes from the OVERLAY, not the cursor (see _meta note).
         with _meta(spouse=SPOUSE), patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["User", "Dana"]
+            mock_resolve.side_effect = ["User", "Katya"]
 
             prose_list = convert_to_prose([fact], mock_db)
 
         assert len(prose_list) == 1
         assert "User" in prose_list[0]
-        assert "Dana" in prose_list[0]
+        assert "Katya" in prose_list[0]
         assert "married" in prose_list[0].lower()
 
     def test_prose_class_c_no_label_leak(self):
@@ -319,7 +319,7 @@ class TestConvertToProse:
         # Templates via the OVERLAY (X/Y placeholders per natural_language contract).
         with _meta(spouse=SPOUSE, likes=LIKES), \
                 patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["User", "Dana", "User", "Art"]
+            mock_resolve.side_effect = ["User", "Katya", "User", "Art"]
 
             prose_list = convert_to_prose(facts, mock_db)
 
@@ -349,7 +349,7 @@ class TestConvertToProse:
 
         with _meta(parent_of=PARENT_OF, spouse=SPOUSE), \
                 patch("src.api.main.resolve_display_name") as mock_resolve:
-            mock_resolve.side_effect = ["Alice", "Bob", "Chris", "Dana"]
+            mock_resolve.side_effect = ["Alice", "Bob", "Chris", "Katya"]
 
             prose_list = convert_to_prose(facts, mock_db)
 

@@ -3,7 +3,7 @@
 
 THE MEASURED WOUND (DEV/BUGS/family-smoke-20261111/LIVE-OPENWEBUI-DIAGNOSIS.md, the owner's
 prod seat): "forget all previous family information and replace with: Rowan Ellis
-(Chris), spouse Dana Feld (Day), …" scored GLiNER2 CORRECTION @0.58 but
+(Chris), spouse Katya Feld (Kat), …" scored GLiNER2 CORRECTION @0.58 but
 ``classify_intent.correction_marker_gate`` REFUSED it — the note verbatim: "the turn
 carries NO explicit old-value/repair marker — a prescription/usage statement is not a
 repair; routes STATEMENT (ingest)" — so the whole 16:47–17:16 reset session ingested as
@@ -44,8 +44,8 @@ from src.extraction.reset_shapes import (  # noqa: E402
 # THE MEASURED PROD SENTENCE (the diagnosis §2, 16:47:46 turn — byte-shaped).
 RESET_TURN = (
     "forget all previous family information and replace with: "
-    "Rowan Ellis (Ren), spouse Dana Feld (Day), sons Cato 20 and "
-    "Desmond \"Dez\" 13, daughter Bianca \"Gabby\" 10"
+    "Rowan Ellis (Ren), spouse Katya Feld (Kat), sons Cato 20 and "
+    "Desmond \"Dez\" 13, daughter Sunniva \"Sunny\" 10"
 )
 
 
@@ -124,4 +124,4 @@ def test_detect_declines_non_reset_carrier_sentence():
 
 
 def test_detect_declines_plain_statement():
-    assert detect_global_reset("My wife is Dana Feld and she prefers to be called Day") is None
+    assert detect_global_reset("My wife is Katya Feld and she prefers to be called Kat") is None

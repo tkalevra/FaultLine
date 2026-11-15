@@ -1,6 +1,6 @@
 """HARD LINE — the USER ANCHOR is never given a `subclass_of` edge by the what-is climb.
 
-Regression for the category error: ingesting "My manager is Priya Sharma." queued the user
+Regression for the category error: ingesting "My manager is Amara Sharma." queued the user
 ANCHOR itself as a novel concept-object, and the re_embedder what-is climb classified it and
 minted `(user, subclass_of, role)` (+ the role→social_role→function ladder), which then leaked
 into unrelated recalls.
@@ -90,7 +90,7 @@ def test_whatis_climb_never_ladders_the_user_anchor(conn):
             "   first_text_snippet, decision_reason, occurrence_count, last_seen_at,"
             "   re_embedder_decision)"
             "  VALUES ('related_to','unknown','unknown', %s, 'user', 'ingest_miss_pushback',"
-            "          'My manager is Priya Sharma.', 'test-hardline', 1, now(), NULL)"
+            "          'My manager is Amara Sharma.', 'test-hardline', 1, now(), NULL)"
             "  ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
             "  DO UPDATE SET re_embedder_decision = NULL, occurrence_count = 1, last_seen_at = now()",
             (USER,),

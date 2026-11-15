@@ -1088,7 +1088,7 @@ RELATIONSHIP RULES:
 - NEVER emit child_of with the speaker as subject. Use parent_of instead.
 - Siblings share a parent — emit sibling_of between them, not parent_of/child_of.
 - For "X and Y are children of Z": Z parent_of X, Z parent_of Y, X sibling_of Y.
-- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Dana" → (user, spouse, dana) AND (dana, also_known_as, dana) if needed.
+- POSSESSIVE FORMS: "my wife's name is X", "my husband is X", "my son is Y" → ALWAYS emit spouse/child_of FIRST, then separately emit also_known_as for the name. Example: "my wife's name is Katya" → (user, spouse, katya) AND (katya, also_known_as, katya) if needed.
 - BIDIRECTIONAL EMISSION: For inverse rel_types (parent_of/child_of, spouse, sibling_of), ALWAYS emit BOTH directions as separate facts. If you emit (user, parent_of, alice), you MUST also emit (alice, child_of, user). If you emit (user, spouse, emma), you MUST also emit (emma, spouse, user). If you emit (alice, sibling_of, charlie), you MUST also emit (charlie, sibling_of, alice). Example: "I have a son named alice, my husband emma" → (user, parent_of, alice) + (alice, child_of, user) + (user, spouse, emma) + (emma, spouse, user). This ensures the graph is complete in both directions.
 
 REL_TYPE REFERENCE:
@@ -1341,7 +1341,7 @@ async def rewrite_to_triples(text: str, valves, model: str, url: str, auth_heade
                 falls back to simple formatting.
 
                 Example outputs:
-                - "Dana is your spouse (Class A, confidence 1.0)"
+                - "Katya is your spouse (Class A, confidence 1.0)"
                 - "You are the parent of alice (Class B, awaiting confirmation)"
                 - "You are 12 years old (Class A)"
                 """

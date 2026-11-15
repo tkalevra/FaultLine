@@ -26,14 +26,14 @@ THE FIX (src/extraction/linguistics.py, flag SPINE_ROLE_HEAD_NO_BIND default ON)
 PRESERVED (all pinned below): negation absence ("My wife is not Ophelia." binds nothing), the
 "is not named X but Y" predicate-negation shape (derives [] byte-identically), the correction
 shape (the ASSERTED name binds; the role word never welds), non-kin possessed heads ("my manager
-is Priya Sharma" keeps its legacy reading), sortals ("my car is a Tesla Model 3" untouched), the
+is Amara Sharma" keeps its legacy reading), sortals ("my car is a Tesla Model 3" untouched), the
 broad flag's certified flag-ON behavior (byte-parity), and the rollback arm
 (SPINE_ROLE_HEAD_NO_BIND=false → the pre-fix baseline exactly, weld included).
 
 Known residual (out of scope, pre-existing in BOTH flag states): a name the sm tagger mis-types
 NOUN/ADJ (Cassian → NOUN, Winifred/Odile → ADJ acomp) is not a PROPER-NAME complement — the
 naming chains decline and the legacy weld/has_state twin remains; and the INVERSE copula order
-("Dana is my wife.") is a different frame (role in the attr slot), owned by the caller-seam
+("Katya is my wife.") is a different frame (role in the attr slot), owned by the caller-seam
 naming analyzer behind SPINE_NAMING_CHAIN.
 """
 import datetime
@@ -132,11 +132,11 @@ def test_correction_shape_binds_the_asserted_name():
 def test_nonkin_role_stays_owner_opt_in():
     # The <role>_of novel-rel leg must NOT arm under the no-bind flag alone — a new default
     # never inherits a dormant broad flag's owner-opt-in surface.
-    triples = _triples(m.derive_sentence_facts("My manager is Priya Sharma.", _REF))
+    triples = _triples(m.derive_sentence_facts("My manager is Amara Sharma.", _REF))
     assert not any(r == "manager_of" for _s, r, _o in triples), triples
     assert not any(r == "also_known_as" and o == "manager" for _s, r, o in triples), triples
     # legacy certified reading unchanged
-    assert ("user", "manager", "priya sharma") in triples, triples
+    assert ("user", "manager", "amara sharma") in triples, triples
 
 
 def test_sortal_possessed_head_untouched():

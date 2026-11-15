@@ -248,7 +248,7 @@ def _type_mismatch_refuse_on() -> bool:
 
 # ── STORED-TYPE PRECEDENCE (the convergence residual: the T04 pet misroute) ─────────
 # THE WOUND (acceptance5, seat 92f2b86a, image c27d55211d, 2026-11-15 — kept-seat
-# forensics re-measured on residual-autopsy4 seat f7199b8f: dana1.entity_type='Person'
+# forensics re-measured on residual-autopsy4 seat f7199b8f: katya1.entity_type='Person'
 # and fraggle.entity_type='Animal' were CORRECT in the DB the whole time): "Fraggle is
 # Mars's morkie." still type_refused because the REFUSAL CHECK validated the CALLER-
 # PASSED per-mention surface guesses ('mars' → LOCATION by the planet heuristic,

@@ -18,7 +18,7 @@ These cover the pure-logic + DB-bound surfaces with a fake cursor (no live DB):
                                     (engine can NEVER re-link a user-severed pair)
 
 Subject-agnostic: no hardcoded group/rel names are asserted; the fakes drive the
-metadata so "Dana's pets aren't her family" works the same as "my pets ...".
+metadata so "Katya's pets aren't her family" works the same as "my pets ...".
 """
 from src.api import main as m
 from src.re_embedder import embedder as e
@@ -129,9 +129,9 @@ def test_detect_structural_correction_groups_nesting_negation():
 
 
 def test_detect_subject_agnostic_other_anchor():
-    # "Dana's pets aren't her family" — same op, different anchor.
+    # "Katya's pets aren't her family" — same op, different anchor.
     conn, _ = _make_conn()
-    det = m._detect_structural_correction("Dana's pets are not part of her family", conn)
+    det = m._detect_structural_correction("Katya's pets are not part of her family", conn)
     assert det is not None
     assert det["parent"] == "family"
     assert det["child"] == "pets"

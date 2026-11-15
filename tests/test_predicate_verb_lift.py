@@ -41,7 +41,7 @@ class TestLiftPredicateMorphology:
 
     def test_load_bearing_preposition_kept(self):
         # lives_in ≠ lives_at — the preposition immediately after the verb survives.
-        assert P.lift_predicate("Dana lives in Toronto", "dana", "toronto") == "live_in"
+        assert P.lift_predicate("Katya lives in Toronto", "katya", "toronto") == "live_in"
 
     def test_leading_adverb_dropped(self):
         # "just" is an adverb between subject and verb — the lift starts at the real verb.

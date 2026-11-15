@@ -74,7 +74,7 @@ def _triples(text):
     ("Kai is a member of the hockey team.", ("kai", "member_of", "hockey team")),
     ("The GPS is a part of the car.", ("gps", "part_of", "car")),
     ("Marlow is a friend of Devon.", ("marlow", "friend_of", "devon")),
-    ("Eli is the child of Dana.", ("eli", "child_of", "dana")),
+    ("Eli is the child of Katya.", ("eli", "child_of", "katya")),
 ])
 def test_declared_relational_frame_replaces_the_instance_of_reading(frames, text, expected):
     t = _triples(text)

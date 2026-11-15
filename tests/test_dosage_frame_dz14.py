@@ -114,7 +114,7 @@ def test_dosage_frame_floor_builds_the_extraction_the_llm_could_not():
     assert out["old_value"] == "10"  # the REJECTED numeral, never the new value's own
     assert out["dimension"] == "SCALAR"
     # non-dosage frames decline (no aspect-NP subject, no possessive, no quantity)
-    assert _dosage_correction_frame_floor("Actually, my sister's name is Marlow, not Dana.") is None
+    assert _dosage_correction_frame_floor("Actually, my sister's name is Marlow, not Katya.") is None
     assert _dosage_correction_frame_floor("the measure is 7 centimeters, not 5") is None
     assert _dosage_correction_frame_floor("") is None
 

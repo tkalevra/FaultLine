@@ -235,7 +235,7 @@ class TestApplyConfidenceGate:
         """Test that facts below min_confidence are excluded."""
         db_facts = [
             {"subject": "user", "rel_type": "parent_of", "object": "child", "confidence": 1.0, "fact_class": "A"},
-            {"subject": "user", "rel_type": "spouse", "object": "dana", "confidence": 0.8, "fact_class": "B"},
+            {"subject": "user", "rel_type": "spouse", "object": "katya", "confidence": 0.8, "fact_class": "B"},
             {"subject": "user", "rel_type": "has_pet", "object": "fido", "confidence": 0.3, "fact_class": "C"},  # Below threshold
         ]
 
@@ -251,7 +251,7 @@ class TestApplyConfidenceGate:
         db_facts = [
             {"subject": "user", "rel_type": "has_pet", "object": "fido", "confidence": 0.6, "fact_class": "B"},
             {"subject": "user", "rel_type": "parent_of", "object": "child", "confidence": 1.0, "fact_class": "A"},
-            {"subject": "user", "rel_type": "spouse", "object": "dana", "confidence": 0.8, "fact_class": "B"},
+            {"subject": "user", "rel_type": "spouse", "object": "katya", "confidence": 0.8, "fact_class": "B"},
         ]
 
         result = apply_confidence_gate(db_facts, [], min_confidence=0.4)
@@ -306,7 +306,7 @@ class TestApplyConfidenceGate:
         db_facts = []
         qdrant_facts = [
             {
-                "subject": "user", "rel_type": "spouse", "object": "dana", "confidence": 0.8, "fact_class": "B",
+                "subject": "user", "rel_type": "spouse", "object": "katya", "confidence": 0.8, "fact_class": "B",
                 "qdrant_score": 0.5
             },
             {
@@ -365,7 +365,7 @@ class TestApplyConfidenceGate:
     def test_mixed_sources_merged_ordered(self):
         """Test that DB + Qdrant facts are merged and properly ordered."""
         db_facts = [
-            {"subject": "user", "rel_type": "spouse", "object": "dana", "confidence": 0.8, "fact_class": "B"},
+            {"subject": "user", "rel_type": "spouse", "object": "katya", "confidence": 0.8, "fact_class": "B"},
         ]
         qdrant_facts = [
             {

@@ -175,11 +175,11 @@ def test_rollback_then_resolve_lands_in_tenant_schema(tenant):
     user = str(uuid.uuid4())
     _lose_the_binding(conn, sch)
     reg = EntityRegistry(conn, auto_commit=False, schema_name=sch)  # main.py:28855's shape
-    rid = reg.resolve(user, "priya")
+    rid = reg.resolve(user, "amara")
     assert uuid.UUID(rid)
     assert _show(conn) == sch, "the registry must leave the connection bound to the tenant"
-    assert _count(conn, f"{sch}.entity_aliases", "priya") == 1
-    assert _count(conn, "public.entity_aliases", "priya") == 0
+    assert _count(conn, f"{sch}.entity_aliases", "amara") == 1
+    assert _count(conn, "public.entity_aliases", "amara") == 0
 
 
 @needs_db
@@ -270,15 +270,15 @@ def test_unbound_registry_refuses_under_per_tenant_operation(tenant, monkeypatch
     reg = EntityRegistry(conn, auto_commit=False)  # ← the construction-site defect
     this_line = _line_of(__file__, "reg = EntityRegistry(conn, auto_commit=False)  # ← the construction-site defect")
     with pytest.raises(RegistrySearchPathError) as ei:
-        reg.resolve(str(uuid.uuid4()), "priya")
+        reg.resolve(str(uuid.uuid4()), "amara")
     assert "unbound_registry_refused" in str(ei.value)
     assert rec.calls, "refusal must be CRIT-logged, not just raised"
     msg, kw = rec.calls[0]
     site = kw.get("construction_site", "")
     assert site == f"{Path(__file__).name}:{this_line}::{test_unbound_registry_refuses_under_per_tenant_operation.__name__}", site
     assert kw.get("op") == "resolve"
-    assert _count(conn, "public.entity_aliases", "priya") == 0
-    assert _count(conn, f"{sch}.entity_aliases", "priya") == 0
+    assert _count(conn, "public.entity_aliases", "amara") == 0
+    assert _count(conn, f"{sch}.entity_aliases", "amara") == 0
     # every public DB-touching method refuses the same way
     for call in (lambda: reg.register_alias("x", "y"), lambda: reg.get_preferred_name("x"),
                  lambda: reg.get_any_alias("x"), lambda: reg.get_all_aliases("x")):

@@ -64,20 +64,20 @@ VALUES
   ('\bi\s+wants?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'First-person: I want to be called X', 'I want to be called Chris', 'preference', 'hardcoded_legacy', 0.87),
 
   -- Third-person preference patterns
-  ('([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+prefers?\s+(?:to\s+be\s+called\s+)?([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, age N, who prefers X', 'Dana, age 10, who prefers emma', 'preference', 'hardcoded_legacy', 0.88),
-  ('([A-Z][a-z]+)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name prefers to be called X', 'Dana prefers to be called emma', 'preference', 'hardcoded_legacy', 0.89),
+  ('([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+prefers?\s+(?:to\s+be\s+called\s+)?([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, age N, who prefers X', 'Katya, age 10, who prefers emma', 'preference', 'hardcoded_legacy', 0.88),
+  ('([A-Z][a-z]+)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name prefers to be called X', 'Katya prefers to be called emma', 'preference', 'hardcoded_legacy', 0.89),
   ('([A-Z][a-z]+)(?:(?:,\s*age\s+\d+|,\s*our\s+(?:son|daughter|child)|,\s*a\s+(?:son|daughter|child))\s*,?\s*)?,?\s*who\s+goes\s+by\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, age N, who goes by X', 'Diana, age 12, who goes by alice', 'preference', 'hardcoded_legacy', 0.87),
-  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )([A-Z][a-z]+)\s+goes\s+by\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name goes by X', 'Dana goes by emma', 'preference', 'hardcoded_legacy', 0.86),
-  ('([A-Z][a-z]+)\s*,\s*known\s+as\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, known as X', 'Dana, known as emma', 'preference', 'hardcoded_legacy', 0.85),
+  ('(?<!who )(?<!she )(?<!he )(?<!it )(?<!they )([A-Z][a-z]+)\s+goes\s+by\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name goes by X', 'Katya goes by emma', 'preference', 'hardcoded_legacy', 0.86),
+  ('([A-Z][a-z]+)\s*,\s*known\s+as\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: Name, known as X', 'Katya, known as emma', 'preference', 'hardcoded_legacy', 0.85),
   ('who\s+prefers?\s+([A-Z][a-z]+)', 'pref_name', 'Third-person: who prefers X (bare)', 'who prefers bob', 'preference', 'hardcoded_legacy', 0.80),
   ('(?:she|he|it)\s+wants?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'Third-person pronoun: wants to be called X', 'she wants to be called Thumbelina', 'preference', 'hardcoded_legacy', 0.84),
   ('(?:she|he|it)\s+prefers?\s+to\s+be\s+called\s+([A-Z][a-z]+)', 'pref_name', 'Third-person pronoun: prefers to be called X', 'he prefers to be called bob', 'preference', 'hardcoded_legacy', 0.86),
 
   -- Marriage patterns
-  ('\b(?:i\s+am|i''m)\s+married\s+to\s+([A-Z][a-z]+)', 'spouse', 'User: I am married to X', 'I am married to Dana', 'relationship', 'hardcoded_legacy', 0.91),
-  ('\bmarried\s+to\s+([A-Z][a-z]+)', 'spouse', 'Married to X', 'married to Dana', 'relationship', 'hardcoded_legacy', 0.88),
-  ('\bmy\s+(wife|husband|spouse|partner)\s+([A-Z][a-z]+)', 'spouse', 'My spouse/wife/husband X', 'my wife Dana', 'relationship', 'hardcoded_legacy', 0.90),
-  ('([A-Z][a-z]+)\s+is\s+my\s+(wife|husband|spouse|partner)', 'spouse', 'Name is my spouse/wife/husband', 'Dana is my wife', 'relationship', 'hardcoded_legacy', 0.89),
+  ('\b(?:i\s+am|i''m)\s+married\s+to\s+([A-Z][a-z]+)', 'spouse', 'User: I am married to X', 'I am married to Katya', 'relationship', 'hardcoded_legacy', 0.91),
+  ('\bmarried\s+to\s+([A-Z][a-z]+)', 'spouse', 'Married to X', 'married to Katya', 'relationship', 'hardcoded_legacy', 0.88),
+  ('\bmy\s+(wife|husband|spouse|partner)\s+([A-Z][a-z]+)', 'spouse', 'My spouse/wife/husband X', 'my wife Katya', 'relationship', 'hardcoded_legacy', 0.90),
+  ('([A-Z][a-z]+)\s+is\s+my\s+(wife|husband|spouse|partner)', 'spouse', 'Name is my spouse/wife/husband', 'Katya is my wife', 'relationship', 'hardcoded_legacy', 0.89),
 
   -- Child/parent patterns
   ('a\s+(daughter|son|child)\s+([A-Z][a-z]+)', 'parent_of', 'Child pattern: a daughter/son X', 'a daughter Diana', 'family', 'hardcoded_legacy', 0.87),

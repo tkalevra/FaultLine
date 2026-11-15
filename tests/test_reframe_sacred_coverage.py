@@ -59,17 +59,17 @@ class TestDropDetection:
         assert dropped == set()
 
     def test_dropped_number_flagged(self):
-        raw = "We have three kids: Bianca who is 10 and Dez who is 12."
+        raw = "We have three kids: Sunniva who is 10 and Dez who is 12."
         # Split lost Dez's age.
         dropped = R._atomization_drops_sacred_token(
-            raw, _atoms("We have kids Bianca and Dez.", "Bianca is 10."))
+            raw, _atoms("We have kids Sunniva and Dez.", "Sunniva is 10."))
         assert "12" in dropped
 
     def test_all_names_and_numbers_covered_ok(self):
-        raw = "We have three kids: Bianca who is 10 and Dez who is 12."
+        raw = "We have three kids: Sunniva who is 10 and Dez who is 12."
         dropped = R._atomization_drops_sacred_token(
-            raw, _atoms("We have kids Bianca and Dez.",
-                        "Bianca is 10.", "Dez is 12."))
+            raw, _atoms("We have kids Sunniva and Dez.",
+                        "Sunniva is 10.", "Dez is 12."))
         assert dropped == set()
 
 

@@ -94,7 +94,7 @@ def test_w4s_ordinal_applies_ONLY_to_the_grade_class():
     grade class the store types."""
     from src.api.main import _scalar_attr_possessive_prose as _sp
 
-    assert _sp("Priya", "age", "7", False, "age") == "Priya's age is 7"
+    assert _sp("Amara", "age", "7", False, "age") == "Amara's age is 7"
     assert _sp("The pack", "count", "7", False, "quantity") == (
         "The pack's count is 7")
     assert _sp("Server", "ram", "64 gigabytes", False, "ram") == (

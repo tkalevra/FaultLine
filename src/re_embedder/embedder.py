@@ -649,7 +649,7 @@ def _gliner2_type_doc(sdoc, gmodel, labels):
 
     Mirrored mechanics (keep in sync with main.py::_build_typed_doc): the
     ROUND-7 machine-value veto (``is_value_shape`` — a value is never an entity
-    span), the coordinated-surface split ("Bianca, Dez" → two spans), exact
+    span), the coordinated-surface split ("Sunniva, Dez" → two spans), exact
     case-insensitive substring locate → ``char_span(contract)`` (never fuzzy),
     longest-first overlap resolution, ``set_ents``. DELIBERATELY ABSENT: the
     GLiNER2 RELATION pass (main.py writes ``doc._.rel``) — that phase needs the

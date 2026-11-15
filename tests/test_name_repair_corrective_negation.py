@@ -134,8 +134,8 @@ def test_role_slot_alias_never_lands_on_the_rejected_rival():
 # ── no collateral damage on the non-repair paths ────────────────────────────────────────────────
 
 def test_plain_naming_assertion_unchanged():
-    edges = _edges("My wife's name is Dana.")
-    assert ("dana", "spouse", "user") in edges
+    edges = _edges("My wife's name is Katya.")
+    assert ("katya", "spouse", "user") in edges
     assert not [e for e in edges if e[1] == "pref_name"]
 
 

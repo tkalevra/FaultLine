@@ -45,7 +45,7 @@ from src.mcp.server import remember_facts_tool, retract_fact_tool  # noqa: E402
 BrainUnavailable = getattr(S, "BrainUnavailable", None) or type("BrainUnavailableMissing", (Exception,), {})
 
 _UID = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
-_TEXT = "My sister Dana moved to Halifax last spring and she works as a marine biologist."
+_TEXT = "My sister Katya moved to Halifax last spring and she works as a marine biologist."
 
 
 def _resp(json_body, status=200):
@@ -372,7 +372,7 @@ def test_remember_facts_healthy_path_unchanged_when_retry_lands(monkeypatch):
         "/confidence-gate": [{"threshold": 0.7}],
         "/episodic/append": [{"status": "stored", "id": 1}],
         "/internal/ingest-route": [{"statement_extractor": "spine"}],
-        "/harvest-spans": [{"edges": [{"subject": "dana", "rel_type": "lives_in",
+        "/harvest-spans": [{"edges": [{"subject": "katya", "rel_type": "lives_in",
                                        "object": "halifax"}]}],
         "/ingest": [{"status": "valid", "committed": 1, "staged": 0, "facts": []}],
     })
@@ -895,7 +895,7 @@ def test_spine_harvest_timeout_never_becomes_a_rewrite_run(monkeypatch):
     cause. Now: one retry, then queued + loud; /extract/rewrite and /ingest are NEVER called
     and the status is never `valid`."""
     be = _Backend({**_SPINE_OK, "/harvest-spans": [_timeout()],
-                   "/extract/rewrite": [{"edges": [{"subject": "dana", "rel_type": "lives_in",
+                   "/extract/rewrite": [{"edges": [{"subject": "katya", "rel_type": "lives_in",
                                                     "object": "halifax"}]}],
                    "/ingest": [{"status": "valid", "committed": 1, "staged": 0, "facts": []}]})
     monkeypatch.setattr(S, "_http_client", be)
@@ -914,7 +914,7 @@ def test_spine_harvest_timeout_never_becomes_a_rewrite_run(monkeypatch):
 
 def test_spine_harvest_retry_lands_and_the_turn_is_a_normal_spine_turn(monkeypatch):
     be = _Backend({**_SPINE_OK,
-                   "/harvest-spans": [_timeout(), {"edges": [{"subject": "dana", "rel_type": "lives_in",
+                   "/harvest-spans": [_timeout(), {"edges": [{"subject": "katya", "rel_type": "lives_in",
                                                               "object": "halifax"}]}],
                    "/ingest": [{"status": "valid", "committed": 1, "staged": 0, "facts": []}]})
     monkeypatch.setattr(S, "_http_client", be)
@@ -928,7 +928,7 @@ def test_spine_zero_edges_is_the_brains_decision_and_rewrite_fallback_stays(monk
     """The documented fail-safe survives: the brain ANSWERED with zero edges → /extract/rewrite
     is consulted. That is a decision, not a transport substitution."""
     be = _Backend({**_SPINE_OK, "/harvest-spans": [{"edges": []}],
-                   "/extract/rewrite": [{"edges": [{"subject": "dana", "rel_type": "lives_in",
+                   "/extract/rewrite": [{"edges": [{"subject": "katya", "rel_type": "lives_in",
                                                     "object": "halifax"}]}],
                    "/ingest": [{"status": "valid", "committed": 1, "staged": 0, "facts": []}]})
     monkeypatch.setattr(S, "_http_client", be)
@@ -943,7 +943,7 @@ def test_rewrite_lane_transport_failure_queues_instead_of_substituting_the_harve
     deterministic harvest (a different, weaker extractor) and reported 'stored'."""
     be = _Backend({**_SPINE_OK, "/internal/ingest-route": [{"statement_extractor": "rewrite"}],
                    "/extract/rewrite": [_timeout()],
-                   "/harvest-spans": [{"edges": [{"subject": "dana", "rel_type": "lives_in",
+                   "/harvest-spans": [{"edges": [{"subject": "katya", "rel_type": "lives_in",
                                                   "object": "halifax"}]}]})
     monkeypatch.setattr(S, "_http_client", be)
     out, log = _run(remember_facts_tool(_TEXT, _UID))
@@ -1299,7 +1299,7 @@ def test_d4_seat_unknown_in_turn_is_pending_queued_and_cache_invalidated(monkeyp
                                         {"status": "soft_error", "id": None, "reason": "seat_unknown"},
                                         {"status": "stored", "id": 3}],
                    "/provisioning/status": [{"status": "provisioning"}, {"status": "ready"}],
-                   "/harvest-spans": [{"edges": [{"subject": "dana", "rel_type": "lives_in", "object": "halifax"}]}],
+                   "/harvest-spans": [{"edges": [{"subject": "katya", "rel_type": "lives_in", "object": "halifax"}]}],
                    "/ingest": [{"status": "valid", "committed": 1, "staged": 0, "facts": []}]})
     monkeypatch.setattr(S, "_http_client", be)
     monkeypatch.setattr(S.asyncio, "sleep", _fast_sleep)
@@ -2748,7 +2748,7 @@ def test_recalls_inherit_the_wall_lanes_honour_it_through_the_bounded_client(mon
     monkeypatch.setattr(S, "_TURN_WALL_S", 3.0)
     monkeypatch.setattr(S, "_send_progress", lambda *a, **k: None)
     t0 = _time.monotonic()
-    out, log = _run(S.recall_memory_tool("my sister Dana moved to Halifax", _UID))
+    out, log = _run(S.recall_memory_tool("my sister Katya moved to Halifax", _UID))
     wall = _time.monotonic() - t0
     assert wall < 3.0 + 2.5, (wall, log[-500:])
     assert isinstance(out, dict) and (out.get("isError") or "retrieval failure" in str(out.get("memory", "")))

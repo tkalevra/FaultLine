@@ -237,9 +237,9 @@ def test_p70_family_surfaces_stem_match():
 
 def test_similar_named_person_shape_does_not_match():
     # A person surface carrying no digit-bearing hostname token can never match.
-    assert EntityRegistry._hostname_tokens("bianca") == []
-    assert EntityRegistry._hostname_stem_match("chris-p70", "bianca") is None
-    assert EntityRegistry._hostname_stem_match("daughter", "bianca") is None
+    assert EntityRegistry._hostname_tokens("sunniva") == []
+    assert EntityRegistry._hostname_stem_match("chris-p70", "sunniva") is None
+    assert EntityRegistry._hostname_stem_match("daughter", "sunniva") is None
 
 
 def test_hostname_guard_rejects_short_or_digitless_tokens():

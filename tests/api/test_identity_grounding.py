@@ -44,13 +44,13 @@ from src.entity_registry.registry import EntityRegistry, _FIRST_PERSON_PRONOUNS
     # Capitalized real names register (stored lowercased).
     ("My name is Christopher", "christopher"),
     ("I'm Chris", "chris"),
-    ("I am Dana", "dana"),
+    ("I am Katya", "katya"),
     ("Call me Bob", "bob"),
     ("People call me Dez", "dez"),
     # LOOSE ON INPUT: a legitimate LOWERCASE declaration must register too — the
     # old caps-gate dropped this, the bug this revision fixes.
     ("my name is chris", "chris"),
-    ("i'm dana", "dana"),
+    ("i'm katya", "katya"),
 ])
 def test_extract_identity_registers_names_loosely(text, expected):
     assert _extract_identity(text) == expected
@@ -91,7 +91,7 @@ def test_extract_preferred_name_single_char_floor():
 # stored lowercased).
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("alias", ["chris", "christopher", "dana", "bob", "dez"])
+@pytest.mark.parametrize("alias", ["chris", "christopher", "katya", "bob", "dez"])
 def test_surfaceable_accepts_real_names(alias):
     """A real (lowercased) name IS surfaceable as the user's name."""
     assert _is_surfaceable_user_name(alias) is True

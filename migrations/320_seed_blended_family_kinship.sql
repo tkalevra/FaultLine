@@ -19,7 +19,7 @@
 --   stepson / step-son / stepdaughter / step-daughter → step_parent_of (the live seat already
 --       reached step_parent_of through the LLM lane; the cue makes the deterministic rail agree)
 --   eldest / youngest / oldest → child_of (superlative birth-order kin cues — "our eldest,
---       Priya" binds child_of AT the named child)
+--       Amara" binds child_of AT the named child)
 --
 -- GENDER (kinship_gender): the gendered ex/step roles (the same convention as migration 117 —
 -- ONLY the roles whose gender the language states; eldest/youngest/oldest stay absent).
@@ -47,11 +47,11 @@ VALUES
   ('step-daughter', 'kinship_noun', 'step_parent_of',
    'My step-daughter Ailsa is 9.', 'seed_blended_family_kinship', 0.95),
   ('eldest', 'kinship_noun', 'child_of',
-   'Our eldest, Priya, turned 14 on January 22.', 'seed_blended_family_kinship', 0.90),
+   'Our eldest, Amara, turned 14 on January 22.', 'seed_blended_family_kinship', 0.90),
   ('youngest', 'kinship_noun', 'child_of',
    'Our youngest Saskia is 3.', 'seed_blended_family_kinship', 0.90),
   ('oldest', 'kinship_noun', 'child_of',
-   'Our oldest, Priya, turned 14 on January 22.', 'seed_blended_family_kinship', 0.90),
+   'Our oldest, Amara, turned 14 on January 22.', 'seed_blended_family_kinship', 0.90),
   ('ex-wife', 'kinship_gender', 'female',
    'My ex-wife Isabelle and I split up in 2022.', 'seed_blended_family_kinship', 0.90),
   ('ex-husband', 'kinship_gender', 'male',

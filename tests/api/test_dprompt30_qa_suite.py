@@ -93,7 +93,7 @@ class TestScenario1ComplexFamilyProse:
 
         text = (
             "My wife and I have three kids. My son Cato is 19. "
-            "My daughter Bianca, she goes by Gabby, she's 10. "
+            "My daughter Sunniva, she goes by Sunny, she's 10. "
             "My son Desmond, he prefers Dez, he's 12."
         )
         ingest = _ingest(client, text, self.uid)
@@ -170,7 +170,7 @@ class TestScenario2ComplexSystemMetadata:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestScenario3AliasResolution:
-    """Query using nickname 'Gabby' → resolves to Bianca."""
+    """Query using nickname 'Sunny' → resolves to Sunniva."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -182,15 +182,15 @@ class TestScenario3AliasResolution:
     def test_alias_resolution_under_query(self, app):
         client = TestClient(app)
 
-        # Ingest: Bianca with alias Gabby
+        # Ingest: Sunniva with alias Sunny
         edges = [
-            {"subject": "bianca", "object": "gabby", "rel_type": "pref_name",
+            {"subject": "sunniva", "object": "gabby", "rel_type": "pref_name",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "bianca", "object": "pizza", "rel_type": "likes",
+            {"subject": "sunniva", "object": "pizza", "rel_type": "likes",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
         ingest = _ingest(client,
-                        "Bianca goes by Gabby and likes pizza.",
+                        "Sunniva goes by Sunny and likes pizza.",
                         self.uid, edges=edges)
         assert ingest.get("status") == "valid", f"Ingest failed: {ingest}"
 
@@ -222,15 +222,15 @@ class TestScenario4AgeUpdate:
         client = TestClient(app)
 
         # Ingest age=10
-        r1 = _ingest(client, "Bianca is 10", self.uid)
+        r1 = _ingest(client, "Sunniva is 10", self.uid)
         assert r1.get("status") == "valid"
 
         # Ingest age=11
-        r2 = _ingest(client, "Bianca is 11", self.uid)
+        r2 = _ingest(client, "Sunniva is 11", self.uid)
         assert r2.get("status") == "valid"
 
         # Query — should return latest age (11), not both
-        result = _query(client, "how old is bianca", self.uid)
+        result = _query(client, "how old is sunniva", self.uid)
         assert result.get("status") == "ok"
 
         facts = result.get("facts", [])
@@ -471,13 +471,13 @@ class TestScenario10ExtendedFamily:
              "subject_type": "Person", "object_type": "Person"},
             {"subject": "alice", "object": "cato", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "alice", "object": "bianca", "rel_type": "parent_of",
+            {"subject": "alice", "object": "sunniva", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
             {"subject": "alice", "object": "desmond", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
         ]
         ingest = _ingest(client,
-                        "Alice married to Bob. Kids: Cato, Bianca, Desmond.",
+                        "Alice married to Bob. Kids: Cato, Sunniva, Desmond.",
                         self.uid, edges=edges)
         assert ingest.get("status") == "valid", f"Ingest failed: {ingest}"
 
@@ -516,13 +516,13 @@ class TestScenario11MyKidsAutoDiscovery:
              "subject_type": "Person", "object_type": "Person"},
             {"subject": "cato", "object": "student", "rel_type": "occupation",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "user", "object": "bianca", "rel_type": "parent_of",
+            {"subject": "user", "object": "sunniva", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "bianca", "object": "student", "rel_type": "occupation",
+            {"subject": "sunniva", "object": "student", "rel_type": "occupation",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
         ingest = _ingest(client,
-                        "Cato and Bianca are my kids. Both are students.",
+                        "Cato and Sunniva are my kids. Both are students.",
                         self.uid, edges=edges)
         assert ingest.get("status") == "valid"
 
@@ -644,7 +644,7 @@ class TestScenario14PartialReIngest:
 
         # Ingest 1: full family
         r1 = _ingest(client,
-                     "My wife and I have three kids: Cato (19), Gabby (10), Dez (12)",
+                     "My wife and I have three kids: Cato (19), Sunny (10), Dez (12)",
                      self.uid)
         assert r1.get("status") == "valid"
 

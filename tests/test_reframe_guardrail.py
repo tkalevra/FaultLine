@@ -470,8 +470,8 @@ class TestEnumerationSubjectlessSource:
         # METRIC FIX: an OK atom whose model `source` equals its `statement` (the common single-fact
         # case) must NOT be counted as rejected (the old text==source_span heuristic false-counted it).
         out = R._apply_guardrail(
-            [{"statement": "My wife is Dana.", "source": "My wife is Dana."}],
-            "My wife is Dana.")
+            [{"statement": "My wife is Katya.", "source": "My wife is Katya."}],
+            "My wife is Katya.")
         assert len(out) == 1
         assert out[0].rejected is False
 

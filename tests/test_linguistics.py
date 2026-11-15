@@ -268,8 +268,8 @@ def test_analyze_naming_all_mixed_kinds_subject_agnostic():
 def test_analyze_naming_all_no_construction_returns_empty():
     """No naming verb → empty list (fail-safe; the genitive-name chain owns 'My wife's name is X')."""
     m = _reload(LINGUISTIC_LAYER="true")
-    assert m.analyze_naming_all("My wife's name is Dana.") == []
-    assert m.analyze_naming("My wife's name is Dana.") is None
+    assert m.analyze_naming_all("My wife's name is Katya.") == []
+    assert m.analyze_naming("My wife's name is Katya.") is None
 
 
 # ─────────────────────────── POSSESSIVE HEAD (poss dep → head noun) ───────────────────────
@@ -1033,7 +1033,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
     os.environ.pop("POSTGRES_DSN", None)
     m = _reload(LINGUISTIC_LAYER="true")
     ref = _dt(2026, 6, 21)
-    sent = "I married dana"
+    sent = "I married katya"
     doc = m._parse(sent)
     assert doc is not None
     # locate the subject (nsubj of the content verb) and object (dobj) token indices.
@@ -1045,7 +1045,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
 
     # BASELINE (no minted rel) → SVO verb-lemma predicate ("marry") stands as the gap-fill.
     facts_svo = m.derive_sentence_facts(doc, ref)
-    svo_rels = {f.rel_type for f in facts_svo if f.object == "dana"}
+    svo_rels = {f.rel_type for f in facts_svo if f.object == "katya"}
     assert any(r.startswith("marry") for r in svo_rels), \
         f"SVO gap-fill predicate missing: {[(f.subject, f.rel_type, f.object) for f in facts_svo]!r}"
 
@@ -1056,7 +1056,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
     obj2 = next((c for c in verb2.children if c.dep_ in ("dobj", "obj")), None)
     assert m.set_minted_rel(doc2, subj2.i, obj2.i, "spouse")
     facts_minted = m.derive_sentence_facts(doc2, ref)
-    minted_rels = {f.rel_type for f in facts_minted if f.object == "dana"}
+    minted_rels = {f.rel_type for f in facts_minted if f.object == "katya"}
     assert "spouse" in minted_rels, \
         f"GLiNER2 minted rel did not win: {[(f.subject, f.rel_type, f.object) for f in facts_minted]!r}"
     # and the SVO verb lemma did NOT also emit a competing fact for the same pair.
@@ -1859,7 +1859,7 @@ def test_kinship_specific_rels_metadata_driven():
     """Fix 1/2: the specific kin rel comes from the kinship_noun cue map (son→child_of,
     wife→spouse), not an in-code literal."""
     assert ("desmond", "child_of", "user") in _triples(_derive("My son's name is Desmond.")), "son→child_of"
-    assert ("dana", "spouse", "user") in _triples(_derive("My wife's name is Dana.")), "wife→spouse"
+    assert ("katya", "spouse", "user") in _triples(_derive("My wife's name is Katya.")), "wife→spouse"
 
 
 @requires_model
@@ -2002,7 +2002,7 @@ def test_part1_genuine_phrasal_and_year_date_no_regression():
     ("two weeks ago", True),    # relative-time — already caught (no regression)
     ("yesterday", True),
     ("house", False),           # non-date noun — MUST be kept (no over-drop)
-    ("dana", False),
+    ("katya", False),
     ("sarah", False),
     ("gps system", False),
 ])
@@ -2237,9 +2237,9 @@ def test_coordinated_propn_list_appos_tail_not_dropped():
 def test_kinship_collective_routes_to_kin_rel_not_owns():
     # "kids"/"children" → child_of (member is SUBJECT), NEVER (user, owns/have, kids).
     m = _reload(LINGUISTIC_LAYER="true")
-    facts = m.derive_sentence_facts("We have three kids: Bianca, Dez, and Cato.", None)
+    facts = m.derive_sentence_facts("We have three kids: Sunniva, Dez, and Cato.", None)
     triples = {(f.subject, f.rel_type, (f.object or "").lower()) for f in facts}
-    assert ("bianca", "child_of", "user") in triples, triples
+    assert ("sunniva", "child_of", "user") in triples, triples
     assert ("dez", "child_of", "user") in triples, triples
     assert ("cato", "child_of", "user") in triples, triples
     # the collective head never becomes an owned/have object
@@ -2259,11 +2259,11 @@ def test_kinship_collective_gendered_head_emits_gender():
 
 @requires_model
 def test_non_kin_collective_members_each_captured():
-    # "My team has Sarah, Tom, and Priya" → three people; no member dropped, no merge.
+    # "My team has Sarah, Tom, and Amara" → three people; no member dropped, no merge.
     m = _reload(LINGUISTIC_LAYER="true")
-    facts = m.derive_sentence_facts("My team has Sarah, Tom, and Priya.", None)
+    facts = m.derive_sentence_facts("My team has Sarah, Tom, and Amara.", None)
     objs = {(f.object or "").lower() for f in facts}
-    assert {"sarah", "tom", "priya"} <= objs, objs
+    assert {"sarah", "tom", "amara"} <= objs, objs
 
 
 @requires_model
@@ -2327,12 +2327,12 @@ def test_affect_complements_empty_for_non_self_or_nominal():
 
 @requires_model
 def test_collective_kinship_list_routes_every_member_to_kin_rel():
-    """"We have three kids: Bianca, Dez, and Cato." → each member child_of the user; NO member is
+    """"We have three kids: Sunniva, Dez, and Cato." → each member child_of the user; NO member is
     instance_of the collective "kids", and the user never ``owns``/``has`` a member."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        "We have three kids: Bianca, Dez, and Cato.", _dt(2026, 6, 21))
-    kids = {"bianca", "dez", "cato"}
+        "We have three kids: Sunniva, Dez, and Cato.", _dt(2026, 6, 21))
+    kids = {"sunniva", "dez", "cato"}
     childof = {f.subject for f in facts if f.rel_type == "child_of" and f.object == "user"}
     assert kids <= childof, f"not every kid is child_of user: {facts!r}"
     # NO collective-noun type, NO possession junk for any member.
@@ -2349,8 +2349,8 @@ def test_collective_kinship_list_carries_intrinsic_gender():
     """A GENDERED kinship head distributes the intrinsic gender to each member (sons → male)."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        "We have three sons: Bianca, Dez, and Cato.", _dt(2026, 6, 21))
-    for who in ("bianca", "dez", "cato"):
+        "We have three sons: Sunniva, Dez, and Cato.", _dt(2026, 6, 21))
+    for who in ("sunniva", "dez", "cato"):
         assert any(f.subject == who and f.rel_type == "child_of" and f.object == "user"
                    for f in facts), f"{who} not child_of user: {facts!r}"
         assert any(f.subject == who and f.rel_type == "has_gender" and f.object == "male"
@@ -2363,8 +2363,8 @@ def test_collective_group_list_member_of_and_singular_type():
     member_of the governing group; the plural collective is never a member's type."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        "My team has three engineers: Sarah, Tom, and Priya.", _dt(2026, 6, 21))
-    for who in ("sarah", "tom", "priya"):
+        "My team has three engineers: Sarah, Tom, and Amara.", _dt(2026, 6, 21))
+    for who in ("sarah", "tom", "amara"):
         assert any(f.subject == who and f.rel_type == "instance_of" and f.object == "engineer"
                    for f in facts), f"{who} not instance_of singular 'engineer': {facts!r}"
         assert any(f.subject == who and f.rel_type == "member_of" and f.object == "team"
@@ -2417,18 +2417,18 @@ def test_collective_single_appositive_rename_does_not_fire():
 @requires_model
 def test_propn_age_survives_noisy_gliner_type():
     """FIX A (live-only bug): the copula-measure additive guard must NOT let a NOISY GLiNER2 type veto a
-    PROPER-NOUN subject's bare-cardinal age. We force "Bianca" to the (wrong) ANIMAL type on the Doc
+    PROPER-NOUN subject's bare-cardinal age. We force "Sunniva" to the (wrong) ANIMAL type on the Doc
     — exactly what live GLiNER2 does for a one-name micro-sentence — and assert the age still lands."""
     m = _reload(LINGUISTIC_LAYER="true")
-    doc = m._parse("Bianca is 10.")
+    doc = m._parse("Sunniva is 10.")
     assert doc is not None
-    span = doc.char_span(0, len("Bianca"), label="ANIMAL", alignment_mode="contract")
+    span = doc.char_span(0, len("Sunniva"), label="ANIMAL", alignment_mode="contract")
     assert span is not None
     doc.set_ents([span])
     # sanity: the subject really carries the noisy non-Person type the guard would otherwise veto on.
     assert any(e.label_ == "ANIMAL" for e in doc.ents)
     facts = m.derive_sentence_facts(doc, _dt(2026, 6, 21))
-    assert any(f.subject == "bianca" and f.rel_type == "age" and f.object == "10"
+    assert any(f.subject == "sunniva" and f.rel_type == "age" and f.object == "10"
                for f in facts), f"PROPN age vetoed by noisy NER type: {facts!r}"
     # NOTE: the complementary "COMMON-noun subject with an incompatible type STILL steps aside" case
     # depends on the rel_types ``head_types`` metadata resolved from the DB; offline that metadata is
@@ -2439,8 +2439,8 @@ def test_propn_age_survives_noisy_gliner_type():
 # ──────────────────────────────────────────────────────────────────────────────
 # split_enumeration — the DETERMINISTIC colon-enumeration pre-split (atomizer net)
 #
-# The LLM atomizer's split of a colon list varies run-to-run (folds "a designer named Priya" into
-# the membership line → downstream drops Priya's member_of; drops a per-member attribute; or leaves
+# The LLM atomizer's split of a colon list varies run-to-run (folds "a designer named Amara" into
+# the membership line → downstream drops Amara's member_of; drops a per-member attribute; or leaves
 # the dense sentence un-split on a REFRAME timeout). split_enumeration normalizes the structurally
 # obvious colon list deterministically so the spine sees the SAME atom set every time. These tests
 # are pure-function (spaCy only, no LLM/DB) and assert determinism + the fabrication guard.
@@ -2451,12 +2451,12 @@ def test_split_enumeration_relative_and_naming_mixed():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
     out = m.split_enumeration(
         "My team has three engineers: Sarah who is 35, Tom who is a backend dev, "
-        "and a designer named Priya.")
+        "and a designer named Amara.")
     assert out == [
-        "My team has three engineers: Sarah, Tom, and Priya.",
+        "My team has three engineers: Sarah, Tom, and Amara.",
         "Sarah is 35.",
         "Tom is a backend dev.",
-        "Priya is a designer.",
+        "Amara is a designer.",
     ]
 
 
@@ -2478,10 +2478,10 @@ def test_split_enumeration_all_naming_items():
 def test_split_enumeration_relative_clauses():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
     out = m.split_enumeration(
-        "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19.")
+        "We have three kids: Sunniva who is 10, Dez who is 12, and Cato who is 19.")
     assert out == [
-        "We have three kids: Bianca, Dez, and Cato.",
-        "Bianca is 10.",
+        "We have three kids: Sunniva, Dez, and Cato.",
+        "Sunniva is 10.",
         "Dez is 12.",
         "Cato is 19.",
     ]
@@ -2492,7 +2492,7 @@ def test_split_enumeration_is_deterministic_across_repeats():
     # determinism is the deliverable — the SAME input must give the SAME atom set every call.
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
     txt = ("My team has three engineers: Sarah who is 35, Tom who is a backend dev, "
-           "and a designer named Priya.")
+           "and a designer named Amara.")
     first = m.split_enumeration(txt)
     for _ in range(8):
         assert m.split_enumeration(txt) == first
@@ -2510,7 +2510,7 @@ def test_split_enumeration_affect_list_not_an_enumeration():
 @requires_model
 def test_split_enumeration_no_colon_returns_none():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
-    assert m.split_enumeration("My wife is Dana.") is None
+    assert m.split_enumeration("My wife is Katya.") is None
 
 
 @requires_model
@@ -2527,7 +2527,7 @@ def test_split_enumeration_fabrication_guard_rejects_invented_token(monkeypatch)
     # split (USER IS TRUTH). Simulate by forcing a parse that would inject a foreign name; here we
     # assert the guard path by checking a clean split has every token grounded in the source.
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
-    src = "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19."
+    src = "We have three kids: Sunniva who is 10, Dez who is 12, and Cato who is 19."
     out = m.split_enumeration(src)
     src_tokens = set(__import__("re").findall(r"[a-z0-9]+", src.lower())) | {"is"}
     for atom in out:
@@ -2539,7 +2539,7 @@ def test_split_enumeration_fabrication_guard_rejects_invented_token(monkeypatch)
 def test_split_enumeration_flag_off_returns_none():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="false")
     assert m.split_enumeration(
-        "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19.") is None
+        "We have three kids: Sunniva who is 10, Dez who is 12, and Cato who is 19.") is None
     _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")  # restore for other tests
 
 
@@ -2549,8 +2549,8 @@ def test_count_declarative_assertions_routes_multi_fact_statement():
     # A first-person declarative opening with a courtesy "tell you about" clause but ASSERTING
     # facts must score >= 2 so the caller routes it to STATEMENT (it was mis-scored QUERY → dropped).
     m = _reload(LINGUISTIC_LAYER="true")
-    txt = ("I wanted to tell you about my family. My wife's name is Dana. "
-           "We have three kids: Bianca, Dez, and Cato.")
+    txt = ("I wanted to tell you about my family. My wife's name is Katya. "
+           "We have three kids: Sunniva, Dez, and Cato.")
     assert m.count_declarative_assertions(txt) >= 2
 
 

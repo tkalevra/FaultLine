@@ -50,8 +50,8 @@ class TestQueryFamilyCompound:
 
         text = (
             "My name is Christopher, I prefer to be called Chris, "
-            "I am married to Dana, who prefers to be called Day. "
-            "We have 3 children, a daughter Bianca, age 10, who prefers Gabby, "
+            "I am married to Katya, who prefers to be called Kat. "
+            "We have 3 children, a daughter Sunniva, age 10, who prefers Sunny, "
             "Cato, our son is 19, and a son named Desmond, age 12, who goes by Dez."
         )
 
@@ -85,7 +85,7 @@ class TestQueryFamilyCompound:
 
         # Must have parent_of facts for 3 children
         parent_facts = [f for f in facts if f["rel_type"] == "parent_of"]
-        assert len(parent_facts) >= 3  # bianca, cato, desmond
+        assert len(parent_facts) >= 3  # sunniva, cato, desmond
 
         # Ages are stored in entity_attributes — verify via DB since
         # attribute-to-fact merging requires Qdrant (unavailable in test).

@@ -108,7 +108,7 @@ def test_turn_role_name_map_binds_passive_and_genitive():
     assert m.build_turn_role_name_map(
         "My mother is named Sarah and she is 62.") == {"mother": "sarah"}
     assert m.build_turn_role_name_map(
-        "My mother's name is Priya and she is 62.") == {"mother": "priya"}
+        "My mother's name is Amara and she is 62.") == {"mother": "amara"}
 
 
 def test_turn_role_name_map_empty_when_role_never_named():

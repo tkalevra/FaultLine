@@ -79,10 +79,10 @@ def test_apposition_is_LEFT_WHOLE_and_does_not_escalate():
 def test_relative_inside_an_apposition_is_still_lifted():
     """The apposition stays whole (the binder chain owns it) but the relative clause riding on it
     is still promoted to its own assertion."""
-    out = decompose_assertions("My daughter Bianca, who is 10, broke her leg.")
+    out = decompose_assertions("My daughter Sunniva, who is 10, broke her leg.")
     assert len(out) == 2, out
     joined = " | ".join(out).lower()
-    assert "bianca is 10" in joined
+    assert "sunniva is 10" in joined
     assert "broke her leg" in joined
     assert "who" not in joined
 
@@ -109,7 +109,7 @@ def test_subordination_and_simple_clauses_are_left_whole(sentence):
 def test_colon_enumeration_is_handed_on_untouched():
     """Colon lists belong to split_enumeration / the LLM escalation — never to generic decomposition
     (which mis-attaches the count noun to every member)."""
-    s = "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19."
+    s = "We have three kids: Sunniva who is 10, Dez who is 12, and Cato who is 19."
     assert decompose_assertions(s) == [s]
     assert "unsplit_enumeration" in segmentation_residual_signals(s)
 
@@ -124,7 +124,7 @@ _CORPUS = [
     "I bought a car and sold the bike.",
     "My laptop, a Dell XPS 13, died yesterday.",
     "Paris, which is in France, is lovely.",
-    "My daughter Bianca, who is 10, broke her leg.",
+    "My daughter Sunniva, who is 10, broke her leg.",
     "I fixed the fence, painted the shed and mowed the lawn on Sunday.",
     "I got my car serviced on March 15th, and it was a great experience.",
     "I went to the store because it was raining.",

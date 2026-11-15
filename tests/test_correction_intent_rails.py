@@ -526,9 +526,9 @@ class TestMarriedToDenialRail:
         assert negated_name_assertion("I am not married to Wren.") == ("I", "Wren")
 
     def test_nna_married_to_conj_names(self):
-        got = negated_name_assertion("I am not married to Chris or Dana.")
+        got = negated_name_assertion("I am not married to Chris or Katya.")
         assert got is not None and got[0] == "I"
-        assert {w for w in got[1].split() if w not in ("or",)} == {"Chris", "Dana"}
+        assert {w for w in got[1].split() if w not in ("or",)} == {"Chris", "Katya"}
 
     def test_nna_married_to_class_pobj_stays_out(self):
         """A negated CLASS complement is a new negative FACT, not a correction."""
@@ -546,8 +546,8 @@ class TestMarriedToDenialRail:
 
     def test_floor_married_to_conj_scaffold(self):
         got = _api_main._negated_name_correction_floor(
-            "I am not married to Chris or Dana.")
-        assert set(got["denial_surfaces"]) == {"Chris", "Dana"}
+            "I am not married to Chris or Katya.")
+        assert set(got["denial_surfaces"]) == {"Chris", "Katya"}
 
     def test_wren_weld_not_revalidated(self):
         """THE WREN-REVALIDATE RAIL: the floor hands the gate the turn's named surface;
