@@ -54,10 +54,11 @@ hits=$(git grep -n -E '^(from saas|import saas)|[^_a-zA-Z]saas\.[a-z_]+\(' "$BRA
         | grep -vE ':[0-9]+:[[:space:]]*(from|import)[[:space:]]' | head -20 || true)
 # 4. CLOSED-ONLY cortex consumers. The cortex ITSELF is part of the open core since the
 #    2026-11-15 uplift (src/api/cortex.py, migrations/147_cortex_episodes.sql, the
-#    cortex_remember/cortex_recall MCP tools, the flagent_<uuid> schema — all ported
-#    public-src). What stays closed is the private line's console/gauntlet consumer layer;
-#    those names must never appear on a public branch.
-if git grep -q -iE 'cortex_engagement|cortex_ops' "$BRANCH" \
+#    cortex_remember/cortex_recall MCP tools, the flagent_<uuid> schema, the
+#    cortex_engagement counts table inside src/api/cortex.py — all ported public-src).
+#    What stays closed is the private line's ops-dashboard consumer surface (cortex_ops);
+#    that name must never appear on a public branch.
+if git grep -q -iE 'cortex_ops' "$BRANCH" \
      -- ':!tools/foss_gate.sh' ':!migrations' ':!CHANGELOG.md' 2>/dev/null; then
     bad "closed-only cortex consumer symbols present (console/engagement layer)"
 else
