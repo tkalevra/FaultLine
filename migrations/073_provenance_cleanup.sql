@@ -24,12 +24,26 @@ END
 WHERE fact_provenance IS NULL
    OR fact_provenance NOT IN ('user_stated', 'llm_inferred', 'llm_learned');
 
--- 1b. Backfill stale fact_provenance values in public.staged_facts (if table exists)
+-- 1b. Backfill stale fact_provenance values in public.staged_facts (if table AND column exist)
+-- GUARD CORRECTED (gauntlet first-boot-migration-corpus, 2026-09-16): this block tested only
+-- for the TABLE. `public.staged_facts` has NEVER carried a `fact_provenance` column — 012 adds
+-- that column to `facts` (the legacy public table) and the per-tenant staged_facts gets it from
+-- the template, never from a migration — so this DO block raised SQLSTATE 42703
+-- (undefined_column) on EVERY boot of EVERY box, the ledger recorded the whole file `failed`
+-- (unattributable error → nothing stamped), and 073 re-ran on every start: the public
+-- DROP/ADD CONSTRAINT pair and the whole per-tenant fan-out below were re-executed against
+-- every existing tenant on every boot. Block 1f two statements down already tests table AND
+-- column; this block now tests the same pair. A table with no such column has nothing to
+-- backfill — that is the guard's literal meaning, not a swallowed error.
 DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'staged_facts'
+    ) AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'staged_facts'
+          AND column_name = 'fact_provenance'
     ) THEN
         UPDATE public.staged_facts
         SET fact_provenance = CASE

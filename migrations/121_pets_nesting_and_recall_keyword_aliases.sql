@@ -65,6 +65,50 @@ BEGIN
                AND COALESCE(source, 'seeded') <> 'user_corrected'
         $upd$, _schema);
 
+        -- SEED-ORDER PRE-STEP (first-boot self-sufficiency): the alias INSERT below carries the
+        -- per-tenant FK rel_type_aliases.canonical_rel_type -> %I.rel_types(rel_type) (the FK is
+        -- created by migration 094). On schemas whose rel_types predates these canonical rows
+        -- (pre-ledger / drifted tenants), lives_in / feels are ABSENT and the FK rejects the
+        -- whole multi-row INSERT (23503) — the file then only applies on boot #2, if at all.
+        -- Fix: mirror the bootstrap mint copy (schema_manager.py: INSERT INTO rel_types
+        -- SELECT * FROM public.rel_types) so every schema this loop visits ends up with the SAME
+        -- canonical rows a fresh mint would get — skeleton INSERT (the 085-B3a column set,
+        -- proven present on every tenant) followed by a guarded metadata copy FROM public (the
+        -- 085-B3b column set), only for rows this step itself inserted (head_types IS NULL).
+        -- ON CONFLICT DO NOTHING never rewrites an existing row; idempotent on every re-run.
+        IF EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = _schema AND table_name = 'rel_types'
+        ) THEN
+            EXECUTE format($seed$
+                INSERT INTO %I.rel_types
+                    (rel_type, label, wikidata_pid, engine_generated, confidence,
+                     source, correction_behavior)
+                SELECT p.rel_type, p.label, p.wikidata_pid, p.engine_generated, p.confidence,
+                       p.source, p.correction_behavior
+                FROM public.rel_types p
+                WHERE p.rel_type IN ('lives_in', 'feels')
+                ON CONFLICT (rel_type) DO NOTHING
+            $seed$, _schema);
+
+            EXECUTE format($meta$
+                UPDATE %I.rel_types t SET
+                    head_types       = p.head_types,
+                    tail_types       = p.tail_types,
+                    is_symmetric     = p.is_symmetric,
+                    inverse_rel_type = p.inverse_rel_type,
+                    is_hierarchy_rel = p.is_hierarchy_rel,
+                    fact_class       = p.fact_class,
+                    storage_target   = p.storage_target,
+                    category         = p.category,
+                    natural_language = p.natural_language
+                FROM public.rel_types p
+                WHERE p.rel_type = t.rel_type
+                  AND t.rel_type IN ('lives_in', 'feels')
+                  AND t.head_types IS NULL
+            $meta$, _schema);
+        END IF;
+
         -- recall keyword aliases (ON CONFLICT on the per-tenant alias unique constraint)
         EXECUTE format($al$
             INSERT INTO %I.rel_type_aliases (canonical_rel_type, alias, source)

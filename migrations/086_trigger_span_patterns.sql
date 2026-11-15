@@ -34,7 +34,7 @@ VALUES
   ('\bmy\s+\w+\s+(?:is|was|are|were|has|have)\b', '__gliner2_span__',
    'possessive-attribute signal', 'my car is a Subaru', 'trigger', 'bootstrap', 0.6),
   ('\b(?:named|called|goes by)\b', '__gliner2_span__',
-   'naming signal', 'my son is named Sampson', 'trigger', 'bootstrap', 0.6),
+   'naming signal', 'my son is named Desmond', 'trigger', 'bootstrap', 0.6),
   ('\bby the way\b', '__gliner2_span__',
    'in-passing fact lead-in', 'by the way, I recently...', 'trigger', 'bootstrap', 0.55),
   ('\b(?:bought|sold|rented|leased|owns?|own)\b', '__gliner2_span__',

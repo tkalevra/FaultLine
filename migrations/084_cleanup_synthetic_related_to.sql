@@ -45,10 +45,39 @@
 --
 -- Per-tenant loop over every `faultline_%` schema (mirrors migration 079's idiom).
 -- Idempotent: re-running deletes nothing once the rows are gone. No DROP, no DDL.
+--
+-- FIXED AT CAUSE (gauntlet first-boot-migration-corpus, rounds 2–3, 2026-09-16). As shipped,
+-- the two DELETEs read `subject_id = user_id`. The per-tenant `facts` / `staged_facts` tables
+-- have NO `user_id` column (only `entity_attributes` carries one — the bound search_path IS
+-- the tenant scope), so on every box with at least one tenant the first DELETE raised
+-- SQLSTATE 42703 and the WHOLE fan-out DO block rolled back: nothing was ever deleted
+-- anywhere, and on the pre-ledger sweep it failed again on every boot. Under the boot ledger
+-- it is worse than failed: a tenant minted after this file shipped is stamped `applied` for it
+-- at mint, so the ledger never even re-runs it there.
+--
+-- THE PREDICATE THE FILE MEANT — "the row's subject IS the user's own entity UUID" — is the
+-- seat IDENTITY the schema name already carries, not a lookup of any alias string:
+--   * schema_manager.py::derive_user_slug_from_uuid — the slug IS the seat uuid, lowercased,
+--     '-' → '_' (validated against the UUID regex; raises otherwise);
+--   * schema_manager.py::derive_schema_name / main.py `f"faultline_{derive_user_slug_from_uuid(user_id)}"`
+--     — the tenant schema is `faultline_<slug>`;
+--   * schema_manager.py::_execute_bootstrap_queries — `INSERT INTO entities (id, entity_type)
+--     VALUES (<user_id>, 'Person')`: the seat's own entity row is keyed by the seat uuid itself.
+-- So the seat uuid is reconstructed from the schema name — `replace(substring(_schema FROM
+-- length('faultline_') + 1), '_', '-')` — and the DELETEs key on `subject_id = <that uuid>`.
+-- No alias is consulted: the placeholder alias 'user' can be stripped (bench sandbox resets,
+-- seats minted before it existed), demoted (a user-stated name takes is_preferred) or worn by
+-- a NON-seat entity, and none of those may change which rows this file removes.
+-- LOUD, NEVER GUESSED: if the reconstructed id matches no `entities` row in that schema (a
+-- legacy non-uuid slug, a schema minted some other way) the schema is SKIPPED with a NOTICE
+-- naming it and the id — the file never widens to "some entity that looks like the user".
+-- The other two guards are unchanged.
 
 DO $$
 DECLARE
     _schema  TEXT;
+    _seat    TEXT;
+    _found   INT;
     _deleted BIGINT;
 BEGIN
     FOR _schema IN
@@ -56,6 +85,21 @@ BEGIN
         FROM information_schema.schemata
         WHERE schema_name LIKE 'faultline\_%'
     LOOP
+        -- the seat's own entity id, from the schema name (see the header): never an alias lookup
+        _seat := replace(substring(_schema FROM length('faultline_') + 1), '_', '-');
+        _found := NULL;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = _schema AND table_name = 'entities'
+        ) THEN
+            EXECUTE format('SELECT 1 FROM %I.entities WHERE id = $1', _schema) INTO _found USING _seat;
+        END IF;
+        IF _found IS NULL THEN
+            RAISE NOTICE 'Migration 085: % — reconstructed seat id % matches no entities row; schema SKIPPED (not guessed)',
+                _schema, _seat;
+            CONTINUE;
+        END IF;
+
         -- facts (currently 0 matches in pre-prod; included for safety/idempotency)
         IF EXISTS (
             SELECT 1 FROM information_schema.tables
@@ -64,9 +108,9 @@ BEGIN
             EXECUTE format($del$
                 DELETE FROM %I.facts
                 WHERE rel_type = 'related_to'
-                  AND subject_id = user_id
+                  AND subject_id = $1
                   AND fact_provenance = 'llm_learned'
-            $del$, _schema);
+            $del$, _schema) USING _seat;
             GET DIAGNOSTICS _deleted = ROW_COUNT;
             RAISE NOTICE 'Migration 085: deleted % synthetic related_to row(s) from %.facts', _deleted, _schema;
         END IF;
@@ -79,9 +123,9 @@ BEGIN
             EXECUTE format($del$
                 DELETE FROM %I.staged_facts
                 WHERE rel_type = 'related_to'
-                  AND subject_id = user_id
+                  AND subject_id = $1
                   AND fact_provenance = 'llm_learned'
-            $del$, _schema);
+            $del$, _schema) USING _seat;
             GET DIAGNOSTICS _deleted = ROW_COUNT;
             RAISE NOTICE 'Migration 085: deleted % synthetic related_to row(s) from %.staged_facts', _deleted, _schema;
         END IF;

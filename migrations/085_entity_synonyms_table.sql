@@ -40,6 +40,39 @@ BEGIN
         FROM information_schema.schemata
         WHERE schema_name LIKE 'faultline\_%' ESCAPE '\'
     LOOP
+        -- SEED-ORDER PRE-STEP (first-boot self-sufficiency): the CREATE TABLE below carries
+        -- FOREIGN KEY (entity_id) REFERENCES %I.entities(id) — a SINGLE-column reference.
+        -- Migration 002 built entities with PRIMARY KEY (id, user_id) and pre-template tenants
+        -- carried that composite shape; a composite PK does NOT match a single-column FK
+        -- reference (SQLSTATE 42830), so on FIRST boot the CREATE TABLE failed here and the
+        -- aborted DO block left entity_synonyms absent from this and every later schema in the
+        -- loop. The current provisioning template (user_schema.sql) has id TEXT PRIMARY KEY, so
+        -- freshly minted schemas already satisfy the FK and this guard no-ops on them. PostgreSQL
+        -- accepts a NON-PARTIAL, non-expression UNIQUE INDEX as an FK target
+        -- (docs/current/ddl-constraints.html), so the repair is a plain unique index:
+        -- IF NOT EXISTS keeps this idempotent across ~151 schemas and every re-run boot; the
+        -- probe matches by catalog name-joins (no regclass cast) and is a pure SELECT, so it can
+        -- never itself abort the loop.
+        IF EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = _schema AND table_name = 'entities'
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a
+              ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] AND a.attname = 'id'
+            WHERE n.nspname = _schema AND c.relname = 'entities'
+              AND i.indisunique
+              AND i.indisvalid
+              AND i.indnatts = 1
+              AND i.indpred IS NULL
+              AND i.indexprs IS NULL
+        ) THEN
+            EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS uq_entities_id ON %I.entities (id)', _schema);
+        END IF;
+
         EXECUTE format($ddl$
             CREATE TABLE IF NOT EXISTS %I.entity_synonyms (
                 id               SERIAL PRIMARY KEY,

@@ -3,9 +3,9 @@
 --
 -- WHY
 -- ---
--- The spine deriver captured a FIRST-PERSON self-name ("I prefer to be called Max") and the
+-- The spine deriver captured a FIRST-PERSON self-name ("I prefer to be called Sam") and the
 -- "<role>'s name is <PROPN>" frame, but a THIRD-PARTY nickname stated with a PHRASAL alias idiom —
--- "she goes by Dee", "he is known as Sammy", "she is referred to as Liv" — was DROPPED, and the
+-- "she goes by Dee", "he is known as Sammy", "she is referred to as Mars" — was DROPPED, and the
 -- intransitive/copula-state chains mis-minted a junk (she, has_state, go) / (she, has_state, know)
 -- twin off the idiom's verb. The new deriver chain _chain_alias_predicate
 -- (src/extraction/linguistics.py) captures these as (person, also_known_as, <Name>), resolving a
@@ -15,7 +15,7 @@
 --   (A) a NAMING VERB (naming_verb cue class — call/name/title/…) taking the name as a direct
 --       complement ("prefers to be called <Name>") — already DB-held; no new data.
 --   (B) a PHRASAL ALIAS IDIOM — a verb + a specific licensing PREPOSITION governing a proper-noun
---       object ("go BY Dee", "known AS Sammy", "referred to AS Liv"). "go"/"know"/"refer" are NOT
+--       object ("go BY Dee", "known AS Sammy", "referred to AS Mars"). "go"/"know"/"refer" are NOT
 --       naming verbs (they take no name as a direct object), so the alias reading needs the
 --       LICENSING PARTICLE as the disambiguator. This migration seeds that verb→particle MAP as a
 --       new KEYED cue class on the SAME (cue, category) rail as kinship_noun / unit_scalar / role_noun
@@ -72,7 +72,7 @@ INSERT INTO public.linguistic_cues
 VALUES
   ('go',    'alias_predicate', 'by', 'she goes by Dee',           'seed_alias_predicate', 0.90),
   ('know',  'alias_predicate', 'as', 'he is known as Sammy',      'seed_alias_predicate', 0.88),
-  ('refer', 'alias_predicate', 'as', 'she is referred to as Liv', 'seed_alias_predicate', 0.85)
+  ('refer', 'alias_predicate', 'as', 'she is referred to as Mars', 'seed_alias_predicate', 0.85)
 ON CONFLICT (cue, category) DO NOTHING;
 
 -- ============================================================================

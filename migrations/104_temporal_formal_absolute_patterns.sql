@@ -12,7 +12,7 @@
 -- We now add a LATENCY GATE in front of the whole date pipeline (spaCy DATE NER +
 -- dateparser): before any of that runs, a CHEAP single combined-regex precheck asks
 -- "does this turn match ANY active temporal_patterns row?". A no-cue turn ("my name is
--- Alexander") skips the entire date engine. For that gate to be COMPLETE it must also
+-- Alicia") skips the entire date engine. For that gate to be COMPLETE it must also
 -- recognize ABSOLUTE dates that carry NO relative cue ("January 17th", "3/22", "2023") —
 -- otherwise the gate would skip a real absolute date. So this migration SEEDS the formal
 -- absolute surface forms as DB rows too, making the table the single source of truth the
