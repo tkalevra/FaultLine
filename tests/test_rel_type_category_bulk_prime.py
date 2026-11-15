@@ -1,6 +1,6 @@
 """Pins: REL_TYPE_CATEGORY_BULK_PRIME (BUG-R4-3 lane, the 11.6s prod family walk).
 
-THE WOUND (measured live on prod, owner seat 10d7d879, 2026-11-14, cProfile on the
+THE WOUND (measured live on prod, owner seat e345e523, 2026-11-14, cProfile on the
 TTL-expired walk): ``_get_rel_type_category`` opens ONE fresh psycopg2 connection per
 distinct rel_type once the 60s TTL memo expires — and a heavy seat carries hundreds of
 distinct rel_types in a single walk's fact set (627 measured; 5,275 live on the seat).

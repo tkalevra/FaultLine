@@ -35,8 +35,8 @@ class TestSacredSourceTokens:
         assert "business" in sac and "administration" in sac
 
     def test_literal_is_sacred(self):
-        sac = R._sacred_source_tokens("My server ip is 192.168.40.21.")
-        assert "192.168.40.21" in sac
+        sac = R._sacred_source_tokens("My server ip is 192.0.2.21.")
+        assert "192.0.2.21" in sac
 
     def test_common_nouns_not_sacred(self):
         sac = R._sacred_source_tokens("I graduated with a degree.")

@@ -458,7 +458,7 @@ _NAME_AFTER_TYPE_PHRASE = [
     ("Bought a mountain bike (Monty) yesterday.", "mountain bike", "monty"),
     # verbatim production ARM-3 targets
     ("Our landing page (Gauntlet) is live.", "landing page", "gauntlet"),
-    ("The company (Optimuscannabis) filed today.", "company", "optimuscannabis"),
+    ("The company (Seedtenant) filed today.", "company", "seedtenant"),
     ("My laptop (Cato) died.", "laptop", "cato"),
     ("The cat (Luna) knocked it over.", "cat", "luna"),
 ]
@@ -1006,10 +1006,10 @@ def test_recall_miss_three_word_short_form_u_of_g():
     That cap is FAITHFUL to S&H §3.1 ("at most two words"), so this is the paper's limit
     correctly implemented — a real recall cost, not a port defect. Widening it would grant MORE
     licences, which is the unsafe direction."""
-    assert abbreviation.is_valid_short_form("U of G") is False
+    assert abbreviation.is_valid_short_form("U of T") is False
     assert abbreviation.text_licenses_coreference(
-        "I studied at the University of Guelph (U of G).",
-        "university of guelph", "u of g") is False
+        "I studied at the University of Waterloo (U of T).",
+        "university of waterloo", "U of T") is False
 
 
 def test_recall_miss_truncated_long_form_is_licensed_instead_ebs():
@@ -1044,7 +1044,7 @@ def test_independently_chosen_recall_is_eight_of_twelve():
     cases = [
         ("I maxed out my registered retirement savings plan (RRSP) this year.",
          "registered retirement savings plan", "rrsp"),
-        ("I studied at the University of Guelph (U of G).", "university of guelph", "u of g"),
+        ("I studied at the University of Waterloo (U of T).", "university of waterloo", "U of T"),
         ("We migrated Oracle E-Business Suite (EBS) to RHEL 8.", "oracle e-business suite", "ebs"),
         ("The request for proposal (RFP) closes Friday.", "request for proposal", "rfp"),
         ("He has chronic obstructive pulmonary disease (COPD).",

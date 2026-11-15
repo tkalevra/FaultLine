@@ -27,8 +27,8 @@ _ROSTER = [
     {"account_id": "4b266de7-4171-4acd-955b-31df5a53873f", "name": "default",
      "slug": "default", "plan": "legacy", "status": "active", "account_type": "standard",
      "seat_limit": 100, "seats_used": 3, "created_at": "2026-07-05T20:23:20+00:00"},
-    {"account_id": "044b9d9c-ec55-43db-a9e6-f751712d504f", "name": "HelpDeskPro",
-     "slug": "helpdeskpro", "plan": "standard", "status": "active", "account_type": "standard",
+    {"account_id": "044b9d9c-ec55-43db-a9e6-f751712d504f", "name": "ExampleCorp",
+     "slug": "examplecorp", "plan": "standard", "status": "active", "account_type": "standard",
      "seat_limit": 7, "seats_used": 1, "created_at": "2026-07-05T20:56:57+00:00"},
 ]
 
@@ -61,7 +61,7 @@ def test_operator_lists_all_accounts(client, monkeypatch):
     body = r.json()
     assert isinstance(body.get("accounts"), list)
     names = [a["name"] for a in body["accounts"]]
-    assert names == ["default", "HelpDeskPro"]  # order preserved (created_at asc)
+    assert names == ["default", "ExampleCorp"]  # order preserved (created_at asc)
     # seat counts + control-plane fields surfaced; NO secret/key fields leak.
     d = body["accounts"][0]
     assert d["seats_used"] == 3 and d["seat_limit"] == 100
@@ -136,11 +136,11 @@ def test_delete_account_success(client, monkeypatch):
                 "purged_users": [], "reason": "account deleted"}
     monkeypatch.setattr(saas_admin._accounts, "delete_account", _del)
     r = client.request("DELETE", "/admin/accounts/acct-1", headers=_op(),
-                       json={"confirm_slug": "helpdeskpro"})
+                       json={"confirm_slug": "examplecorp"})
     assert r.status_code == 200
     assert r.json()["seats_freed"] == 3
     # purge_memory defaults to False when omitted (memory kept).
-    assert seen == {"account_id": "acct-1", "slug": "helpdeskpro", "op": True, "purge": False}
+    assert seen == {"account_id": "acct-1", "slug": "examplecorp", "op": True, "purge": False}
 
 
 def test_delete_account_purge_memory_flows_through(client, monkeypatch):
@@ -151,7 +151,7 @@ def test_delete_account_purge_memory_flows_through(client, monkeypatch):
                 "purged_users": ["u1", "u2"], "reason": "account deleted + memory erased"}
     monkeypatch.setattr(saas_admin._accounts, "delete_account", _del)
     r = client.request("DELETE", "/admin/accounts/acct-1", headers=_op(),
-                       json={"confirm_slug": "helpdeskpro", "purge_memory": True})
+                       json={"confirm_slug": "examplecorp", "purge_memory": True})
     assert r.status_code == 200
     assert seen["purge"] is True
     assert r.json()["memory_purged"] == 2
@@ -163,7 +163,7 @@ def test_delete_account_not_archived_is_409(client, monkeypatch):
                             "ok": False, "status_code": 409, "seats_freed": None,
                             "reason": "account must be in Trash (archived) before permanent delete"})
     r = client.request("DELETE", "/admin/accounts/acct-1", headers=_op(),
-                       json={"confirm_slug": "helpdeskpro"})
+                       json={"confirm_slug": "examplecorp"})
     assert r.status_code == 409
 
 
@@ -186,7 +186,7 @@ def test_delete_account_not_operator_denied(client, monkeypatch):
     monkeypatch.setattr(saas_admin._accounts, "delete_account", _poison)
     r = client.request("DELETE", "/admin/accounts/acct-1",
                        headers={"Authorization": "Bearer flk_sometenant"},
-                       json={"confirm_slug": "helpdeskpro"})
+                       json={"confirm_slug": "examplecorp"})
     assert r.status_code == 403
     assert called["n"] == 0
 

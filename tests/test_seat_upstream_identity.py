@@ -113,7 +113,7 @@ def test_absent_identity_renders_exactly_as_today(cards):
 def test_editable_seat_label_control_is_untouched_in_both_states(cards):
     """The ✎ "Label for seat …" control is IDENTICAL with and without an upstream identity.
 
-    The owner's constraint verbatim: "leave the 'Label for seat 89f903d2… (name the agent)'
+    The owner's constraint verbatim: "leave the 'Label for seat 7c1b8320… (name the agent)'
     alone". Two separate fields with two separate authorities — the label is the TENANT's
     name for the seat, the identity is upstream truth. This asserts the glyph, the classes,
     the wiring, AND the prompt copy the user actually sees, in both states at once.
@@ -124,7 +124,7 @@ def test_editable_seat_label_control_is_untouched_in_both_states(cards):
         assert c["edit_text"] == "✎"
         assert c["edit_classes"] == "btn xs sc-edit"
         assert c["edit_wired"] is True
-        assert c["edit_prompt"]["message"] == "Label for seat 89f903d2… (name the agent)"
+        assert c["edit_prompt"]["message"] == "Label for seat 7c1b8320… (name the agent)"
     # Identical, not merely both-present.
     assert a["edit_classes"] == b["edit_classes"]
     assert a["edit_prompt"]["message"] == b["edit_prompt"]["message"]

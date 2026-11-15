@@ -25,7 +25,7 @@ from src.api import main as m
 from src.api import llm_calls as _llm
 from src.api.models import RewriteRequest
 
-_USER = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+_USER = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 
 
 # ── Minimal fakes so extract_rewrite runs hermetically ───────────────────────

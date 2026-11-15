@@ -49,7 +49,7 @@ _TEMPLATE = _REPO_ROOT / "src" / "provisioning" / "templates" / "user_schema.sql
 _DSN_BACKEND = "http://backend.test"
 
 CHUNK_TEXT = ("Marcus owns two vintage synthesizers. "
-              "His sister Lena works at the hospital in Guelph.")
+              "His sister Lena works at the hospital in Waterloo.")
 
 
 def _queue_ddl(schema_name: str) -> str:

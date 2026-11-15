@@ -1,6 +1,6 @@
 """RENDER NAME-SLOT PREFERRED-ALIAS GUARD — the "a Kwame named Ptolemy" wound.
 
-THE WOUND (pre-prod seat 843d39dc): recall rendered "you have a Kwame named Ptolemy"
+THE WOUND (pre-prod seat c3d62ac4): recall rendered "you have a Kwame named Ptolemy"
 for an entity whose alias set is {child (non-preferred), kwame (non-preferred),
 ptolemy (preferred)}. The named-instance composer's TYPE slot resolved to a word
 that is one of the INSTANCE ENTITY'S OWN aliases ("kwame") — the prose template

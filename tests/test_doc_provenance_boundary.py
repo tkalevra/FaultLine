@@ -10,14 +10,14 @@ the user's world model:
   (b) not served when the user asks "who is my wife?" / "tell me about my family";
   (c) the document-grounded retrieval still serves the passage WITH its citation.
 
-THE LIVE RECEIPTS (pre-prod truenas, throwaway seat 552f63da…, image sha256:52826027…,
+THE LIVE RECEIPTS (pre-prod truenas, throwaway seat 3c329b32…, image sha256:52826027…,
 2026-11-15): document drained committed=0 staged=5/9 (all prov=document,
 fact_provenance=llm_inferred, fact_class=B, source_ref cited); the kinship edges were
 NOT filed at all (the kin_role_word_surface pre-classification drop caught the
 role-surface edge the extractor emitted); tom/sally/timmy are standalone Person
 entities with zero edges touching the user; "who is my wife?" / "tell me about my
 family" served honest-empty; the doc-grounded asks served the verbatim passage twice
-cited (document id 1, section 1 / page 1). REVERSE GUARD (seat 6d49858c…, first-person
+cited (document id 1, section 1 / page 1). REVERSE GUARD (seat 8f31fe47…, first-person
 doc): (user, spouse, isolde), (poppy, child_of, user), (user, has_pet, nimbus) all
 FILED (staged B, document provenance, cited) — nimbus entered the pets space, and the
 document never named the user (document_lane_never_names_the_user).
@@ -229,7 +229,7 @@ def test_character_character_doc_rows_stay_silent(monkeypatch):
 # == 5. THE REVERSE-GUARD VOICING SPLIT =============================================
 
 def test_first_person_doc_pet_row_voices_in_held_band(monkeypatch):
-    """REVERSE GUARD (seat 6d49858c receipts): a first-person document about the user
+    """REVERSE GUARD (seat 8f31fe47 receipts): a first-person document about the user
     files normally — (user, has_pet, nimbus) staged B / document / cited — and the
     non-kinship user-world row VOICES (the held-band discipline renders it; the
     kinship gate does not apply: has_pet is not a kinship-class rel)."""

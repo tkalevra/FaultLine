@@ -3,8 +3,8 @@
 A proper-noun-modified / compound-noun entity NP was truncated to its bare HEAD noun in two seams the
 left-modifier-only ``_object_value_phrase`` never covered, dropping the answer-bearing specifier:
 
-  (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Guelph"
-      stored ``works_for -> university`` ("Guelph" dropped). The ``_chain_employment`` seam folds only
+  (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Waterloo"
+      stored ``works_for -> university`` ("Waterloo" dropped). The ``_chain_employment`` seam folds only
       left modifiers; the SVO chain already recovers this via ``_nominal_pp_complement``. The employment
       chain now folds the tail via the existing ``_proper_name_of_tail`` and claims the tokens so the
       residue guard / PA-core (G5 twin-suppression) see the whole name COVERED.
@@ -54,7 +54,7 @@ def _objects(sentence):
 @pytest.mark.parametrize(
     "sentence,tail",
     [
-        ("I work at the University of Guelph.", "guelph"),
+        ("I work at the University of Waterloo.", "waterloo"),
         ("I work for the Bank of America.", "america"),
         ("She works for the Isle of Skye Council.", "skye"),   # 3rd-person, subject-agnostic
     ],
@@ -65,8 +65,8 @@ def test_employer_of_propn_tail_captured_whole(sentence, tail):
         f"of-tail '{tail}' dropped from works_for object in: {sentence} -> {_triples(sentence)}"
 
 
-def test_employer_full_surface_university_of_guelph():
-    assert _has("I work at the University of Guelph.", "user", "works_for", "university", "guelph")
+def test_employer_full_surface_university_of_waterloo():
+    assert _has("I work at the University of Waterloo.", "user", "works_for", "university", "waterloo")
 
 
 # ── (b) LEFT PROPN nmod BRAND premodifier rides the object WHOLE ───────────────────────────────────
@@ -148,8 +148,8 @@ def test_flag_off_byte_identical_head_only():
                     for f in _L.derive_sentence_facts(sentence, reference=None)
                     for o in [f.object] if f.rel_type == rel]
         # employer truncates to the head noun (legacy)
-        assert "university" in _obj("I work at the University of Guelph.", "works_for")
-        assert "university of guelph" not in _obj("I work at the University of Guelph.", "works_for")
+        assert "university" in _obj("I work at the University of Waterloo.", "works_for")
+        assert "university of waterloo" not in _obj("I work at the University of Waterloo.", "works_for")
         # brand nmod dropped (legacy) -> object is the compound head only
         assert any(o == "stand mixer" for o in _obj("I bought a KitchenAid stand mixer.", "buy"))
     finally:

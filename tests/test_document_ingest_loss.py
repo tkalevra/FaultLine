@@ -577,7 +577,7 @@ def test_n_doomed_chunks_report_exactly_n_failed_never_ready_silent(monkeypatch)
 # MEASURED 2026-07-31 on pre-prod. Over one 6h window 1153 of 1166 document-lane chunk
 # failures were `ConnectError: [Errno 111] Connection refused` — the re_embedder shares a
 # container with the API, so on every deploy/restart it wakes before uvicorn is listening.
-# Each refusal was charged to the CHUNK, so seat 2295c6ce docs 1 and 2 were claimed at
+# Each refusal was charged to the CHUNK, so seat 7f7a8ef7 docs 1 and 2 were claimed at
 # 01:03:16.9 and finalized TERMINAL 'partial' at 01:03:18.4: 400 chunks "processed" in 1.5
 # seconds, chunks_failed=400, facts_committed=0. Two whole user documents destroyed by a
 # container restart, permanently, with a healthy-looking API.
@@ -676,7 +676,7 @@ def test_backend_reachable_probe_is_fail_safe_closed(monkeypatch):
 
 # ── (C) DOCDRAIN — the /ingest client timeout was BELOW the server's worst case ──
 #
-# MEASURED 2026-07-31, seat 8162c435 doc_id=9 (2 chunks): chunk 0's POST /ingest was aborted
+# MEASURED 2026-07-31, seat 83677ac3 doc_id=9 (2 chunks): chunk 0's POST /ingest was aborted
 # client-side by a bare `timeout=30.0` literal; its six facts landed in `facts` ~30s later.
 # The work SUCCEEDED and we recorded a failure — facts_committed said 4 of 10 and the
 # document terminated TERMINAL 'partial' with every fact actually in memory.

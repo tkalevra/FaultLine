@@ -2,7 +2,7 @@
 alienability enforcement point on the named-instance possession chain (TASK B).
 
 Census source: the 76-question LongMemEval bench archive
-``/home/chris/lme-preprod/archive_oracle_combined.preabstention-20260728-001641.json``
+``/home/user/lme-preprod/archive_oracle_combined.preabstention-20260728-001641.json``
 (29 rendered ``interested in`` recall lines / 24 distinct objects, re-derived 2026-07-28).
 
 Mechanism (established terms, cited in the helper docstrings):
@@ -190,7 +190,7 @@ def test_flag_defaults_off():
 # ── TASK B: the second alienability enforcement point (named-instance possession) ────────────────
 
 def test_named_instance_possession_gate_demotes_an_inalienable_place():
-    """'My hometown is Guelph' must not read as OWNERSHIP.
+    """'My hometown is Waterloo' must not read as OWNERSHIP.
 
     The named-instance chain re-homes the possession onto the NAME and its ``_ni_suppress`` entry
     makes ``_chain_possessive`` step aside, so the alienability gate that chain applies was never

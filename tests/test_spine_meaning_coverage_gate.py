@@ -65,7 +65,7 @@ _OVERLAY = {
 _UNITS = {"dollar": "price", "minute": "duration", "hour": "duration",
           "foot": "height", "year": "age", "kg": "weight"}
 
-_UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+_UID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 
 _spine = pytest.mark.skipif(
     not L.linguistics_available(),

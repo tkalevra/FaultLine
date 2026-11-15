@@ -15,7 +15,7 @@
 -- person-identity data. Migration 314's admission (b) stamped every contact/
 -- identity/network-category row sensitive, and the net caught the mechanism's own
 -- plumbing: the negative-space serve's is_hierarchy_rel two-hop bridge DRIVES on
--- exactly these rows. Measured on pre-prod seat 1946ac55 (2026-11-12): the seat's
+-- exactly these rows. Measured on pre-prod seat f34887dd (2026-11-12): the seat's
 -- fresh-mint vocabulary census carried subclass_of/instance_of/is_a stamped
 -- is_sensitive=true — the cats-class bridge would render no taxonomy content and the
 -- aspect-affinity floor (which counts the subclass-of rows' query-token overlap) would

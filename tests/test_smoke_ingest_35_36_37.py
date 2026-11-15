@@ -1,4 +1,4 @@
-"""Smoke @ c88f04e0 (pre-prod deploy #17, seat 843d39dc) — ingest-side issues #35 / #36 / #37.
+"""Smoke @ c88f04e0 (pre-prod deploy #17, seat c3d62ac4) — ingest-side issues #35 / #36 / #37.
 
 #35  A discourse-frame correction ("Correction: …", "I was wrong earlier, …") was never routed as
      a correction (spaCy roots the turn on the label noun; the clause-initial marker scan and the
@@ -621,7 +621,7 @@ def _harvest_one(monkeypatch, text):
         return RF.ReframeResult(atoms=[RF.Atom(text=t, source_span=t)], used_llm=True,
                                 rejected_count=0)
     monkeypatch.setattr(RF, "reframe_to_atomic", _one_atom)
-    uid = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    uid = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
     r = asyncio.run(M._harvest_via_sentence_pipeline(RewriteRequest(text=text, user_id=uid), uid))
     return [(e.get("subject"), e.get("rel_type"), (e.get("object") or "").lower())
             for e in (r or {}).get("edges", [])]
@@ -735,7 +735,7 @@ def test_clausal_frame_needs_a_contradiction_row(monkeypatch):
 def test_classify_intent_passes_the_seat_to_the_cue_route(monkeypatch):
     import httpx
     M = _main()
-    uid = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    uid = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
     monkeypatch.delenv("POSTGRES_DSN", raising=False)
 
     async def _ready(*_a, **_k):

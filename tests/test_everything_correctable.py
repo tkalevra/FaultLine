@@ -3,7 +3,7 @@
 OWNER RULING (2026-10-07, live): "everything should be correctable though, there
 shouldn't be shit marked immutable … everything should be able to be overwritten,
 user.is.truth." NO immutable escape hatch anywhere in the correction lane. The
-measured wound (prod seat 24ed879f): "Correct my date of birth: I was born on
+measured wound (prod seat 54064c76): "Correct my date of birth: I was born on
 1978-03-18." (SAME value as stored) → Phase-6 hardcoded set hard-rejected → the
 serving model told the user their birthday is immutable.
 

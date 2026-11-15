@@ -19,8 +19,8 @@ super-admin has no tenant). All three tenant-console login paths mint with
   4. the user is told the save failed on our side — true, but eight layers from the cause,
      and it reads as "you are not allowed to add this endpoint".
 
-Note the egress allowlist was NEVER involved: SAAS_LLM_ALLOWED_EGRESS=192.168.40.0/25 covers
-192.168.40.20, and the message itself says the endpoint was ACCEPTED. Blaming the SSRF guard
+Note the egress allowlist was NEVER involved: SAAS_LLM_ALLOWED_EGRESS=192.0.2.0/25 covers
+192.0.2.20, and the message itself says the endpoint was ACCEPTED. Blaming the SSRF guard
 would have been the obvious wrong turn.
 
 FIXED AT THREE LAYERS, because each is independently correct:

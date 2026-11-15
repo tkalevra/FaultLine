@@ -176,7 +176,7 @@ def test_learned_window_becomes_authoritative():
 def _prep_endpoint(monkeypatch):
     from src.api import llm_calls
     monkeypatch.setenv("LLM_BACKEND_TYPE", "openwebui")
-    monkeypatch.setenv("LLM_BASE_URL", "http://192.168.40.20:8080")
+    monkeypatch.setenv("LLM_BASE_URL", "http://192.0.2.20:8080")
     monkeypatch.setenv("WGM_LLM_MODEL", "test-model")
     monkeypatch.delenv("SAAS_MODE", raising=False)
     llm_calls.reset_circuit_breaker()

@@ -44,7 +44,7 @@ When they EXPLICITLY want something deleted or forgotten ("forget that",
 
 FORGET (one fact): When the user EXPLICITLY asks to forget or delete ONE
 specific named fact about a NAMED target — e.g. "forget my email address",
-"forget that Ada is my spouse" — call forget_fact with the named subject
+"forget that Alma is my spouse" — call forget_fact with the named subject
 (use 'me' for the user) and, to pin it, rel_type and/or old_value. NEVER
 call forget_fact for a bulk wipe ("forget everything"); there is no bulk
 forget — ask which single fact.

@@ -3597,7 +3597,7 @@ CORRECTION_ROLE_SLOT_REBIND = os.environ.get(
     "CORRECTION_ROLE_SLOT_REBIND", "true").strip().lower() not in ("false", "0", "no", "off")
 
 # ── FLAG: CORRECTION_REPLACE_NOT_PARALLEL (convergence litmus, the parallel-truth class;
-# default ON). THE WOUND (measured live on the litmus seat 3e7b2cc4, image b9161e04,
+# default ON). THE WOUND (measured live on the litmus seat 5a57b94b, image b9161e04,
 # 2026-11-14 autopsy: tools/regression_results/convergence/results/autopsy-report.md):
 # a user correction/statement that lands the RIGHT row MINTS it BESIDE the wrong one and
 # the wrong row stays live — "Goose is Cato's cat." committed (cato, has_pet, goose)
@@ -3627,7 +3627,7 @@ CORRECTION_REPLACE_NOT_PARALLEL = os.environ.get(
     "CORRECTION_REPLACE_NOT_PARALLEL", "true").strip().lower() not in ("false", "0", "no", "off")
 
 # ── FLAG: EXTRACTION_STRONG_SUBJECT_BIND (acceptance4 subject-bind class; default ON) ──
-# THE WOUND (convergence litmus acceptance4, seat fe5a992c, image 670be985, 2026-11-15 —
+# THE WOUND (convergence litmus acceptance4, seat 8bd47ed7, image 670be985, 2026-11-15 —
 # tools/regression_results/convergence/results/acceptance4-report.md): corrections landed
 # only 57% because UPSTREAM EXTRACTION bound the WRONG SUBJECT on three shapes that are
 # one class — the named THING never became the target:
@@ -3655,7 +3655,7 @@ EXTRACTION_STRONG_SUBJECT_BIND = os.environ.get(
 ).strip().lower() not in ("false", "0", "no", "off")
 
 # ── FLAG: CORRECTION_ROLE_SLOT_BIND (s2-corrections-wire wife-name class; default ON) ──
-# THE WOUND (measured 2026-11-12, regression harness s2, seat 0fa55482): a name correction
+# THE WOUND (measured 2026-11-12, regression harness s2, seat 93dc7789): a name correction
 # on a possessive ROLE slot whose role edge was never stored ("Actually my wife's name is
 # Odile, not Rosalind." on a seat that holds the Rosalind entity but NO (user, spouse, ·)
 # edge — the plant's kin edge died upstream at the ingest consensus gate) resolved its
@@ -3668,7 +3668,7 @@ EXTRACTION_STRONG_SUBJECT_BIND = os.environ.get(
 # role could name) and the rejected value resolves through the alias registry to EXACTLY
 # ONE stored non-user entity whose every fact carries a HUMAN-ASSERTED provenance
 # (user_stated / user_correction / mcp — the wire door stamps the human turn 'mcp';
-# measured on the gate seat 8b5dac55: the plant's teach fact rides prov=mcp, so a
+# measured on the gate seat f152e8fe: the plant's teach fact rides prov=mcp, so a
 # user_stated-only filter declines the very entity the clause names) — a personal
 # memory, never a world/doc entity — a world entity sharing the label must never be
 # renamed — that entity
@@ -3682,7 +3682,7 @@ CORRECTION_ROLE_SLOT_BIND = os.environ.get(
 
 # ── FLAG: SHAPE_RECONCILIATION_SWEEP (convergence residual: the planted wrong-shape
 # class; default ON, OFF = byte-parity) ──────────────────────────────────────────────
-# THE WOUND (acceptance5 store checks S11a/S11b/S11c, re-measured kept-seat 6c891e26,
+# THE WOUND (acceptance5 store checks S11a/S11b/S11c, re-measured kept-seat f7199b8f,
 # image c27d55211d, 2026-11-15): the fuckered fixture's junk shapes stay LIVE forever —
 # three (pet, belong_to, owner) wrong-shape twins beside live has_pet truth, a
 # (user, has_pet, <Activity>) row filing a talk as a pet, and a born_on attribute on a
@@ -3696,7 +3696,7 @@ CORRECTION_ROLE_SLOT_BIND = os.environ.get(
 # new rel/type word list:
 #   ARM A — the authority-less inverse twin: a live (x, R, y) whose rel R carries NO
 #     user-or-seed authority (absent from rel_types, or present only as an
-#     ENGINE-GROWN row — measured live on the kept seat 6c891e26: the novel-rel growth
+#     ENGINE-GROWN row — measured live on the kept seat f7199b8f: the novel-rel growth
 #     lane auto-declared the junk rel (engine_generated, source=engine, head/tail
 #     {ANY}) minutes after the junk rows were planted, so mere declaredness is
 #     worthless as a junk signal; authority provenance is the signal) while the
@@ -3720,7 +3720,7 @@ SHAPE_RECONCILIATION_SWEEP = os.environ.get(
 
 # ── FLAG: GENERIC_KIN_TWIN_CONSOLIDATION (convergence residual: the generic-kid
 # twin-scatter; default ON, OFF = byte-parity) ───────────────────────────────────────
-# THE WOUND (acceptance5 S05, re-measured kept-seat 6c891e26: BOTH '13-year-old son'
+# THE WOUND (acceptance5 S05, re-measured kept-seat f7199b8f: BOTH '13-year-old son'
 # and '13-year-old daughter' entities live with child_of edges to the speaker beside
 # the named kids): the extractor once minted GENERIC kin surfaces as standalone
 # entities and the correction drive lands on the named kids while the generic twins
@@ -5139,7 +5139,7 @@ _REL_TYPE_CATEGORY_LOCK = threading.RLock()
 
 # ── FLAG: REL_TYPE_CATEGORY_BULK_PRIME (BUG-R4-3 lane, the 11.6s family walk; default ON;
 # OFF = byte-for-byte the per-key connect path) ────────────────────────────────────────
-# MEASURED WOUND (prod, owner seat 10d7d879, 2026-11-14, cProfile on the TTL-expired walk):
+# MEASURED WOUND (prod, owner seat e345e523, 2026-11-14, cProfile on the TTL-expired walk):
 # the TTL memo above collapsed the 2026-08-10 storm (one connection PER FACT) to one
 # connection per rel_type per TTL window — but a heavy seat carries HUNDREDS of distinct
 # rel_types in one walk's fact set (627 measured; 5,275 live on the seat), and a
@@ -7064,7 +7064,7 @@ from src.extraction.rel_vocab import growth_veto_reason as _rel_growth_veto_reas
 REL_TYPE_VOCAB_GUARD: bool = os.environ.get(
     "REL_TYPE_VOCAB_GUARD", "true").strip().lower() not in ("0", "false", "no")
 
-# PER-EDGE DROP EVALUATION (BUG-FAMILY-1, owner-bar smoke 2026-11-11, seat 8cec7acd: 7/21
+# PER-EDGE DROP EVALUATION (BUG-FAMILY-1, owner-bar smoke 2026-11-11, seat 3e8dbfeb: 7/21
 # natural multi-fact turns lost edges BEFORE classification — measured wounds, each pinned
 # by its sentence):
 #   • fam1 "…she was born on March 12, 1990." → the DATE preflight refused the natural
@@ -14318,7 +14318,7 @@ def _ensure_live_residence_end_state(db_conn, user_entity_id) -> None:
 
 
 def _reconcile_single_owner_edges(db_conn) -> int:
-    """BUG-RECALL-11 SEAM 2 (qP1, measured on the A17 bench seat 90206360) — the
+    """BUG-RECALL-11 SEAM 2 (qP1, measured on the A17 bench seat aefc91e8) — the
     OWNS-TRANSFER SUPERSESSION. 'owns' is seeded correction_behavior='supersede'
     (migration 007): a single-truth slot. When a transfer turn mints the recipient as
     the new owner ((mateo, owns, ingest rewrite) — the deriver's possession-transfer
@@ -21266,7 +21266,7 @@ someone user-adjacent.
 Examples of subject extraction:
 - "I am not a doctor" → subject_name: "user" (speaker/user)
 - "I'm not 18, I'm 23" → subject_name: "user" (speaker/user)
-- "University of Guelph is not a person, it is an organization" → subject_name: "University of Guelph"
+- "University of Waterloo is not a person, it is an organization" → subject_name: "University of Waterloo"
 - "Wren is an LLM model, not a person" → subject_name: "Wren"
 - "Computing and Communication Services is an organization" → subject_name: "Computing and Communication Services"
 - "Ottawa is the capital of Canada, not a person" → subject_name: "Ottawa"
@@ -21324,7 +21324,7 @@ RULES:
    - old_value and new_value are TYPE/CLASS NAMES (resolve to UUID)
    - Update facts.object_id with hierarchy semantics
    - Example: instance_of dog → cat
-   - Example: "University of Guelph is not a person" → subject_name="University of Guelph", old_value="person", new_value="organization"
+   - Example: "University of Waterloo is not a person" → subject_name="University of Waterloo", old_value="person", new_value="organization"
 
 4. SUBJECT dimension (wrong entity):
    - subject_uuid MUST CHANGE
@@ -21491,7 +21491,7 @@ Examples of subject extraction:
 - "I don't have any pets" → subject: "user"
 - "I'm not 42" → subject: "user"
 - "Spot is not a bunny" → subject: "Spot"
-- "University of Guelph is not a person" → subject: "University of Guelph"
+- "University of Waterloo is not a person" → subject: "University of Waterloo"
 - "forget that Wren is a person" → subject: "Wren"
 - "Computing and Communication Services is not an organization" → subject: "Computing and Communication Services"
 - "Remove the name Rex" → subject: "user" (self-alias removal)
@@ -21545,7 +21545,7 @@ RULES:
    - rel_type = the hierarchy rel (instance_of, member_of, part_of)
    - object = the type/class being removed
    - Example: "Spot is not a bunny" → subject="Spot", rel_type="instance_of", object="bunny"
-   - Example: "University of Guelph is not a person" → subject="University of Guelph", rel_type="instance_of", object="person"
+   - Example: "University of Waterloo is not a person" → subject="University of Waterloo", rel_type="instance_of", object="person"
 
 4. ENTITY (alias removal):
    - dimension = ENTITY
@@ -25118,9 +25118,9 @@ def _scalar_sensitivity_for(category: str | None, datatype: str | None) -> str:
     return "public"
 
 
-# WOUND A (host-CIDR discipline, prod seat 10d7d879): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
+# WOUND A (host-CIDR discipline, prod seat e345e523): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
 # with a prefix length — NOT a subnet declaration. The detector's CIDR grammar used to file the rel
-# ``has_subnet`` unconditionally, so ``"an ip of: 192.168.40.83/25"`` landed as has_subnet beside
+# ``has_subnet`` unconditionally, so ``"an ip of: 192.0.2.83/25"`` landed as has_subnet beside
 # (never superseding) the host's real has_ip. The value SHAPE decides: a CIDR-shaped value files
 # ``has_ip`` (datatype stays ``cidr`` — detector-carried) UNLESS the local context explicitly names
 # it a subnet/netmask/vlan statement (``the subnet is 10.0.0.0/24`` still files has_subnet). The
@@ -26058,7 +26058,7 @@ DOMAIN-SPECIFIC REL_TYPE GUIDANCE:
             if correction_behavior_rows:
                 # The unbounded enumeration here was rendering one line per rel_types row: a
                 # well-grown tenant (522 rows) produced 5,925 tokens of menu, overflowing the
-                # brain's context window and killing EXTRACT outright (0/93 on seat 04658f0e).
+                # brain's context window and killing EXTRACT outright (0/93 on seat 9fccbb8a).
                 # Progressive by construction — the better-trained the tenant, the harder it
                 # failed. State the dominant behavior once, enumerate only the exceptions, and
                 # bound by the DISCOVERED window. See src/api/prompt_budget.py.
@@ -27600,7 +27600,7 @@ async def _recover_possessive_presupposition_edges(
                 # a person NAMED after the role ("You are the child of Dad") or bound the alias
                 # holder for that word — the instance_of TYPE node "brother" — as the user's
                 # sibling, so every later "my brother" anchored on that empty node instead of the
-                # named brother and Bilbao was never reached (pre-prod smoke, seat 843d39dc).
+                # named brother and Bilbao was never reached (pre-prod smoke, seat c3d62ac4).
                 # Owned THINGS keep projecting ("…for my Sony A7R IV?"): the role test is the
                 # per-tenant person-role cue rail, no word list.
                 if _presupposed_endpoint_is_unnamed_role(_f):
@@ -28242,7 +28242,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     #     "states no concrete fact". A document chunk is none of those things — it is multi-sentence
     #     third-person prose, routinely 300-1500 chars, whose atom JSON does not fit in 256 tokens.
     #
-    #     MEASURED on the product's OWN chunks (2026-07-31, real 200-chunk document, seat 04658f0e,
+    #     MEASURED on the product's OWN chunks (2026-07-31, real 200-chunk document, seat 9fccbb8a,
     #     35B local brain, LLM_TIMEOUT_REFRAME=45 as pre-prod runs it) — 137 atomizer invocations on
     #     document text produced **ONE** usable atomization:
     #         reframe.done 1 · reframe.empty 22 · reframe.llm_failed 26 · reframe.no_usable_output 88
@@ -35447,7 +35447,7 @@ def _supersede_parallel_slot_rows(db, class_a_rows, negated_triples=()) -> int:
         with db.cursor() as cur:
             for (subj, rel), keep_obj in plan["subject_side"].items():
                 # RETIRE-CONDITIONAL-ON-REPLACEMENT (acceptance2, measured live
-                # 2026-11-14 seat e9271c7a: T02 flaked to clarification_needed — the
+                # 2026-11-14 seat ec9560d1: T02 flaked to clarification_needed — the
                 # (user, spouse, marla) replacement NEVER committed — yet the sweep
                 # still retired the live spouse rows and the serve lost the family).
                 # THE CONTRACT: a sweep is CONDITIONAL on its replacement actually
@@ -35944,7 +35944,7 @@ def _consolidate_generic_kin_twins(db, user_id, kid_entity_id, age_value) -> int
 # ── ENTITY-RETRACTION SPEAKER GUARD (CORRECTION_REPLACE_NOT_PARALLEL, acceptance3) ─
 
 def _entity_retraction_speaker_misbind(subject_uuid, request_user_id, enabled=None):
-    """PURE DECIDER (acceptance3, seat 932cc9e0): True when a whole-ENTITY retraction
+    """PURE DECIDER (acceptance3, seat d22ad096): True when a whole-ENTITY retraction
     is keyed on the SPEAKER's own entity — the "Remove Rex." class: the retraction
     extractor returned subject=user (rel=pref_name, old=Rex), dimension ENTITY bound
     to the user, and the unbounded remove_all_facts wipe retired EVERY affirmed row
@@ -37569,7 +37569,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
             # un-retired the denial-retired row IN PLACE). Named in dropped[] (issue #8
             # carrier) so the discard is never silent. Non-kin rels are untouched
             # ("I like my mother" — likes — files normally), and a kin-tie edge whose
-            # object is a real NAME ("My wife is Seren.") never matches (the name is not
+            # object is a real NAME ("My wife is Nora.") never matches (the name is not
             # in the kinship_noun cue class). The kin_weld gate (lane B) is downstream;
             # this runs first and the revive guard holds even when the gate admits.
             if (_taut_rels and _kin_tautology_drop(
@@ -42383,7 +42383,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                                     # already holds an age slot keeps it, so "Desmond is
                                     # 13." SUPERSEDES the stale age=12 row instead of
                                     # minting a parallel has_value twin beside it (measured
-                                    # autopsy seat 3e7b2cc4: attribute=has_value value=13
+                                    # autopsy seat 5a57b94b: attribute=has_value value=13
                                     # landed beside a live age=12). OFF → the probe is
                                     # skipped and the guard decides byte-for-byte as before.
                                     _seam1_prior_age = False
@@ -47490,7 +47490,7 @@ def _resolve_possessive_rel_target(db, owner_uuid: str, rel_word: str) -> str | 
         # A TYPE NODE IS NEVER THE FILLER WHEN A MEMBER OF IT IS. "My brother Pablo …" files
         # (pablo, instance_of, brother); the bare role word then names that TYPE node, and an
         # unattested recall harvest of "Where does my brother live?" once bound the node itself
-        # as the user's sibling (pre-prod smoke, seat 843d39dc). With two fillers — Pablo and
+        # as the user's sibling (pre-prod smoke, seat c3d62ac4). With two fillers — Pablo and
         # the place he is filed at — the walk deferred on "ambiguity" and the answer never
         # reached Bilbao. A filler something else is CLASSIFIED AS (object of a P31/P279 rel)
         # is the shelf, not the person; drop it while a non-place filler remains.
@@ -49878,7 +49878,7 @@ def _filter_possessed_role_user_kinship(facts, query_text, user_id, db):
 
 
 # -- ROLE-COLLISION GATE (fog-family critic R8 RG-F; RECALL_ROLE_COLLISION_GATE) --
-# LIVE WOUND (R5b seat 76e214a0, measured): "who is Bricmer's wife?" voiced the
+# LIVE WOUND (R5b seat cd0c09ed, measured): "who is Bricmer's wife?" voiced the
 # IMPOSSIBLE line "Godgifu has role Magnus". DB trace: the fenland doc-lane ingest
 # wrote the staged row (godgifu, has_role, e6efb2a2) binding the doc person to a ROLE
 # SLOT - but e6efb2a2 is the conversational WIFE-WELD entity (statement lane minted it
@@ -50724,7 +50724,7 @@ def _head_aliases_to_rel(db, word: str) -> tuple | None:
     forms) ``determine_path``'s keyword loop reads, so the ANCHOR and the SCOPE can
     never disagree about what the word means.
 
-    The bare-plural-kin wound, anchor half (prod seat ec6bac8b-trace): "my children"
+    The bare-plural-kin wound, anchor half (prod seat 30cae573-trace): "my children"
     grounded the possessed head onto a LEGACY junk grouping-entity NAMED ``children``
     (prior smoke runs) instead of the speaker, and the third-party projection then
     scoped out every real family row — (child, child_of, user) never "touches" the
@@ -51509,7 +51509,7 @@ def _query_health_shelf_rels(query_text: str) -> tuple:
     except Exception:  # noqa: BLE001 — fail-safe: no admission
         return ()
 
-# BUG-RECALL-11 SEAM 2 (qP1, measured on the A17 bench seat 90206360): flag gate for the
+# BUG-RECALL-11 SEAM 2 (qP1, measured on the A17 bench seat aefc91e8): flag gate for the
 # OWNS-TRANSFER SUPERSESSION — the single-owner reconciliation for the owns-family edges
 # (``_reconcile_single_owner_edges``). 'owns' is seeded correction_behavior='supersede'
 # (migration 007) — a single-truth slot: when a transfer mints the recipient as the new
@@ -52239,7 +52239,7 @@ def resolve_anchor(
         _is_dative = any(query_lower.startswith(p) or query_lower.startswith("can you " + p)
                          or query_lower.startswith("could you " + p)
                          for p in _dative_prefixes)
-        # BUG-RECALL-9 CLASS 1 (qF2, measured A17 seat 90206360): the instrumental-how
+        # BUG-RECALL-9 CLASS 1 (qF2, measured A17 seat aefc91e8): the instrumental-how
         # frame's speaker pronoun is the FRAME, not the subject — before Rule 1 pins the
         # speaker, probe the query for a REGISTERED entity alias (pg_dump). The probe's
         # miss changes nothing: the identity return below is byte-for-byte today's.
@@ -61156,7 +61156,7 @@ def determine_path(
                     continue
                 # ALIAS FIRST, then exact rel_type name. Carry tail_types so SCALAR vs
                 # relationship routing is unchanged.
-                # PRECEDENCE (the bare-plural-kin wound, prod seat 10d7d879): the old UNION
+                # PRECEDENCE (the bare-plural-kin wound, prod seat e345e523): the old UNION
                 # listed the exact-name arm FIRST, so when a grown rel_type shares the
                 # alias's surface word (live: an engine-grown rel_type `children` beside the
                 # seeded alias children→parent_of), the name-shaped shell shadowed the
@@ -61743,7 +61743,7 @@ def determine_path(
             if anchor_resolved_uuid and _aspect_words:
                 try:
                     # (B) ALIAS-RESOLVED RELATIONSHIP OUTRANKS THE SAME-NAMED ATTRIBUTE
-                    # (the bare-plural-kin wound, prod seat 10d7d879): a query aspect word
+                    # (the bare-plural-kin wound, prod seat e345e523): a query aspect word
                     # that resolves through rel_type_aliases to a NON-scalar rel names a
                     # RELATIONSHIP ("children" -> parent_of), not a scalar slot — so it must
                     # not ALSO admit a same-named stored attribute into scalar_rels, and the
@@ -64806,7 +64806,7 @@ def fetch_facts_from_anchor(
                     except Exception:
                         pass  # fail-safe: the lane below runs unchanged
                 if path.fetch_all_details or path.scalar_rels or _nonuser_concrete_anchor:
-                    # BUG-RECALL-12 (F-HIGH-1b, measured on fresh seat 4f194996) — THE
+                    # BUG-RECALL-12 (F-HIGH-1b, measured on fresh seat a6e30eae) — THE
                     # CURRENT-VALUE RECENCY SHADOW. When a correction is captured but the
                     # old-row cascade missed the scalar slot, the seat can hold BOTH the
                     # stale attribute (has_port=8001) AND the fresher correction fact
@@ -67298,7 +67298,7 @@ def resolve_display_name(entity_id: str, db) -> str:
 
         # Fallback: any alias (non-preferred). ORDERED preferred-first so the fallback is
         # DETERMINISTIC (an unordered LIMIT 1 returned whichever row Postgres happened to
-        # serve — on the seat 843d39dc wound that arbitrariness surfaced a person's
+        # serve — on the seat c3d62ac4 wound that arbitrariness surfaced a person's
         # non-preferred alias where a preferred row existed one lock-tick away). Mirrors
         # the owner-identity fallback ordering ("ORDER BY is_preferred DESC, alias", the
         # /query bulk read below). Never returns a non-preferred alias while a preferred
@@ -67337,7 +67337,7 @@ def resolve_display_name(entity_id: str, db) -> str:
 def _type_word_is_instance_alias(db, instance_id, type_word) -> bool:
     """THE HARD LINE, naming-slot side: a NAME is never its own TYPE word.
 
-    WOUND (pre-prod seat 843d39dc): the recall rendered "you have a Kwame named
+    WOUND (pre-prod seat c3d62ac4): the recall rendered "you have a Kwame named
     Ptolemy" — an entity whose alias set is {child, kwame, ptolemy(preferred)} had its
     named-instance TYPE slot resolved to a word that is one of the INSTANCE ENTITY'S
     OWN ALIASES ("kwame", a non-preferred person-alias), so the composed naming
@@ -69025,7 +69025,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                                     _ni_type_id, identity_set, preferred_alias_map, db)
                             except Exception:
                                 named_type_name = None
-                        # NAME-SLOT ALIAS GUARD (seat 843d39dc wound): a resolved "type"
+                        # NAME-SLOT ALIAS GUARD (seat c3d62ac4 wound): a resolved "type"
                         # word that is itself an ALIAS of the instance entity is a NAME,
                         # never a type (THE HARD LINE — a person is never its own type).
                         # Rendering it composed "a Kwame named Ptolemy". Decline the type
@@ -69207,7 +69207,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                                 _subj_type_name = None
                         # NAME-SLOT ALIAS GUARD (mirror of the object-side block): the
                         # inverse composer's TYPE word must never be an alias of the
-                        # instance entity itself ("a Kwame named Ptolemy", seat 843d39dc).
+                        # instance entity itself ("a Kwame named Ptolemy", seat c3d62ac4).
                         # Decline; the composer returns None and the template path renders
                         # the preferred display name instead.
                         if _subj_type_name and _type_word_is_instance_alias(
@@ -72316,8 +72316,8 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # Qdrant payloads store subject/object as DISPLAY NAMES (re_embedder writes
         # subject_display/object_display), not UUIDs. A DB copy of the same fact keys
         # on its UUID; the Qdrant copy keyed on a display name — so dedup never
-        # collapsed them and the SAME fact rendered twice (e.g. "you works for guelph"
-        # AND "chris works for guelph"). Resolve each Qdrant point's backing row
+        # collapsed them and the SAME fact rendered twice (e.g. "you works for waterloo"
+        # AND "chris works for waterloo"). Resolve each Qdrant point's backing row
         # (fact_id + source_table) to its real subject_id/object_id UUIDs and stamp
         # them onto the fact, so the UUID-keyed dedup below collapses DB+Qdrant copies
         # and the central resolver renders the survivor ONE way. Runs AFTER the
@@ -74135,7 +74135,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
                 # (the walk resolved the query onto it) always belongs -- the pin
                 # excludes the anchor itself, so the dated gold row (user --ship->
                 # v2.3) scoped out and the reply abstained with the fact LIVE
-                # (measured on kept seat b2256d39: dropped=1 pinned=1).
+                # (measured on kept seat e50b1aa8: dropped=1 pinned=1).
                 _touches_anchor = bool(_f_s and _f_o and _f_s != _f_o
                                        and (_f_s == str(anchor) or _f_o == str(anchor)))
                 if _belongs or _touches_anchor or not (_f.get("event_date")
@@ -74157,7 +74157,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # member walk reaches the SPEAKER and every other member: the aspect-bound exemption
         # below then admitted every lives_in row on the walk and the measure exemption every
         # family scalar, so the reply read "Pablo lives in Bilbao" followed by "You live in …",
-        # "You are 34", a sister's birth date (pre-prod smoke, seat 843d39dc). When the anchor
+        # "You are 34", a sister's birth date (pre-prod smoke, seat c3d62ac4). When the anchor
         # is not the speaker and the question never refers to the speaker, a row that does not
         # touch the anchor and is either about the speaker or another entity's own scalar is
         # not part of the answer. Rows touching the anchor ("Pablo is your brother") stay;
@@ -75082,7 +75082,7 @@ def correct_fact(req: FactCorrectionRequest):
         is_retraction = (req.intent == "RETRACTION") if req.intent else False
 
         # ── KIN-NAME DESIGNATION FLOOR — HOISTED ABOVE THE LLM DRAW (the convergence
-        # residual closer; re-measured on residual-autopsy4 seat 6c891e26, image
+        # residual closer; re-measured on residual-autopsy4 seat f7199b8f, image
         # c27d55211d, 2026-11-15): the floor ran AFTER the Stage-2 LLM extraction, so an
         # unanswered / rate-deferred draw (the extraction_degraded burst — T02 returned
         # extraction_degraded, llm_rate_deferred, retained_for_reextraction; the spouse
@@ -77369,7 +77369,7 @@ def correct_fact(req: FactCorrectionRequest):
                                 fact_class=_corr_class,
                                 fact_provenance=_corr_prov
                             )
-                            # BUG-RECALL-12 (F-HIGH-1a, measured on fresh seat 4f194996:
+                            # BUG-RECALL-12 (F-HIGH-1a, measured on fresh seat a6e30eae:
                             # "staging api Has Port 8001" served as CURRENT after the
                             # correction lane reported failed) — THE DETERMINISTIC SS1
                             # FALLBACK. The cascade's old-row lookups probe the FACTS
@@ -77544,7 +77544,7 @@ def correct_fact(req: FactCorrectionRequest):
                                                        if str(r[1]) != str(object_uuid)]
                                     # THE NEW VALUE'S OWN ROW IS NOT THE OLD ONE
                                     # (s2-corrections-wire pet-medication class, measured
-                                    # 2026-11-12 seat 0fa55482 + forensics seat a4ebea37,
+                                    # 2026-11-12 seat 93dc7789 + forensics seat c3b7aad3,
                                     # facts id 10: created 00:03:35.848, stamped SUP
                                     # 00:03:35.928 — 80ms later, inside this same call). The
                                     # unresolved-commit ABOVE already wrote (subject,
@@ -78361,7 +78361,7 @@ def correct_fact(req: FactCorrectionRequest):
                 # For corrections: not applicable
                 if is_retraction:
                     # RETIRE-CONDITIONAL-ON-REPLACEMENT's sibling guard (acceptance3, measured
-                    # live 2026-11-15 seat 932cc9e0: "Remove Rex." extracted subject=user,
+                    # live 2026-11-15 seat d22ad096: "Remove Rex." extracted subject=user,
                     # rel=pref_name → dimension ENTITY keyed on the SPEAKER → the unbounded
                     # wipe below retired EVERY affirmed row touching the user — spouse ×3,
                     # child_of ×5, user-has-fraggle — one UPDATE at 00:33:05.989, while the
@@ -78800,7 +78800,7 @@ def correct_fact(req: FactCorrectionRequest):
                                     # the old span) walked the F8 revive route and un-retired
                                     # the fragment IN PLACE (superseded_at cleared while the
                                     # row's qdrant_synced=false fingerprint stayed —
-                                    # facts id 11, seat fd57e768), and the stale street
+                                    # facts id 11, seat b214aa8f), and the stale street
                                     # served again. The R7 refusal
                                     # (fact_store.denial_retired_revive_refused) reads this
                                     # marker and never un-retires the row in place.
@@ -78810,8 +78810,8 @@ def correct_fact(req: FactCorrectionRequest):
                                         " WHERE id = ANY(%s)",
                                         (_rr_fids,))
                                 # COMMIT THE RETIREMENT BEFORE REPORTING IT (s2-corrections-wire
-                                # address class, measured 2026-11-12 seat 0fa55482 + forensics
-                                # seat a4ebea37): this block runs AFTER the endpoint's last
+                                # address class, measured 2026-11-12 seat 93dc7789 + forensics
+                                # seat c3b7aad3): this block runs AFTER the endpoint's last
                                 # db.commit() (the reporting seam sits behind it), and the
                                 # success path never commits again — the connection's close in
                                 # `finally` ROLLED THE UPDATE BACK while the response still

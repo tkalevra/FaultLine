@@ -65,7 +65,7 @@ class TestYouAgreementFixup:
         assert _you_agreement_fixup("you has a pet that is Fraggle") == "you have a pet that is Fraggle"
 
     def test_you_was_to_you_were(self):
-        assert _you_agreement_fixup("you was born in Guelph") == "you were born in Guelph"
+        assert _you_agreement_fixup("you was born in Waterloo") == "you were born in Waterloo"
 
     def test_no_fuzzy_s_stripping(self):
         # The fixup must NOT mangle "you likes"/"you runs" — only the explicit set.

@@ -361,7 +361,7 @@ def _reembedder_bind_tenant_brain(schema_name: str) -> None:
             "identity still set; bind NOT verified)")
         return
     except Exception as _bind_err:  # noqa: BLE001 — fail-safe (the lane continues), but LOUD
-        # THE SWALLOW THAT TOOK A LIVE REPRO TO CLOSE (2026-10-21, seat c591f22b): a bare
+        # THE SWALLOW THAT TOOK A LIVE REPRO TO CLOSE (2026-10-21, seat 87898a5c): a bare
         # `except: pass` here meant a bind that failed to even RUN (import error, unexpected
         # raise) was indistinguishable from a healthy bind, and every consumer of this seam —
         # the document drain, the growth loops — proceeded with NO brain and NO evidence.
@@ -4498,7 +4498,7 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                         # (source preserved 'mcp' -> user_stated rank 3, tie passes the SS5
                         # gate), so a value /retract/correct had retired in the interleaving
                         # RESURRECTED: superseded_at -> NULL, history 'ingest_restate'
-                        # (live wound 2026-09-04 22:04:49, seat b3f8a2c4). The marker extends
+                        # (live wound 2026-09-04 22:04:49, seat e7062ae4). The marker extends
                         # the shipped replay-transport contract to this third writer: the
                         # backend's retired-value freeze treats this POST as the re-send it is.
                         # The lane hint header names the sender for attribution/logging; it is
@@ -4961,7 +4961,7 @@ _DOC_CHUNK_HTTP_TIMEOUT = float(os.getenv("DOC_CHUNK_HTTP_TIMEOUT", "180"))
 # classifier (an LLM op whose own budget is 45s) and the L4 build-out, all under the
 # document lane's own chunk concurrency.
 #
-# MEASURED 2026-07-31 (DOCDRAIN, seat 8162c435, doc_id=9, two chunks): chunk 1 answered
+# MEASURED 2026-07-31 (DOCDRAIN, seat 83677ac3, doc_id=9, two chunks): chunk 1 answered
 # inside the window and reported committed=4; chunk 0's POST /ingest was aborted CLIENT-SIDE
 # at 30s and the chunk was recorded failed — yet its six facts (fraggle/instance_of/beagle,
 # diane/sibling_of, lives_in/toronto, works_for/shopify, …) landed in `facts` 30s later.
@@ -4988,7 +4988,7 @@ _DOC_BACKEND_PROBE_TIMEOUT = float(os.getenv("DOC_BACKEND_PROBE_TIMEOUT", "5"))
 # comes up BEFORE uvicorn is serving. Measured 2026-07-31 over one 6h window: 1153 of 1166
 # chunk failures were `ConnectError: [Errno 111] Connection refused` — i.e. 99% of all
 # document-lane chunk loss was the worker talking to its own not-yet-listening backend.
-# Live proof of the damage (seat 2295c6ce, docs 1 and 2): claimed at 01:03:16.9, finalized
+# Live proof of the damage (seat 7f7a8ef7, docs 1 and 2): claimed at 01:03:16.9, finalized
 # 'partial' at 01:03:18.4 — 400 chunks "processed" in 1.5 SECONDS, chunks_failed=400,
 # facts_committed=0, status TERMINAL. Two whole documents destroyed by a container restart,
 # with a healthy-looking API and one log line. Skipping a cycle costs one poll interval;
@@ -5269,7 +5269,7 @@ _DOC_HEADER_RE = _docstruct.DOC_HEADER_RE
 # only ONE speaker — which is the COMMON case, because the chunker splits on size, not on turn
 # boundaries — the other lane comes back as the bare header and nothing else.
 #
-# MEASURED on the product's own chunks (2026-07-31, real 200-chunk document, seat 04658f0e):
+# MEASURED on the product's own chunks (2026-07-31, real 200-chunk document, seat 9fccbb8a):
 #   381 non-empty extraction lanes, of which **172 (45.1%) were header-only** — the literal
 #   30-character string "[Date: 2023/05/22 (Mon) 18:21]".
 # Every one of those 172 lanes then: called /harvest-spans (0 edges, by construction), logged
@@ -5911,7 +5911,7 @@ def _process_document_chunk(chunk, *, idx, doc_id, user_id: str, backend_url: st
     X-FL-Deferred-Replay marker + X-FL-Replay-Lane: reextract so the backend's
     retired-value freeze engages: a value /retract/correct retired in the interleaving is
     NEVER resurrected by the re-send (the wound class the episodic lane paid for
-    2026-09-04, seat b3f8a2c4). Header-only — the idempotency key hashes edges and must
+    2026-09-04, seat e7062ae4). Header-only — the idempotency key hashes edges and must
     stay byte-identical to any live ingest of the same chunk. A FIRST drain
     (replay=False, the default) never carries the marker: a first attempt IS a genuine
     write. The marker changes NOTHING about provenance — source stays "document" →
@@ -8488,7 +8488,7 @@ _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or 
 # TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
 # nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
 # on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
-# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `fraggle` sat at
+# BINDS. Measured on production (seat e345e523, 2026-08-11): cap = 3, yet `fraggle` sat at
 # attempt_count=188, `sophia` 189, `goose` 187 — each a re-classification burning LLM calls — with
 # 47 rows over cap and 2,372 recorded attempts across 570 rows on ONE seat.
 # This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a

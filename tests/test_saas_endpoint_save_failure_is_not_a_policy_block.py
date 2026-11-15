@@ -273,7 +273,7 @@ def test_the_test_button_detail_is_fail_safe(monkeypatch):
 
 @pytest.mark.parametrize("url", [
     "http://127.0.0.1:8080", "https://127.0.0.1:8080",
-    "http://10.0.0.5:1234", "http://192.168.40.20:1234", "http://172.16.0.9:1234",
+    "http://10.0.0.5:1234", "http://192.0.2.20:1234", "http://172.16.0.9:1234",
     "http://169.254.169.254/latest/meta-data/", "https://169.254.169.254/",
     "http://[::1]:8080", "http://[fd00::1]:8080", "http://[fec0::1]:8080",
     "http://100.64.0.1:8080",              # RFC 6598 CGNAT

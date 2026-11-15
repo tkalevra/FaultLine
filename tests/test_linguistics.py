@@ -3569,10 +3569,10 @@ def test_address_bridge_subject_agnostic_named_person():
     """Subject-agnostic: 'Sarah lives at <street> in <city>, <province>' bridges lives_in(sarah, city)."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        _ner_doc("Sarah lives at 5 Elm Road in Guelph, Ontario."), _dt(2026, 6, 30))
-    assert any(f.subject == "sarah" and f.rel_type == "lives_in" and f.object == "guelph"
+        _ner_doc("Sarah lives at 5 Elm Road in Waterloo, Ontario."), _dt(2026, 6, 30))
+    assert any(f.subject == "sarah" and f.rel_type == "lives_in" and f.object == "waterloo"
                for f in facts), facts
-    assert any(f.subject == "guelph" and f.rel_type == "located_in" and f.object == "ontario"
+    assert any(f.subject == "waterloo" and f.rel_type == "located_in" and f.object == "ontario"
                for f in facts), facts
 
 

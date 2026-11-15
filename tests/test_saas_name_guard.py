@@ -64,7 +64,7 @@ def test_reserved_blocked(word):
 
 
 # ── L2 (SECURITY audit 2026-07-15): the reserved list was over-broad. Generic PRODUCT / content
-#    words are NO LONGER reserved (the owner's own product is HelpDeskPro → `helpdesk` must
+#    words are NO LONGER reserved (the owner's own product is ExampleCorp → `helpdesk` must
 #    register), but every genuine infra / DNS / payment / impersonation label still blocks. ─────
 @pytest.mark.parametrize("word", [
     "helpdesk", "support", "help", "store", "shop", "blog", "news", "dev", "demo",
@@ -217,7 +217,7 @@ def test_scunthorpe_words_pass(word):
 # ══════════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("good", [
-    "acme-labs", "chris", "helpdeskpro", "acme", "widgets-inc", "north-star",
+    "acme-labs", "chris", "examplecorp", "acme", "widgets-inc", "north-star",
     "team42", "kitchener-it", "optimus-cannabis", "blue-ridge", "j5",
 ])
 def test_legit_labels_accepted(good):
@@ -251,7 +251,7 @@ def test_disposable_email_detected(email):
 
 
 @pytest.mark.parametrize("email", [
-    "chris@gmail.com", "me@helpdeskpro.ca", "a@uoguelph.ca", "x@company.co.uk", "not-an-email",
+    "chris@gmail.com", "me@example.com", "a@uoft.ca", "x@company.co.uk", "not-an-email",
 ])
 def test_real_email_not_disposable(email):
     assert not ng.is_disposable_email(email)

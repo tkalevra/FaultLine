@@ -1,7 +1,7 @@
 """Fog-family critic-R5-7 pins (2026-11-07) - the possessed-role frame filter
 (POSSESSED_ROLE_FRAME_FILTER, default ON).
 
-LIVE WOUND (critic R5 seat 76e214a0-..., measured): "who is Bramwell's wife?" -
+LIVE WOUND (critic R5 seat cd0c09ed-..., measured): "who is Bramwell's wife?" -
 Bramwell has NO facts - leaked a USER-side kinship line into the answer. The anchor
 lane fell through the kinship HEAD ("wife" -> spouse rail) and bound the user's spouse
 entity; the walk returned the user's own stated row (Wren, spouse, Leofwine) WITH live

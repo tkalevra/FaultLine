@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 
 ACCT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+UID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 OWNER = "11111111-1111-4111-8111-111111111111"     # billing admin
 ADMIN_NB = "22222222-2222-4222-8222-222222222222"  # seat/security admin — NO billing
 OP_KEY = "op-super-secret-key"

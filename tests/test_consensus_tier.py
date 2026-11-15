@@ -177,27 +177,27 @@ class _FakeGliner:
 
 def test_carrier_side_channel_keyed_label_surface_and_entities_unchanged():
     g = _FakeGliner({"entities": {
-        "Person": [{"text": "Seren", "confidence": 0.87}, {"text": "Isolde", "confidence": 0.31}],
-        "Concept": [{"text": "Seren", "confidence": 0.44}],
+        "Person": [{"text": "Nora", "confidence": 0.87}, {"text": "Isolde", "confidence": 0.31}],
+        "Concept": [{"text": "Nora", "confidence": 0.44}],
         "Organization": ["bare-string-shape"],  # back-compat: a non-confidence result shape
     }})
-    out = _gliner2_type_entities(g, "Seren and Isolde talk about Seren.", ["Person", "Concept", "Organization"])
+    out = _gliner2_type_entities(g, "Nora and Isolde talk about Nora.", ["Person", "Concept", "Organization"])
     # THE CONTRACT: the entities shape every consumer reads is byte-identical.
-    assert out["entities"] == {"Person": ["Seren", "Isolde"], "Concept": ["Seren"],
+    assert out["entities"] == {"Person": ["Nora", "Isolde"], "Concept": ["Nora"],
                                "Organization": ["bare-string-shape"]}
     # THE CARRIER: the same (label, surface) keys, now carrying the score.
-    assert out["confidences"] == {"Person": {"Seren": 0.87, "Isolde": 0.31},
-                                  "Concept": {"Seren": 0.44}}
+    assert out["confidences"] == {"Person": {"Nora": 0.87, "Isolde": 0.31},
+                                  "Concept": {"Nora": 0.44}}
     assert "Organization" not in out["confidences"]  # a bare string never had a score
     # the call still asks GLiNER2 for confidence (the light-up contract)
     assert g.calls[0]["include_confidence"] is True
 
 
 def test_carrier_duplicate_surface_keeps_first_score_deterministically():
-    g = _FakeGliner({"entities": {"Person": [{"text": "Seren", "confidence": 0.9},
-                                             {"text": "Seren", "confidence": 0.1}]}})
-    out = _gliner2_type_entities(g, "Seren", ["Person"])
-    assert out["confidences"] == {"Person": {"Seren": 0.9}}  # FIRST seen — not max/min (scan-order-free)
+    g = _FakeGliner({"entities": {"Person": [{"text": "Nora", "confidence": 0.9},
+                                             {"text": "Nora", "confidence": 0.1}]}})
+    out = _gliner2_type_entities(g, "Nora", ["Person"])
+    assert out["confidences"] == {"Person": {"Nora": 0.9}}  # FIRST seen — not max/min (scan-order-free)
 
 
 def test_carrier_miss_paths_return_empty_side_channel():
@@ -231,10 +231,10 @@ def _linguistics_or_loud_skip():
 def test_build_typed_doc_attaches_gliner_conf_to_committed_ents():
     ling = _linguistics_or_loud_skip()
     g = _FakeGliner({"entities": {
-        "Person": [{"text": "Seren", "confidence": 0.87}],
+        "Person": [{"text": "Nora", "confidence": 0.87}],
         "Concept": [{"text": "the thesis", "confidence": 0.55}],
     }})
-    doc = _build_typed_doc("Seren finished the thesis.", g, ["Person", "Concept"])
+    doc = _build_typed_doc("Nora finished the thesis.", g, ["Person", "Concept"])
     assert doc is not None
     conf_by_surface = {}
     for ent in doc.ents:
@@ -242,7 +242,7 @@ def test_build_typed_doc_attaches_gliner_conf_to_committed_ents():
         conf = getattr(ent._, "gliner_conf", "MISSING-EXTENSION")
         assert conf != "MISSING-EXTENSION", "the gliner_conf Span extension is not registered"
         conf_by_surface[ent.text.strip().lower()] = conf
-    assert conf_by_surface.get("seren") == pytest.approx(0.87)
+    assert conf_by_surface.get("nora") == pytest.approx(0.87)
     assert conf_by_surface.get("the thesis") == pytest.approx(0.55)
 
 
@@ -261,7 +261,7 @@ def test_build_typed_doc_coordinated_split_inherits_parent_score():
 
 def test_build_typed_doc_untyped_or_failed_typing_leaves_none_conf():
     ling = _linguistics_or_loud_skip()
-    doc = _build_typed_doc("Seren finished the thesis.", None, None)
+    doc = _build_typed_doc("Nora finished the thesis.", None, None)
     assert doc is not None  # parsed but untyped → thin-tag gap-fill (today's behavior)
     for ent in doc.ents:
         assert getattr(ent._, "gliner_conf", None) is None
@@ -269,7 +269,7 @@ def test_build_typed_doc_untyped_or_failed_typing_leaves_none_conf():
     class _Boom:
         def extract_entities(self, *a, **k):
             raise RuntimeError("down")
-    doc2 = _build_typed_doc("Seren finished the thesis.", _Boom(), ["Person"])
+    doc2 = _build_typed_doc("Nora finished the thesis.", _Boom(), ["Person"])
     assert doc2 is not None
 
 

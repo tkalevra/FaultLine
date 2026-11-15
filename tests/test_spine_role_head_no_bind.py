@@ -183,7 +183,7 @@ def test_genitive_name_frames_still_bind():
 
 
 # ── R2 (live bench 76e214a0 residual) — the attr/acomp PARSE-SHAPE COIN FLIP ─────────────────
-# The sm tagger parses "My wife is Seren." with the name as attr, and "My wife is Isolde." with
+# The sm tagger parses "My wife is Nora." with the name as attr, and "My wife is Isolde." with
 # the SAME construction's name as PROPN acomp — the measure-NP dobj/npadvmod coin-flip class.
 # The R1 complement scan missed acomp, the possessive weld edge shipped, and ingest linked it
 # onto the seat's PRE-EXISTING [wife]-aliased weld entity (committed=1, Isolde orphaned). The

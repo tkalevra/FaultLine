@@ -1,6 +1,6 @@
 """DOCUMENT-lane tenant-brain bind contract (regression: silent brainless drain).
 
-THE REPRO this pins (pre-prod, 2026-10-21 02:40 UTC, seat c591f22b, account 0b1a09e6 WITH a
+THE REPRO this pins (pre-prod, 2026-10-21 02:40 UTC, seat 87898a5c, account 0b1a09e6 WITH a
 bound BYO brain): a document was drained to ``committed=0 staged=6`` and the operator could
 not tell from the bind site whether the lane had a brain at all, because
 
@@ -57,7 +57,7 @@ from src.re_embedder import supervisor as embedder_supervisor
 SEAT = "c591f22b-4f2a-4c3b-9d1e-c11cba7f975f"
 SCHEMA = "faultline_c591f22b_4f2a_4c3b_9d1e_c11cba7f975f"
 ACCT = "0b1a09e6-eb67-40ac-9194-16b98ac60610"
-TENANT_BASE_URL = "http://192.168.40.20:8080/v1"
+TENANT_BASE_URL = "http://192.0.2.20:8080/v1"
 TENANT_CFG = {
     "account_id": ACCT,
     "backend_type": "openai",

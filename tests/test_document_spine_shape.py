@@ -1,6 +1,6 @@
 """DOCSPINE — the document lane's SHAPE boundary.
 
-Two defects, both measured on the product's own chunks (2026-07-31, seat 04658f0e, a real
+Two defects, both measured on the product's own chunks (2026-07-31, seat 9fccbb8a, a real
 200-chunk LongMemEval document):
 
   (1) CONTENT-FREE LANES.  `_partition_chunk_by_role` prepends the shared "[Date: …]" header to

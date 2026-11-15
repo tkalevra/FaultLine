@@ -1,6 +1,6 @@
 """Issue #222 — the tenant console "test & calibrate" gate on seats with no individual login.
 
-THE WOUND (measured on prod 2026-10-06, seat "Christopher", University of Guelph): the seat
+THE WOUND (measured on prod 2026-10-06, seat "Christopher", University of Waterloo): the seat
 card's Endpoint Health card offered "▸ test & calibrate", which POSTs
 ``/tenant/seats/{uid}/brain-health/recalibrate`` — a route that resolves the seat's brain
 binding through its ``individual_users`` login row (``tenant_console.get_managed_individual``).

@@ -40,7 +40,7 @@ def test_scalar_value_as_date_accepts_dates(value, expected):
     "40 tb",           # a storage size
     "72 bpm",          # a heart rate
     "metformin",
-    "123 maple street in guelph",
+    "123 maple street in waterloo",
     "2015-13-40",      # impossible date
     "42",              # too-short number (not a 4-digit year)
 ])

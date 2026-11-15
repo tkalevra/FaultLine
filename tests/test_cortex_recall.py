@@ -311,16 +311,16 @@ def test_semantic_recall_tag_free():
     assert status == "ready"
     try:
         # NO descriptive tags — the only bridge to the query is MEANING (embedding cosine).
-        assert cortex.note(uid, "LLM endpoint is 192.168.40.20:8080, NOT :1234",
+        assert cortex.note(uid, "LLM endpoint is 192.0.2.20:8080, NOT :1234",
                            category="gotcha", tags=[])
         assert cortex.note(uid, "new files under tests/ are gitignored, use git add -f",
                            category="pitfall", tags=[])
         # embeddings must actually have been stored at write.
-        assert _row(schema, "192.168.40.20")["has_embedding"] is True
+        assert _row(schema, "192.0.2.20")["has_embedding"] is True
         # Query shares NO exact word with the note text; only semantics connect them.
         hits = cortex.recall_notes(uid, "what port for the model", limit=5)
         assert hits, "semantic recall returned nothing on a tag-free note"
-        assert "192.168.40.20" in hits[0]["note"], f"wrong note on top: {hits[0]['note']!r}"
+        assert "192.0.2.20" in hits[0]["note"], f"wrong note on top: {hits[0]['note']!r}"
         # an unrelated query is an HONEST MISS — no keyword, sub-floor cosine → nothing.
         assert cortex.recall_notes(uid, "unrelated aquarium submarine dolphin") == []
     finally:
@@ -336,12 +336,12 @@ def test_keyword_tag_recall_still_works(monkeypatch):
     schema, status = create_cortex_schema(uid)
     assert status == "ready"
     try:
-        cortex.note(uid, "LLM endpoint is 192.168.40.20:8080, NOT :1234",
+        cortex.note(uid, "LLM endpoint is 192.0.2.20:8080, NOT :1234",
                     category="gotcha", tags=["llm-endpoint", "config", "port", "model"])
         cortex.note(uid, "new files under tests/ are gitignored, use git add -f",
                     category="pitfall", tags=["git", "tests"])
         hits = cortex.recall_notes(uid, "what port for the model", limit=5)
-        assert hits and "192.168.40.20" in hits[0]["note"]
+        assert hits and "192.0.2.20" in hits[0]["note"]
         # honest miss with no embedder and no overlap.
         assert cortex.recall_notes(uid, "unrelated aquarium submarine") == []
     finally:
@@ -380,13 +380,13 @@ def test_failsafe_embedding_unavailable(monkeypatch):
     schema, status = create_cortex_schema(uid)
     assert status == "ready"
     try:
-        assert cortex.note(uid, "LLM endpoint is 192.168.40.20:8080, NOT :1234",
+        assert cortex.note(uid, "LLM endpoint is 192.0.2.20:8080, NOT :1234",
                            category="gotcha", tags=["llm-endpoint", "port", "model"])
         # No embedding was stored (backend down) — recall must NOT error and must still work.
-        assert _row(schema, "192.168.40.20")["has_embedding"] is False
+        assert _row(schema, "192.0.2.20")["has_embedding"] is False
         hits = cortex.recall_notes(uid, "what port for the model", limit=5)
         assert hits, "fail-safe keyword/tag recall returned nothing"
-        assert "192.168.40.20" in hits[0]["note"]
+        assert "192.0.2.20" in hits[0]["note"]
     finally:
         _drop_schema(schema)
 

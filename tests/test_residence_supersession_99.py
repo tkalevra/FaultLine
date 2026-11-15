@@ -1,6 +1,6 @@
 """#99 — a move never ended the previous residence.
 
-Pre-prod smoke (saas after #89b, seat 843d39dc): the seat carried toronto[now], hamilton[now],
+Pre-prod smoke (saas after #89b, seat c3d62ac4): the seat carried toronto[now], hamilton[now],
 regina[now], york[now] lives_in rows; after "This year I moved from Regina to Saskatoon." the answer
 to "Where do I live?" rendered "You currently live in Regina … / You currently live in Saskatoon".
 

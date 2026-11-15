@@ -5,7 +5,7 @@ writes nothing, and a recall answers only what was asked"), which added `_topic_
 as the last gate before the /query response. Two independent defects in it, both MEASURED on the
 running stack against a seat whose stored, user_stated memory is a family:
 
-  seat c468d35b, facts: (chen, child_of, user) user_stated
+  seat aa9edf96, facts: (chen, child_of, user) user_stated
                         (son,  child_of, user) user_stated
                         (chen, instance_of, son) user_stated
 

@@ -51,9 +51,9 @@ from src.api.llm_client import classify_model_class, resolve_reasoning_controls
     # ORANGE — xAI: reasoning cannot be disabled, effort floor "low" is the recorded control.
     ("https://api.x.ai/v1", "grok-4.5", "orange"),
     # GREY — unknown host + a model that matches no reasoning marker: honest third state.
-    ("http://192.168.40.20:8080/v1", "totally-unknown-model", "grey"),
+    ("http://192.0.2.20:8080/v1", "totally-unknown-model", "grey"),
     # RED — unknown HOST but a DETECTED reasoning family: reasoning is known, control is not.
-    ("http://192.168.40.20:8080/v1", "deepseek-r1", "red"),
+    ("http://192.0.2.20:8080/v1", "deepseek-r1", "red"),
     # GREEN — recognized host, non-reasoning model → nothing to disable.
     ("https://api.openai.com/v1", "gpt-4o-mini", "green"),
     # Degenerate inputs must not raise: classify to grey like any other unknown.

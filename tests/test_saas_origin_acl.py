@@ -141,7 +141,7 @@ def test_cors_on_allowlists_configured_and_faces(saas_on, primed, monkeypatch):
 def test_cors_on_rejects_arbitrary_origin(saas_on, primed):
     """THE fix (audit MED #6): an arbitrary origin is NO LONGER reflected."""
     assert a.cors_allows("https://evil.example.com") is False
-    assert a.cors_allows("http://192.168.40.10:3000") is False
+    assert a.cors_allows("http://192.0.2.10:3000") is False
     assert a.cors_allows("https://anything.at.all") is False
     assert a.cors_allows("garbage") is False   # still must be a valid origin
 

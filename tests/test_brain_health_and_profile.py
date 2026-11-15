@@ -108,19 +108,19 @@ def test_ingest_path_completes_when_the_health_lane_raises(monkeypatch):
 
     async def _fake_llm(**kwargs):
         calls["n"] += 1
-        return {"atoms": [{"statement": "Anna moved to Guelph.",
-                           "source": "Anna moved to Guelph."}]}
+        return {"atoms": [{"statement": "Anna moved to Waterloo.",
+                           "source": "Anna moved to Waterloo."}]}
 
     monkeypatch.setattr("src.api.llm_calls.call_llm_with_retry_async", _fake_llm)
     monkeypatch.setattr("src.api.llm_calls.LLMModels.get", staticmethod(lambda op: "test-model"))
 
     result = asyncio.run(
-        reframe.reframe_to_atomic("Anna moved to Guelph.",
+        reframe.reframe_to_atomic("Anna moved to Waterloo.",
                                   user_id="11111111-2222-3333-4444-555555555555"))
 
     assert calls["n"] == 1, "the LLM call still happened"
     assert result.used_llm is True
-    assert [a.text for a in result.atoms] == ["Anna moved to Guelph."]
+    assert [a.text for a in result.atoms] == ["Anna moved to Waterloo."]
 
 
 def test_collect_seat_metrics_never_raises_on_a_dead_db(monkeypatch):

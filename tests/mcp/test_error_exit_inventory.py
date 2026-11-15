@@ -1117,7 +1117,7 @@ async def test_a_document_whose_every_chunk_failed_cannot_report_ok():
         client.post = AsyncMock(side_effect=RuntimeError("extractor down"))
         client.get = AsyncMock(side_effect=RuntimeError("extractor down"))
         result = await s.ingest_document_tool(
-            "Rufus is a dog.\n\nRufus lives in Guelph.\n\nRufus is seven.", "alice")
+            "Rufus is a dog.\n\nRufus lives in Waterloo.\n\nRufus is seven.", "alice")
 
     assert result["chunks"] and result["chunks_failed"] == result["chunks"], \
         f"the fixture did not actually fail every chunk: {result}"
@@ -2071,7 +2071,7 @@ def _backend_frozen():
     ("learn_facts_tool",     {"text": "A dog is a subclass of Animal", "user_id": "alice"}),
     ("forget_fact_tool",     {"subject": "me", "old_value": "old@example.com",
                               "user_id": "alice"}),
-    ("ingest_document_tool", {"text": "Rufus is a dog.\n\nRufus lives in Guelph.",
+    ("ingest_document_tool", {"text": "Rufus is a dog.\n\nRufus lives in Waterloo.",
                               "user_id": "alice"}),
 ])
 async def test_a_frozen_backend_is_reported_as_frozen_not_as_a_write(tool, kwargs):
@@ -2211,7 +2211,7 @@ async def test_a_document_whose_chunks_hit_a_frozen_backend_says_so():
          patch.object(s, "_episodic_capture", new=AsyncMock(return_value=None)), \
          patch.object(s, "_check_injection_signals", return_value=None), \
          patch.object(s, "DOC_ASYNC_LANE", False, create=True):
-        result = await s.ingest_document_tool("Rufus is a dog.\n\nRufus lives in Guelph.", "alice")
+        result = await s.ingest_document_tool("Rufus is a dog.\n\nRufus lives in Waterloo.", "alice")
     assert result["status"] == "ingest_disabled", result
     assert not result.get("facts_committed"), result
 
@@ -2281,7 +2281,7 @@ async def test_a_document_chunk_hitting_a_frozen_backend_freezes_the_document():
          patch.object(s, "_check_injection_signals", return_value=None), \
          patch.object(s, "_ingest_with_retry",
                       new=AsyncMock(return_value=(dict(DISABLED_BODY), None))):
-        result = await s.ingest_document_tool("Rufus is a dog.\n\nRufus lives in Guelph.", "alice")
+        result = await s.ingest_document_tool("Rufus is a dog.\n\nRufus lives in Waterloo.", "alice")
     assert result["status"] == "ingest_disabled", result
     assert not result.get("facts_committed"), result
 

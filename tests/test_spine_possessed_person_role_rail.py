@@ -266,7 +266,7 @@ def test_site_c_residual_an_ungrown_role_still_leaks_here():
 @pytest.mark.parametrize("text,possessed", [
     ("My favorite colour is blue.", "favorite colour"),
     ("My blood type is O negative.", "blood type"),
-    ("My hometown is Guelph.", "hometown"),
+    ("My hometown is Waterloo.", "hometown"),
 ])
 def test_site_c_leaves_a_genuine_preference_axis_alone(text, possessed):
     # FIREWALL in BOTH arms: the widening must not eat the preference lane this seam exists for.

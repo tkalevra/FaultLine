@@ -8,7 +8,7 @@ WHY THIS FILE EXISTS (ZAIURL, 2026-08-13): a tenant pointed their BYO brain at z
 ``_BACKEND_PATHS["openai"] == "/v1/chat/completions"`` is appended unconditionally, so
 every call went to ``https://api.z.ai/api/paas/v4/v1/chat/completions`` — note BOTH ``v4``
 AND ``v1`` — and 404'd (observed on production: ENRICHMENT / CLASSIFY_CHAIN, 3 attempts,
-all three HelpDeskPro seats).
+all three ExampleCorp seats).
 
 Part 1 of this file PINS the two shapes that are LIVE ON PRODUCTION RIGHT NOW plus every
 other entry in ``_BACKEND_PATHS``. Part 1 was written and run FIRST, against unmodified

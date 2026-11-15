@@ -5,7 +5,7 @@ Covers the four levers of the presentation/lean-query fix:
   1. One centralized display resolver (resolve_entity_display) — "you" vs preferred
      vs safe fallback; NEVER a non-preferred alias when a preferred one exists.
   2. Dedup on UUID before render — same-UUID DB+Qdrant copies collapse to one
-     (the "you works for guelph" AND "chris works for guelph" duplication).
+     (the "you works for waterloo" AND "chris works for waterloo" duplication).
   3. Preferred-name facts kept and rendered cleanly (pref_name survives).
   4. Non-preferred (also_known_as) aliases held in reserve — gated on name-intent.
 """
@@ -19,7 +19,7 @@ from src.api.main import (
     _query_has_name_intent,
 )
 
-USER_UUID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+USER_UUID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 ORG_UUID = "43033395-0000-4000-8000-000000000001"
 
 
@@ -33,8 +33,8 @@ def test_resolve_entity_display_you_for_identity():
 
 def test_resolve_entity_display_prefers_preferred_map():
     """Preferred alias from the pre-fetched map wins (no DB round-trip needed)."""
-    out = resolve_entity_display(ORG_UUID, {USER_UUID.lower()}, {ORG_UUID: "Guelph"}, MagicMock())
-    assert out == "Guelph"
+    out = resolve_entity_display(ORG_UUID, {USER_UUID.lower()}, {ORG_UUID: "Waterloo"}, MagicMock())
+    assert out == "Waterloo"
 
 
 def test_resolve_entity_display_never_nonpreferred_when_preferred_exists():
@@ -87,7 +87,7 @@ def test_dedup_ungrounded_qdrant_would_not_collapse():
     name in the Qdrant slot (NOT grounded), the keys differ and dedup can't collapse
     — proving why UUID grounding must run before dedup."""
     db_fact = {"subject": USER_UUID, "object": ORG_UUID, "rel_type": "works_for", "source": "db"}
-    ungrounded = {"subject": "chris", "object": "guelph", "rel_type": "works_for", "source": "qdrant"}
+    ungrounded = {"subject": "chris", "object": "waterloo", "rel_type": "works_for", "source": "qdrant"}
     # Two distinct keys → NOT collapsed (the pre-fix duplication).
     assert len(deduplicate_facts([db_fact, ungrounded])) == 2
 

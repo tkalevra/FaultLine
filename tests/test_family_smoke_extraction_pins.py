@@ -1,4 +1,4 @@
-"""BUG-FAMILY-1..4 (owner-bar family-smoke 2026-11-11, live pre-prod seat 8cec7acd,
+"""BUG-FAMILY-1..4 (owner-bar family-smoke 2026-11-11, live pre-prod seat 3e8dbfeb,
 37% raw recall) — the four extraction defects, each pinned by its MEASURED sentence.
 
 The BUG files (DEV/BUGS/family-smoke-20261111/) name the sentences; these pins freeze

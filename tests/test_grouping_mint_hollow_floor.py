@@ -1,6 +1,6 @@
 """HOLLOW-BIRTH FLOOR for the grouping mint (bug 05 fix 3) - MEASURED regression tests.
 
-Measured on prod (tenant faultline_10d7d879, 2026-11-03): 61/600 entity_taxonomies rows
+Measured on prod (tenant faultline_1a2b3c4d, 2026-11-03): 61/600 entity_taxonomies rows
 have an empty rel_types_defining_group, 57 of them source=engine_grown_ingest, dominated
 by place heads (databricks, honolulu, austin-tx-usa ...) and fragments. Root cause: the
 membership mint (_mint_groupings_from_membership) writes the observed candidate rel into

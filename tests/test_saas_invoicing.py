@@ -92,7 +92,7 @@ def mock_cp(monkeypatch):
              "monthly": 80.0, "label": "Agent add-on x 1"},
         ],
     })
-    monkeypatch.setattr(invoicing._accounts, "get_account_name", lambda a: "HelpDeskPro Inc.")
+    monkeypatch.setattr(invoicing._accounts, "get_account_name", lambda a: "ExampleCorp Inc.")
     monkeypatch.setattr(invoicing._accounts, "get_billing_contact_email",
                         lambda a: "finance@hdp.example")
     monkeypatch.delenv("SAAS_INVOICE_TAX_RATE", raising=False)
@@ -105,7 +105,7 @@ def test_build_invoice_tenant_lines_and_total(mock_cp):
     assert inv["invoice_number"] == "INV-AAAA1111-202607"
     assert inv["seller"]["legal_name"] == "Volenti"
     assert inv["seller"]["product"] == "FaultLine"
-    assert inv["bill_to"]["account_name"] == "HelpDeskPro Inc."
+    assert inv["bill_to"]["account_name"] == "ExampleCorp Inc."
     assert inv["bill_to"]["billing_contact"] == "finance@hdp.example"
     assert len(inv["line_items"]) == 3
     assert inv["subtotal"] == 1715.0

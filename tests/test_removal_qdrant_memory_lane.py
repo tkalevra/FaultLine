@@ -253,7 +253,7 @@ def test_rollback_arm_read_lane_live(explode_on_contact):
     point = {
         "score": 0.82,
         "payload": {
-            "subject": "chris", "rel_type": "works_for", "object": "guelph",
+            "subject": "chris", "rel_type": "works_for", "object": "waterloo",
             "confidence": 0.9, "fact_class": "C", "source_table": "staged_facts",
             "fact_id": 42, "provenance": "user_stated",
         },
@@ -329,7 +329,7 @@ def test_rollback_arm_ingest_c_sync_runs(explode_on_contact):
         def commit(self):
             self.commits += 1
 
-    staged = [(9, "chris", "guelph", "works_for", "user_stated", 0.9, "C", None)]
+    staged = [(9, "chris", "waterloo", "works_for", "user_stated", 0.9, "C", None)]
     conn = _FakeConn(staged)
     with patch.object(main, "REMOVE_QDRANT_MEMORY_LANE", False), \
          patch.object(main, "USER_MEMORY_VECTOR_LANE", True), \

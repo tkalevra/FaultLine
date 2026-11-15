@@ -1,6 +1,6 @@
 """TOMATO LIVE RENDER (issue #31 R1) — pins.
 
-The deploy-#16 live wound (fresh seat 843d39dc, aurora): "My tomato plants were planted
+The deploy-#16 live wound (fresh seat c3d62ac4, aurora): "My tomato plants were planted
 on May 15th, 2026 and each one is roughly 90 centimeters tall." ingested the #30 row
 correctly at the DERIVER, but the how-tall render answered "tomato plants used to be
 related to related measure / You own tomato plants" — no 90 centimeters.

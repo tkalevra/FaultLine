@@ -1,6 +1,6 @@
 """EACH-ONE-ANAPHOR (issue #30) — pins.
 
-The deploy-#15 live wound (seat 843d39dc): the atomizer's second-clause atom carried the
+The deploy-#15 live wound (seat 7e19ca7c): the atomizer's second-clause atom carried the
 INDEFINITE ANAPHOR as the subject — 'Each one is roughly 90 centimeters tall.' — the
 copula-measure chain resolved the bare function-word surface 'one', /ingest minted the junk
 entity, and the row ``(one, height, '90')`` landed with the UNIT STRIPPED, unreachable by

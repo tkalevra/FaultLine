@@ -101,7 +101,7 @@ def primed(monkeypatch):
     """Prime the rule cache: one global deny /24, one global allow /16, one tenant rule."""
     m._cache["global"] = [("203.0.113.0/24", "deny"), ("192.168.0.0/16", "allow")]
     m._cache["accounts"] = {
-        "acct-on": [("192.168.40.0/24", "deny")],
+        "acct-on": [("192.0.2.0/24", "deny")],
     }
     m._cache["at"] = time.monotonic()
     yield
@@ -142,12 +142,12 @@ def test_no_rule_matches_allows(saas_on, primed):
 
 
 def test_global_account_merge_and_specificity(saas_on, primed):
-    # global allow 192.168.0.0/16 vs TENANT deny 192.168.40.0/24 → the /24 wins → deny.
-    assert m.decide("acct-on", "192.168.40.20") == "deny"
+    # global allow 192.168.0.0/16 vs TENANT deny 192.0.2.0/24 → the /24 wins → deny.
+    assert m.decide("acct-on", "192.0.2.20") == "deny"
     # same global allow, outside the tenant hole → allow.
     assert m.decide("acct-on", "192.168.41.20") == "allow"
     # an account with NO own rules still inherits global rules.
-    assert m.decide("acct-other", "192.168.40.20") == "allow"
+    assert m.decide("acct-other", "192.0.2.20") == "allow"
     assert m.decide("acct-other", "203.0.113.9") == "deny"
 
 
@@ -223,9 +223,9 @@ def test_mapped_ipv6_cannot_dodge_v4_rules(saas_on, monkeypatch):
 
 
 def test_explain_names_the_winning_rule(saas_on, primed):
-    r = m.explain("acct-on", "192.168.40.20")
+    r = m.explain("acct-on", "192.0.2.20")
     assert r["decision"] == "deny"
-    assert r["matched"]["cidr"] == "192.168.40.0/24"
+    assert r["matched"]["cidr"] == "192.0.2.0/24"
     assert r["matched"]["action"] == "deny"
     assert r["matched"]["scope"] == "account"
     r2 = m.explain("acct-on", "198.51.100.1")
@@ -240,11 +240,11 @@ def fake_db(monkeypatch):
     # two query shapes hit the same table: _load (3 cols) and list_ip_rules (6 cols,
     # recognizable by its ORDER BY). The matcher takes the FIRST needle that fits, so the
     # list-shaped needle is declared first.
-    load_rows = [(None, "203.0.113.0/24", "deny"), ("acct-on", "192.168.40.0/24", "allow")]
+    load_rows = [(None, "203.0.113.0/24", "deny"), ("acct-on", "192.0.2.0/24", "allow")]
     list_rows = [(1, "203.0.113.0/24", "deny", None, "operator:global", _ts()),
-                 (2, "192.168.40.0/24", "allow", None, "operator", _ts())]
+                 (2, "192.0.2.0/24", "allow", None, "operator", _ts())]
     global_rows = [(1, "203.0.113.0/24", "deny", None, "operator:global", _ts())]
-    tenant_rows = [(2, "192.168.40.0/24", "allow", None, "operator", _ts())]
+    tenant_rows = [(2, "192.0.2.0/24", "allow", None, "operator", _ts())]
 
     class _ScopedCur(_Cur):
         """Honor the WHERE scope the real SQL carries (plain _Cur ignores it): the list
@@ -288,7 +288,7 @@ def test_list_scopes_and_shapes(saas_on, fake_db):
     glob = m.list_ip_rules(None)
     own = m.list_ip_rules("acct-on")
     assert [g["cidr"] for g in glob] == ["203.0.113.0/24"]
-    assert [o["cidr"] for o in own] == ["192.168.40.0/24"]
+    assert [o["cidr"] for o in own] == ["192.0.2.0/24"]
     sql, params = fake_db.cur.executed[-1]
     assert "account_id = %s" in sql and params == ("acct-on",)
     gsql, gparams = fake_db.cur.executed[-2]
@@ -297,7 +297,7 @@ def test_list_scopes_and_shapes(saas_on, fake_db):
 
 def test_effective_payload(saas_on, fake_db):
     eff = m.effective_ip_rules("acct-on")
-    assert [r["cidr"] for r in eff["rules"]] == ["192.168.40.0/24"]
+    assert [r["cidr"] for r in eff["rules"]] == ["192.0.2.0/24"]
     assert [r["cidr"] for r in eff["global"]] == ["203.0.113.0/24"]
 
 

@@ -1,4 +1,4 @@
-"""Round 3 (lane B, b2) — the two rendered failures from the pre-prod smoke on seat 843d39dc.
+"""Round 3 (lane B, b2) — the two rendered failures from the pre-prod smoke on seat c3d62ac4.
 
 1. "My brother Pablo lives in Bilbao." → "Where does my brother live?" rendered the sibling rows but
    never Bilbao. Root cause (pre-prod logs): recall's possessive-presupposition harvest of the QUESTION

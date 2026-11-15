@@ -30,7 +30,7 @@ class FakeResp:
         self.text = text
 
 
-HOMELAB = "http://192.168.40.20:1234/v1"      # unknown host — no table entry
+HOMELAB = "http://192.0.2.20:1234/v1"      # unknown host — no table entry
 CEREBRAS = "https://api.cerebras.ai/v1"        # table entry WITH a published rpm (5, Free Trial)
 ZAI = "https://api.z.ai/api/paas/v4"           # table entry, rpm=None + non-rate 429 codes
 

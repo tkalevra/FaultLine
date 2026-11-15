@@ -1,4 +1,4 @@
-"""Issue #52 (re-smoke @ eca52925, seat 843d39dc) — a measure is a scalar in every store and lane.
+"""Issue #52 (re-smoke @ eca52925, seat c3d62ac4) — a measure is a scalar in every store and lane.
 
 Live turns: ``My canoe is 4 meters long.`` → ``Correction: my canoe is 5 meters long, not 4.`` →
 ``How long is my canoe?``. Measured from the pre-prod log (04:43, deploy #19), the three defects

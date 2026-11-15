@@ -47,7 +47,7 @@ def test_detect_temporal_future_dated():
 
 
 def test_detect_temporal_now_default():
-    status, ed, _gran = m._detect_temporal("I work at Guelph")
+    status, ed, _gran = m._detect_temporal("I work at Waterloo")
     assert status == "now"
     assert ed is None
 

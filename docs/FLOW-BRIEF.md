@@ -24,15 +24,15 @@ FaultLine solves this by **actually remembering things you say** and using those
 
 When you say something to the assistant, FaultLine listens for facts.
 
-**Example:** "My son Des is 12, and my wife is Marla."
+**Example:** "My son Dez is 12, and my wife is Marla."
 
 FaultLine identifies:
-- **Fact 1:** Des is a son (relationship: parent_of)
+- **Fact 1:** Dez is a son (relationship: parent_of)
 - **Fact 2:** Marla is a wife (relationship: spouse)
-- **Fact 3:** Des's age is 12 (attribute)
+- **Fact 3:** Dez's age is 12 (attribute)
 
 **But wait, you might correct yourself:**
-- "Actually, Des is 14, not 12"
+- "Actually, Dez is 14, not 12"
 
 FaultLine notices the correction word "Actually" and marks it as an override. Your correction wins over any AI guess.
 
@@ -52,28 +52,28 @@ Now FaultLine validates these facts before storing them.
   - YES? Use what we know about it
   - NO? Learn it as something new
   
-- "Is Des a known type of person?"
+- "Is Dez a known type of person?"
   - YES? Skip
-  - NO? Remember Des is a person
+  - NO? Remember Dez is a person
 
 - "Does this conflict with anything we know?"
-  - Example: Can't have "Des is a type of dog" AND "Des is your son" at the same time
+  - Example: Can't have "Dez is a type of dog" AND "Dez is your son" at the same time
 
 **Then it stores the fact with a confidence level:**
-- **High confidence (you said it directly):** "My son Des" → stored immediately ✓
-- **Medium confidence (AI inferred it):** "Based on context, Des is probably 14" → ask for confirmation ⚠️
-- **Low confidence (AI guessed something new):** "Des might be a Gemini zodiac sign" → hold for later evaluation ❓
+- **High confidence (you said it directly):** "My son Dez" → stored immediately ✓
+- **Medium confidence (AI inferred it):** "Based on context, Dez is probably 14" → ask for confirmation ⚠️
+- **Low confidence (AI guessed something new):** "Dez might be a Gemini zodiac sign" → hold for later evaluation ❓
 
 ---
 
 ### Step 3: Use It (Recall)
 
-Later, you ask: "How old is Des?"
+Later, you ask: "How old is Dez?"
 
 FaultLine:
-1. **Finds all relevant facts** about Des
-   - Direct facts: Des is your son, age is 14
-   - Connections: Des is connected to you, to Marla
+1. **Finds all relevant facts** about Dez
+   - Direct facts: Dez is your son, age is 14
+   - Connections: Dez is connected to you, to Marla
    - Context: Related to family memories
 
 2. **Checks for consistency**
@@ -81,12 +81,12 @@ FaultLine:
    - Is the source trustworthy? Yes (you said it)
 
 3. **Tells the AI**
-   - Adds to context: "You have a son named Des who is 14"
+   - Adds to context: "You have a son named Dez who is 14"
    - The AI sees this before answering
 
 4. **AI responds naturally**
-   - "Des is 14 years old. How is he doing?"
-   - No guessing, no forgetting, no asking "who is Des?"
+   - "Dez is 14 years old. How is he doing?"
+   - No guessing, no forgetting, no asking "who is Dez?"
 
 ---
 
@@ -138,11 +138,11 @@ Facts get stored in different places depending on what they are:
 |------|---------|---------|---------|
 | **Attributes** | "age = 14" | Single value table | Quick lookup |
 | **Relationships** | "spouse → Marla" | Connection graph | Find connected people |
-| **Classifications** | "Des is a Person" | Hierarchy | Understand what things are |
+| **Classifications** | "Dez is a Person" | Hierarchy | Understand what things are |
 
 This matters because the system can answer different questions efficiently:
-- "How old is Des?" → Quick attribute lookup
-- "Who is Des connected to?" → Graph traversal
+- "How old is Dez?" → Quick attribute lookup
+- "Who is Dez connected to?" → Graph traversal
 - "What am I?" → Hierarchy traversal
 
 ---
@@ -173,7 +173,7 @@ Not all facts are equal.
 ## Example: Full Cycle
 
 ### Day 1
-**You say:** "My son Des is 12, and my wife is Marla"
+**You say:** "My son Dez is 12, and my wife is Marla"
 
 FaultLine:
 - Extracts facts
@@ -182,7 +182,7 @@ FaultLine:
 - Learns: parent_of relationship, spouse relationship
 
 ### Day 2
-**You say:** "Actually Des is 14 now"
+**You say:** "Actually Dez is 14 now"
 
 FaultLine:
 - Detects the correction
@@ -193,10 +193,10 @@ FaultLine:
 **You ask:** "Tell me about my family"
 
 FaultLine:
-- Retrieves: Des (son, age 14), Marla (spouse)
-- Formats naturally: "Your son Des is 14 and your wife is Marla"
+- Retrieves: Dez (son, age 14), Marla (spouse)
+- Formats naturally: "Your son Dez is 14 and your wife is Marla"
 - Injects into AI context
-- AI responds: "You have a son Des who is 14 and a wife Marla. That's a nice family! How are they doing?"
+- AI responds: "You have a son Dez who is 14 and a wife Marla. That's a nice family! How are they doing?"
 
 **No guessing. No forgetting. Just remembering.**
 
@@ -210,7 +210,7 @@ FaultLine:
 - Hallucinations: "Your son is probably named John" (just guessing)
 
 **FaultLine-Enhanced AI:**
-- "Your son Des is 14 and your wife is Marla"
+- "Your son Dez is 14 and your wife is Marla"
 - Remembers across conversations
 - Never guesses about your personal facts
 - Asks for clarification if unsure

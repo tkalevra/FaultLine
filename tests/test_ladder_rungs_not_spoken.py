@@ -29,7 +29,7 @@ _LADDER = ("subclass_of", "instance_of")
 def _ask(uid, text):
     # FORCE, never setdefault: with setdefault an already-set POSTGRES_DSN wins and the
     # test silently runs against a different database than LADDER_TEST_DSN names. Seat
-    # 10d7d879 holds 69 facts locally and 862 on production — same id, different truth.
+    # 1a2b3c4d holds 69 facts locally and 862 on production — same id, different truth.
     os.environ["POSTGRES_DSN"] = DSN or ""
     os.environ.setdefault("SPACY_MODEL", "en_core_web_sm")
     from src.api.models import QueryRequest

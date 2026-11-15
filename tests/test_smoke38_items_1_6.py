@@ -1,4 +1,4 @@
-"""#38 items 1 and 6 (smoke c88f04e0, seat 843d39dc).
+"""#38 items 1 and 6 (smoke c88f04e0, seat c3d62ac4).
 
 Item 1 — "I found my best specimen in Bancroft, Ontario." → user has_pet "best specimen in bancroft".
   (a) the NP swallowed its PP: _nominal_pp_complement / _verb_pp_value composed a PROPN PP into a

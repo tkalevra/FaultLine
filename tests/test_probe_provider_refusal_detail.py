@@ -1,7 +1,7 @@
 """BUG-02 (P1, 2026-10-30): the probe result must carry a CURATED provider-refusal
 sentence for auth/billing-class statuses — never the raw provider body (CWE-209).
 
-Filed from prod: HelpDeskPro (z.ai coding-plan endpoint) saw the model LIST succeed
+Filed from prod: ExampleCorp (z.ai coding-plan endpoint) saw the model LIST succeed
 (unmetered GET) while every chat-shaped call was refused HTTP 429 code 1113 "Insufficient
 balance or no resource package. Please recharge." — and the console rendered only
 "call failed: HTTPStatusError: the endpoint answered with an HTTP error status". The

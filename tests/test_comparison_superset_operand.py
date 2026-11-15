@@ -1,6 +1,6 @@
 """Temporal-comparison recall cluster — DIRECTIONAL operand resolution + dated-symmetry.
 
-Live-grounded root cause (LME gpt4_0b2f1d21 / gpt4_6ed717ea, test seat 04658f0e):
+Live-grounded root cause (LME gpt4_0b2f1d21 / gpt4_6ed717ea, test seat 9fccbb8a):
 a "which did I <verb> first, A or B" comparison MISSED because the dative-for / amod fold
 at CAPTURE composes the beneficiary + premodifiers INTO the acquisition object surface —
 "I got a new dog bed for Max" is stored under the alias ``new dog bed for max`` (@date).

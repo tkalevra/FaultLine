@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 
 
 ACCT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"           # the granted seat
+UID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"           # the granted seat
 JENN = "beadfeed-2222-4222-8222-222222222222"          # the ungranted "Jenn from accounting" seat
 FOREIGN = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"        # a seat of ANOTHER account (BOLA target)
 ADMIN_NB = "22222222-2222-4222-8222-222222222222"       # seat/security admin — NO billing rights

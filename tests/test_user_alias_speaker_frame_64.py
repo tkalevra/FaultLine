@@ -79,7 +79,7 @@ def test_third_party_propn_refused():
 # ── the speaker's own frames still license (no regression on "I'm Chris") ────────────────────────
 @pytest.mark.parametrize("text,alias", [
     ("I'm Chris.", "chris"),
-    ("I am Christopher and I live in Guelph.", "christopher"),
+    ("I am Christopher and I live in Waterloo.", "christopher"),
     ("I am called Chris.", "chris"),
     ("People call me Chris.", "chris"),
     ("Chris is my name.", "chris"),

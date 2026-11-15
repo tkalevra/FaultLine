@@ -1442,7 +1442,7 @@ def test_the_contract_surface_names_exactly_ONE_cancellation_address():
     is the product brand. So the correct invariant is the INVERSE of what this test first asserted,
     and the assertion is flipped rather than deleted.
 
-    Also swept: ``helpdeskpro.ca``, which must appear NOWHERE — it is a separate entity and not a
+    Also swept: ``example.com``, which must appear NOWHERE — it is a separate entity and not a
     registered company, and it was live in the RFC 9116 ``/.well-known/security.txt`` default, so a
     security researcher following the machine-readable canonical contact was pointed at a
     non-company."""
@@ -1467,14 +1467,14 @@ def test_the_contract_surface_names_exactly_ONE_cancellation_address():
             # a CONTACT address at the product domain — not bare "faultline.ca" (URLs are fine)
             if _re.search(r"[A-Za-z0-9._%+-]+@faultline\.ca", line):
                 wrong_domain.append(f"{rel}:{n}")
-            if "helpdeskpro" in line.lower():
+            if "examplecorp" in line.lower():
                 banned_entity.append(f"{rel}:{n}")
     assert wrong_domain == [], (
         "the contract surface names a @faultline.ca contact address. Volenti is the REGISTERED "
         "COMPANY and the party to this agreement; the binding Terms name @volenti.ca, and the "
         f"page/webhook/refusal text must match it exactly: {wrong_domain}")
     assert banned_entity == [], (
-        "helpdeskpro.ca is a separate entity and NOT a registered company — it must not appear "
+        "example.com is a separate entity and NOT a registered company — it must not appear "
         f"anywhere on the contract surface: {banned_entity}")
 
 

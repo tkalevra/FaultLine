@@ -45,7 +45,7 @@ from src.re_embedder import embedder
 pytestmark = pytest.mark.usefixtures("requires_postgres")
 
 CHUNK = ("Marcus owns two vintage synthesizers. "
-         "His sister Lena works at the hospital in Guelph.")
+         "His sister Lena works at the hospital in Waterloo.")
 
 _DET_EDGES = [{"subject": "marcus", "rel_type": "works_for",
                "object": "hospital", "confidence": 0.8,

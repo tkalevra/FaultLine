@@ -48,7 +48,7 @@ def test_detect_atomic_values_claims_generic_identifier(text, ident):
     "My ticket and docket are open",           # plain words → no digit
     "The refund is 45 dollars",                # bare count
     "utf8 and win10 and iPhone13 and mp3",     # lowercase / <2-digit tech tokens
-    "My IP is 192.168.40.20",                  # IPv4 (no uppercase)
+    "My IP is 192.0.2.20",                  # IPv4 (no uppercase)
     "The MAC is AA-BB-CC-DD-EE-01",            # uppercase hyphen-MAC → yields to has_mac
     "Email me at bob@example.com",             # email span
     "My server is host.example.com",           # FQDN span

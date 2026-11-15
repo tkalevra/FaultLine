@@ -380,7 +380,7 @@ CALIBRATION:
        backward walk matches the inner ``r`` of "retirement" first, yielding the truncated span
        "retirement savings plan", which then has only three word-initials (r,s,p) for four
        characters. Already disclosed under MISSED LICENCES; this is its independent confirmation.
-    2. {u of g} ≡ {university of guelph} — a THREE-WORD short form, rejected by
+    2. {U of T} ≡ {university of waterloo} — a THREE-WORD short form, rejected by
        ``is_valid_short_form``'s ``_MAX_SHORT_WORDS = 2``. That cap is FAITHFUL to §3.1 ("at most
        two words"), so this is the paper's limit correctly implemented, not a port defect — but
        it is a real recall cost and was not previously listed as one.

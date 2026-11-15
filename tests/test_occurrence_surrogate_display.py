@@ -83,7 +83,7 @@ def test_handle_is_detected_as_internal_surrogate():
 
 
 def test_ordinary_labels_are_not_surrogates():
-    for _label in ("data analysis using python", "webinar", "diane", "guelph", ""):
+    for _label in ("data analysis using python", "webinar", "diane", "waterloo", ""):
         assert not main._is_internal_surrogate_surface(_label)
     assert not main._is_internal_surrogate_surface(None)
 

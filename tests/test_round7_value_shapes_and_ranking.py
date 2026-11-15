@@ -1,4 +1,4 @@
-# ROUND-7 nvidia-lane re-gate pins (seat 53cc923e, live-proven wounds):
+# ROUND-7 nvidia-lane re-gate pins (seat 93e3050b, live-proven wounds):
 #   RED 3(c)  recall "what is the IP and MAC of my laptop?" anchored the JUNK 'mac'
 #             Person (f37ce038, occupation=wireless) -- the wifi/mac junk PAIR still
 #             minted live at the name-type binding seam, and the copula-state lane
@@ -34,7 +34,7 @@ def test_value_shape_mac():
 
 
 def test_value_shape_ipv4_cidr():
-    assert is_value_shape("192.168.40.83/25") is True
+    assert is_value_shape("192.0.2.83/25") is True
     assert is_value_shape("10.0.0.1") is True
 
 

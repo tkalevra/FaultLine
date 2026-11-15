@@ -178,14 +178,14 @@ def test_recall_matches_by_keyword_and_tag_topk():
     schema, status = create_cortex_schema(uid)
     assert status == "ready"
     try:
-        cortex.note(uid, "LLM endpoint is 192.168.40.20:8080, NOT :1234",
+        cortex.note(uid, "LLM endpoint is 192.0.2.20:8080, NOT :1234",
                     category="gotcha", tags=["llm-endpoint", "config", "port", "model"])
         cortex.note(uid, "new files under tests/ are gitignored, use git add -f",
                     category="pitfall", tags=["git", "tests"])
         # FUZZY query — no exact words shared with the note text; tags bridge it.
         hits = cortex.recall_notes(uid, "what port for the model", limit=5)
         assert hits, "keyword/tag recall returned nothing"
-        assert "192.168.40.20" in hits[0]["note"]        # right note on top
+        assert "192.0.2.20" in hits[0]["note"]        # right note on top
         # a query with no overlap returns nothing (honest miss, no leak).
         assert cortex.recall_notes(uid, "unrelated aquarium submarine") == []
         # bare recall (no query) returns the most-relevant/recent top-K.

@@ -122,7 +122,7 @@ def test_step4_does_not_touch_non_event_rels():
     edge is never touched even when the spine reified."""
     manifest = {"handles": {"h1"}, "titles": set(), "event_types": {"meeting"}}
     edges = [
-        {"subject": "user", "rel_type": "lives_in", "object": "guelph"},
+        {"subject": "user", "rel_type": "lives_in", "object": "waterloo"},
         {"subject": "user", "rel_type": "works_for", "object": "university"},
         {"subject": "user", "rel_type": "age", "object": "40"},
     ]

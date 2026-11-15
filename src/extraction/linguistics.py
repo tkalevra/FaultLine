@@ -2235,7 +2235,7 @@ SPINE_RELATIONAL_PREDICATIVE: bool = os.environ.get(
 # NP_ENTITY_COMPLETION (default ON) — capture a MULTI-WORD ENTITY NAME WHOLE at the object slot.
 # A proper-noun-modified / compound-noun entity NP was truncated to its bare HEAD noun in two seams the
 # left-modifier-only ``_object_value_phrase`` never covered, dropping the answer-bearing specifier:
-#   (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Guelph"
+#   (a) a RIGHT ``of <PROPN>`` name-completion tail on an EMPLOYER — "I work at the University OF Waterloo"
 #       / "Bank OF America" stored ``works_for → university`` / ``bank`` (``_chain_employment`` folds
 #       only left modifiers; the SVO chain already recovers this via ``_nominal_pp_complement``). The
 #       tail is folded via the existing ``_proper_name_of_tail`` (nested ``prep``-"of" → ``pobj`` PROPN;
@@ -6879,7 +6879,7 @@ def _verb_dative_recipient(verb_tok, obj_tok, exclude_idx=None):
 
 
 # ── POSSESSION-TRANSFER OWNS FRAME (BUG-RECALL-11 SEAM 2, qP1, measured on the A17 bench
-#    seat 90206360) ─────────────────────────────────────────────────────────────────────
+#    seat aefc91e8) ─────────────────────────────────────────────────────────────────────
 # "Kira handed the ingest rewrite to Mateo last sprint" minted ONLY the event weld
 # (kira, hand, "ingest rewrite to mateo") — the dative recipient folded INTO the object
 # surface by the nominal/verb folds above — and left the seed row (kira, owns, ingest
@@ -20962,7 +20962,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 _rexcl = (_date_token_idx | _rate_span_idx)
                 _obj_tok = _svo_object_head(_v, exclude_idx=_rexcl)
                 # FIRST-PERSON POSSESSIVE-PP ASPECT REFUSAL (BUG-RECALL-7 extension,
-                # measured corpus-A R2b on the A17 bench seat 90206360): "Every Friday
+                # measured corpus-A R2b on the A17 bench seat aefc91e8): "Every Friday
                 # deploy in my history has ended with me on the laptop at dinner." — the
                 # rate's activity object resolved to the pobj of a PP governed by the verb
                 # whose subtree carries a first-person possessive determiner ("in MY
@@ -23681,7 +23681,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             if _org is not None:
                 org_phrase = _object_value_phrase(_org)
                 # FULL ENTITY-NAME COMPLETION: fold the RIGHT ``of <PROPN>`` name tail ("University OF
-                # Guelph", "Bank OF America") that ``_object_value_phrase`` (left-modifiers only) drops —
+                # Waterloo", "Bank OF America") that ``_object_value_phrase`` (left-modifiers only) drops —
                 # else the employer truncates to the bare head noun. The SVO chain already recovers this
                 # via ``_nominal_pp_complement``; the employment chain needs it explicitly. Claim the tail
                 # tokens so the residue guard / PA-core (G5 twin-suppression) see the whole name COVERED.
@@ -25873,7 +25873,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the PROPER NAME — the copula's attr/oprd complement that is a PROPN (a NOUN the parser
             # mis-tagged is excluded here: a common-noun complement is a type/role, owned elsewhere).
             # ROLE-HEAD NO-BIND (F1-R2): the sm tagger alternates attr/acomp for the SAME
-            # construction across names — "My wife is Seren." parses the name attr,
+            # construction across names — "My wife is Nora." parses the name attr,
             # "My wife is Isolde." parses it PROPN acomp (the measure-NP dobj/npadvmod coin-flip
             # class) — and a frame whose name lands in acomp missed this scan entirely, the
             # possessive weld edge shipped, and ingest linked it onto the seat's PRE-EXISTING
@@ -28680,8 +28680,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # instance class (falls back to owns).
                     _poss = _possession_rel_for_type(type_head, instance_type_tag=_inst_tag)
                     # ALIENABILITY GATE (SPINE_POSSESSIVE_ALIENABILITY) — SECOND ENFORCEMENT POINT.
-                    # This chain re-homes the possession onto the NAME ("my hometown is Guelph" →
-                    # (user, owns, guelph)), and its ``_ni_suppress`` entry makes ``_chain_possessive``
+                    # This chain re-homes the possession onto the NAME ("my hometown is Waterloo" →
+                    # (user, owns, waterloo)), and its ``_ni_suppress`` entry makes ``_chain_possessive``
                     # step aside (:12935) — so the gate that chain applies at :13180 was NEVER reached
                     # for this construction and ``_possession_rel_for_type`` defaults to ``owns`` with
                     # no value-type check. Same contract, same helper, ONE flag, two enforcement points.
@@ -28696,7 +28696,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # named entity stays a durable object of the user's outbound edge and stays
                     # reachable by the descendant walk. The specific relational reading is separately
                     # captured by the preference/possessive-predication seam (main.py:404 →
-                    # (user, hometown, guelph)), so nothing is lost by withdrawing the ownership claim.
+                    # (user, hometown, waterloo)), so nothing is lost by withdrawing the ownership claim.
                     if SPINE_POSSESSIVE_ALIENABILITY and not _possessum_admitted_by_rel_tail(
                             (type_head or "").strip().lower(), _inst_tag or "", _poss):
                         _poss = "related_to"
@@ -31494,7 +31494,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # ── REGISTER DECONFLICTION FIREWALL (BUG-RECALL-7 extension, post-chain) ──────
             # When THIS sentence IS a register frame, the generic chains' twin readings of
             # the register's own material are PARAPHRASE JUNK that shadows the honest row at
-            # serving time (measured live on the A17 bench seat 90206360, corpus-A R1/R3):
+            # serving time (measured live on the A17 bench seat aefc91e8, corpus-A R1/R3):
             #   "Personal rule that has paid for itself: always run the smoke suite…"
             #        → (rule, has_state, pay) + (personal rule, run, smoke suite)
             #          served where (deploy, has_setting, "smoke suite") belongs;
@@ -34851,10 +34851,10 @@ def _collect_date_spans(text: str) -> list:
                         seen_spans.add(span.lower())
     except Exception as e:  # noqa: BLE001 — fail-safe: relative-cue recovery never crashes the net
         log.warning("linguistics.date_relative_cue_net_failed", error=str(e)[:160])
-    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 10d7d879) ──────────────
+    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat e345e523) ──────────────
     # A network-address token (IPv4 A.B.C.D, with or without /NN prefix; an octet RUN of three or
     # more dot-groups; IPv6 colon-hex; a MAC pair-shape) is NEVER a date candidate, no matter how
-    # the NER or the numeric regexes proposed it: dateparser on a fragment of "192.168.40.83/25"
+    # the NER or the numeric regexes proposed it: dateparser on a fragment of "192.0.2.83/25"
     # fabricated a calendar date out of the address text and the junk row landed as a dated scalar
     # beside the real has_ip. Same discipline as ``_span_is_bare_duration_measure`` — a structural
     # reject of a span SHAPE that cannot be a time-position, top-level candidates only, fail-safe
@@ -34996,11 +34996,11 @@ def _recover_overextended_date_core(span: str, reference):
 def _span_is_ip_cidr_token(span: str) -> bool:
     """Is ``span`` a NETWORK-ADDRESS token (or a span containing one) — never a time-position?
 
-    Structural shapes only, no word list: a full IPv4 literal (``192.168.40.83``, with or without a
+    Structural shapes only, no word list: a full IPv4 literal (``192.0.2.83``, with or without a
     ``/NN`` prefix), an OCTET RUN of three or more dot-separated numeric groups (an IPv4 literal is
     four; no calendar date anywhere carries three dot-groups), an IPv6 colon-hex run, and a MAC
     pair-shape (``2e:0f:ef:d9:67:11``). This is the date-lane firewall half of the WOUND A fix: the
-    CIDR string "an ip of: 192.168.40.83/25" must never feed dateparser, which happily fabricates a
+    CIDR string "an ip of: 192.0.2.83/25" must never feed dateparser, which happily fabricates a
     calendar date from address fragments (measured live: ip_address='2026-10-25', datatype='date',
     minted from the address text). Deterministic, subject-agnostic, fail-safe → False upstream."""
     if not span:
@@ -35025,7 +35025,7 @@ def _span_is_ip_cidr_token(span: str) -> bool:
     if re.search(r"\b[0-9a-f]{2}(?:[:\-][0-9a-f]{2}){5}\b", _s):
         return True
     # CIDR TAIL FRAGMENT (the ``/NN`` prefix-length tail a NER/regex net sheared off the
-    # address: "83/25" out of "192.168.40.83/25" — the measured fabrication path). A
+    # address: "83/25" out of "192.0.2.83/25" — the measured fabrication path). A
     # ``<num>/<num>`` slash pair is a date candidate ONLY when it reads as a calendar
     # month/day pair (12/25); an impossible reading (83/25) is address residue, never a date.
     for _mfrac in re.finditer(r"\b(\d{1,3})/(\d{1,2})\b", _s):

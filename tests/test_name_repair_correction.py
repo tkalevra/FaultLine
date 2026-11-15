@@ -178,7 +178,7 @@ def test_intercept_declines_rather_than_minting_a_referent():
 
 @pytest.mark.parametrize("text", [
     "My favorite color is red, not blue.",     # a VALUE correction — the guard's original premise
-    "I moved to Guelph, not Toronto.",
+    "I moved to Waterloo, not Toronto.",
     "",
 ])
 def test_intercept_declines_on_anything_that_is_not_a_name_repair(text):

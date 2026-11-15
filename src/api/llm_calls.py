@@ -2482,7 +2482,7 @@ _RATE_429_FALLBACK: dict[str, dict] = {
     # Cerebras — Free Trial tier ("$5 in free credits", expire 30 days). The tier
     # _PROVIDER_LIMITS deliberately does NOT clamp to, because that table records the paid
     # Developer figures so a paying tenant is never capped. Independently corroborated
-    # against a live HelpDeskPro key whose failure profile matched 5 RPM exactly.
+    # against a live ExampleCorp key whose failure profile matched 5 RPM exactly.
     "api.cerebras.ai": {
         "tier": "Free Trial (lowest published; Developer = 300-1000 RPM)",
         "rpm": 5, "rps": None, "tpm": 30_000, "rpd": None, "concurrency": None,
@@ -3807,7 +3807,7 @@ def _get_rate_bucket(key: str, rate: float, limits: Optional[dict] = None,
 
     STALE-FLOOR CLEAR: a floor is tagged with the endpoint it was learned from
     (``learner_source``). When ``endpoint_tag`` differs from that source, the brain has
-    switched providers (e.g. HelpDeskPro → DashScope) — the old floor is CLEARED so the
+    switched providers (e.g. ExampleCorp → DashScope) — the old floor is CLEARED so the
     new provider is not permanently under-paced by the previous provider's tier. The new
     endpoint re-learns its own profile from its first response.
     """

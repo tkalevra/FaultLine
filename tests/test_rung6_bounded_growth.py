@@ -62,7 +62,7 @@ def test_bridge_rejects_self_bridge():
 
 def test_bridge_rejects_type_mismatch():
     ok, reason = emb._validate_bridge_placement(
-        "dog", "guelph", "canid", child_a_type="Animal", child_b_type="Location"
+        "dog", "waterloo", "canid", child_a_type="Animal", child_b_type="Location"
     )
     assert ok is False
     assert reason.startswith("type_mismatch")

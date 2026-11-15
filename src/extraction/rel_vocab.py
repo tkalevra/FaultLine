@@ -1,6 +1,6 @@
 """Rel-type VOCABULARY gates for the rel_type mint chokepoint.
 
-BUG 05 (prod seat 10d7d879, 2026-11-03) measured an ontology that mints junk vocabulary at
+BUG 05 (prod seat e345e523, 2026-11-03) measured an ontology that mints junk vocabulary at
 scale: negated/modal phrases as rel_types (should_not_be_given_broad_autonomy_when,
 "cannot handle" WITH a space, not_inspects, never_watches, might_not_understand),
 space-bearing sentence fragments ("enhances performance", "results in the loss of"), a

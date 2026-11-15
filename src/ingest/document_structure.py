@@ -164,7 +164,7 @@ def propagate_chunk_context(chunks):
 # ---------------------------------------------------------------------------
 # REFERENCE / FRONT-MATTER DENSITY GATE (litmus fix L4, 2026-11-03)
 # ---------------------------------------------------------------------------
-# THE CORPUS EVIDENCE (prod seat faultline_10d7d879..., docs 10-14 + 6 controls,
+# THE CORPUS EVIDENCE (prod seat faultline_1a2b3c4d..., docs 10-14 + 6 controls,
 # 671 chunks, benchmarks/corpus_gate_eval8.py + the CSV it reads): arXiv-style
 # documents carry CONTIGUOUS reference runs (doc10 lines 106-155, doc12 98-129,
 # doc13 65-94, doc14 107-146) whose chunks are citation-line DENSE - every non-empty

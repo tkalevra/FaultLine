@@ -273,16 +273,16 @@ def test_resolver_exception_fails_closed(monkeypatch):
 # ════════════════════════════════════════════════════════════════════════════════════
 
 def test_operator_allowlist_still_reaches_a_lan_brain(monkeypatch):
-    """This is how pre-prod reaches its LAN brain (192.168.40.20:1234, LM Studio).
+    """This is how pre-prod reaches its LAN brain (192.0.2.20:1234, LM Studio).
     Breaking it breaks the dev loop, so it is pinned by address, not in principle."""
-    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "10.0.0.0/8,192.168.40.0/24")
-    for url in ("http://10.0.0.5:11434/v1", "http://192.168.40.20:1234", "https://10.0.0.5/v1"):
+    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "10.0.0.0/8,192.0.2.0/24")
+    for url in ("http://10.0.0.5:11434/v1", "http://192.0.2.20:1234", "https://10.0.0.5/v1"):
         cls = C.validate_egress_url(url)
         assert cls["allowlisted"] is True
 
 
 def test_allowlist_is_scoped_not_a_blanket_unlock(monkeypatch):
-    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.168.40.0/24")
+    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.0.2.0/24")
     for url in ("http://192.168.1.10/v1",         # different RFC1918 subnet
                 "http://10.0.0.5/v1",
                 "http://127.0.0.1:1234/v1",

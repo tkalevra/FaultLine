@@ -27,15 +27,15 @@ from src.extraction import reframe as R
 
 class TestLiteralIntegrity:
     def test_ip_byte_intact_ok(self):
-        msg = "set my server ip to 192.168.40.21 please"
-        src = "my server ip to 192.168.40.21"
-        atom = "my server ip is 192.168.40.21"
+        msg = "set my server ip to 192.0.2.21 please"
+        src = "my server ip to 192.0.2.21"
+        atom = "my server ip is 192.0.2.21"
         assert R._guardrail_ok(atom, src, msg) is True
 
     def test_ip_dropped_octet_reject(self):
-        msg = "set my server ip to 192.168.40.21 please"
-        src = "my server ip to 192.168.40.21"
-        atom = "my server ip is 192.168.40.2"   # dropped last octet
+        msg = "set my server ip to 192.0.2.21 please"
+        src = "my server ip to 192.0.2.21"
+        atom = "my server ip is 192.0.2.2"   # dropped last octet
         assert R._guardrail_ok(atom, src, msg) is False
 
     def test_date_reformat_reject(self):
@@ -408,7 +408,7 @@ class TestReframeFailSafe:
 
 class TestTokenizer:
     def test_ip_is_single_token(self):
-        assert "192.168.40.21" in R._content_tokens("ip 192.168.40.21")
+        assert "192.0.2.21" in R._content_tokens("ip 192.0.2.21")
 
     def test_email_is_single_token(self):
         assert "foo@bar.com" in R._content_tokens("email foo@bar.com")
@@ -422,8 +422,8 @@ class TestTokenizer:
         assert "fence" in ct and "east" in ct and "side" in ct
 
     def test_literals_only_digit_tokens(self):
-        lits = R._literals("i fixed the fence on 3/22 with 192.168.40.21")
-        assert lits == {"3/22", "192.168.40.21"}
+        lits = R._literals("i fixed the fence on 3/22 with 192.0.2.21")
+        assert lits == {"3/22", "192.0.2.21"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

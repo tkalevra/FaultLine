@@ -1,4 +1,4 @@
-"""Issue #48 (re-smoke @ f32076f7, seat 843d39dc) — measure contrast + measure interrogative.
+"""Issue #48 (re-smoke @ f32076f7, seat c3d62ac4) — measure contrast + measure interrogative.
 
 (a) "Correction: my kayak is 16 feet long, not 14." also filed (user, kayak, "feet long 14").
     Root cause: the possessive-preference seam (``analyze_possessive_predication``) declines a

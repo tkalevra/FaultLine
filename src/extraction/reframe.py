@@ -153,7 +153,7 @@ _FUNCTION_WORDS: frozenset[str] = frozenset({
 })
 
 # Token regex that keeps dotted/dated/IP/email literals INTACT as one token:
-#   192.168.40.21, foo@bar.com, 3/22, 2023-03-22  →  single tokens.
+#   192.0.2.21, foo@bar.com, 3/22, 2023-03-22  →  single tokens.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[.\-:/@][A-Za-z0-9]+)*")
 
 

@@ -113,7 +113,7 @@ def _supersede_link_decision(note_ordered, note_tokens, victim_note, victor_note
 
     A correction may only tombstone a note that restates the SAME FACT with a new
     value. Two independent signals, either of which suffices — validated against the
-    78 real tombstone pairs on kept seat f69b42eb (47 false / 31 true):
+    78 real tombstone pairs on kept seat 4c95567a (47 false / 31 true):
     (a) TEMPLATE MATCH: >= 4 shared content tokens, the first 3 content tokens of
         both notes agree (same sentence opening), and Jaccard >= 0.5 over the union —
         the coffee-count / changelog-rant / runbook-pin chains all pass; generic

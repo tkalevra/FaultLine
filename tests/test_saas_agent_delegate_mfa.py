@@ -45,7 +45,7 @@ PASSKEY_FACTOR = [{"id": "f-pk", "factor_type": "webauthn", "label": "Optimus-Fa
 TOTP_FACTOR = [{"id": "f-totp", "factor_type": "totp", "label": "Authenticator",
                 "email_masked": None, "is_default": True}]
 EMAIL_FACTOR = [{"id": "f-mail", "factor_type": "email", "label": "Email",
-                 "email_masked": "c***@optimuscannabis.ca", "is_default": True}]
+                 "email_masked": "c***@seedtenant.example", "is_default": True}]
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -119,8 +119,8 @@ def env(monkeypatch):
     from saas import tenant_console as tc
 
     users = {
-        "passkey@optimuscannabis.ca": {
-            "id": USER_A, "account_id": ACCT_A, "username": "passkey@optimuscannabis.ca",
+        "passkey@seedtenant.example": {
+            "id": USER_A, "account_id": ACCT_A, "username": "passkey@seedtenant.example",
             "password_hash": "HASH", "role": "admin", "status": "active",
         },
         "totp@example.test": {
@@ -213,7 +213,7 @@ def _app():
     return app
 
 
-def _console_login_passkey(c, email="passkey@optimuscannabis.ca"):
+def _console_login_passkey(c, email="passkey@seedtenant.example"):
     """Drive the console's REAL passkey login: password → mfa_required → webauthn options →
     webauthn verify → session cookie. Returns the CSRF token."""
     r = c.post("/tenant/login", json={"username": email, "password": "good-pw"})
@@ -251,8 +251,8 @@ def test_webauthn_only_login_obtains_a_delegate_through_the_pairing_flow(env):
     """The exact production account shape: one enabled factor, factor_type='webauthn', no TOTP
     secret to supply. Before this change that login could not mint a delegate at all."""
     state, store = env
-    state["mfa_required"]["passkey@optimuscannabis.ca"] = True
-    state["factors"]["passkey@optimuscannabis.ca"] = PASSKEY_FACTOR
+    state["mfa_required"]["passkey@seedtenant.example"] = True
+    state["factors"]["passkey@seedtenant.example"] = PASSKEY_FACTOR
     state["totp_ok"] = False        # there is NO totp secret on this account, ever
 
     from saas import dashboard_auth as auth
@@ -296,11 +296,11 @@ def test_webauthn_only_login_is_told_precisely_why_the_headless_path_cannot_work
     """The old message ("a current totp code is required") was simply FALSE for this account and
     left the appliance nothing to try. It must now name the real factors and the other door."""
     state, _ = env
-    state["mfa_required"]["passkey@optimuscannabis.ca"] = True
-    state["factors"]["passkey@optimuscannabis.ca"] = PASSKEY_FACTOR
+    state["mfa_required"]["passkey@seedtenant.example"] = True
+    state["factors"]["passkey@seedtenant.example"] = PASSKEY_FACTOR
     with TestClient(_app()) as c:
         r = c.post("/v1/auth/tenant-delegate",
-                   json={"email": "passkey@optimuscannabis.ca", "password": "good-pw"})
+                   json={"email": "passkey@seedtenant.example", "password": "good-pw"})
     assert r.status_code == 401
     d = r.json()["detail"]
     assert d["error"] == "mfa_factor_unsupported"
@@ -314,11 +314,11 @@ def test_email_only_login_is_also_pointed_at_the_pop_up(env):
     """Email codes need a send step, so they never fit the single request either — same answer,
     no longer 'totp or nothing'."""
     state, _ = env
-    state["mfa_required"]["passkey@optimuscannabis.ca"] = True
-    state["factors"]["passkey@optimuscannabis.ca"] = EMAIL_FACTOR
+    state["mfa_required"]["passkey@seedtenant.example"] = True
+    state["factors"]["passkey@seedtenant.example"] = EMAIL_FACTOR
     with TestClient(_app()) as c:
         r = c.post("/v1/auth/tenant-delegate",
-                   json={"email": "passkey@optimuscannabis.ca", "password": "good-pw"})
+                   json={"email": "passkey@seedtenant.example", "password": "good-pw"})
     assert r.status_code == 401
     assert r.json()["detail"]["enabled_factors"] == ["email"]
     assert r.json()["detail"]["error"] == "mfa_factor_unsupported"
@@ -408,13 +408,13 @@ def test_failed_passkey_assertion_yields_no_session_and_therefore_no_delegate(en
     """The pop-up path's MFA gate is the CONSOLE's. Fail the assertion and there is no session,
     so the approval 401s and the pairing can never be claimed."""
     state, _ = env
-    state["mfa_required"]["passkey@optimuscannabis.ca"] = True
-    state["factors"]["passkey@optimuscannabis.ca"] = PASSKEY_FACTOR
+    state["mfa_required"]["passkey@seedtenant.example"] = True
+    state["factors"]["passkey@seedtenant.example"] = PASSKEY_FACTOR
     state["webauthn_ok"] = False
     with TestClient(_app()) as c:
         s = c.post("/v1/auth/agent-pairing/start", json={})
         pid, device = s.json()["pairing_id"], s.json()["device_code"]
-        lg = c.post("/tenant/login", json={"username": "passkey@optimuscannabis.ca",
+        lg = c.post("/tenant/login", json={"username": "passkey@seedtenant.example",
                                            "password": "good-pw"})
         assert lg.json()["status"] == "mfa_required"
         o = c.post("/tenant/mfa/webauthn/options", json={"mfa_token": lg.json()["mfa_token"]},
@@ -595,8 +595,8 @@ def test_exchange_mints_only_for_the_sessions_own_account(env):
     """Identity + scope come from the SIGNED session, never the request. Two different logins get
     two different account scopes, and neither can ask for the other's."""
     state, _ = env
-    state["mfa_required"]["passkey@optimuscannabis.ca"] = True
-    state["factors"]["passkey@optimuscannabis.ca"] = PASSKEY_FACTOR
+    state["mfa_required"]["passkey@seedtenant.example"] = True
+    state["factors"]["passkey@seedtenant.example"] = PASSKEY_FACTOR
     from saas import dashboard_auth as auth
     with TestClient(_app()) as c:
         csrf = _console_login_passkey(c)

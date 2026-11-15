@@ -16,7 +16,7 @@ families today:
    src/re_embedder/embedder.py): a re-mined ``episodic_log`` row is BY CONSTRUCTION a
    replay — the turn's live ingest already ran when the row was captured, so its re-POST
    to /ingest is a re-send of already-attempted content, not a fresh user statement. The
-   wound (2026-09-04, seat b3f8a2c4): this lane re-ingested with preserved user_stated
+   wound (2026-09-04, seat e7062ae4): this lane re-ingested with preserved user_stated
    authority and NO marker, so a value /retract/correct had retired came back as a
    genuine-looking re-statement (history 'ingest_restate', superseded_at NULL). The
    marker now rides this lane too — gauntlet reextract-replay-resurrection.

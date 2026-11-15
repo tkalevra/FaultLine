@@ -1,7 +1,7 @@
 """Billing COUNTING BASIS (entitled, not occupied) + operator COMP / EXTEND-TRIAL levers.
 CLOSED-SOURCE SaaS layer.
 
-THE BUG (owner, 2026-08, with a screenshot of the HelpDeskPro bill): a Team account holding
+THE BUG (owner, 2026-08, with a screenshot of the ExampleCorp bill): a Team account holding
 TWO Expert licences with only ONE hired into was billed ``Expert × 1 — CAD $50``. The per-seat
 line counted OCCUPANCY (``account_users`` active rows) instead of the ENTITLEMENT
 (``account_entitlements.quantity``) — a straight revenue leak for every customer who buys

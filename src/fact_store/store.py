@@ -470,7 +470,7 @@ class FactStoreManager:
             staged_ids = [r[0] for r in cur.fetchall()]
 
         # ── SURGICAL TOMBSTONE GUARD (fail-closed) ────────────────────────────────────
-        # WOUND (prod seat 10d7d879, 2026-08-19 18:41:13): a surgical_scalar retraction
+        # WOUND (prod seat e345e523, 2026-08-19 18:41:13): a surgical_scalar retraction
         # ("I don't have a laptop") resolved its subject to the SPEAKER (user → user_uuid)
         # with no object value bound. The object-side fallback above then matched
         # object_id = user_uuid AND rel_type = child_of — EVERY live kin edge in the seat —

@@ -44,7 +44,7 @@ from src.mcp.server import remember_facts_tool, retract_fact_tool  # noqa: E402
 # every `pytest.raises(BrainUnavailable)` then demands the exception the old code never raised.
 BrainUnavailable = getattr(S, "BrainUnavailable", None) or type("BrainUnavailableMissing", (Exception,), {})
 
-_UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+_UID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 _TEXT = "My sister Dana moved to Halifax last spring and she works as a marine biologist."
 
 
@@ -964,7 +964,7 @@ def test_document_lane_spine_timeout_fails_and_queues_the_chunk(monkeypatch):
                    "/documents": [_timeout()]})
     monkeypatch.setattr(S, "_http_client", be)
     monkeypatch.setattr(S, "_check_injection_signals", lambda *_a, **_k: None)
-    out, log = _run(ingest_document_tool("Rufus is a dog. Rufus lives in Guelph.", _UID))
+    out, log = _run(ingest_document_tool("Rufus is a dog. Rufus lives in Waterloo.", _UID))
     assert out["chunks"] >= 1 and out["chunks_failed"] == out["chunks"], out
     assert out["chunks_deferred_retry"] == out["chunks"], out
     assert "/extract/rewrite" not in be.calls, be.calls

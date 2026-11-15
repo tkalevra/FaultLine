@@ -59,7 +59,7 @@ def _dsn_or_skip() -> str:
     dbname = _DSN.rsplit("/", 1)[-1].split("?", 1)[0]
     assert dbname not in ("faultline", "faultline_test", "postgres"), \
         f"refusing to drive a destructive pin against db {dbname!r}"
-    for banned in ("truenas", "faultline.ca", "192.168.40.10", "faultline-prod"):
+    for banned in ("truenas", "faultline.ca", "192.0.2.10", "faultline-prod"):
         assert banned not in _DSN, f"refusing a non-local DSN ({banned})"
     return _DSN
 
@@ -356,7 +356,7 @@ def test_bw2_start_run_marks_an_errored_run_with_the_loud_reason(seam, monkeypat
     monkeypatch.setattr(B, "_RUNS", {})
     monkeypatch.setattr(B, "_ACCOUNT_RUNS", {})
 
-    reason = "sandbox seat 5f6d9dce not ready after 180s (…) — run ERRORED, no claim scored"
+    reason = "sandbox seat be6f92c6 not ready after 180s (…) — run ERRORED, no claim scored"
 
     async def _not_ready(account_id, brain_cfg, progress_cb=None):
         raise B.SandboxNotReady(reason, last_status="provisioning")

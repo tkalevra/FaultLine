@@ -1,6 +1,6 @@
 """smoke-read (issues #31 R2 + #38 items 2-5): reader/render defects where the rows exist.
 
-Measured on pre-prod seat 843d39dc (saas c88f04e0, 2026-09-28) and reproduced in-process by
+Measured on pre-prod seat c3d62ac4 (saas c88f04e0, 2026-09-28) and reproduced in-process by
 replaying that seat's rows into a fresh throwaway seat with production flag values:
 
   #31 R2a "What do I know about woodworking?" -> honest-empty. `_topic_grounded_facts` took

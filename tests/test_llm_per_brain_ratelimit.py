@@ -178,7 +178,7 @@ def test_effective_rpm_for_tightest(monkeypatch):
 
 def test_effective_rpm_for_unknown_host_no_provider_max(monkeypatch):
     monkeypatch.setenv("LLM_MAX_RPM", "480")
-    info = rl.effective_rpm_for("http://192.168.40.20:1234/v1", "qwen3.5-9b", 300)
+    info = rl.effective_rpm_for("http://192.0.2.20:1234/v1", "qwen3.5-9b", 300)
     assert info["provider_known"] is False
     assert info["provider_max_rpm"] is None      # no published max for a self-hosted host
     assert info["effective_rpm"] == 300          # min(480 global, 300 brain)

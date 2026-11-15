@@ -1,7 +1,7 @@
 
-"""Pins for the L4-placement fix cluster (WOUNDS A-D, prod seat 10d7d879 laptop turn).
+"""Pins for the L4-placement fix cluster (WOUNDS A-D, prod seat e345e523 laptop turn).
 
-WOUND A  — a CIDR host address ("an ip of: 192.168.40.83/25") files has_ip (datatype cidr),
+WOUND A  — a CIDR host address ("an ip of: 192.0.2.83/25") files has_ip (datatype cidr),
            never has_subnet-by-default, and NEVER feeds the date lane (no fabricated date).
 WOUND B  — GROWTH-FIRST canonical keys (owner directive): resolution is (1) an EMPTY-floor
            tenant override rail, (2) identity no-op, (3) structural ASPECT-TOKEN IDENTITY
@@ -90,16 +90,16 @@ def _atomic_by_value(text, value):
 
 def test_cidr_host_address_files_has_ip():
     got = _atomic_by_value(
-        "My laptop, hostname: chris-P70 has an ip of: 192.168.40.83/25 and exists on tailscale.",
-        "192.168.40.83/25")
+        "My laptop, hostname: chris-P70 has an ip of: 192.0.2.83/25 and exists on tailscale.",
+        "192.0.2.83/25")
     assert len(got) == 1
     assert got[0]["rel_type"] == "has_ip"
     assert got[0]["type"] == "cidr"  # datatype stays cidr (detector-carried)
 
 
 def test_bare_subnet_statement_still_files_has_subnet():
-    got = _atomic_by_value("The subnet is 192.168.40.0/24 for the office LAN.",
-                           "192.168.40.0/24")
+    got = _atomic_by_value("The subnet is 192.0.2.0/24 for the office LAN.",
+                           "192.0.2.0/24")
     assert len(got) == 1
     assert got[0]["rel_type"] == "has_subnet"
 
@@ -108,14 +108,14 @@ def test_bare_subnet_statement_still_files_has_subnet():
 
 def test_ip_cidr_span_never_a_date_candidate():
     from src.extraction.linguistics import _collect_date_spans, _span_is_ip_cidr_token
-    assert _span_is_ip_cidr_token("192.168.40.83/25")
-    assert _span_is_ip_cidr_token("192.168.40.83")
+    assert _span_is_ip_cidr_token("192.0.2.83/25")
+    assert _span_is_ip_cidr_token("192.0.2.83")
     assert _span_is_ip_cidr_token("an address 10.0.0.5 tail")
     assert _span_is_ip_cidr_token("83/25")  # the sheared CIDR tail — the measured fabrication path
     assert not _span_is_ip_cidr_token("2026-10-25")
     assert not _span_is_ip_cidr_token("october 25th")
     assert not _span_is_ip_cidr_token("12/25")  # a real calendar m/d reading stays a candidate
-    text = ("My laptop, hostname: chris-P70 has an ip of: 192.168.40.83/25 and exists "
+    text = ("My laptop, hostname: chris-P70 has an ip of: 192.0.2.83/25 and exists "
             "on tailscale as the same name.")
     for _start, span in _collect_date_spans(text):
         assert "192.168" not in span and "40.83" not in span
@@ -129,7 +129,7 @@ def test_p70_turn_fabricates_no_event_date():
     from src.temporal import extract_event_date
     from datetime import datetime, timezone
     ref = datetime(2026, 10, 9, tzinfo=timezone.utc)
-    text = ("My laptop, hostname: chris-P70 has an ip of: 192.168.40.83/25 and exists "
+    text = ("My laptop, hostname: chris-P70 has an ip of: 192.0.2.83/25 and exists "
             "on tailscale as the same name. The mac of this (wireless) nic is: "
             "2e:0f:ef:d9:67:11")
     iso, _gran = extract_event_date(text, ref)
@@ -459,10 +459,10 @@ def test_livefail1_datatype_rides_the_value_through_the_merge():
     assert "atomic_datatype_carried" in main_src,         "the merge-site datatype carry is missing"
     assert 'object_datatype"] = _dt' in main_src
     # the surviving edge datatype validates the /25 value against the CIDR grammar
-    ok, why = _validate_scalar_datatype("cidr", "192.168.40.83/25", None)
+    ok, why = _validate_scalar_datatype("cidr", "192.0.2.83/25", None)
     assert ok, why
     # value-shape-first belt: a declared ipv4 slot NEVER rejects a cidr-shaped value
-    ok2, why2 = _validate_scalar_datatype("ipv4", "192.168.40.83/25", None)
+    ok2, why2 = _validate_scalar_datatype("ipv4", "192.0.2.83/25", None)
     assert ok2, why2
     # and a genuinely wrong ipv4 value still refuses (no widening of the gate)
     ok3, _ = _validate_scalar_datatype("ipv4", "not-an-ip", None)
@@ -531,7 +531,7 @@ import datetime as _datetime
 
 _RED1_REF = _datetime.date(2023, 6, 1)
 
-_RED1_SENT = ("my laptop, hostname: chris-P70 has an ip of 192.168.40.83/25 and exists on "
+_RED1_SENT = ("my laptop, hostname: chris-P70 has an ip of 192.0.2.83/25 and exists on "
               "tailscale as the same name. The mac of this (wireless) nic is: "
               "2e:0f:ef:d9:67:11")
 

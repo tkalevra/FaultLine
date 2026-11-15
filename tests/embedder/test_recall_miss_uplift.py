@@ -140,7 +140,7 @@ def _clean_state(monkeypatch):
 
 
 CHUNK_TEXT = ("Marcus owns two vintage synthesizers. "
-              "His sister Lena works at the hospital in Guelph.")
+              "His sister Lena works at the hospital in Waterloo.")
 
 
 def _seed_doc(conn, user, doc_id=1, status="ready", chunk_state=None,
@@ -712,7 +712,7 @@ def test_typed_doc_veto_machine_value_spans():
 def test_typed_doc_coordinated_surface_splits():
     """A comma/"and"-joined surface seeds EACH member as its own span (the
     "Bianca, Dez" glue-defect fixture main.py documents)."""
-    doc = _parse_sent("Bianca and Dez visited Guelph today.")
+    doc = _parse_sent("Bianca and Dez visited Waterloo today.")
     gmodel = _FakeGliner({"Person": [{"text": "Bianca and Dez", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     surfaces = sorted(e.text.lower() for e in out.ents)

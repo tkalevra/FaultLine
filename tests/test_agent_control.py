@@ -49,7 +49,7 @@ if str(REPO) not in sys.path:
 
 ACCT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 OTHER_ACCT = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-SEAT = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+SEAT = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
 FOREIGN_SEAT = "20d7d879-63cd-4f31-92ce-f2c9edb760ab"
 
 # A peer address the tests can put inside / outside an allow-list. TestClient's default peer is
@@ -578,7 +578,7 @@ def test_cidr_gate_unset_is_a_noop(control, monkeypatch):
 def test_cidr_gate_allows_a_listed_source(control, monkeypatch):
     """14. SET + the peer inside the list → allowed."""
     app, _, _, _ = control
-    monkeypatch.setenv("AGENT_CONTROL_ALLOWED_CIDRS", "10.99.0.0/24, 192.168.40.10")
+    monkeypatch.setenv("AGENT_CONTROL_ALLOWED_CIDRS", "10.99.0.0/24, 192.0.2.10")
     with _client(app, peer=PEER) as c:
         r = c.get("/v1/agent/seats", headers=_hdr(_delegate_token()))
     assert r.status_code == 200

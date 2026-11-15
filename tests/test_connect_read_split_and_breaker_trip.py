@@ -1,6 +1,6 @@
 """CONNECT/READ SPLIT + BREAKER CONNECT TRIP - BUG-brain-connect-timeout-burns-full-budget-20261026.
 
-The bug, measured live on pre-prod against a SYN-blackholed brain host (192.168.40.20,
+The bug, measured live on pre-prod against a SYN-blackholed brain host (192.0.2.20,
 100% packet loss): every per-request LLM timeout arrived at httpx as a bare number, which
 sets the CONNECT phase to the FULL read budget - so a host that will never answer a SYN
 was waited on for 90s (REFRAME) / 120s (NL_FILL_BATCH) / 180s (atomic_subject_resolution)

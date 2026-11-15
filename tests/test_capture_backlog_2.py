@@ -93,7 +93,7 @@ def test_111_e2e_two_brothers(e2e_111c):
 
 def test_111_e2e_fresh_domain_genitive_sister(e2e_111b):
     _seat(e2e_111b, ("I live in Halifax.", "I used to live in Perth.",
-                     "My sister's name is Ingrid.", "Ingrid lives in Tromso."))
+                     "My sister's name is Ines.", "Ines lives in Tromso."))
     p = _prose(e2e_111b, "Where does my sister live?")
     assert "tromso" in p, p
     assert "halifax" not in p and "perth" not in p, p

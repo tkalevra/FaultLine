@@ -57,7 +57,7 @@ from src.api import llm_client as LC
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_V4 = "8.8.8.8"          # globally routable (TEST-NET ranges are is_global=False)
 PUBLIC_V6 = "2606:4700:4700::1111"
-LAN_BRAIN = "192.168.40.20"    # inside the pre-prod allowlist 192.168.40.0/25
+LAN_BRAIN = "192.0.2.20"    # inside the pre-prod allowlist 192.0.2.0/25
 BRAIN = "brain.example.test"
 CFG = {"account_id": "acct-egress-test", "backend_type": "openai",
        "base_url": f"https://{BRAIN}/v1", "model": "m", "api_key": "k"}
@@ -215,15 +215,15 @@ def test_ipv6_answer_is_pinned_bracketed(resolver, wire, saas_env):
 
 
 def test_operator_allowlisted_lan_brain_still_passes(resolver, wire, saas_env, monkeypatch):
-    """The pre-prod LAN brain (192.168.40.0/25 via SAAS_LLM_ALLOWED_EGRESS) must keep working —
+    """The pre-prod LAN brain (192.0.2.0/25 via SAAS_LLM_ALLOWED_EGRESS) must keep working —
     the allowlist is read from the ONE existing place (``_allowed_networks``)."""
-    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.168.40.0/25")
+    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.0.2.0/25")
     resolver.table["lan.example.test"] = [LAN_BRAIN]
     with C.guarded_client(timeout=1.0) as c:
         assert c.get("http://lan.example.test:8080/v1/models").status_code == 200
     assert wire[-1]["host"] == LAN_BRAIN
     # ...and the allowlist is SCOPED: a neighbour outside the /25 is still refused.
-    resolver.table["lan2.example.test"] = ["192.168.40.200"]
+    resolver.table["lan2.example.test"] = ["192.0.2.200"]
     with C.guarded_client(timeout=1.0) as c, pytest.raises(C.EgressBlocked):
         c.get("http://lan2.example.test/v1/models")
 
@@ -560,7 +560,7 @@ def agent_app(monkeypatch, saas_env):
     logs = []
     app = FastAPI()
     app.include_router(agent_proxy.build_agent_proxy_router(
-        require_auth=_auth, resolve_user_id=lambda r, b, p: "10d7d879-63cd-4f31-92ce-f2c9edb760ab",
+        require_auth=_auth, resolve_user_id=lambda r, b, p: "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab",
         account_for=lambda p, u: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", log=logs.append))
     yield TestClient(app), logs
     _recall_cache.reset()
@@ -822,7 +822,7 @@ def test_main_hand_rolled_sites_dial_the_vetted_ip_at_the_pool(resolver, pool_wi
 
 def test_main_hand_rolled_sites_allowlisted_lan_brain_dials_lan_ip(resolver, pool_wire, main_brain,
                                                                   monkeypatch):
-    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.168.40.0/25")
+    monkeypatch.setenv("SAAS_LLM_ALLOWED_EGRESS", "192.0.2.0/25")
     resolver.table[BRAIN] = [LAN_BRAIN]
     _drive_learn(main_brain)
     assert pool_wire and pool_wire[-1]["host"] == LAN_BRAIN
@@ -857,7 +857,7 @@ def test_mcp_expand_online_source_url_is_fetched_through_the_guard(resolver, wir
     monkeypatch.setattr(S, "_log", lambda *a, **k: None, raising=False)
 
     async def run(url):
-        await S._learn_via_llm("widgets", "10d7d879-63cd-4f31-92ce-f2c9edb760ab",
+        await S._learn_via_llm("widgets", "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab",
                                source_url=url, online=True)
         await asyncio.sleep(0.3)         # let the background task run
 

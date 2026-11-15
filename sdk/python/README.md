@@ -21,7 +21,7 @@ from faultline import Client
 fl = Client(
     api_key="flk_your_account_key",          # or a flu_ seat token; omit on an open self-host
     base_url="https://memory.example.com",
-    user_id="10d7d879-63cd-4f31-92ce-f2c9edb760ab",  # the seat UUID (tenant)
+    user_id="1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab",  # the seat UUID (tenant)
 )
 
 fl.remember("My sister Diane is a nurse in Ottawa.")

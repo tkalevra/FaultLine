@@ -58,7 +58,7 @@ STATEMENT_MARKER_CUEBLIND = "My address changed to 99 Fake Street"
 # R4-J (autopsy tools/regression_results/r4j_autopsy.md): the wife-rename correction shape —
 # the end-anchored ", not <Name>" appositive is now a tier-1 structural member → ZERO LLM.
 CORRECTION_APPOSITIVE_NAME = "Actually my wife's name is Odile, not Rosalind."
-CORRECTION_APPOSITIVE_NAME_2 = "Actually my wife is Magnus, not Seren."
+CORRECTION_APPOSITIVE_NAME_2 = "Actually my wife is Magnus, not Nora."
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +127,7 @@ def llm_boom(monkeypatch):
     "Rex is no longer my pet",         # "no longer"
     "Oops, the address changed to 99 Fake Street",  # "changed to" behind a cue marker
     CORRECTION_APPOSITIVE_NAME,        # R4-J: end-anchored ", not <Name>" appositive
-    CORRECTION_APPOSITIVE_NAME_2,      # R4-J: the Magnus/Seren kin-rename shape
+    CORRECTION_APPOSITIVE_NAME_2,      # R4-J: the Magnus/Nora kin-rename shape
     "my mother is named Imogen, not Rosalind.",  # R4-J: bare (cue-free) appositive tail
 ])
 def test_structural_markers_are_strong(text):

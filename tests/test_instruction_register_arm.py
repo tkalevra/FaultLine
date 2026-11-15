@@ -141,7 +141,7 @@ def test_detector_mints_the_instruction_class(text, expected):
 #    qR1/qR2/qR3 class, sentences VERBATIM from ctx_corpus.json). The pins:
 #    R1/R3 mint the honest (subject, value) pairs AND nothing else — the generic chains'
 #    twin readings of the register's own material are the junk rows the bench seat served
-#    where the gold belonged (measured live on the A17 seat 90206360: (rule, has_state,
+#    where the gold belonged (measured live on the A17 seat aefc91e8: (rule, has_state,
 #    pay) + (personal rule, run, smoke suite) for R1; (release tags, prefix, style) for
 #    R3; (history, deploy, "every friday") for R2b's rate reading). R2's negated rule
 #    ("Never deploy Friday afternoon.") REFUSES at the detector — the negation scan-back
@@ -326,7 +326,7 @@ def test_non_instruction_sentences_mint_nothing():
     for t in [
         "The staging API listens on port 8001, the dashboard proxies to it directly.",
         "I always run the smoke suite before a deploy, never after.",
-        "My wife is Seren and we live in Cardiff.",
+        "My wife is Nora and we live in Cardiff.",
     ]:
         assert _pairs(t) == [], t
 

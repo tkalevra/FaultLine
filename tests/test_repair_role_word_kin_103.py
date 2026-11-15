@@ -89,11 +89,11 @@ def _plant(schema, seat):
     ent("brother", etype="Concept")
     fact(ent("pablo"), "instance_of", ids["brother"], cls="A", prov="user_stated")
     rows["brother"] = ("facts", fact(seat, "sibling_of", ids["brother"]))
-    # CONTROL (prod seat 591d25af shape): a real NAMED child that a stray instance_of made a
+    # CONTROL (prod seat 4c595338 shape): a real NAMED child that a stray instance_of made a
     # "type node" — a name is never a role word, so it must never be retired
     rows["lucas"] = ("facts", fact(seat, "parent_of", ent("lucas")))
     fact(ent("kid"), "instance_of", ids["lucas"])
-    # CONTROL (prod seat 10d7d879 shape): a product type node on a social rel — not this class
+    # CONTROL (prod seat e345e523 shape): a product type node on a social rel — not this class
     rows["portainer"] = ("facts", fact(seat, "knows", ent("portainer", etype="Concept")))
     fact(ent("stack55"), "instance_of", ids["portainer"])
     # CONTROL: a real NAMED mother (unattested, but a name is never a role word)

@@ -444,7 +444,7 @@ def test_seam1_subsequence_flag_defaults_on():
 
 # ══════════════════════════════════════════════════════════════════════════════════
 # BUG-RECALL-11 SEAM 2 (qP1) — the possession-transfer frame + the single-owner
-# reconcile + the walk recency ranking. Measured on the A17 seat 90206360: the
+# reconcile + the walk recency ranking. Measured on the A17 seat aefc91e8: the
 # correction minted only the weld (kira, hand, "ingest rewrite to mateo") and the seed
 # row (kira, owns, ingest rewrite) served as the owner forever. Door-proven 2026-11-11:
 # X4 → (mateo, owns, ingest rewrite) minted, the kira edge RETIRED by the reconcile,

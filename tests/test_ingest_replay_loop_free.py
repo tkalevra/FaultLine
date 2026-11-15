@@ -510,8 +510,8 @@ def test_fifty_identical_plus_five_distinct_keep_health_p99_under_one_second(app
     tracked = _install_connect_tracker(monkeypatch, _Tracked(), census=False)
     tag = uuid.uuid4().hex[:8]
     same_subject = f"rep{tag}"
-    identical = _body(app_env["user_id"], f"My sibling {same_subject} lives in Guelph and owns a blue kayak {tag}.",
-                      _edges(same_subject, "guelph", f"blue kayak {tag}"))
+    identical = _body(app_env["user_id"], f"My sibling {same_subject} lives in Waterloo and owns a blue kayak {tag}.",
+                      _edges(same_subject, "waterloo", f"blue kayak {tag}"))
     distinct = [
         _body(app_env["user_id"], f"My sibling dst{tag}{i} lives in Cambridge and owns a green tent {tag}{i}.",
               _edges(f"dst{tag}{i}", "cambridge", f"green tent {tag}{i}"))

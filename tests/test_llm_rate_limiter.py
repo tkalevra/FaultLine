@@ -273,7 +273,7 @@ def test_registry_resolves_dashscope_qwen_turbo():
 
 
 def test_registry_unknown_host_is_not_clamped():
-    lim = rl.resolve_provider_limits("http://192.168.40.20:1234/v1", "qwen3.5-9b")
+    lim = rl.resolve_provider_limits("http://192.0.2.20:1234/v1", "qwen3.5-9b")
     assert lim["known"] is False  # self-hosted / LAN → no hard clamp
 
 
@@ -538,7 +538,7 @@ def test_observe_never_loosens_beyond_effective_clamp(monkeypatch):
     monkeypatch.setenv("LLM_RATE_HEADROOM", "0.9")
     monkeypatch.setattr(rl, "_current_llm_config_or_none",
                         lambda: {"account_id": "acct-hdr",
-                                 "base_url": "http://192.168.40.20:8080/v1",
+                                 "base_url": "http://192.0.2.20:8080/v1",
                                  "model": "qwen3.5-9b"})
     key, bucket = _seed_bucket(rate=2.0)  # 120 RPM / 60
     reset_epoch_s = int(time.time()) + 1

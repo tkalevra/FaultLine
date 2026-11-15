@@ -62,7 +62,7 @@ def test_filter_edges_drops_junk_from_any_extractor():
         {"subject": "user", "rel_type": "gets_my", "object": "discount"},      # LLM junk
         {"subject": "user", "rel_type": "has_my", "object": "car"},            # LLM junk
         {"subject": "user", "rel_type": "fix", "object": "fence"},             # clean growth
-        {"subject": "user", "rel_type": "lives_in", "object": "guelph"},       # clean known
+        {"subject": "user", "rel_type": "lives_in", "object": "waterloo"},       # clean known
     ]
     kept = relation_fit.filter_edges(edges)
     kept_rels = {e["rel_type"] for e in kept}

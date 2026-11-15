@@ -917,10 +917,10 @@ INGEST_INTENT_INDEPENDENT_HARVEST = os.environ.get(
 
 
 # CORRECTION-TURN HARVEST SUPPRESSION (correction-integrity F2, critic R1 2026-11-07; default ON).
-# Measured on bench seat 76e214a0: "Actually my wife is Magnus, not Seren." returned
+# Measured on bench seat cd0c09ed: "Actually my wife is Magnus, not Nora." returned
 # corrected+facts_superseded=1 (the /retract/correct supersede DID land; the report was TRUE at
 # write time), and then the SAME remember_facts turn's intent-independent harvest re-ingested the
-# CONTRASTIVE-NEGATED surface ("not Seren") as a LIVE (user, spouse, seren) edge - the
+# CONTRASTIVE-NEGATED surface ("not Nora") as a LIVE (user, spouse, nora) edge - the
 # deterministic spine emits the negated surface as a spouse edge (curl-proven on /harvest-spans),
 # the fresh unmarked /ingest upsert RESURRECTS the row /retract/correct had just retired
 # (src/fact_store/store.py superseded_at CASE: an unmarked user_stated re-ingest clears
@@ -935,7 +935,7 @@ CORRECTION_HARVEST_SUPPRESS_OLD_VALUE = os.environ.get(
 ).strip().lower() not in ("false", "0", "no")
 
 # CORRECTION-TURN HARVEST REPORT RECONCILE (correction-integrity F5, critic R1 2026-11-07;
-# default ON). Measured on bench seat 76e214a0: "Actually I moved to Ashbell." returned
+# default ON). Measured on bench seat cd0c09ed: "Actually I moved to Ashbell." returned
 # status=failed with facts_superseded=0 - yet the DB showed the old residence row SUPERSEDED at
 # that timestamp and Ashbell live; recall rendered Ashbell. The destructive change had LANDED
 # through the intent-independent harvest (spine emits the lives_in edge; the ingest-side
@@ -4136,7 +4136,7 @@ def _episodic_verbatim_band_once(user_id: str, query: str) -> str:
         sel_words = words[:4]
         # Per-word fetch + overlap ranking (NOT recency-first: the bench corpora plant
         # facts early and ask late -- recency ORDER BY buried the true partner under
-        # newer one-word matches, measured on kept seat b2256d39).
+        # newer one-word matches, measured on kept seat e50b1aa8).
         cand: dict = {}
         row_intent: dict = {}
         row_created: dict = {}
@@ -6797,7 +6797,7 @@ async def _recall_memory_tool_impl(query: str, user_id: str) -> dict[str, Any]:
             # for an unconfigured seat, so that seat NEVER received an abstention. The two
             # answer different questions and a reader needs both: the abstention says the
             # memory holds no answer, the status says why the engine is talking about itself.
-            # Measured on pre-prod seat 11111111 after the topic gate landed: "What car do I
+            # Measured on pre-prod seat 2463aef6 after the topic gate landed: "What car do I
             # drive?" correctly returned no facts, and the reply carried only the brain notice
             # — an empty answer that never actually said it was empty.
             from .response_types import render as _render_recall

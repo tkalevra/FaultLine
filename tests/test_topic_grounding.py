@@ -2,7 +2,7 @@
 
 Every other stage on the recall path RANKS. None of them asks whether the thing being ranked
 is on the subject of the question, so a walk anchored on the user hands back the user's facts
-whether or not the query's subject is among them. Measured on pre-production seat 11111111,
+whether or not the query's subject is among them. Measured on pre-production seat 2463aef6,
 whose stored content is exactly six facts, `POST /query "What car do I drive?"` returned FIVE
 of them — the pet, both cities, the weight and the height — and the MCP rendered all five as
 memory. There is no car in that seat. Ranking cannot fix that: the right answer is not further
@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
     reason="WordNet corpus absent — the gate cannot fire, so passing would be meaningless")
 
 
-# The live pre-production content of seat 11111111, transcribed from the `facts` table.
+# The live pre-production content of seat 2463aef6, transcribed from the `facts` table.
 SEAT = [
     {"subject": "user", "rel_type": "has_pet", "object": "the cure"},
     {"subject": "user", "rel_type": "lives_in", "object": "Wellington"},

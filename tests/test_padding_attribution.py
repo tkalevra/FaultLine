@@ -7,7 +7,7 @@ resolve_reasoning_controls returns can_disable=False for two populations:
     CAPABILITY, "unavoidable" is an honest word;
   * UNRECOGNIZED host + a model name that says it reasons — resolution FAILED, no
     suppression field could even be sent, and the headroom pad is a PRECAUTION
-    (measured on this deployment: LAN llama.cpp brains at http://192.168.40.20:8080
+    (measured on this deployment: LAN llama.cpp brains at http://192.0.2.20:8080
     serving Qwen/GLM weights resolve unknown).
 
 Before this lane, all three surfaces (the per-call audit log, the Test & calibrate
@@ -25,7 +25,7 @@ import src.api.llm_client as CL
 
 
 GENUINE = {"base_url": "https://api.z.ai/api/coding/paas/v4", "model": "glm-5.2"}
-UNRESOLVED = {"base_url": "http://192.168.40.20:8080/v1", "model": "glm-5.2"}
+UNRESOLVED = {"base_url": "http://192.0.2.20:8080/v1", "model": "glm-5.2"}
 
 
 def _brain(cfg):
@@ -79,7 +79,7 @@ def test_audit_resolution_failure_states_the_precaution_not_a_capability(monkeyp
         "asserting the spend is unavoidable claims a provider capability nobody "
         "established — resolution FAILED here, the capability question is open")
     assert kw["resolution"] == "unresolved"
-    assert kw["resolution_source"] == "192.168.40.20"
+    assert kw["resolution_source"] == "192.0.2.20"
 
 
 def test_audit_resolution_failure_is_info_never_crit(monkeypatch):
@@ -145,7 +145,7 @@ def test_probe_note_unresolved_names_the_real_cause(monkeypatch):
     rc = _probe(monkeypatch, UNRESOLVED)
     assert rc["resolution"] == "unresolved"
     assert "UNRESOLVED" in rc["note"]
-    assert "192.168.40.20" in rc["note"]
+    assert "192.0.2.20" in rc["note"]
     assert "cannot be turned off on this provider" not in rc["note"], (
         "the probe must not assert a capability nobody established")
     assert rc["reasoning_tokens"] == 412  # the measured spend is still stated
