@@ -373,9 +373,14 @@ def test_doc_pipeline_env_absent_never_touches_spacy(monkeypatch, _fresh_doc_cac
 
 
 def test_dockerfile_sm_bake_untouched_and_default():
+    """Vehicle update (foss-es uplift port): the conversational default bake on THIS branch is
+    the es multilingual form — `es_core_news_sm` (the branch IS the language; the English
+    model over Spanish text is silent corruption, and linguistics.py's language guard
+    refuses the mismatch). The pin's mechanism is unchanged: the default sm wheel stays
+    baked, parametrized, and additive with the doc-lane trf wheel."""
     src = open("Dockerfile", encoding="utf-8").read()
-    assert "ARG SPACY_MODEL=en_core_web_sm" in src, \
-        "the conversational default bake must stay en_core_web_sm"
+    assert "ARG SPACY_MODEL=es_core_news_sm" in src, \
+        "the conversational default bake must stay es_core_news_sm (the branch IS the language)"
     assert "releases/download/${SPACY_MODEL}-${SPACY_MODEL_VERSION}/" in src, \
         "the original sm wheel install must remain"
 
