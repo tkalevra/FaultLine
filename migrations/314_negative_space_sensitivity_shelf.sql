@@ -13,7 +13,7 @@
 -- is_sensitive = true, by three deterministic admissions:
 --   (a) the EXACT declared rel_type names — the surfaces the store actually mints
 --       (has_medical_condition / has_medication / has_phone / has_email / ... the
---       measured leak class: seat 188dad57's "how old is my sister?" served diabetes,
+--       measured leak class: seat 6e25c1a3's "how old is my sister?" served diabetes,
 --       metformin and 555-0142 under the disclosure);
 --   (b) the ingest-side's own PRIVATE categories (contact / identity / network) —
 --       src/api/main.py::_scalar_sensitivity_for already derives

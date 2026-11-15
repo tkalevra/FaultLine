@@ -109,7 +109,7 @@ class _FakeConn:
 
 
 _EID = "5ec89b52-9ea8-59b5-8ecd-e1e6650221be"
-_SCHEMA = "faultline_76e214a0_0ae9_4523_914c_f1709568bfa6"
+_SCHEMA = "faultline_4c7e21b8_1d64_4e92_a5c3_9f08b2d64e70"
 
 
 def _registry(monkeypatch):
@@ -123,7 +123,7 @@ def test_probe_returns_no_target_for_address_vs_recent_city(monkeypatch):
     reg = _registry(monkeypatch)
     cur = _FakeCur(all_rows=[[( _EID, "harlow bend")]])
     assert reg._restatement_convergence_target(
-        cur, "76e214a0-0ae9-4523-914c-f1709568bfa6",
+        cur, "4c7e21b8-1d64-4e92-a5c3-9f08b2d64e70",
         "31 alder gate in harlow bend") is None
 
 
@@ -132,7 +132,7 @@ def test_probe_still_binds_genuine_restatement(monkeypatch):
     reg = _registry(monkeypatch)
     cur = _FakeCur(all_rows=[[( _EID, "harlow bend")]], one_rows=[None])
     assert reg._restatement_convergence_target(
-        cur, "76e214a0-0ae9-4523-914c-f1709568bfa6", "old harlow bend") == _EID
+        cur, "4c7e21b8-1d64-4e92-a5c3-9f08b2d64e70", "old harlow bend") == _EID
 
 
 def test_rollback_lever_still_restores_legacy(monkeypatch):
@@ -140,5 +140,5 @@ def test_rollback_lever_still_restores_legacy(monkeypatch):
     reg = _registry(monkeypatch)
     cur = _FakeCur(all_rows=[[( _EID, "harlow bend")]])
     assert reg._restatement_convergence_target(
-        cur, "76e214a0-0ae9-4523-914c-f1709568bfa6",
+        cur, "4c7e21b8-1d64-4e92-a5c3-9f08b2d64e70",
         "old harlow bend") is None

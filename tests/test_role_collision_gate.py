@@ -1,6 +1,6 @@
 """Fog-family critic R8 re-gate pins - RG-F possessed-role composition junk.
 
-LIVE WOUND (R5b seat 76e214a0, measured): "who is Bricmer's wife?" voiced the
+LIVE WOUND (R5b seat 4c7e21b8, measured): "who is Bricmer's wife?" voiced the
 IMPOSSIBLE line "Godgifu has role Magnus". DB trace: the fenland doc-lane ingest
 wrote the staged row (godgifu, has_role, e6efb2a2) binding the doc person to a ROLE
 SLOT; e6efb2a2 is the conversational wife-weld entity (statement lane minted it as

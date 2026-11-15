@@ -7,7 +7,7 @@ Covers the three correction-integrity findings, each with its deterministic rail
        relative's own verb, so the wh reaches the ROOT without a subordinate dep. The
        fused-relative guard (FREE_RELATIVE_DECLARATIVE, default ON) requires a
        sentence-initial wh OR subject-aux inversion before calling it interrogative.
-       Measured live on bench 76e214a0: the whole correction routed QUERY@0.95 through
+       Measured live on bench 4c7e21b8: the whole correction routed QUERY@0.95 through
        the interrogative preroute, 2/2 rounds ("Use recall_memory for queries").
 
   F3b  negated_name_assertion: "My wife is not Isolde." (negated finite root +
@@ -407,7 +407,7 @@ class _FakeCur:
         return []
 
 
-_USER = "76e214a0-0ae9-4523-914c-f1709568bfa6"
+_USER = "4c7e21b8-1d64-4e92-a5c3-9f08b2d64e70"
 
 
 class TestDenialExactKeyProbe:
@@ -751,7 +751,7 @@ class TestDenialRetireReviveGuardR7:
     the re-statement files a FRESH row with fresh provenance. The tautology
     ('My wife is Wife.') files nothing at all."""
 
-    _ROW = ("76e214a0-0ae9-4523-914c-f1709568bfa6", "u1", "o1", "spouse", "user_stated")
+    _ROW = ("4c7e21b8-1d64-4e92-a5c3-9f08b2d64e70", "u1", "o1", "spouse", "user_stated")
 
     def _run(self, retired_id_row):
         cur = _R7FakeCur((True,), retired_id_row)

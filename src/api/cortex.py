@@ -101,7 +101,7 @@ _CORRECTION_SHAPE_RE = re.compile(
 # Shape-marker words: they MARK a correction (and fire _CORRECTION_SHAPE_RE) but are
 # not SUBJECT MATTER. Counting them as content let "never a bare --force" tombstone
 # the --force-recreate compose note (shared: force + never) at corpus scale (A5 seat
-# f69b42eb: 78 tombstones, 47 of them false links). Excluded from the link bar.
+# d94a73f0: 78 tombstones, 47 of them false links). Excluded from the link bar.
 _SHAPE_MARKERS = frozenset({
     "never", "not", "changed", "instead", "renamed", "replaced",
     "correction", "supersedes", "longer", "actually",
@@ -113,7 +113,7 @@ def _supersede_link_decision(note_ordered, note_tokens, victim_note, victor_note
 
     A correction may only tombstone a note that restates the SAME FACT with a new
     value. Two independent signals, either of which suffices — validated against the
-    78 real tombstone pairs on kept seat f69b42eb (47 false / 31 true):
+    78 real tombstone pairs on kept seat d94a73f0 (47 false / 31 true):
     (a) TEMPLATE MATCH: >= 4 shared content tokens, the first 3 content tokens of
         both notes agree (same sentence opening), and Jaccard >= 0.5 over the union —
         the coffee-count / changelog-rant / runbook-pin chains all pass; generic

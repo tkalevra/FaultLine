@@ -23394,7 +23394,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     # === PRE-GLINER2 NEGATED-NAME-ASSERTION ROUTE (correction-integrity F3b, critic R1) ===
     # "My wife is not Isolde." DENIES a stored identity value — a correction directive — yet
     # GLiNER2 scored it QUERY@0.546 over the user's 0.50 gate and remember_facts answered
-    # "Use recall_memory for queries" (bench 76e214a0, 2/2). Route CORRECTION deterministically
+    # "Use recall_memory for queries" (bench 4c7e21b8, 2/2). Route CORRECTION deterministically
     # BEFORE GLiNER2 (kept pure, Pitfall 11) when the grammar fires negated_name_assertion:
     # negated finite root + first-person subject (self or 'my X' via Person=1/Poss=Yes
     # morphology) + PROPER-NAME complement. The correction lane's own resolution already
@@ -26626,7 +26626,7 @@ SPINE_AFFECT_PREFERENCE = os.getenv("SPINE_AFFECT_PREFERENCE", "true").lower() n
 # kinship role words and which still carries a live spouse/parent/… row — get their ghost row
 # superseded and the role alias transferred to the named person, so the seat can never again
 # render "You and Wife are spouses/partners" from the old weld nor re-absorb a role-word edge
-# (live bench 76e214a0: committed=1 UPSERTED onto the [wife]-aliased weld entity, Isolde
+# (live bench 4c7e21b8: committed=1 UPSERTED onto the [wife]-aliased weld entity, Isolde
 # orphaned, corrections clogged). Metadata-gated (kinship cue classes — pet lane, non-kin
 # roles and named persons never match); fail-open; see src/api/kin_weld_repoint.py.
 SPINE_KIN_WELD_REPOINT = os.getenv("SPINE_ROLE_HEAD_NO_BIND", "true").lower() not in ("0", "false", "no")
@@ -26720,7 +26720,7 @@ QUERY_INTERROGATIVE_PREROUTE = os.getenv("QUERY_INTERROGATIVE_PREROUTE", "true")
 
 # ── NEGATED-NAME-ASSERTION CORRECTION PREROUTE (correction-integrity F3b, critic R1 2026-11-07) ──
 # "My wife is not Isolde." routed QUERY@0.546 (GLiNER2 native, per-user gate 0.50 — measured on
-# bench 76e214a0) and the correction was EATEN with "Use recall_memory for queries", 2/2 rounds.
+# bench 4c7e21b8) and the correction was EATEN with "Use recall_memory for queries", 2/2 rounds.
 # A negated finite predication with a FIRST-PERSON subject (self or 'my X') and a PROPER-NAME
 # complement is a DENIAL OF A STORED IDENTITY VALUE — a correction directive, deterministically
 # (neg dep + Person=1/Poss=Yes morphology + PROPN POS; negated_name_assertion, no word-lists).
@@ -49878,7 +49878,7 @@ def _filter_possessed_role_user_kinship(facts, query_text, user_id, db):
 
 
 # -- ROLE-COLLISION GATE (fog-family critic R8 RG-F; RECALL_ROLE_COLLISION_GATE) --
-# LIVE WOUND (R5b seat 76e214a0, measured): "who is Bricmer's wife?" voiced the
+# LIVE WOUND (R5b seat 4c7e21b8, measured): "who is Bricmer's wife?" voiced the
 # IMPOSSIBLE line "Godgifu has role Magnus". DB trace: the fenland doc-lane ingest
 # wrote the staged row (godgifu, has_role, e6efb2a2) binding the doc person to a ROLE
 # SLOT - but e6efb2a2 is the conversational WIFE-WELD entity (statement lane minted it
