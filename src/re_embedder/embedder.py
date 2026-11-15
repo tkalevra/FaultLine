@@ -3799,7 +3799,7 @@ _REEXTRACT_FAIL_ABORT = max(0, int(os.getenv("REEXTRACT_FAIL_ABORT", "3")))
 # begin once the whole pass is done.
 #
 # ⛔ WHY THE EXISTING STORM BOUND DOES NOT COVER THIS — AND WHY IT USED TO.
-# `REEXTRACT_FAIL_ABORT` was built (63cdd1cf) for EXACTLY this shape; its own comment names it:
+# `REEXTRACT_FAIL_ABORT` was built (aa71d1cf) for EXACTLY this shape; its own comment names it:
 # "a sick brain fails SLOW … so `batch_size` sick rows cost `batch_size × 60 s` PER TENANT PER
 # CYCLE". It arms off `consecutive_failures`. Then 28215456 — correctly, fixing a real data-loss
 # bug where a lane outage stamped `reextracted_at` and froze turns out of eligibility FOREVER —
@@ -4702,7 +4702,7 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                 # so the whole batch is re-selected on the first cycle after a brain returns.
                 # Nothing is lost; the only thing declined is spend on calls we have evidence
                 # will fail — which is verbatim the justification the storm bound shipped with
-                # (63cdd1cf), for the case its own exemption later removed from it.
+                # (aa71d1cf), for the case its own exemption later removed from it.
                 #
                 # `_paced` is deliberately NOT a trigger: pacing is a deferral we are already
                 # observing correctly, and treating it as an outage would abort a healthy lane.

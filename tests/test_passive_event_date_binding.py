@@ -47,13 +47,13 @@ def _find(facts, subject, rel):
 
 @requires_model
 def test_birth_date_binds_to_named_person_not_role():
-    f = _facts("My wife Marla was born on July 8, 1985.")
-    # the DATE is filed on the NAME (marla), never on the role noun "wife"
-    born = _find(f, "marla", "born")
+    f = _facts("My wife Dana was born on July 8, 1985.")
+    # the DATE is filed on the NAME (dana), never on the role noun "wife"
+    born = _find(f, "dana", "born")
     assert born and born[0][2] == "1985-07-08"
     assert born[0][3] and born[0][3].startswith("1985-07-08")
     # the role stays the kinship relation, untouched
-    assert _find(f, "marla", "spouse")
+    assert _find(f, "dana", "spouse")
     # NO junk: the participle is never a state OBJECT, and "wife" never carries the date
     assert not [x for x in f if x[2] in ("born", "bear")]
     assert not _find(f, "wife", "has_state")
@@ -110,7 +110,7 @@ def test_pet_born_date_on_name():
 def test_name_preferred_over_possessed_common_noun_two_nsubjpass():
     # spaCy attaches "my cat Whiskers" as TWO nsubjpass siblings (cat + Whiskers); the date must bind
     # to the trailing PROPER NAME (whiskers), NEVER the possessed common noun (cat). Non-kinship,
-    # non-person — the SAME grammatical name-preference rule as "my wife Marla".
+    # non-person — the SAME grammatical name-preference rule as "my wife Dana".
     f = _facts("My cat Whiskers was born on May 3, 2019.")
     assert _find(f, "whiskers", "born") and _find(f, "whiskers", "born")[0][2] == "2019-05-03"
     assert not _find(f, "cat", "born")   # the common noun never carries the date
@@ -121,7 +121,7 @@ def test_name_preferred_over_possessed_common_noun_two_nsubjpass():
 @requires_model
 def test_passive_participle_never_a_relationship_object():
     for sent in (
-        "My wife Marla was born on July 8, 1985.",
+        "My wife Dana was born on July 8, 1985.",
         "My company Acme was founded in 1998.",
         "My server Apollo was provisioned on March 1, 2023.",
     ):

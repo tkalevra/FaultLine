@@ -268,8 +268,8 @@ def test_analyze_naming_all_mixed_kinds_subject_agnostic():
 def test_analyze_naming_all_no_construction_returns_empty():
     """No naming verb → empty list (fail-safe; the genitive-name chain owns 'My wife's name is X')."""
     m = _reload(LINGUISTIC_LAYER="true")
-    assert m.analyze_naming_all("My wife's name is Marla.") == []
-    assert m.analyze_naming("My wife's name is Marla.") is None
+    assert m.analyze_naming_all("My wife's name is Dana.") == []
+    assert m.analyze_naming("My wife's name is Dana.") is None
 
 
 # ─────────────────────────── POSSESSIVE HEAD (poss dep → head noun) ───────────────────────
@@ -1033,7 +1033,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
     os.environ.pop("POSTGRES_DSN", None)
     m = _reload(LINGUISTIC_LAYER="true")
     ref = _dt(2026, 6, 21)
-    sent = "I married marla"
+    sent = "I married dana"
     doc = m._parse(sent)
     assert doc is not None
     # locate the subject (nsubj of the content verb) and object (dobj) token indices.
@@ -1045,7 +1045,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
 
     # BASELINE (no minted rel) → SVO verb-lemma predicate ("marry") stands as the gap-fill.
     facts_svo = m.derive_sentence_facts(doc, ref)
-    svo_rels = {f.rel_type for f in facts_svo if f.object == "marla"}
+    svo_rels = {f.rel_type for f in facts_svo if f.object == "dana"}
     assert any(r.startswith("marry") for r in svo_rels), \
         f"SVO gap-fill predicate missing: {[(f.subject, f.rel_type, f.object) for f in facts_svo]!r}"
 
@@ -1056,7 +1056,7 @@ def test_phase2_minted_rel_wins_over_svo_else_svo_fills_gap():
     obj2 = next((c for c in verb2.children if c.dep_ in ("dobj", "obj")), None)
     assert m.set_minted_rel(doc2, subj2.i, obj2.i, "spouse")
     facts_minted = m.derive_sentence_facts(doc2, ref)
-    minted_rels = {f.rel_type for f in facts_minted if f.object == "marla"}
+    minted_rels = {f.rel_type for f in facts_minted if f.object == "dana"}
     assert "spouse" in minted_rels, \
         f"GLiNER2 minted rel did not win: {[(f.subject, f.rel_type, f.object) for f in facts_minted]!r}"
     # and the SVO verb lemma did NOT also emit a competing fact for the same pair.
@@ -1859,7 +1859,7 @@ def test_kinship_specific_rels_metadata_driven():
     """Fix 1/2: the specific kin rel comes from the kinship_noun cue map (son→child_of,
     wife→spouse), not an in-code literal."""
     assert ("desmond", "child_of", "user") in _triples(_derive("My son's name is Desmond.")), "son→child_of"
-    assert ("marla", "spouse", "user") in _triples(_derive("My wife's name is Marla.")), "wife→spouse"
+    assert ("dana", "spouse", "user") in _triples(_derive("My wife's name is Dana.")), "wife→spouse"
 
 
 @requires_model
@@ -2002,7 +2002,7 @@ def test_part1_genuine_phrasal_and_year_date_no_regression():
     ("two weeks ago", True),    # relative-time — already caught (no regression)
     ("yesterday", True),
     ("house", False),           # non-date noun — MUST be kept (no over-drop)
-    ("marla", False),
+    ("dana", False),
     ("sarah", False),
     ("gps system", False),
 ])
@@ -2510,7 +2510,7 @@ def test_split_enumeration_affect_list_not_an_enumeration():
 @requires_model
 def test_split_enumeration_no_colon_returns_none():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
-    assert m.split_enumeration("My wife is Marla.") is None
+    assert m.split_enumeration("My wife is Dana.") is None
 
 
 @requires_model
@@ -2549,7 +2549,7 @@ def test_count_declarative_assertions_routes_multi_fact_statement():
     # A first-person declarative opening with a courtesy "tell you about" clause but ASSERTING
     # facts must score >= 2 so the caller routes it to STATEMENT (it was mis-scored QUERY → dropped).
     m = _reload(LINGUISTIC_LAYER="true")
-    txt = ("I wanted to tell you about my family. My wife's name is Marla. "
+    txt = ("I wanted to tell you about my family. My wife's name is Dana. "
            "We have three kids: Bianca, Dez, and Cato.")
     assert m.count_declarative_assertions(txt) >= 2
 

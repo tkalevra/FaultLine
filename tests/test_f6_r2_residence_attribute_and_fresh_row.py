@@ -213,15 +213,15 @@ def _patch_psycopg_connect(monkeypatch, cur):
 def test_f8_cache_busts_when_residence_row_retired(monkeypatch):
     cur = _FakeCur([(1,)])  # a retired residence row exists
     _patch_psycopg_connect(monkeypatch, cur)
-    resp = {"facts": [{"subject": "76e214a0-0ae9-4523-914c-f1709568bfa6",
+    resp = {"facts": [{"subject": "5d8e93b4-0ae9-4523-914c-f1709568bfa6",
                        "object": "30e65f04-56bb-5bdb-8c4f-c979e8608fc2",
                        "rel_type": "lives_in"}]}
     assert M._idempotency_cached_residence_rows_retired(
-        "faultline_76e214a0_0ae9_4523_914c_f1709568bfa6", resp) is True
+        "faultline_5d8e93b4_0ae9_4523_914c_f1709568bfa6", resp) is True
     cur2 = _FakeCur([None])  # a real SELECT 1 miss returns None, not a (None,) row
     _patch_psycopg_connect(monkeypatch, cur2)
     assert M._idempotency_cached_residence_rows_retired(
-        "faultline_76e214a0_0ae9_4523_914c_f1709568bfa6", resp) is False
+        "faultline_5d8e93b4_0ae9_4523_914c_f1709568bfa6", resp) is False
 
 
 def test_f8_cache_bust_is_residence_only(monkeypatch):
@@ -237,11 +237,11 @@ def test_f8_cache_bust_is_residence_only(monkeypatch):
 
     cur.execute = _recording_execute
     _patch_psycopg_connect(monkeypatch, cur)
-    resp = {"facts": [{"subject": "76e214a0-0ae9-4523-914c-f1709568bfa6",
+    resp = {"facts": [{"subject": "5d8e93b4-0ae9-4523-914c-f1709568bfa6",
                        "object": "30e65f04-56bb-5bdb-8c4f-c979e8608fc2",
                        "rel_type": "spouse"}]}
     assert M._idempotency_cached_residence_rows_retired(
-        "faultline_76e214a0_0ae9_4523_914c_f1709568bfa6", resp) is False
+        "faultline_5d8e93b4_0ae9_4523_914c_f1709568bfa6", resp) is False
     assert not any("superseded_at IS NOT NULL" in s for s in seen)
 
 

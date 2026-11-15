@@ -179,7 +179,7 @@ _ENV_MODE = "ALIAS_WELD_GUARD"
 #   FORWARD blast radius, TOTAL across armed arms: 194 entities. Sampled: common-noun type
 #   nodes (runtime/driver/process/servidor) — where a user's name must never land.
 #   SEAT-OWNER false refusals: 0 historical, 0 forward-looking.
-#   Legitimate multi-alias entities: 0 refused — {marla,mars,wife}, {cato,son},
+#   Legitimate multi-alias entities: 0 refused — {dana,mars,wife}, {cato,son},
 #   {desmond,son}, {bianca,gabby} and the seat's {user,chris,christopher} all pass.
 #   Lexical canonicalization lane: 0 refusals, proven by a positive control, not by absence.
 _DEFAULT_MODE = "enforce"

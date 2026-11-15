@@ -621,7 +621,7 @@ def _harvest_one(monkeypatch, text):
         return RF.ReframeResult(atoms=[RF.Atom(text=t, source_span=t)], used_llm=True,
                                 rejected_count=0)
     monkeypatch.setattr(RF, "reframe_to_atomic", _one_atom)
-    uid = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+    uid = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
     r = asyncio.run(M._harvest_via_sentence_pipeline(RewriteRequest(text=text, user_id=uid), uid))
     return [(e.get("subject"), e.get("rel_type"), (e.get("object") or "").lower())
             for e in (r or {}).get("edges", [])]
@@ -735,7 +735,7 @@ def test_clausal_frame_needs_a_contradiction_row(monkeypatch):
 def test_classify_intent_passes_the_seat_to_the_cue_route(monkeypatch):
     import httpx
     M = _main()
-    uid = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+    uid = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
     monkeypatch.delenv("POSTGRES_DSN", raising=False)
 
     async def _ready(*_a, **_k):

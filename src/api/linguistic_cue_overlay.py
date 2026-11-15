@@ -1881,7 +1881,7 @@ def _resolve_keyed_map(dsn: str, category: str, bootstrap: dict[str, str]) -> di
     ``if not tenant_map: tenant_map = dict(bootstrap)``, i.e. the code floor applied ONLY when the
     tenant held ZERO rows in the category. The moment a tenant grew ONE row, the ENTIRE seeded floor
     was discarded. Measured locally, exactly as on production: tenant
-    ``faultline_1a2b3c4d_63cd_4f31_92ce_f2c9edb760ab`` holds social_role = {agent, colleague} and
+    ``faultline_1a2b3c4d_aa71_bb82_4c93_6d5e7f809a2b`` holds social_role = {agent, colleague} and
     therefore resolved WITHOUT the floor's ``friend → friend_of`` — so "my friend is Sam" fell back
     to has_role + ``owns(user, sam)``, a PERSON filed as an owned object, on a tenant that had done
     nothing wrong except grow. A growth mechanism that ERODES seeded knowledge as the tenant grows

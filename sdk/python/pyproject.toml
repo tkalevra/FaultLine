@@ -9,7 +9,7 @@ description = "Thin Python client for the FaultLine v1 memory API."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "AGPL-3.0-only"
-authors = [{ name = "Christopher Thompson" }]
+authors = [{ name = "Rowan Ellis" }]
 # Zero runtime dependencies — the client uses only the standard library (urllib).
 dependencies = []
 

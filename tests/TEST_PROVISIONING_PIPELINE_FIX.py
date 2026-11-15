@@ -47,10 +47,10 @@ def test_user_id():
 
 def test_derive_schema_name_from_uuid():
     """Test that UUID slug becomes proper schema name."""
-    user_id = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+    user_id = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
     slug = derive_user_slug_from_uuid(user_id)
     schema_name = derive_schema_name(slug)
-    assert schema_name == "faultline_1a2b3c4d_63cd_4f31_92ce_f2c9edb760ab"
+    assert schema_name == "faultline_1a2b3c4d_aa71_bb82_4c93_6d5e7f809a2b"
     assert schema_name.startswith("faultline_")
 
 

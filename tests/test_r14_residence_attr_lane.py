@@ -1,7 +1,7 @@
 """R14 - residence ATTR lane (critic RG-Z-4 follow-up).
 
 Live-trace conclusions pinned here (the R13-window DB + API-log trace, bench seat
-76e214a0, repro 'We moved from Falker's Step in Dyer's Hollow to Candler's Rest.'):
+5d8e93b4, repro 'We moved from Falker's Step in Dyer's Hollow to Candler's Rest.'):
 
   * The R13 moved-from dest REL row DID land live (row 1028 lives_in braider's hold
     @now) - the critic's 'missing rel' was a final-state misread: the battery_c rep's

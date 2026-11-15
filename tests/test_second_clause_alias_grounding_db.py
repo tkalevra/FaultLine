@@ -2,18 +2,18 @@
 PostgreSQL through the REAL EntityRegistry (the seam /ingest grounds edges with).
 
 The deriver suite (test_spine_second_clause_alias_bind.py) pins the EDGE SHAPE: the
-second clause of "My wifes name is Marla, she prefers to be called Mars" must emit
-(marla, also_known_as, mars) — the FIRST clause's person surface, never the alias
+second clause of "My wifes name is Dana, she prefers to be called Day" must emit
+(dana, also_known_as, mars) — the FIRST clause's person surface, never the alias
 surface in subject position. This suite grounds that edge stream exactly as ingest does
 and asserts the literal production bar:
 
-  * ENTITY ID EQUALITY — resolve('mars') == resolve('marla'): the alias points at the
+  * ENTITY ID EQUALITY — resolve('mars') == resolve('dana'): the alias points at the
     SAME canonical entity the first clause established;
-  * NO NEW ENTITY — the alias surfaces marla/wife/mars all resolve to ONE entity_id.
+  * NO NEW ENTITY — the alias surfaces dana/wife/mars all resolve to ONE entity_id.
 
 Also demonstrates WHY the deriver shape is load-bearing: a novel surface grounded in
 subject position MINTS a fresh uuid5 entity (the phantom-mint mechanism measured live —
-the GLiNER2-relation fallback's (mars, related_to, marla) proposal grounds 'mars' as a
+the GLiNER2-relation fallback's (mars, related_to, dana) proposal grounds 'mars' as a
 subject when the deriver drops the clause).
 
 Skips cleanly when no throwaway database is offered via ALIAS_BIND_TEST_DSN (the
@@ -78,8 +78,8 @@ def reg():
 def _edges_of_turn():
     """The deriver's edge stream for the exact production turn, two atoms.
 
-    Atom 1: (marla, spouse, user) + (marla, also_known_as, wife).
-    Atom 2 (the fix): (marla, also_known_as, mars) — the FIRST clause's person surface.
+    Atom 1: (dana, spouse, user) + (dana, also_known_as, wife).
+    Atom 2 (the fix): (dana, also_known_as, mars) — the FIRST clause's person surface.
     Read LIVE from the deriver when the linguistic layer is available so this suite
     cannot drift from the capture it grounds; the literals are the fallback shape.
     """
@@ -88,18 +88,18 @@ def _edges_of_turn():
         if L.linguistics_available():
             import datetime
             ref = datetime.date(2026, 8, 20)
-            trn = L.build_turn_role_name_map("My wifes name is Marla") or {}
-            f1 = L.derive_sentence_facts("My wifes name is Marla", ref,
+            trn = L.build_turn_role_name_map("My wifes name is Dana") or {}
+            f1 = L.derive_sentence_facts("My wifes name is Dana", ref,
                                          turn_role_names=trn)
-            f2 = L.derive_sentence_facts("she prefers to be called Mars", ref,
+            f2 = L.derive_sentence_facts("she prefers to be called Day", ref,
                                          prior_nps=["user", "wife"],
-                                         turn_persons=["marla", "mars"],
+                                         turn_persons=["dana", "mars"],
                                          turn_role_names=trn)
             return [(f.subject, f.rel_type, f.object) for f in (f1 + f2)]
     except Exception:  # noqa: BLE001 — fall through to the pinned shape
         pass
-    return [("marla", "spouse", "user"), ("marla", "also_known_as", "wife"),
-            ("marla", "also_known_as", "mars")]
+    return [("dana", "spouse", "user"), ("dana", "also_known_as", "wife"),
+            ("dana", "also_known_as", "mars")]
 
 
 def test_second_clause_alias_grounds_on_the_first_clause_entity(reg):
@@ -119,7 +119,7 @@ def test_second_clause_alias_grounds_on_the_first_clause_entity(reg):
     assert registry.resolve(user, "mars") == person_eid
     assert registry.resolve(user, person_surface) == person_eid
 
-    # NO NEW ENTITY: one canonical entity carries marla/wife/mars
+    # NO NEW ENTITY: one canonical entity carries dana/wife/mars
     with conn.cursor() as cur:
         cur.execute("SET search_path TO " + registry.schema_name)
         cur.execute(
@@ -131,10 +131,10 @@ def test_second_clause_alias_grounds_on_the_first_clause_entity(reg):
 def test_subject_position_grounding_mints_a_new_entity(reg):
     """The phantom mechanism, demonstrated: a NOVEL surface grounded as a SUBJECT mints
     a fresh uuid5 entity. This is why the deriver must never emit the alias surface in
-    subject position (the GLiNER2 fallback's (mars, related_to, marla) shape)."""
+    subject position (the GLiNER2 fallback's (mars, related_to, dana) shape)."""
     registry, _ = reg
     user = str(uuid.uuid4())
-    person_eid = registry.resolve(user, "marla")
+    person_eid = registry.resolve(user, "dana")
     phantom_eid = registry.resolve(user, "mars")  # novel surface -> mint
     assert phantom_eid != person_eid
     with reg[1].cursor() as cur:

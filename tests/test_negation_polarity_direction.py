@@ -1082,13 +1082,13 @@ def test_prenominal_comparatives_keep_their_type_row():
     The guard assumed whichever token owns the `than` standard is the comparative. That holds in UD
     and NOT in the parser this runs on: measured on UD's own example ("A more difficult problem than
     you thought."), UD hangs the than-clause off `difficult` while spaCy hangs it off `problem` —
-    the head NOUN, which is the legitimate type. So the guard ate "Marla is a faster runner than
+    the head NOUN, which is the legitimate type. So the guard ate "Dana is a faster runner than
     Devon." and, worse, the correct DENIAL in "He is no more a plumber than I am."
 
     Every case here DEMANDS a row and the last demands a NEGATED one, so neither silence nor a
     blanket polarity can satisfy this test."""
     for sentence, subject, rel, obj, want_negated in [
-        ("Marla is a faster runner than Devon.", "marla", "instance_of", "faster runner", False),
+        ("Dana is a faster runner than Devon.", "dana", "instance_of", "faster runner", False),
         ("Sarah is a better cook than her sister.", "sarah", "instance_of", "better cook", False),
         ("Rex is a bigger dog than Max.", "rex", "instance_of", "bigger dog", False),
         ("He is no more a plumber than I am.", "he", "instance_of", "plumber", True),

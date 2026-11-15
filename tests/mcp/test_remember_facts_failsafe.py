@@ -31,7 +31,7 @@ import src.mcp.server as S
 from src.mcp.server import remember_facts_tool, retract_fact_tool
 
 
-_UID = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+_UID = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
 
 
 def _resp(json_body, status=200):

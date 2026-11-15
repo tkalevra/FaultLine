@@ -15,7 +15,7 @@ every other tenant the whole rest of the serial pass, including the ontology-gro
 only begin once the pass is done.
 
 ⛔ WHY THE EXISTING STORM BOUND DID NOT CATCH IT — AND WHY ITS OWN TEST STAYED GREEN.
-`REEXTRACT_FAIL_ABORT` was built for exactly this shape (63cdd1cf: "a sick brain fails SLOW").
+`REEXTRACT_FAIL_ABORT` was built for exactly this shape (aa71d1cf: "a sick brain fails SLOW").
 It arms off `consecutive_failures`. 28215456 then added `_exempt` — correctly, to stop a lane
 outage stamping `reextracted_at` and freezing turns out of eligibility forever — and wired it to
 that SAME counter: `if not _exempt: consecutive_failures += 1`.

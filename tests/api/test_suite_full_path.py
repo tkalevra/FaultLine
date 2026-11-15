@@ -101,7 +101,7 @@ class TestGroupABaseIntegration:
         # Ingest
         text = (
             "My name is Christopher, I prefer to be called Chris. "
-            "I am married to Marla, who prefers to be called Mars. "
+            "I am married to Dana, who prefers to be called Day. "
             "We have 3 children: Cato (19), Bianca who goes by Gabby (10), "
             "and Desmond who prefers Dez (12)."
         )

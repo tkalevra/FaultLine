@@ -33,7 +33,7 @@ broad flag's certified flag-ON behavior (byte-parity), and the rollback arm
 Known residual (out of scope, pre-existing in BOTH flag states): a name the sm tagger mis-types
 NOUN/ADJ (Cassian → NOUN, Winifred/Odile → ADJ acomp) is not a PROPER-NAME complement — the
 naming chains decline and the legacy weld/has_state twin remains; and the INVERSE copula order
-("Marla is my wife.") is a different frame (role in the attr slot), owned by the caller-seam
+("Dana is my wife.") is a different frame (role in the attr slot), owned by the caller-seam
 naming analyzer behind SPINE_NAMING_CHAIN.
 """
 import datetime
@@ -182,7 +182,7 @@ def test_genitive_name_frames_still_bind():
         assert ("wife", "spouse", "user") not in triples, (text, triples)
 
 
-# ── R2 (live bench 76e214a0 residual) — the attr/acomp PARSE-SHAPE COIN FLIP ─────────────────
+# ── R2 (live bench 5d8e93b4 residual) — the attr/acomp PARSE-SHAPE COIN FLIP ─────────────────
 # The sm tagger parses "My wife is Nora." with the name as attr, and "My wife is Isolde." with
 # the SAME construction's name as PROPN acomp — the measure-NP dobj/npadvmod coin-flip class.
 # The R1 complement scan missed acomp, the possessive weld edge shipped, and ingest linked it

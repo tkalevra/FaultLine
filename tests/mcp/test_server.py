@@ -1590,7 +1590,7 @@ def test_validate_tool_input_pin_set_empty_arg_passes():
     """Pin set + empty arg user_id → effective = pin, validation passes (pinned deploy unchanged)."""
     from src.mcp.server import _validate_tool_input
 
-    with patch("src.mcp.server.FAULTLINE_USER_ID", "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"):
+    with patch("src.mcp.server.FAULTLINE_USER_ID", "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"):
         # user_id arg empty, but effective resolves to the pin → no user_id error
         err = _validate_tool_input("query", {"text": "hello", "user_id": ""})
     # Should not be a user_id error (text is valid, so None overall)
@@ -1624,7 +1624,7 @@ def test_validate_tool_input_whitespace_arg_agrees_with_bind_tenant():
     """
     from src.mcp.server import _validate_tool_input
 
-    _pin = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+    _pin = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
     with patch("src.mcp.server.FAULTLINE_USER_ID", _pin):
         # Whitespace-only ⇒ absent ⇒ the pin fills the void, same as bind_tenant.
         assert _validate_tool_input("query", {"text": "hello", "user_id": "   "}) is None
@@ -1738,7 +1738,7 @@ async def test_recall_no_timestamp_prefix_when_not_temporal_ordered(mock_http_cl
     query_response.raise_for_status = MagicMock()
     query_response.json.return_value = {
         "facts": [
-            {"definition": "You are married to Marla", "fact_class": "A",
+            {"definition": "You are married to Dana", "fact_class": "A",
              "event_date": None, "rel_type": "spouse"},
         ],
         "attributes": {},
@@ -1751,7 +1751,7 @@ async def test_recall_no_timestamp_prefix_when_not_temporal_ordered(mock_http_cl
         result = await recall_memory_tool("who is my spouse", "user-alice")
 
     mem = result["memory"]
-    assert "You are married to Marla" in mem
+    assert "You are married to Dana" in mem
     assert "Event #" not in mem
     assert "order they happened" not in mem
 

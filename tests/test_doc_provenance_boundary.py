@@ -97,8 +97,8 @@ def test_genuine_name_binds_and_reaches_adjudication():
     (where the doc-lane discipline, not this gate, decides)."""
     assert kin_self_role_surface("tom", "sally", USER, _KIN_NOUNS) is None
     assert kin_self_role_surface(TOM, SALLY, USER, _KIN_NOUNS) is None
-    # inverse-copula family: 'Marla is my wife.' is a legitimate bind shape.
-    assert kin_self_role_surface("marla", "wife", USER, _KIN_NOUNS) is None
+    # inverse-copula family: 'Dana is my wife.' is a legitimate bind shape.
+    assert kin_self_role_surface("dana", "wife", USER, _KIN_NOUNS) is None
 
 
 # == 3. THE FAMILY-WALK CONTAINMENT =================================================

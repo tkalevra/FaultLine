@@ -50,7 +50,7 @@ class TestQueryFamilyCompound:
 
         text = (
             "My name is Christopher, I prefer to be called Chris, "
-            "I am married to Marla, who prefers to be called Mars. "
+            "I am married to Dana, who prefers to be called Day. "
             "We have 3 children, a daughter Bianca, age 10, who prefers Gabby, "
             "Cato, our son is 19, and a son named Desmond, age 12, who goes by Dez."
         )

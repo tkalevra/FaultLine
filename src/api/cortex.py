@@ -101,7 +101,7 @@ _CORRECTION_SHAPE_RE = re.compile(
 # Shape-marker words: they MARK a correction (and fire _CORRECTION_SHAPE_RE) but are
 # not SUBJECT MATTER. Counting them as content let "never a bare --force" tombstone
 # the --force-recreate compose note (shared: force + never) at corpus scale (A5 seat
-# f69b42eb: 78 tombstones, 47 of them false links). Excluded from the link bar.
+# c74a08de: 78 tombstones, 47 of them false links). Excluded from the link bar.
 _SHAPE_MARKERS = frozenset({
     "never", "not", "changed", "instead", "renamed", "replaced",
     "correction", "supersedes", "longer", "actually",

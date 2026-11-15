@@ -649,7 +649,7 @@ from src.api.kin_weld_repoint import (  # noqa: E402
 
 
 def test_bind_endpoint_keys_either_arrangement():
-    USER = "1a2b3c4d-63cd-4f31-92ce-f2c9edb760ab"
+    USER = "1a2b3c4d-aa71-bb82-4c93-6d5e7f809a2b"
     FOX = "foxglove-0000-4000-8000-000000000001"
     # the LIVE door arrangement: name on OBJECT
     assert kin_bind_endpoint(USER, FOX, USER) == FOX
@@ -674,12 +674,12 @@ def test_tautology_role_word_surface_refuses_both_sides():
 
 
 def test_tautology_never_fires_on_the_predicate_slot_r8():
-    """RG-B(2) (critic R5B): 'Marla is my wife.' is the INVERSE-COPULA family — the subject
+    """RG-B(2) (critic R5B): 'Dana is my wife.' is the INVERSE-COPULA family — the subject
     is a genuine name and the role phrase sits in the predicate slot. The tautology refusal
     keys on the NAME slot only; this shape must reach the adjudication, never refuse here."""
     NOUNS = frozenset({"wife", "spouse"})
-    assert kin_self_role_surface("Marla", "wife", "user", NOUNS) is None
-    assert kin_self_role_surface("marla", "wife", "user", NOUNS) is None
+    assert kin_self_role_surface("Dana", "wife", "user", NOUNS) is None
+    assert kin_self_role_surface("dana", "wife", "user", NOUNS) is None
     # ...but the same role word on a genuine USER-side frame still refuses
     assert kin_self_role_surface("user", "wife", "user", NOUNS) == "wife"
 

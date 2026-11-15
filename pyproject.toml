@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 # errors on the combination. The SPDX field is the single source of truth.
 license = "AGPL-3.0-only"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "Christopher Thompson" }]
+authors = [{ name = "Rowan Ellis" }]
 classifiers = ["Programming Language :: Python :: 3.11"]
 dependencies = [
     # PINNED, and it must stay pinned. 2026-08-27: an UNPINNED gliner2 silently absorbed a

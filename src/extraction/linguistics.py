@@ -469,10 +469,10 @@ _CORRECTIVE_ALT_EXCLUDED_POS: frozenset = frozenset({
 # vocabulary proper name in that slot is tagged ADJ and attached ``acomp`` instead of PROPN/``attr``,
 # and the mis-tag tracks the NAME TOKEN, not the frame — "my {sister,mother,dog,colleague}'s name is
 # Marlow" is ``acomp``/ADJ in ALL FOUR while the same four with Diana/Renata/Rex/Kate/Bob/Sarah/
-# Zephyrine/Marla/Priya/Susan/Fraggle are ``attr``/PROPN in all four; "my name is Marlow" is
+# Zephyrine/Dana/Priya/Susan/Fraggle are ``attr``/PROPN in all four; "my name is Marlow" is
 # ``acomp``/ADJ too. A complement scan filtered to attr/oprd/dobj/obj therefore drops the WHOLE
 # construction for those names — silently, with no error: the chain simply declines and every fact
-# in the turn is lost. (Live: "Actually my sister's name is Marlow, not Marla." derived ZERO edges.)
+# in the turn is lost. (Live: "Actually my sister's name is Marlow, not Dana." derived ZERO edges.)
 #
 # This is the SAME parser-unreliability that ``corrective_negation_alternative`` below already
 # documents for the ALTERNATIVE slot one clause over ("… is Bob, not Rob" → Rob/ADJ) — there the
@@ -1113,7 +1113,7 @@ def _clause_has_corrective_alternative(anchor):
 
     Returns the TOKEN, not a flag, because its part of speech is the discriminator the caller
     needs: measured in this parser, the alternative is PROPN when the slot holds a NAME
-    ("…is Marlow, not MARLA") and ADJ when it holds a property ("…is Greek, not ROMAN").
+    ("…is Marlow, not DANA") and ADJ when it holds a property ("…is Greek, not ROMAN").
 
     Grammatical evidence that a complement slot holds a NAME rather than a property: you can only
     correct a name TO another name. Used to narrow the OOV mis-tag recovery in
@@ -1175,7 +1175,7 @@ def _copular_name_complement(copula):
             # FRAME rather than from the token.
             #
             # IT DOES, AND IT IS EXACTLY THE FRAME THIS ARM EXISTS FOR: a CORRECTIVE alternative
-            # ("… is Marlow, NOT Marla"). You can only correct a name TO another name, so a rejected
+            # ("… is Marlow, NOT Dana"). You can only correct a name TO another name, so a rejected
             # alternative is grammatical evidence that the slot holds a name — and the plain
             # assertion "My sister's name is Irish." carries none, so it is declined and mints
             # nothing. Measured: every corrective case still repairs (Renata/Thorne/Priya via the
@@ -1199,7 +1199,7 @@ def _copular_name_complement(copula):
             #      (Juniper/Rosalind/Ugo tag ADJ here), which is how the arm reached zero net gain.
             #   4. NEUTRAL-FRAME RE-PARSE ("They were very X yesterday.") — tags Marlow, Diane and
             #      Fraggle ADJ as well; 3 of 9 real names lost.
-            #   5. THE REJECTED ALTERNATIVE'S POS — separates "Marlow, not Marla" from "Greek, not
+            #   5. THE REJECTED ALTERNATIVE'S POS — separates "Marlow, not Dana" from "Greek, not
             #      Roman", but collapses the moment the alternative is itself a name: in
             #      "…is Greek, not Wrenna." the adjective and the name are byte-identical in dep,
             #      POS and alternative (acomp/ADJ, alt PROPN/appos).
@@ -7826,7 +7826,7 @@ def _bound_name_for_type(type_tok, _naming):
       (3) COPULA       — the type is the ``nsubj`` of a copula ``be`` whose ``attr``/``oprd`` is a
                          PROPN with no determiner ("my friend is Sam").
       (4) INVERSE COPULA — the mirror of (3): the type is the POSSESSED ``attr``/``oprd`` and the NAME
-                         is the ``nsubj`` ("Marla is my wife"). Gated on 1st-person possession.
+                         is the ``nsubj`` ("Dana is my wife"). Gated on 1st-person possession.
       (5) COPULA TYPE-PREDICATE — a DETERMINER-introduced predicate nominal is a second, narrower TYPE
                          for the instance the possessed subject NP already names ("My dog Fraggle is a
                          morkie" → morkie binds to Fraggle).
@@ -7993,14 +7993,14 @@ def _bound_name_for_type(type_tok, _naming):
                 except Exception:  # noqa: BLE001
                     pass
                 return c, "copula"
-    # (4) INVERSE COPULA — "Marla is my wife": the NAME is the ``nsubj`` and the POSSESSED ROLE is the
-    #     ``attr``. Branch (3) reads only the forward order ("my wife is Marla"), so this everyday
+    # (4) INVERSE COPULA — "Dana is my wife": the NAME is the ``nsubj`` and the POSSESSED ROLE is the
+    #     ``attr``. Branch (3) reads only the forward order ("my wife is Dana"), so this everyday
     #     order bound NOTHING and the role noun leaked as its own entity: the possessive chain minted
     #     (wife, spouse, user) — a PHANTOM "Wife" person that then collected an instance_of, an owns,
-    #     and a retraction's negative fact, all conflicting with the real (marla, spouse, user).
+    #     and a retraction's negative fact, all conflicting with the real (dana, spouse, user).
     #     GATED on the role being 1st-person POSSESSED ("my"/"our" — Person=1 ∧ Poss=Yes), the same
     #     user-anchored gate branch (3) and ``_chain_copula_name`` use, so an unpossessed predicate
-    #     nominal ("Marla is a doctor" — a ROLE reading owned by the appositive/role chains) is never
+    #     nominal ("Dana is a doctor" — a ROLE reading owned by the appositive/role chains) is never
     #     swept in here. The complement NAME must be a bare PROPN (no determiner) and not a wh-word.
     if type_tok.dep_ in ("attr", "oprd"):
         head = type_tok.head
@@ -18106,7 +18106,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # legitimate TYPE — and the predicate is exactly inverted relative to the source it rests on.
         #
         # WHAT IT COST, measured against the parent: it deleted USER CONTENT IN BOTH POLARITIES.
-        #   "Marla is a faster runner than Devon."   lost (marla, instance_of, `faster runner`)
+        #   "Dana is a faster runner than Devon."   lost (dana, instance_of, `faster runner`)
         #   "Sarah is a better cook than her sister." lost (sarah, instance_of, `better cook`)
         #   "He is no more a plumber than I am."      lost (he, instance_of, `plumber`, NEGATED)
         # A guard written to suppress junk ate real facts, and a correct DENIAL with them. One junk
@@ -25877,7 +25877,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # "My wife is Isolde." parses it PROPN acomp (the measure-NP dobj/npadvmod coin-flip
             # class) — and a frame whose name lands in acomp missed this scan entirely, the
             # possessive weld edge shipped, and ingest linked it onto the seat's PRE-EXISTING
-            # role-weld entity (live bench 76e214a0: committed=1 onto [wife], Isolde orphaned).
+            # role-weld entity (live bench 5d8e93b4: committed=1 onto [wife], Isolde orphaned).
             # Accept the acomp slot too (PROPN-only, below; SPINE_ROLE_HEAD_NO_BIND-gated so the
             # certified flag-ON battery keeps its byte-identity on rollback).
             proper = None
@@ -26131,7 +26131,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
     def _chain_alias_predicate(doc):
         r"""THIRD-PARTY / NAMED-SUBJECT ALIAS PREDICATE (Failure 2). Capture a NON-first-person
         subject's nickname/alias and file it via ``also_known_as`` on that person:
-            "She prefers to be called Mars"  → (marla, also_known_as, mars)   [she → Marla by coref]
+            "She prefers to be called Day"  → (dana, also_known_as, mars)   [she → Dana by coref]
             "She goes by Dee"                → (dana,  also_known_as, dee)
             "He is known as Sammy"           → (sam,   also_known_as, sammy)
             "Dana goes by Dee"               → (dana,  also_known_as, dee)    [named subject]
@@ -26180,7 +26180,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # → (subject_surface | None, is_first_person). First-person self is flagged so the caller
             # defers to the preference/naming seam. A PROPN is used directly; a KIN/RELATIONAL role
             # NOUN whose proper name a turn-level naming construction bound ("My wife likes to be
-            # called Mars" — wife→marla via the turn_role_names CAP2DUP whole-turn map) collapses
+            # called Mars" — wife→dana via the turn_role_names CAP2DUP whole-turn map) collapses
             # onto that named person, so the role surface never grounds a parallel entity; anything
             # else → None (never guess a non-name subject — pronouns resolve in _own_alias_verb via
             # _resolve_person_referent so the ASSIGNED NAME can be excluded from the pool).
@@ -26208,7 +26208,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # PRONOUN subjects resolve via _resolve_person_referent(st, exclude_surface=name): the
             # name THIS clause assigns is the edge's OBJECT, never its subject antecedent, so
             # excluding it from the turn-level person pool can only DISAMBIGUATE ("My wifes name is
-            # Marla, she prefers to be called Mars" with the nickname NER-typed PERSON leaves exactly
+            # Dana, she prefers to be called Day" with the nickname NER-typed PERSON leaves exactly
             # one real person — the referent). Structural exclusion, subject-agnostic: no name list.
             _alias_suppress.add(verb.i)
             _claim(verb, name_tok)
@@ -26678,7 +26678,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # the name is filed via its surface, never classified into L4 and never carries a date.
             # Modifiers already stripped by keying on the "name" head noun.
             #
-            # THIRD-PARTY BRANCH — the second clause of the naming turn ("My wifes name is Marla,
+            # THIRD-PARTY BRANCH — the second clause of the naming turn ("My wifes name is Dana,
             # her name is Mars"): the possessive pronoun resolves to the person the FIRST clause
             # already established (turn pool minus THIS clause's own assigned name — structural,
             # subject-agnostic), so the alias binds to THAT person's surface and ingest files it on
@@ -27130,8 +27130,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         # TURN-LEVEL person pool minus THIS clause's own assigned name: the name a naming/alias
         # clause ASSIGNS is that edge's OBJECT, never its subject antecedent, so excluding it can
         # only disambiguate — a pool naming just the referent and the new alias is a ONE-person
-        # turn for resolution purposes ("My wifes name is Marla, she prefers to be called Mars"
-        # with the nickname NER-typed PERSON → ['marla', 'mars'] minus 'mars' → marla). Exactly
+        # turn for resolution purposes ("My wifes name is Dana, she prefers to be called Day"
+        # with the nickname NER-typed PERSON → ['dana', 'mars'] minus 'mars' → dana). Exactly
         # one survivor → that person; zero or several → None (never guess). Subject-agnostic:
         # morphology + the whole-turn NER pool, no name list.
         try:
@@ -32657,7 +32657,7 @@ def negated_name_assertion(text: str):
     via a possessive determiner) and whose REJECTED complement is a PROPER-NAME surface —
     e.g. "My wife is not Isolde.", "I am not Chris." That shape DENIES a stored identity
     value: a correction directive, never a question, and GLiNER2's verbose labels mis-score
-    it QUERY@~0.55 (measured live on bench 76e214a0, gate 0.50 — the misroute that ate the
+    it QUERY@~0.55 (measured live on bench 5d8e93b4, gate 0.50 — the misroute that ate the
     correction 2/2 rounds). A negated CLASS complement ("my wife is not a vegetarian") is a
     brand-new negative FACT, not a correction — PROPN-only keeps this narrow. Grammar only
     (neg dep + Person=1/Poss=Yes morphology + POS), no word-lists, subject-agnostic.
