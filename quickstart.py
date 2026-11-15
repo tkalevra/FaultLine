@@ -120,6 +120,13 @@ def _http_get(url, headers=None, timeout=8):
         return r.status, r.read().decode("utf-8", "replace")
 
 
+def _http_post_json(url, payload, headers=None, timeout=15):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected — url is from operator env (FAULTLINE_API_URL / MCP_RECALL_URL / MCP_REMEMBER_URL), never user input
+        return r.status, r.read().decode("utf-8", "replace")
+
+
 def _probe_url(url):
     """host-side probe target: undo the container rewrite so we test from here."""
     return url.replace("host.docker.internal", "localhost").rstrip("/")
@@ -136,7 +143,38 @@ def probe_models(backend, base_url, key):
         if backend in ("lm_studio", "openai", "openwebui"):
             path = "/api/models" if backend == "openwebui" else "/v1/models"
             headers = {"Authorization": f"Bearer {key}"} if key else {}
-            status, body = _http_get(base + path, headers=headers)
+            try:
+                status, body = _http_get(base + path, headers=headers)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    return False, [], f"HTTP {e.code} — auth failed (check your API key)"
+                if e.code != 404:
+                    return False, [], f"HTTP {e.code} — endpoint error"
+                # CODING-PLAN GATEWAYS (verified live 2026-11-15 against
+                # https://api.z.ai/api/coding/paas/v4): the endpoint serves NO model
+                # list — a working config still 404s on /v1/models. Fall back to the
+                # exact call the stack itself makes: a minimal 1-token chat probe.
+                # Any 2xx (or even a model-name 4xx, which still proves the server
+                # parsed an AUTHED request) means connect; the operator types the
+                # model id manually.
+                chat_headers = {"Authorization": f"Bearer {key}"} if key else {}
+                probe_model = os.environ.get("FAULTLINE_PROBE_MODEL", "default")
+                try:
+                    status, _body = _http_post_json(
+                        base + "/chat/completions",
+                        {"model": probe_model,
+                         "messages": [{"role": "user", "content": "ping"}],
+                         "max_tokens": 1},
+                        headers=chat_headers)
+                    return True, [], ("chat probe — endpoint serves no model list; "
+                                      "enter the model id manually")
+                except urllib.error.HTTPError as e2:
+                    if e2.code in (401, 403):
+                        return False, [], f"HTTP {e2.code} — auth failed (check your API key)"
+                    return False, [], (f"HTTP {e2.code} — endpoint reachable but the chat "
+                                       f"probe failed; enter the base URL/model id manually")
+                except Exception as e2:
+                    return False, [], f"{type(e2).__name__}: {e2}"
             data = []
             try:
                 p = json.loads(body)
