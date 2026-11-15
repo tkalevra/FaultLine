@@ -3,7 +3,7 @@
 --
 -- WHY
 -- ---
--- A user directly STATING where they live ("I live at 156 Cedar St. S", "I live in Riverton")
+-- A user directly STATING where they live ("I live at 156 Cedar St. S", "I live in Kitchener")
 -- is grounded user truth — the same tier as name / identity / birthdate. But `lives_at` and
 -- `lives_in` were seeded at fact_class='B' (behavioral, staged, promote-on-confirmation), so a
 -- user-stated residence landed in staged_facts and had to be repeated 3× before it committed

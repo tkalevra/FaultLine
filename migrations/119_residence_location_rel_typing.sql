@@ -3,7 +3,7 @@
 --
 -- WHY
 -- ---
--- Live pre-prod evidence for "I live in Riverton, Ontario":
+-- Live pre-prod evidence for "I live in Kitchener, Ontario":
 --   wgm.category_invalid_subject        allowed_types={'location'} rel_type=lives_in subject_type=person
 --   wgm.hierarchy_membership_violation   object_type=LOCATION ... hierarchy_members=['PERSON','ANIMAL'] / ['LOCATION']
 --   wgm.hierarchy_violation_low_confidence  rel_type=lives_in  -> "stored as Class C (staged)"
@@ -19,7 +19,7 @@
 --     Residence rels are correctly typed by head_types/tail_types (head=Person/Animal,
 --     tail=Location), NOT by same-type group membership.
 --   Defect 4 — `located_in` had is_hierarchy_rel=false, so geographic containment
---     (Riverton located_in Ontario located_in Canada ...) was never walked as L4. It must be a
+--     (Kitchener located_in Ontario located_in Canada ...) was never walked as L4. It must be a
 --     HIERARCHY rel (head=Location, tail=Location) so the deterministic L4 walk traverses it the
 --     same way as subclass_of/part_of. Per the repo invariant (main.py _strip_hierarchy_rels_from_
 --     defining / embedder.py guard) a hierarchy rel must NEVER appear in any

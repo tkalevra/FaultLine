@@ -6,7 +6,7 @@
 -- cycle, forever — continuous CLASSIFY_CHAIN / ENRICHMENT LLM calls even with no new ingest
 -- (live: `apparel_item` what-is'd 9x/40s; its children re-loop the moment it's soft-deleted).
 --
--- DESIGN (Alexander): do the classification work ONCE, cache the verdict, read the cache
+-- DESIGN (Christopher): do the classification work ONCE, cache the verdict, read the cache
 -- BEFORE any LLM call, and re-attempt ONLY on a real additive new-info trigger — never a
 -- blind every-cycle re-sweep. Hard attempt-cap + backoff as a backstop.
 --
