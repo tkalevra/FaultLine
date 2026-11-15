@@ -8,7 +8,7 @@ an entity UUID. In FactStoreManager.retract (store.py):
   • subject-side probe binds old_value (`object_id = <sentence>`) → 0 rows (correct);
   • the object-side FALLBACK did NOT bind old_value — it matched
     `object_id = subject(=user_uuid) [AND rel_type]` over every live row, ignoring the
-    sentence entirely → ALL five (cyrus/des/N-year-old, child_of, user) kin rows;
+    sentence entirely → ALL five (cato/dez/N-year-old, child_of, user) kin rows;
   • the SURGICAL TOMBSTONE GUARD keyed on `not old_value` — a TRUTHY unresolvable
     sentence string DISARMED it (guard only fired for old_value=None);
   → the mass tombstone UPDATE stamped deleted_at=now() on all five rows in ONE
@@ -38,8 +38,8 @@ import src.fact_store.store as store_module
 from src.fact_store.store import FactStoreManager
 
 USER = "11111111-1111-1111-1111-111111111111"   # chris (the speaker; object of the kin rows)
-CYRUS = "33333333-3333-3333-3333-333333333333"
-DES = "55555555-5555-5555-5555-555555555555"
+CATO = "33333333-3333-3333-3333-333333333333"
+DEZ = "55555555-5555-5555-5555-555555555555"
 KIN_IDS = [101, 102, 103, 104, 105]             # the five (X, child_of, user) rows
 SENTENCE_OLD_VALUE = "aurora flood was born on 2026-08-08"  # unresolvable: no alias row
 # a RESOLVED object value (the legitimate flipped-row target): (aurora, child_of, user)

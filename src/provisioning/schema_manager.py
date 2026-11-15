@@ -264,7 +264,7 @@ def derive_schema_name(user_slug: str) -> str:
         >>> derive_schema_name("christopher")
         'faultline_christopher'
 
-        >>> derive_schema_name("ada")
+        >>> derive_schema_name("alma")
         'faultline_marla'
     """
     # Sanitize slug: lowercase, alphanumeric + underscore only

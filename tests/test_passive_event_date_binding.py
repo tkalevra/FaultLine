@@ -62,7 +62,7 @@ def test_birth_date_binds_to_named_person_not_role():
 @requires_model
 def test_three_people_birthdays_on_their_names():
     for sent, name, val in (
-        ("My son Cyrus was born on March 14, 2012.", "cyrus", "2012-03-14"),
+        ("My son Cato was born on March 14, 2012.", "cato", "2012-03-14"),
         ("My mother Diane was born in 1958.", "diane", "1958"),
     ):
         f = _facts(sent)
@@ -197,8 +197,8 @@ def test_dateless_passive_state_unchanged():
 
 @requires_model
 def test_by_agent_passive_left_to_relational_chain():
-    # "founded BY Ada" is captured relationally (found_by) with its date — our lane must NOT fire a twin
-    f = _facts("The company was founded in 1998 by Ada.")
+    # "founded BY Alma" is captured relationally (found_by) with its date — our lane must NOT fire a twin
+    f = _facts("The company was founded in 1998 by Alma.")
     assert not _find(f, "company", "founded")   # no date-only scalar twin
     assert any(rel == "found_by" for _s, rel, _o, _e, _d in f)
 

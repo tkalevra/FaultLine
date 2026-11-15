@@ -91,7 +91,7 @@ def test_step4_flat_participation_superseded_when_spine_reified():
         {"subject": "user", "rel_type": "participated_in", "object": "turbocharged tuesdays"},
         # non-event edges → must survive
         {"subject": "user", "rel_type": "has_pet", "object": "fraggle"},
-        {"subject": "user", "rel_type": "spouse", "object": "des"},
+        {"subject": "user", "rel_type": "spouse", "object": "dez"},
         # the spine's OWN canonical edges (subject/object ARE handles) → must survive
         {"subject": "user", "rel_type": "participated_in", "object": "racking event on 2023-06-14"},
         {"subject": "racking event on 2023-06-14", "rel_type": "instance_of", "object": "racking event"},
@@ -101,7 +101,7 @@ def test_step4_flat_participation_superseded_when_spine_reified():
     assert ("user", "participated_in", "turbocharged tuesdays") not in rels, \
         "garbled flat participation was NOT superseded by the reified spine"
     assert ("user", "has_pet", "fraggle") in rels
-    assert ("user", "spouse", "des") in rels
+    assert ("user", "spouse", "dez") in rels
     assert ("user", "participated_in", "racking event on 2023-06-14") in rels, \
         "the spine's OWN reified participated_in (object is a handle) was wrongly dropped"
 

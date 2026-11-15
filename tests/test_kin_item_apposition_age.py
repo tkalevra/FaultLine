@@ -6,7 +6,7 @@ edges (the plural-kin machinery owns the membership) but NOT the ages as scalars
 (entity_attributes only got the speaker's own 34), and the bare cardinal
 resurfaced mis-bound as a RELATIONSHIP OBJECT ("Ptolemy is the parent of 17" —
 an (x, parent_of, '<NUM>') edge). The bare cardinal after a determiner-introduced
-kin apposition is the NAMED PERSON'S AGE — prod's phrasing "my son Desmonde is
+kin apposition is the NAMED PERSON'S AGE — prod's phrasing "my son Desmond is
 12" already captures it via _chain_copula_measure.
 
 FIX (deterministic, metadata-driven, NO new word lists — linguistics.py):
@@ -87,7 +87,7 @@ def test_kin_item_numeral_is_never_a_relationship_object():
 
 @_needs_spacy
 def test_prod_kin_age_phrasing_still_captures_control():
-    triples = _triples(m.derive_sentence_facts("my son Desmonde is 12", _REF))
+    triples = _triples(m.derive_sentence_facts("my son Desmond is 12", _REF))
     assert any(o == "12" and r == "age" for s, r, o in triples), triples
 
 

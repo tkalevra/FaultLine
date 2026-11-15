@@ -51,8 +51,8 @@ class TestQueryFamilyCompound:
         text = (
             "My name is Christopher, I prefer to be called Chris, "
             "I am married to Marla, who prefers to be called Mars. "
-            "We have 3 children, a daughter Gabriella, age 10, who prefers Gabby, "
-            "Cyrus, our son is 19, and a son named Desmonde, age 12, who goes by Des."
+            "We have 3 children, a daughter Bianca, age 10, who prefers Gabby, "
+            "Cato, our son is 19, and a son named Desmond, age 12, who goes by Dez."
         )
 
         ingest = _ingest(client, text, self.uid)
@@ -85,7 +85,7 @@ class TestQueryFamilyCompound:
 
         # Must have parent_of facts for 3 children
         parent_facts = [f for f in facts if f["rel_type"] == "parent_of"]
-        assert len(parent_facts) >= 3  # gabriella, cyrus, desmonde
+        assert len(parent_facts) >= 3  # bianca, cato, desmond
 
         # Ages are stored in entity_attributes — verify via DB since
         # attribute-to-fact merging requires Qdrant (unavailable in test).
@@ -302,13 +302,13 @@ class TestFamilyScopeNoServerBleed:
             {"subject": "user", "object": "mars", "rel_type": "spouse",
              "fact_provenance": "user_stated", "confidence": 1.0,
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "user", "object": "desmonde", "rel_type": "parent_of",
+            {"subject": "user", "object": "desmond", "rel_type": "parent_of",
              "fact_provenance": "user_stated", "confidence": 1.0,
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "user", "object": "cyrus", "rel_type": "parent_of",
+            {"subject": "user", "object": "cato", "rel_type": "parent_of",
              "fact_provenance": "user_stated", "confidence": 1.0,
              "subject_type": "Person", "object_type": "Person"},
-        ], text="My spouse is Mars and my children are Desmonde and Cyrus")
+        ], text="My spouse is Mars and my children are Desmond and Cato")
 
         # ── Server entity: true type via hierarchy, plus the leaking edges ──
         self._ingest_edges(client, [
@@ -468,10 +468,10 @@ class TestFamilyScopeAnchorConnectedness:
             {"subject": "user", "object": "mars", "rel_type": "spouse",
              "fact_provenance": "user_stated", "confidence": 1.0,
              "subject_type": "Person", "object_type": "Person"},
-            {"subject": "user", "object": "desmonde", "rel_type": "parent_of",
+            {"subject": "user", "object": "desmond", "rel_type": "parent_of",
              "fact_provenance": "user_stated", "confidence": 1.0,
              "subject_type": "Person", "object_type": "Person"},
-        ], text="My spouse is Mars and my child is Desmonde")
+        ], text="My spouse is Mars and my child is Desmond")
 
         # ── DISCONNECTED family cluster (ZERO edges to the user) ─────────
         # Both are family-CATEGORY rels — in scope by TYPE — but about people
@@ -512,7 +512,7 @@ class TestFamilyScopeAnchorConnectedness:
         assert "spouse" in rel_types or "parent_of" in rel_types, \
             f"connected family lost! got: {rel_types} / {facts}"
         assert ("mars" in subjects or "mars" in objects
-                or "desmonde" in subjects or "desmonde" in objects), \
+                or "desmond" in subjects or "desmond" in objects), \
             f"connected family members lost: {facts}"
 
         # DISCONNECTED subjects ABSENT (the 1C contract).

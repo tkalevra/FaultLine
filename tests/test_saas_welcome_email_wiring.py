@@ -52,11 +52,11 @@ def _patch(monkeypatch, sender, *, base_url="https://app.faultline.ca/dashboard/
 def test_welcome_is_sent_with_console_link_and_from_address(monkeypatch):
     s = _Sender()
     _patch(monkeypatch, s)
-    out = uc.send_welcome_to_individual({"email": "a@b.com", "display_name": "Ada"})
+    out = uc.send_welcome_to_individual({"email": "a@b.com", "display_name": "Alma"})
     assert out["delivery"] == "emailed"
     (to, kw), = s.calls
     assert to == "a@b.com"
-    assert kw["display_name"] == "Ada"
+    assert kw["display_name"] == "Alma"
     assert kw["from_address"] == "noreply@faultline.ca"
     # console_url is derived from the configured reset-link origin, deep-linked to the console.
     assert kw["console_url"] == "https://app.faultline.ca/dashboard/user.html"
@@ -103,7 +103,7 @@ def test_admin_approve_delegates_to_the_shared_sender(monkeypatch):
         return {"delivery": "emailed"}
 
     monkeypatch.setattr(uc, "send_welcome_to_individual", _shared)
-    out = ad._send_welcome({"email": "a@b.com", "display_name": "Ada"})
+    out = ad._send_welcome({"email": "a@b.com", "display_name": "Alma"})
     assert out == {"delivery": "emailed"}
     assert seen["target"]["email"] == "a@b.com"
 

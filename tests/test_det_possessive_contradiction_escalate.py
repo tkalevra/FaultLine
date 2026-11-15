@@ -3,8 +3,8 @@
 
 TWO INDEPENDENT CONVICTIONS (the owner's live seat + the round-4 corpus control
 tools/regression_results/results-20261114T2103Z-*.json / r4j_autopsy.md) convicted the same
-arm: corrections phrased as PLAIN POSSESSIVES ("Fraggle is Mars's morkie.", "Goose is Cyrus's
-cat.", "Sophia is Desmonde's corn snake.") walked in as NEW statements —
+arm: corrections phrased as PLAIN POSSESSIVES ("Fraggle is Mars's morkie.", "Goose is Cato's
+cat.", "Sophia is Desmond's corn snake.") walked in as NEW statements —
 
   * ROUTER HALF: the deterministic-first possessive arm (tier-2) short-circuits to STATEMENT
     and SKIPS the GLiNER2 / below-gate INTENT_ADJUDICATION layers. Fix:
@@ -42,8 +42,8 @@ _UID = "5d1c2b3a-2222-4000-8000-abcdefabcdef"
 
 # THE OWNER'S LIVE SEAT SHAPES (the conviction fixtures).
 OWNER_MORKIE = "Fraggle is Mars's morkie."
-OWNER_CAT = "Goose is Cyrus's cat."
-OWNER_SNAKE = "Sophia is Desmonde's corn snake."
+OWNER_CAT = "Goose is Cato's cat."
+OWNER_SNAKE = "Sophia is Desmond's corn snake."
 OWNER_SHAPES = [OWNER_MORKIE, OWNER_CAT, OWNER_SNAKE]
 # The same wound phrased speaker-anchored — the shape tier-2 actually short-circuits on.
 SELF_POSSESSIVE = "Fraggle is my morkie."
@@ -175,8 +175,8 @@ async def test_escalation_flag_off_short_circuits_anyway(monkeypatch):
 
 @pytest.mark.parametrize("text,name,owner", [
     (OWNER_MORKIE, "fraggle", "mars"),
-    (OWNER_CAT, "goose", "cyrus"),
-    (OWNER_SNAKE, "sophia", "desmonde"),
+    (OWNER_CAT, "goose", "cato"),
+    (OWNER_SNAKE, "sophia", "desmond"),
 ])
 async def test_owner_shapes_keep_the_llm_ladder(text, name, owner, monkeypatch):
     """The owner's three live-seat shapes are NOT speaker-anchored (tier-2's gate declines
@@ -184,7 +184,7 @@ async def test_owner_shapes_keep_the_llm_ladder(text, name, owner, monkeypatch):
     holding the contradicting original, the third-person leg of the escalation probe admits
     the CORRECTION label the marker floor would otherwise refuse: they route CORRECTION."""
     def _probe(uid, txt):
-        return {"rel_type": "has_pet", "owner": "desmonde", "anchor": name}
+        return {"rel_type": "has_pet", "owner": "desmond", "anchor": name}
 
     monkeypatch.setattr(M, "_det_possessive_contradiction_probe", _probe)
     resp = await M.classify_intent({"text": text}, user_id=_UID,
@@ -268,8 +268,8 @@ def _facts(text):
 
 @pytest.mark.parametrize("text,name,kind,owner", [
     (OWNER_MORKIE, "fraggle", "morkie", "mars"),
-    (OWNER_CAT, "goose", "cat", "cyrus"),
-    (OWNER_SNAKE, "sophia", "corn snake", "desmonde"),
+    (OWNER_CAT, "goose", "cat", "cato"),
+    (OWNER_SNAKE, "sophia", "corn snake", "desmond"),
 ])
 def test_guard_files_pet_registry_rows(text, name, kind, owner):
     """THE FIX (extraction half): the pet-registry rows land and the class-subject
@@ -283,8 +283,8 @@ def test_guard_files_pet_registry_rows(text, name, kind, owner):
 
 @pytest.mark.parametrize("text,kind,owner", [
     (OWNER_MORKIE, "morkie", "mars"),
-    (OWNER_CAT, "cat", "cyrus"),
-    (OWNER_SNAKE, "corn snake", "desmonde"),
+    (OWNER_CAT, "cat", "cato"),
+    (OWNER_SNAKE, "corn snake", "desmond"),
 ])
 def test_guard_off_is_byte_identical(monkeypatch, text, kind, owner):
     """OFF leg: the legacy class-subject loose link returns byte-for-byte."""
@@ -323,8 +323,8 @@ def test_guard_negated_possessive_copula_declines():
 
 @pytest.mark.parametrize("text,name,owner,self_owner,kind", [
     (OWNER_MORKIE, "fraggle", "mars", False, "morkie"),
-    (OWNER_CAT, "goose", "cyrus", False, "cat"),
-    (OWNER_SNAKE, "sophia", "desmonde", False, "corn snake"),
+    (OWNER_CAT, "goose", "cato", False, "cat"),
+    (OWNER_SNAKE, "sophia", "desmond", False, "corn snake"),
     (SELF_POSSESSIVE, "fraggle", "my", True, "morkie"),
 ])
 def test_shape_parses(text, name, owner, self_owner, kind):

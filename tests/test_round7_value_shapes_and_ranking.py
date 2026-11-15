@@ -267,22 +267,22 @@ def test_ranked_alias_bare_node_without_instances_never_overrides(monkeypatch):
 
 
 def test_tombstoned_instance_of_rung_never_ranks(monkeypatch):
-    """ROUND-8 (prod-proven): a RETRACTED (cyrus, instance_of, laptop) rung still sat in
+    """ROUND-8 (prod-proven): a RETRACTED (cato, instance_of, laptop) rung still sat in
     facts and competed at rank 0; the (rank, uuid) tie broke to the lexically-smaller
-    junk uuid and recall anchored 'laptop' to Cyrus instead of the device. The helper's
+    junk uuid and recall anchored 'laptop' to Cato instead of the device. The helper's
     facts probes (has_fact + type-descend instances) must filter superseded_at IS NULL,
     so the tombstoned rung never ranks and the anchor lands on the device."""
     import src.api.main as M
     # the prod tie: BOTH instances are owned and evidence-bearing, so the rung tie
-    # broke to the lexically-smaller uuid (aaa-cyrus) while the tombstoned rung sat
-    # in facts. uuids chosen so the UNFIXED sort deterministically picks cyrus.
+    # broke to the lexically-smaller uuid (aaa-cato) while the tombstoned rung sat
+    # in facts. uuids chosen so the UNFIXED sort deterministically picks cato.
     store = {
         "aliases": [("type-node",)],
-        "attrs": [("aaa-cyrus",), ("zzz-device",)],
-        # (cyrus, instance_of, laptop) is RETRACTED -> superseded_at set
-        "instances": [("aaa-cyrus", "type-node", "2026-10-10"),
+        "attrs": [("aaa-cato",), ("zzz-device",)],
+        # (cato, instance_of, laptop) is RETRACTED -> superseded_at set
+        "instances": [("aaa-cato", "type-node", "2026-10-10"),
                       ("zzz-device", "type-node", None)],
-        "facts": [("aaa-cyrus", "aaa-cyrus", "2026-10-10")],
+        "facts": [("aaa-cato", "aaa-cato", "2026-10-10")],
     }
     db = _FakeDB(store)
     monkeypatch.setattr(M, "_entity_owned_by", lambda d, eid, uid: True)

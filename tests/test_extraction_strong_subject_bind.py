@@ -11,7 +11,7 @@ extraction bound the WRONG SUBJECT, so the named THING never became the target:
   2. T02 "Actually my wife's name is Marla MacPhee." — flakes to
      clarification_needed / failed ~2 of 3 runs (the R4-J extraction-draw variance
      class; no contrast clause for the deterministic ", not <Name>" marker lanes).
-  3. 'mars'/'desmonde' — person-shaped, kin/pet-membership-bearing entities retyped
+  3. 'mars'/'desmond' — person-shaped, kin/pet-membership-bearing entities retyped
      entity_type=Location in place by the ingest class-a unconditional stamp riding a
      zero-shot type guess, cascading type_refused on T04 "Fraggle is Mars's morkie."
 
@@ -222,10 +222,10 @@ def _retype_cur(entity_type="Person", membership=False):
 
 
 def test_retype_refused_on_person_shaped_entity():
-    """THE PIN: the autopsy shape — a Person-typed entity (desmonde/mars, holding live
+    """THE PIN: the autopsy shape — a Person-typed entity (desmond/mars, holding live
     kin edges) is never retyped Location by the class-a unconditional stamp."""
     cur = _retype_cur("Person")
-    assert M._membership_retype_blocked(cur, E["desmonde"], "Location") is True
+    assert M._membership_retype_blocked(cur, E["desmond"], "Location") is True
     cur = _retype_cur("Animal")
     assert M._membership_retype_blocked(cur, E["marla1"], "location") is True  # casefold
 
@@ -241,14 +241,14 @@ def test_retype_allowed_for_genuine_places_and_non_location_stamps():
     cur = _retype_cur(None, membership=False)   # no entities row, no membership rows
     assert M._membership_retype_blocked(cur, "some-uuid", "Location") is False
     cur = _retype_cur("Person")
-    assert M._membership_retype_blocked(cur, E["desmonde"], "Animal") is False
-    assert M._membership_retype_blocked(cur, E["desmonde"], "Concept") is False
+    assert M._membership_retype_blocked(cur, E["desmond"], "Animal") is False
+    assert M._membership_retype_blocked(cur, E["desmond"], "Concept") is False
 
 
 def test_retype_flag_off_is_byte_parity():
     cur = _retype_cur("Person", membership=True)
     assert M._membership_retype_blocked(
-        cur, E["desmonde"], "Location", enabled=False) is False
+        cur, E["desmond"], "Location", enabled=False) is False
     assert cur.executed == []  # OFF never probes
 
 

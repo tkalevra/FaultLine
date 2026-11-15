@@ -5,7 +5,7 @@ THE MEASURED WOUND (live litmus autopsy seat 3e7b2cc4, image b9161e04, 2026-11-1
 tools/regression_results/convergence/results/autopsy-report.md): corrections minted
 correct rows BESIDE the planted wrong ones and never superseded them; the litmus
 fixture minted a PARALLEL USER ENTITY (uuid5 off the seat) beside the seat-uuid one so
-entity-linking by id never touched the planted rows; "Desmonde is 13." landed
+entity-linking by id never touched the planted rows; "Desmond is 13." landed
 attribute=has_value beside the stale age=12 (the SEAM-1 non-animate retype); and a
 negated twin served beside its affirmed counterpart.
 
@@ -87,9 +87,9 @@ def test_plan_taxonomy_defining_rel_sweeps_object_side():
     """has_pet defines the 'pets' taxonomy group: a newly affirmed owner arms the
     OBJECT-side sweep — the pet's OTHER live claimant (the misrouted user row) retires."""
     plan = M._slot_supersession_plan(
-        [("cyrus", "goose", "has_pet")], set(), REL_META, DEFINING)
-    assert plan["object_side"] == {("has_pet", "goose"): "cyrus"}
-    assert ("cyrus", "has_pet") not in plan["subject_side"]  # multi-valued subject side
+        [("cato", "goose", "has_pet")], set(), REL_META, DEFINING)
+    assert plan["object_side"] == {("has_pet", "goose"): "cato"}
+    assert ("cato", "has_pet") not in plan["subject_side"]  # multi-valued subject side
 
 
 def test_plan_immutable_and_plain_supersede_rels_never_sweep():
@@ -173,10 +173,10 @@ def _stub_db(update_rowcount=1, live_replacement=True):
 
 
 def test_executor_retires_parallel_rows_and_commits():
-    """THE PIN: 'Goose is Cyrus's cat.' (Class A, affirmed) retires the OTHER live
+    """THE PIN: 'Goose is Cato's cat.' (Class A, affirmed) retires the OTHER live
     (subject, has_pet, goose) claimant and commits before counting."""
     db = _stub_db()
-    rows = [("uid", "cyrus", "goose", "has_pet", "mcp")]
+    rows = [("uid", "cato", "goose", "has_pet", "mcp")]
     n = M._supersede_parallel_slot_rows(db, rows)
     assert n == 1  # object-side sweep retired the misrouted user-goose row
     upd = [(s, p) for c in db.cursors for s, p in c.executed
@@ -184,7 +184,7 @@ def test_executor_retires_parallel_rows_and_commits():
     assert len(upd) == 1
     sql, params = upd[0]
     assert "object_id = %s" in sql and "subject_id <> %s" in sql
-    assert params[0] == "goose" and params[2] == "cyrus"
+    assert params[0] == "goose" and params[2] == "cato"
     assert "superseded_at IS NULL" in sql and "superseded_at = now()" in sql
     assert db.committed == 1
 
@@ -196,7 +196,7 @@ def test_executor_flag_off_is_byte_parity():
     M.CORRECTION_REPLACE_NOT_PARALLEL = False
     try:
         assert M._supersede_parallel_slot_rows(
-            db, [("uid", "cyrus", "goose", "has_pet", "mcp")]) == 0
+            db, [("uid", "cato", "goose", "has_pet", "mcp")]) == 0
     finally:
         M.CORRECTION_REPLACE_NOT_PARALLEL = prev
     assert db.cursors == []
@@ -210,7 +210,7 @@ def test_executor_flag_off_is_byte_parity():
 # "Actually my wife's name is Marla MacPhee." flaked to clarification_needed — the
 # (user, spouse, marla) replacement NEVER committed — yet the post-commit slot sweep
 # still retired the live spouse rows and the family serve LOST
-# Marla/Desmonde/Gabriella/Fraggle/Sophia (store 10/17, serve 48%). THE CONTRACT: a
+# Marla/Desmond/Bianca/Fraggle/Sophia (store 10/17, serve 48%). THE CONTRACT: a
 # sweep is CONDITIONAL on its replacement actually committing — retire-the-old only
 # when the-new landed; a failed correction leaves the store untouched.
 
@@ -229,12 +229,12 @@ def test_acceptance2_failed_correction_leaves_store_untouched_subject_side():
 
 
 def test_acceptance2_failed_correction_leaves_store_untouched_object_side():
-    """Same guard, OBJECT side: 'Goose is Cyrus's cat.' flakes before commit — the
-    (cyrus, has_pet, goose) replacement is not live — the taxonomy-defining sweep for
+    """Same guard, OBJECT side: 'Goose is Cato's cat.' flakes before commit — the
+    (cato, has_pet, goose) replacement is not live — the taxonomy-defining sweep for
     (has_pet, goose) DOES NOT RUN and the misrouted (user, has_pet, goose) row stays
     live (better a parallel row than a lost pet)."""
     db = _stub_db(update_rowcount=1, live_replacement=False)
-    rows = [("uid", "cyrus", "goose", "has_pet", "mcp")]
+    rows = [("uid", "cato", "goose", "has_pet", "mcp")]
     assert M._supersede_parallel_slot_rows(db, rows) == 0
     upd = [(s, p) for c in db.cursors for s, p in c.executed
            if s.startswith("UPDATE facts")]
@@ -248,7 +248,7 @@ def test_acceptance2_skipped_sweep_names_the_slot_and_reason():
     from structlog.testing import capture_logs
     db = _stub_db(update_rowcount=1, live_replacement=False)
     with capture_logs() as logs:
-        M._supersede_parallel_slot_rows(db, [("uid", "cyrus", "goose", "has_pet", "mcp")])
+        M._supersede_parallel_slot_rows(db, [("uid", "cato", "goose", "has_pet", "mcp")])
     skipped = [e for e in logs if e.get("event") == "ingest.slot_supersede_skipped"]
     assert len(skipped) == 1
     assert skipped[0]["side"] == "object" and skipped[0]["rel"] == "has_pet"
@@ -263,10 +263,10 @@ def test_acceptance2_landed_correction_sweep_proceeds_both_sides():
     db = _stub_db(update_rowcount=2)
     assert M._supersede_parallel_slot_rows(
         db, [("uid", SEAT, "marla2", "spouse", "mcp")]) == 2
-    # object side: the landed (cyrus, has_pet, goose) retires the user-goose misroute
+    # object side: the landed (cato, has_pet, goose) retires the user-goose misroute
     db = _stub_db(update_rowcount=1)
     assert M._supersede_parallel_slot_rows(
-        db, [("uid", "cyrus", "goose", "has_pet", "mcp")]) == 1
+        db, [("uid", "cato", "goose", "has_pet", "mcp")]) == 1
 
 
 def test_acceptance2_mixed_batch_sweeps_only_landed_slots():
@@ -301,7 +301,7 @@ def test_acceptance2_mixed_batch_sweeps_only_landed_slots():
     }, update_rowcount=1)
     n = M._supersede_parallel_slot_rows(db, [
         ("uid", SEAT, "marla2", "spouse", "mcp"),     # landed → sweep runs
-        ("uid", "cyrus", "goose", "has_pet", "mcp"),  # flaked → sweep skipped
+        ("uid", "cato", "goose", "has_pet", "mcp"),  # flaked → sweep skipped
     ])
     assert n == 1  # only the spouse slot retired rows
     upd = [(s, p) for c in db.cursors for s, p in c.executed
@@ -348,7 +348,7 @@ def test_sweep_taxonomy_probe_uses_the_real_column():
     `SELECT DISTINCT rel_type` errored live on every call (ingest.slot_supersede_
     failed) and the object-side sweep silently never ran."""
     db = _stub_db()
-    M._supersede_parallel_slot_rows(db, [("uid", "cyrus", "goose", "has_pet", "mcp")])
+    M._supersede_parallel_slot_rows(db, [("uid", "cato", "goose", "has_pet", "mcp")])
     tax = [(s, p) for c in db.cursors for s, p in c.executed
            if "FROM entity_taxonomies" in s]
     assert len(tax) == 1
@@ -359,11 +359,11 @@ def test_sweep_taxonomy_probe_uses_the_real_column():
 
 def test_object_side_sweep_retires_only_the_rehomed_object():
     """THE SPECIFICITY PIN (the parent's fix-2): the object-side sweep's UPDATE keys
-    on the SPECIFIC re-homed object — (cyrus, has_pet, goose) retires (user, has_pet,
+    on the SPECIFIC re-homed object — (cato, has_pet, goose) retires (user, has_pet,
     goose) ONLY; (user, has_pet, fraggle) is a different object_id and must never be
     touched by the goose sweep."""
     db = _stub_db()
-    M._supersede_parallel_slot_rows(db, [("uid", "cyrus", "goose", "has_pet", "mcp")])
+    M._supersede_parallel_slot_rows(db, [("uid", "cato", "goose", "has_pet", "mcp")])
     upd = [(s, p) for c in db.cursors for s, p in c.executed
            if s.startswith("UPDATE facts")]
     assert len(upd) == 1
@@ -388,7 +388,7 @@ def test_entity_wipe_count_surfaces_in_facts_superseded():
 
 def test_age_shelf_prior_slot_beats_non_animate_retype():
     """THE PIN: a subject holding a LIVE age row keeps the age shelf even when its
-    entity_type is non-animate — 'Desmonde is 13.' supersedes age=12, never mints a
+    entity_type is non-animate — 'Desmond is 13.' supersedes age=12, never mints a
     parallel has_value twin (the autopsy wound: has_value=13 beside age=12)."""
     assert M._seam1_age_shelf("Location", True, enabled=True) == "age"
     assert M._seam1_age_shelf("unknown", True, enabled=True) == "age"
@@ -422,7 +422,7 @@ def test_affirmation_wins_over_negated_twin():
     """THE PIN: same natural key, affirmed + negated — the negated twin is withdrawn
     from the serve (it renders only on archive/before asks)."""
     out = M._disengage_negated_twins(
-        [_f("cyrus", "goose", "has_pet"), _f("cyrus", "goose", "has_pet", "negated")],
+        [_f("cato", "goose", "has_pet"), _f("cato", "goose", "has_pet", "negated")],
         enabled=True)
     assert [f["polarity"] for f in out] == ["affirmed"]
 
@@ -435,7 +435,7 @@ def test_lone_negation_still_serves():
 
 
 def test_negation_disengagement_flag_off_is_byte_parity():
-    rows = [_f("cyrus", "goose", "has_pet"), _f("cyrus", "goose", "has_pet", "negated")]
+    rows = [_f("cato", "goose", "has_pet"), _f("cato", "goose", "has_pet", "negated")]
     out = M._disengage_negated_twins(rows, enabled=False)
     assert out is rows
 
@@ -444,7 +444,7 @@ def test_disengagement_keys_on_the_full_natural_key():
     """A negated row on a DIFFERENT triple never rides the disengagement (the user's
     own denial about their pets survives a neighbour's affirmation)."""
     out = M._disengage_negated_twins(
-        [_f("cyrus", "goose", "has_pet"), _f("u1", "goose", "has_pet", "negated")],
+        [_f("cato", "goose", "has_pet"), _f("u1", "goose", "has_pet", "negated")],
         enabled=True)
     assert len(out) == 2
 
@@ -461,4 +461,4 @@ def test_fixture_shapes_survive_the_bind():
     sql, E = L.fixture_sql(str(uuid.uuid4()), "sch")
     for alias in ("'marla'", "'wife'", "13-year-old son", "belong_to", "born_on"):
         assert alias in sql
-    assert E["desmonde"] != E["user"]
+    assert E["desmond"] != E["user"]

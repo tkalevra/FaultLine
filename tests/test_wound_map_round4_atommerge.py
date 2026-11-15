@@ -78,11 +78,11 @@ def test_wa_content_coverage_declines_a_dropping_split():
 def test_wa_legit_enumeration_still_splits():
     """The canonical colon enumeration still splits (the fix must not overfire)."""
     legit = ("We run three servers: a web server named Apollo, a database named Vault, "
-             "and a mail relay named Cyrus.")
+             "and a mail relay named Cato.")
     out = L.split_enumeration(legit)
     assert out, "the canonical named enumeration must still split"
     joined = " ".join(out).lower()
-    assert "apollo" in joined and "vault" in joined and "cyrus" in joined
+    assert "apollo" in joined and "vault" in joined and "cato" in joined
     assert "web server" in joined and "database" in joined and "mail relay" in joined
 
 

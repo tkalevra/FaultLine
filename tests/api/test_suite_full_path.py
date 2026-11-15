@@ -4,7 +4,7 @@ resolution → query verification. Catches integration failures that unit tests 
 
 Groups:
   A (1-5):  Base integration — family prose, system metadata, corrections, aliases, promotion
-  B (6-11): Name collision + resolution — simple, LLM, Gabriella repro, triple, scalar, re-ingest
+  B (6-11): Name collision + resolution — simple, LLM, Bianca repro, triple, scalar, re-ingest
   C (12-15): Hierarchy + graph integration — combined traversal, depth+collision, mixed types, transitive
   D (16-19): Sensitivity + novel types — gating, novel rel_type, confidence, entity type propagation
   E (20-23): Idempotency + edge cases — 10x ingest, partial re-ingest, cycles, empty query
@@ -102,8 +102,8 @@ class TestGroupABaseIntegration:
         text = (
             "My name is Christopher, I prefer to be called Chris. "
             "I am married to Marla, who prefers to be called Mars. "
-            "We have 3 children: Cyrus (19), Gabriella who goes by Gabby (10), "
-            "and Desmonde who prefers Des (12)."
+            "We have 3 children: Cato (19), Bianca who goes by Gabby (10), "
+            "and Desmond who prefers Dez (12)."
         )
         ingest = _ingest(client, text, self.uid)
         assert ingest.get("status") == "valid"
@@ -163,10 +163,10 @@ class TestGroupABaseIntegration:
         """Ingest age=10, correct to 11, verify only 11 returned."""
         client = TestClient(app)
 
-        _ingest(client, "Gabriella is 10", self.uid)
-        _ingest(client, "Gabriella is 11", self.uid)
+        _ingest(client, "Bianca is 10", self.uid)
+        _ingest(client, "Bianca is 11", self.uid)
 
-        result = _query(client, "how old is gabriella", self.uid)
+        result = _query(client, "how old is bianca", self.uid)
         assert result.get("status") == "ok"
 
         # Verify DB: only 1 active age
@@ -179,12 +179,12 @@ class TestGroupABaseIntegration:
         client = TestClient(app)
 
         edges = [
-            {"subject": "gabriella", "object": "gabby", "rel_type": "pref_name",
+            {"subject": "bianca", "object": "gabby", "rel_type": "pref_name",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "gabriella", "object": "pizza", "rel_type": "likes",
+            {"subject": "bianca", "object": "pizza", "rel_type": "likes",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
-        _ingest(client, "Gabriella goes by Gabby, likes pizza", self.uid, edges=edges)
+        _ingest(client, "Bianca goes by Gabby, likes pizza", self.uid, edges=edges)
 
         result = _query(client, "what does gabby like", self.uid)
         assert result.get("status") == "ok"
@@ -230,9 +230,9 @@ class TestGroupBNameCollision:
         _ingest(client, "I go by Gabby", self.uid, edges=edges1)
 
         # Entity 2: child also claims "gabby"
-        edges2 = [{"subject": "gabriella", "object": "gabby", "rel_type": "pref_name",
+        edges2 = [{"subject": "bianca", "object": "gabby", "rel_type": "pref_name",
                    "subject_type": "Person", "object_type": "SCALAR"}]
-        _ingest(client, "Gabriella goes by Gabby", self.uid, edges=edges2)
+        _ingest(client, "Bianca goes by Gabby", self.uid, edges=edges2)
 
         # Verify collision stored
         conflicts = _db_count(self.uid, "entity_name_conflicts",
@@ -266,8 +266,8 @@ class TestGroupBNameCollision:
         result = _query(client, "tell me about entity a", self.uid)
         assert result.get("status") == "ok"
 
-    def test_8_gabriella_reproduction(self, app):
-        """EXACT reproduction of live bug: Gabriella ingested but invisible."""
+    def test_8_bianca_reproduction(self, app):
+        """EXACT reproduction of live bug: Bianca ingested but invisible."""
         client = TestClient(app)
 
         # Pre-seed: user already has pref_name="gabby"
@@ -279,8 +279,8 @@ class TestGroupBNameCollision:
         ]
         _ingest(client, "I go by Gabby, also Christopher", self.uid, edges=edges_user)
 
-        # Now ingest Gabriella — same preferred name "gabby"
-        text = "We have a third Daughter, Gabriella who's 10 and goes by Gabby"
+        # Now ingest Bianca — same preferred name "gabby"
+        text = "We have a third Daughter, Bianca who's 10 and goes by Gabby"
         ingest = _ingest(client, text, self.uid)
         assert ingest.get("status") == "valid"
 
@@ -298,7 +298,7 @@ class TestGroupBNameCollision:
             except Exception:
                 pass
 
-        # Query — Gabriella must be visible (the fix)
+        # Query — Bianca must be visible (the fix)
         result = _query(client, "tell me about my family", self.uid)
         assert result.get("status") == "ok"
         facts = result.get("facts", [])
@@ -306,7 +306,7 @@ class TestGroupBNameCollision:
         # At minimum, parent_of fact exists in DB. Display resolution
         # may vary based on name collision resolution status.
         assert len(parent_facts) >= 1, \
-            f"Gabriella missing — parent_of facts: {len(parent_facts)}"
+            f"Bianca missing — parent_of facts: {len(parent_facts)}"
 
     def test_9_triple_collision(self, app):
         """Three entities claim same name → 2 conflicts → all resolved."""
@@ -337,12 +337,12 @@ class TestGroupBNameCollision:
         _ingest(client, "I go by Gabby", self.uid, edges=edges_user)
 
         edges_child = [
-            {"subject": "gabriella", "object": "gabby", "rel_type": "pref_name",
+            {"subject": "bianca", "object": "gabby", "rel_type": "pref_name",
              "subject_type": "Person", "object_type": "SCALAR"},
-            {"subject": "gabriella", "object": "10", "rel_type": "age",
+            {"subject": "bianca", "object": "10", "rel_type": "age",
              "subject_type": "Person", "object_type": "SCALAR"},
         ]
-        _ingest(client, "Gabriella is 10, goes by Gabby", self.uid, edges=edges_child)
+        _ingest(client, "Bianca is 10, goes by Gabby", self.uid, edges=edges_child)
 
         # Age fact exists
         if _DSN:
@@ -350,7 +350,7 @@ class TestGroupBNameCollision:
                                   "AND attribute = 'age'")
             # Age may be in entity_attributes or facts
 
-        result = _query(client, "how old is gabriella", self.uid)
+        result = _query(client, "how old is bianca", self.uid)
         assert result.get("status") == "ok"
 
     def test_11_resolved_collision_reingest(self, app):
@@ -582,13 +582,13 @@ class TestGroupEIdempotencyEdge:
         client = TestClient(app)
 
         for i in range(10):
-            _ingest(client, "Cyrus is 19", self.uid)
+            _ingest(client, "Cato is 19", self.uid)
 
         active = _db_count(self.uid, "facts",
                           "AND rel_type = 'age' AND superseded_at IS NULL")
         assert active <= 1, f"Expected <=1 active age, got {active}"
 
-        result = _query(client, "how old is cyrus", self.uid)
+        result = _query(client, "how old is cato", self.uid)
         assert result.get("status") == "ok"
 
     def test_21_partial_reingest(self, app):
@@ -596,16 +596,16 @@ class TestGroupEIdempotencyEdge:
         client = TestClient(app)
 
         edges = [
-            {"subject": "user", "object": "cyrus", "rel_type": "parent_of",
+            {"subject": "user", "object": "cato", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
             {"subject": "user", "object": "gabby", "rel_type": "parent_of",
              "subject_type": "Person", "object_type": "Person"},
         ]
-        _ingest(client, "Kids: Cyrus and Gabby", self.uid, edges=edges)
+        _ingest(client, "Kids: Cato and Gabby", self.uid, edges=edges)
         count_before = _db_count(self.uid, "facts", "AND superseded_at IS NULL")
 
-        # Re-ingest only cyrus
-        _ingest(client, "Cyrus is my son", self.uid)
+        # Re-ingest only cato
+        _ingest(client, "Cato is my son", self.uid)
         count_after = _db_count(self.uid, "facts", "AND superseded_at IS NULL")
         # Should not lose gabby
         assert count_after >= count_before, \

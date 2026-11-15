@@ -52,7 +52,7 @@ CORRECTION_CONTRAST_ONLY = "she is 14, not 12"
 STATEMENT_POSSESSIVE = "My wife's name is Seraphine"
 STATEMENT_PLAIN_FIRST = "I live at 12 fog lane"
 STATEMENT_NEGATED = "My dog is not a poodle"
-STATEMENT_THIRD_PARTY = "Her name is Ada"
+STATEMENT_THIRD_PARTY = "Her name is Alma"
 QUERY_TERMINAL_Q = "where do I live?"
 STATEMENT_MARKER_CUEBLIND = "My address changed to 99 Fake Street"
 # R4-J (autopsy tools/regression_results/r4j_autopsy.md): the wife-rename correction shape —
@@ -245,7 +245,7 @@ async def test_negated_statement_declines_to_gliner():
 
 
 async def test_third_party_statement_declines_to_gliner():
-    """'Her name is Ada' is not speaker-anchored — today's path keeps it."""
+    """'Her name is Alma' is not speaker-anchored — today's path keeps it."""
     resp = await M.classify_intent({"text": STATEMENT_THIRD_PARTY}, user_id=_UID,
                                    model=_GlinerStub("STATEMENT", 0.99))
     assert resp["intent"] == "STATEMENT"

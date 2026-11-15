@@ -2344,7 +2344,7 @@ async def test_a_completed_forget_drops_the_seats_cached_answers(monkeypatch):
     resp = MagicMock(); resp.raise_for_status = MagicMock()
     resp.json.return_value = {"status": "ok", "retracted": 1, "mode": "hard_delete"}
     with patch.object(s, "_post", new=AsyncMock(return_value=resp)):
-        await s.forget_fact_tool(subject="P70 Laptop", old_value="cyrus", user_id="alice")
+        await s.forget_fact_tool(subject="P70 Laptop", old_value="cato", user_id="alice")
     assert seen == ["alice"], (
         f"a completed forget did not drop the seat's cached recall answers: {seen}")
 

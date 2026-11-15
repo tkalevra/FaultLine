@@ -711,12 +711,12 @@ def test_typed_doc_veto_machine_value_spans():
 
 def test_typed_doc_coordinated_surface_splits():
     """A comma/"and"-joined surface seeds EACH member as its own span (the
-    "Gabriella, Des" glue-defect fixture main.py documents)."""
-    doc = _parse_sent("Gabriella and Des visited Guelph today.")
-    gmodel = _FakeGliner({"Person": [{"text": "Gabriella and Des", "confidence": 0.9}]})
+    "Bianca, Dez" glue-defect fixture main.py documents)."""
+    doc = _parse_sent("Bianca and Dez visited Guelph today.")
+    gmodel = _FakeGliner({"Person": [{"text": "Bianca and Dez", "confidence": 0.9}]})
     out = embedder._gliner2_type_doc(doc, gmodel, embedder._RECALL_UPLIFT_LABELS)
     surfaces = sorted(e.text.lower() for e in out.ents)
-    assert surfaces == ["des", "gabriella"]
+    assert surfaces == ["dez", "bianca"]
 
 
 def test_typed_doc_longest_span_wins_overlap():

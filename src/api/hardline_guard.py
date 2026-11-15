@@ -271,8 +271,8 @@ def refuses_subclass_rung(
     return (False, None)
 
 # ── WOUND E: the instance_of TARGET guard (the cross-ontology break) ────────────────────
-# THE WHY (prod seat 10d7d879, measured): recall rendered "P70 Laptop is an instance of CYRUS"
-# — cyrus is the owner's SON, a named Person entity. That edge is a CATEGORY ERROR ACROSS THE
+# THE WHY (prod seat 10d7d879, measured): recall rendered "P70 Laptop is an instance of CATO"
+# — cato is the owner's SON, a named Person entity. That edge is a CATEGORY ERROR ACROSS THE
 # HARD LINE: instance_of is the L4 PLACE edge and must target a TYPE node (laptop → device
 # ladder), NEVER a named instance/person (a memory). The subclass_of guard above protects the
 # LADDER (no rung onto a value/name); this is its TARGET-SHAPE twin — the SAME evidence row
@@ -280,7 +280,7 @@ def refuses_subclass_rung(
 # type slot another node instances into".
 #
 # REFUSAL EVIDENCE (memory-side = a NAMED INSTANCE / VALUE / NAME — never a type slot):
-#   R1 instance_subject   the node is itself the SUBJECT of a live instance_of edge (cyrus
+#   R1 instance_subject   the node is itself the SUBJECT of a live instance_of edge (cato
 #                         instances into person/son) → an instance can never host instances;
 #   R2 naming_surface     the node carries a naming edge (also_known_as/pref_name) → a NAME
 #                         is the naming layer, a memory — "a name is never a place";
@@ -304,7 +304,7 @@ def refuses_subclass_rung(
 # top-branch id onto type nodes (engine metadata, e.g. the taxonomy root of the node's
 # subclass_of ladder) and refuse instance_of when the SUBJECT's branch differs. Until that
 # column exists, THIS guard (target-shape) catches the measured wound class: every real
-# cross-ontology break observed so far (cyrus, chris-p70→person) has a memory-side TARGET,
+# cross-ontology break observed so far (cato, chris-p70→person) has a memory-side TARGET,
 # which R1/R2/R6 refuse structurally.
 def refuses_instance_target(
     db_conn,
@@ -364,7 +364,7 @@ def refuses_instance_target(
         return (False, None)
     role = (row[_EV_ROLE] or "").strip().lower() if row[_EV_ROLE] else None
     if row[_EV_INSTANCE]:
-        # THE cyrus arm: the target is itself an instance (it instances into person/son) —
+        # THE cato arm: the target is itself an instance (it instances into person/son) —
         # an instance is never another instance's TYPE slot. This is the cross-ontology
         # break in its pure form: instance_of must climb the TYPE ladder, never land on a
         # named person.

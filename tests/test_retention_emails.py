@@ -247,11 +247,11 @@ def _no_smtp_session(monkeypatch):
     monkeypatch.setattr(smtp, "_open_session", _boom)
 
 
-def _individual(uid="usr-aaa", email="ada@example.com",
+def _individual(uid="usr-aaa", email="alma@example.com",
                 trial_ends_at_iso=None) -> dict:
     return {"individual_id": "ind-1", "user_id": uid, "account_id": "acc-1",
             "email": email, "trial_ends_at": trial_ends_at_iso,
-            "display_name": "Ada"}
+            "display_name": "Alma"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -270,7 +270,7 @@ def test_warning_send_captures_in_test_mode(monkeypatch, fake_db):
     assert res.get("captured") is True
     assert len(fake_db["outbox"]) == 1
     assert fake_db["outbox"][0]["reason"] == "retention_warning"
-    assert fake_db["outbox"][0]["to_address"] == "ada@example.com"
+    assert fake_db["outbox"][0]["to_address"] == "alma@example.com"
     assert ("usr-aaa", "warning") in fake_db["email_log"]
 
 

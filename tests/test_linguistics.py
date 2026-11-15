@@ -1858,7 +1858,7 @@ def test_genitive_name_binding_is_subject_agnostic():
 def test_kinship_specific_rels_metadata_driven():
     """Fix 1/2: the specific kin rel comes from the kinship_noun cue map (son→child_of,
     wife→spouse), not an in-code literal."""
-    assert ("desmonde", "child_of", "user") in _triples(_derive("My son's name is Desmonde.")), "son→child_of"
+    assert ("desmond", "child_of", "user") in _triples(_derive("My son's name is Desmond.")), "son→child_of"
     assert ("marla", "spouse", "user") in _triples(_derive("My wife's name is Marla.")), "wife→spouse"
 
 
@@ -2237,11 +2237,11 @@ def test_coordinated_propn_list_appos_tail_not_dropped():
 def test_kinship_collective_routes_to_kin_rel_not_owns():
     # "kids"/"children" → child_of (member is SUBJECT), NEVER (user, owns/have, kids).
     m = _reload(LINGUISTIC_LAYER="true")
-    facts = m.derive_sentence_facts("We have three kids: Gabriella, Des, and Cyrus.", None)
+    facts = m.derive_sentence_facts("We have three kids: Bianca, Dez, and Cato.", None)
     triples = {(f.subject, f.rel_type, (f.object or "").lower()) for f in facts}
-    assert ("gabriella", "child_of", "user") in triples, triples
-    assert ("des", "child_of", "user") in triples, triples
-    assert ("cyrus", "child_of", "user") in triples, triples
+    assert ("bianca", "child_of", "user") in triples, triples
+    assert ("dez", "child_of", "user") in triples, triples
+    assert ("cato", "child_of", "user") in triples, triples
     # the collective head never becomes an owned/have object
     assert not any(r in ("owns", "have") and o in ("kids", "kid", "children")
                    for (_s, r, o) in triples), triples
@@ -2327,12 +2327,12 @@ def test_affect_complements_empty_for_non_self_or_nominal():
 
 @requires_model
 def test_collective_kinship_list_routes_every_member_to_kin_rel():
-    """"We have three kids: Gabriella, Des, and Cyrus." → each member child_of the user; NO member is
+    """"We have three kids: Bianca, Dez, and Cato." → each member child_of the user; NO member is
     instance_of the collective "kids", and the user never ``owns``/``has`` a member."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        "We have three kids: Gabriella, Des, and Cyrus.", _dt(2026, 6, 21))
-    kids = {"gabriella", "des", "cyrus"}
+        "We have three kids: Bianca, Dez, and Cato.", _dt(2026, 6, 21))
+    kids = {"bianca", "dez", "cato"}
     childof = {f.subject for f in facts if f.rel_type == "child_of" and f.object == "user"}
     assert kids <= childof, f"not every kid is child_of user: {facts!r}"
     # NO collective-noun type, NO possession junk for any member.
@@ -2349,8 +2349,8 @@ def test_collective_kinship_list_carries_intrinsic_gender():
     """A GENDERED kinship head distributes the intrinsic gender to each member (sons → male)."""
     m = _reload(LINGUISTIC_LAYER="true")
     facts = m.derive_sentence_facts(
-        "We have three sons: Gabriella, Des, and Cyrus.", _dt(2026, 6, 21))
-    for who in ("gabriella", "des", "cyrus"):
+        "We have three sons: Bianca, Dez, and Cato.", _dt(2026, 6, 21))
+    for who in ("bianca", "dez", "cato"):
         assert any(f.subject == who and f.rel_type == "child_of" and f.object == "user"
                    for f in facts), f"{who} not child_of user: {facts!r}"
         assert any(f.subject == who and f.rel_type == "has_gender" and f.object == "male"
@@ -2417,18 +2417,18 @@ def test_collective_single_appositive_rename_does_not_fire():
 @requires_model
 def test_propn_age_survives_noisy_gliner_type():
     """FIX A (live-only bug): the copula-measure additive guard must NOT let a NOISY GLiNER2 type veto a
-    PROPER-NOUN subject's bare-cardinal age. We force "Gabriella" to the (wrong) ANIMAL type on the Doc
+    PROPER-NOUN subject's bare-cardinal age. We force "Bianca" to the (wrong) ANIMAL type on the Doc
     — exactly what live GLiNER2 does for a one-name micro-sentence — and assert the age still lands."""
     m = _reload(LINGUISTIC_LAYER="true")
-    doc = m._parse("Gabriella is 10.")
+    doc = m._parse("Bianca is 10.")
     assert doc is not None
-    span = doc.char_span(0, len("Gabriella"), label="ANIMAL", alignment_mode="contract")
+    span = doc.char_span(0, len("Bianca"), label="ANIMAL", alignment_mode="contract")
     assert span is not None
     doc.set_ents([span])
     # sanity: the subject really carries the noisy non-Person type the guard would otherwise veto on.
     assert any(e.label_ == "ANIMAL" for e in doc.ents)
     facts = m.derive_sentence_facts(doc, _dt(2026, 6, 21))
-    assert any(f.subject == "gabriella" and f.rel_type == "age" and f.object == "10"
+    assert any(f.subject == "bianca" and f.rel_type == "age" and f.object == "10"
                for f in facts), f"PROPN age vetoed by noisy NER type: {facts!r}"
     # NOTE: the complementary "COMMON-noun subject with an incompatible type STILL steps aside" case
     # depends on the rel_types ``head_types`` metadata resolved from the DB; offline that metadata is
@@ -2478,12 +2478,12 @@ def test_split_enumeration_all_naming_items():
 def test_split_enumeration_relative_clauses():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
     out = m.split_enumeration(
-        "We have three kids: Gabriella who is 10, Des who is 12, and Cyrus who is 19.")
+        "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19.")
     assert out == [
-        "We have three kids: Gabriella, Des, and Cyrus.",
-        "Gabriella is 10.",
-        "Des is 12.",
-        "Cyrus is 19.",
+        "We have three kids: Bianca, Dez, and Cato.",
+        "Bianca is 10.",
+        "Dez is 12.",
+        "Cato is 19.",
     ]
 
 
@@ -2527,7 +2527,7 @@ def test_split_enumeration_fabrication_guard_rejects_invented_token(monkeypatch)
     # split (USER IS TRUTH). Simulate by forcing a parse that would inject a foreign name; here we
     # assert the guard path by checking a clean split has every token grounded in the source.
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")
-    src = "We have three kids: Gabriella who is 10, Des who is 12, and Cyrus who is 19."
+    src = "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19."
     out = m.split_enumeration(src)
     src_tokens = set(__import__("re").findall(r"[a-z0-9]+", src.lower())) | {"is"}
     for atom in out:
@@ -2539,7 +2539,7 @@ def test_split_enumeration_fabrication_guard_rejects_invented_token(monkeypatch)
 def test_split_enumeration_flag_off_returns_none():
     m = _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="false")
     assert m.split_enumeration(
-        "We have three kids: Gabriella who is 10, Des who is 12, and Cyrus who is 19.") is None
+        "We have three kids: Bianca who is 10, Dez who is 12, and Cato who is 19.") is None
     _reload(LINGUISTIC_LAYER="true", ENUM_PRESPLIT="true")  # restore for other tests
 
 
@@ -2550,7 +2550,7 @@ def test_count_declarative_assertions_routes_multi_fact_statement():
     # facts must score >= 2 so the caller routes it to STATEMENT (it was mis-scored QUERY → dropped).
     m = _reload(LINGUISTIC_LAYER="true")
     txt = ("I wanted to tell you about my family. My wife's name is Marla. "
-           "We have three kids: Gabriella, Des, and Cyrus.")
+           "We have three kids: Bianca, Dez, and Cato.")
     assert m.count_declarative_assertions(txt) >= 2
 
 

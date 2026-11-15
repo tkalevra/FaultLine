@@ -140,7 +140,7 @@ def test_third_party_pref_regex_linear_and_equivalent():
     for s in ["Alice prefers bob", "xAlice prefers bob", "Al1ice prefers bob",
               "alice goes by al and Bob prefers robert", "A prefers b", "ALICE KNOWN AS AL",
               "my daughter Sarah prefers to be called Sam", "Jo-Anne prefers jo", "aaaa",
-              "Desmond goes by Des", "Z known as z and Y prefers x", "prefer to be called x",
+              "Desmond goes by Dez", "Z known as z and Y prefers x", "prefer to be called x",
               "Ann prefers to be called CJ and Bob goes by Bobby"]:
         assert [m.groups() for m in old.finditer(s)] == [m.groups() for m in rx.finditer(s)], s
 

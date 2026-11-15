@@ -237,9 +237,9 @@ def test_p70_family_surfaces_stem_match():
 
 def test_similar_named_person_shape_does_not_match():
     # A person surface carrying no digit-bearing hostname token can never match.
-    assert EntityRegistry._hostname_tokens("gabriella") == []
-    assert EntityRegistry._hostname_stem_match("chris-p70", "gabriella") is None
-    assert EntityRegistry._hostname_stem_match("daughter", "gabriella") is None
+    assert EntityRegistry._hostname_tokens("bianca") == []
+    assert EntityRegistry._hostname_stem_match("chris-p70", "bianca") is None
+    assert EntityRegistry._hostname_stem_match("daughter", "bianca") is None
 
 
 def test_hostname_guard_rejects_short_or_digitless_tokens():
@@ -288,7 +288,7 @@ def test_tenant_union_and_registry_sql_probe_db_gated():
 
 
 # ── WOUND E: the instance_of TARGET-SHAPE guard (the cross-ontology break) ──────────
-# Prod specimen: recall rendered "P70 Laptop is an instance of CYRUS" — cyrus is the owner's
+# Prod specimen: recall rendered "P70 Laptop is an instance of CATO" — cato is the owner's
 # SON, a named Person. instance_of is the L4 PLACE edge and must target a TYPE node, never a
 # named instance/person. Guard: hardline_guard.refuses_instance_target (same evidence row as
 # refuses_subclass_rung, polarity inverted for the TARGET slot), wired at
@@ -349,7 +349,7 @@ class _BoomConn:
 
 
 def test_instance_of_target_guard_refuses_a_named_person():
-    # THE wound shape: target 'cyrus' — a named PERSON (naming row + its own instance_of
+    # THE wound shape: target 'cato' — a named PERSON (naming row + its own instance_of
     # into person/son). All memory-side arms refuse, structurally, no word lists.
     for row, why in (
         (_ev_row(instance=True), "instance_target_is_an_instance"),
@@ -359,7 +359,7 @@ def test_instance_of_target_guard_refuses_a_named_person():
         (_ev_row(role="name"), "node_role=name"),
         (_ev_row(asserted=True, instance_slot=True), "instance_target_is_an_instance_slot"),
     ):
-        refuse, reason = hg.refuses_instance_target(_EvidenceConn(row), "cyrus")
+        refuse, reason = hg.refuses_instance_target(_EvidenceConn(row), "cato")
         assert refuse, (row, reason)
         assert reason == why or reason.startswith("node_role"), (why, reason)
 
@@ -406,13 +406,13 @@ def test_instance_of_target_guard_wired_at_the_semantic_conflict_gate():
 
 def test_semantic_conflict_gate_refuses_the_cross_ontology_edge(monkeypatch):
     # End-to-end through the gate with a canned memory-side target: (p70 laptop, instance_of,
-    # cyrus) -> supersede_new (edge refused), never 'keep'.
+    # cato) -> supersede_new (edge refused), never 'keep'.
     monkeypatch.setattr(
         hg, "refuses_instance_target",
         lambda db, nid, surface=None, user_id=None: (True, "instance_target_is_an_instance"))
     monkeypatch.setattr(m, "_get_rel_type_metadata", lambda rt: {})
     decision, reason = m._detect_semantic_conflicts(
-        _FakeDB(), "u-123", "p70 laptop", "instance_of", "cyrus")
+        _FakeDB(), "u-123", "p70 laptop", "instance_of", "cato")
     assert decision == "supersede_new"
     assert "hard_line_instance_of_target_not_a_type" in reason
 

@@ -77,7 +77,7 @@ def test_affirmed_binding_unchanged():
     assert any(r.get("rel_type") == "has_pet" and not r.get("negated") for r in rows)
     assert any(r.get("rel_type") == "instance_of" and r.get("object") == "cat"
                for r in rows)
-    kin = _as_dicts(_facts("Chris has two sons: Cyrus and Desmonde"))
+    kin = _as_dicts(_facts("Chris has two sons: Cato and Desmond"))
     assert any(r.get("rel_type") == "child_of" and not r.get("negated") for r in kin)
 
 

@@ -421,14 +421,14 @@ def test_the_operator_resend_always_sends_and_is_always_recorded(signed_contract
 
     for _ in range(2):
         res = notices.deliver_agreement_copy(signed_contract["id"], resend=True,
-                                             requested_by="operator:ada")
+                                             requested_by="operator:alma")
         assert res["status"] == "sent", res
 
     assert len(_captures("contract_copy_resend", signed_contract["email"])) == 2
     resends = [r for r in _notice_rows(signed_contract["id"])
                if r["notice_kind"] == "agreement_copy_resend"]
     assert len(resends) == 2
-    assert all(r["requested_by"] == "operator:ada" for r in resends)
+    assert all(r["requested_by"] == "operator:alma" for r in resends)
     assert len({r["notice_ref"] for r in resends}) == 2, "each resend needs its own ref"
 
     # ...and it did NOT disturb the statutory delivery record.

@@ -56,7 +56,7 @@ def test_the_one_blocking_production_refusal_is_licensed():
     # Every one of these is a REAL weld measured on production and refused by ARM 3. None may
     # ever acquire a licence — a name is not an abbreviation of its own type.
     ("cat", "luna", "I'm looking for recommendations for both Luna and Max. Luna is a cat."),
-    ("laptop", "cyrus", "all wireless clients (like my laptop, Cyrus's phone) connect through it"),
+    ("laptop", "cato", "all wireless clients (like my laptop, Cato's phone) connect through it"),
     ("old school friend", "emma", "I ran into Emma, an old school friend, downtown."),
     ("friend", "emily", "she reminded me of my friend Emily, who's also an aspiring actress"),
     ("film festivals", "cannes", "How does Cannes Film Festival differ from other film festivals?"),
@@ -444,7 +444,7 @@ _NAME_AFTER_TYPE_PHRASE = [
     ("My morkie dog (Fraggle) sleeps all day.", "morkie dog", "fraggle"),
     ("We got a corn snake (Sophia) last spring.", "corn snake", "sophia"),
     # people and nicknames — including the owner's real family-roster shape
-    ("My sons Cyrus and Desmonde (Des) are here.", "desmonde", "des"),
+    ("My sons Cato and Desmond (Dez) are here.", "desmond", "dez"),
     ("An old school friend (Emma) called me.", "old school friend", "emma"),
     ("I met my primary care provider (Priya) today.", "primary care provider", "priya"),
     ("His younger brother (Davy) moved out.", "younger brother", "davy"),
@@ -459,7 +459,7 @@ _NAME_AFTER_TYPE_PHRASE = [
     # verbatim production ARM-3 targets
     ("Our landing page (Gauntlet) is live.", "landing page", "gauntlet"),
     ("The company (Optimuscannabis) filed today.", "company", "optimuscannabis"),
-    ("My laptop (Cyrus) died.", "laptop", "cyrus"),
+    ("My laptop (Cato) died.", "laptop", "cato"),
     ("The cat (Luna) knocked it over.", "cat", "luna"),
 ]
 

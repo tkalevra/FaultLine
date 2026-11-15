@@ -121,7 +121,7 @@ def test_decompose_when_is_possessive_chain():
 
 
 def test_decompose_how_old_named_entity():
-    assert main._decompose_query_steps("How old is Cyrus?") == ["cyrus", "age"]
+    assert main._decompose_query_steps("How old is Cato?") == ["cato", "age"]
 
 
 def test_decompose_where_is_scalar():

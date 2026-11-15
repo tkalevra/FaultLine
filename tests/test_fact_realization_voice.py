@@ -59,7 +59,7 @@ class TestYouAgreementFixup:
         assert _you_agreement_fixup("you's preferred name is Chris") == "your preferred name is Chris"
 
     def test_you_is_to_you_are(self):
-        assert _you_agreement_fixup("you is the parent of Cyrus") == "you are the parent of Cyrus"
+        assert _you_agreement_fixup("you is the parent of Cato") == "you are the parent of Cato"
 
     def test_you_has_to_you_have(self):
         assert _you_agreement_fixup("you has a pet that is Fraggle") == "you have a pet that is Fraggle"
@@ -182,10 +182,10 @@ class TestPerspectiveResolution:
         ident = {"user", str(uuid4()).lower()}
         db = MagicMock()
 
-        with patch("src.api.main.resolve_display_name", return_value="Cyrus"):
+        with patch("src.api.main.resolve_display_name", return_value="Cato"):
             result = _resolve_perspective_name(other_uuid, ident, db)
 
-        assert result == "Cyrus"
+        assert result == "Cato"
 
     def test_namesake_third_party_not_collapsed(self):
         """A third party whose preferred name equals the user's name must NOT
@@ -287,13 +287,13 @@ class TestConvertToProsePerspective:
         ]
 
         with _meta(parent_of=PARENT_3P), \
-                patch("src.api.main.resolve_display_name", return_value="Cyrus"):
+                patch("src.api.main.resolve_display_name", return_value="Cato"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
 
         # The template row here is 3p-only (no natural_language_2p), so this exercises
         # the null-fallback agreement fixup: "you is" → "you are" (migration 081 adds
         # the real 2p template "You are the parent of Y"; this guards un-backfilled rows).
-        assert prose == ["you are the parent of Cyrus"]
+        assert prose == ["you are the parent of Cato"]
 
     def test_no_anchor_falls_back_to_names(self):
         user_uuid = str(uuid4())
@@ -308,12 +308,12 @@ class TestConvertToProsePerspective:
         cur.fetchall.return_value = [("parent_of", "X is the parent of Y")]
 
         with _meta(parent_of=PARENT_3P), \
-                patch("src.api.main.resolve_display_name", side_effect=["chris", "Cyrus"]):
+                patch("src.api.main.resolve_display_name", side_effect=["chris", "Cato"]):
             prose = convert_to_prose([fact], db)  # no anchor → plain names
 
         # Display names are TITLECASED at render — deliberate (`c059e8a`: "render it like a
         # person"). This test pinned the pre-c059e8a lowercase output; the product is right.
-        assert prose == ["Chris is the parent of Cyrus"]
+        assert prose == ["Chris is the parent of Cato"]
 
     def test_class_c_no_staged_label(self):
         user_uuid = str(uuid4())
@@ -359,13 +359,13 @@ class TestConvertToProsePerspective:
 
         # Templates come from the rel_type OVERLAY, not this cursor (since 5161ee7). Injecting
         # them via cur.fetchall fed a DEAD SEAM: no template resolved, the composer fell through
-        # to the bare "you parent_of Cyrus" join, and the test read as a 2p regression that was
+        # to the bare "you parent_of Cato" join, and the test read as a 2p regression that was
         # never there. Inject where the code actually LOOKS.
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", return_value="Cyrus"):
+                patch("src.api.main.resolve_display_name", return_value="Cato"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
 
-        assert prose == ["You are the parent of Cyrus"]
+        assert prose == ["You are the parent of Cato"]
 
     def test_pref_name_2p_template(self):
         """pref_name 2p form: 'X's preferred name is Y' → 'You go by Y'."""
@@ -408,9 +408,9 @@ class TestConvertToProsePerspective:
         # subject must not steal it. Injected via the overlay (the live seam), so the guard is
         # actually exercised instead of silently falling back to a bare join.
         with _meta(parent_of=PARENT), \
-                patch("src.api.main.resolve_display_name", side_effect=["Marla", "Cyrus"]):
+                patch("src.api.main.resolve_display_name", side_effect=["Marla", "Cato"]):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        assert prose == ["Marla is the parent of Cyrus"]
+        assert prose == ["Marla is the parent of Cato"]
 
     def test_object_side_you_stays_3p(self):
         """Object-side 'you' is already grammatical on the 3p template — only the
@@ -529,9 +529,9 @@ class TestConvertToProsePerspective:
         }
         with patch("src.api.main.rel_type_overlay.resolve_current",
                    return_value=good_meta), \
-             patch("src.api.main.resolve_display_name", return_value="Cyrus"):
+             patch("src.api.main.resolve_display_name", return_value="Cato"):
             prose = convert_to_prose([fact], db, anchor=user_uuid, user_id=user_uuid)
-        assert prose == ["You are the parent of Cyrus"]
+        assert prose == ["You are the parent of Cato"]
 
     def test_unbound_context_not_perspective_rewritten(self):
         """context (store_context) facts are unbound prose — no perspective."""

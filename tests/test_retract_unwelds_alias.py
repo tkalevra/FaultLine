@@ -7,7 +7,7 @@ removing. A mocked cursor sees none of those — it returns whatever it was told
 reached production precisely because the only thing that could catch it was the SQL actually
 running.
 
-THE PRODUCTION SYMPTOM THIS REPRODUCES. On a live seat the surface `cyrus` stayed welded to a
+THE PRODUCTION SYMPTOM THIS REPRODUCES. On a live seat the surface `cato` stayed welded to a
 laptop entity after the owner redacted it: the fact went, the name did not, so the thing they
 asked to forget kept rendering and kept resolving. The weld had landed NON-preferred, which is
 what made it structurally undeletable by the old statement.
@@ -78,40 +78,40 @@ def _aliases(cur, entity_id):
 
 # ── the production case ───────────────────────────────────────────────────────────────────
 def test_removes_a_non_preferred_weld(cur):
-    """THE BUG. `cyrus` welded onto the laptop entity, non-preferred, must come off."""
+    """THE BUG. `cato` welded onto the laptop entity, non-preferred, must come off."""
     _add(cur, LAPTOP, "laptop", preferred=False, source="inferred")
-    _add(cur, LAPTOP, "cyrus", preferred=False, source="rel_default")
+    _add(cur, LAPTOP, "cato", preferred=False, source="rel_default")
 
-    removed, _ = unweld_alias(cur, LAPTOP, "cyrus")
+    removed, _ = unweld_alias(cur, LAPTOP, "cato")
 
     assert removed == 1
-    assert "cyrus" not in _aliases(cur, LAPTOP)
+    assert "cato" not in _aliases(cur, LAPTOP)
 
 
 def test_matches_the_lowercase_key_when_caller_sends_display_casing(cur):
     """Stored aliases are the lowercase matching key; callers send the user's casing."""
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
+    _add(cur, LAPTOP, "cato", source="rel_default")
 
-    removed, _ = unweld_alias(cur, LAPTOP, "Cyrus")
+    removed, _ = unweld_alias(cur, LAPTOP, "Cato")
 
     assert removed == 1
     assert _aliases(cur, LAPTOP) == {}
 
 
 def test_surrounding_whitespace_does_not_defeat_the_match(cur):
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
-    removed, _ = unweld_alias(cur, LAPTOP, "  Cyrus  ")
+    _add(cur, LAPTOP, "cato", source="rel_default")
+    removed, _ = unweld_alias(cur, LAPTOP, "  Cato  ")
     assert removed == 1
 
 
 def test_a_surface_string_is_not_an_entity_id(cur):
     """Passing the raw surface the caller sent must not silently match some other row."""
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
+    _add(cur, LAPTOP, "cato", source="rel_default")
 
-    removed, _ = unweld_alias(cur, "laptop", "cyrus")
+    removed, _ = unweld_alias(cur, "laptop", "cato")
 
     assert removed == 0
-    assert "cyrus" in _aliases(cur, LAPTOP)
+    assert "cato" in _aliases(cur, LAPTOP)
 
 
 # ── keeping the entity renderable ─────────────────────────────────────────────────────────
@@ -171,12 +171,12 @@ def test_removing_the_last_alias_leaves_the_entity_nameless(cur):
 
 # ── scope and contract ────────────────────────────────────────────────────────────────────
 def test_other_entities_are_untouched(cur):
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
-    _add(cur, OTHER, "cyrus", preferred=True, source="user_stated")
+    _add(cur, LAPTOP, "cato", source="rel_default")
+    _add(cur, OTHER, "cato", preferred=True, source="user_stated")
 
-    unweld_alias(cur, LAPTOP, "cyrus")
+    unweld_alias(cur, LAPTOP, "cato")
 
-    assert _aliases(cur, OTHER) == {"cyrus": True}
+    assert _aliases(cur, OTHER) == {"cato": True}
 
 
 def test_a_missing_alias_is_a_no_op_not_an_error(cur):
@@ -186,20 +186,20 @@ def test_a_missing_alias_is_a_no_op_not_an_error(cur):
     assert _aliases(cur, LAPTOP) == {"laptop": True}
 
 
-@pytest.mark.parametrize("entity_id,alias", [(None, "cyrus"), (LAPTOP, None), (LAPTOP, "   ")])
+@pytest.mark.parametrize("entity_id,alias", [(None, "cato"), (LAPTOP, None), (LAPTOP, "   ")])
 def test_empty_operands_do_nothing(cur, entity_id, alias):
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
+    _add(cur, LAPTOP, "cato", source="rel_default")
     assert unweld_alias(cur, entity_id, alias) == (0, 0)
-    assert "cyrus" in _aliases(cur, LAPTOP)
+    assert "cato" in _aliases(cur, LAPTOP)
 
 
 def test_the_caller_owns_the_transaction(cur):
     """The helper must not commit — the handler commits, and a failure must be rollback-able."""
-    _add(cur, LAPTOP, "cyrus", source="rel_default")
+    _add(cur, LAPTOP, "cato", source="rel_default")
     cur.execute("SAVEPOINT sp_unweld")
 
-    unweld_alias(cur, LAPTOP, "cyrus")
-    assert "cyrus" not in _aliases(cur, LAPTOP)
+    unweld_alias(cur, LAPTOP, "cato")
+    assert "cato" not in _aliases(cur, LAPTOP)
 
     cur.execute("ROLLBACK TO SAVEPOINT sp_unweld")
-    assert "cyrus" in _aliases(cur, LAPTOP)
+    assert "cato" in _aliases(cur, LAPTOP)

@@ -329,14 +329,14 @@ def _consolidation_steps(twin_rows, holders=(1,), slot_rows=(("child_of", True),
 
 
 def test_consolidation_fires_on_the_fixture_shape():
-    """'Desmonde is 13.' landed age 13 → BOTH bare 13-embedded twins consolidate: their
+    """'Desmond is 13.' landed age 13 → BOTH bare 13-embedded twins consolidate: their
     (twin, child_of, user) rows retire; the count rides the ingest supersession."""
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(
         twin_rows=[(E["gen-son13"], "13-year-old son"),
                    (E["gen-daughter13"], "13-year-old daughter")],
         update_rowcounts=(1, 1)))
-    retired = M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13)
+    retired = M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13)
     assert retired == 2, retired
     assert db.commits == 1
     # the retirement is a supersession UPDATE, never a delete
@@ -354,22 +354,22 @@ def test_consolidation_abstains_when_the_age_holder_is_not_unique():
     a lost twin)."""
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(twin_rows=[], holders=(2,)))
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13) == 0
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13) == 0
     assert not any("UPDATE" in sql for sql, _p in db.cur.executed)
 
 
 def test_consolidation_flag_off_is_byte_parity():
     M.GENERIC_KIN_TWIN_CONSOLIDATION = False
     db = _SeqDb([])
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13) == 0
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13) == 0
     assert db.cur.executed == []
 
 
 def test_consolidation_declines_junk_inputs():
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
-    assert M._consolidate_generic_kin_twins(None, SEAT, E["desmonde"], 13) == 0
+    assert M._consolidate_generic_kin_twins(None, SEAT, E["desmond"], 13) == 0
     db = _SeqDb([])
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], None) == 0
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], None) == 0
     assert M._consolidate_generic_kin_twins(db, SEAT, "not-an-int", "thirteen") == 0
     # the kid IS the speaker → never consolidates
     assert M._consolidate_generic_kin_twins(db, SEAT, SEAT, 13) == 0
@@ -383,7 +383,7 @@ def test_consolidation_bare_guard_lives_in_the_twins_probe():
     collapses."""
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(twin_rows=[]))
-    M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13)
+    M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13)
     twins_sql = next(sql for sql, _p in db.cur.executed
                      if "FROM entity_aliases a" in sql)
     assert "NOT EXISTS (SELECT 1 FROM entity_attributes" in twins_sql
@@ -397,7 +397,7 @@ def test_consolidation_declines_a_non_kin_age_embedded_twin():
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(
         twin_rows=[(E["gen-son13"], "20-year-old car")], holders=(1,)))
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 20) == 0
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 20) == 0
     assert not any("UPDATE" in sql for sql, _p in db.cur.executed)
 
 
@@ -408,7 +408,7 @@ def test_consolidation_abstains_on_gender_contradiction():
     db = _SeqDb(_consolidation_steps(
         twin_rows=[(E["gen-son13"], "13-year-old son")],
         kid_gender=("female",)))
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13) == 0
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13) == 0
     assert not any("UPDATE" in sql for sql, _p in db.cur.executed)
 
 
@@ -419,7 +419,7 @@ def test_consolidation_gender_unknown_kin_word_never_blocks():
     db = _SeqDb(_consolidation_steps(
         twin_rows=[(E["gen-son13"], "13-year-old child")],
         kid_gender=("female",), update_rowcounts=(1,)))
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13) == 1
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13) == 1
 
 
 # ── acceptance6b residual: THE MERGE COMPLETES (attr rows + alias collapse) ───────
@@ -433,7 +433,7 @@ def test_consolidation_completes_the_merge_attrs_and_aliases():
     db = _SeqDb(_consolidation_steps(
         twin_rows=[(E["gen-son13"], "13-year-old child")],
         update_rowcounts=(1,)))
-    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13) == 1
+    assert M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13) == 1
     executed = [sql for sql, _p in db.cur.executed]
     assert any("UPDATE entity_attributes SET superseded_at" in s
                for s in executed)  # the twin's attr rows retire
@@ -449,7 +449,7 @@ def test_consolidation_bare_guard_admits_engine_provenance_twins_only():
     user taught never collapses."""
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(twin_rows=[]))
-    M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13)
+    M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13)
     twins_sql = next(sql for sql, _p in db.cur.executed
                      if "FROM entity_aliases a" in sql)
     for _auth in ("'user_stated'", "'user_correction'", "'mcp'"):
@@ -471,9 +471,9 @@ def test_registry_generic_kin_weld_carries_the_kin_gender_guard():
     tax2 = [(m, r) for (_n, m, r) in _TAX]
     cur = _SeqCur([
         ("FROM entity_taxonomies", tax2),
-        ("FROM entities e", [(E["desmonde"],)]),
+        ("FROM entities e", [(E["desmond"],)]),
     ])
-    assert reg._generic_kin_surface_target(cur, SEAT, "the 13-year-old son") == E["desmonde"]
+    assert reg._generic_kin_surface_target(cur, SEAT, "the 13-year-old son") == E["desmond"]
     holder_sql, holder_p = next((sql, p) for sql, p in cur.executed
                                 if "FROM entities e" in sql)
     assert "has_gender" in holder_sql
@@ -485,7 +485,7 @@ def test_consolidation_kin_rels_are_metadata_computed_not_word_listed():
     slot: the exclusively-animate-declared discipline excludes it by construction."""
     M.GENERIC_KIN_TWIN_CONSOLIDATION = True
     db = _SeqDb(_consolidation_steps(twin_rows=[]))
-    M._consolidate_generic_kin_twins(db, SEAT, E["desmonde"], 13)
+    M._consolidate_generic_kin_twins(db, SEAT, E["desmond"], 13)
     slots_sql, slots_p = next((sql, p) for sql, p in db.cur.executed
                               if "SELECT DISTINCT rel_type FROM facts f" in sql)
     assert "child_of" in str(slots_p[0])
@@ -511,15 +511,15 @@ def test_registry_generic_kin_weld_target_unique_holder():
     tax2 = [(m, r) for (_n, m, r) in _TAX]
     cur = _SeqCur([
         ("FROM entity_taxonomies", tax2),
-        ("FROM entities e", [(E["desmonde"],)]),             # the unique age holder
+        ("FROM entities e", [(E["desmond"],)]),             # the unique age holder
     ])
-    assert reg._generic_kin_surface_target(cur, SEAT, "the 13-year-old son") == E["desmonde"]
+    assert reg._generic_kin_surface_target(cur, SEAT, "the 13-year-old son") == E["desmond"]
 
 
 def test_registry_generic_kin_weld_requires_year_old_morphology():
     """A bare number, a name, or a breed word never triggers the weld probe."""
     reg = _registry()
-    for surface in ("13", "desmonde", "morkie", "13 cats"):
+    for surface in ("13", "desmond", "morkie", "13 cats"):
         cur = _SeqCur([])
         assert reg._generic_kin_surface_target(cur, SEAT, surface) is None, surface
         assert cur.executed == [], surface
@@ -530,7 +530,7 @@ def test_registry_generic_kin_weld_ambiguous_age_abstains():
     tax2 = [(m, r) for (_n, m, r) in _TAX]
     cur = _SeqCur([
         ("FROM entity_taxonomies", tax2),
-        ("FROM entities e", [(E["desmonde"],), (E["cyrus"],)]),   # two same-age kids
+        ("FROM entities e", [(E["desmond"],), (E["cato"],)]),   # two same-age kids
     ])
     assert reg._generic_kin_surface_target(cur, SEAT, "the 13-year-old son") is None
 

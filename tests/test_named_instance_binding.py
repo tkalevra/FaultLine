@@ -301,28 +301,28 @@ def test_self_possession_verb_acquired_via_acquisition_class():
 
 @requires_model
 def test_kinship_enumeration_copula_binds_every_child():
-    # "My kids are Cyrus, Des, and Gabriella" — ONE kinship head over a coordinated PROPN list; each
+    # "My kids are Cato, Dez, and Bianca" — ONE kinship head over a coordinated PROPN list; each
     # name is a distinct child (child_of → user), filed at the SINGULAR type place, none dropped.
-    facts = _facts("My kids are Cyrus, Des, and Gabriella.")
-    for name in ("cyrus", "des", "gabriella"):
+    facts = _facts("My kids are Cato, Dez, and Bianca.")
+    for name in ("cato", "dez", "bianca"):
         assert (name, "child_of", "user") in facts, f"{name} missing child_of"
     # each name is its OWN entity, filed at the singular type — never made a TYPE (no subclass_of).
-    assert not any(r == "subclass_of" and s in ("cyrus", "des", "gabriella")
+    assert not any(r == "subclass_of" and s in ("cato", "dez", "bianca")
                    for (s, r, _o) in facts)
 
 
 @requires_model
 def test_kinship_enumeration_children_copula():
-    facts = _facts("My children are Cyrus, Des, and Gabriella.")
-    for name in ("cyrus", "des", "gabriella"):
+    facts = _facts("My children are Cato, Dez, and Bianca.")
+    for name in ("cato", "dez", "bianca"):
         assert (name, "child_of", "user") in facts
 
 
 @requires_model
 def test_kinship_enumeration_named_apposition():
     # the "named" apposition form (plural collective head "children" → singular kin lemma "child").
-    facts = _facts("I have three children named Cyrus, Des, and Gabriella.")
-    for name in ("cyrus", "des", "gabriella"):
+    facts = _facts("I have three children named Cato, Dez, and Bianca.")
+    for name in ("cato", "dez", "bianca"):
         assert (name, "child_of", "user") in facts, f"{name} missing child_of"
         assert (name, "instance_of", "child") in facts  # singular type place, not "children"
 
@@ -387,9 +387,9 @@ def test_analyze_naming_declines_plural_head():
 
 @requires_model
 def test_single_child_copula_still_binds_name():
-    facts = _facts("My son is Cyrus.")
-    assert ("cyrus", "child_of", "user") in facts
-    assert ("cyrus", "has_gender", "male") in facts
+    facts = _facts("My son is Cato.")
+    assert ("cato", "child_of", "user") in facts
+    assert ("cato", "has_gender", "male") in facts
 
 
 @requires_model

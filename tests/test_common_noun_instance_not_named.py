@@ -95,6 +95,6 @@ def test_inverse_anchor_proper_name_still_named():
     out = _compose_inverse_anchor_clause(
         rel_type="child_of", rel_meta={"inverse_rel_type": "parent_of"},
         anchor_name="you", anchor_is_you=True,
-        instance_name="cyrus", instance_type_name="son")
+        instance_name="cato", instance_type_name="son")
     assert out is not None
-    assert "named cyrus" in out.lower(), out
+    assert "named cato" in out.lower(), out

@@ -44,8 +44,8 @@ from src.extraction.reset_shapes import (  # noqa: E402
 # THE MEASURED PROD SENTENCE (the diagnosis §2, 16:47:46 turn — byte-shaped).
 RESET_TURN = (
     "forget all previous family information and replace with: "
-    "Christopher Thompson (Chris), spouse Marla MacPhee (Mars), sons Cyrus 20 and "
-    "Desmonde \"Des\" 13, daughter Gabriella \"Gabby\" 10"
+    "Christopher Thompson (Chris), spouse Marla MacPhee (Mars), sons Cato 20 and "
+    "Desmond \"Dez\" 13, daughter Bianca \"Gabby\" 10"
 )
 
 
