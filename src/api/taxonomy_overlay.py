@@ -42,12 +42,12 @@ invalidation on tenant edits.
 import time
 import threading
 
-import psycopg2
 import structlog
 
 # Reuse the SAME request-schema ContextVar binding as the rel_type overlay so one
 # set_current_schema()/reset_current_schema() per request governs BOTH overlays.
 from src.api import rel_type_overlay
+from src.api.db_read import read_only_connection
 
 log = structlog.get_logger()
 
@@ -111,7 +111,10 @@ def _fetch_taxonomies(dsn: str, schema_qualifier: str) -> dict:
     seed/public read which must have the column.
     """
     meta: dict = {}
-    with psycopg2.connect(dsn) as conn:
+    # read_only_connection (src/api/db_read.py): autocommit + readonly + guaranteed close.
+    # A metadata read must never own a transaction (AccessShareLock held across a slow
+    # caller stalled prod deprovision + pg_dump) and never own a backend past its scope.
+    with read_only_connection(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.columns "

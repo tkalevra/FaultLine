@@ -4,13 +4,61 @@ import time
 import json
 import httpx
 import psycopg2
+from src.api import errors as _errors
 import logging
 import structlog
+from src.api.db_read import read_only_connection  # READ SEAM — cannot leak a txn or a backend
 from src.fact_store.store import FactStoreManager
 from src.api.llm_output_validator import LLMOutputValidator
 from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts, LLMModels
 
 log = structlog.get_logger()
+
+
+def _rel_type_growth_gate_refusal(rel_type) -> str | None:
+    """Structural mint gate for the WGM gate's novel-type growth seams
+    (bug 05 + bug 03-remainder, DEV/BUGS/prod-document-drain-20261103/).
+
+    rel_type VOCABULARY growth is bound to the same mint contract as the ingest
+    chokepoint (src/api/main.py::_create_rel_type_in_flow, src/extraction/rel_vocab.py):
+    (1) normal form - a rel_type must match ^[a-z]+(?:_[a-z]+)*$ with a bounded token count
+    (spaces, digits, sentence fragments are not vocabulary); (2) a negated phrase must
+    never become a rel_type - negation belongs to the fact's polarity column, which the
+    schema already carries (EdgeInput.polarity, staged_facts/facts CHECK).
+    Returns a human-readable refusal reason, or None when the candidate is mintable.
+    Fail-open on gate machinery errors: a broken gate must never block ingest.
+    A refused candidate is NOT minted here and is NOT quarantined into
+    ontology_evaluations - the re_embedder approval lane inserts rel_types directly at
+    freq>=3 (embedder.py), so quarantining would re-mint the refused string."""
+    try:
+        from src.extraction.rel_vocab import phrase_is_negated, vocab_normal_form
+        _ok, _why = vocab_normal_form(rel_type)
+        if not _ok:
+            return "vocab_normal_form: " + str(_why)
+        _neg, _nwhy = phrase_is_negated(rel_type)
+        if _neg:
+            return "negated_phrase: " + str(_nwhy)
+    except Exception:  # noqa: BLE001 - fail-open by contract
+        return None
+    return None
+
+# The ingest GROWTH lanes' writer tags (the `provenance` column of staged_facts — a WRITER
+# tag, not user provenance, which lives in `fact_provenance`). ONE OWNER: src.api.main
+# imports it from here (the gate is the validation layer; main imports from the gate —
+# never the reverse), so the purge in main and the purge in the gate cannot drift. Rows
+# carrying one of these are engine-grown LADDER RUNGS: complementary lattice growth, never
+# contradictory twins — spared by `_delete_conflicting_staged_hierarchy_facts` (the
+# compound head rung and the stated kind parent COEXIST by the issue #11 ruling, and the
+# WordNet/backbone/aspect-term rungs always could). Keyed on ENGINE-MECHANISM tags, never
+# a domain/type literal.
+_INGEST_GROWN_LADDER_PROVENANCES: frozenset[str] = frozenset({
+    "ingest_backbone_attach",         # seeded-canonical backbone endpoint rung
+    "ingest_classification_growth",   # re-typed-leaf classification climb
+    "ingest_aspect_term",             # aspect-term term-is-a-head rung
+    "ingest_wordnet_hypernym",        # offline WordNet is-a ladder
+    "ingest_hearst_hyponym",          # Hearst exemplar is-a growth
+    "ingest_compound_type",           # compound-type head rung (issue #11)
+})
 
 # Import logging classification
 try:
@@ -105,6 +153,232 @@ def _typecheck_veto_on() -> bool:
     return _flag_on("WGM_TYPE_MISMATCH_VETO", "true")
 
 
+# ── SEED-DECLARED TYPE-CONSTRAINT ENFORCEMENT (SHACL sh:class reading of head/tail_types) ──
+#
+# THE MECHANISM, BY ITS ESTABLISHED NAME. `head_types` / `tail_types` are this engine's
+# rdfs:domain / rdfs:range. RDF Schema 1.1 §4 is explicit that those are DESCRIPTIVE, not
+# enforcing — "RDF Schema provides a mechanism for describing this information, but does not
+# say whether or how an application should use it" — and under the standard entailment reading
+# `(x P y)` with `P rdfs:range C` ENTAILS `y rdf:type C`; it can never signal an error
+# (https://www.w3.org/TR/rdf-schema/#ch_range, #ch_domain). That is EXACTLY the reading this
+# gate implements today: on an unknown object `_check_type_constraints` calls
+# `_infer_entity_type(object_id, tail_types[0])` — range-as-entailment — and returns
+# ("type_unknown", pass). Validation instead needs the SHACL reading: `sh:class` is a VALUE
+# TYPE CONSTRAINT — "for each value node that is ... not a SHACL instance of $class in the data
+# graph, there is a validation result" (https://www.w3.org/TR/shacl/#ClassConstraintComponent),
+# i.e. a closed-world check performed AT WRITE TIME against the declared shape. SHACL is "a
+# language for validating RDF graphs against a set of conditions"; RDFS is a language for
+# inferring from them. Conflating the two is why a declared constraint never rejects anything.
+#
+# WHY THIS IS GATED ON THE *SEED* DECLARATION (authority order: user > seed > engine growth).
+# The existing USER-IS-TRUTH EXEMPTION in `validate_edge` is correct in principle — a genuine
+# user statement whose entity types are wider than our ontology should WIDEN the ontology, not
+# be quarantined. But `fact_provenance="user_stated"` is stamped by the ingest provenance router
+# for EVERYTHING arriving via MCP, and on the STATEMENT path the user authors the CONTENT while
+# the EXTRACTOR authors the STRUCTURE (which rel_type this reading gets filed under). So an
+# extractor's rel choice inherits the user's authority and the veto is exempted 100% of the time.
+# The discriminator that restores the authority order is STRUCTURAL: does the violated
+# constraint come from the SEED (present in `public.rel_types`, the curated template) or from
+# engine growth? A SEEDED rel's declared value-type shape is seed-authority; engine growth may
+# ADD/widen but must never override it (the same rule `_seed_structural_flags` already enforces
+# for the structural CLASSIFICATION fields). A rel that is NOT seeded is genuinely novel —
+# engine growth owns its structure — and is never enforced here.
+#
+# Deterministic and subject-agnostic: exact-normalized type-token comparison against the seed
+# arrays, plus the pre-existing hierarchy-reachability escape (a true subtype IS allowed).
+# No rel-name literal, no domain word list, no fuzzy/substring matching, no embeddings.
+# A violating edge is NOT dropped — it falls through to the documented Class-C quarantine
+# ("we don't forget": staged, reclassifiable, user-correctable).
+#
+# DEFAULT OFF — flag OFF is byte-for-byte current behaviour.
+def _seed_type_constraint_enforce_on() -> bool:
+    return _flag_on("WGM_SEED_TYPE_CONSTRAINT_ENFORCE", "false")
+
+
+# ── CONCRETE TYPE-MISMATCH REFUSAL (owner ruling 2026-09-16, gauntlet l4-type-constraints-enforced) ──
+#
+# Every lane above this one turned a declared value-type constraint into a SIGNAL — a Class-C
+# crater (`hierarchy_type_mismatch: True`), a confidence dock, a growth-candidate log line — and
+# then handed the edge back to the ingest loop, which ADMITTED it: the loop's own
+# ``type_mismatch`` handler rewrites the verdict to ``valid`` whenever the caller supplied edges
+# ("user-provided edges override type constraints"), and on the MCP path the caller ALWAYS
+# supplies edges. Measured on production tenants (alias-morphology-fold critics r5/r6):
+# ``(user, spouse, company)`` landed with an ORGANIZATION object against ``spouse.tail_types =
+# {Person}``, and ``(user, educated_at, waterloo)`` with a LOCATION object against
+# ``tail_types = {Organization}`` — both Class A, both user_stated, both silent.
+#
+# THE MECHANISM, BY ITS ESTABLISHED NAME. ``head_types`` / ``tail_types`` are this engine's
+# ``rdfs:domain`` / ``rdfs:range``. RDF Schema 1.1 §3.2/§3.3 makes those DESCRIPTIVE: "P rdfs:range
+# C" states that the values of P are instances of C, and under RDFS entailment ``(x P y)`` then
+# ENTAILS ``y rdf:type C`` — a range declaration can never contradict a triple, it only adds a type
+# (https://www.w3.org/TR/rdf-schema/#ch_range, #ch_domain). That entailment reading is what the
+# ``type_unknown`` → ``_infer_entity_type`` branches implement, and it is correct there: an entity
+# with NO type is typed by the constraint. Refusal is the SHACL reading: ``sh:class`` is a
+# validating VALUE-TYPE constraint — "for each value node that is not a SHACL instance of $class
+# in the data graph, there is a validation result" (https://www.w3.org/TR/shacl/#ClassConstraintComponent)
+# — and a validation result is a REFUSAL of the write, not a weaker admission. The two readings are
+# reconciled by the CONCRETENESS of the signal: an absent / ``'unknown'`` entity type carries no
+# contradiction, so RDFS entailment applies (admit, infer); a CONCRETE entity type that is not a
+# declared value type and is not a subtype reachable through the ``instance_of``/``subclass_of``
+# chain contradicts the declaration, so SHACL validation applies (refuse). ``ANY`` and the
+# ``SCALAR`` storage sentinel are not value types and never refuse (``_constraint_is_concrete``).
+#
+# WHAT IS REFUSED, EXACTLY (``_concrete_role_violation``): a role whose LIVE constraint (tenant
+# overlay — seed ∪ tenant widening, so a tenant that legitimately grew its types keeps them) is
+# concrete, whose entity type — the caller-passed GLiNER2 type, else the stored ``entities``
+# type — is concrete, and for which ``_passed_type_is_genuine_mismatch`` finds no direct match and
+# no hierarchy path. Every provenance is refused alike: user_stated / llm_inferred / llm_learned /
+# a correction. A user's authority is over CONTENT; the extractor authored the STRUCTURE (which
+# rel this reading was filed under), and a category error in the structure is not something the
+# user asserted. It IS user-correctable, and the response says how: assert the entity's type (the
+# hierarchy path then admits it) or restate the fact. The check runs FIRST — before correction
+# supersession, before the confidence bypass — so a refused edge changes NOTHING in memory.
+#
+# A refusal is LOUD: ``status="type_refused"`` + ``reason`` + the violated role, the entity type
+# seen and the declared value types, and the ingest loop surfaces every refusal on the /ingest
+# response (``refused[]``) so the MCP can tell the user. It is never a silent flag.
+#
+# Deterministic, subject-agnostic, metadata-driven: exact-normalized type-token comparison
+# against the live ontology arrays; no rel-name literal, no type word list, no fuzzy matching.
+# ``WGM_TYPE_MISMATCH_REFUSE`` is the ROLLBACK LEVER only (default ON = the ruling); OFF restores
+# the pre-ruling admit-and-flag behaviour byte-for-byte.
+def _type_mismatch_refuse_on() -> bool:
+    return _flag_on("WGM_TYPE_MISMATCH_REFUSE", "true")
+
+
+# ── STORED-TYPE PRECEDENCE (the convergence residual: the T04 pet misroute) ─────────
+# THE WOUND (acceptance5, seat 19fa579d, image c27d55211d, 2026-11-15 — kept-seat
+# forensics re-measured on residual-autopsy4 seat 6c891e26: marla1.entity_type='Person'
+# and fraggle.entity_type='Animal' were CORRECT in the DB the whole time): "Fraggle is
+# Mars's morkie." still type_refused because the REFUSAL CHECK validated the CALLER-
+# PASSED per-mention surface guesses ('mars' → LOCATION by the planet heuristic,
+# 'fraggle' → PERSON by the name NER) against has_pet's declared {Person}/{Animal} —
+# the stored world-model types never got a vote. ``_membership_retype_blocked`` had
+# already stopped the DB retype path (the types above are clean), but the EXTRACTION's
+# mention-time types still overrode them at the check. THE CONTRACT (the same
+# ground-truth doctrine this file already states at the confidence-bypass pre-gate:
+# resolve the AUTHORITATIVE stored/hierarchy type, NOT the extraction-provided type):
+# for an entity the edge RESOLVES to (entity_id known), the STORED entity type is the
+# world model's committed truth; a concrete stored type outranks a contradicting
+# per-mention guess, in BOTH roles. A fresh entity (stored unknown) keeps today's
+# passed-type behavior, so genuinely-new mistyped extractions still refuse. Deterministic,
+# metadata-only. ``WGM_STORED_TYPE_PRECEDENCE`` is the ROLLBACK LEVER (default ON);
+# OFF restores passed-type-first byte-for-byte.
+def _stored_type_precedence_on() -> bool:
+    return _flag_on("WGM_STORED_TYPE_PRECEDENCE", "true")
+
+
+TYPE_REFUSED_STATUS = "type_refused"
+
+
+# ── REFLEXIVE HIERARCHY TAUTOLOGY (X subclass_of X) ──
+# RDF 1.1 Semantics §9.2.1 entailment rule **rdfs10**: "If S contains: xxx rdf:type rdfs:Class .
+# then S RDFS entails: xxx rdfs:subClassOf xxx ." — i.e. `rdfs:subClassOf` is REFLEXIVE BY AXIOM
+# (https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative). An asserted
+# self-loop on a hierarchy rel is therefore ENTAILED by the graph already and carries ZERO
+# information: it is a tautology, not a memory. It is also actively harmful — it is a cycle in
+# what must be a DAG, so a hierarchy walk can revisit the node, and it renders as the nonsense
+# recall line "Parent is a subclass of Parent". Detection is purely STRUCTURAL (subject_id ==
+# object_id on a rel whose ontology metadata says `is_hierarchy_rel`) — no vocabulary, no
+# type inspection, no fuzzy matching.
+# DEFAULT OFF — flag OFF is byte-for-byte current behaviour.
+def _reject_reflexive_hierarchy_on() -> bool:
+    return _flag_on("WGM_REJECT_REFLEXIVE_HIERARCHY", "false")
+
+
+# ── UNAMBIGUOUS-ONLY CONSTRAINT TYPE INFERENCE (the `tail_types[0]` fabrication) ──
+#
+# `head_types`/`tail_types` is a DISJUNCTION: `owns tail={Animal,Object,Organization}` declares
+# "the value is an Animal OR an Object OR an Organization". Under RDFS that disjunction entails
+# NOTHING about which one holds — only OWL's `owl:unionOf` can express it, and a union class
+# membership does not entail membership of any particular member
+# (https://www.w3.org/TR/rdf-schema/#ch_range, https://www.w3.org/TR/owl2-syntax/#Union_of_Class_Expressions).
+# Taking `tail_types[0]` therefore FABRICATES a fact the ontology never stated: an unknown-typed
+# owned thing gets stamped `Animal` purely because `Animal` sorts first in the array. That is a
+# manufactured type in L4 — and now that the seed value-type constraint is enforced, a fabricated
+# type can make a LATER, legitimate edge fail its own `sh:class` check.
+#
+# THE FIX: only a SINGLETON concrete constraint entails a type (`lives_at tail={Location}` — one
+# disjunct, so the disjunction IS that type). A multi-element disjunction is UNDECIDABLE: leave
+# the entity `unknown` and log. Nothing is lost — `unknown` is precisely the state the entity was
+# already in, every downstream branch already handles it (the hierarchy resolver, the "type
+# unknown → skip check" path), and the real type still arrives from GLiNER2 typing, an
+# `instance_of` edge, or a user correction.
+#
+# Purely structural (array cardinality), no rel-name literal, no vocabulary. DEFAULT OFF —
+# flag OFF is byte-for-byte current behaviour.
+def _infer_type_only_if_unambiguous_on() -> bool:
+    return _flag_on("WGM_INFER_TYPE_ONLY_IF_UNAMBIGUOUS", "false")
+
+
+def _entailed_constraint_type(types) -> str | None:
+    """The ONE entity type a role constraint entails, or ``None`` when it entails none.
+
+    With the flag OFF this is the legacy ``types[0]`` (byte-identical). With it ON, a type is
+    entailed ONLY by a SINGLETON concrete constraint; a multi-element disjunction returns
+    ``None`` → the caller leaves the entity ``unknown`` and logs (see
+    :func:`_infer_type_only_if_unambiguous_on`). Fail-safe: an empty/None list → ``None``."""
+    _t = [str(x).strip() for x in (types or []) if str(x or "").strip()]
+    if not _t:
+        return None
+    if not _infer_type_only_if_unambiguous_on():
+        return _t[0]
+    if len(_t) == 1 and _t[0].upper() not in ("ANY", "SCALAR"):
+        return _t[0]
+    return None
+
+
+def _seed_role_type_constraints(db_conn, rel_type: str) -> dict | None:
+    """Return the SEED-declared ``{"head_types": [...], "tail_types": [...]}`` for a rel from the
+    ``public`` template, or ``None`` when the rel is NOT seeded (genuinely novel — engine growth
+    owns its structure, so nothing here is enforced against it).
+
+    Sibling of :func:`_seed_structural_flags`, and read for the same reason and in the same way:
+    ``public`` is consulted ONLY as the seed-AUTHORITY reference, fully-qualified so it resolves
+    regardless of the tenant ``search_path`` (which deliberately excludes ``public``). It is never
+    used as a runtime data source — the tenant overlay remains the operational ontology; this read
+    answers exactly one question: "did the curated template declare this shape?"
+
+    Deliberately a SEPARATE reader rather than an extra field on ``_SEED_STRUCTURAL_FIELDS``:
+    that tuple is the IMMUTABLE-to-growth pin list consumed by other call sites, and ``head_types``
+    is intentionally absent from it because additive head widening must keep working. Reading the
+    seed shape for VALIDATION is a different question from pinning it against overwrite.
+
+    Fail-safe: any error → log + ``None`` (caller keeps today's behaviour), never crashes ingest.
+    """
+    rt = (rel_type or "").strip().lower()
+    if not rt:
+        return None
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT head_types, tail_types FROM public.rel_types WHERE rel_type = %s",
+                (rt,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"head_types": row[0], "tail_types": row[1]}
+    except Exception as e:
+        log.warning("wgm.seed_role_type_constraints_read_failed",
+                    rel_type=rt, error=str(e)[:160])
+        return None
+
+
+def _constraint_is_concrete(types) -> bool:
+    """True when a declared role constraint actually CONSTRAINS: non-empty, no ``ANY``, and not
+    the ``SCALAR`` sentinel (a scalar tail is a storage-routing marker, not an entity class).
+    Exact-normalized token comparison; no rel-name literal, no fuzzy matching."""
+    toks = [str(t).strip().lower() for t in (types or []) if t and str(t).strip()]
+    if not toks:
+        return False
+    if "any" in toks:
+        return False
+    if toks == ["scalar"]:
+        return False
+    return True
+
+
 # DEAD CODE REMOVED: _detect_llm_endpoint()
 # All LLM endpoint logic consolidated in src/api/llm_calls._get_endpoint_list()
 # Use llm_calls module for all endpoint detection
@@ -133,7 +407,17 @@ class RelTypeRegistry:
 
     def _refresh(self) -> None:
         try:
-            with psycopg2.connect(self.dsn) as conn:
+            # READ SEAM, not `psycopg2.connect`. This fires on every 5s TTL expiry, so it was
+            # the same latent leak as the re_embedder sweep in a higher-frequency dress:
+            # `with psycopg2.connect(...)` is NOT `closing()` — psycopg2's connection context
+            # manager commits the transaction and LEAVES THE BACKEND OPEN, to be reclaimed only
+            # if/when the object is garbage collected. A traceback or a reference cycle pins it
+            # indefinitely (measured on the local stack: 11 abandoned `idle` backends from one
+            # container, oldest 6 days). read_only_connection() is autocommit + readonly and
+            # closes in a `finally`, so this refresh can leave behind neither a transaction nor
+            # a backend. No `schema=` is passed — identical to today: this registry reads
+            # rel_types under the connection's default search_path.
+            with read_only_connection(self.dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT rel_type, head_types, tail_types,
@@ -149,7 +433,7 @@ class RelTypeRegistry:
                         self._ontology[rel_type] = {
                             "head_types": row[1],
                             "tail_types": row[2],
-                            "correction_behavior": row[3],  # hard_delete, supersede, immutable
+                            "correction_behavior": row[3],  # hard_delete | supersede (issue #224: 'immutable' retired)
                             "inverse_rel_type": row[4],
                             "is_symmetric": row[5],
                             "is_hierarchy_rel": row[6],
@@ -192,10 +476,10 @@ SEED_ONTOLOGY = {
     # Relational rel_types — constrained head_types/tail_types
     "created_by":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["ANY"]},
     "works_for":      {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["Person", "Organization"]},
-    "parent_of":      {"correction_behavior": "immutable", "inverse_rel_type": "child_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
-    "child_of":       {"correction_behavior": "immutable", "inverse_rel_type": "parent_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "parent_of":      {"correction_behavior": "supersede", "inverse_rel_type": "child_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "child_of":       {"correction_behavior": "supersede", "inverse_rel_type": "parent_of", "is_symmetric": False, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
     "spouse":         {"correction_behavior": "supersede", "inverse_rel_type": "spouse", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
-    "sibling_of":     {"correction_behavior": "immutable", "inverse_rel_type": "sibling_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
+    "sibling_of":     {"correction_behavior": "supersede", "inverse_rel_type": "sibling_of", "is_symmetric": True, "is_hierarchy_rel": False, "category": "family", "head_types": ["Person"], "tail_types": ["Person"]},
     "also_known_as":  {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["SCALAR"]},
     "pref_name":      {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["SCALAR"]},
     "same_as":        {"correction_behavior": "supersede", "inverse_rel_type": "same_as", "is_symmetric": True, "is_hierarchy_rel": False, "category": "identity", "head_types": ["ANY"], "tail_types": ["ANY"]},
@@ -209,11 +493,11 @@ SEED_ONTOLOGY = {
     "educated_at":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["Organization"]},
     "lives_in":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location"]},
     "lives_at":       {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location", "SCALAR"]},
-    "born_in":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location"]},
+    "born_in":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "location", "head_types": ["Person"], "tail_types": ["Location"]},
     # Scalar rel_types
     "nationality":    {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
     "occupation":     {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": "work", "head_types": ["Person"], "tail_types": ["SCALAR"]},
-    "born_on":        {"correction_behavior": "immutable", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
+    "born_on":        {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
     "age":            {"correction_behavior": "hard_delete", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["Person"], "tail_types": ["SCALAR"]},
     "height":         {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["SCALAR"]},
     "weight":         {"correction_behavior": "supersede", "inverse_rel_type": None, "is_symmetric": False, "is_hierarchy_rel": False, "category": None, "head_types": ["ANY"], "tail_types": ["SCALAR"]},
@@ -270,6 +554,16 @@ class WGMValidationGate:
         return None
 
     def __init__(self, db_conn, registry: RelTypeRegistry = None, validator: LLMOutputValidator = None, schema_name: str = None):
+        # REQUEST-SCOPED TAXONOMY CACHE (litmus fix L3, 2026-11-03): the per-edge hierarchy
+        # gate used to run an entity_taxonomies SELECT PER EDGE (302 edges → 302 identical
+        # queries on one /ingest — the row set cannot change mid-transaction: this gate
+        # instance lives exactly one request, and the txn's own writes below cannot add a
+        # taxonomy because taxonomy growth runs AFTER commit). Keyed by the query's argument
+        # tuple; a cache hit returns the same rows the query would. The gate object is
+        # constructed per request (main.py builds one per /ingest), so this never leaks
+        # across requests or tenants.
+        self._taxonomy_cache = {}
+
         self.db_conn = db_conn
         self.registry = registry
         # Guard the schema name shape — it is interpolated into SET search_path
@@ -285,8 +579,18 @@ class WGMValidationGate:
         # If not provided, create instance with auto-detected LLM endpoint via centralized logic
         if validator is None:
             from src.api.llm_calls import _get_endpoint_list
+            from src.api.llm_client import _saas_mode as _llm_saas_mode
             endpoints = _get_endpoint_list()
-            llm_endpoint = endpoints[0] if endpoints else "http://open-webui:8080/api/chat/completions"
+            if endpoints:
+                llm_endpoint = endpoints[0]
+            elif _llm_saas_mode():
+                # SaaS fail-closed: no tenant brain resolved ⇒ NO endpoint. The hardcoded
+                # default below is an open-core convenience; handing it to a SaaS tenant would
+                # point the validator's embedding call at the operator's global host. The
+                # validator treats "" as "no remote embedding available" (see _embed_text).
+                llm_endpoint = ""
+            else:
+                llm_endpoint = "http://open-webui:8080/api/chat/completions"
             self.validator = LLMOutputValidator(db_conn=db_conn, llm_endpoint=llm_endpoint)
         else:
             self.validator = validator
@@ -309,7 +613,7 @@ class WGMValidationGate:
             return
         try:
             with self.db_conn.cursor() as cur:
-                cur.execute(f"SET search_path TO {self._schema_name}")
+                cur.execute(f"SET search_path TO {self._schema_name}")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query schema_name validated by _SCHEMA_NAME_RE ^[a-z0-9_]+$ in __init__
                 # Verify the SET actually took effect on this connection —
                 # closes the case where SET "succeeds" but connection state
                 # is not what we think.
@@ -442,13 +746,21 @@ class WGMValidationGate:
                                     rel_type=rel_type.lower(), role="subject")
                         return (False, "hierarchy_type_mismatch")
             else:
-                # Growth engine: infer subject type from head_types constraint
+                # Growth engine: infer subject type from head_types constraint — but ONLY when the
+                # constraint is UNAMBIGUOUS (a disjunction entails no single type; see
+                # `_entailed_constraint_type`). Undecidable → stay `unknown`, log, never fabricate.
                 if head_types and not head_any:
-                    inferred = head_types[0]
-                    self._infer_entity_type(subject_id, inferred)
-                    log.info("wgm.entity_type_inferred",
-                             entity_id=subject_id, inferred_type=inferred,
-                             rel_type=rel_type.lower(), role="subject")
+                    inferred = _entailed_constraint_type(head_types)
+                    if inferred:
+                        self._infer_entity_type(subject_id, inferred)
+                        log.info("wgm.entity_type_inferred",
+                                 entity_id=subject_id, inferred_type=inferred,
+                                 rel_type=rel_type.lower(), role="subject")
+                    else:
+                        log.info("wgm.entity_type_inference_ambiguous",
+                                 entity_id=str(subject_id)[:16], constraint=head_types,
+                                 rel_type=rel_type.lower(), role="subject",
+                                 note="disjunctive constraint entails no single type — left unknown")
                 log.warning(
                     "wgm.type_check_skipped",
                     extra={
@@ -481,13 +793,21 @@ class WGMValidationGate:
                                     rel_type=rel_type.lower(), role="object")
                         return (False, "hierarchy_type_mismatch")
             else:
-                # Growth engine: infer object type from tail_types constraint
+                # Growth engine: infer object type from tail_types constraint — UNAMBIGUOUS ONLY
+                # (`owns tail={Animal,Object,Organization}` must NOT stamp `Animal`; see
+                # `_entailed_constraint_type`). Undecidable → stay `unknown`, log, never fabricate.
                 if tail_types and not tail_any and not is_scalar:
-                    inferred = tail_types[0]
-                    self._infer_entity_type(object_id, inferred)
-                    log.info("wgm.entity_type_inferred",
-                             entity_id=object_id, inferred_type=inferred,
-                             rel_type=rel_type.lower(), role="object")
+                    inferred = _entailed_constraint_type(tail_types)
+                    if inferred:
+                        self._infer_entity_type(object_id, inferred)
+                        log.info("wgm.entity_type_inferred",
+                                 entity_id=object_id, inferred_type=inferred,
+                                 rel_type=rel_type.lower(), role="object")
+                    else:
+                        log.info("wgm.entity_type_inference_ambiguous",
+                                 entity_id=str(object_id)[:16], constraint=tail_types,
+                                 rel_type=rel_type.lower(), role="object",
+                                 note="disjunctive constraint entails no single type — left unknown")
                 log.warning(
                     "wgm.type_check_skipped",
                     extra={
@@ -502,6 +822,20 @@ class WGMValidationGate:
         # Constraint checks (case-insensitive type comparison)
         head_types_lower = [t.lower() for t in head_types] if head_types else []
         tail_types_lower = [t.lower() for t in tail_types] if tail_types else []
+        # STORED-TYPE PRECEDENCE (WGM_STORED_TYPE_PRECEDENCE, default ON — the T04
+        # convergence residual, measured again through this seam after the loud-refusal
+        # seam was fixed: the verdict flipped type_refused → type_mismatch on the SAME
+        # surface guesses): for an entity the edge RESOLVES to, the committed world-model
+        # kind is the ground truth and outranks the caller-passed per-mention surface
+        # guess — the same rule the confidence-bypass pre-gate applies by passing None
+        # here. A fresh entity (stored unknown/absent) keeps the passed type.
+        if _stored_type_precedence_on():
+            _st = (self._resolve_entity_type(subject_id) or "").strip() if subject_id else ""
+            if _st and _st.lower() != "unknown":
+                subject_type = _st
+            _ot = (self._resolve_entity_type(object_id) or "").strip() if object_id else ""
+            if _ot and _ot.lower() != "unknown":
+                object_type = _ot
         subject_type_lower = subject_type.lower() if subject_type else None
         object_type_lower = object_type.lower() if object_type else None
 
@@ -520,6 +854,127 @@ class WGMValidationGate:
             )
 
         return (True, "ok")
+
+    def _seed_declared_constraint_violation(
+        self, rel_type: str, subject_id: str, object_id: str,
+        subject_type: str = None, object_type: str = None,
+    ) -> str | None:
+        """Return ``"head"`` / ``"tail"`` when a CONCRETE entity type genuinely violates the role
+        constraint the SEED template declared for this rel, else ``None``.
+
+        This is the SHACL ``sh:class`` reading of ``head_types``/``tail_types`` — a value-type
+        constraint checked at write time ("for each value node that is ... not a SHACL instance of
+        $class ... there is a validation result", https://www.w3.org/TR/shacl/#ClassConstraintComponent)
+        — as opposed to the RDFS ``rdfs:range`` reading the rest of this gate applies, under which
+        the same declaration merely ENTAILS the missing type and can never fail
+        (https://www.w3.org/TR/rdf-schema/#ch_range). See the module-level note on
+        ``_seed_type_constraint_enforce_on`` for why the SEED (not the tenant overlay) is the
+        authority consulted here: authority order is user > seed > engine growth, so a growth-
+        widened tenant row must not be able to launder away a curated declaration.
+
+        DETERMINISTIC, subject-agnostic, metadata-only:
+          • the shape comes from ``public.rel_types`` by rel PRESENCE — no rel-name literal;
+          • a role is checked only when its seed constraint is CONCRETE (``_constraint_is_concrete``:
+            non-empty, no ``ANY``, not the ``SCALAR`` storage sentinel);
+          • the verdict reuses the existing ``_passed_type_is_genuine_mismatch``, so an absent /
+            ``'unknown'`` type NEVER triggers (no concrete signal → no verdict, fail-safe) and a
+            true SUBTYPE reachable through the ``instance_of``/``subclass_of`` chain is ALLOWED;
+          • exact-normalized token comparison only — no substring/ILIKE, no embeddings, no scoring.
+
+        Fail-safe: any error → ``None`` (today's behaviour, no new drops).
+        """
+        try:
+            seed = _seed_role_type_constraints(self.db_conn, rel_type)
+            if not seed:
+                return None  # not seeded → engine growth owns this rel's structure
+            # STORED-TYPE PRECEDENCE (WGM_STORED_TYPE_PRECEDENCE, default ON — the T04
+            # convergence residual): the seed shape constrains the entity's KIND, and for
+            # a resolved entity the committed world-model kind outranks the caller-passed
+            # per-mention surface guess (the acceptance5 misroute would have quarantined
+            # the pet edge on the planet guess after the loud-refusal seam admitted it).
+            if _stored_type_precedence_on():
+                _st = (self._resolve_entity_type(subject_id) or "").strip() if subject_id else ""
+                if _st and _st.lower() != "unknown":
+                    subject_type = _st
+                _ot = (self._resolve_entity_type(object_id) or "").strip() if object_id else ""
+                if _ot and _ot.lower() != "unknown":
+                    object_type = _ot
+            seed_tail = seed.get("tail_types")
+            if _constraint_is_concrete(seed_tail) and self._passed_type_is_genuine_mismatch(
+                object_type, seed_tail, object_id
+            ):
+                return "tail"
+            seed_head = seed.get("head_types")
+            if _constraint_is_concrete(seed_head) and self._passed_type_is_genuine_mismatch(
+                subject_type, seed_head, subject_id
+            ):
+                return "head"
+            return None
+        except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest on the check
+            log.warning("wgm.seed_declared_constraint_check_failed",
+                        rel_type=(rel_type or "")[:48], error=str(e)[:160])
+            return None
+
+    def _concrete_role_violation(
+        self, rel_type: str, subject_id: str, object_id: str,
+        subject_type: str = None, object_type: str = None,
+    ) -> dict | None:
+        """The ONE refusal predicate (see ``_type_mismatch_refuse_on``): return
+        ``{"role", "entity_type", "allowed", "entity_id"}`` when a CONCRETE entity type genuinely
+        violates a CONCRETE live role constraint, else ``None``.
+
+        Per role (tail first, then head — the same order ``_seed_declared_constraint_violation``
+        reports): the constraint is read from the LIVE overlay ontology (seed ∪ tenant widening);
+        it is checked only when ``_constraint_is_concrete`` (non-empty, no ``ANY``, not the
+        ``SCALAR`` sentinel); the entity type is the caller-passed type when concrete, else the
+        stored ``entities.entity_type`` (a fresh entity is ``'unknown'`` → no signal → admit, which
+        keeps today's co-extraction ordering safe) — EXCEPT that under
+        ``WGM_STORED_TYPE_PRECEDENCE`` (default ON) a RESOLVED entity's CONCRETE stored type
+        always outranks the caller-passed per-mention guess (the world model's committed kind
+        is the ground truth; the acceptance5 T04 misroute validated planet/name surface
+        guesses against the pet-edge declaration while the stored Person/Animal kinds were
+        correct); and the verdict is
+        ``_passed_type_is_genuine_mismatch`` — direct match admits, a subtype reachable through
+        the hierarchy chain admits, absent/'unknown'/ANY never refuse.
+
+        Fail-safe: any error → ``None`` (no new refusal), logged.
+        """
+        try:
+            rt = (rel_type or "").strip().lower()
+            entry = (self.get_current_ontology() or {}).get(rt)
+            if not entry:
+                return None  # unknown rel → nothing declared → nothing to violate
+            for role, declared, passed, ent_id in (
+                ("tail", entry.get("tail_types"), object_type, object_id),
+                ("head", entry.get("head_types"), subject_type, subject_id),
+            ):
+                if not _constraint_is_concrete(declared):
+                    continue
+                stored = ""
+                if ent_id is not None:
+                    stored = (self._resolve_entity_type(ent_id) or "").strip()
+                eff = (passed or "").strip()
+                if _stored_type_precedence_on() and stored and stored.lower() != "unknown":
+                    # STORED-TYPE PRECEDENCE: the edge RESOLVES to a known entity whose
+                    # committed kind is concrete — that kind is the world model's truth;
+                    # the per-mention surface guess cannot contradict it (T04 wound).
+                    eff = stored
+                elif not eff or eff.lower() == "unknown":
+                    eff = stored
+                if not eff or eff.lower() == "unknown":
+                    continue  # no concrete signal → RDFS entailment applies (admit, infer)
+                if self._passed_type_is_genuine_mismatch(eff, declared, ent_id):
+                    return {
+                        "role": role,
+                        "entity_type": eff,
+                        "allowed": [str(t) for t in (declared or [])],
+                        "entity_id": ent_id,
+                    }
+            return None
+        except Exception as e:  # noqa: BLE001 — fail-safe: never break ingest on the check
+            log.warning("wgm.concrete_role_violation_check_failed",
+                        rel_type=(rel_type or "")[:48], error=str(e)[:160])
+            return None
 
     def _passed_type_is_genuine_mismatch(
         self, passed_type: str, allowed_types, entity_id: str = None
@@ -883,7 +1338,17 @@ class WGMValidationGate:
 
     # ── dprompt-064 Phase 1: Correction Semantics (Metadata-Driven) ──────
     # Replaces hardcoded negation word list with rel_types.correction_behavior
-    # Semantics: hard_delete (pref_name, age), supersede (lives_at), immutable (born_in, parent_of)
+    # Semantics: hard_delete (pref_name, age), supersede (lives_at, works_for, …)
+    #
+    # ⚠️ NO 'immutable' ACTION (owner ruling 2026-10-07, issue #224): "everything
+    # should be correctable … no immutable escape hatch anywhere in the correction
+    # lane." This method used to return action='immutable' for rels seeded
+    # correction_behavior='immutable', which validate_edge turned into a
+    # status='immutable_fact' edge rejection — reachable from /ingest's
+    # is_correction pickup, a live correction-lane refusal by rel name. The branch
+    # is DELETED and the seed rows flipped to 'supersede' (migration 290); a
+    # straggler row still carrying the token now falls through to the accept
+    # default below — inert metadata, fail-toward-not-losing-data.
 
     def _apply_correction_semantics(self, edge: dict, rel_type: str) -> dict:
         """
@@ -893,7 +1358,6 @@ class WGMValidationGate:
         Queries rel_types.correction_behavior to determine action:
         - hard_delete: DELETE old values, INSERT new (pref_name, also_known_as, age, height)
         - supersede: Mark old values as superseded_at=now() (lives_at, works_for, spouse, etc)
-        - immutable: Ignore correction, reject fact (born_in, born_on, parent_of, sibling_of)
 
         Args:
             edge: dict with is_correction flag, confidence, subject_id, object_id
@@ -962,15 +1426,9 @@ class WGMValidationGate:
                 "superseded_count": superseded_count,
             }
 
-        elif behavior == "immutable":
-            # born_in, born_on, parent_of, sibling_of: User cannot correct these
-            # Reject the correction attempt
-            return {
-                "action": "immutable",
-                "reason": f"correction_behavior=immutable — this fact is unchangeable",
-            }
-
-        # Unknown behavior: safe default is accept
+        # Unknown behavior (incl. the retired 'immutable' token — no immutable
+        # escape hatch, issue #224): safe default is accept; the correction lane's
+        # own guards and supersession own the write.
         return {
             "action": "accept",
             "reason": f"unknown_correction_behavior={behavior}",
@@ -1010,11 +1468,20 @@ class WGMValidationGate:
            (e.g. "university instance_of person" when "university instance_of
            organization" is arriving).  Staged_facts has no superseded_at column;
            hard-delete is the correct action.
+           ENGINE-GROWN LADDER RUNGS ARE SPARED (compound-type L4, issue #11): rows whose
+           writer tag (`provenance` column) is one of the ingest growth lanes
+           (`_INGEST_GROWN_LADDER_PROVENANCES` — defined on this class as the ONE OWNER;
+           src.api.main imports it for its mirror purge) are COMPLEMENTARY lattice growth,
+           never contradictory twins. The owner ruling requires `blue-ringed octopus
+           --subclass_of--> octopus` (engine-grown head rung) and `blue-ringed octopus
+           --subclass_of--> cephalopod` (the user's stated kind) to COEXIST on one node;
+           the same sparing un-breaks the WordNet / backbone / aspect-term rungs on any
+           node that later receives a same-rel fact.
 
         2. Inverted rows — subject is a generic ontology token (matches
            _SYSTEM_ENTITY_NAMES) and rel_type is a hierarchy rel.  These are
            mis-extracted facts that have subject/object swapped (e.g. "person
-           instance_of alexander").
+           instance_of christopher").
 
         Qdrant cleanup is best-effort: a failed delete does not affect the gate
         decision or the DB operation.
@@ -1033,7 +1500,9 @@ class WGMValidationGate:
 
         try:
             with self.db_conn.cursor() as cur:
-                # --- Pass 1: conflicting type rows (same subject+rel, different object) ---
+                # --- Pass 1: conflicting type rows (same subject+rel, different object).
+                # Engine-grown ladder rungs (the ingest growth lanes' writer tags) are
+                # spared — see the docstring: complementary lattice growth, not twins.
                 cur.execute(
                     """
                     SELECT id FROM staged_facts
@@ -1041,8 +1510,10 @@ class WGMValidationGate:
                       AND rel_type   = %s
                       AND object_id != %s
                       AND promoted_at IS NULL
+                      AND (provenance IS NULL OR provenance != ALL(%s))
                     """,
-                    (subject_id, rt_lower, object_id),
+                    (subject_id, rt_lower, object_id,
+                     sorted(_INGEST_GROWN_LADDER_PROVENANCES)),
                 )
                 conflict_rows = [r[0] for r in cur.fetchall()]
 
@@ -1123,27 +1594,47 @@ class WGMValidationGate:
         # (source_table, fact_id) payload filter (covers payload-tagged points);
         # Pass 2 deletes the deterministic derived point id (new-scheme points).
         # Legacy bare-int points are cleaned by re_embedder reconcile / re-sync.
-        if deleted_ids and qdrant_url and user_id:
+        #
+        # LANE GATE (interactive-latency round 2): the user-memory vector tier is RETIRED
+        # by default (USER_MEMORY_VECTOR_LANE default false — read here from env because
+        # the WGM gate cannot import src.api.main). With the lane off there are no staged
+        # points to purge; each deleted id was a 5s-timeout POST to a host that may not
+        # exist, ON the caller's thread (the gate runs inside the async /ingest path).
+        # REMOVAL (REMOVE_QDRANT_MEMORY_LANE default ON): the user-memory Qdrant lane is
+        # REMOVED (owner ruling: the vector store is for the cortex memory only) — this
+        # memory-side purge is dead regardless of USER_MEMORY_VECTOR_LANE. Cortex
+        # (flagent-*) collections are never touched here. Flag OFF = rollback arm: the
+        # legacy `not _lane_off` gate below is truth-identical.
+        _lane_off = (
+            os.environ.get("USER_MEMORY_VECTOR_LANE", "false").strip().lower() in ("false", "0", "no")
+            or os.environ.get("REMOVE_QDRANT_MEMORY_LANE", "true").strip().lower() not in ("false", "0", "no")
+        )
+        if deleted_ids and qdrant_url and user_id and not _lane_off:
             try:
-                from src.re_embedder.embedder import derive_collection, derive_qdrant_point_id
+                from src.api.qdrant_partition import (
+                    resolve_partition as _qp_resolve, require_tenant as _qp_require,
+                    build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
+                    qdrant_headers as _qp_hdr,
+                )
                 import httpx as _httpx
-                collection = derive_collection(user_id)
+                collection, _tflt = _qp_resolve(user_id, "memory")
+                _qp_require(_tflt, op="delete", collection=collection)
                 for _did in deleted_ids:
                     _httpx.post(
                         f"{qdrant_url}/collections/{collection}/points/delete",
-                        json={
-                            "filter": {
-                                "must": [
-                                    {"key": "source_table", "match": {"value": "staged_facts"}},
-                                    {"key": "fact_id", "match": {"value": _did}},
-                                ]
-                            }
-                        },
+                        json=_qp_delbody(_tflt, must=[
+                            {"key": "source_table", "match": {"value": "staged_facts"}},
+                            {"key": "fact_id", "match": {"value": _did}},
+                        ]),
+                        headers=_qp_hdr(),
                         timeout=5.0,
                     )
                 _httpx.post(
                     f"{qdrant_url}/collections/{collection}/points/delete",
-                    json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
+                    json=_qp_delbody(_tflt, point_ids=[
+                        _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
+                    ]),
+                    headers=_qp_hdr(),
                     timeout=5.0,
                 )
                 log.info(
@@ -1243,12 +1734,32 @@ class WGMValidationGate:
 
         return (True, "hierarchy_valid")
 
+    def _tax_cache(self) -> dict:
+        """Lazily-created request-scoped entity_taxonomies cache (litmus fix L3).
+
+        The gate used to fire an entity_taxonomies SELECT PER EDGE (302 edges -> 302
+        identical queries on one /ingest): the row set cannot change under this gate
+        instance - it lives exactly one request and taxonomy growth runs AFTER commit.
+        Keyed by the query's argument tuple; a hit returns the same rows the query would.
+        Lazy so gates built via __new__ (the test lane) work unmodified.
+        """
+        c = getattr(self, "_taxonomy_cache", None)
+        if c is None:
+            c = {}
+            self._taxonomy_cache = c
+        return c
+
     def _get_taxonomy_rel_types(self, taxonomy_name: str) -> set[str]:
         """
         Query entity_taxonomies for rel_types that define a given taxonomy.
         FAIL HARD if taxonomy not found — engine should have learned this.
         Returns set of lowercase rel_type strings.
         """
+        # REQUEST-SCOPED CACHE (litmus fix L3): taxonomy rows cannot change under this gate
+        # instance (one request, growth runs post-commit), so a repeat probe is a dict hit.
+        _ck = ("rel_types", taxonomy_name)
+        if _ck in self._tax_cache():
+            return self._taxonomy_cache[_ck]
         try:
             with self.db_conn.cursor() as cur:
                 cur.execute(
@@ -1265,7 +1776,9 @@ class WGMValidationGate:
                     )
                     log_crit(log, msg, taxonomy=taxonomy_name, component="entity_taxonomies")
                     raise RuntimeError(msg)
-                return set(rt.lower() for rt in row[0])
+                _out = set(rt.lower() for rt in row[0])
+                self._tax_cache()[_ck] = _out
+                return _out
         except RuntimeError:
             raise  # Re-raise intentional errors
         except Exception as e:
@@ -1291,55 +1804,64 @@ class WGMValidationGate:
         object_type = fact_dict.get("object_type", "").lower() if fact_dict.get("object_type") else None
 
         # Query entity_taxonomies for this category → get member_entity_types + rel_types_defining_group
-        try:
-            with self.db_conn.cursor() as cur:
-                cur.execute("""
-                    SELECT member_entity_types, rel_types_defining_group
-                    FROM entity_taxonomies
-                    WHERE taxonomy_name = %s
-                """, (category,))
-                row = cur.fetchone()
-                if not row:
-                    # dprompt-LLM-Fix: Taxonomy not found — allow fact, re-embedder discovers async
-                    # No synchronous LLM call in validation hot path
-                    log.info("wgm.taxonomy_missing_deferred_to_re_embedder",
-                            category=category, rel_type=rel_type,
-                            reason="re_embedder async discovery prevents ingest blocking")
-                    return (False, "valid")
+        # REQUEST-SCOPED CACHE (litmus fix L3) — also cache the miss: the re-embedder
+        # backfill happens AFTER commit, so a missing taxonomy stays missing for the whole
+        # request and per-edge re-probes would burn round trips on the same NULL.
+        _ck = ("cat", category)
+        if _ck in self._tax_cache():
+            row = self._taxonomy_cache[_ck]
+            if row is None:
+                return (False, "valid")  # same deferred verdict the query miss returns
+        else:
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT member_entity_types, rel_types_defining_group
+                        FROM entity_taxonomies
+                        WHERE taxonomy_name = %s
+                    """, (category,))
+                    row = cur.fetchone()
+                self._tax_cache()[_ck] = row  # None caches the miss too
+            except RuntimeError:
+                raise
+            except Exception as e:
+                log.error(f"wgm.category_validation_error: category={category}, error={e}")
+                raise RuntimeError(f"Failed to validate category constraints for '{category}': {e}")
+        if not row:
+            # dprompt-LLM-Fix: Taxonomy not found — allow fact, re-embedder discovers async
+            # No synchronous LLM call in validation hot path
+            log.info("wgm.taxonomy_missing_deferred_to_re_embedder",
+                    category=category, rel_type=rel_type,
+                    reason="re_embedder async discovery prevents ingest blocking")
+            return (False, "valid")
 
-                member_entity_types = set(t.lower() for t in (row[0] or []))
-                category_rels = set(rt.lower() for rt in (row[1] or []))
+        member_entity_types = set(t.lower() for t in (row[0] or []))
+        category_rels = set(rt.lower() for rt in (row[1] or []))
 
-                if rel_type not in category_rels:
-                    return (True, "rel_type_not_in_category")
+        if rel_type not in category_rels:
+            return (True, "rel_type_not_in_category")
 
-                # Validate subject_type against member_entity_types
-                if member_entity_types and subject_type and subject_type != "unknown":
-                    if subject_type not in member_entity_types:
-                        log.warning(
-                            "wgm.category_invalid_subject",
-                            category=category,
-                            rel_type=rel_type,
-                            subject_type=subject_type,
-                            allowed_types=member_entity_types
-                        )
+        # Validate subject_type against member_entity_types
+        if member_entity_types and subject_type and subject_type != "unknown":
+            if subject_type not in member_entity_types:
+                log.warning(
+                    "wgm.category_invalid_subject",
+                    category=category,
+                    rel_type=rel_type,
+                    subject_type=subject_type,
+                    allowed_types=member_entity_types
+                )
 
-                # Validate object_type against member_entity_types
-                if member_entity_types and object_type and object_type != "unknown":
-                    if object_type not in member_entity_types:
-                        log.warning(
-                            "wgm.category_invalid_object",
-                            category=category,
-                            rel_type=rel_type,
-                            object_type=object_type,
-                            allowed_types=member_entity_types
-                        )
-
-        except RuntimeError:
-            raise  # Re-raise intentional errors
-        except Exception as e:
-            log.error(f"wgm.category_validation_error: category={category}, error={e}")
-            raise RuntimeError(f"Failed to validate category constraints for '{category}': {e}")
+        # Validate object_type against member_entity_types
+        if member_entity_types and object_type and object_type != "unknown":
+            if object_type not in member_entity_types:
+                log.warning(
+                    "wgm.category_invalid_object",
+                    category=category,
+                    rel_type=rel_type,
+                    object_type=object_type,
+                    allowed_types=member_entity_types
+                )
 
         return (True, "category_valid")
 
@@ -1391,64 +1913,73 @@ class WGMValidationGate:
         except Exception:
             pass  # fail-safe: fall through to the homogeneous membership check
 
-        try:
-            with self.db_conn.cursor() as cur:
-                # Query hierarchies that define this rel_type
-                cur.execute("""
-                    SELECT taxonomy_name, member_entity_types, rel_types_defining_group
-                    FROM entity_taxonomies
-                    WHERE rel_types_defining_group @> ARRAY[%s]
-                    ORDER BY taxonomy_name
-                """, (rt_lower,))
+        # REQUEST-SCOPED CACHE (litmus fix L3): keyed by the defining-rel probe. THE hot one
+        # — the per-edge hierarchy gate fired this SELECT once per candidate edge (302x per
+        # /ingest), identical every time; the row set cannot change mid-request.
+        _ck = ("hier", rt_lower)
+        _rows = self._tax_cache().get(_ck)
+        if _rows is None:
+            try:
+                with self.db_conn.cursor() as cur:
+                    # Query hierarchies that define this rel_type
+                    cur.execute("""
+                        SELECT taxonomy_name, member_entity_types, rel_types_defining_group
+                        FROM entity_taxonomies
+                        WHERE rel_types_defining_group @> ARRAY[%s]
+                        ORDER BY taxonomy_name
+                    """, (rt_lower,))
+                    _rows = cur.fetchall()
+                self._tax_cache()[_ck] = _rows
+            except Exception as e:
+                log.warning("wgm.hierarchy_membership_validation_failed",
+                           rel_type=rt_lower, error=str(e))
+                # The reason string is carried on the edge (``hierarchy_violation``) — keep it
+                # a code + ref, never the driver's sentence (src/api/errors.py). SAME graceful
+                # fallback verdict the pre-cache try gave a query failure.
+                return (True, "validation_error:" + _errors.public_detail(e, where="gate.hierarchy_membership", what=type(e).__name__), [])
+        matching_hierarchies = []
+        violations = []
 
-                matching_hierarchies = []
-                violations = []
+        for row in _rows:
+            hierarchy_name = row[0]
+            member_types = row[1] or []
+            defining_rels = row[2] or []
 
-                for row in cur.fetchall():
-                    hierarchy_name = row[0]
-                    member_types = row[1] or []
-                    defining_rels = row[2] or []
+            # Convert member_types to uppercase for comparison
+            member_types_upper = {t.upper() for t in member_types if t}
 
-                    # Convert member_types to uppercase for comparison
-                    member_types_upper = {t.upper() for t in member_types if t}
+            # Check if both subject and object types are in this hierarchy's members
+            subject_in_hierarchy = subject_type_upper in member_types_upper
+            object_in_hierarchy = object_type_upper in member_types_upper
 
-                    # Check if both subject and object types are in this hierarchy's members
-                    subject_in_hierarchy = subject_type_upper in member_types_upper
-                    object_in_hierarchy = object_type_upper in member_types_upper
+            if subject_in_hierarchy and object_in_hierarchy:
+                # Both types match this hierarchy
+                matching_hierarchies.append(hierarchy_name)
+                log.info("wgm.hierarchy_membership_valid",
+                        rel_type=rt_lower, hierarchy=hierarchy_name,
+                        subject_type=subject_type_upper, object_type=object_type_upper,
+                        member_types=member_types_upper)
+            elif subject_in_hierarchy or object_in_hierarchy:
+                # One matches, one doesn't — partial match (violation)
+                violations.append({
+                    "hierarchy": hierarchy_name,
+                    "reason": f"Mixed types: subject={subject_type_upper}({subject_in_hierarchy}), object={object_type_upper}({object_in_hierarchy}), hierarchy_members={list(member_types_upper)}"
+                })
 
-                    if subject_in_hierarchy and object_in_hierarchy:
-                        # Both types match this hierarchy
-                        matching_hierarchies.append(hierarchy_name)
-                        log.info("wgm.hierarchy_membership_valid",
-                                rel_type=rt_lower, hierarchy=hierarchy_name,
-                                subject_type=subject_type_upper, object_type=object_type_upper,
-                                member_types=member_types_upper)
-                    elif subject_in_hierarchy or object_in_hierarchy:
-                        # One matches, one doesn't — partial match (violation)
-                        violations.append({
-                            "hierarchy": hierarchy_name,
-                            "reason": f"Mixed types: subject={subject_type_upper}({subject_in_hierarchy}), object={object_type_upper}({object_in_hierarchy}), hierarchy_members={list(member_types_upper)}"
-                        })
+        if matching_hierarchies:
+            # Entity types match at least one hierarchy that defines this rel_type
+            return (True, f"hierarchy_valid:{','.join(matching_hierarchies)}", matching_hierarchies)
 
-                if matching_hierarchies:
-                    # Entity types match at least one hierarchy that defines this rel_type
-                    return (True, f"hierarchy_valid:{','.join(matching_hierarchies)}", matching_hierarchies)
+        if violations:
+            # Partial matches found (one entity type matches, other doesn't)
+            reason = f"partial_hierarchy_match: {'; '.join(v['reason'] for v in violations)}"
+            log.warning("wgm.hierarchy_membership_partial",
+                       rel_type=rt_lower, violations=violations)
+            return (False, reason, [])
 
-                if violations:
-                    # Partial matches found (one entity type matches, other doesn't)
-                    reason = f"partial_hierarchy_match: {'; '.join(v['reason'] for v in violations)}"
-                    log.warning("wgm.hierarchy_membership_partial",
-                               rel_type=rt_lower, violations=violations)
-                    return (False, reason, [])
-
-                # No hierarchies define this rel_type (novel or generic rel_type)
-                # This is OK — generic rel_types don't belong to a specific hierarchy
-                return (True, "no_hierarchy_defines_rel_type", [])
-
-        except Exception as e:
-            log.warning("wgm.hierarchy_membership_validation_failed",
-                       rel_type=rt_lower, error=str(e))
-            return (True, f"validation_error:{str(e)}", [])  # Graceful fallback
+        # No hierarchies define this rel_type (novel or generic rel_type)
+        # This is OK — generic rel_types don't belong to a specific hierarchy
+        return (True, "no_hierarchy_defines_rel_type", [])
 
     def validate_edge(self, subject_id, object_id, rel_type: str,
                       provenance=None, subject_type: str = None,
@@ -1462,6 +1993,43 @@ class WGMValidationGate:
 
         Per-user schema isolation: user_id parameter removed (schema itself provides isolation).
         """
+        # CONCRETE TYPE-MISMATCH REFUSAL (WGM_TYPE_MISMATCH_REFUSE, default ON — owner ruling
+        # 2026-09-16; see `_type_mismatch_refuse_on`). FIRST, deliberately: before the correction
+        # supersession below (a refused correction must supersede nothing) and before the
+        # confidence bypass (which returns early for user_stated 1.0 and used to enthrone the
+        # mismatch). Every provenance alike; a loud, user-correctable verdict, never a flag.
+        if _type_mismatch_refuse_on():
+            _viol = self._concrete_role_violation(
+                rel_type, subject_id, object_id, subject_type, object_type,
+            )
+            if _viol:
+                _rt_l = (rel_type or "").strip().lower()
+                _reason = (
+                    f"{_viol['role']} type '{_viol['entity_type']}' is not a declared "
+                    f"{_viol['role']} type of '{_rt_l}' (declared: {_viol['allowed']}) and no "
+                    f"hierarchy path admits it"
+                )
+                log.warning(
+                    "wgm.type_refused",
+                    rel_type=_rt_l, role=_viol["role"],
+                    entity_id=str(_viol.get("entity_id") or "")[:16],
+                    entity_type=_viol["entity_type"], allowed=_viol["allowed"],
+                    subject_type=subject_type, object_type=object_type,
+                    provenance=str(edge_args.get("fact_provenance") or provenance or "")[:24],
+                    is_correction=bool(self._is_user_correction(edge_args)),
+                    note="concrete value-type constraint violated (SHACL sh:class reading) — "
+                         "REFUSED, nothing written; user-correctable by asserting the entity's "
+                         "type or restating the fact",
+                )
+                return {
+                    "status": TYPE_REFUSED_STATUS,
+                    "reason": _reason,
+                    "role": _viol["role"],
+                    "entity_type": _viol["entity_type"],
+                    "allowed": _viol["allowed"],
+                    "committed": 0,
+                }
+
         # dprompt-90: Semantic supersession on user corrections
         # If this is a correction, archive conflicting facts before validation
         if self._is_user_correction(edge_args):
@@ -1473,6 +2041,41 @@ class WGMValidationGate:
                 )
 
         rt = rel_type.lower().strip()
+
+        # REFLEXIVE HIERARCHY TAUTOLOGY (WGM_REJECT_REFLEXIVE_HIERARCHY, default OFF).
+        # `X subclass_of X` is RDFS-ENTAILED by X being a class at all (RDF 1.1 Semantics
+        # entailment rule rdfs10 — see _reject_reflexive_hierarchy_on above), so asserting it
+        # adds no information while introducing a self-cycle into what must be a DAG and
+        # rendering as the nonsense recall line "Parent is a subclass of Parent".
+        # Placed BEFORE the confidence bypass so it also catches the user_stated 1.0 path
+        # (which returns early and never reaches the type checks).
+        # "WE DON'T FORGET" does not apply: there is no user content to lose — a self-loop
+        # names exactly ONE entity, which is already registered in `entities`/`entity_aliases`
+        # by the resolver before this call, and the triple itself is a tautology, not a memory.
+        # It is logged in full (both ids + rel) so the drop is auditable, never silent.
+        # Purely structural: identity of the two ids + the ontology's own `is_hierarchy_rel`.
+        # No vocabulary, no rel-name literal, no fuzzy matching.
+        if _reject_reflexive_hierarchy_on():
+            try:
+                _s_norm = str(subject_id or "").strip().lower()
+                _o_norm = str(object_id or "").strip().lower()
+                if _s_norm and _s_norm == _o_norm:
+                    _hier_meta = self.get_current_ontology().get(rt, {}) or {}
+                    if _hier_meta.get("is_hierarchy_rel"):
+                        log.warning(
+                            "wgm.reflexive_hierarchy_tautology",
+                            rel_type=rt, subject_id=_s_norm, object_id=_o_norm,
+                            note="self-loop on a hierarchy rel is RDFS-entailed (rdfs10) — "
+                                 "tautology carries no information and cycles the DAG; rejected",
+                        )
+                        return {
+                            "status": "reflexive_tautology",
+                            "reason": f"reflexive self-loop on hierarchy rel '{rt}'",
+                            "committed": 0,
+                        }
+            except Exception as _rfe:  # noqa: BLE001 — fail-safe: never break ingest on the guard
+                log.warning("wgm.reflexive_hierarchy_guard_failed",
+                            rel_type=rt, error=str(_rfe)[:120])
 
         # dprompt-119: Check for inverse rel_type mapping
         # If rel_type not found, try to find canonical form via inverse relationship
@@ -1523,21 +2126,14 @@ class WGMValidationGate:
 
                     return {"status": "novel_unapproved"}
 
-        # dprompt-064 Phase 1: Apply correction semantics (metadata-driven)
-        # BEFORE validation gates, check if this is an immutable fact
+        # dprompt-064 Phase 1: Apply correction semantics (metadata-driven).
+        # The former 'immutable' rejection arm is DELETED (owner ruling 2026-10-07,
+        # issue #224 — no immutable escape hatch anywhere in the correction lane):
+        # _apply_correction_semantics can no longer return action='immutable', so
+        # its whole vocabulary is hard_delete / supersede / accept, and a user
+        # correction is never refused here by rel name.
         if self._is_user_correction(edge_args):
-            correction_result = self._apply_correction_semantics(edge_args, rt)
-            if correction_result["action"] == "immutable":
-                log.warning(
-                    "wgm.immutable_fact_correction_rejected",
-                    rel_type=rt,
-                    reason=correction_result["reason"],
-                )
-                return {
-                    "status": "immutable_fact",
-                    "reason": correction_result["reason"],
-                    "committed": 0,
-                }
+            self._apply_correction_semantics(edge_args, rt)
 
         # Staged-facts hierarchy conflict cleanup:
         # For any hierarchy rel_type (is_hierarchy_rel=true), delete staged_facts rows
@@ -1581,6 +2177,43 @@ class WGMValidationGate:
             or ""
         ).strip().lower()
         _is_user_authored = (_edge_provenance == "user_stated") or is_user_correction
+
+        # SEED-DECLARED CONSTRAINT WITHHOLDS THE USER-IS-TRUTH EXEMPTION
+        # (WGM_SEED_TYPE_CONSTRAINT_ENFORCE, default OFF → `_exempt_user_authored` is exactly
+        # `_is_user_authored` and every branch below is byte-for-byte unchanged).
+        #
+        # The exemption above is right for a fact the USER authored. But the ingest provenance
+        # router stamps `user_stated` on everything arriving via MCP, and on the STATEMENT path
+        # the user authored the CONTENT while the EXTRACTOR authored the STRUCTURE (the rel_type
+        # this reading got filed under). So an extractor's rel choice inherits user authority and
+        # the type veto is exempted on 100% of ingests — which is how a `met` edge whose object is
+        # a concrete non-Person, or an `owns` edge whose object is a concrete non-{Animal,Object,
+        # Organization}, lands durable despite the rel's own DECLARED value-type shape.
+        #
+        # AUTHORITY ORDER (user > seed > engine growth) supplies the discriminator, structurally:
+        # when the violated shape is the SEED's (present in `public.rel_types` — detected by
+        # PRESENCE, never by a rel-name literal), engine growth may widen it but may not override
+        # it, so the exemption is withheld and the edge falls through to the SAME documented
+        # Class-C quarantine used for every other type-inconsistent reading (we don't forget). A
+        # rel that is NOT seeded is genuinely novel — growth owns its structure — and is untouched.
+        _exempt_user_authored = _is_user_authored
+        _seed_constraint_violation = None
+        if _is_user_authored and _seed_type_constraint_enforce_on():
+            _seed_constraint_violation = self._seed_declared_constraint_violation(
+                rt, subject_id, object_id, subject_type, object_type,
+            )
+            if _seed_constraint_violation:
+                _exempt_user_authored = False
+                log.info(
+                    "wgm.seed_type_constraint_withholds_exemption",
+                    rel_type=rt, role=_seed_constraint_violation,
+                    subject_type=subject_type, object_type=object_type,
+                    provenance=_edge_provenance or "user_correction",
+                    note="SHACL-style value-type constraint declared by the SEED template is "
+                         "violated by a concrete type; extractor-chosen structure does not inherit "
+                         "user authority over a seeded shape → routed to Class-C quarantine",
+                )
+
         # Set True when a user-authored edge's type genuinely mismatched (logged as a growth
         # candidate below); used to skip the constraint-driven type INFERENCE so we never stamp
         # a mismatching constraint type (e.g. Person) onto the user's actual entity (a product).
@@ -1662,7 +2295,9 @@ class WGMValidationGate:
                         # USER-IS-TRUTH EXEMPTION: a user-authored edge is NOT quarantined —
                         # it lands durable and the mismatch is logged as an ontology-growth
                         # candidate (widen the rel's head/tail_types to admit the user's world).
-                        if not _is_user_authored:
+                        # `_exempt_user_authored` == `_is_user_authored` unless the SEED-declared
+                        # shape is the one being violated (flag-gated; see above).
+                        if not _exempt_user_authored:
                             _bypass_type_conflict = True
                             log.info("wgm.confidence_bypass_type_pregate",
                                      rel_type=rt, confidence=raw_confidence,
@@ -1704,7 +2339,9 @@ class WGMValidationGate:
                             # user-authored fact. A user-stated "a product was born" / "the company
                             # was founded" genuinely violates a Person-constrained head — but it is
                             # TRUE, so it lands durable and the mismatch becomes a growth candidate.
-                            if not _is_user_authored:
+                            # `_exempt_user_authored` == `_is_user_authored` unless the SEED-declared
+                            # shape is the one being violated (flag-gated; see above).
+                            if not _exempt_user_authored:
                                 _bypass_type_conflict = True
                                 log.info("wgm.confidence_bypass_passed_type_veto",
                                          rel_type=rt, confidence=raw_confidence,
@@ -1741,15 +2378,19 @@ class WGMValidationGate:
             # that would poison L4 (e.g. mark the user's product as 'Person' just because
             # born_on.head=Person). The mismatch is a rel-widening candidate, not an entity
             # re-type. Only fill types for user-authored edges whose types actually satisfy.
+            # …and only when the constraint UNAMBIGUOUSLY entails one type — a disjunctive
+            # `tail_types` entails none (`_entailed_constraint_type`); undecidable → leave unknown.
             if not _user_authored_type_mismatch:
                 if not head_any and head_types:
                     st = self._resolve_entity_type(subject_id)
-                    if st and st.lower() == 'unknown':
-                        self._infer_entity_type(subject_id, head_types[0])
+                    _ht = _entailed_constraint_type(head_types)
+                    if st and st.lower() == 'unknown' and _ht:
+                        self._infer_entity_type(subject_id, _ht)
                 if not tail_any and not is_scalar and tail_types:
                     ot = self._resolve_entity_type(object_id)
-                    if ot and ot.lower() == 'unknown':
-                        self._infer_entity_type(object_id, tail_types[0])
+                    _tt = _entailed_constraint_type(tail_types)
+                    if ot and ot.lower() == 'unknown' and _tt:
+                        self._infer_entity_type(object_id, _tt)
             log.info("wgm.confidence_bypass_early",
                      rel_type=rt, confidence=raw_confidence,
                      is_user_correction=is_user_correction,
@@ -1770,7 +2411,7 @@ class WGMValidationGate:
         # for downgrade to Class C in the ingest loop — never silently pass.
         # USER-IS-TRUTH EXEMPTION: a user-authored fact (user_stated / correction) at
         # sub-0.95 confidence is NOT downgraded either — same principle as the bypass pregate.
-        if not type_ok and type_reason == "hierarchy_type_mismatch" and _is_user_authored:
+        if not type_ok and type_reason == "hierarchy_type_mismatch" and _exempt_user_authored:
             log.info("wgm.type_veto_exempted_user_stated",
                      rel_type=rt, provenance=_edge_provenance or "user_correction",
                      reason="hierarchy_type_mismatch",
@@ -2004,7 +2645,7 @@ class WGMValidationGate:
                 " (subject_id, object_id, rel_type, provenance,"
                 "  temporal_status, event_date, event_date_granularity, polarity)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT (subject_id, object_id, rel_type) DO UPDATE SET"
+                " ON CONFLICT (subject_id, object_id, rel_type) WHERE superseded_at IS NULL DO UPDATE SET"
                 "   temporal_status = CASE WHEN EXCLUDED.temporal_status = 'now'"
                 "     THEN facts.temporal_status ELSE EXCLUDED.temporal_status END,"
                 "   event_date = COALESCE(EXCLUDED.event_date, facts.event_date),"
@@ -2054,6 +2695,13 @@ class WGMValidationGate:
         upgrade its metadata if needed.
         Returns True if the type was inserted (or already existed).
         """
+        _refusal = _rel_type_growth_gate_refusal(rel_type)
+        if _refusal:
+            log.warning("gate.novel_type_mint_refused",
+                        rel_type=str(rel_type)[:60], reason=_refusal,
+                        seam="auto_approve",
+                        note="structural growth veto - deferred, not minted, not quarantined")
+            return False
         try:
             with self.db_conn.cursor() as cur:
                 cur.execute(
@@ -2088,6 +2736,17 @@ class WGMValidationGate:
         If approved with confidence >= 0.7, inserts into rel_types and returns True.
         Otherwise, inserts into pending_types and returns False.
         """
+        _refusal = _rel_type_growth_gate_refusal(rel_type)
+        if _refusal:
+            # REFUSE BEFORE the enrichment call: a structurally ineligible string never
+            # spends LLM validation and never mints. The FACT is not lost - validate_edge
+            # files it under the unknown rel (Class C pending classification); the False
+            # return here only skips the vocabulary write.
+            log.warning("gate.novel_type_mint_refused",
+                        rel_type=str(rel_type)[:60], reason=_refusal,
+                        seam="llm_approve",
+                        note="structural growth veto - mint refused, fact preserved")
+            return False
         try:
             # Use centralized retry logic instead of raw httpx.post()
             messages = [

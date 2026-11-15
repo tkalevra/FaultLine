@@ -9,14 +9,15 @@ scan (the poison-test guarantee).
 Two modes, selected by env ``QDRANT_PARTITION_MODE``:
 
   • ``collection_per_seat`` (DEFAULT) — TODAY's exact behavior, BYTE-FOR-BYTE. The resolved
-    collection name is the current ``derive_collection`` output and NO
+    collection name is the current ``derive_collection`` / ``flagent-<uuid>`` output and NO
     tenant filter is injected (``tenant_filter is None``). ``stamp_tenant`` is a no-op. This
     lets the code deploy changing nothing until the flag is flipped + data migrated.
 
-  • ``shared_payload`` — the consolidated model. One shared collection
-    ``faultline-memory``. Every point carries ``payload.tenant_id = <seat_uuid>``; every
-    read/delete carries the ALWAYS-FILTER ``{must:[{key:tenant_id, match:{value:seat}}]}``.
-    An unresolvable seat → ``tenant_filter is None`` → ``require_tenant`` THROWS.
+  • ``shared_payload`` — the consolidated model. Two shared collections (one per embedding
+    kind): ``faultline-memory`` (Class-C scratchpad) and ``flagent-cortex`` (agent cortex).
+    Every point carries ``payload.tenant_id = <seat_uuid>``; every read/delete carries the
+    ALWAYS-FILTER ``{must:[{key:tenant_id, match:{value:seat}}]}``. An unresolvable seat →
+    ``tenant_filter is None`` → ``require_tenant`` THROWS.
 
 Seams left for later phases (do NOT build here):
   • P2 (per-seat JWT): ``qdrant_headers()`` is where a minted, seat-scoped JWT bearer will be
@@ -37,10 +38,12 @@ MODE_COLLECTION_PER_SEAT = "collection_per_seat"
 MODE_SHARED_PAYLOAD = "shared_payload"
 
 SHARED_MEMORY_COLLECTION = "faultline-memory"
+SHARED_CORTEX_COLLECTION = "flagent-cortex"
 
 TENANT_KEY = "tenant_id"
 
 KIND_MEMORY = "memory"
+KIND_CORTEX = "cortex"
 
 # Namespace for tenant-scoped point ids in shared mode. In ``collection_per_seat`` the point
 # id is UUIDv5 over (source_table, fact_id) — collision-free WITHIN a seat's own collection.
@@ -130,8 +133,16 @@ def _derive_memory_collection(user_id: str) -> str:
     return derive_collection(user_id or "")
 
 
+def _derive_cortex_collection(user_id: str) -> Optional[str]:
+    # Lazy import to avoid an import cycle (cortex imports this module).
+    from src.api.cortex import cortex_collection_for
+    return cortex_collection_for(user_id)
+
+
 def resolve_partition(user_id: Any, kind: str = KIND_MEMORY):
     """THE choke-point. Resolve ``(collection_name, tenant_filter)`` for a Qdrant op.
+
+    ``kind`` ∈ {``memory``, ``cortex``}.
 
     collection_per_seat → (per-seat collection, None)  [today, byte-for-byte]
     shared_payload      → (shared collection, {"must":[{tenant_id: seat}]} or None)
@@ -144,6 +155,11 @@ def resolve_partition(user_id: Any, kind: str = KIND_MEMORY):
     collection (e.g. ``faultline-memory-clinical-<shard>``) + per-seat payload encryption,
     never the shared one. That branch keys off the account_kind resolved from ``user_id``.
     """
+    if kind == KIND_CORTEX:
+        if shared_mode():
+            return SHARED_CORTEX_COLLECTION, tenant_filter_for(user_id)
+        return _derive_cortex_collection(user_id), None
+    # default: memory
     if shared_mode():
         return SHARED_MEMORY_COLLECTION, tenant_filter_for(user_id)
     return _derive_memory_collection(user_id), None
@@ -192,9 +208,9 @@ def stamp_tenant(payload: Optional[dict], user_id: Any) -> dict:
 def resolve_point_id(user_id: Any, source_table: str, fact_id: Any, kind: str = KIND_MEMORY) -> str:
     """Collision-free Qdrant point id for a fact/note.
 
-    collection_per_seat → today's derivation (UUIDv5 over ``source_table:fact_id``).
-    shared_payload → fold the seat uuid in so two seats' ``facts#5`` never collide into one
-    shared point.
+    collection_per_seat → today's derivation (UUIDv5 over ``source_table:fact_id`` for memory;
+    the bare int for cortex is handled by ``resolve_cortex_point_id``). shared_payload → fold
+    the seat uuid in so two seats' ``facts#5`` never collide into one shared point.
     """
     if not shared_mode():
         from src.re_embedder.embedder import derive_qdrant_point_id
@@ -203,6 +219,17 @@ def resolve_point_id(user_id: Any, source_table: str, fact_id: Any, kind: str = 
     if v is None:
         raise UnboundTenantError("refusing to derive a shared point id with no resolvable tenant")
     return str(uuid.uuid5(_SHARED_POINT_NS, f"{v}:{source_table}:{int(fact_id)}"))
+
+
+def resolve_cortex_point_id(user_id: Any, row_id: Any):
+    """Cortex point id. Per-seat → the bare int row id (today). Shared → a tenant-namespaced
+    UUID so two seats' ``cortex_episodes#N`` never collide into one shared point."""
+    if not shared_mode():
+        return int(row_id)
+    v = tenant_value(user_id)
+    if v is None:
+        raise UnboundTenantError("refusing to derive a shared cortex point id with no tenant")
+    return str(uuid.uuid5(_SHARED_POINT_NS, f"cortex:{v}:{int(row_id)}"))
 
 
 # ── filter/body composition (reads, searches, scrolls, deletes) ──────────────────────────

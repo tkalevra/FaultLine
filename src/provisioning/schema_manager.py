@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 from urllib.parse import urlparse
 from src.config.settings import settings
+from src.api import errors as _errors  # THE ONE ERROR SEAM — user_provisioning.error_message is rendered by /provisioning/status
+from src.api.db_read import release_read_transaction
 
 log = structlog.get_logger()
 
@@ -141,7 +143,7 @@ def derive_user_slug_from_uuid(user_id: str) -> str:
 
 
 
-def execute_psql_file(file_path: Path, schema_name: str, dsn_components: Dict[str, str], timeout: int = 30) -> Tuple[bool, str]:
+def execute_psql_file(file_path: Path, schema_name: str, dsn_components: Dict[str, str], timeout: int = None) -> Tuple[bool, str]:
     """Execute SQL file via psql subprocess with proper error handling.
 
     Uses psql directly for bulletproof SQL parsing (handles dollar-quoted strings,
@@ -158,6 +160,15 @@ def execute_psql_file(file_path: Path, schema_name: str, dsn_components: Dict[st
     """
     if not file_path.exists():
         return False, f"File not found: {file_path}"
+
+    # PROVISIONING_PSQL_TIMEOUT_S (interactive-latency): the user-schema template is a
+    # ~1100-line DDL+seed file. On a loaded box it legitimately takes >30s, and the old
+    # hard default made every such attempt a psql_timeout FAILURE — the queue then retried
+    # the whole schema creation six times (measured 145s to provision a fresh seat on
+    # pre-prod, with each attempt's DDL freezing the event loop before the worker offload).
+    # 120s default: first-try completion under load; env-tunable without a rebuild.
+    if timeout is None:
+        timeout = int(os.environ.get("PROVISIONING_PSQL_TIMEOUT_S", "120"))
 
     try:
         # Build psql command
@@ -183,7 +194,7 @@ def execute_psql_file(file_path: Path, schema_name: str, dsn_components: Dict[st
             "-h", dsn_components["host"],
             "-p", dsn_components["port"],
             "-d", dsn_components["database"],
-            "-c", f"SET search_path TO {schema_name}, public",
+            "-c", f"SET search_path TO {schema_name}, public",  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema_name validated by derive_user_slug_from_uuid UUID regex + derive_schema_name sanitize
             "-f", str(file_path)
         ]
 
@@ -235,7 +246,7 @@ def execute_psql_file(file_path: Path, schema_name: str, dsn_components: Dict[st
         log.error(f"psql_timeout", file=str(file_path), schema=schema_name, timeout=timeout)
         return False, msg
     except Exception as e:
-        msg = f"psql execution failed: {str(e)}"
+        msg = "psql execution failed: " + _errors.public_detail(e, where="schema.psql", what=type(e).__name__)
         log.error(f"psql_exception", file=str(file_path), schema=schema_name, error=str(e))
         return False, msg
 
@@ -244,22 +255,206 @@ def derive_schema_name(user_slug: str) -> str:
     """Derive PostgreSQL schema name from user slug (never hardcode).
 
     Args:
-        user_slug: Human-readable slug from users.slug (e.g., "alexander")
+        user_slug: Human-readable slug from users.slug (e.g., "christopher")
 
     Returns:
-        Schema name (e.g., "faultline_alice")
+        Schema name (e.g., "faultline_christopher")
 
     Examples:
-        >>> derive_schema_name("alexander")
-        'faultline_alice'
+        >>> derive_schema_name("christopher")
+        'faultline_christopher'
 
-        >>> derive_schema_name("elena")
-        'faultline_bob'
+        >>> derive_schema_name("ada")
+        'faultline_marla'
     """
     # Sanitize slug: lowercase, alphanumeric + underscore only
     safe_slug = "".join(c if c.isalnum() or c == "_" else "_" for c in user_slug.lower())
     prefix = settings.SCHEMA_NAME_PREFIX
     return f"{prefix}_{safe_slug}"
+
+
+# ── Agent Cortex (Tier-1 episodic self-healing) — firewalled per-seat schema ──────────
+# The cortex is the serving-agent's OWN memory of operating this tenant's memory. It
+# lives in its OWN schema `flagent_<uuid_slug>`, DISTINCT from the user-fact schema
+# `faultline_<uuid_slug>`. That distinct string IS the truth firewall: the user-fact
+# walk derives ONLY the `faultline_` name, so it can NEVER reference the cortex table.
+# Prefix is INTENTIONALLY NOT `settings.SCHEMA_NAME_PREFIX` — it must never collide with
+# the user prefix even if that setting is overridden.
+CORTEX_SCHEMA_PREFIX = "flagent"
+
+
+def derive_cortex_schema_name(user_id: str) -> str:
+    """Derive the firewalled cortex schema name from a user UUID (never hardcode).
+
+    Mirrors ``derive_user_slug_from_uuid`` + ``derive_schema_name`` but emits the
+    ``flagent_`` prefix so the name is DISJOINT from the user-fact schema
+    (``faultline_``). Raises on a non-UUID id (a bad id can never interpolate a
+    schema name).
+
+    Example:
+        derive_cortex_schema_name("550e8400-e29b-41d4-a716-446655440000")
+        -> 'flagent_550e8400_e29b_41d4_a716_446655440000'
+        (never equal to the user schema 'faultline_550e8400_...').
+    """
+    slug = derive_user_slug_from_uuid(user_id)  # validates UUID; raises on bad id
+    return f"{CORTEX_SCHEMA_PREFIX}_{slug}"
+
+
+def _bind_cortex_seed_brain(user_id: str):
+    """Bind the provisioning seat's OWN BYO engine-brain for the cortex seed (BYOM audit GAP-1).
+
+    The seed's semantic lane (``cortex.seed_usage_patterns`` -> ``_embed_cortex_text`` ->
+    ``llm_client.get_llm_chat_url()``) used to run with NO brain bound in the provisioning
+    context: under SAAS every seed embed was refused (``saas.global_brain_refused
+    account_id=(unresolved)``) and even a PAID tenant's cortex seed landed keyword-only.
+    ``user_id`` is in hand here, so bind THAT user's brain — the provisioning twin of the
+    backend request seam (``main.py::_saas_bind_tenant_brain`` -> ``bind_request_brain``).
+
+    Discipline mirrors ``src/re_embedder/embedder.py::_reembedder_bind_tenant_brain``
+    (post-BUG-12): fail-safe (never raise into provisioning) but never silent — the exact
+    saas-absent OSS miss stays silent, every other bind failure and every brainless resolution
+    warns LOUDLY with a note that the seed proceeds keyword-only. Returns the ContextVar token
+    to clear (None = nothing to clear).
+    """
+    try:
+        from saas.llm_context import bind_request_brain
+        _token = bind_request_brain(user_id)
+    except ModuleNotFoundError as _missing:
+        # THE OSS NO-OP STATE, NOT A FAILURE (same ruling as embedder): the public core has no
+        # saas package at all. Exactly that one miss stays silent; a None-in-sys.modules halt or
+        # a missing TRANSITIVE dependency renders a DIFFERENT message and falls through loud.
+        if str(_missing) == "No module named 'saas'":
+            return None
+        log.warning("provisioning.tenant_brain_seed_bind_failed",
+                    user_id=user_id[:8], error=type(_missing).__name__,
+                    detail=str(_missing)[:120],
+                    note="cortex seed proceeds keyword-only (embed refused fail-closed)")
+        return None
+    except Exception as _bind_err:  # noqa: BLE001 — fail-safe (seed never blocks), but LOUD
+        log.warning("provisioning.tenant_brain_seed_bind_failed",
+                    user_id=user_id[:8], error=type(_bind_err).__name__,
+                    detail=str(_bind_err)[:120],
+                    note="cortex seed proceeds keyword-only (embed refused fail-closed)")
+        return None
+    # Read the bind back the way an LLM call would see it and say so: bind_request_brain binds
+    # NOTHING for a user with no owning ACTIVE account, and the no-brain sentinel for an account
+    # without a routable brain — in both states the seed stays keyword-only. SAAS off = the
+    # byte-for-byte OSS no-op (nothing was bound, nothing to say).
+    try:
+        from saas.config import saas_mode_enabled
+        if saas_mode_enabled():
+            from saas.llm_context import current_llm_config
+            _cfg = current_llm_config()
+            if _cfg is None:
+                log.warning("provisioning.tenant_brain_seed_bind_unresolved",
+                            user_id=user_id[:8],
+                            note="no owning ACTIVE account resolved - seed proceeds keyword-only")
+            elif _cfg.get("no_brain") or not _cfg.get("base_url"):
+                log.warning("provisioning.tenant_brain_seed_bind_no_routable_brain",
+                            user_id=user_id[:8], account=_cfg.get("account_id") or "-",
+                            reason=_cfg.get("no_brain_reason") or "no_base_url",
+                            note="seed proceeds keyword-only (embed fail-closed, never a global)")
+    except Exception:  # noqa: BLE001 — an observer must never break the bind it reports on
+        pass
+    return _token
+
+
+def _clear_cortex_seed_brain(token) -> None:
+    """Teardown twin of ``_bind_cortex_seed_brain`` (mirrors
+    ``src/re_embedder/embedder.py::_reembedder_clear_tenant_brain``): the seed's brain must
+    never outlive the seat it was bound for. No-op on a None token (OSS / SAAS off / failed
+    bind — in each, nothing was bound, so nothing may be cleared).
+
+    ⚠️ SAME-CONTEXT discipline: bind (token set) and this reset MUST stay in ONE contextvars
+    context — the provisioning worker runs the whole batch in one copied context and the lazy
+    in-request caller (``cortex._ensure_cortex_schema`` -> ``create_cortex_schema``) is one
+    request task, so the token reset restores the PRIOR value (unset, or the request's own
+    bind) exactly. Moving this clear across a thread/task boundary makes ``ContextVar.reset``
+    raise ValueError (swallowed below) and STRANDS the bound brain — the cross-seat leak the
+    finally exists to prevent."""
+    if token is None:
+        return
+    try:
+        from saas.llm_context import reset_llm_config
+        reset_llm_config(token)
+    except Exception:  # noqa: BLE001 — teardown must never raise into provisioning
+        pass
+
+
+def create_cortex_schema(user_id: str, db: Optional[psycopg2.extensions.connection] = None) -> Tuple[str, str]:
+    """Create the per-seat cortex schema ``flagent_<uuid>`` and its one table.
+
+    Idempotent (``CREATE SCHEMA/TABLE IF NOT EXISTS``). Uses its OWN template
+    ``templates/cortex_schema.sql`` (NOT the user template). Best-effort: a failure
+    here NEVER blocks user provisioning — cortex writes are fail-safe until the schema
+    exists (they simply no-op-log until then).
+
+    Returns (schema_name, status) where status is 'ready' or an error description.
+    """
+    schema_name = derive_cortex_schema_name(user_id)  # raises on non-UUID
+    close_conn = False
+    try:
+        if not db:
+            db = get_postgres_connection()
+            close_conn = True
+
+        template_path = Path(__file__).parent / "templates" / "cortex_schema.sql"
+        if not template_path.exists():
+            return schema_name, f"Cortex template not found: {template_path}"
+        template_sql = template_path.read_text().replace("{schema_name}", schema_name)
+
+        with db.cursor() as cur:
+            # Create the FIREWALLED schema, then apply the template DDL under it.
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query schema_name derived from UUID via derive_cortex_schema_name which calls derive_user_slug_from_uuid (UUID regex validated)
+            # Bind the cortex schema WITHOUT public — the DDL is fully schema-qualified,
+            # but binding keeps any unqualified object creation isolated too.
+            cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query validated cortex schema name from UUID source
+            cur.execute(template_sql)
+        db.commit()
+        log.info("created_cortex_schema", schema=schema_name, user_id=user_id[:8])
+        # Seed the HOW-YOU-OPERATE usage-pattern set into THIS tenant's cortex schema
+        # (per-tenant seed rail — `public` is a read-only template, never read at runtime).
+        # Idempotent + best-effort: a seed failure NEVER blocks provisioning (opens its own
+        # flagent_<uuid> connection; the table is already committed above).
+        # BYOM GAP-1: bind the provisioning seat's OWN brain for the seed (its semantic lane
+        # embeds via llm_client.get_llm_chat_url, which refuses under SAAS with no brain bound),
+        # then clear it — the brain must never outlive this seat's seed step.
+        _seed_brain_token = _bind_cortex_seed_brain(user_id)
+        try:
+            from src.api.cortex import seed_usage_patterns
+            _seeded = seed_usage_patterns(user_id)
+            log.info("seeded_cortex_usage_patterns", user_id=user_id[:8], inserted=_seeded)
+        except Exception as _seed_e:
+            log.warning("seed_cortex_usage_patterns_failed_nonfatal",
+                        user_id=user_id[:8], error=str(_seed_e)[:120])
+        finally:
+            _clear_cortex_seed_brain(_seed_brain_token)
+        # Per-seat cortex Qdrant collection (`flagent-<uuid>`, DISTINCT from the user's
+        # `faultline-<uuid>`) — the semantic recall lane's HNSW index. Best-effort +
+        # fail-safe: a Qdrant outage NEVER blocks provisioning; the cortex write path
+        # re-ensures the collection lazily on first /iremember.
+        try:
+            from src.api.cortex import ensure_cortex_collection_for
+            _cx_coll_ok = ensure_cortex_collection_for(user_id)
+            log.info("created_cortex_collection", user_id=user_id[:8], ok=bool(_cx_coll_ok))
+        except Exception as _cx_e:
+            log.warning("create_cortex_collection_failed_nonfatal",
+                        user_id=user_id[:8], error=str(_cx_e)[:120])
+        return schema_name, "ready"
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        log.error("create_cortex_schema_failed", schema=schema_name,
+                  user_id=user_id[:8], error=str(e))
+        return schema_name, "Cortex schema creation failed: " + _errors.public_detail(e, where="schema.cortex", what=type(e).__name__)
+    finally:
+        if close_conn and db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: str, user_id: str) -> bool:
@@ -345,6 +540,58 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
                 ON CONFLICT (alias) DO NOTHING
             """)
             log.info("bootstrapped_rel_type_aliases", schema=schema_name, note="copied from public template")
+
+            # Bootstrap the SENSE LAYER (migration 323, LANGUAGE-STANDARDS-SPEC.md §2):
+            # copy the seed senses + the citable VerbNet class inventory + the
+            # sense-scoped VerbNet bindings from the public TEMPLATE into the tenant
+            # schema. public is the SEED SOURCE only, never read at runtime (the
+            # rel_type_aliases discipline). The tables themselves come from the template
+            # (which MUST precede rel_types — its sense_id carries the inline FK); the
+            # to_regclass guards skip an older template rather than fail provisioning,
+            # mirroring migration 320's fan. Serial ids are per-schema: the bindings map
+            # through the NATURAL keys (sense_key / class_id), never the ids.
+            cur.execute(
+                "SELECT to_regclass('public.senses') IS NOT NULL "
+                "AND to_regclass('public.verbnet_classes') IS NOT NULL "
+                "AND to_regclass('public.sense_verbnet_bindings') IS NOT NULL "
+                "AND to_regclass(%s) IS NOT NULL "
+                "AND to_regclass(%s) IS NOT NULL "
+                "AND to_regclass(%s) IS NOT NULL",
+                (f"{schema_name}.senses", f"{schema_name}.verbnet_classes",
+                 f"{schema_name}.sense_verbnet_bindings"),
+            )
+            if cur.fetchone()[0]:
+                cur.execute("""
+                    INSERT INTO senses
+                        (sense_key, lemma, pos, sense_class, definition, standard_ref,
+                         discriminators, default_sense, source)
+                    SELECT sense_key, lemma, pos, sense_class, definition, standard_ref,
+                           discriminators, default_sense, source
+                    FROM public.senses
+                    WHERE source = 'seed'
+                    ON CONFLICT (sense_key) DO NOTHING
+                """)
+                cur.execute("""
+                    INSERT INTO verbnet_classes
+                        (class_id, label, members, lexicon_ref, source)
+                    SELECT class_id, label, members, lexicon_ref, source
+                    FROM public.verbnet_classes
+                    WHERE source = 'seed'
+                    ON CONFLICT (class_id) DO NOTHING
+                """)
+                cur.execute("""
+                    INSERT INTO sense_verbnet_bindings
+                        (sense_id, verbnet_class_id, source)
+                    SELECT ls.id, lv.id, b.source
+                    FROM public.sense_verbnet_bindings b
+                    JOIN public.senses s ON s.id = b.sense_id
+                    JOIN public.verbnet_classes v ON v.id = b.verbnet_class_id
+                    JOIN senses ls ON ls.sense_key = s.sense_key
+                    JOIN verbnet_classes lv ON lv.class_id = v.class_id
+                    ON CONFLICT (sense_id, verbnet_class_id) DO NOTHING
+                """)
+                log.info("bootstrapped_sense_layer", schema=schema_name,
+                         note="copied from public template (migration 323 seeds)")
 
             # NOTE: entity_taxonomies seeded separately via _seed_entity_taxonomies()
             # (Moved to dedicated function for clarity and to copy from public schema)
@@ -458,15 +705,27 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
             # 'aspectual_control_verb' (migration 113, _aspectual_activity_xcomp — start/begin/keep/
             # continue/resume/finish/stop phase verbs licensing the split-SVO xcomp descent), and
             # 'employment_verb' (migration 125, derive_sentence_facts._chain_employment — work/serve/
-            # act/employ/hire/… gating the "<subj> <verb> as <role> [at|for <org>]" construction). The
+            # act/employ/hire/… gating the "<subj> <verb> as <role> [at|for <org>]" construction), and
+            # 'relocation_verb' (migration 167, derive_sentence_facts._chain_relocation — move/relocate/
+            # resettle/emigrate/… gating "<person> <verb> to <place>" → lives_in state change). The
             # relations stay in code; only the verb-LEMMA / particle-SURFACE VOCABULARY is DB data that grows
             # (freq-gated, tenant-only). Copies the seeded GRAMMAR/UNIT/KINSHIP categories.
             #
-            # CARVE-OUT (lean-seed): the DOMAIN-FLAVORED classes social_role / problem_noun / thin_type
-            # are NO LONGER seeded — they are GROWN PER-TENANT from observed constructions (re_embedder
+            # CARVE-OUT (lean-seed): the DOMAIN-FLAVORED classes problem_noun / thin_type are NOT seeded —
+            # they are GROWN PER-TENANT from observed constructions (re_embedder
             # grow_linguistic_cue_candidates). The WHERE excludes them as defense-in-depth so a NEW tenant
-            # never inherits them even if a stray seed row reappears in public (migration 119 also clears
+            # never inherits them even if a stray seed row reappears in public (migration 123 also clears
             # public). KINSHIP (kinship_noun/kinship_gender) + grammar/unit classes REMAIN seeded.
+            #
+            # ⚠️ AMENDED 2026-08-27 (migration 272): `social_role` is NO LONGER carved out. It measured
+            # n=0 on a fresh seat, which left the possessed-person-role rail INERT on every virgin
+            # tenant — "My colleague works late." emitted (user, owns, colleague), a PERSON filed as an
+            # OWNED OBJECT. It is not domain-flavored: colleague/coworker/teammate/roommate is
+            # CLOSED-CLASS English structure, the same category as the already-seeded kinship_noun, and
+            # the inventory is WordNet-derived (DEV/derivations/social_role_from_wordnet.py). Per the
+            # owner's ruling, engine scaffolding is seeded and grown, never gated behind confirmations.
+            # This carve-out is defense-in-depth ONLY — leaving social_role in the list would silently
+            # starve every NEW tenant of the class migration 272 seeds into public.
             cur.execute("""
                 INSERT INTO linguistic_cues
                     (cue, category, frequency, confirmed_count, rejected_count,
@@ -476,7 +735,7 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
                        correction_count, global_confidence, description, example_text,
                        source, is_active, archived_at, last_matched_at
                 FROM public.linguistic_cues
-                WHERE category NOT IN ('social_role', 'problem_noun', 'thin_type')
+                WHERE category NOT IN ('problem_noun', 'thin_type')
                 ON CONFLICT (cue, category) DO NOTHING
             """)
 
@@ -528,16 +787,33 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
 
             # Seed user identity anchor — allows first-person references from GLiNER2
             # (subject="user") to normalize to the user UUID immediately on first ingest.
-            # Overwritable: when user later says "my name is Alex", pref_name updates the alias.
+            # Overwritable: when user later says "my name is Chris", pref_name updates the alias.
             cur.execute("""
                 INSERT INTO entities (id, entity_type)
                 VALUES (%s, 'Person')
                 ON CONFLICT (id) DO NOTHING
             """, (user_id,))
+            # PLACEHOLDER PROVENANCE (identity-honesty, ALIAS-PROVENANCE-DESIGN provisioned):
+            # the 'user' alias is a PROVISIONING PLACEHOLDER nobody ever chose, so it must be
+            # stamped preference_source='provisioned' (rank 1) — NOT left at the column default
+            # 'unspecified' (rank 0). Measured on the owner's demo seat: the unstamped row was
+            # accepted by every read-time guard that checks preference_source != 'provisioned'
+            # and by _is_surfaceable_user_name ('user' is not a stopword), so recall rendered the
+            # literal placeholder FOREVER — and a user-stated name (rank 5) that did land had to
+            # fight a phantom unspecified incumbent instead of an honestly-labelled placeholder.
+            # Stamping at the SOURCE keeps every consumer's existing provisioned-refusal logic
+            # (query display gate, fallback SQL, re_embedder suspect flag) finally reachable.
+            # The ON CONFLICT arm deliberately does NOT clobber an existing preference_source —
+            # a re-run of bootstrap must never demote a name the user already stated.
             cur.execute("""
-                INSERT INTO entity_aliases (entity_id, alias, is_preferred)
-                VALUES (%s, 'user', TRUE)
-                ON CONFLICT (entity_id, alias) DO UPDATE SET is_preferred = TRUE
+                INSERT INTO entity_aliases (entity_id, alias, is_preferred, preference_source)
+                VALUES (%s, 'user', TRUE, 'provisioned')
+                ON CONFLICT (entity_id, alias) DO UPDATE
+                SET is_preferred = TRUE,
+                    preference_source = CASE
+                        WHEN entity_aliases.preference_source = 'unspecified'
+                        THEN 'provisioned'
+                        ELSE entity_aliases.preference_source END
             """, (user_id,))
             log.info("bootstrapped_user_anchor", schema=schema_name, user_id=user_id)
 
@@ -577,8 +853,7 @@ def _seed_entity_taxonomies(user_id: str, schema_name: str, db: psycopg2.extensi
     try:
         with db.cursor() as cur:
             # Set schema path for this transaction
-            cur.execute(f"SET search_path TO {schema_name}, public")
-
+            cur.execute(f"SET search_path TO {schema_name}, public")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query schema_name from derive_schema_name(UUID) validated
             # Copy taxonomies from public schema to per-user schema
             # ON CONFLICT ensures idempotency (can be retried safely)
             # Phase 2 (2C): carry `source` so seeded vs user-corrected scope rows
@@ -618,7 +893,7 @@ def _seed_entity_taxonomies(user_id: str, schema_name: str, db: psycopg2.extensi
             db.commit()
 
             # Verify seeding succeeded by counting rows
-            cur.execute(f"SET search_path TO {schema_name}, public")
+            cur.execute(f"SET search_path TO {schema_name}, public")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query validated schema name from UUID source
             cur.execute("SELECT COUNT(*) FROM entity_taxonomies")
             count = cur.fetchone()[0]
 
@@ -748,7 +1023,8 @@ def _validate_schema_structure(schema_name: str, user_id: str, db: psycopg2.exte
                         errors.append(f"Column '{column_name}' missing from table '{table_name}'")
 
     except Exception as e:
-        errors.append(f"Validation query failed: {str(e)}")
+        # ``errors`` becomes the row's error_message (validation-failure arm) → rendered.
+        errors.append("Validation query failed: " + _errors.public_detail(e, where="schema.validate", what=type(e).__name__))
         log.error(
             "schema_validation_exception",
             schema=schema_name,
@@ -807,6 +1083,81 @@ def _flush_user_idempotency_cache(user_id: str) -> None:
                     user_id=user_id[:8], error=str(e))
 
 
+def seed_tenant_metadata(db: psycopg2.extensions.connection, schema_name: str, user_id: str,
+                         user_slug: str, *, after_stage=None) -> Optional[str]:
+    """Seed EVERYTHING a tenant schema needs to be a usable seat, from the public template —
+    the single seeding source. Returns ``None`` on success or the provisioning failure message.
+
+    Three stages, exactly the ones ``create_user_schema`` has always run in this order:
+      1. ``_execute_bootstrap_queries`` — rel_types (upsert), rel_type_aliases, negation/correction
+         patterns, retraction signals, extraction/temporal patterns, linguistic_cues, intent
+         classes, preference patterns, correction_signals, intent_pattern_cache, the seat's own
+         ``entities`` row + preferred ``'user'`` alias (all ON CONFLICT — idempotent).
+      2. ``_seed_entity_taxonomies`` — the groupings, with the guarded family ⊃ pets nesting.
+      3. the seat's slug as a NON-preferred technical alias.
+
+    ``after_stage`` (optional) runs after each successful stage — provisioning passes its
+    heartbeat. Callers other than provisioning (the bench sandbox reset, which TRUNCATEs the
+    seat's tables between claims) call this so the seat comes out of a reset carrying the SAME
+    rows a freshly provisioned tenant carries, by construction: a table added to the seed here
+    is re-seeded there without anyone having to remember it. The connection's search_path is
+    bound to ``<schema>, public`` for the duration (the copies read ``public.*`` qualified and
+    write the tenant's tables unqualified, as they always have).
+    """
+    with db.cursor() as cur:
+        # Apply bootstrap metadata directly (no longer via migration 052)
+        try:
+            cur.execute(f"SET search_path TO {schema_name}, public")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query validated schema name from UUID source
+            if not _execute_bootstrap_queries(db, schema_name, user_id):
+                return "Bootstrap metadata queries failed (see logs)"
+            log.info("bootstrapped_metadata", schema=schema_name, user_id=user_id[:8])
+            if after_stage:
+                after_stage()
+        except Exception as e:
+            log.error("bootstrap_exception", schema=schema_name, user_id=user_id[:8], error=str(e))
+            return "Bootstrap failed: " + _errors.public_detail(e, where="schema.bootstrap", what=type(e).__name__)
+
+        # Seed entity_taxonomies from public schema (Phase 3.5)
+        # Copies 5 core taxonomies to enable taxonomy-aware query filtering
+        if not _seed_entity_taxonomies(user_id, schema_name, db):
+            return "Entity taxonomy seeding failed (see logs)"
+        log.info("seeded_entity_taxonomies", schema=schema_name, user_id=user_id[:8])
+        if after_stage:
+            after_stage()
+
+        # Register user identity in entity_aliases (Phase 3.6)
+        # User UUID must have a preferred display name for /query resolution.
+        # Without this, /query can't resolve user_id to display_name,
+        # Filter injects UUID to LLM, LLM can't ground user identity.
+        try:
+            cur.execute(f"SET search_path TO {schema_name}, public")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query validated schema name from UUID source
+            # Insert user entity (idempotent)
+            cur.execute("""
+                INSERT INTO entities (id, entity_type)
+                VALUES (%s, 'Person')
+                ON CONFLICT (id) DO NOTHING
+            """, (user_id,))
+
+            # Register user slug in entity_aliases as a NON-preferred technical alias.
+            # The slug is a UUID-derived identifier (e.g., 550e8400_e29b_41d4_...)
+            # used for schema naming only — it is NOT a human display name.
+            # is_preferred=false ensures the query layer never surfaces it as the
+            # user's name. Human names (set via ingest pref_name/also_known_as)
+            # will be registered as is_preferred=true by entity_registry.register_alias().
+            cur.execute("""
+                INSERT INTO entity_aliases (entity_id, alias, is_preferred)
+                VALUES (%s, %s, false)
+                ON CONFLICT (entity_id, alias) DO NOTHING
+            """, (user_id, user_slug))
+            db.commit()
+            log.info("registered_user_identity", schema=schema_name, user_id=user_id[:8], display_name=user_slug)
+        except Exception as e:
+            db.rollback()
+            log.error("user_identity_registration_failed", schema=schema_name, user_id=user_id[:8], error=str(e))
+            return "User identity registration failed: " + _errors.public_detail(e, where="schema.identity", what=type(e).__name__)
+    return None
+
+
 def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.extensions.connection] = None) -> Tuple[str, str]:
     """Create a new user schema and bootstrap metadata.
 
@@ -823,9 +1174,9 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
     Examples:
         >>> schema_name, status = create_user_schema(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     user_slug="alexander"
+        ...     user_slug="christopher"
         ... )
-        >>> assert schema_name == "faultline_alice"
+        >>> assert schema_name == "faultline_christopher"
         >>> assert status == "ready"
     """
     schema_name = derive_schema_name(user_slug)
@@ -844,19 +1195,19 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
         try:
             dsn_components = parse_postgres_dsn(dsn)
         except ValueError as e:
-            return schema_name, f"Error parsing POSTGRES_DSN: {str(e)}"
+            return schema_name, "Error parsing POSTGRES_DSN: " + _errors.public_detail(e, where="schema.dsn", what=type(e).__name__)
 
         with db.cursor() as cur:
             # Create schema (idempotent)
             try:
-                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query schema_name from derive_schema_name which sanitizes UUID-derived slug
                 db.commit()
                 log.info("created_schema", schema=schema_name, user_id=user_id[:8])
                 # Update heartbeat after schema creation
                 _update_provisioning_heartbeat(user_id, db)
             except Exception as e:
                 db.rollback()
-                return schema_name, f"Failed to create schema: {str(e)}"
+                return schema_name, "Failed to create schema: " + _errors.public_detail(e, where="schema.create", what=type(e).__name__)
 
             # Verify schema actually exists before proceeding
             try:
@@ -868,7 +1219,19 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                 if not exists:
                     return schema_name, f"Schema {schema_name} not found in information_schema after CREATE"
             except Exception as e:
-                return schema_name, f"Failed to verify schema existence: {str(e)}"
+                return schema_name, "Failed to verify schema existence: " + _errors.public_detail(e, where="schema.verify_exists", what=type(e).__name__)
+
+            # The catalog check above opened a read transaction on this connection. The
+            # template apply below runs a psql SUBPROCESS that takes tens of seconds; held
+            # open, this transaction sat idle-in-transaction across the whole subprocess —
+            # measured live 2026-08-22 on the gauntlet rig: 12.3s (the 2026-08-01 incident
+            # class — the original pre-prod probe saw the same schemata fingerprint at
+            # 5-11s x3). Release the pure-read transaction BEFORE the subprocess; the
+            # connection is re-bound (SET search_path) before its next statement anyway.
+            try:
+                release_read_transaction(db, context="create_user_schema_schemata")
+            except Exception:
+                pass  # fail-safe: the release protects lock retention, never provisioning
 
             # Apply template schema via psql (handles dollar-quoted strings correctly)
             template_path = Path(__file__).parent / "templates" / "user_schema.sql"
@@ -934,62 +1297,22 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
 
             log.info("schema_structure_validated", schema=schema_name, user_id=user_id[:8])
 
-            # Apply bootstrap metadata directly (no longer via migration 052)
-            try:
-                cur.execute(f"SET search_path TO {schema_name}, public")
-                if not _execute_bootstrap_queries(db, schema_name, user_id):
-                    return schema_name, "Bootstrap metadata queries failed (see logs)"
-                log.info("bootstrapped_metadata", schema=schema_name, user_id=user_id[:8])
-                # Update heartbeat after bootstrap
-                _update_provisioning_heartbeat(user_id, db)
-            except Exception as e:
-                log.error("bootstrap_exception", schema=schema_name, user_id=user_id[:8], error=str(e))
-                return schema_name, f"Bootstrap failed: {str(e)}"
-
-            # Seed entity_taxonomies from public schema (Phase 3.5)
-            # Copies 5 core taxonomies to enable taxonomy-aware query filtering
-            if not _seed_entity_taxonomies(user_id, schema_name, db):
-                return schema_name, "Entity taxonomy seeding failed (see logs)"
-            log.info("seeded_entity_taxonomies", schema=schema_name, user_id=user_id[:8])
-            # Update heartbeat after seeding
-            _update_provisioning_heartbeat(user_id, db)
-
-            # Register user identity in entity_aliases (Phase 3.6)
-            # User UUID must have a preferred display name for /query resolution.
-            # Without this, /query can't resolve user_id to display_name,
-            # Filter injects UUID to LLM, LLM can't ground user identity.
-            try:
-                cur.execute(f"SET search_path TO {schema_name}, public")
-                # Insert user entity (idempotent)
-                cur.execute("""
-                    INSERT INTO entities (id, entity_type)
-                    VALUES (%s, 'Person')
-                    ON CONFLICT (id) DO NOTHING
-                """, (user_id,))
-
-                # Register user slug in entity_aliases as a NON-preferred technical alias.
-                # The slug is a UUID-derived identifier (e.g., 550e8400_e29b_41d4_...)
-                # used for schema naming only — it is NOT a human display name.
-                # is_preferred=false ensures the query layer never surfaces it as the
-                # user's name. Human names (set via ingest pref_name/also_known_as)
-                # will be registered as is_preferred=true by entity_registry.register_alias().
-                cur.execute("""
-                    INSERT INTO entity_aliases (entity_id, alias, is_preferred)
-                    VALUES (%s, %s, false)
-                    ON CONFLICT (entity_id, alias) DO NOTHING
-                """, (user_id, user_slug))
-                db.commit()
-                log.info("registered_user_identity", schema=schema_name, user_id=user_id[:8], display_name=user_slug)
-            except Exception as e:
-                db.rollback()
-                log.error("user_identity_registration_failed", schema=schema_name, user_id=user_id[:8], error=str(e))
-                return schema_name, f"User identity registration failed: {str(e)}"
+            # SEED the tenant's metadata — the ONE function every "make this schema a usable seat"
+            # caller runs (provisioning here; the bench sandbox reset after its TRUNCATE), so a
+            # table the provisioner seeds can never be missed by a re-seeder that keeps its own
+            # hand list (gauntlet kinship-name-cold-seat r2: the bench re-seeded 4 of 6 and every
+            # reset seat came out with correction_patterns/correction_signals at 0).
+            _seed_failure = seed_tenant_metadata(
+                db, schema_name, user_id, user_slug,
+                after_stage=lambda: _update_provisioning_heartbeat(user_id, db))
+            if _seed_failure:
+                return schema_name, _seed_failure
 
             # Verify critical tables exist before marking ready (FIX #2: prevent schema gaps)
             # False assumption: schema exists in schemata ≠ tables exist in schema
             # Ref: COMPREHENSIVE-FIX-PROMPT.md — migration errors cause partial table creation
             try:
-                cur.execute(f"SET search_path TO {schema_name}, public")
+                cur.execute(f"SET search_path TO {schema_name}, public")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query validated schema name from UUID source
                 # FIX #2: Expanded list of 9 required tables (from prior 5)
                 # All tables must exist for Layer 2 pattern matching to work without tuple errors
                 required_tables = [
@@ -1025,15 +1348,83 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                 log.info("schema_tables_verified", schema=schema_name, user_id=user_id[:8], tables_verified=len(required_tables))
             except Exception as e:
                 log.error("schema_verification_failed", schema=schema_name, user_id=user_id[:8], error=str(e))
-                return schema_name, f"Schema verification failed: {str(e)}"
+                return schema_name, "Schema verification failed: " + _errors.public_detail(e, where="schema.verify", what=type(e).__name__)
 
             # Flush stale Redis idempotency keys for this user.
             # On fresh schema creation, cached ingest/extract responses from a
             # prior schema are stale — the data they reference no longer exists.
             # One-shot: only fires during provisioning, never on normal requests.
+            #
+            # The tables-verified read above opened a READ transaction on this
+            # connection; the flush performs NETWORK I/O (redis ping + SCAN) that
+            # blocks on an unreachable DNS name for seconds — measured live on the
+            # gauntlet stack 2026-08-22: 7.9s idle-in-transaction on BOTH provisioning
+            # backends (schemata class), last query the information_schema verify.
+            # Release before the blocking wait (the 9aa355c6 class).
+            try:
+                release_read_transaction(db, context="create_user_schema_redis_flush")
+            except Exception:
+                pass  # fail-safe: release protects lock retention, never provisioning
             _flush_user_idempotency_cache(user_id)
 
-            # Update user_provisioning status to ready (in public schema)
+            # ── READY MEANS READY: everything below runs BEFORE the ready flag ─────────────
+            # THE WOUND (first-touch-cold-path gauntlet, measured on pre-prod 2026-09-14): the
+            # `status='ready'` UPDATE used to be committed HERE, and then this thread went on to
+            # (a) stamp the migration ledger and (b) create the cortex schema + seed it (10
+            # fastembed embeddings, an in-process ONNX model init on a cold process, Qdrant
+            # PUTs). The MCP polls `status`, saw `ready`, and fired the seat's first
+            # /classify-intent INTO that tail — measured locally: GLiNER2 inference 4.7s vs
+            # 0.95s on the next turn, the whole request 8.4s vs ~1s, exactly co-timed with the
+            # embedding PUTs; on pre-prod the same overlap was 22s, past the MCP's timeouts,
+            # and the transport then substituted its own route. `asyncio.to_thread` keeps this
+            # job off the event loop but NOT off the CPU — a `ready` written before the CPU-
+            # heavy tail is a lie the first request pays for.
+            #
+            # Order now: heartbeat → ledger stamp → cortex (bounded, own connection) → READY.
+            # The MCP's readiness wait (`_ensure_provisioned`) and the backend's
+            # `_ensure_tenant_ready` both key on this flag, so both now include the whole job.
+            _update_provisioning_heartbeat(user_id, db)  # the reaper must not mistake the tail for a crash
+
+            # ── Record this brand-new schema as already carrying every on-disk migration ──
+            # Provisioning does NOT run migrations; it applies the template and seeds from
+            # `public`. Measured 2026-08-27: sweeping all 275 migrations over a freshly minted
+            # schema changed NOTHING once the template's one missing column
+            # (entity_aliases.coreference_warrant) was added — the corpus is redundant against
+            # the template.
+            #
+            # This stamp is what keeps the boot gate honest. Without it a single new tenant has
+            # no ledger rows, every fan-out migration becomes "needed" again, and the next boot
+            # re-runs all 95 of them across the WHOLE fleet — steamrolling every existing tenant
+            # to catch up one new one, which is exactly the behaviour the gate exists to stop.
+            #
+            # Fail-safe and non-blocking: if the stamp cannot be written the mint still succeeds
+            # and the tenant simply gets the migrations applied on the next boot (correct, just
+            # noisier). A ledger problem must never fail a provisioning. (It is now ONE multi-row
+            # INSERT — `boot_migrations._stamp_rows` — not one autocommit transaction per file.)
+            try:
+                from src.provisioning.boot_migrations import stamp_schema_as_current
+                stamped = stamp_schema_as_current(schema_name)
+                log.info("stamped_schema_migration_current",
+                         schema=schema_name, user_id=user_id[:8], migrations=stamped)
+            except Exception as _stamp_e:
+                log.warning("stamp_schema_migration_current_failed",
+                            schema=schema_name, user_id=user_id[:8],
+                            error=str(_stamp_e)[:200])
+
+            # ── Agent cortex (firewalled `flagent_<uuid>` schema + seed + collection) ──────
+            # Best-effort — a cortex failure NEVER fails user provisioning (cortex writes are
+            # fail-safe until it exists, and the re-embedder's `sweep_lifecycle_for_user`
+            # back-fills any seed row whose vector never landed). BOUNDED so that a Qdrant
+            # black-hole cannot hold `ready` hostage past the transports' wait budgets: the
+            # work runs on its own connection in a helper thread and we wait at most
+            # PROVISIONING_CORTEX_BUDGET_SEC (default 30s); past the budget the flag is set
+            # anyway and the cortex step finishes in the background (outage case only —
+            # on a healthy box it completes in a few seconds and `ready` waits for it).
+            _cortex_status = _provision_cortex_bounded(user_id)
+            log.info("provisioned_cortex_schema", user_id=user_id[:8],
+                     schema=derive_cortex_schema_name(user_id), status=_cortex_status)
+
+            # Update user_provisioning status to ready (in public schema) — the LAST write.
             try:
                 cur.execute("SET search_path TO public")
                 cur.execute("""
@@ -1046,12 +1437,16 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
             except Exception as e:
                 db.rollback()
                 log.error("failed_to_mark_ready", schema=schema_name, user_id=user_id[:8], error=str(e))
-                return schema_name, f"Failed to mark provisioning as ready: {str(e)}"
+                return schema_name, "Failed to mark provisioning as ready: " + _errors.public_detail(e, where="schema.mark_ready", what=type(e).__name__)
 
             return schema_name, "ready"
 
     except Exception as e:
         log.error("provisioning_failed", schema=schema_name, user_id=user_id, error=str(e))
+        # ONE public shape for the row AND the return (one correlation id, one CRIT line). The
+        # row is rendered VERBATIM by GET /provisioning/status via check_provisioning_status —
+        # the round-2 critic read a DSN password back out of it (src/api/errors.py, ASVS V7.4.1).
+        _public = _errors.public_detail(e, where="schema.create_user_schema", what="provisioning failed")
 
         # Try to update provisioning status with error
         try:
@@ -1061,16 +1456,53 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
                     UPDATE public.user_provisioning
                     SET status = 'error', error_message = %s
                     WHERE user_id = %s
-                """, (str(e)[:500], user_id))
+                """, (_public, user_id))
                 db.commit()
         except Exception as e2:
             log.error("failed_to_update_error_status", error=str(e2))
 
-        return schema_name, f"Error: {str(e)}"
+        return schema_name, "Error: " + _public
 
     finally:
         if close_conn and db:
             db.close()
+
+
+def _provision_cortex_bounded(user_id: str) -> str:
+    """Run `create_cortex_schema(user_id)` on its OWN connection, waiting at most
+    PROVISIONING_CORTEX_BUDGET_SEC (default 30s) for it.
+
+    Returns the cortex status ('ready' / error text / 'budget_exceeded'). NEVER raises and
+    NEVER shares the caller's connection (a thread that outlives the budget must not touch a
+    connection the caller is about to use for the ready UPDATE — psycopg2 connections are not
+    safe for concurrent use). Past the budget the thread keeps running to completion in the
+    background (best-effort semantics preserved); the reconcile sweep covers anything that
+    did not land. The budget is env-driven, never a literal at the call site."""
+    import concurrent.futures as _cf
+    try:
+        budget = float(os.environ.get("PROVISIONING_CORTEX_BUDGET_SEC", "30") or 30)
+        if budget <= 0:
+            budget = 30.0
+    except ValueError:
+        budget = 30.0
+    pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cortex-provision")
+    try:
+        fut = pool.submit(create_cortex_schema, user_id, None)
+        try:
+            _schema, status = fut.result(timeout=budget)
+            return status
+        except _cf.TimeoutError:
+            log.warning("provisioning_cortex_budget_exceeded", user_id=user_id[:8],
+                        budget_sec=budget,
+                        note="ready flag set anyway; cortex completes in background, "
+                             "reconcile sweep back-fills")
+            return "budget_exceeded"
+        except Exception as e:  # noqa: BLE001 — best-effort by contract
+            log.warning("provisioning_cortex_exception_nonfatal", user_id=user_id[:8],
+                        error=str(e)[:200])
+            return "error: " + _errors.public_detail(e, where="schema.cortex_bounded", what=type(e).__name__)
+    finally:
+        pool.shutdown(wait=False)
 
 
 def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.extensions.connection] = None) -> bool:
@@ -1078,7 +1510,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
     Args:
         user_id: UUID of user (for logging)
-        schema_name: Schema to delete (e.g., "faultline_alice")
+        schema_name: Schema to delete (e.g., "faultline_christopher")
         db: Optional psycopg2 connection. Creates new if not provided.
 
     Returns:
@@ -1087,7 +1519,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
     Examples:
         >>> success = delete_user_schema(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     schema_name="faultline_alice"
+        ...     schema_name="faultline_christopher"
         ... )
         >>> assert success
     """
@@ -1100,7 +1532,7 @@ def delete_user_schema(user_id: str, schema_name: str, db: Optional[psycopg2.ext
 
         with db.cursor() as cur:
             # Drop schema and all objects (CASCADE)
-            cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
+            cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query schema_name from derive_schema_name(UUID) with sanitize, validated by UUID regex gate at derive_user_slug_from_uuid
             db.commit()
             log.info(f"deleted_schema", schema=schema_name, user_id=user_id)
 

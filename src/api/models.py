@@ -44,6 +44,18 @@ class EdgeInput(BaseModel):
     # temporal_status/event_date ride their own columns. Mirrors the facts.polarity DEFAULT.
     polarity: str = "affirmed"                     # affirmed | negated
 
+    # PRESUPPOSED (Frege-Strawson backgrounding). True when the deriver captured this fact from
+    # BACKGROUNDED content rather than from what the clause ASSERTS — the possessive/definite
+    # presupposition of "my favourite colour", which survives negation and questioning ("What is my
+    # favourite colour?" still presupposes the user HAS one). SEP "Presupposition" (Beaver, Geurts &
+    # Denlinger 2021, §2 "The Frege-Strawson tradition"): presupposed information is "taken for
+    # granted, rather than being part of the main propositional content of a speech act", and
+    # possessives are listed triggers. The deriver has computed this flag all along; it had no field
+    # to ride on, so it was DROPPED at the transport and backgrounded content committed at Class A /
+    # confidence 1.0 identically to asserted content. Consumed by assign_class_and_confidence under
+    # PRESUPPOSED_TIER_B. Default False → every existing producer is unchanged.
+    presupposed: bool = False
+
     # PER-EDGE TEMPORAL STATUS OVERRIDE (relocation / past-habitual residence). Normally
     # temporal_status (now|past|future) is derived at request level from the parsed event_date vs now
     # (purely date-driven). A GRAMMATICALLY-past residence ("I used to live in London") carries NO
@@ -52,6 +64,36 @@ class EdgeInput(BaseModel):
     # request-level status. None → the request-level derivation (every normal edge). Mirrors how
     # polarity/event_date ride their own fields.
     temporal_status: Optional[str] = None          # now | past | future (per-edge override)
+
+    # SPEAKER-ROLE ANCHOR (#160/#161). The deriver's token-level proof that this edge's subject /
+    # object IS the speaker's bare possessed role mention ("my sister"), carrying the role lemma.
+    # The /ingest role-holder bind re-keys ONLY anchored endpoints onto the person on file; a
+    # surface match alone ("Tom's sister", a mis-attached clause subject) never binds. None -> no bind.
+    subject_role_anchor: Optional[str] = None
+    object_role_anchor: Optional[str] = None
+
+    # CONSENSUS HARNESS reader signals (A24 SHADOW — extractor-consensus scoping §4.2; AMENDMENTS
+    # 1+2). The spine harvest computes per-fact reader observations and threads them to /ingest so
+    # the seams_dict reconciliation seam can log the per-fact reader SET (the co-firing matrix).
+    #   reader_parse_arm        — the deterministic deriver arms produced this fact.
+    #   reader_atomizer_surface — the sentence survived the LLM atomizer (vs a deterministic unit,
+    #                             the segment_clauses fallback, or a coverage-net re-add).
+    #   reader_gliner2_conf     — the RAW GLiNER2 span score over the fact's endpoints (None = no
+    #                             scored span). τ is NOT applied here — one threshold authority at
+    #                             the ingest seam (GLINER2_ENTITY_THRESHOLD), recorded per log row
+    #                             so the matrix is re-cuttable at a different τ offline.
+    #   reader_register_frame   — a deterministic register/value detector (instruction register,
+    #                             negated-prescription register, atomic value detector) observed
+    #                             this fact's slot on the harvest side (ingest-side seams add
+    #                             their own observations).
+    # A24 WRITES NOTHING to any fact column — these fields are consumed ONLY by the
+    # consensus.cofiring log at the seams_dict seam. Absent (None) = reader not observed on the
+    # lane that produced the edge (the honest negative). Declared fields with defaults → every
+    # existing producer/consumer is byte-identical.
+    reader_parse_arm: Optional[bool] = None
+    reader_atomizer_surface: Optional[bool] = None
+    reader_gliner2_conf: Optional[float] = None
+    reader_register_frame: Optional[bool] = None
 
 
 class ExtractContext(BaseModel):
@@ -113,6 +155,33 @@ class RelTypeRequest(BaseModel):
     is_symmetric: Optional[bool] = None     # bidirectional (spouse, knows, same_as)
     inverse_rel_type: Optional[str] = None  # reverse relationship (parent_of ↔ child_of)
     is_hierarchy_rel: Optional[bool] = None # classification/taxonomy (instance_of, subclass_of)
+    # ── WHERE the write lands (see POST /ontology/rel_types) ───────────────────────────
+    # `user_id` names the TENANT whose ontology is being asserted against; the handler
+    # derives `faultline_<slug>` from it and binds `SET search_path TO <schema>` WITHOUT
+    # `public`, exactly as `DeactivateCueRequest` does for the cue lane. Required for the
+    # default (`scope="tenant"`) lane.
+    user_id: Optional[str] = None
+    # `scope` is the seed-template ESCAPE HATCH and defaults to the tenant lane. Only the
+    # literal "public" targets `public.rel_types` — the template every future tenant is
+    # provisioned from — and that lane additionally demands the operator credential. It is
+    # opt-in and explicit so a `public` write can never be the accidental default of an
+    # unbound connection (which is precisely how it behaved before).
+    scope: Optional[str] = None
+
+
+class DeactivateCueRequest(BaseModel):
+    """Retire (or restore) ONE engine-grown / seeded linguistic cue for ONE tenant.
+
+    The target is the table's own UNIQUE key `(cue, category)` -- an EXACT identifier the
+    caller must have read from `/structure/grown` first. It is deliberately NOT free text:
+    a free-text target would need matching, and matching is the seam that turns a structure
+    edit into a memory deletion. `reactivate=True` is the inverse (is_active back to true),
+    which is what makes the whole lane reversible.
+    """
+    user_id: str
+    cue: str
+    category: str
+    reactivate: bool = False
 
 
 class RetractRequest(BaseModel):
@@ -129,6 +198,12 @@ class RetractResponse(BaseModel):
     mode: str
     note: Optional[str] = None
     scope_level: Optional[str] = None
+    # FORGET_ENTITY_SWEEP (BUG-R4-H): the honest per-table redaction envelope —
+    # {"admitted": [{mention, entity_id, facts, staged_facts, episodic_log}],
+    #  "declined": [{mention, reason}], "totals": {table: count}}. None when the
+    # sweep is OFF (byte-parity) or nothing was named. Never reports a redaction
+    # that did not happen (SEC-BUG-1).
+    entity_sweep: Optional[dict] = None
 
 
 class StoreContextRequest(BaseModel):
@@ -158,6 +233,179 @@ class EpisodicAppendRequest(BaseModel):
     source_ref: Optional[str] = None
     intent: Optional[str] = None
     extracted_fact_count: Optional[int] = None
+    # Per-turn idempotency key (migration 274): generated ONCE per turn by the client and carried
+    # by every retry attempt of that turn. Enforced by a partial UNIQUE index, so two in-flight
+    # attempts converge on one row and the second attempt's answer is the read-back. Optional:
+    # a keyless writer keeps the plain append.
+    turn_key: Optional[str] = None
+
+
+class ArtefactPlacement(BaseModel):
+    """ONE embedded image's placement + the deterministic verdicts computed about it.
+
+    Every field here was derived WITHOUT a model of any kind: the box comes off the PDF's
+    own content stream, the caption from page GEOMETRY (`src/ingest/artefact_geometry.py`),
+    the chunk index from locating that caption verbatim in the chunked text. A decline is
+    carried explicitly (`caption_declined_reason`) because a decline is a RESULT, not a
+    failure — it is what lets recall say "I kept this figure but could not tell which text
+    describes it" instead of asserting a neighbour's caption.
+    """
+    page_index: int
+    artefact_index: int
+    bbox: list[float] = []            # x0, top, x1, bottom — TOP-ORIGIN, pdfplumber's
+    page_size: list[float] = []       # width, height
+    caption_text: Optional[str] = None
+    caption_confidence: Optional[float] = None
+    caption_method: Optional[str] = None
+    caption_declined_reason: Optional[str] = None
+    chunk_index: Optional[int] = None
+    chunk_bind_method: Optional[str] = None
+
+
+class ArtefactRetainRequest(BaseModel):
+    """Persist a retained upload + its placements into the per-tenant `artefacts` table.
+
+    The BYTES arrive here because this process is the one that binds the tenant schema
+    (`SET search_path TO faultline_<slug>` WITHOUT public). The MCP door does the
+    deterministic compute (sniff, extract, geometry, caption, chunk tie) and never touches
+    the database — that separation is deliberate, and it is why this lane adds NO new
+    isolation boundary: it reuses the existing tenant-derivation chokepoint exactly as
+    `/documents/enqueue` does.
+
+    `data_b64` carries the container file. Base64 is used on this INTERNAL hop only (the
+    public door takes raw bytes) because the hop is JSON over the container network and
+    the 33 % inflation buys a single uniform request shape.
+    """
+    user_id: str
+    media_type: str
+    data_b64: str
+    filename: Optional[str] = None
+    source_ref: Optional[str] = None
+    document_id: Optional[int] = None
+    placements: list[ArtefactPlacement] = []
+
+
+class DocumentEnqueueRequest(BaseModel):
+    """Enqueue a chunked document into the per-tenant async ingestion registry.
+
+    The flagship `ingest_document` lane chunks the document deterministically
+    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
+    `documents` row status='pending' (chunks retained verbatim) and returns fast.
+    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
+    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
+    """
+    user_id: str
+    chunks: list[str]
+    chunk_count: int = 0
+    source_ref: Optional[str] = None
+    title: Optional[str] = None
+    truncated: bool = False
+    # DOCLOSS-A part accounting: a document larger than the per-row chunk bound is
+    # SEGMENTED across consecutive rows instead of having its tail discarded. These
+    # describe WHICH slice of the original document this row carries, so the terminal
+    # signal read off the registry can state the truth about the whole document.
+    # Defaults reproduce a single-part document exactly (legacy callers unchanged).
+    part_index: int = 0
+    part_count: int = 1
+    total_chunks: int = 0
+    # R5 parser seam (migration 298): which parser produced the TEXT in `chunks`
+    # (`naive_v1` pdfplumber/paste default, `docling_v1` Docling CPU). One row is
+    # one parser's output — the chunk provenance key the re-parse trigger selects on.
+    parser_version: str = "naive_v1"
+
+
+class DocumentSourceRequest(BaseModel):
+    """Read back a stored document's ORIGINAL TEXT (its `chunks` verbatim net).
+
+    The read half of the R5 re-parse trigger (`remine_with_parser`): the stored
+    chunks ARE today's retained original for the text lane (TODO(R1): once
+    artefact-source retention lands, the retained original bytes/artefact supersede
+    this read for binary re-parses). Tenant-scoped by derivation; a foreign or
+    unknown document is an honest empty, never another tenant's rows."""
+    user_id: str
+    document_id: int
+
+
+class CortexNoteRequest(BaseModel):
+    """Write an AGENT-CORTEX operational note (the /iremember manual door).
+
+    The cortex is the operating-agent's OWN persistent operational memory — gotchas,
+    failed commands, pitfalls, corrections, how-tos, overruns. A note is NEVER a user
+    fact and is NEVER served as one — it lands in the firewalled ``flagent_<uuid>``
+    schema, source ``agent_manual``, durable. Stance is always "my operational note,"
+    never "you told me."
+    """
+    user_id: str
+    note: str
+    # EVIDENCE (optional) — the artifact that produced this claim: {sha, ref, command, output}.
+    # A note is a CLAIM; a claim with no proof rots into a TRAP that manufactures phantom work.
+    # `sha` makes staleness DECIDABLE (git merge-base --is-ancestor <sha> HEAD), and an evidenced
+    # note outranks an unevidenced one at recall. Optional — a note without it is still recorded.
+    evidence: Optional[Union[dict, str]] = None   # dict, or a JSON string (MCP clients vary)
+    category: Optional[str] = None                  # gotcha|failed_command|pitfall|correction|howto|overrun
+    tags: Optional[list[str]] = None                # triggers/topics the note guards
+    context: Optional[dict] = None                  # optional: {command, fix, file, path, ...}
+    # WHICH MCP client (LLM/tool) wrote this note — same seat, just tagged so a multi-model seat
+    # can tell its own notes apart and a "mine" recall lane can filter to them. Optional: NULL on
+    # any note the model didn't tag (and on legacy rows); recall's `client_source IS NULL` lane
+    # keeps untagged notes visible to every client.
+    client_source: Optional[str] = None
+    # The line of work this lesson was learned on (a git branch, a matter number, a ward
+    # name — opaque to the engine). Stored on the row; used ONLY as an additive ranking
+    # signal at recall. Never gates/filters/excludes.
+    branch: Optional[str] = None
+    # The ENVIRONMENT this lesson is true in ('truenas', 'p70', a ward, a lab) — many
+    # operational facts are env-BOUND. Ranking signal only: same-env notes rank first at
+    # recall, other-env notes demote slightly and are STAMPED, untagged stays neutral.
+    env: Optional[str] = None
+    # The user's EXACT words, as a short quoted fragment — SECONDARY BY SCHEMA: stored in
+    # context.owner_quote, never merged into the note body. The stored note always LEADS
+    # with the distilled rule; the quote (if the wording itself matters) rides behind it.
+    owner_quote: Optional[str] = None
+    # SCHEMA UPLIFT (owner directive) — provenance, all OPTIONAL free strings (bounded 64
+    # at the write seam), never enums:
+    #   model   — the configured MODEL doing the recording (auto-stamped by the MCP layer
+    #             from CORTEX_AGENT_MODEL when the caller omits it; explicit wins).
+    #   type    — the owner-facing FREE-FORM note type ("code", "bug", "operational", an
+    #             emoji, anything) — deliberately LOOSE; the fixed engine enum stays
+    #             `category`, which the dedup key, provenance weights, admission gate and
+    #             supersession logic all key on.
+    #   project — the PROJECT the note relates to ("faultline", a repo name). A deployment
+    #             may default it via CORTEX_PROJECT; explicit always wins.
+    model: Optional[str] = None
+    type: Optional[str] = None
+    project: Optional[str] = None
+
+
+class CortexRecallRequest(BaseModel):
+    """Read AGENT-CORTEX operational notes (the /irecall manual door)."""
+    user_id: str
+    query: Optional[str] = None
+    limit: int = 8
+    # False = read WITHOUT the recall-relevance write-back. Reading the cortex re-ranks it
+    # (hit_count / last_seen_at, and the candidate field is ORDER BY last_seen_at DESC), so an
+    # UNATTENDED per-turn lane must not bump or it slowly eats its own candidate window. A
+    # deliberate call is a real relevance signal and keeps today's default.
+    bump: bool = True
+    # "mine" lane: restrict the field to notes tagged with THIS client PLUS untagged notes
+    # (untagged rows stay visible to every client — never lose a lesson to a missing tag; the
+    # lane only EXCLUDES notes explicitly tagged to ANOTHER client). Leave None for today's
+    # behaviour (all notes from the seat).
+    client_source: Optional[str] = None
+    # The branch/line of work being operated on RIGHT NOW. Optional ranking signal: notes
+    # recorded on the same branch get an additive bonus; everything else is unchanged
+    # (never a gate). Absent on legacy callers — no bonus, no penalty.
+    branch: Optional[str] = None
+    # The environment the caller is operating in RIGHT NOW — same-env notes rank first;
+    # other-env notes demote slightly and render STAMPED so the agent sees why.
+    env: Optional[str] = None
+
+
+class LearnTopicRequest(BaseModel):
+    topic: str
+    user_id: str = "anonymous"
+    source_text: Optional[str] = None   # pre-fetched content from a URL
+    source_url: Optional[str] = None    # informational, logged but not fetched again
 
 
 class RewriteRequest(BaseModel):
@@ -170,12 +418,53 @@ class RewriteRequest(BaseModel):
     messages: list[dict] | None = None  # Prior conversation context
     typed_entities: list[dict] | None = None  # Pre-extracted entities from GLiNER2
     memory_facts: list[dict] | None = None  # Prior facts for pronoun resolution
+    force_relation_extraction: bool = False  # DOC LANE: force LLM relation extraction even when the global flag is detect-only (interactive path unaffected)
+    # DOC LANE: per-request override of SPINE_DETERMINISTIC_SEGMENTATION for /harvest-spans.
+    # None (every caller today) → the process-wide flag decides → byte-identical behaviour.
+    # True → the spine segments with the deterministic decomposer and escalates to the LLM
+    # atomizer ONLY for units whose parse still shows an un-decomposed second assertion.
+    # WHY a per-REQUEST field rather than one global flag: the atomizer's prompt and budget are
+    # sized for "one short chat message" (LLMMaxTokens REFRAME=256, LLMTimeouts REFRAME=6.0s),
+    # which a multi-sentence document chunk overruns — while a chat turn still benefits from it.
+    # The shape of the INPUT differs per caller, so the decision belongs on the call, not the process.
+    deterministic_segmentation: Optional[bool] = None
+    # DOC LANE: per-request PARSE-MODEL pin for /harvest-spans (the spaCy parse-model split).
+    # None (every caller except the document lane — i.e. every conversational turn) -> the
+    # request parses with the process-wide SPACY_MODEL -> byte-identical behaviour. The
+    # doc-lane caller (embedder._document_chunk_edges) sets this ONLY while its
+    # DOC_SPACY_MODEL env is enabled, and names exactly that env value; the backend validates
+    # via linguistics.resolve_parse_model_request (the env is the capability switch — a
+    # request can never make the process spacy.load an arbitrary name) and lazy-loads the
+    # second pipeline ONCE, cached. Honored ONLY by /harvest-spans: no other endpoint reads
+    # this field. GLiNER2 entity typing is unaffected — only the spaCy PARSE model splits.
+    parse_model: Optional[str] = None
 
 
 class RewriteResponse(BaseModel):
     """LLM-extracted edges (facts) from input text."""
     status: str  # "success" or "error"
     edges: list[EdgeInput] = []  # Extracted facts with types
+
+
+class SchemaSecondPassRequest(BaseModel):
+    """DOC-LANE schema-guided SECOND PASS over one document chunk
+    (DEV/DESIGN-document-extraction-sota.md §4/§8.2 — the EDC refinement shape).
+
+    One BOUNDED re-ask per chunk AFTER that chunk's primary extraction already
+    returned ≥1 edge. The prompt carries (a) the pass-1 triples and (b) schema
+    elements selected from the seat's OWN ontology (per-tenant rel_types
+    head/tail types ∩ the entity types GLiNER2 detects in THIS chunk, plus the
+    entity_taxonomies defining rels). The pass-2 LLM may return ONLY rel_types
+    from that candidate menu — it cannot mint vocabulary. Conversational turns
+    never reach this door: its only caller is the document worker
+    (re_embedder.embedder._extract_and_ingest), behind DOC_SCHEMA_SECOND_PASS.
+    """
+    text: str
+    user_id: Optional[str] = "anonymous"
+    # Pass-1 triples (surface dicts as the worker holds them). Read-only input:
+    # shapes the "do not repeat" list and the dedupe keys. Edges that lack all
+    # three surface keys (subject/rel_type/object) are skipped, never rejected.
+    prior_edges: list[dict] = []
 
 
 class FactCorrectionRequest(BaseModel):
@@ -187,17 +476,38 @@ class FactCorrectionRequest(BaseModel):
     intent: Optional[str] = None  # GLiNER2 classification from Filter: CORRECTION or RETRACTION
     context_facts: Optional[list[dict]] = None  # Recent facts for entity resolution
     idempotency_key: Optional[str] = None  # Deduplicate retried correction requests (via Redis)
+    # AUTHORSHIP (default True): the correction was EXPLICITLY routed by the model through
+    # the retract_fact tool -- the model's attestation that a human said it, so the
+    # superseding rows are written user_stated / Class A / confidence 1.0 exactly as
+    # historically. False marks an UNATTESTED lane (recall's auto-detected CORRECTION
+    # divert): the same supersede mechanics run, but the superseding rows land
+    # llm_inferred / Class B / 0.7 -- a machine side-effect never claims the human said
+    # it, and the ladder to A stays open via a later explicit correction or remember_facts.
+    attested: bool = True
 
 
 class FactCorrectionResponse(BaseModel):
     """Surgical correction result."""
-    status: str  # "corrected", "failed", "disambiguation_needed"
+    # "corrected" | "success" | "unchanged" (same-value no-op, nothing written —
+    # issue #224: user-is-truth, nothing is immutable) | "corrected_unresolved"
+    # (the new value was committed but the supersession REFUSED - the old fact the
+    # correction named was not found under any lookup step; visible + countable via
+    # retraction_outcomes method 'correction_unresolved_supersession'; GLM.md
+    # "Correction refusal: unresolved supersession") | "failed" |
+    # "clarification_needed" | "disambiguation_needed" | "ingest_disabled" | ...
+    status: str
     subject_uuid: Optional[str] = None
     subject_name: Optional[str] = None
     old_rel_type: Optional[str] = None
     old_value: Optional[str] = None
     new_rel_type: Optional[str] = None
     new_value: Optional[str] = None
+    # R8 (critic RG-E): the standard-name supersession counter on EVERY shape that
+    # reports a correction - the /ingest shape has carried it since R1, but the
+    # correction shape did not, so a moved-to correction that really superseded a
+    # row reported facts_superseded=0 (or lacked the field entirely) with no
+    # countable supersession anywhere on the envelope. Additive, default 0.
+    facts_superseded_by_ingest: int = 0
     dimension: Optional[str] = None  # SCALAR | RELATIONAL | HIERARCHICAL | SUBJECT | REL_TYPE | ENTITY_TYPE
     confidence: float = 0.0
     facts_superseded: int = 0
@@ -272,6 +582,14 @@ class QueryPath(BaseModel):
     #   (network ⊃ subnets, body ⊃ parts behave identically). Empty for a plain concept/
     #   temporal query → that projection is byte-for-byte unchanged.
     nesting_rels: list[str] = []
+    # aspect_bound_rels: rels the query's OWN possessed noun phrase resolved to through the
+    #   tenant's grown place-index (rel_type_aliases: "my email address" → email_address →
+    #   has_email — the row `_ground_aspect_term_place` wrote at ingest). A fact on one of
+    #   these rels is on the question's topic BY CONSTRUCTION (the tenant's ontology bound
+    #   the user's own term to it), so the lexical topic gate must not re-judge it — the
+    #   same authority the taxonomy-scope skip already carries. Subset of allowed_rels.
+    #   Empty when no possessed NP resolved → every consumer is byte-for-byte unchanged.
+    aspect_bound_rels: list[str] = []
     # hierarchy_intent: True when the QUERY REFERENCE asks for a hierarchy / map / full
     #   grouping and the walk should DESCEND the containment/membership tree from the
     #   anchor ("the network hierarchy under dc-toronto", "the org tree from acme",
@@ -296,6 +614,41 @@ class QueryPath(BaseModel):
     #   grown canonical attribute for observability/tests only — None on the steady-state
     #   (deterministic) path and on a non-grow miss. NOT part of allowed_rels.
     aspect_grown: Optional[str] = None
+    # when_pinned_entity_ids (issue #17, when-ask object-pinning): the SPECIFIC entity
+    #   ids a when-interrogative names ("When did I start taking METFORMIN?" → the
+    #   metformin entity), resolved in determine_path from the query's own concept
+    #   tokens against THIS tenant's alias registry (the same grounding
+    #   `_query_scoped_to_absent_concept` uses). When non-empty, a dated row riding the
+    #   aspect-bound exemption must BELONG to one of these entities (its subject or
+    #   object slot) — rel-granular breadth (#15) is kept ONLY for entity-less shapes
+    #   ("When did I take anything?"). L4 places (type nodes) and the speaker are never
+    #   pinned. Empty → byte-for-byte the #15 behaviour.
+    when_pinned_entity_ids: list[str] = []
+    # measure_axis_admission (issue #17, measure-axis grown-rung voice): True when the
+    #   measure-interrogative admission (#13/#11) actually resolved the axis from the
+    #   anchor's own stored rows (`measure_interrogative_aspect` fired). The render then
+    #   gives the ASKED CHAIN's grown classification rungs their voice back on THIS
+    #   question — they render in the HELD band (their own provenance), the same
+    #   contract the ladder question already carries, without touching the growth gate
+    #   or what the walk admits. False (default) → the rung-silencing gate is
+    #   byte-for-byte unchanged.
+    measure_axis_admission: bool = False
+    # measure_dimension_declined (issue #49): the measure interrogative's degree word named a
+    #   dimension the anchor does not hold and every stored measure was proven a DIFFERENT
+    #   dimension ("how wide" vs a stored length). scalar_rels then carries only the asked
+    #   dimension names, and the anchor-own scalar lane reads ONLY those (a non-user anchor
+    #   otherwise returns all its attributes unconditionally) — so no other dimension answers.
+    #   False (default) → byte-for-byte unchanged.
+    measure_dimension_declined: bool = False
+    # register_value_entity_ids (BUG-FAMILY-7, the rule value-affinity admission): the ROW-
+    # OWNER entities of has_setting rows whose VALUE carries the rule question's own content
+    # tokens ("what's the rule about proxmox upgrades?" → the row (the lab, has_setting,
+    # "snapshot before a proxmox upgrade")). The rule-register admission sets this when the
+    # ANCHOR holds no register row — the entity-centric expansion unions the ids so the scalar
+    # lane fetches those rows by construction and the _mi_rels tail seam admits them (the
+    # walk reaches the row the question's own tokens point at). Bounded (≤3 entities, one
+    # read). Empty → byte-for-byte unchanged.
+    register_value_entity_ids: list[str] = []
 
     @property
     def allowed_rels(self) -> set[str]:
@@ -322,6 +675,14 @@ class QueryRequest(BaseModel):
     temporal_scope: Optional[str] = None  # ISO date or date range: "2024-05-01" or "2024-01-01/2024-12-31"
                                          # When set, filters facts to only those valid during period
 
+    # CHEAP-FLOOR-ONLY (litmus fix L6, 2026-11-03): serve the deterministic passage floor
+    # (stub_tsv document_hits + the walk's zero LLM work) and SKIP the graph walk
+    # entirely. The MCP recall lane fires this FIRST as a bounded probe (~3-4s wall) so a
+    # degraded/slow turn still opens with real passage evidence captured before the walk
+    # is attempted; the normal pipeline runs after with the floor already banked. Off by
+    # default — a caller must ASK for the floor-only shape.
+    floor_only: bool = False
+
 
 class QueryResponse(BaseModel):
     """Response from /query endpoint."""
@@ -329,11 +690,27 @@ class QueryResponse(BaseModel):
     facts: list[dict] = []  # Structured facts with metadata (definition contains prose)
     preferred_names: dict = {}  # UUID → display name mapping for Filter's UUID resolution
     canonical_identity: Optional[str] = None  # Same as anchor, for backward compatibility
+    # OWNER RULING (2026-08-20, additive option): `anchor`/`canonical_identity` KEEP the
+    # raw entity UUID — consuming software (MCP slot resolution, OpenWebUI filter) keys on
+    # it — and this ADDITIVE field carries the human-readable name ALONGSIDE it. Sourced
+    # from the store's alias tables (entity_aliases, preferred-first; the user-identity
+    # lane for the seat owner), never an enumerated list. None = honest absence (the
+    # anchor is not a known entity or carries no surfaceable name) — a UUID is never the
+    # value and no placeholder name is invented.
+    anchor_name: Optional[str] = None
     attributes: dict = {}  # entity_id → {attr: value} mapping for attributes
     confidence_applied: bool = True
     staged_facts_count: int = 0  # Class C facts included
     error: Optional[str] = None
     alerts: list[dict] = []  # Active system alerts (e.g. Qdrant collection mismatch); empty = no issues
+    # THE BY-CONSTRUCTION ASPECT MARK (wound-map round 3, the allergy-after serve):
+    # the rels the walk's shelf/aspect admissions RESOLVED against live rows and marked
+    # aspect-bound (the lexical-gate exemption class). Empty when no admission bound —
+    # byte-parity for every existing consumer; the MCP self-verify shape check reads it
+    # to honor a by-construction resolution instead of failing the factually-correct
+    # serve on lexical token coverage (the question's own noun can never lexically match
+    # the shelf row's surface — that is WHY the by-construction mark exists).
+    aspect_bound_rels: list[str] = []
     # PART 2 (DESIGN-ingest-spine-and-temporal-recall §"RECALL-SIDE TEMPORAL ORDERING"):
     # True when the backend resolved a temporal pivot/ordinal and pre-sorted the dated
     # facts chronologically. Signals the recall layer to hand the model a timestamp-
@@ -361,9 +738,10 @@ class QueryResponse(BaseModel):
     # the data: a 'pending'/'processing' hit is VERBATIM TEXT ONLY — the stub is
     # searchable at the enqueue commit, facts come later. Never counted as facts.
     document_hits: Optional[list[dict]] = None
-    # R7 MISS-ESCALATION: True when the graph walk (Layer 1) returned ZERO facts AND the
-    # passage lane (Layer 2, R6) surfaced ≥1 hit — the recall KNOWS it fell back to the
-    # document text instead of the graph. Observability only: the response body is
+    # R7 MISS-ESCALATION (gauntlet R7, plan DEV/BUGS/plan-100pct-addressability-20261024.md):
+    # True when the graph walk (Layer 1) returned ZERO facts AND the passage lane
+    # (Layer 2, R6) surfaced ≥1 hit — the recall KNOWS it fell back to the document
+    # text instead of the graph. Observability only: the response body is
     # otherwise unchanged apart from this additive key (the passage hits ride
     # document_hits as before), no fabrication, and a both-lanes-miss stays
     # False (the honest empty). The tag is the signal the
@@ -372,49 +750,20 @@ class QueryResponse(BaseModel):
     # 'recall_miss_reexamine') so the growth drain re-examines the chunk that had
     # the answer — the NEXT time this question is asked, the graph walk finds it.
     escalated: bool = False
-    # R7 marker gate: the graph walk's OWN resolved STORED-fact count — the composed
-    # walk result BEFORE any synthetic verdict/grounding row is injected and BEFORE the
-    # presentation gates (type-assertion, lexical topic). A presentation gate can
-    # remove EVERY rendered fact on a walk that SUCCEEDED — rendered facts alone
-    # cannot distinguish that from a true walk miss; conversely a synthetic
-    # no-answer grounding row can re-inflate a pre-gate count on a TRUE miss. The
-    # marker gate therefore requires BOTH the rendered list AND this walk-boundary
-    # count to be empty. None on early-return paths where the walk did not report a
-    # count (treated as 0 — every such empty-facts path IS a miss). The `escalated`
-    # tag above stays rendered-facts-based: the recall genuinely fell back to the
-    # document lane for the USER either way; only the feedback halves differ.
+    # R7 marker gate (round-3/4 critic GAPs): the graph walk's OWN resolved
+    # STORED-fact count — the composed walk result BEFORE any synthetic
+    # verdict/grounding row is injected (named-winner, temporal_calc,
+    # sum/count-over-walk, recursive-walk metacog, the no-answer location
+    # fallback) and BEFORE the presentation gates (type-assertion, lexical
+    # topic). The topic gate is presentation precision ("a fact on the wrong
+    # topic is not an answer") and a DOCUMENTED live shape removes EVERY
+    # rendered fact (before=13 after=0) on a walk that SUCCEEDED — rendered
+    # facts alone cannot distinguish that from a true walk miss; conversely a
+    # synthetic no-answer grounding row can re-inflate a pre-gate count on a
+    # TRUE miss. The marker gate therefore requires BOTH the rendered list
+    # AND this walk-boundary count to be empty. None on early-return paths
+    # where the walk did not report a count (treated as 0 — every such
+    # empty-facts path IS a miss). The `escalated` tag above stays
+    # rendered-facts-based: the recall genuinely fell back to the document
+    # lane for the USER either way; only the feedback halves differ.
     walk_facts_found: Optional[int] = None
-
-
-class DocumentEnqueueRequest(BaseModel):
-    """Enqueue a chunked document into the per-tenant async ingestion registry.
-
-    The flagship `ingest_document` lane chunks the document deterministically
-    (server-side, no LLM) and posts the chunk list here; this endpoint writes ONE
-    `documents` row status='pending' (chunks retained verbatim) and returns fast.
-    The re_embedder poll loop drains it and runs the per-chunk hybrid extraction.
-    Purely additive — no WGM gate / class assignment / query scope at enqueue time.
-    """
-    user_id: str
-    chunks: list[str]
-    chunk_count: int = 0
-    source_ref: Optional[str] = None
-    title: Optional[str] = None
-    truncated: bool = False
-    part_index: int = 0
-    part_count: int = 1
-    total_chunks: int = 0
-    # R5 PARSER SEAM (migration 298): which parser produced ``chunks`` —
-    # 'naive_v1' (pdfplumber line-walk / raw pasted text) or 'docling_v1'
-    # (src/ingest/doc_parser.py, layout-aware). Normalized + shape-checked
-    # [a-z0-9_]+ at the enqueue door — the stamp must never lie. Rows written
-    # before migration 298 read the column default ('naive_v1'), which is
-    # honest for every legacy row.
-    parser_version: Optional[str] = None
-
-
-class LearnTopicRequest(BaseModel):
-    topic: str
-    user_id: str = "anonymous"
-    source_text: Optional[str] = None
-    source_url: Optional[str] = None

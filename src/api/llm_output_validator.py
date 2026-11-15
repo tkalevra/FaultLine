@@ -365,28 +365,66 @@ class LLMOutputValidator:
     async def _embed_text(self, text: str) -> Optional[list[float]]:
         """Embed text using nomic-embed-text via OpenWebUI."""
         try:
-            from src.api.llm_client import get_llm_headers
+            from src.api.llm_client import get_llm_headers, saas_global_brain_blocked
 
-            base_url = self.llm_endpoint.rstrip('/')
-            embed_url = os.getenv(
-                "EMBEDDING_API_URL",
-                base_url
-                .replace("/api/chat/completions", "")
-                .replace("/v1/chat/completions", "")
-                + "/api/embeddings"
-            )
+            # SaaS fail-closed. This is a HAND-ROLLED outbound call — it never passed through
+            # the centralized stack's `_saas_brain_unavailable` guard, so without this check a
+            # tenant with no brain would embed against the operator's global endpoint (and,
+            # because `get_llm_headers` used to hand out the env key, with the operator's
+            # credential). Degrading to "no similar patterns" is the correct, cheap answer.
+            if saas_global_brain_blocked():
+                log.warning("llm_output_validator.embed_skipped_saas_no_brain")
+                return None
+
+            base_url = (self.llm_endpoint or "").rstrip('/')
+            explicit = os.getenv("EMBEDDING_API_URL", "").strip()
+            if explicit:
+                embed_url = explicit
+            elif base_url:
+                # THE ONE JOIN's embeddings sibling, not a chain of string replaces. The old
+                # form assumed the endpoint literally contained an OpenAI/OpenWebUI chat path
+                # and always appended OpenWebUI's `/api/embeddings` — so anthropic's
+                # `/v1/messages` fell through unchanged and got the wrong suffix welded on,
+                # and a versioned base doubled its version. get_embedding_url is backend-aware.
+                try:
+                    from src.api.llm_client import get_embedding_url
+                    embed_url = get_embedding_url(base_url)
+                except Exception:  # noqa: BLE001 — no endpoint is a legitimate state
+                    embed_url = ""
+                if not embed_url:
+                    return None
+            else:
+                # No endpoint at all → no remote embedding lane.
+                return None
 
             payload = {
                 "model": _EMBEDDING_MODEL,
                 "input": text,
             }
 
-            response = await httpx.AsyncClient().post(
-                embed_url,
-                json=payload,
-                headers=get_llm_headers(),
-                timeout=10.0
-            )
+            _client = None
+            try:
+                from src.api.llm_calls import _tenant_byo_cfg
+                if _tenant_byo_cfg() is not None:
+                    from saas.llm_config import guarded_async_client
+                    _client = guarded_async_client()   # CALL-TIME egress pin (IS1)
+            except Exception:  # noqa: BLE001 — public core has no saas/ package
+                _client = None
+            async with (_client or httpx.AsyncClient()) as _c:
+                try:
+                    # CONNECT/READ SPLIT (critic round 2026-11-06): same rule as the chat
+                    # seams — a bare 10.0 set httpx's CONNECT phase to the FULL budget,
+                    # so a SYN-blackholed embeddings host burned it at dial.
+                    from src.api.llm_calls import split_connect_timeout
+                    _timeout = split_connect_timeout(10.0)
+                except Exception:  # noqa: BLE001 — public core has no saas/ package
+                    _timeout = 10.0
+                response = await _c.post(
+                    embed_url,
+                    json=payload,
+                    headers=get_llm_headers(),
+                    timeout=_timeout
+                )
             response.raise_for_status()
             data = response.json()
 

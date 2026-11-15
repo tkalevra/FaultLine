@@ -16,6 +16,6 @@ def commit_edge(sub: str, obj: str, rel: str, prov: str, db_conn=None,
     return {"id": 1}
 
 
-def reembed_facts():
-    """Stub: Re-embed data for Qdrant update"""
-    pass
+# REMOVED 2026-08-12 — `reembed_facts()`, a bare `pass` body with a "Stub: Re-embed data for
+# Qdrant update" docstring and zero callers anywhere in the repo. The real re-embed loop is
+# `src/re_embedder/embedder.py`; this stub never stood in for it.

@@ -27,9 +27,12 @@ from __future__ import annotations
 from src.temporal.duration import duration, is_point, point_anchor
 from src.temporal.intervals import is_calendar_period_window, resolve_calendar_window
 from src.temporal.named_events import (
+    apply_advance_offset,
     is_named_event,
     most_recent_past_year,
+    parse_advance_offset,
     resolve_named_event,
+    resolve_offset_named_event,
 )
 from src.temporal.reference import derive_now, now_utc
 from src.temporal.resolve import (
@@ -49,6 +52,9 @@ __all__ = [
     "resolve_calendar_window",
     "is_calendar_period_window",
     "resolve_named_event",
+    "resolve_offset_named_event",
+    "parse_advance_offset",
+    "apply_advance_offset",
     "is_named_event",
     "most_recent_past_year",
     "duration",

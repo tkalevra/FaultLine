@@ -31,10 +31,12 @@ def _load_trigger_patterns() -> list[re.Pattern]:
 
     patterns: list[re.Pattern] = []
     try:
-        import psycopg2
+        # read_only_connection (src/api/db_read.py): autocommit + readonly + guaranteed close.
+        # A metadata read must never own a transaction — an AccessShareLock held across a slow
+        # caller is what stalled prod deprovision + pg_dump on 2026-08-01.
+        from src.api.db_read import read_only_connection
         dsn = os.environ.get("POSTGRES_DSN", "postgresql://faultline:faultline@localhost:5432/faultline")
-        db = psycopg2.connect(dsn)
-        try:
+        with read_only_connection(dsn) as db:
             with db.cursor() as cur:
                 cur.execute(
                     "SELECT pattern_regex FROM extraction_patterns "
@@ -45,8 +47,6 @@ def _load_trigger_patterns() -> list[re.Pattern]:
                         patterns.append(re.compile(rx, re.IGNORECASE))
                     except re.error as e:
                         print(f"[WARNING] invalid trigger regex skipped: {e}")
-        finally:
-            db.close()
     except Exception as e:
         print(f"[WARNING] failed to load trigger patterns: {e}")
 
