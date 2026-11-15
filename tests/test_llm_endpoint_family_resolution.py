@@ -31,7 +31,7 @@ from src.api import llm_client
 #
 # DASHSCOPE is LIVE ON PRODUCTION RIGHT NOW (account 95aa8183…, backend_type=openai,
 # model qwen-turbo) — every assertion about it is a regression pin, not a wish.
-# ZAI_FULL is also live (account d0fa70b1…, backend_type=raw) — the owner's z.ai brain,
+# ZAI_FULL is also live (account 8e4a51c2…, backend_type=raw) — the owner's z.ai brain,
 # stored as the FULL endpoint after the versioned-base attempt 404'd.
 DASHSCOPE_BASE = "https://dashscope-intl.aliyuncs.com/compatible-mode/"
 DASHSCOPE_CHAT = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
@@ -203,7 +203,7 @@ def test_full_endpoint_pasted_as_base_resolution_is_idempotent(monkeypatch):
 
 def test_raw_full_endpoint_chat_still_verbatim(monkeypatch):
     """``raw`` is the escape hatch: the base IS the URL, never rewritten. This is the
-    config LIVE ON PROD for account d0fa70b1…"""
+    config LIVE ON PROD for account 8e4a51c2…"""
     assert _chat(monkeypatch, "raw", ZAI_FULL) == ZAI_FULL
 
 
