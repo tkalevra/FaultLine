@@ -1,6 +1,6 @@
 """BUG-005 — RATE-DEFERRED FAST-FAIL (the retry ladder must not eat its own rate budget).
 
-Prod wedge, 2026-10-20 (account d0fa70b1, BYOM NIM brain max_rpm=40): every harvest turn
+Prod wedge, 2026-10-20 (account 8e4a51c2, BYOM NIM brain max_rpm=40): every harvest turn
 of the document drain degraded with ``first_reason=REFRAME:rate_deferred`` — the limiter
 never put the turn's LLM requests on the wire — yet the chunk path STILL paid the full
 timeout ladder: spine (up to its full client timeout), then the /extract/rewrite fallback.

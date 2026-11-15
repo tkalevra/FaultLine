@@ -195,7 +195,7 @@ ZAI_EXPECTED = "https://api.z.ai/api/paas/v4/chat/completions"
 
 
 def test_zai_versioned_base_does_not_double_the_version_env(monkeypatch):
-    """THE DEFECT. Stored on prod as account d0fa70b1… (backend_type=openai,
+    """THE DEFECT. Stored on prod as account 8e4a51c2… (backend_type=openai,
     base_url=https://api.z.ai/api/paas/v4). Before: …/v4/v1/chat/completions → 404."""
     assert _env_endpoint(monkeypatch, "openai", "https://api.z.ai/api/paas/v4") == ZAI_EXPECTED
 
