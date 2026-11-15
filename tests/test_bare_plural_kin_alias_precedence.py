@@ -1,6 +1,6 @@
 """BARE-PLURAL-KIN ALIAS PRECEDENCE — the "who are my children?" recall wound.
 
-THE WOUND (prod seat 10d7d879, saas 5dd91ad0): capture was FIXED —
+THE WOUND (prod seat 3f9c21ae, saas 5dd91ad0): capture was FIXED —
 (marlow|dax|marina, child_of, user) + the three ages stored; migration 296
 seeded the bare-plural kin aliases children/kids/sons/daughters -> parent_of into
 public + every faultline_% schema — yet recall of "who are my children and how old

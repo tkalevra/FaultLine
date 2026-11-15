@@ -186,7 +186,7 @@ async def _drive(app):
             try:
                 return await c.post(
                     "/classify-intent",
-                    params={"user_id": "10d7d879-63cd-4f31-92ce-f2c9edb760ab"},
+                    params={"user_id": "921514dd-512e-44e1-8f0c-f58090027bd9"},
                     json={"text": "My sister Dana moved to Halifax last spring."})
             finally:
                 done.set()

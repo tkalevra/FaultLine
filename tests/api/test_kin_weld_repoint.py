@@ -649,7 +649,7 @@ from src.api.kin_weld_repoint import (  # noqa: E402
 
 
 def test_bind_endpoint_keys_either_arrangement():
-    USER = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    USER = "921514dd-512e-44e1-8f0c-f58090027bd9"
     FOX = "foxglove-0000-4000-8000-000000000001"
     # the LIVE door arrangement: name on OBJECT
     assert kin_bind_endpoint(USER, FOX, USER) == FOX

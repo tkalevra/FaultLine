@@ -93,7 +93,7 @@ def _plant(schema, seat):
     # "type node" — a name is never a role word, so it must never be retired
     rows["lucas"] = ("facts", fact(seat, "parent_of", ent("lucas")))
     fact(ent("kid"), "instance_of", ids["lucas"])
-    # CONTROL (prod seat 10d7d879 shape): a product type node on a social rel — not this class
+    # CONTROL (prod seat 3f9c21ae shape): a product type node on a social rel — not this class
     rows["portainer"] = ("facts", fact(seat, "knows", ent("portainer", etype="Concept")))
     fact(ent("stack55"), "instance_of", ids["portainer"])
     # CONTROL: a real NAMED mother (unattested, but a name is never a role word)

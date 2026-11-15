@@ -1881,7 +1881,7 @@ def _resolve_keyed_map(dsn: str, category: str, bootstrap: dict[str, str]) -> di
     ``if not tenant_map: tenant_map = dict(bootstrap)``, i.e. the code floor applied ONLY when the
     tenant held ZERO rows in the category. The moment a tenant grew ONE row, the ENTIRE seeded floor
     was discarded. Measured locally, exactly as on production: tenant
-    ``faultline_10d7d879_63cd_4f31_92ce_f2c9edb760ab`` holds social_role = {agent, colleague} and
+    ``faultline_921514dd_512e_44e1_8f0c_f58090027bd9`` holds social_role = {agent, colleague} and
     therefore resolved WITHOUT the floor's ``friend → friend_of`` — so "my friend is Sam" fell back
     to has_role + ``owns(user, sam)``, a PERSON filed as an owned object, on a tenant that had done
     nothing wrong except grow. A growth mechanism that ERODES seeded knowledge as the tenant grows
@@ -2143,7 +2143,7 @@ def resolve_measure_canonical_map(dsn: str) -> dict[str, str]:
 
 # ── WOUND B: canonical scalar-attribute-key rail ─────────────────────────────────────────
 # The same fact class must land on ONE attribute shelf, or the query's aspect→attribute routing
-# cannot walk it (measured on prod seat 10d7d879: the ip aspect filed as ``has_ip`` on a September
+# cannot walk it (measured on prod seat 3f9c21ae: the ip aspect filed as ``has_ip`` on a September
 # row, junk ``ip_address`` on another, ``has_subnet`` on a third).
 #
 # OWNER DIRECTIVE (growth is the key; direct seeding is last-ditch): the resolution is NOT a

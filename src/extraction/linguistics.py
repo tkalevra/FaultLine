@@ -34968,7 +34968,7 @@ def _collect_date_spans(text: str) -> list:
                         seen_spans.add(span.lower())
     except Exception as e:  # noqa: BLE001 — fail-safe: relative-cue recovery never crashes the net
         log.warning("linguistics.date_relative_cue_net_failed", error=str(e)[:160])
-    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 10d7d879) ──────────────
+    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 3f9c21ae) ──────────────
     # A network-address token (IPv4 A.B.C.D, with or without /NN prefix; an octet RUN of three or
     # more dot-groups; IPv6 colon-hex; a MAC pair-shape) is NEVER a date candidate, no matter how
     # the NER or the numeric regexes proposed it: dateparser on a fragment of "198.51.100.83/25"

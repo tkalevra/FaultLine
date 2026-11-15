@@ -1590,7 +1590,7 @@ def test_validate_tool_input_pin_set_empty_arg_passes():
     """Pin set + empty arg user_id → effective = pin, validation passes (pinned deploy unchanged)."""
     from src.mcp.server import _validate_tool_input
 
-    with patch("src.mcp.server.FAULTLINE_USER_ID", "10d7d879-63cd-4f31-92ce-f2c9edb760ab"):
+    with patch("src.mcp.server.FAULTLINE_USER_ID", "921514dd-512e-44e1-8f0c-f58090027bd9"):
         # user_id arg empty, but effective resolves to the pin → no user_id error
         err = _validate_tool_input("query", {"text": "hello", "user_id": ""})
     # Should not be a user_id error (text is valid, so None overall)
@@ -1624,7 +1624,7 @@ def test_validate_tool_input_whitespace_arg_agrees_with_bind_tenant():
     """
     from src.mcp.server import _validate_tool_input
 
-    _pin = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+    _pin = "921514dd-512e-44e1-8f0c-f58090027bd9"
     with patch("src.mcp.server.FAULTLINE_USER_ID", _pin):
         # Whitespace-only ⇒ absent ⇒ the pin fills the void, same as bind_tenant.
         assert _validate_tool_input("query", {"text": "hello", "user_id": "   "}) is None

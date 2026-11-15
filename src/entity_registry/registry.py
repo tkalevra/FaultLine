@@ -910,7 +910,7 @@ class EntityRegistry:
                         note="convergence probe error → minting as today (fail-safe)")
             return None
 
-    # ── DEVICE-HOSTNAME COREF AT MINT (WOUND C, prod seat 10d7d879) ────────────────────
+    # ── DEVICE-HOSTNAME COREF AT MINT (WOUND C, prod seat 3f9c21ae) ────────────────────
     # The SAME physical device kept minting rivals across months: 'lenovo thinkpad p70' (Aug),
     # 'p70 laptop' (Aug), 'p70' (Sept), 'sam-p70' (today) — so its scalars (has_ip, has_mac …)
     # scattered across sibling entities that never superseded or merged. The #226 convergence above

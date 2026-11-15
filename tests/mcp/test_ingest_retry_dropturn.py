@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import src.mcp.server as S
 from src.mcp.server import ingest_document_tool, learn_facts_tool, remember_facts_tool
 
-_UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+_UID = "921514dd-512e-44e1-8f0c-f58090027bd9"
 _EDGES = [{"subject": "user", "rel_type": "owns", "object": "corolla"}]
 
 

@@ -1,6 +1,6 @@
 """The `climb_state` attempt cap must actually BIND — a growing ontology cannot reset it forever.
 
-THE BUG (measured on production seat 10d7d879, 2026-08-11). `_climb_state_should_skip` honours an
+THE BUG (measured on production seat 3f9c21ae, 2026-08-11). `_climb_state_should_skip` honours an
 `unplaceable` verdict only while `attempt_count < _CLIMB_MAX_ATTEMPTS` (default 3) AND the concept's
 FINGERPRINT is unchanged. But `_concept_fingerprint` is built from two terms:
 
@@ -10,7 +10,7 @@ FINGERPRINT is unchanged. But `_concept_fingerprint` is built from two terms:
 Term (b) moves whenever ANY concept anywhere in the tenant gains a parent. On a growing tenant that
 happens constantly, so EVERY cached verdict is invalidated at once and the cap is UNREACHABLE.
 
-Production evidence, seat 10d7d879 (`climb_state`, cap = 3):
+Production evidence, seat 3f9c21ae (`climb_state`, cap = 3):
 
     verdict     | reason                  | attempt_count | concept
     ------------+-------------------------+---------------+---------

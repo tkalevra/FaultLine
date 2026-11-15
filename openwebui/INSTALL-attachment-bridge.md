@@ -79,7 +79,7 @@ integration. This filter performs no memory reads or writes of its own.
 # TOOL-SERVER credential + the seat header — exactly what the filter sends.
 FAULTLINE="http://faultline-mcp:8002"          # or https://mcp.faultline.ca
 TOOLSERVER_KEY="<the tool-server bearer>"      # MCP_API_KEY (open core) / account key (SaaS)
-SEAT="10d7d879-63cd-4f31-92ce-f2c9edb760ab"    # the OWUI user id (seat)
+SEAT="921514dd-512e-44e1-8f0c-f58090027bd9"    # the OWUI user id (seat)
 
 base64 -w0 ./EPA_Wind_Turbines_Fact_Sheet.pdf > /tmp/doc.b64
 python3 -c "import json;print(json.dumps({'filename':'EPA_Wind_Turbines_Fact_Sheet.pdf','data_b64':open('/tmp/doc.b64').read()}))" > /tmp/body.json

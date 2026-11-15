@@ -8488,7 +8488,7 @@ _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or 
 # TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
 # nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
 # on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
-# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `fraggle` sat at
+# BINDS. Measured on production (seat 3f9c21ae, 2026-08-11): cap = 3, yet `fraggle` sat at
 # attempt_count=188, `slinky` 189, `mittens` 187 — each a re-classification burning LLM calls — with
 # 47 rows over cap and 2,372 recorded attempts across 570 rows on ONE seat.
 # This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a

@@ -1,6 +1,6 @@
 """SURGICAL TOMBSTONE GUARD — a surgical forget can never become a rel-class sweep.
 
-WOUND (prod seat 10d7d879, 2026-08-19): a surgical_scalar retraction ("I don't have a
+WOUND (prod seat 3f9c21ae, 2026-08-19): a surgical_scalar retraction ("I don't have a
 laptop") resolved subject=USER with NO object bound; FactStoreManager.retract's object-side
 fallback matched object_id=user_uuid AND rel_type=child_of — every live kin edge in the
 seat — and mode="hard_delete" stamped archived_at = deleted_at = now() on all of them in

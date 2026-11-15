@@ -271,7 +271,7 @@ def refuses_subclass_rung(
     return (False, None)
 
 # ── WOUND E: the instance_of TARGET guard (the cross-ontology break) ────────────────────
-# THE WHY (prod seat 10d7d879, measured): recall rendered "P70 Laptop is an instance of DAX"
+# THE WHY (prod seat 3f9c21ae, measured): recall rendered "P70 Laptop is an instance of DAX"
 # — dax is the owner's SON, a named Person entity. That edge is a CATEGORY ERROR ACROSS THE
 # HARD LINE: instance_of is the L4 PLACE edge and must target a TYPE node (laptop → device
 # ladder), NEVER a named instance/person (a memory). The subclass_of guard above protects the

@@ -1,4 +1,4 @@
-"""TOMBSTONE-RESTATE RESURRECTION — the prod re-statement wound (seat 10d7d879).
+"""TOMBSTONE-RESTATE RESURRECTION — the prod re-statement wound (seat 3f9c21ae).
 
 A genuine user RE-STATEMENT (remember_facts, fresh /ingest, NO X-FL-Deferred-Replay
 marker) of a natural key whose facts row carries the Phase-4 forget tombstone

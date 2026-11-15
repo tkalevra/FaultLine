@@ -5139,7 +5139,7 @@ _REL_TYPE_CATEGORY_LOCK = threading.RLock()
 
 # ── FLAG: REL_TYPE_CATEGORY_BULK_PRIME (BUG-R4-3 lane, the 11.6s family walk; default ON;
 # OFF = byte-for-byte the per-key connect path) ────────────────────────────────────────
-# MEASURED WOUND (prod, owner seat 10d7d879, 2026-11-14, cProfile on the TTL-expired walk):
+# MEASURED WOUND (prod, owner seat 3f9c21ae, 2026-11-14, cProfile on the TTL-expired walk):
 # the TTL memo above collapsed the 2026-08-10 storm (one connection PER FACT) to one
 # connection per rel_type per TTL window — but a heavy seat carries HUNDREDS of distinct
 # rel_types in one walk's fact set (627 measured; 5,275 live on the seat), and a
@@ -25127,7 +25127,7 @@ def _scalar_sensitivity_for(category: str | None, datatype: str | None) -> str:
     return "public"
 
 
-# WOUND A (host-CIDR discipline, prod seat 10d7d879): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
+# WOUND A (host-CIDR discipline, prod seat 3f9c21ae): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
 # with a prefix length — NOT a subnet declaration. The detector's CIDR grammar used to file the rel
 # ``has_subnet`` unconditionally, so ``"an ip of: 198.51.100.83/25"`` landed as has_subnet beside
 # (never superseding) the host's real has_ip. The value SHAPE decides: a CIDR-shaped value files
@@ -61176,7 +61176,7 @@ def determine_path(
                     continue
                 # ALIAS FIRST, then exact rel_type name. Carry tail_types so SCALAR vs
                 # relationship routing is unchanged.
-                # PRECEDENCE (the bare-plural-kin wound, prod seat 10d7d879): the old UNION
+                # PRECEDENCE (the bare-plural-kin wound, prod seat 3f9c21ae): the old UNION
                 # listed the exact-name arm FIRST, so when a grown rel_type shares the
                 # alias's surface word (live: an engine-grown rel_type `children` beside the
                 # seeded alias children→parent_of), the name-shaped shell shadowed the
@@ -61763,7 +61763,7 @@ def determine_path(
             if anchor_resolved_uuid and _aspect_words:
                 try:
                     # (B) ALIAS-RESOLVED RELATIONSHIP OUTRANKS THE SAME-NAMED ATTRIBUTE
-                    # (the bare-plural-kin wound, prod seat 10d7d879): a query aspect word
+                    # (the bare-plural-kin wound, prod seat 3f9c21ae): a query aspect word
                     # that resolves through rel_type_aliases to a NON-scalar rel names a
                     # RELATIONSHIP ("children" -> parent_of), not a scalar slot — so it must
                     # not ALSO admit a same-named stored attribute into scalar_rels, and the

@@ -4,7 +4,7 @@ Pins `src.extraction.linguistics.type_term_shape`, the TERM-ADMISSIBILITY predic
 the three `ingest_miss_pushback` writers (two on the ingest path in `src/api/main.py`, one in the
 async climb in `src/re_embedder/embedder.py`).
 
-THE BUG THIS PINS (measured on production seat 10d7d879, 2026-08-11). The ingest concept-grounding
+THE BUG THIS PINS (measured on production seat 3f9c21ae, 2026-08-11). The ingest concept-grounding
 queue admitted ANY un-laddered relational OBJECT as a "novel concept" needing an is-a ladder. It
 asked "does this object have a place yet?" and never "is this the KIND OF THING that gets a place?"
 So phrases lifted verbatim out of the owner's messages were minted as concepts and driven through

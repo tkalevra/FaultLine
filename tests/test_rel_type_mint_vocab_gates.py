@@ -1,7 +1,7 @@
 """MEASURED regression tests for the rel_type mint vocabulary gates (bug 05 + bug 03).
 
 Every fixture below is a REAL prod measurement from the tenant that produced the junk
-(faultline_10d7d879, dump-window 2026-11-01..03; corpus pull /tmp/veto_corpus_all.txt):
+(faultline_3f9c21ae, dump-window 2026-11-01..03; corpus pull /tmp/veto_corpus_all.txt):
   * 225 rel_types minted in 24h, ~25% surname-shaped single tokens (citation lift);
   * the negation family (not_at, cannot_handle, never_watches, ...) minted from negated
     clauses that folded their polarity into the predicate string (20/20 vetoed by the

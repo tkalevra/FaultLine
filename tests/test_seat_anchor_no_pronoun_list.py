@@ -57,8 +57,8 @@ class _FakeCur:
         return False
 
 
-SEAT_UUID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
-SEAT_SCHEMA = "faultline_10d7d879_63cd_4f31_92ce_f2c9edb760ab"
+SEAT_UUID = "921514dd-512e-44e1-8f0c-f58090027bd9"
+SEAT_SCHEMA = "faultline_921514dd_512e_44e1_8f0c_f58090027bd9"
 OTHER_UUID = "3f1c9d22-1111-4222-8333-444455556666"
 
 
@@ -72,7 +72,7 @@ def test_marker1_the_bound_schema_name_identifies_the_seat_owner():
 
 def test_marker1_is_prefix_agnostic_so_the_cortex_schema_family_works_too():
     assert WG.is_seat_anchor(_FakeCur({}), SEAT_UUID,
-                             schema_name="flagent_10d7d879_63cd_4f31_92ce_f2c9edb760ab") is True
+                             schema_name="flagent_921514dd_512e_44e1_8f0c_f58090027bd9") is True
 
 
 def test_marker1_does_not_promote_a_different_entity_in_the_same_schema():

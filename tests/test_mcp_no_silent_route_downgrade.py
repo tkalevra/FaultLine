@@ -44,7 +44,7 @@ from src.mcp.server import remember_facts_tool, retract_fact_tool  # noqa: E402
 # every `pytest.raises(BrainUnavailable)` then demands the exception the old code never raised.
 BrainUnavailable = getattr(S, "BrainUnavailable", None) or type("BrainUnavailableMissing", (Exception,), {})
 
-_UID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+_UID = "921514dd-512e-44e1-8f0c-f58090027bd9"
 _TEXT = "My sister Dana moved to Halifax last spring and she works as a marine biologist."
 
 

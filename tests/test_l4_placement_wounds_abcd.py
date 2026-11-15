@@ -1,5 +1,5 @@
 
-"""Pins for the L4-placement fix cluster (WOUNDS A-D, prod seat 10d7d879 laptop turn).
+"""Pins for the L4-placement fix cluster (WOUNDS A-D, prod seat 3f9c21ae laptop turn).
 
 WOUND A  — a CIDR host address ("an ip of: 198.51.100.83/25") files has_ip (datatype cidr),
            never has_subnet-by-default, and NEVER feeds the date lane (no fabricated date).

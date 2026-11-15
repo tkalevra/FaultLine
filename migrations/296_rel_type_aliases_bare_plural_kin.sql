@@ -10,7 +10,7 @@
 -- possessed/verb forms (has_child/has_children/has_son/…→parent_of) and the role nouns
 -- (kid→parent_of, son/daughter→parent_of, child→child_of), but NOT the bare plurals a real
 -- question uses: "who are my CHILDREN / kids / sons / daughters?". Measured live on prod (seat
--- 10d7d879, 2026-10-09, after the #227-#231 deploy): "my children are: Marlow, a son 12;
+-- 3f9c21ae, 2026-10-09, after the #227-#231 deploy): "my children are: Marlow, a son 12;
 -- Dax, a son 20; Marina, a daughter 10" captured PERFECTLY — (marlow|dax|marina,
 -- child_of, user) + the three ages — but the recall of "who are my children" bound NO
 -- relationship rel (no 'children' alias row in the tenant), the aspect fell through to a junk
