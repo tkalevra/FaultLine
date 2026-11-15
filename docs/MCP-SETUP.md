@@ -58,14 +58,14 @@ The `faultline-mcp` service reads both automatically on startup.
 
 #### Step 2a — OpenWebUI integration
 
-In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server**
+In OpenWebUI: **Settings → Integrations → Tools → Add MCP Server** (native MCP) **OR** Settings → Tools → `+` (OpenAPI tool server — the recommended path that reliably forwards the per-user identity header).
 
 | Field | Value |
 |-------|-------|
-| URL | `http://faultline-mcp:8002/mcp` (Docker-internal) |
+| URL | `http://faultline-mcp:8002/mcp` (native MCP, Docker-internal) or `http://faultline-mcp:8002` (OpenAPI tool server) |
 | Bearer Token | `<your MCP_API_KEY value>` |
 
-OpenWebUI will call `tools/list`, discover all six tools — `recall_memory`, `remember_facts`, `ingest_document`, `learn_facts`, `retract_fact`, `forget_fact` — and surface them as native tools in every conversation. The MCP tools are the live integration path; the legacy OpenWebUI Filter in `openwebui/` is intentionally disabled.
+OpenWebUI will call `tools/list` and surface the tool suite as native tools in every conversation: the memory tools (`recall_memory`, `remember_facts`, `ingest_document`, `ingest_file`, `document_status`, `retry_document`, `learn_facts`, `retract_fact`, `forget_fact`, `review_structure`) plus the agent-cortex tools (`cortex_recall`, `cortex_remember`). Tool descriptions OpenWebUI reads come from **`src/mcp/tools.py::TOOLS`** — the single source of truth. `/openapi.json` is a hand-built spec (`_build_tool_openapi`) that resolves each operation's description from `TOOLS`; the `@app.post` decorator text is never served to an OpenAPI client, so editing it changes nothing — do not keep two copies in sync (three hand-maintained copies drifted once, and the OpenAPI door served an impoverished `recall_memory` description; `_build_tool_openapi` now resolves descriptions FROM `TOOLS`). The legacy OpenWebUI Filter in `openwebui/` remains intentionally disabled — the MCP tool server is the supported path.
 
 #### Step 2b — Claude Desktop over HTTP (remote MCP server)
 
