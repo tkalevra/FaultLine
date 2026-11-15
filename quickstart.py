@@ -120,6 +120,17 @@ def _http_get(url, headers=None, timeout=8):
         return r.status, r.read().decode("utf-8", "replace")
 
 
+def _http_post_json(url, payload, headers=None, timeout=12):
+    """Minimal POST for the connectivity chat probe — the exact call shape the stack's
+    LLM client makes against {base}/chat/completions (the operator's own key, 1 token)."""
+    body = json.dumps(payload).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(url, data=body, headers=hdrs)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected — url is from operator env (LLM_BASE_URL), never user input
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode("utf-8", "replace")
+
+
 def _probe_url(url):
     """host-side probe target: undo the container rewrite so we test from here."""
     return url.replace("host.docker.internal", "localhost").rstrip("/")
@@ -136,7 +147,36 @@ def probe_models(backend, base_url, key):
         if backend in ("lm_studio", "openai", "openwebui"):
             path = "/api/models" if backend == "openwebui" else "/v1/models"
             headers = {"Authorization": f"Bearer {key}"} if key else {}
-            status, body = _http_get(base + path, headers=headers)
+            try:
+                status, body = _http_get(base + path, headers=headers)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise  # auth failures / other codes: handled by the outer handler verbatim
+                # CODING-PLAN / minimal gateways serve no model list (404 on /v1/models)
+                # while the chat completions endpoint works fine — the truenas proof stack
+                # hit exactly this against https://api.z.ai/api/coding/paas/v4. Fall back
+                # to the ONE call the stack itself makes: a minimal 1-token chat probe
+                # with the operator's key. Success ⇒ connected, models list empty (the
+                # operator types the model id by hand — same as a server with no models).
+                probe_headers = dict(headers)
+                probe_headers.setdefault("Content-Type", "application/json")
+                try:
+                    pstatus, _pbody = _http_post_json(
+                        base + "/chat/completions",
+                        {"model": "default",
+                         "messages": [{"role": "user", "content": "ping"}],
+                         "max_tokens": 1},
+                        headers=probe_headers)
+                except urllib.error.HTTPError as pe:
+                    if pe.code in (401, 403):
+                        return False, [], f"HTTP {pe.code} — auth failed (check your API key)"
+                    return False, [], f"HTTP {pe.code} — endpoint error (chat probe)"
+                except Exception as pe:
+                    return False, [], f"{type(pe).__name__}: {pe} (chat probe)"
+                return True, [], (
+                    "chat probe — endpoint serves no model list; enter the model id manually "
+                    "/ sonda de chat: el endpoint no publica lista de modelos; introduce el id "
+                    f"de modelo a mano) [HTTP {pstatus}]")
             data = []
             try:
                 p = json.loads(body)

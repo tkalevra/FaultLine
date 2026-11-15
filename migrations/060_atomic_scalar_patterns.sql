@@ -117,7 +117,7 @@ VALUES
   '\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}\b',
   'has_fqdn',
   'Fully-qualified domain name',
-  'hairbrush.helpdeskpro.ca',
+  'mail.example.com',
   'scalar_atomic', 'bootstrap', 0.91
 ),
 
@@ -137,7 +137,7 @@ VALUES
   'https?://[^\s\)\"'']+',
   'has_url',
   'HTTP/HTTPS URL',
-  'https://hairbrush.helpdeskpro.ca/api',
+  'https://mail.example.com/api',
   'scalar_atomic', 'bootstrap', 0.95
 ),
 
