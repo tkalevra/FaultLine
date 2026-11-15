@@ -47,7 +47,7 @@ DELETE FROM rel_types
  WHERE engine_generated IS TRUE
    AND rel_type ~ '(^|_)(not|never|cannot|cant|dont|doesnt|didnt|isnt|arent|wasnt|werent|wont|wouldnt|couldnt|shouldnt|nor|neither)(_|$)';
 
--- (3) measured name/place rel_types (BUG-03 evidence list, seat 10d7d879 inspection).
+-- (3) measured name/place rel_types (BUG-03 evidence list, seat 3f2a9c41 inspection).
 DELETE FROM rel_types
  WHERE engine_generated IS TRUE
    AND rel_type IN ('beltagy','cattan','see','zhuoyi','zekai','yuanzhi','xiangrui','vipula','vinija','usa','rizwan','shreshtha','kul','askell','cohan');

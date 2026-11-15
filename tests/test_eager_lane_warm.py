@@ -1,6 +1,6 @@
 """Pins: EAGER_LANE_WARM (BUG-R4-3 lane, the residual first-turn cost).
 
-MEASURED on prod (owner seat 10d7d879, 2026-11-14): after the REL_TYPE_CATEGORY_BULK_PRIME
+MEASURED on prod (owner seat 3f2a9c41, 2026-11-14): after the REL_TYPE_CATEGORY_BULK_PRIME
 fix the steady-state walk is ~2.2s and the door ~2.5s — but the FIRST turn in a fresh
 process pays lazy loads that dwarf the walk: spaCy ~4.6s (first ``_get_nlp``), NLTK
 WordNet ~4.7-9s (first ``wordnet_ladder._wn``), plus the rel-type category window's first

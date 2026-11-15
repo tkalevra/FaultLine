@@ -30,7 +30,7 @@ async def provision_user_schema_background(user_id: str, user_slug: str, dsn: st
         >>> import asyncio
         >>> asyncio.run(provision_user_schema_background(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     user_slug="christopher"
+        ...     user_slug="daniel"
         ... ))
     """
     try:

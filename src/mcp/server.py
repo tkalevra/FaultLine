@@ -6886,7 +6886,7 @@ async def _recall_memory_tool_impl(query: str, user_id: str) -> dict[str, Any]:
     # slots already arrive as "you", everyone else by their preferred alias). The
     # old name→"you" string-substitution map lived here as a tourniquet; it is
     # dead now that the backend emits perspective at build time. Removing it also
-    # kills the "\b name \b" rewrite that historically produced "The christopher".
+    # kills the "\b name \b" rewrite that historically produced "The daniel".
     # _clean_for_mcp is retained as belt-and-suspenders against stray
     # UUID/label tokens in older prose.
 
@@ -8672,7 +8672,7 @@ async def _remember_facts_tool_impl(text: str, user_id: str, *, attested: bool =
         # capture the SAME self-predication fact for one turn ("I felt stressed yesterday" → feels).
         # If they BOTH ingest, the turn lands twice — one copy stamped with event_date, one undated —
         # and recall's facts-over-staged dedup then shadows the dated copy with the undated one. So
-        # ground a bare-copula self-statement ("I am worried"/"I am Chris") ONLY when harvest captured
+        # ground a bare-copula self-statement ("I am worried"/"I am Alex") ONLY when harvest captured
         # nothing for this turn. This mirrors the STATEMENT branch's harvest→ground fallthrough below.
         # FAIL-SAFE: a turn whose only fact comes from grounding is still captured (harvest returns 0).
         if not _harvested:
@@ -11820,7 +11820,7 @@ _OPERATION_LANES: dict[str, tuple[tuple[str, ...], tuple[str, ...], frozenset[st
     # kind: (count fields, extra positive fields, success statuses or None)
     # IDENTITY-HONESTY (bug 2): the ingest lane ALSO counts alias/preference effects — a name
     # turn that registered (or promoted) an alias is a WRITE that landed, never a zero-capture.
-    # Measured on the owner's demo: "My name is Christopher" answered three zeros while the
+    # Measured on the owner's demo: "My name is Daniel" answered three zeros while the
     # alias row landed, and this predicate misreported it as NOTHING LANDED.
     "ingest": (("committed", "staged", "scalar_committed", "aliases_registered"),
                ("aliases_preferred", "alias_preference_flips",

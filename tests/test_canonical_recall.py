@@ -19,7 +19,7 @@ from src.api.main import (
     _query_has_name_intent,
 )
 
-USER_UUID = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+USER_UUID = "7e4b1d02-8a35-4c67-9d24-51e0b3a97f16"
 ORG_UUID = "43033395-0000-4000-8000-000000000001"
 
 

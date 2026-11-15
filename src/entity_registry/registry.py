@@ -902,13 +902,13 @@ class EntityRegistry:
                         note="convergence probe error → minting as today (fail-safe)")
             return None
 
-    # ── DEVICE-HOSTNAME COREF AT MINT (WOUND C, prod seat 10d7d879) ────────────────────
+    # ── DEVICE-HOSTNAME COREF AT MINT (WOUND C, prod seat 3f2a9c41) ────────────────────
     # The SAME physical device kept minting rivals across months: 'lenovo thinkpad p70' (Aug),
-    # 'p70 laptop' (Aug), 'p70' (Sept), 'chris-p70' (today) — so its scalars (has_ip, has_mac …)
+    # 'p70 laptop' (Aug), 'p70' (Sept), 'dev-rig' (today) — so its scalars (has_ip, has_mac …)
     # scattered across sibling entities that never superseded or merged. The #226 convergence above
     # is TIME-WINDOWED (recent entities only); a hostname re-statement months later misses it.
     # This probe is the HOSTNAME-SHAPE branch: a surface whose hostname token (alnum, carries a
-    # digit, len ≥ 3 — 'p70', 'chris-p70', 'xps-13') is a stem/suffix match of an EXISTING entity
+    # digit, len ≥ 3 — 'p70', 'dev-rig', 'xps-13') is a stem/suffix match of an EXISTING entity
     # alias's hostname token binds to that entity through the EXISTING alias machinery
     # (register_alias — the walk reaches every scalar from any alias), NOT a merge rewrite.
     # GUARDS (a wrong bind corrupts user truth):
@@ -920,14 +920,14 @@ class EntityRegistry:
     @staticmethod
     def _hostname_tokens(surface: str) -> list[str]:
         """Hostname-shaped tokens of a surface: alphanumerics only (hyphens/underscores split —
-        'chris-p70' → ['chris', 'p70']), each carrying a DIGIT and ≥3 chars. Pure; no DB."""
+        'dev-rig' → ['alex', 'p70']), each carrying a DIGIT and ≥3 chars. Pure; no DB."""
         _toks = [t for t in re.split(r"[^a-z0-9]+", str(surface or "").strip().lower()) if t]
         return [t for t in _toks if len(t) >= 3 and any(ch.isdigit() for ch in t)]
 
     @classmethod
     def _hostname_stem_match(cls, new_surface: str, alias_surface: str) -> str | None:
         """The matched hostname TOKEN (the stem) or None. Stem/suffix rule: one side's hostname
-        token equals or is a SUFFIX of the other's ('p70' ⊂ 'chris-p70'); a shared prefix alone
+        token equals or is a SUFFIX of the other's ('p70' ⊂ 'dev-rig'); a shared prefix alone
         ('xps-13' vs 'xps-15' sharing 'xps' — no digits) never matches, and a longer-token match
         must end at the token boundary ('p700' does not stem-match 'p70')."""
         _new = cls._hostname_tokens(new_surface)
@@ -961,7 +961,7 @@ class EntityRegistry:
                 if (_etype or "").strip().lower() == "person" and not _alias_is_hostname:
                     continue  # a similarly-nicknamed PERSON never merges (the guard, spelled)
                 # LIVE-FAIL ROOT CAUSE (pre-prod be10006d verdict): GLiNER2 routinely types a
-                # bare hostname surface ('chris-P70') PERSON — it LOOKS like a name — so the
+                # bare hostname surface ('alex-P70') PERSON — it LOOKS like a name — so the
                 # FIRST device mention landed in entities typed Person and the person-skip
                 # above refused the restate's coref, minting a SECOND device entity. A HOSTNAME
                 # SHAPED alias (a digit-bearing token, _hostname_tokens) is never a person:
@@ -1814,7 +1814,7 @@ class EntityRegistry:
                 # A new preferred alias may only demote the incumbent preferred
                 # alias when its source rank is >= the incumbent's. A weaker
                 # source (e.g. rel_default) can no longer clobber a stronger one
-                # (e.g. user_stated) — this is the wren-over-chris poisoning,
+                # (e.g. user_stated) — this is the wren-over-alex poisoning,
                 # prevented at the source. The new alias is still stored (never
                 # lost), just as is_preferred=false.
                 # ──────────────────────────────────────────────────────────────

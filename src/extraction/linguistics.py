@@ -227,11 +227,11 @@ SPINE_CORRECTION_NAME_REPAIR: bool = os.environ.get(
 ).strip().lower() not in ("0", "false", "no")
 
 # LIVE-OPENWEBUI FIX 2 (2026-11-13): the RELATIONAL NEGATION-DELETION for the named-binding
-# shapes in the STATEMENT lane. The measured prod turns — "Chris does not have a child named
-# Aurora Flood" / "Chris does not have a stepchild" — routed STATEMENT (the ingest lane) and
+# shapes in the STATEMENT lane. The measured prod turns — "Alex does not have a child named
+# Aurora Flood" / "Alex does not have a stepchild" — routed STATEMENT (the ingest lane) and
 # the negated name-type binding was SKIPPED SILENTLY (``b.negated`` → continue), so no
 # negated row landed anywhere and the denied child later landed LIVE from the stale-chat
-# re-assert. The scalar-own negation ("Chris does not own a Goose" → (user, owns, goose)
+# re-assert. The scalar-own negation ("Alex does not own a Goose" → (user, owns, goose)
 # polarity='negated') already works — this arm MIRRORS it for the binding-carried relations:
 # a negated (Name ↔ Type) binding emits ONLY the category relation edge with negated=True
 # (kin → the specific child_of/sibling_of/… rel; pet/possession → has_pet), never the
@@ -584,7 +584,7 @@ def _possessor_bearer_kind(tok):
 
 
 # Dependency labels that OPEN A NEW CLAUSE. The naming frame's token span stops at each of them, so
-# a second naming clause riding the same turn ("… my sister's name is Thorne, AND my name is Chris")
+# a second naming clause riding the same turn ("… my sister's name is Thorne, AND my name is Alex")
 # contributes its tokens to ITS OWN frame and to no other. Without this the two clauses share a
 # subtree — spaCy attaches the second copula as ``conj`` of the first — and the guard becomes
 # TURN-GLOBAL again by the back door, which is the defect this scoping exists to close.
@@ -868,7 +868,7 @@ def _naming_frame_records(text: str) -> tuple:
 
     Everything is collected CLAUSE-LOCALLY. An older version returned a single turn-global
     ``speaker_names_self`` BOOLEAN, so one self-naming clause anywhere in the turn switched the guard
-    off for every other clause — "Actually my sister's name is Thorne, and my name is Chris." left the
+    off for every other clause — "Actually my sister's name is Thorne, and my name is Alex." left the
     third-party clause completely unprotected. A caller can now ask the questions that are actually
     well-formed: is the value it is about to write a token of a clause about somebody ELSE and of no
     clause about the speaker, and does any label THAT clause uses identify the entity it would land
@@ -3352,7 +3352,7 @@ def surface_is_date_span(text: str, surface: str) -> bool:
 # ``\bi'm (\w+)`` name regex AND the per-turn ``INTENT_PRECLASSIFY`` LLM call.
 #   ADJ   → feeling/affective state ("worried", "anxious")          → rel "feels"
 #   NOUN  → role / occupation        ("teacher", "engineer")        → rel "occupation"
-#   PROPN → name / proper noun        ("Chris", "Ace")              → rel "also_known_as"
+#   PROPN → name / proper noun        ("Alex", "Ace")              → rel "also_known_as"
 # DETERMINER OVERRIDE: a complement with a ``det`` child (article "a"/"an"/"the") is a common-noun
 # role regardless of POS — "I am a Systems Analyst" → occupation even when the sm model title-case-
 # tags "Analyst" as PROPN. This is a grammatical primitive (the det dependency), casing-robust.
@@ -3374,7 +3374,7 @@ class CopulaAnalysis:
     - ``subject_is_self`` : True ONLY when the nsubj is a genuine 1st-person *personal* pronoun
                             ("I"/"we" — Person=1 ∧ PronType=Prs ∧ no Poss). A possessive subject
                             ("my favorite color …") is NOT self (Poss=Yes) → preference residue.
-    - ``complement`` : the copula complement, lowercased ("worried", "teacher", "chris").
+    - ``complement`` : the copula complement, lowercased ("worried", "teacher", "alex").
     - ``complement_pos`` : the complement's universal POS ("ADJ"/"NOUN"/"PROPN"/"VERB").
     - ``relation``   : the first-cut rel_type from complement POS, or ``None`` when ambiguous
                        (VERB participle) → caller routes the residue (e.g. LLM grounding).
@@ -3438,12 +3438,12 @@ def _is_first_person_possessive(tok) -> bool:
 # OF THE USER (preference_source='rel_default': an also_known_as/pref_name edge that no user-stated
 # signal licensed). With "what" as the user's name, any question containing it anchored on the user.
 # The rule is grammatical: a surface names the SPEAKER only when the speaker's own clause assigns it —
-#   • a copular/passive-naming clause whose subject is a 1st-person personal pronoun ("I'm Chris",
-#     "I am called Chris") and the surface is its complement (attr/oprd);
+#   • a copular/passive-naming clause whose subject is a 1st-person personal pronoun ("I'm Alex",
+#     "I am called Alex") and the surface is its complement (attr/oprd);
 #   • a clause whose subject is a NAMING NOUN possessed by the speaker ("my nickname is Topher"), or
-#     its inversion ("Chris is my name");
+#     its inversion ("Alex is my name");
 #   • a naming verb (the grown naming_verb cue class) with the speaker as its object ("people call me
-#     Chris") and the surface as the name dependent.
+#     Alex") and the surface as the name dependent.
 # A closed-class token (PRON/DET/AUX/SCONJ/CCONJ/ADP/PART, or a wh-tag WDT/WP/WP$/WRB) is never a
 # name — refused by POS/tag, never a word list. A PROPN outside such a frame ("Matt Shumer built…",
 # "I met Matt Shumer") names somebody else and is refused by the same test.
@@ -3477,8 +3477,8 @@ def _speaker_naming_frame_holds(root) -> str | None:
     its own clause, else ``None``. Pure grammar + grown cue classes.
 
     #93 additions (chat self-identification): the clitic copula that en_core_web_sm parses as a
-    genitive ("My name's Chris" / "Name's Chris": the naming noun is a ``poss`` of the name with a
-    ``case`` 's), a demonstrative / neuter subject ("It's Chris", "This is Chris speaking"), and the
+    genitive ("My name's Alex" / "Name's Alex": the naming noun is a ``poss`` of the name with a
+    ``case`` 's), a demonstrative / neuter subject ("It's Alex", "This is Alex speaking"), and the
     verbless ``X here`` (a demonstrative ``advmod`` on the bare name)."""
     head = root.head
     naming_nouns = _naming_nouns()
@@ -3507,7 +3507,7 @@ def _speaker_naming_frame_holds(root) -> str | None:
     if head.i == root.i and any(c.dep_ == "advmod" and "Dem" in c.morph.get("PronType")
                             for c in root.children):
         return "name_here"
-    # "It's Chris" / "This is Chris speaking": climb ≤2 heads to the copula
+    # "It's Alex" / "This is Alex speaking": climb ≤2 heads to the copula
     _h = root
     for _ in range(2):
         if _h.head.i == _h.i:
@@ -5550,7 +5550,7 @@ def _is_structured_atomic_value(text: str) -> bool:
 def _nearest_hostname_surface(doc, before_idx):
     r"""The nearest PRECEDING hostname-shaped NP surface in THIS doc -- a NOUN/PROPN phrase
     whose token run carries a digit-bearing token of >=3 chars (the same hostname shape the
-    registry's WOUND C coref matches: 'chris-p70', 'p70 workstation', 'xps 15') -- or None.
+    registry's WOUND C coref matches: 'dev-rig', 'p70 workstation', 'xps 15') -- or None.
 
     THE WOUND IT GUARDS (live-fail 2, lab be10006d verdict): a 3rd-person possessive
     determiner over HARDWARE ("its mac is ...") whose antecedent lives in a SIBLING atom must
@@ -5590,7 +5590,7 @@ def _hostname_binding_appositive(head_tok):
     r"""The INSTANCE SURFACE of a hostname-binding appositive on head_tok -- or None.
 
     THE CONSTRUCTION (round-5 RED 1): the label-appositive shape, possessor NP + comma + hostname
-    label + colon + machine name (my laptop, hostname: chris-P70 has an ip of ...). The apposed
+    label + colon + machine name (my laptop, hostname: alex-P70 has an ip of ...). The apposed
     label clause BINDS the device machine name; the type head (laptop) is that device L4 TYPE --
     a common noun the instance_of rung points AT -- never a second, attribute-less referent.
 
@@ -5615,7 +5615,7 @@ def _hostname_binding_appositive(head_tok):
             if _host_tok is None:
                 # PARATACTIC LABEL MIS-PARSE: spaCy hangs the label clause off the head but
                 # leaves the machine name a SIBLING nsubj of the clause verb ("my laptop,
-                # hostname: chris-P70 has an ip of ..." -> chris-P70 nsubj has). The label
+                # hostname: alex-P70 has an ip of ..." -> alex-P70 nsubj has). The label
                 # child still marks the construction: scan LINEARLY from the label child
                 # for the first hostname-shaped token.
                 #
@@ -5634,7 +5634,7 @@ def _hostname_binding_appositive(head_tok):
                 # scan STOPS at the first CLAUSE punctuation (a label clause is contiguous
                 # — the colon of the shape itself is NOT clause punctuation and stays
                 # inside) and at 3 tokens (the measured shape: label ':' name — the name
-                # is 1-2 tokens past the label). "chris-P70" at distance 2 survives;
+                # is 1-2 tokens past the label). "alex-P70" at distance 2 survives;
                 # "… Biscuit is a corgi; … 2023" crosses the semicolon at distance 10 →
                 # refused, the binding stands. Flag-gated (default ON = the bounded
                 # window; OFF = the unbounded scan, byte-for-byte).
@@ -8332,7 +8332,7 @@ def analyze_name_type_bindings(text):
                     d.pos_ == "NUM" and d.dep_ == "nummod" for d in type_tok.children):
                 continue
             # ROUND-5 RED 1 (detector-level, live-proven on SPINE_NAMING_CHAIN): a
-            # hostname-BINDING appositive on the type head (my laptop, hostname: chris-P70
+            # hostname-BINDING appositive on the type head (my laptop, hostname: alex-P70
             # ...) means the recovered name is the LABEL NOUN of a device-name bind --
             # binding it re-mints the zero-attribute fragment (hostname, instance_of,
             # laptop) + (user, owns, hostname) and the pre-pass suppresses the real type
@@ -17387,7 +17387,7 @@ SPINE_HOSTNAME_APPOSITIVE_TYPE: bool = os.environ.get(
 SPINE_HOSTNAME_LABEL_WINDOW: bool = os.environ.get(
     "SPINE_HOSTNAME_LABEL_WINDOW", "true").strip().lower() not in ("0", "false", "no")
 # ROUND-5 RED 1 (gate verdict): the exact P70 turn minted the type head (laptop) as a STANDALONE
-# zero-attribute entity beside the device (chris-p70) -- recall anchored to the EMPTY fragment
+# zero-attribute entity beside the device (dev-rig) -- recall anchored to the EMPTY fragment
 # and answered honest-empty while every scalar sat on the sibling. Required semantics: the type
 # head in the surface+hostname-label construction is the DEVICE L4 TYPE (the instance_of rung),
 # not a referent. ON by default; OFF -> byte-identical legacy behaviour.
@@ -25027,16 +25027,16 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # ── TWO CORRECTIONS (SPINE_FUNCTIONAL_SLOT) ──────────────────────────────────────
             # (1) RAIL, NOT THE LITERAL LEMMA "name". This gate keyed the bare string "name"
             #     while the DB-grown ``naming_noun`` cue class already carries alias/byname/
-            #     epithet/moniker/nickname/surname. So "Christopher is the user's NICKNAME"
+            #     epithet/moniker/nickname/surname. So "Daniel is the user's NICKNAME"
             #     failed in a way "…'s NAME" did not — a subject-agnostic violation (the class
             #     lives on the per-tenant rail; the code must ASK the rail).
             # (2) BOTH COPULAR ORDERS. A copular clause pairing a NAME with a naming-noun NP
             #     comes in the two orders Higgins (1973) distinguishes and Mikkelsen (2005:
             #     ch. 1, exx. 1.1/1.2) states in these terms:
-            #       SPECIFICATIONAL  "My name is Christopher."        name=nsubj, name-value=attr
+            #       SPECIFICATIONAL  "My name is Daniel."        name=nsubj, name-value=attr
             #                        — subject introduces the VARIABLE, post-copular supplies
             #                          its VALUE (Higgins 1979: 153ff).
-            #       PREDICATIONAL    "Christopher is the user's name."  name-value=nsubj, name=attr
+            #       PREDICATIONAL    "Daniel is the user's name."  name-value=nsubj, name=attr
             #     ⚠️ NOTE THE DIRECTION — it is easy to get backwards, and this chain's own
             #     history did. The order this guard ALREADY handled (naming noun in ``nsubj``)
             #     is the SPECIFICATIONAL one; the order it MISSED (naming noun in ``attr``) is
@@ -25046,7 +25046,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #     sentences), so subject=value is the plain canonical order.
             #     The guard admitted ``nsubj`` only, so on the predicational order it did not
             #     fire and the SORTAL genitive leg below claimed the clause — emitting
-            #     (name, related_to, user) with "Christopher" dropped as uncovered residue.
+            #     (name, related_to, user) with "Daniel" dropped as uncovered residue.
             #     The naming noun occupies a copular ARGUMENT slot in both orders; that is what
             #     we test.
             def _is_name_copula_nsubj(_n):
@@ -25397,7 +25397,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     # prior affirmed row in place. See _possessum_predication_negated for the
                     # presupposition-projection carve-out that keeps "My dog is not sick" affirmed.
                     # ROUND-5 RED 1 -- DEVICE-FRAGMENT SPLIT SUPPRESSION: "my laptop,
-                    # hostname: chris-P70 ..." -- when the possessed type head carries a
+                    # hostname: alex-P70 ..." -- when the possessed type head carries a
                     # hostname-BINDING appositive, the HEAD is the device's L4 TYPE, never a
                     # standalone zero-attribute entity. Retarget the ownership onto the DEVICE
                     # surface and file the instance_of rung (the type head stays the type);
@@ -26312,7 +26312,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             "Dana goes by Dee"               → (dana,  also_known_as, dee)    [named subject]
 
         THE HARD LINE: a NAME is FILED via the alias registry (``also_known_as``), NEVER classified
-        into L4. First-person self-naming ("I prefer to be called Chris") is OWNED by the affect/
+        into L4. First-person self-naming ("I prefer to be called Alex") is OWNED by the affect/
         preference seam (analyze_naming / _detect_preference_states on the UNION path) and is SKIPPED
         here to avoid a double capture.
 
@@ -26451,14 +26451,14 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # ── BOTH COPULAR ORDERS + THE NAMING RAIL (SPINE_FUNCTIONAL_SLOT) ─────────────────
             # A copular clause pairing a proper NAME with a naming noun comes in the two orders
             # Higgins (1973) / Mikkelsen (2005: ch. 1) distinguish —
-            #   SPECIFICATIONAL  "My name is Christopher."         name=nsubj, Christopher=attr
-            #   PREDICATIONAL    "Christopher is the user's name."  name=attr,  Christopher=nsubj
+            #   SPECIFICATIONAL  "My name is Daniel."         name=nsubj, Daniel=attr
+            #   PREDICATIONAL    "Daniel is the user's name."  name=attr,  Daniel=nsubj
             # (⚠️ direction check: the naming-noun-as-``nsubj`` order is the SPECIFICATIONAL one.
             #  Do not label the other "inverted specificational" — for Mikkelsen the
             #  specificational clause is itself the inverse one, after Moro 1997.)
             # This chain admitted the specificational order ONLY, so on the predicational order it declined,
             # the sortal genitive leg of ``_chain_possessive`` claimed the clause and emitted
-            # (name, related_to, user) while "Christopher" was logged as uncovered residue — the
+            # (name, related_to, user) while "Daniel" was logged as uncovered residue — the
             # chain knew the construction in one direction only. The naming noun is also resolved
             # from the DB-grown ``naming_noun`` rail rather than the literal lemma "name", so
             # "… is the user's NICKNAME" no longer fails where "… NAME" succeeds.
@@ -26506,7 +26506,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                      and (c.lemma_ or c.text or "").strip().lower() in _kin_rel_nouns),
                     None)
             if role is None:
-                # BARE FIRST-PERSON POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Christopher is MY name":
+                # BARE FIRST-PERSON POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Daniel is MY name":
                 # the functional noun's argument is a 1st-person POSSESSIVE PRONOUN, so there is no
                 # role NOUN for the scans above to find and the chain declined the clause outright
                 # (``_chain_possessive`` then minted the slot as (user, owns, name)). The possessor
@@ -26558,7 +26558,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # copy is exactly how the two naming sites drifted, and the drift was invisible (the
             # chain declines silently and the whole turn derives zero edges).
             if _inverted:
-                # PREDICATIONAL order: the NAME is the copula's SUBJECT ("Christopher is the
+                # PREDICATIONAL order: the NAME is the copula's SUBJECT ("Daniel is the
                 # user's name"). Take it from the subject slot; the ADJ/acomp OOV-name admission
                 # that ``_copular_name_complement`` grants is complement-specific and does not
                 # apply to a subject, so this is a deliberately narrower scan, not a re-inline.
@@ -26583,9 +26583,9 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 # builds a NEW ``Token`` wrapper on every access, so ``c is not role`` is ALWAYS
                 # True even when both name the same token — the "exclude the role itself" filter
                 # never excluded anything. Latent until the predicational arm arrived: in the
-                # BARE-possessor frame ("Christopher is the user's name") the naming noun's only
+                # BARE-possessor frame ("Daniel is the user's name") the naming noun's only
                 # ``poss`` child IS the role, so the filter re-selected it and possessor collapsed
-                # onto the role surface, yielding (christopher, related_to, user) instead of the
+                # onto the role surface, yielding (daniel, related_to, user) instead of the
                 # alias edge. Compare by token OFFSET (``.i``), which is the identity spaCy
                 # actually preserves. Gated with the bare arm below: on its own the corrected
                 # filter would leave possessor unresolved and DROP the clause, so the two must
@@ -26606,7 +26606,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                     possessor = "user"
                 elif poss_tok.pos_ in ("NOUN", "PROPN"):
                     possessor = (poss_tok.text or poss_tok.lemma_ or "").strip().lower()
-            # BARE POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Christopher is THE USER'S name" / "Rex is
+            # BARE POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Daniel is THE USER'S name" / "Rex is
             # JOHN'S name": the naming noun is possessed DIRECTLY, with no intermediate role noun
             # to collapse — so the ``role`` slot found above IS the possessor, and it carries no
             # ``poss`` child of its own. The frame above required a role WITH its own possessor and
@@ -26907,7 +26907,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # mother IS CALLED Anna": nsubjpass/auxpass) assigns the name to its subject, and spaCy
             # may label that name oprd/attr/dobj. An ACTIVE clause ("my mother CALLS Anna every
             # day") names nothing through its plain dobj — Anna is the one being called; only a
-            # secondary predicate (oprd/attr: "people call me Chris") can carry a name there.
+            # secondary predicate (oprd/attr: "people call me Alex") can carry a name there.
             _passive = any(c.dep_ in ("nsubjpass", "auxpass") for c in tok.children)
             _name_deps = ("oprd", "attr", "dobj", "obj") if _passive else ("oprd", "attr")
             # #97(c) — ACTIVE VOICE: the secondary predicate (oprd/attr) names the DIRECT OBJECT,
@@ -26935,7 +26935,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 role = next((c for c in tok.children
                              if c.dep_ in ("nsubjpass", "nsubj") and c.pos_ == "NOUN"), None)
             if role is None:
-                # BARE FIRST-PERSON POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Christopher is MY name":
+                # BARE FIRST-PERSON POSSESSOR (SPINE_FUNCTIONAL_SLOT). "Daniel is MY name":
                 # the functional noun's argument is a 1st-person POSSESSIVE PRONOUN, so there is no
                 # role NOUN for the scans above to find and the chain declined the clause outright
                 # (``_chain_possessive`` then minted the slot as (user, owns, name)). The possessor
@@ -28610,7 +28610,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
         try:
             _p = next((c for c in type_tok.children if c.dep_ == "poss"), None)
             if _p is None:
-                # DEVICE GUARD: a hostname-shaped type surface (chris-p70) is hardware --
+                # DEVICE GUARD: a hostname-shaped type surface (dev-rig) is hardware --
                 # its scalars belong to the DEVICE, never the speaker (live-fail 2:
                 # its-mac landed on the user entity). No 1st-person poss is present, so
                 # the 1st-person hook does not apply; the device surface is the anchor.
@@ -28686,7 +28686,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                           and (t.text or "").strip().lower() == type_head_raw), None)
             type_head = ((_ttok.lemma_ if _ttok is not None else "") or type_head_raw).strip().lower()
             # ROUND-5 RED 1 (SPINE_NAMING_CHAIN shape, live-proven): a hostname-binding
-            # appositive on the type head (my laptop, hostname: chris-P70 ...) makes the
+            # appositive on the type head (my laptop, hostname: alex-P70 ...) makes the
             # binding name the LABEL NOUN (hostname), not a name of the referent --
             # this chain then mints (hostname, instance_of, laptop) + (user, owns,
             # hostname), re-creating the zero-attribute fragment WITH the label word AS
@@ -29095,7 +29095,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                         _emit(_full_name, "instance_of", _type_head,
                               obj_tok=tok, subj_tok=head)
                         continue
-            # ROUND-5 RED 1: a hostname-binding appositive ("laptop, hostname: chris-P70")
+            # ROUND-5 RED 1: a hostname-binding appositive ("laptop, hostname: alex-P70")
             # is a device-name BIND -- the label noun is not a role and the head is not a
             # referent. Decline the generic has_role (the hostname lane owns the bind).
             if SPINE_HOSTNAME_APPOSITIVE_TYPE and _hostname_binding_appositive(head):
@@ -30719,7 +30719,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
                 continue
             # ── NEGATED BINDING — RELATIONAL NEGATION-DELETION (LIVE-OPENWEBUI FIX 2,
             # SPINE_NEGATED_NAME_BINDING, default ON; OFF → the plain skip, byte-parity) ──
-            # "Chris does not have a child named Aurora Flood" detected its (Aurora Flood ↔
+            # "Alex does not have a child named Aurora Flood" detected its (Aurora Flood ↔
             # child) binding and this chain SKIPPED it — no negated row anywhere, and the
             # denied child later landed LIVE. Mirror the WORKING scalar-own negation (the
             # SVO carry emits (subject, owns, goose) negated=True → the facts row lands
@@ -30730,8 +30730,8 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             #   kin head    → (name, <specific kin rel>, <possessor>)  negated
             #   pet head    → (<owner>, <possession rel>, name)        negated
             # The possessor is the SPEAKER for a self-possessed binding; otherwise the
-            # governing possession verb's own subject surface ("Chris does not have …" →
-            # chris), first person → user. An unresolvable possessor or a non-kin,
+            # governing possession verb's own subject surface ("Alex does not have …" →
+            # alex), first person → user. An unresolvable possessor or a non-kin,
             # non-pet type → no edge (never a guessed relation on a denial).
             if b.negated:
                 if SPINE_NEGATED_NAME_BINDING:
@@ -30922,7 +30922,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # social_role row DISCARDS the whole seeded floor. That is a rail/metadata defect and must
             # be fixed there, not compensated for here.
             # ROUND-5 RED 1: a hostname-binding appositive on the type head (my laptop,
-            # hostname: chris-P70 ...) makes this a LABEL-BIND mis-read -- the name here is
+            # hostname: alex-P70 ...) makes this a LABEL-BIND mis-read -- the name here is
             # the hostname label, not a name of the referent, and aliasing the type head to it
             # re-mints the zero-attribute fragment this gate exists to suppress. The hostname
             # lane owns that bind; decline the alias.
@@ -32855,7 +32855,7 @@ def negated_name_assertion(text: str):
     2026-11-07). Returns (subject_surface, denied_value) when the clause is a NEGATED
     finite predication whose subject is FIRST-PERSON (the speaker, or a speaker-owned noun
     via a possessive determiner) and whose REJECTED complement is a PROPER-NAME surface —
-    e.g. "My wife is not Isolde.", "I am not Chris." That shape DENIES a stored identity
+    e.g. "My wife is not Isolde.", "I am not Alex." That shape DENIES a stored identity
     value: a correction directive, never a question, and GLiNER2's verbose labels mis-score
     it QUERY@~0.55 (measured live on bench 76e214a0, gate 0.50 — the misroute that ate the
     correction 2/2 rounds). A negated CLASS complement ("my wife is not a vegetarian") is a
@@ -32893,12 +32893,12 @@ def negated_name_assertion(text: str):
                 (c for c in tok.children if c.dep_ in ("acomp", "attr", "dobj", "obj")),
                 None)
             # ── participial complement: negated finite copula + "married to <NAME>" ──
-            # R4 follow-up (live bench wound 2026-11-07): "I am not married to Chris."
+            # R4 follow-up (live bench wound 2026-11-07): "I am not married to Alex."
             # parses ROOT=am + acomp=married(ADJ) + prep(to) -> pobj NAME. The plain
             # branch above sees a non-name acomp ("married") and declines — so this
             # detector returned None, the intent door filed the DENIAL as a STATEMENT,
             # and the ingest lane INVERTED it: it minted a positive
-            # (user, spouse, chris) row (fabricated marriage, bench row 670) and
+            # (user, spouse, alex) row (fabricated marriage, bench row 670) and
             # re-validated the [wife]-weld row for Wren. The married head may BE the
             # acomp complement (the sm parse) or the ROOT itself, or hide under an
             # acomp/attr child when the complement slot is empty. Same grammar as the
@@ -34974,7 +34974,7 @@ def _collect_date_spans(text: str) -> list:
     # ask the combined per-tenant temporal_patterns matcher: does this turn carry ANY date cue
     # (relative cue OR a formal-absolute surface form: month name / numeric shape / 4-digit year)?
     # No cue → no possible date span → return [] WITHOUT loading spaCy NER. This is what keeps a
-    # plain statement ("my name is Christopher") off the date pipeline. ONE combined .search()
+    # plain statement ("my name is Daniel") off the date pipeline. ONE combined .search()
     # (warm cache = DB-free). Fail-safe inside the overlay: any gate error → True → pipeline runs,
     # so a real date is never silently lost. Tenant cues resolve via the request-bound ContextVar
     # (same binding the cue/rel_type/taxonomy overlays use — set at the ingest temporal block).
@@ -35051,7 +35051,7 @@ def _collect_date_spans(text: str) -> list:
                         seen_spans.add(span.lower())
     except Exception as e:  # noqa: BLE001 — fail-safe: relative-cue recovery never crashes the net
         log.warning("linguistics.date_relative_cue_net_failed", error=str(e)[:160])
-    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 10d7d879) ──────────────
+    # ── IP/CIDR TOKEN FIREWALL (structural; WOUND A, prod seat 3f2a9c41) ──────────────
     # A network-address token (IPv4 A.B.C.D, with or without /NN prefix; an octet RUN of three or
     # more dot-groups; IPv6 colon-hex; a MAC pair-shape) is NEVER a date candidate, no matter how
     # the NER or the numeric regexes proposed it: dateparser on a fragment of "192.0.2.83/25"
@@ -35722,7 +35722,7 @@ def extract_event_date(text: str, reference):
 
 
 # ── PEEL-AND-DROP-OUT — extract the date, REMOVE its span, return the date-free residue ─────────
-# THE COMPOSITIONAL CAPTURE PRINCIPLE (Christopher's directive): "on a component existing → extract
+# THE COMPOSITIONAL CAPTURE PRINCIPLE (Daniel's directive): "on a component existing → extract
 # it, DROP IT OUT of the clause, then build the relation from the residue." For the DATE component
 # this PREVENTS the circumstantial prep from FOLDING into the predicate: with "I got X on February
 # 20th" the SVO grammar would otherwise attach the prepositional date ("on …") to the verb → a

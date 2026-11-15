@@ -9,7 +9,7 @@ THE DEFECT (measured, then reproduced locally row-for-row):
 
 — REPLACE, not union. The in-code floor applied ONLY when the tenant held ZERO rows in the
 category. The moment a tenant grew ONE row the ENTIRE seeded floor was discarded. Local tenant
-``faultline_10d7d879_63cd_4f31_92ce_f2c9edb760ab`` holds social_role = {agent, colleague} and
+``faultline_7e4b1d02_8a35_4c67_9d24_51e0b3a97f16`` holds social_role = {agent, colleague} and
 therefore resolved WITHOUT the floor's ``friend -> friend_of``, so "my friend is Sam" fell through
 to has_role + ``owns(user, sam)`` — a PERSON filed as an owned object — on a tenant whose only sin
 was to grow. A growth mechanism that ERODES seeded knowledge as the tenant grows gets worse the

@@ -271,7 +271,7 @@ def refuses_subclass_rung(
     return (False, None)
 
 # ── WOUND E: the instance_of TARGET guard (the cross-ontology break) ────────────────────
-# THE WHY (prod seat 10d7d879, measured): recall rendered "P70 Laptop is an instance of LEO"
+# THE WHY (prod seat 3f2a9c41, measured): recall rendered "P70 Laptop is an instance of LEO"
 # — leo is the owner's SON, a named Person entity. That edge is a CATEGORY ERROR ACROSS THE
 # HARD LINE: instance_of is the L4 PLACE edge and must target a TYPE node (laptop → device
 # ladder), NEVER a named instance/person (a memory). The subclass_of guard above protects the
@@ -289,7 +289,7 @@ def refuses_subclass_rung(
 #                         metadata) → a captured value / named instance;
 #   R5 stamp              node_role ∈ {value, name, both} → CORROBORATION;
 #   R6 lexical            user-asserted object whose surface is NOT a common-noun type → a
-#                         proper NAME (chris-p70).
+#                         proper NAME (dev-rig).
 # ALLOW (the LV2 regression bar, identical polarity to refuses_subclass_rung): a node with NO
 # memory-side evidence — including a FRESH not-yet-registered type surface — is a legitimate
 # new TYPE node and instances exactly as today. Absence of evidence is never refusal.
@@ -304,7 +304,7 @@ def refuses_subclass_rung(
 # top-branch id onto type nodes (engine metadata, e.g. the taxonomy root of the node's
 # subclass_of ladder) and refuse instance_of when the SUBJECT's branch differs. Until that
 # column exists, THIS guard (target-shape) catches the measured wound class: every real
-# cross-ontology break observed so far (leo, chris-p70→person) has a memory-side TARGET,
+# cross-ontology break observed so far (leo, dev-rig→person) has a memory-side TARGET,
 # which R1/R2/R6 refuse structurally.
 def refuses_instance_target(
     db_conn,

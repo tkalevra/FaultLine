@@ -1692,7 +1692,7 @@ def _reflexive_hierarchy_blocked(subject_id, object_id, is_hierarchy_rel) -> boo
         return False
 
 # THE HARD LINE — the SKOS naming/label rels whose OBJECT is a NAME (a memory: Rex,
-# Apollo, "Chris"), NOT a type. An alias registered as the object of one of these edges is a
+# Apollo, "Alex"), NOT a type. An alias registered as the object of one of these edges is a
 # proper name and is NEVER a valid L4 classification subject — the subclass_of ladder hangs
 # off the TYPE node (dog, computer), never off the name. Same fixed SKOS-identity invariant the
 # rest of the codebase pins (main._ALIAS_BACKED_NAME_RELS = pref_name/also_known_as, the
@@ -2792,7 +2792,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         db_conn: PostgreSQL connection (per-user schema context via search_path)
         qdrant_url: Qdrant service URL for staged collection cleanup
         user_id: User UUID for collection naming (optional, derived from schema context)
-        schema_name: User schema name (e.g., "faultline_christopher"). If provided, sets search_path.
+        schema_name: User schema name (e.g., "faultline_daniel"). If provided, sets search_path.
         promotion_threshold: Confirmed count threshold for promotion (default 3, configurable)
 
     Returns:
@@ -8488,7 +8488,7 @@ _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or 
 # TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
 # nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
 # on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
-# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `luna` sat at
+# BINDS. Measured on production (seat 3f2a9c41, 2026-08-11): cap = 3, yet `luna` sat at
 # attempt_count=188, `bella` 189, `goose` 187 — each a re-classification burning LLM calls — with
 # 47 rows over cap and 2,372 recorded attempts across 570 rows on ONE seat.
 # This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a
@@ -8792,7 +8792,7 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
             f"  worried -> fear\n"
             f"  fence -> structure\n"
             f"  democracy -> political_system\n"
-            f"  christopher -> null\n\n"
+            f"  daniel -> null\n\n"
             f"Concept: \"{c}\"\n\n"
             f"Respond with ONLY valid JSON (no markdown, no extra text):\n"
             f"{{\n"
@@ -8925,7 +8925,7 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             f"\"affective_state\"/\"psychological_phenomenon\"/\"mental_concept\"/\"cognitive_entity\""
             f"/\"abstract_entity\"; those are upper-ontology junk, NOT a real category)\n"
             f"  apollo   -> []\n"
-            f"  christopher -> []\n\n"
+            f"  daniel -> []\n\n"
             f"Concept: \"{c}\"\n\n"
             f"Respond with ONLY valid JSON (no markdown, no extra text):\n"
             f"{{\n"
@@ -15745,7 +15745,7 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
     These are rows where the subject_id is a generic ontology token
     (person, organization, location, etc.) rather than a real entity UUID.
     They were created by mis-extracted triples with subject/object swapped, e.g.:
-        person instance_of christopher
+        person instance_of daniel
         organization instance_of company
 
     Runs once per re_embedder startup — not every poll cycle.  The function is
@@ -16169,7 +16169,7 @@ def main():
     log.info("re_embedder.entering_main_loop")
 
     # One-time startup sweep: remove pre-existing inverted staged_facts hierarchy rows
-    # (e.g. "person instance_of christopher") that were created before the ingest-path
+    # (e.g. "person instance_of daniel") that were created before the ingest-path
     # cleanup was in place.  Gated here so it runs once per process start, not every
     # 60-second poll cycle.
     if ingest_enabled:

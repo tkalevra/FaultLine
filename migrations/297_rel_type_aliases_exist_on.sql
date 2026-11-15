@@ -4,7 +4,7 @@
 --
 -- WHY
 -- ---
--- Measured on prod (seat 10d7d879, laptop turn): "My laptop … exists on tailscale as the same
+-- Measured on prod (seat 3f2a9c41, laptop turn): "My laptop … exists on tailscale as the same
 -- name" lifted the SVO predicate `exist_on` (the verb lemma + the load-bearing prep, at
 -- `_svo_predicate_token` — the lift itself is correct) and filed it VERBATIM as the rel_type.
 -- The canonical lanes carry run_on/member_of-style co-location rels; a non-canonical `exist_on`

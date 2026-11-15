@@ -6,8 +6,8 @@ from src.provisioning.schema_manager import derive_user_slug_from_uuid
 
 def test_derive_user_slug_from_uuid_standard_format():
     """Test UUID with hyphens → underscores."""
-    result = derive_user_slug_from_uuid("10d7d879-63cd-4f31-92ce-f2c9edb760ab")
-    assert result == "10d7d879_63cd_4f31_92ce_f2c9edb760ab"
+    result = derive_user_slug_from_uuid("7e4b1d02-8a35-4c67-9d24-51e0b3a97f16")
+    assert result == "7e4b1d02_8a35_4c67_9d24_51e0b3a97f16"
     assert len(result) == 36
     assert "-" not in result
     assert result.count("_") == 4
@@ -27,8 +27,8 @@ def test_derive_user_slug_from_uuid_all_fs():
 
 def test_derive_user_slug_from_uuid_uppercase():
     """Test that uppercase UUIDs are lowercased."""
-    result = derive_user_slug_from_uuid("10D7D879-63CD-4F31-92CE-F2C9EDB760AB")
-    assert result == "10d7d879_63cd_4f31_92ce_f2c9edb760ab"
+    result = derive_user_slug_from_uuid("7E4B1D02-8A35-4C67-9D24-51E0B3A97F16")
+    assert result == "7e4b1d02_8a35_4c67_9d24_51e0b3a97f16"
     assert result.islower()
 
 
@@ -55,8 +55,8 @@ def test_derive_user_slug_immutability():
 
 def test_derive_user_slug_collision_resistance():
     """Test that different UUIDs produce different slugs."""
-    uuid1 = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
-    uuid2 = "10d7d879-63cd-4f31-92ce-f2c9edb760ac"
+    uuid1 = "7e4b1d02-8a35-4c67-9d24-51e0b3a97f16"
+    uuid2 = "7e4b1d02-8a35-4c67-9d24-51e0b3a97f17"
     slug1 = derive_user_slug_from_uuid(uuid1)
     slug2 = derive_user_slug_from_uuid(uuid2)
     assert slug1 != slug2
@@ -76,16 +76,16 @@ def test_derive_user_slug_multiple_uuids():
 
 def test_derive_user_slug_no_hyphens_in_output():
     """Test that output contains NO hyphens."""
-    result = derive_user_slug_from_uuid("10d7d879-63cd-4f31-92ce-f2c9edb760ab")
+    result = derive_user_slug_from_uuid("7e4b1d02-8a35-4c67-9d24-51e0b3a97f16")
     assert "-" not in result
     assert "_" in result
 
 
 def test_derive_user_slug_schema_name_format():
     """Test that derived slug is suitable for PostgreSQL schema names."""
-    result = derive_user_slug_from_uuid("10d7d879-63cd-4f31-92ce-f2c9edb760ab")
+    result = derive_user_slug_from_uuid("7e4b1d02-8a35-4c67-9d24-51e0b3a97f16")
     # PostgreSQL identifiers must be alphanumeric + underscore
     assert all(c.isalnum() or c == "_" for c in result)
     # Schema prefix + underscore + slug should work
     schema_name = f"faultline_{result}"
-    assert schema_name == "faultline_10d7d879_63cd_4f31_92ce_f2c9edb760ab"
+    assert schema_name == "faultline_7e4b1d02_8a35_4c67_9d24_51e0b3a97f16"

@@ -33,7 +33,7 @@ def _clear_anon_optin(monkeypatch):
 
 
 def test_present_identity_passes_through():
-    assert _require_resolvable_user_id("10d7d879-abc", "/ingest") == "10d7d879-abc"
+    assert _require_resolvable_user_id("3f2a9c41-abc", "/ingest") == "3f2a9c41-abc"
 
 
 @pytest.mark.parametrize("absent", ["", None, "anonymous"])

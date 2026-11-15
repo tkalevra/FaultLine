@@ -255,13 +255,13 @@ def derive_schema_name(user_slug: str) -> str:
     """Derive PostgreSQL schema name from user slug (never hardcode).
 
     Args:
-        user_slug: Human-readable slug from users.slug (e.g., "christopher")
+        user_slug: Human-readable slug from users.slug (e.g., "daniel")
 
     Returns:
         Schema name (e.g., "faultline_example")
 
     Examples:
-        >>> derive_schema_name("christopher")
+        >>> derive_schema_name("daniel")
         'faultline_example'
 
         >>> derive_schema_name("mia")
@@ -787,7 +787,7 @@ def _execute_bootstrap_queries(db: psycopg2.extensions.connection, schema_name: 
 
             # Seed user identity anchor — allows first-person references from GLiNER2
             # (subject="user") to normalize to the user UUID immediately on first ingest.
-            # Overwritable: when user later says "my name is Chris", pref_name updates the alias.
+            # Overwritable: when user later says "my name is Alex", pref_name updates the alias.
             cur.execute("""
                 INSERT INTO entities (id, entity_type)
                 VALUES (%s, 'Person')
@@ -1174,7 +1174,7 @@ def create_user_schema(user_id: str, user_slug: str, db: Optional[psycopg2.exten
     Examples:
         >>> schema_name, status = create_user_schema(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     user_slug="christopher"
+        ...     user_slug="daniel"
         ... )
         >>> assert schema_name == "faultline_example"
         >>> assert status == "ready"

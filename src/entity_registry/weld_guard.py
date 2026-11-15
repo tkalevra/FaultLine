@@ -180,7 +180,7 @@ _ENV_MODE = "ALIAS_WELD_GUARD"
 #   nodes (runtime/driver/process/servidor) — where a user's name must never land.
 #   SEAT-OWNER false refusals: 0 historical, 0 forward-looking.
 #   Legitimate multi-alias entities: 0 refused — {mara,mars,wife}, {leo,son},
-#   {marco,son}, {chiara,chi} and the seat's {user,chris,christopher} all pass.
+#   {marco,son}, {chiara,chi} and the seat's {user,alex,daniel} all pass.
 #   Lexical canonicalization lane: 0 refusals, proven by a positive control, not by absence.
 _DEFAULT_MODE = "enforce"
 
@@ -210,7 +210,7 @@ _DEFAULT_MODE = "enforce"
 #     Seat-owner false refusals: 0 historical, 0 forward.
 #     Corpus leak survey — the matcher licenses 12 distinct pairs across 5 443 real turns;
 #     9 are genuine definitions ({cpa}/{certified public accountant}, {nat}/{network address
-#     translation}, {des}/{marco}, …), 3 are spurious ({free}/{freemium does not count}) and
+#     translation}, {dev}/{marco}, …), 3 are spurious ({free}/{freemium does not count}) and
 #     NONE of the 3 coincides with any weld, so their measured production effect is zero.
 #
 # IT IS STILL `off`, AND THAT IS DELIBERATE — the remaining reason is no longer the warrant.

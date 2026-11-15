@@ -3487,7 +3487,7 @@ _NEGATION_PATTERNS_CACHE: list = []
 _PREFERENCE_PATTERNS_CACHE: list = []
 
 # ── CORRECTION BYPASS GATE (pre-GLiNER2) ──────────────────────────────────────
-# DESIGN (Christopher 2026-06-14): a correction is a BYPASS GATE, not a post-hoc
+# DESIGN (Daniel 2026-06-14): a correction is a BYPASS GATE, not a post-hoc
 # supersede. GLiNER2 stays PURE and good at its strengths (QUERY vs STATEMENT, entity
 # typing/matching) — it is NEVER asked to judge negation it is bad at. When confident the
 # intent is a fix/omission — LLM-driven, hinged on the validated postgres cache — we SKIP
@@ -4398,7 +4398,7 @@ def _group_edge_is_outward_to_user(
     """True when a group-node edge's NON-group endpoint is the querying user.
 
     Bounds the named-group grown-grouping walk: an /expand TOPIC is commonly anchored to
-    the user via an interest/ownership edge (`chris has_interest_in espresso`). That edge
+    the user via an interest/ownership edge (`alex has_interest_in espresso`). That edge
     is the OUTWARD link — surfacing it injects the user node into the result set and the
     downstream /query expansions (Step 3c `_anchor_connected` fan-out, the traversed-scalar
     read) then cascade into the user's UNRELATED personal profile (occupation, family,
@@ -5139,7 +5139,7 @@ _REL_TYPE_CATEGORY_LOCK = threading.RLock()
 
 # ── FLAG: REL_TYPE_CATEGORY_BULK_PRIME (BUG-R4-3 lane, the 11.6s family walk; default ON;
 # OFF = byte-for-byte the per-key connect path) ────────────────────────────────────────
-# MEASURED WOUND (prod, owner seat 10d7d879, 2026-11-14, cProfile on the TTL-expired walk):
+# MEASURED WOUND (prod, owner seat 3f2a9c41, 2026-11-14, cProfile on the TTL-expired walk):
 # the TTL memo above collapsed the 2026-08-10 storm (one connection PER FACT) to one
 # connection per rel_type per TTL window — but a heavy seat carries HUNDREDS of distinct
 # rel_types in one walk's fact set (627 measured; 5,275 live on the seat), and a
@@ -7742,7 +7742,7 @@ def _extract_identity(text: str) -> str | None:
 
     LOOSE ON INPUT (CLAUDE.md "dumb registry / smart query"): registration accepts
     the captured candidate RAW. We do NOT gate on capitalization here — a legitimate
-    lowercase "my name is chris" must register, and a loose candidate like "worried"
+    lowercase "my name is alex" must register, and a loose candidate like "worried"
     is allowed to land as just-another alias (hundreds of also_known_as cost nothing;
     they all hang off the one user). Discernment about whether a stored alias is junk
     happens ONLY at READ time, when the user's name is surfaced (see the owner-identity
@@ -7779,7 +7779,7 @@ def _extract_preferred_name(text: str) -> str | None:
 
     LOOSE ON INPUT, same as _extract_identity: registration accepts the captured
     candidate RAW (no capitalization gate), so a lowercase explicit "I prefer to be
-    called chris" registers, and a loose candidate like "worried" is allowed to land
+    called alex" registers, and a loose candidate like "worried" is allowed to land
     as a preferred alias. The smart filtering — refusing to SURFACE a junk preferred
     name as the user's display name — happens at READ time in /query. The only ingest
     guard kept is the single-character length floor (a bare initial is not a name).
@@ -7801,13 +7801,13 @@ def _convert_gliner_relations_to_edges(gliner_relations_dict: dict,
     GLiNER2 returns: {
         "relation_extraction": {
             "spouse": [("ada", "user")],
-            "instance_of": [("des", "person")],
+            "instance_of": [("dev", "person")],
         }
     }
 
     Convert to: [
         {"subject": "ada", "object": "user", "rel_type": "spouse", "confidence": 0.85, "fact_provenance": "gliner2"},
-        {"subject": "des", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
+        {"subject": "dev", "object": "person", "rel_type": "instance_of", "confidence": 0.85, "fact_provenance": "gliner2"},
     ]
 
     Severance #4 (Phase 1): carry subject_type/object_type on each edge, sourced from the
@@ -10969,7 +10969,7 @@ def get_gliner_model():
 # The gate's own call is preserved as belt-and-suspenders for the non-MCP path.
 
 # Generic ontology-token entity names — subjects that appear in inverted rows
-# (e.g. "person instance_of christopher").  These should never be subjects of
+# (e.g. "person instance_of daniel").  These should never be subjects of
 # hierarchy facts; rows where they ARE the subject are deleted.
 # Mirrors WGMValidationGate._SYSTEM_ENTITY_NAMES.
 _SYSTEM_ENTITY_NAMES: frozenset = frozenset({
@@ -13162,7 +13162,7 @@ _SCALAR_REL_TYPES_CACHE: set[str] = set()
 # System / ontology entity names that must never be written as personal facts into
 # a user schema.  These appear as subjects/objects of LLM-generated hierarchy edges
 # (e.g. /expand FaultLine) and, if allowed through, surface as garbled query results
-# ("chris is a subclass of des").  frozenset gives O(1) membership tests.
+# ("alex is a subclass of dev").  frozenset gives O(1) membership tests.
 # Primary guard — entity_type ('Concept'/'Object') is the metadata-driven secondary guard
 # applied in learn_topic() alongside this name list.
 _SYSTEM_ENTITY_NAMES: frozenset[str] = frozenset({
@@ -18664,8 +18664,8 @@ def _pet_possession_denial_scaffold(doc, root_tok, subj_tok):
     """ARM P of the negated-name correction floor (LIVE-OPENWEBUI FIX 3, 2026-11-13) —
     the deterministic extraction for the THIRD-PERSON pet/possession denial:
 
-        "<Pet> is not a/an <pet-noun> of <Owner>."      ("Quillfeather is not a pet of Chris's.")
-        "<Pet> is not <Owner>'s <pet-noun>."            ("Quillfeather is not Chris's pet.")
+        "<Pet> is not a/an <pet-noun> of <Owner>."      ("Quillfeather is not a pet of Alex's.")
+        "<Pet> is not <Owner>'s <pet-noun>."            ("Quillfeather is not Alex's pet.")
         "<Pet> is not my <pet-noun>."                   ("Goose is not my cat.")
 
     The measured prod wound: the turn classified CORRECTION and the executor produced
@@ -18736,7 +18736,7 @@ def _pet_possession_denial_scaffold(doc, root_tok, subj_tok):
     _pos_rel = (_prft((comp.lemma_ or comp.text or "").strip().lower()) or "has_pet")
     # THE PET-CLASS PIN (the F5 pet arm's own rule): the possession resolver's GENERIC
     # fallback (owns — untyped head / DB-less read) is upgraded to has_pet when the
-    # complement head is a pet-noun class member — a denial of "a pet of Chris" must
+    # complement head is a pet-noun class member — a denial of "a pet of Alex" must
     # deny the pet slot, never the generic ownership slot.
     try:
         from src.extraction.linguistics import _pet_nouns as _pncls, _PET_NOUN_SEED
@@ -18767,7 +18767,7 @@ def _negated_name_correction_floor(text: str):
     reclassification archives the denied edge; scalar → the addressing seam supersedes).
 
     TWO ARMS, grammar only:
-      ARM N — negated-name denial ("My wife is not Isolde." / "I'm not Chris."):
+      ARM N — negated-name denial ("My wife is not Isolde." / "I'm not Alex."):
         negated finite root + first-person subject (self or possessive-owned) + name-like
         complement (the negated_name_assertion contract). subject = the speaker ("user";
         a possessed role head is the speaker's OWN role toward them — kinship-rel map),
@@ -18867,16 +18867,16 @@ def _negated_name_correction_floor(text: str):
                 # ARM P (LIVE-OPENWEBUI FIX 3): a THIRD-PERSON denial subject is not ARM
                 # N's shape — it is the pet/possession denial's. Try the scaffold before
                 # the decline; the measured prod turn ("Quillfeather is not a pet of
-                # Chris's") died silent exactly here.
+                # Alex's") died silent exactly here.
                 _arm_p = _pet_possession_denial_scaffold(doc, tok, subj)
                 if _arm_p:
                     return _arm_p
                 return None
             # ── participial "married to <NAME>" (R4 follow-up, non-possessive denial) ──
-            # Live wound 2026-11-07: "I am not married to Chris." matched NO plain name
+            # Live wound 2026-11-07: "I am not married to Alex." matched NO plain name
             # complement, the floor declined, and the intent door (before the linguistics
             # preroute extension) filed the DENIAL as a STATEMENT that INVERTED into a
-            # positive (user, spouse, chris) row. Scaffold the same denial semantics as
+            # positive (user, spouse, alex) row. Scaffold the same denial semantics as
             # the possessive shapes: rel=spouse is DETERMINISTIC from the lemma "married"
             # + the to-marked name (never guessed from a kinship-role word). Bounded to
             # 'married to' ONLY — family generalization is a planner decision.
@@ -23270,7 +23270,7 @@ async def classify_intent(req: dict, user_id: str = None, model=Depends(get_glin
     # for its strengths and is never made to judge negation. We skip ONLY the GLiNER2 intent
     # step; the downstream correction path (/retract/correct) still runs EXTRACT/QUERY where
     # GLiNER2 matches the target ("what are we fixing") and the supersede/delete/update lands.
-    # Order (Christopher 2026-06-14 — DB matching + model-strength, NO brittle keyword list):
+    # Order (Daniel 2026-06-14 — DB matching + model-strength, NO brittle keyword list):
     #   (1) DB MATCH — the memoized, confidence-WEIGHTED classification store (curated
     #       correction_patterns + engine-grown negation_patterns / intent_pattern_cache). A
     #       confident match routes by the STORED weight, no LLM. The weight is scrutinizable /
@@ -25118,7 +25118,7 @@ def _scalar_sensitivity_for(category: str | None, datatype: str | None) -> str:
     return "public"
 
 
-# WOUND A (host-CIDR discipline, prod seat 10d7d879): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
+# WOUND A (host-CIDR discipline, prod seat 3f2a9c41): an ``A.B.C.D/NN`` composite is a HOST ADDRESS
 # with a prefix length — NOT a subnet declaration. The detector's CIDR grammar used to file the rel
 # ``has_subnet`` unconditionally, so ``"an ip of: 192.0.2.83/25"`` landed as has_subnet beside
 # (never superseding) the host's real has_ip. The value SHAPE decides: a CIDR-shaped value files
@@ -27338,7 +27338,7 @@ def _build_typed_doc(sentence: str, gmodel, labels):
                 _label_conf = {}
             # COORDINATED-SURFACE SPLIT (subject-agnostic, deterministic): GLiNER2 sometimes returns a
             # comma/"and"-joined LIST of names as ONE surface ("Chiara, Dev") — seeding that whole
-            # span as a single entity GLUES the names into one merged entity ("chiara des") and the
+            # span as a single entity GLUES the names into one merged entity ("chiara dev") and the
             # tail member is lost. Split such a surface on its coordinating commas / " and " into the
             # individual names and seed EACH as its own typed span. A surface with no internal
             # coordinator is unchanged. Pure punctuation/coordinator split — NO fuzzy/similarity.
@@ -29289,7 +29289,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
                 #     edges, not just "busy"). DETERMINISTIC (analyze_copula_affect_complements: grammar
                 #     + ADJ/VBN-complement POS + the conj coordination — NO LLM, NO emotion word list),
                 #     gated to a genuine 1st-person PERSONAL-pronoun subject, not negated. A NOUN
-                #     complement ("I am a teacher" → occupation) / PROPN ("I am Chris" → also_known_as)
+                #     complement ("I am a teacher" → occupation) / PROPN ("I am Alex" → also_known_as)
                 #     are NOT this lane. Deduped via _add_feeling. Subject-agnostic.
                 try:
                     from src.extraction.linguistics import (
@@ -29935,7 +29935,7 @@ async def _harvest_via_sentence_pipeline(req: RewriteRequest, user_id: str):
     # clean-sentence path returns edges to the caller for /ingest but never fires those helpers,
     # so the rung never lands. We mirror those call sites HERE, before returning the edges.
     #
-    # THIN LEAF ON THE EXISTING SEEDED BACKBONE (Christopher's nuance): we do NOT grow a fresh
+    # THIN LEAF ON THE EXISTING SEEDED BACKBONE (Daniel's nuance): we do NOT grow a fresh
     # deep ladder per entity. _attach_to_seeded_backbone stages exactly ONE depth-1 endpoint rung
     # (<concept> <hier_rel> <seeded_taxonomy_anchor>) connecting the leaf to the already-seeded
     # canonical backbone the walk traverses; the bounded mid-chain stays the async re_embedder's
@@ -31736,7 +31736,7 @@ async def _ground_self_predication(text: str, user_id: str) -> list[dict]:
                 "The user is describing THEMSELF with 'I am X' / \"I'm X\". Decide what X represents "
                 "about the user and pick the single best-fit relation:\n"
                 "- feels: an emotion / mood / transient affective state (worried, anxious, happy, exhausted).\n"
-                "- also_known_as: their name, nickname, or what they go by (Chris, Ace).\n"
+                "- also_known_as: their name, nickname, or what they go by (Alex, Ace).\n"
                 "- occupation: their job / role / profession (teacher, engineer, student).\n"
                 "- none: anything else, a NEGATION ('I am not X'), or unclear.\n"
                 'Respond with STRICT JSON only: {"relation":"' + _rels + ' | none","object":"<the core word, lowercase>"}.'
@@ -31767,7 +31767,7 @@ async def _ground_self_predication(text: str, user_id: str) -> list[dict]:
 async def ground_self_predication_endpoint(req: RewriteRequest) -> dict:
     """Backend seam for the self-predication grounding router (see _ground_self_predication).
     The MCP ingest path calls this as a last resort when /extract/rewrite + /harvest-spans
-    yield nothing, so a bare-copula self-statement ("I am worried", "I am Chris") is grounded
+    yield nothing, so a bare-copula self-statement ("I am worried", "I am Alex") is grounded
     and routed to the right relation instead of dropped or mis-filed. Fail-safe → {edges:[]}."""
     user_id = _require_resolvable_user_id(req.user_id, "/ground-self-predication")
     # Freeze switch (knowledge-store mode): pure ingest feeder (its ONLY caller ingests
@@ -36454,8 +36454,8 @@ def _user_alias_write_refusal(text: str, alias: str, *, alias_on_user: bool, pre
       • document / artefact lane (``source == 'document'`` or a ``source_ref`` citation): EVERY
         alias write onto the user entity is refused, whatever the frame (a document's first person
         is its author), corrections included;
-      • chat: no first-person licence is demanded (it refused real names — "My name's Chris",
-        "Chris here"); only a closed-class token is refused, by POS, on every lane."""
+      • chat: no first-person licence is demanded (it refused real names — "My name's Alex",
+        "Alex here"); only a closed-class token is refused, by POS, on every lane."""
     if not alias_on_user:
         return None
     if (source or "") == "document" or doc_lane:
@@ -39495,7 +39495,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                         else:
                             # Pre-check: if this alias is already registered to the user anchor,
                             # short-circuit here — prevents ghost entity creation for the user's
-                            # own names (e.g., "Chris" resolving to 43033395 instead of user UUID).
+                            # own names (e.g., "Alex" resolving to 43033395 instead of user UUID).
                             _subject_is_user_alias = False
                             # SAVEPOINT-guard so a probe failure rolls back ONLY the probe
                             # and never leaves the shared db connection aborted (fail-loud).
@@ -40772,7 +40772,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                             edge.object.lower() in preferred_objects
                         )
                         # ── USER-STATED NAME PROMOTION (identity-honesty, ALIAS-PROVENANCE-DESIGN) ──
-                        # Measured on the owner's live demo (2026-08-21): "My name is Christopher"
+                        # Measured on the owner's live demo (2026-08-21): "My name is Daniel"
                         # landed EVERY time as a NON-preferred alias (re_embedder
                         # suspect_preferred_name reason=preferred_alias_never_user_chosen, flag-only)
                         # because the spine's (user, also_known_as, X) edge carries
@@ -41758,7 +41758,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
                             # A novel rel_type emitted inside a /learn (/extend) batch would
                             # otherwise fall to Class C (30-day expiry) on its low llm_learned
                             # confidence and AGE OUT, even though the user explicitly asked the
-                            # system to learn this domain. Christopher: "if we tell it to grow,
+                            # system to learn this domain. Daniel: "if we tell it to grow,
                             # we don't want it aging out — it's not A, but a solid B for
                             # consistency." Floor to Class B so it lands in staged_facts on the
                             # promotion track (confirmed_count) and is EXEMPT from the Class-C
@@ -42763,7 +42763,7 @@ async def _ingest_impl(req: IngestRequest, request: Request, model):
 
                     # PHASE 3b: instance_of inversion guard
                     # instance_of semantics: (individual) instance_of (type/class).
-                    # If GLiNER2 inverts the direction (e.g., "person instance_of christopher"),
+                    # If GLiNER2 inverts the direction (e.g., "person instance_of daniel"),
                     # the subject is a known type name and the object is the individual — swap them.
                     # Guard uses _SYSTEM_ENTITY_NAMES (DB-driven frozenset of known type tokens).
                     # Zero hardcoded entity names: detection is purely set-membership.
@@ -46370,8 +46370,8 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
       when allowed_rels is set, filtered to the in-scope attributes only.
 
     anchor_uuid: When provided, skip facts where the connected entity points back at
-    the anchor (e.g., des→child_of→user). These anchor-inverse facts are already
-    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→des).
+    the anchor (e.g., dev→child_of→user). These anchor-inverse facts are already
+    handled by fetch_facts_from_anchor()'s inverse query (inverted to user→parent_of→dev).
     Surfacing them again creates dual-direction render in the memory block.
     """
     results: list[dict] = []
@@ -46402,9 +46402,9 @@ def _fetch_entity_facts(db_conn, user_id: str, entity_uuids: set[str], anchor_uu
                 )
                 for r in cur.fetchall():
                     # Skip facts where the connected entity points back at the anchor.
-                    # These are anchor-inverse facts (e.g., des→child_of→user) already handled
+                    # These are anchor-inverse facts (e.g., dev→child_of→user) already handled
                     # by fetch_facts_from_anchor()'s inverse query which inverted them to
-                    # (user→parent_of→des). Surfacing them again creates dual-direction render.
+                    # (user→parent_of→dev). Surfacing them again creates dual-direction render.
                     if anchor_uuid and role_col == "subject_id" and r[1] == anchor_uuid:
                         continue
                     key = (r[0], r[1], r[2])
@@ -48342,7 +48342,7 @@ def _alias_name_provenance(db, owner_uuid: str):
     holds, in two rungs, both deterministic:
 
       1. ``entity_aliases.preference_source`` of the preferred alias, when it is a fact-authority
-         token (``user_stated`` — the naming layer stamped it: "My name is Christopher"). The
+         token (``user_stated`` — the naming layer stamped it: "My name is Daniel"). The
          engine-side alias sources (rel_default / inferred / lexical / merge / provisioned /
          unspecified) rank DISPLAY trust (registry._PREFERENCE_RANK), not truth — they say
          nothing about who asserted the surface, so they fall to rung 2.
@@ -51607,7 +51607,7 @@ def _grown_topic_taxonomy(db, phrase: str) -> bool:
 #   class 3  bare node (no attrs, no facts)
 # plus a TYPE-DESCEND: a queried TYPE (a bare node that INSTANCES hang off) yields its
 # best instance instead of grounding the same-surface zero-fact node ('laptop' -> the
-# owned, attribute-bearing chris-p70). Applied ONLY as the strongest override (class 0);
+# owned, attribute-bearing dev-rig). Applied ONLY as the strongest override (class 0);
 # every other query falls through to the existing longest-match lane byte-for-byte.
 # ── THE QUERY-VARIANT NET (the evidenced-parity roadmap ITEM 5, the variance-sensitive
 # misses, EVIDENCED-DIRECTIONS-TO-RAG-PARITY.md §5): at the ANCHOR-PROBE boundary (the
@@ -61156,7 +61156,7 @@ def determine_path(
                     continue
                 # ALIAS FIRST, then exact rel_type name. Carry tail_types so SCALAR vs
                 # relationship routing is unchanged.
-                # PRECEDENCE (the bare-plural-kin wound, prod seat 10d7d879): the old UNION
+                # PRECEDENCE (the bare-plural-kin wound, prod seat 3f2a9c41): the old UNION
                 # listed the exact-name arm FIRST, so when a grown rel_type shares the
                 # alias's surface word (live: an engine-grown rel_type `children` beside the
                 # seeded alias children→parent_of), the name-shaped shell shadowed the
@@ -61743,7 +61743,7 @@ def determine_path(
             if anchor_resolved_uuid and _aspect_words:
                 try:
                     # (B) ALIAS-RESOLVED RELATIONSHIP OUTRANKS THE SAME-NAMED ATTRIBUTE
-                    # (the bare-plural-kin wound, prod seat 10d7d879): a query aspect word
+                    # (the bare-plural-kin wound, prod seat 3f2a9c41): a query aspect word
                     # that resolves through rel_type_aliases to a NON-scalar rel names a
                     # RELATIONSHIP ("children" -> parent_of), not a scalar slot — so it must
                     # not ALSO admit a same-named stored attribute into scalar_rels, and the
@@ -65342,7 +65342,7 @@ def fetch_facts_from_anchor(
                                     # The user is the SUBJECT asking, never a STRUCTURAL member
                                     # of a TOPIC grouping. An /expand topic is commonly anchored
                                     # to the user via an interest/ownership edge
-                                    # (`chris has_interest_in espresso`). Surfacing that edge
+                                    # (`alex has_interest_in espresso`). Surfacing that edge
                                     # injects the USER node into db_facts + `_ng_members`, and
                                     # the downstream /query expansions then cascade into the
                                     # user's UNRELATED personal profile: Step 3c seeds
@@ -67288,7 +67288,7 @@ def resolve_display_name(entity_id: str, db) -> str:
                     return _resolve_surrogate_display(entity_id, row[0], _all_aliases, db)
                 # DISPLAY-FORM SAFE INDEX (fog-family critic triage, B attribution b9770dff):
                 # the SELECT asks for (alias, display_form) but old-migration-plausible row
-                # shapes can come back 1-wide (the canonical_recall pin feeds ("Chris",)) --
+                # shapes can come back 1-wide (the canonical_recall pin feeds ("Alex",)) --
                 # an unguarded row[1] raised into the outer except and leaked the RAW UUID
                 # as the display name. Fall back to the alias/name surface instead: the
                 # name is always at index 0, and a missing display_form means no retained
@@ -67445,7 +67445,7 @@ def resolve_entity_display(
 
     Every subject/object slot in every recall lane (DB lane, Qdrant lane, and the
     MCP `_emit` prose) must render through THIS function so the same UUID can never
-    diverge — e.g. resolve to "you" in one lane and "chris" in another (the
+    diverge — e.g. resolve to "you" in one lane and "alex" in another (the
     duplication source this fix kills).
 
     Resolution order (preferred-name = exposed identity):
@@ -68073,7 +68073,7 @@ def _compose_object_clause(
             # COMPLETE 2p sentence, so the composer has nothing to add — fall through to the
             # template path. Without this guard Shape 4 fired unconditionally and overwrote the
             # correct prose the template had already produced:
-            #     "You go by Chris"            -> "your preferred name is Chris"
+            #     "You go by Alex"            -> "your preferred name is Alex"
             #     "You were born on 1980-04-02" -> "your born on is 1980-04-02"
             # and for `also_known_as` it rendered the rel's LABEL DOC-COMMENT verbatim to the user
             # ("your also known as (skos:altLabel; use pref_name for preferred display name) is …"),
@@ -69128,7 +69128,7 @@ def convert_to_prose(facts: list[dict], db, anchor: str = None, user_id: str = N
                         # 2p template has the subject baked in (no X slot). Substitute
                         # only the object into the Y placeholder. The baked subject
                         # "You"/"Your" CONTAINS a literal 'Y', so a naive str.replace
-                        # would corrupt it ("You go by Y" → "Chrisou go by Chris").
+                        # would corrupt it ("You go by Y" → "Chrisou go by Alex").
                         # Replace the Y placeholder as a WHOLE WORD only.
                         if object_name:
                             prose = re.sub(r'\bY\b', lambda _m: object_name, template_2p)
@@ -73546,7 +73546,7 @@ def _query_impl(request: QueryRequest) -> QueryResponse:
         # NAME-INTENT gate (presentation only): non-preferred / legal / also-known-as
         # names stay GROUNDED on the entity UUID but are held in reserve — excluded
         # from normal recall and surfaced ONLY when the query is explicitly about an
-        # entity's name(s). pref_name (the PREFERRED-name memory, "you go by Chris")
+        # entity's name(s). pref_name (the PREFERRED-name memory, "you go by Alex")
         # is always kept; only the also_known_as reserve is gated. Metadata-driven:
         # we gate by the rel_type semantics, not by any hardcoded entity name.
         _name_intent = _query_has_name_intent(query_text)
@@ -75748,7 +75748,7 @@ def correct_fact(req: FactCorrectionRequest):
             # SEC-BUG-1 HONESTY CONTRACT (LIVE-OPENWEBUI FIX 3, 2026-11-13): the
             # incomplete-extraction exit WAS the silent zero-write family's terminal —
             # the classified correction produced nothing AND recorded nothing (the
-            # measured prod turn "Quillfeather is not a pet of Chris's" left no
+            # measured prod turn "Quillfeather is not a pet of Alex's" left no
             # retraction_outcomes row, so the evaluator could never count the miss and
             # the UI saw a bare failure with no cause). Every terminal correction exit
             # now WRITES the honest outcome row (detected_as_retraction mirrors the
@@ -75914,7 +75914,7 @@ def correct_fact(req: FactCorrectionRequest):
         # asking. Memory is tied to the SUBJECT, not to the user.
         #
         # ⚠️ CONDITION (1) IS PER-CLAUSE, NOT PER-TURN. The profile returns two clause-local token
-        # sets, so "Actually my sister's name is Thorne, and my name is Chris." asks the well-formed
+        # sets, so "Actually my sister's name is Thorne, and my name is Alex." asks the well-formed
         # question of each value separately — a self-naming clause elsewhere in the turn cannot
         # disarm the third-party clause beside it, and vice versa.
         # (KIN-NAME FLOOR SKIP: the deterministic kin-name extraction files an EDGE —
@@ -77840,7 +77840,7 @@ def correct_fact(req: FactCorrectionRequest):
                         # whole transaction ROLLED BACK → the denial LOST and the denied
                         # value kept rendering (the exact R3-3a failure mode this guard was
                         # written to prevent — measured: "Quillfeather is not a pet of
-                        # Chris's" → POST /retract/correct 500, the has_pet row stayed
+                        # Alex's" → POST /retract/correct 500, the has_pet row stayed
                         # live, the envelope degraded). A denial's ONLY effect is the
                         # supersession already applied above; the honest completion writes
                         # nothing new and falls through to the shared commit + response.
@@ -83470,7 +83470,7 @@ _LEARN_MAX_DEPTH = int(os.environ.get("LEARN_MAX_DEPTH", "2"))
 # Directive C — DELIBERATE /learn growth is durable Class B (NOT Class C, never ages out).
 # When a /learn (/extend) batch emits a NOVEL rel_type, the novel-rel routing would stage the
 # fact as Class C on its low llm_learned confidence and the Class-C expire/decay jobs would age
-# it out. Christopher: deliberate growth is trusted — floor it to Class B (on the promotion
+# it out. Daniel: deliberate growth is trusted — floor it to Class B (on the promotion
 # track, exempt from C expiry). Consistency/durability fix; default ON, reversible.
 _LEARN_DURABLE_CLASS_B = os.environ.get(
     "LEARN_DURABLE_CLASS_B", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -83551,7 +83551,7 @@ async def _backstop_topic_up_parent(topic: str, user_id: str) -> str | None:
                 "answer null — do NOT invent one.\n"
                 "Examples (topic -> parent): ansible -> configuration_management_tool; "
                 "kubernetes -> container_orchestrator; bash -> shell; tcp -> network_protocol; "
-                "christopher -> null.\n"
+                "daniel -> null.\n"
                 'Respond with STRICT JSON only: '
                 '{"parent":"<single lowercase snake_case category, or null>"}.'
             )},
@@ -83880,7 +83880,7 @@ async def learn_topic(req: LearnTopicRequest):
     # The LLM frequently generates abstract upper-ontology edges such as:
     #   "faultline subclass_of object", "organization subclass_of person"
     # These are meaningless as personal facts and surface as garbled query results
-    # (e.g. "chris is a subclass of des") when abstract UUIDs collide with known entities.
+    # (e.g. "alex is a subclass of dev") when abstract UUIDs collide with known entities.
     #
     # Two complementary checks — belt-and-suspenders:
     #   1. Name check (primary): subject or object in _SYSTEM_ENTITY_NAMES
@@ -83954,7 +83954,7 @@ async def learn_topic(req: LearnTopicRequest):
     # The prompt ASKS the LLM to type the topic itself and the filter keeps that edge, but the
     # LLM frequently emits only component (part_of) edges and NOTHING guarantees a topic up-edge
     # survived — so the topic floats as a top-of-tree island and upward traversal dead-ends.
-    # Christopher: "if you're learning about ansible, it should know WHAT ansible is, and class
+    # Daniel: "if you're learning about ansible, it should know WHAT ansible is, and class
     # upward." If NO subclass_of/instance_of edge whose subject IS the topic survived, run a
     # bounded secondary "what is <topic>?" call and inject `topic subclass_of <parent>` (real
     # is-a rung, validated, bounded, fail-safe). Flag-gated (LEARN_TOPIC_UP_BACKSTOP, default ON);

@@ -64,7 +64,7 @@ _overlay_cache: dict[str, dict] = {}
 # ── GATE matcher cache (the LATENCY GATE in front of the whole date pipeline) ──────────
 # One COMBINED regex per schema = the OR-union of ALL active temporal_patterns rows (relative
 # cues + the formal-absolute class seeded by migration 104). A cheap single .search() answers
-# "does this turn carry ANY date cue?" — a no-cue turn ("my name is Christopher") skips the
+# "does this turn carry ANY date cue?" — a no-cue turn ("my name is Daniel") skips the
 # entire spaCy DATE NER + dateparser pipeline. Same per-schema TTL/cache contract as the cues.
 # {schema_name: {"matcher": compiled_union_or_None, "loaded_at": float}}; "" key = unscoped seed.
 _gate_cache: dict[str, dict] = {}

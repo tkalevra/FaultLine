@@ -17,7 +17,7 @@ from src.re_embedder.embedder import (
     should_reconcile_collection,
 )
 
-ORACLE = "10d7d879-63cd-4f31-92ce-f2c9edb760ab"
+ORACLE = "7e4b1d02-8a35-4c67-9d24-51e0b3a97f16"
 ORACLE_COLL = f"faultline-{ORACLE}"
 ORACLE_SCHEMA = "faultline_" + ORACLE.replace("-", "_")
 

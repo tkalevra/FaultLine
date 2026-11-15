@@ -1,7 +1,7 @@
 """MEASURED regression tests for the rel_type mint vocabulary gates (bug 05 + bug 03).
 
 Every fixture below is a REAL prod measurement from the tenant that produced the junk
-(faultline_10d7d879, dump-window 2026-11-01..03; corpus pull /tmp/veto_corpus_all.txt):
+(faultline_3f2a9c41, dump-window 2026-11-01..03; corpus pull /tmp/veto_corpus_all.txt):
   * 225 rel_types minted in 24h, ~25% surname-shaped single tokens (citation lift);
   * the negation family (not_at, cannot_handle, never_watches, ...) minted from negated
     clauses that folded their polarity into the predicate string (20/20 vetoed by the
@@ -729,10 +729,17 @@ class TestMigration307CorpusContract:
             assert not neg.search(c), c  # no measured-healthy control name is touched
 
     def test_no_second_retirement_migration_shipped(self):
-        # the addendum's numbering rule: 307 is theirs; a NEW retirement migration from
-        # this lane would double-ship. The tree must hold exactly one 307 and no 308.
+        # the addendum's numbering rule: 307 is theirs; a NEW RETIREMENT migration from
+        # this lane would double-ship. The tree must hold exactly one retirement
+        # migration (307) and no second one under any number.
+        # 2026-11-15 vehicle fix (uplift port): the old form banned the literal
+        # '308_' prefix, but 308_seed_pet_noun_cue_class.sql is a SEED, not a
+        # retirement — and it exists on the source lineage this corpus was ported
+        # from, so the prefix ban was red at source. The mechanism (exactly one
+        # retirement migration) is what the pin guards; assert that directly.
         from pathlib import Path
         mig = Path(__file__).resolve().parents[1] / "migrations"
         names = sorted(p.name for p in mig.glob('*.sql'))
         assert sum(1 for n in names if n.startswith('307_')) == 1
-        assert not any(n.startswith('308_') for n in names)
+        assert sum(1 for n in names if 'retire_junk' in n.lower()) == 1, \
+            'a second junk-vocabulary retirement migration shipped beside 307' 

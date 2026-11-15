@@ -1481,7 +1481,7 @@ class WGMValidationGate:
         2. Inverted rows — subject is a generic ontology token (matches
            _SYSTEM_ENTITY_NAMES) and rel_type is a hierarchy rel.  These are
            mis-extracted facts that have subject/object swapped (e.g. "person
-           instance_of christopher").
+           instance_of daniel").
 
         Qdrant cleanup is best-effort: a failed delete does not affect the gate
         decision or the DB operation.
